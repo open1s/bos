@@ -1,0 +1,29 @@
+[package]
+name = "config"
+version = "0.1.0"
+edition = "2021"
+description = "BrainOS configuration library"
+
+[features]
+python = ["pyo3", "pyo3-async-runtimes"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+serde_yaml = "0.9"
+anyhow = { version = "1.0" }
+thiserror = "1.0"
+tracing = "0.1"
+tokio = { version = "1.40", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+pyo3 = { version = "0.28", optional = true, features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.28", optional = true, features = ["tokio-runtime"] }
+
+[dev-dependencies]
+tempfile = "3.0"
+pyo3 = { version = "0.28", features = ["auto-initialize"] }
+
+[lib]
+name = "config"
+path = "src/lib.rs"

@@ -1,0 +1,25 @@
+[package]
+name = "bus"
+version = "0.1.0"
+edition = "2021"
+description = "BrainOS Zenoh communication wrapper"
+
+[features]
+python-extension = ["pyo3", "pyo3-async-runtimes"]
+
+[dependencies]
+zenoh = "1.7.2"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+pyo3 = { version = "0.28", optional = true, features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.28", optional = true, features = ["tokio-runtime"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[lib]
+name = "bus"
+path = "src/lib.rs"
