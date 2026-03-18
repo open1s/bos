@@ -6,6 +6,7 @@ pub mod error;
 pub mod publisher;
 pub mod query;
 pub mod queryable;
+pub mod rpc;
 pub mod session;
 pub mod subscriber;
 
@@ -16,6 +17,9 @@ pub use error::ZenohError;
 pub use publisher::PublisherWrapper;
 pub use query::QueryWrapper;
 pub use queryable::QueryableWrapper;
+pub use rpc::client::{RpcClient, RpcClientBuilder};
+pub use rpc::error::{RpcError, RpcServiceError};
+pub use rpc::types::RpcResponse;
 pub use session::{SessionManager, SessionManagerBuilder};
 pub use subscriber::SubscriberWrapper;
 
