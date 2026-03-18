@@ -21,7 +21,7 @@ Implement RPC (Remote Procedure Call) functionality on top of the existing Zenoh
 **Status:** Planned (2 plans)
 
 Plans:
-- [ ] 01-01-PLAN.md — Foundation: RpcError, RpcResponse types, RpcClient
+- [x] 01-01-PLAN.md — Foundation: RpcError, RpcResponse types, RpcClient ✅
 - [ ] 01-02-PLAN.md — RpcService, RpcDiscovery, integration tests
 
 ---

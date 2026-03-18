@@ -2,6 +2,7 @@
 //!
 //! Provides common abstractions for Zenoh-based inter-component communication.
 
+pub mod codec;
 pub mod error;
 pub mod publisher;
 pub mod query;
@@ -18,12 +19,16 @@ pub use publisher::PublisherWrapper;
 pub use query::QueryWrapper;
 pub use queryable::QueryableWrapper;
 pub use rpc::client::{RpcClient, RpcClientBuilder};
+pub use rpc::discovery::{DiscoveryInfo, RpcDiscovery};
 pub use rpc::error::{RpcError, RpcServiceError};
+pub use rpc::service::{RpcHandler, RpcService, RpcServiceBuilder};
 pub use rpc::types::RpcResponse;
 pub use session::{SessionManager, SessionManagerBuilder};
 pub use subscriber::SubscriberWrapper;
 
 pub use zenoh::Session;
+
+pub use codec::{Codec, BincodeCodec, JsonCodec, DEFAULT_CODEC};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ZenohConfig {
@@ -43,18 +48,3 @@ impl Default for ZenohConfig {
         }
     }
 }
-
-#[derive(Debug, Clone, Copy)]
-pub struct JsonCodec;
-
-impl JsonCodec {
-    pub fn encode<T: serde::Serialize>(&self, value: &T) -> anyhow::Result<Vec<u8>> {
-        Ok(serde_json::to_vec(value)?)
-    }
-
-    pub fn decode<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> anyhow::Result<T> {
-        Ok(serde_json::from_slice(data)?)
-    }
-}
-
-pub static DEFAULT_CODEC: JsonCodec = JsonCodec;

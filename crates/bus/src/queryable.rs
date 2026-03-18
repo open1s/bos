@@ -1,9 +1,10 @@
 //! Zenoh queryable wrapper
 
 use std::sync::Arc;
+use std::pin::Pin;
 use tokio::task::JoinHandle;
 
-use crate::{error::ZenohError, JsonCodec, Session};
+use crate::{error::ZenohError, Codec, Session};
 use serde::{de::DeserializeOwned, Serialize};
 use zenoh::query::Query;
 
@@ -15,12 +16,12 @@ where
     topic: String,
     queryable: Option<Arc<zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<Query>>>>,
     handler: Option<Handler<Q, R>>,
-    codec: JsonCodec,
+    codec: Codec,
     _phantom_q: std::marker::PhantomData<Q>,
     _phantom_r: std::marker::PhantomData<R>,
 }
 
-type Handler<Q, R> = Box<dyn Fn(Q) -> Result<R, ZenohError> + Send + Sync>;
+type Handler<Q, R> = Box<dyn Fn(Q) -> Pin<Box<dyn std::future::Future<Output = Result<R, ZenohError>> + Send>> + Send + Sync>;
 
 impl<Q, R> QueryableWrapper<Q, R>
 where
@@ -32,17 +33,24 @@ where
             topic: topic.into(),
             queryable: None,
             handler: None,
-            codec: JsonCodec,
+            codec: Codec::default(),
             _phantom_q: std::marker::PhantomData,
             _phantom_r: std::marker::PhantomData,
         }
     }
 
-    pub fn with_handler<F>(mut self, handler: F) -> Self
+    pub fn with_codec(mut self, codec: Codec) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    pub fn with_handler<F, Fut>(mut self, handler: F) -> Self
     where
-        F: Fn(Q) -> Result<R, ZenohError> + Send + Sync + 'static,
+        F: Fn(Q) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<R, ZenohError>> + Send + 'static,
     {
-        self.handler = Some(Box::new(handler));
+        let handler: Handler<Q, R> = Box::new(move |q| Box::pin(handler(q)));
+        self.handler = Some(handler);
         self
     }
 
@@ -98,7 +106,7 @@ where
     async fn handle_query(
         query: &Query,
         handler: &Handler<Q, R>,
-        codec: &JsonCodec,
+        codec: &Codec,
         topic: &str,
     ) -> Result<(), ZenohError> {
         let Some(payload) = query.payload() else {
@@ -112,7 +120,7 @@ where
                 .map_err(|e| ZenohError::Serialization(e.to_string()))?
         };
 
-        match (handler)(request) {
+        match handler(request).await {
             Ok(response) => {
                 let data = codec
                     .encode(&response)
@@ -144,6 +152,10 @@ where
     pub fn is_running(&self) -> bool {
         self.handler.is_some()
     }
+
+    pub fn codec(&self) -> Codec {
+        self.codec
+    }
 }
 
 impl<Q, R> Clone for QueryableWrapper<Q, R>
@@ -156,7 +168,7 @@ where
             topic: self.topic.clone(),
             queryable: None,
             handler: None,
-            codec: JsonCodec,
+            codec: self.codec,
             _phantom_q: std::marker::PhantomData,
             _phantom_r: std::marker::PhantomData,
         }
@@ -199,7 +211,7 @@ mod tests {
     #[test]
     fn test_queryable_wrapper_with_handler() {
         let queryable = QueryableWrapper::<String, String>::new("test/topic")
-            .with_handler(|q| Ok(q.to_uppercase()));
+            .with_handler(|q| async move { Ok(q.to_uppercase()) });
 
         assert_eq!(queryable.topic(), "test/topic");
         assert!(queryable.is_running());
@@ -207,7 +219,8 @@ mod tests {
 
     #[test]
     fn test_queryable_wrapper_clone() {
-        let queryable = QueryableWrapper::<i32, i32>::new("test/topic").with_handler(|q| Ok(q * 2));
+        let queryable =
+            QueryableWrapper::<i32, i32>::new("test/topic").with_handler(|q| async move { Ok(q * 2) });
 
         let cloned = queryable.clone();
 

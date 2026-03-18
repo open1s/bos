@@ -200,7 +200,7 @@ mod tests {
         let session = manager.connect().await.expect("Failed to connect session");
 
         let mut queryable = QueryableWrapper::<TestQuery, TestResponse>::new(TEST_TOPIC)
-            .with_handler(|q| {
+            .with_handler(|q| async move {
                 Ok(TestResponse {
                     result: q.query.to_uppercase(),
                 })

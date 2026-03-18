@@ -5,12 +5,13 @@ use std::time::Duration;
 use zenoh::Session;
 
 use crate::rpc::error::RpcError;
-use crate::rpc::types::RpcResponse;
-use crate::JsonCodec;
+use crate::rpc::service::RpcRequest;
+use crate::rpc::service::RpcResponseEnvelope;
+use crate::Codec;
 
 /// RPC client for calling remote services.
 ///
-/// Uses topic pattern: `/rpc/{service}/{method}`
+/// Uses topic pattern: `rpc/{service}`
 ///
 /// # Example
 /// ```rust,ignore
@@ -25,7 +26,7 @@ pub struct RpcClient {
     method: String,
     topic: String,
     session: Option<Arc<Session>>,
-    codec: JsonCodec,
+    codec: Codec,
     timeout: Duration,
 }
 
@@ -34,6 +35,7 @@ pub struct RpcClientBuilder {
     service: Option<String>,
     method: Option<String>,
     timeout: Option<Duration>,
+    codec: Option<Codec>,
 }
 
 impl RpcClientBuilder {
@@ -56,6 +58,11 @@ impl RpcClientBuilder {
         self
     }
 
+    pub fn codec(mut self, codec: Codec) -> Self {
+        self.codec = Some(codec);
+        self
+    }
+
     pub fn build(self) -> Result<RpcClient, RpcError> {
         let service = self.service.ok_or_else(|| {
             RpcError::Serialization("RpcClientBuilder: service not set".to_string())
@@ -64,93 +71,102 @@ impl RpcClientBuilder {
             RpcError::Serialization("RpcClientBuilder: method not set".to_string())
         })?;
         Ok(RpcClient {
-            topic: format!("/rpc/{}/{}", service, method),
+            topic: format!("rpc/{}", service),
             service,
             method,
             session: None,
-            codec: JsonCodec,
+            codec: self.codec.unwrap_or_default(),
             timeout: self.timeout.unwrap_or(Duration::from_secs(5)),
         })
     }
 }
 
 impl RpcClient {
-    /// Create a new RpcClient for a service+method.
-    /// Convenience constructor equivalent to builder.
     pub fn new(service: impl Into<String>, method: impl Into<String>) -> Self {
         let service = service.into();
         let method = method.into();
         Self {
-            topic: format!("/rpc/{}/{}", service, method),
+            topic: format!("rpc/{}", service),
             service,
             method,
             session: None,
-            codec: JsonCodec,
+            codec: Codec::default(),
             timeout: Duration::from_secs(5),
         }
     }
 
-    /// Create a builder for RpcClient.
     pub fn builder() -> RpcClientBuilder {
         RpcClientBuilder::new()
     }
 
-    /// Initialize with a Zenoh session.
+    pub fn with_codec(mut self, codec: Codec) -> Self {
+        self.codec = codec;
+        self
+    }
+
     pub async fn init(&mut self, session: Arc<Session>) -> Result<(), RpcError> {
         self.session = Some(session);
         Ok(())
     }
 
-    /// Get the full topic path.
     pub fn topic(&self) -> &str {
         &self.topic
     }
 
-    /// Check if initialized.
     pub fn is_initialized(&self) -> bool {
         self.session.is_some()
     }
 
-    /// Call the service and return a single response.
-    ///
-    /// Deserializes the first RpcResponse::Ok response.
-    /// Returns RpcError::NotFound if no responses received.
-    /// Returns error if multiple responses received.
     pub async fn call<T: serde::de::DeserializeOwned>(
         &self,
         payload: impl serde::Serialize,
     ) -> Result<T, RpcError> {
-        let payload_bytes = self.codec.encode(&payload)?;
-        let responses = self.call_raw(&payload_bytes).await?;
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let req = RpcRequest {
+            method: self.method.clone(),
+            payload: payload_bytes,
+        };
+        let req_bytes = self.codec.encode(&req)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let responses = self.call_raw(&req_bytes).await?;
         self.extract_single(responses).await
     }
 
-    /// Call the service and return ALL responses (including from multiple services).
     pub async fn call_all<T: serde::de::DeserializeOwned>(
         &self,
         payload: impl serde::Serialize,
     ) -> Result<Vec<T>, RpcError> {
-        let payload_bytes = self.codec.encode(&payload)?;
-        let responses = self.call_raw(&payload_bytes).await?;
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let req = RpcRequest {
+            method: self.method.clone(),
+            payload: payload_bytes,
+        };
+        let req_bytes = self.codec.encode(&req)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let responses = self.call_raw(&req_bytes).await?;
         let mut results = Vec::new();
         for bytes in responses {
-            match self.codec.decode::<RpcResponse<T>>(&bytes) {
-                Ok(RpcResponse::Ok(v)) => results.push(v),
-                Ok(RpcResponse::Err { code, message }) => {
-                    return Err(RpcError::Serialization(format!(
-                        "Unexpected RpcResponse::Err in call_all: code={}, msg={}",
-                        code, message
-                    )));
-                }
-                Err(e) => {
-                    return Err(RpcError::Serialization(e.to_string()));
-                }
+            let envelope: RpcResponseEnvelope = self.codec.decode(&bytes)
+                .map_err(|e| RpcError::Serialization(e.to_string()))?;
+            if envelope.status == "err" {
+                let err = envelope.err.unwrap();
+                return Err(RpcError::Serialization(format!(
+                    "RpcResponse::Err in call_all: code={}, msg={}",
+                    err.code, err.message
+                )));
             }
+            let ok_bytes = envelope.ok.ok_or_else(|| {
+                RpcError::Serialization("Response missing ok data".to_string())
+            })?;
+            let result: T = serde_json::from_slice(&ok_bytes)
+                .map_err(|e| RpcError::Serialization(e.to_string()))?;
+            results.push(result);
         }
         Ok(results)
     }
 
-    /// Low-level query sending. Returns raw byte vectors.
     async fn call_raw(&self, payload: &[u8]) -> Result<Vec<Vec<u8>>, RpcError> {
         let session = self
             .session
@@ -190,7 +206,6 @@ impl RpcClient {
         Ok(results)
     }
 
-    /// Extract single value from responses.
     async fn extract_single<T: serde::de::DeserializeOwned>(
         &self,
         responses: Vec<Vec<u8>>,
@@ -202,10 +217,21 @@ impl RpcClient {
             )));
         }
         let bytes = responses.into_iter().next().unwrap();
-        let response: RpcResponse<T> = self.codec.decode(&bytes)?;
-        response.into_result().map_err(|(code, msg)| {
-            RpcError::Serialization(format!("RpcResponse::Err: code={}, msg={}", code, msg))
-        })
+        let envelope: RpcResponseEnvelope = self.codec.decode(&bytes)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        if envelope.status == "err" {
+            let err = envelope.err.unwrap();
+            return Err(RpcError::Serialization(format!(
+                "RpcResponse::Err: code={}, msg={}",
+                err.code, err.message
+            )));
+        }
+        let ok_bytes = envelope.ok.ok_or_else(|| {
+            RpcError::Serialization("Response missing ok data".to_string())
+        })?;
+        let result: T = serde_json::from_slice(&ok_bytes)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        Ok(result)
     }
 }
 
@@ -215,8 +241,8 @@ impl Clone for RpcClient {
             service: self.service.clone(),
             method: self.method.clone(),
             topic: self.topic.clone(),
-            session: None, // Clones drop session (matches QueryWrapper pattern)
-            codec: JsonCodec,
+            session: None,
+            codec: self.codec,
             timeout: self.timeout,
         }
     }
@@ -235,7 +261,7 @@ mod tests {
             .build()
             .expect("Failed to build client");
 
-        assert_eq!(client.topic(), "/rpc/calculator/add");
+        assert_eq!(client.topic(), "rpc/calculator");
         assert_eq!(client.timeout, Duration::from_secs(10));
         assert!(!client.is_initialized());
     }
@@ -244,7 +270,7 @@ mod tests {
     fn test_rpc_client_new() {
         let client = RpcClient::new("calculator", "add");
 
-        assert_eq!(client.topic(), "/rpc/calculator/add");
+        assert_eq!(client.topic(), "rpc/calculator");
         assert_eq!(client.timeout, Duration::from_secs(5));
         assert!(!client.is_initialized());
     }

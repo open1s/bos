@@ -33,6 +33,12 @@ impl From<zenoh::Error> for RpcError {
     }
 }
 
+impl From<anyhow::Error> for RpcError {
+    fn from(e: anyhow::Error) -> Self {
+        RpcError::Serialization(e.to_string())
+    }
+}
+
 /// Service-side error carried in `RpcResponse::Err`.
 ///
 /// This represents errors that occur within the service itself,

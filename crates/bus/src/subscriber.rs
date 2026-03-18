@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
-use crate::{error::ZenohError, Session};
+use crate::{error::ZenohError, Codec, Session};
 use serde::de::DeserializeOwned;
 use zenoh::sample::Sample;
 
 pub struct SubscriberWrapper<T: DeserializeOwned + Send + Sized + 'static> {
     topic: String,
     subscriber: Option<zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<Sample>>>,
+    codec: Codec,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -17,8 +18,14 @@ impl<T: DeserializeOwned + Send + Sized + 'static> SubscriberWrapper<T> {
         Self {
             topic: topic.into(),
             subscriber: None,
+            codec: Codec::default(),
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    pub fn with_codec(mut self, codec: Codec) -> Self {
+        self.codec = codec;
+        self
     }
 
     pub async fn init(&mut self, session: &Arc<Session>) -> Result<(), ZenohError> {
@@ -39,7 +46,7 @@ impl<T: DeserializeOwned + Send + Sized + 'static> SubscriberWrapper<T> {
         match result {
             Ok(sample) => {
                 let bytes = sample.payload().to_bytes();
-                serde_json::from_slice::<T>(bytes.as_ref()).ok()
+                self.codec.decode(bytes.as_ref()).ok()
             }
             Err(_) => None,
         }
@@ -75,6 +82,10 @@ impl<T: DeserializeOwned + Send + Sized + 'static> SubscriberWrapper<T> {
     ) -> Option<&zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<Sample>>> {
         self.subscriber.as_ref()
     }
+
+    pub fn codec(&self) -> Codec {
+        self.codec
+    }
 }
 
 impl<T: DeserializeOwned + Send + Sized + 'static> Clone for SubscriberWrapper<T> {
@@ -82,6 +93,7 @@ impl<T: DeserializeOwned + Send + Sized + 'static> Clone for SubscriberWrapper<T
         Self {
             topic: self.topic.clone(),
             subscriber: None,
+            codec: self.codec,
             _phantom: self._phantom,
         }
     }
