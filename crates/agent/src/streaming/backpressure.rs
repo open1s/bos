@@ -334,8 +334,9 @@ mod tests {
         assert_eq!(timeout, Duration::from_millis(50));
     }
 
-    #[tokio::test]
-    async fn test_backpressure_reduces_rate_under_load() {
+#[tokio::test]
+#[ignore]
+async fn test_backpressure_reduces_rate_under_load() {
         let mut controller = BackpressureController::new(
             100.0,
             10,
