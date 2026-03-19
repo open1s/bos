@@ -71,11 +71,13 @@ Plans:
 
 **Status:** Planned
 
+**Plans:** 4 plans
+
 Plans:
-- [ ] 02-01-PLAN.md — A2A protocol: envelope, state machine, discovery, delegation
-- [ ] 02-02-PLAN.md — MCP bridge: STDIO client, tool adapter, bus integration
-- [ ] 02-03-PLAN.md — Skills system: definition schema, registry, composer, namespacing
-- [ ] 02-04-PLAN.md — Streaming over bus, backpressure, integration tests
+- [x] 02-01-PLAN.md — A2A protocol: envelope, state machine, discovery, delegation
+- [x] 02-02-PLAN.md — MCP bridge: STDIO client, tool adapter, bus integration
+- [x] 02-03-PLAN.md — Skills system: definition schema, registry, composer, namespacing
+- [x] 02-04-PLAN.md — Streaming over bus, backpressure, integration tests
 
 ---
 

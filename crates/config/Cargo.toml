@@ -15,7 +15,7 @@ serde_yaml = "0.9"
 anyhow = { version = "1.0" }
 thiserror = "1.0"
 tracing = "0.1"
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 pyo3 = { version = "0.28", optional = true, features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.28", optional = true, features = ["tokio-runtime"] }
