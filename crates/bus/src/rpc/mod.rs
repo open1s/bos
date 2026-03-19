@@ -216,26 +216,30 @@ mod tests {
         let manager = SessionManager::new(config);
         let session = manager.connect().await.expect("Failed to connect session");
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<DiscoveryInfo>>(1);
+
         let registry = DiscoveryRegistry::new()
             .session(session.clone())
-            .timeout(std::time::Duration::from_secs(5));
+            .timeout(std::time::Duration::from_secs(2));
 
-        let topic1 = "rpc/services/reg-test-1";
-        let topic2 = "rpc/services/reg-test-2";
+        let handle = tokio::spawn(async move {
+            let services = registry.list_services().await.unwrap_or_default();
+            let _ = tx.send(services).await;
+        });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let info1 = DiscoveryInfo::new("reg-test-1");
-        let pub1 = session.declare_publisher(topic1).await.unwrap();
+        let pub1 = session.declare_publisher("rpc/services/reg-test-1").await.unwrap();
         pub1.put(Codec::default().encode(&info1).unwrap()).await.unwrap();
 
         let info2 = DiscoveryInfo::new("reg-test-2");
-        let pub2 = session.declare_publisher(topic2).await.unwrap();
+        let pub2 = session.declare_publisher("rpc/services/reg-test-2").await.unwrap();
         pub2.put(Codec::default().encode(&info2).unwrap()).await.unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let services = rx.recv().await.expect("channel receive failed");
+        handle.await.expect("registry task panicked");
 
-        let services = registry.list_services().await.expect("list_services failed");
         assert!(!services.is_empty(), "Should have received at least one service");
     }
 
