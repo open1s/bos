@@ -17,19 +17,26 @@ use crate::Session;
 /// Discovery information published by RPC services.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryInfo {
-    /// Topic prefix for the service (e.g., "rpc/my-service")
-    pub topic_prefix: String,
-    /// Name of the discovered service
-    pub service_name: String,
+	/// Topic prefix for the service (e.g., "rpc/my-service")
+	pub topic_prefix: String,
+	/// Name of the discovered service
+	pub service_name: String,
+	/// Service version (e.g., "1.0.0")
+	pub version: String,
+	/// Topic for health status publishing (e.g., "rpc/health/my-service")
+	pub health_topic: String,
 }
 
 impl DiscoveryInfo {
-    pub fn new(service_name: &str) -> Self {
-        Self {
-            topic_prefix: format!("rpc/{}", service_name),
-            service_name: service_name.to_string(),
-        }
-    }
+	pub fn new(service_name: &str) -> Self {
+		let topic_prefix = format!("rpc/{}", service_name);
+		Self {
+			topic_prefix: topic_prefix.clone(),
+			service_name: service_name.to_string(),
+			version: "1.0.0".to_string(),
+			health_topic: format!("rpc/health/{}", service_name),
+		}
+	}
 }
 
 /// Service discovery via pub/sub.
@@ -133,16 +140,14 @@ impl DiscoveryQueryBuilder {
             if remaining.is_zero() {
                 break;
             }
-            if let Some(info) = subscriber.recv_with_timeout(remaining).await {
-                eprintln!("DEBUG: Received discovery info: {:?}", info);
-                if info.service_name == self.service_name {
-                    return Ok(info);
-                }
-                last_seen = Some(info);
-            } else {
-                eprintln!("DEBUG: recv_with_timeout returned None, breaking");
-                break;
-            }
+		if let Some(info) = subscriber.recv_with_timeout(remaining).await {
+			if info.service_name == self.service_name {
+				return Ok(info);
+			}
+			last_seen = Some(info);
+		} else {
+			break;
+		}
         }
 
         if let Some(info) = last_seen {
@@ -153,24 +158,99 @@ impl DiscoveryQueryBuilder {
             "No discovery response for service: {}",
             self.service_name
         )))
-    }
+	}
+}
+
+/// Registry for discovering all advertised services.
+/// Subscribes to `rpc/services/**` and collects announcements within a timeout.
+pub struct DiscoveryRegistry {
+	session: Option<Arc<Session>>,
+	timeout: Duration,
+}
+
+impl DiscoveryRegistry {
+	/// Create a new registry.
+	pub fn new() -> Self {
+		Self {
+			session: None,
+			timeout: Duration::from_secs(2),
+		}
+	}
+
+	/// Set the session.
+	pub fn session(mut self, session: Arc<Session>) -> Self {
+		self.session = Some(session);
+		self
+	}
+
+	/// Set the discovery timeout.
+	pub fn timeout(mut self, timeout: Duration) -> Self {
+		self.timeout = timeout;
+		self
+	}
+
+	/// Subscribe to `rpc/services/**` and collect all discovery announcements.
+	pub async fn list_services(&self) -> Result<Vec<DiscoveryInfo>, ZenohError> {
+		let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
+		let topic = "rpc/services/**";
+		let mut subscriber = SubscriberWrapper::<DiscoveryInfo>::new(topic);
+		subscriber.init(session).await?;
+
+		let deadline = tokio::time::Instant::now() + self.timeout;
+		let mut services = Vec::new();
+
+		while tokio::time::Instant::now() < deadline {
+			let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+			if remaining.is_zero() {
+				break;
+			}
+			if let Some(info) = subscriber.recv_with_timeout(remaining).await {
+				if !services.iter().any(|s: &DiscoveryInfo| s.service_name == info.service_name) {
+					services.push(info);
+				}
+			} else {
+				break;
+			}
+		}
+
+		Ok(services)
+	}
+}
+
+impl Default for DiscoveryRegistry {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl Clone for DiscoveryRegistry {
+	fn clone(&self) -> Self {
+		Self {
+			session: None,
+			timeout: self.timeout,
+		}
+	}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_discovery_info_serialization() {
-        let info = DiscoveryInfo::new("my-service");
-        assert_eq!(info.topic_prefix, "rpc/my-service");
-        assert_eq!(info.service_name, "my-service");
+	#[test]
+	fn test_discovery_info_serialization() {
+		let info = DiscoveryInfo::new("my-service");
+		assert_eq!(info.topic_prefix, "rpc/my-service");
+		assert_eq!(info.service_name, "my-service");
+		assert_eq!(info.version, "1.0.0");
+		assert_eq!(info.health_topic, "rpc/health/my-service");
 
-        let json = serde_json::to_string(&info).unwrap();
-        let decoded: DiscoveryInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(info.topic_prefix, decoded.topic_prefix);
-        assert_eq!(info.service_name, decoded.service_name);
-    }
+		let json = serde_json::to_string(&info).unwrap();
+		let decoded: DiscoveryInfo = serde_json::from_str(&json).unwrap();
+		assert_eq!(info.topic_prefix, decoded.topic_prefix);
+		assert_eq!(info.service_name, decoded.service_name);
+		assert_eq!(info.version, decoded.version);
+		assert_eq!(info.health_topic, decoded.health_topic);
+	}
 
     #[test]
     fn test_rpc_discovery_announce() {

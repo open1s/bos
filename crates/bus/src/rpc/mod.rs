@@ -23,15 +23,19 @@
 //! let result: i32 = client.call(&[1, 2]).await?;
 //! ```
 
+pub mod cache;
 pub mod client;
 pub mod discovery;
 pub mod error;
+pub mod health;
 pub mod service;
 pub mod types;
 
+pub use cache::{CacheStats, ServiceCache};
 pub use client::{RpcClient, RpcClientBuilder};
-pub use discovery::{DiscoveryInfo, DiscoveryQueryBuilder, RpcDiscovery};
+pub use discovery::{DiscoveryInfo, DiscoveryQueryBuilder, RpcDiscovery, DiscoveryRegistry};
 pub use error::{RpcError, RpcServiceError};
+pub use health::{HealthChecker, HealthPublisher, HealthStatus, ServiceState};
 pub use service::{RpcHandler, RpcService, RpcServiceBuilder};
 pub use types::RpcResponse;
 
@@ -41,7 +45,7 @@ mod tests {
 
     use crate::rpc::error::RpcServiceError;
     use crate::rpc::service::RpcHandler;
-    use crate::{Codec, DiscoveryInfo, RpcClient, RpcServiceBuilder, SessionManager, ZenohConfig};
+    use crate::{Codec, DiscoveryInfo, DiscoveryRegistry, RpcClient, RpcServiceBuilder, SessionManager, ZenohConfig};
 
     struct TestServiceHandler;
 
@@ -188,6 +192,8 @@ mod tests {
             .await
             .expect("Should have received discovery info");
         assert_eq!(info.service_name, "test-service");
+        assert_eq!(info.version, "1.0.0");
+        assert_eq!(info.health_topic, "rpc/health/test-service");
 
         let mut echo_client = RpcClient::new("test-service", "echo");
         echo_client.init(session.clone()).await.expect("Failed to init echo client");
@@ -202,5 +208,58 @@ mod tests {
         let add_payload = (5, 3);
         let add_result: i32 = add_client.call(&add_payload).await.expect("Add call failed");
         assert_eq!(add_result, 8);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_discovery_registry_list_services() {
+        let config = ZenohConfig::default();
+        let manager = SessionManager::new(config);
+        let session = manager.connect().await.expect("Failed to connect session");
+
+        let registry = DiscoveryRegistry::new()
+            .session(session.clone())
+            .timeout(std::time::Duration::from_secs(5));
+
+        let topic1 = "rpc/services/reg-test-1";
+        let topic2 = "rpc/services/reg-test-2";
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let info1 = DiscoveryInfo::new("reg-test-1");
+        let pub1 = session.declare_publisher(topic1).await.unwrap();
+        pub1.put(Codec::default().encode(&info1).unwrap()).await.unwrap();
+
+        let info2 = DiscoveryInfo::new("reg-test-2");
+        let pub2 = session.declare_publisher(topic2).await.unwrap();
+        pub2.put(Codec::default().encode(&info2).unwrap()).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let services = registry.list_services().await.expect("list_services failed");
+        assert!(!services.is_empty(), "Should have received at least one service");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_health_publisher_checker() {
+        use crate::rpc::health::{HealthChecker, HealthPublisher, ServiceState};
+
+        let config = ZenohConfig::default();
+        let manager = SessionManager::new(config);
+        let session = manager.connect().await.expect("Failed to connect session");
+
+        let publisher = HealthPublisher::new("health-test-svc")
+            .interval(std::time::Duration::from_millis(100));
+        let handle = publisher.start(session.clone());
+
+        let checker = HealthChecker::new()
+            .session(session.clone())
+            .timeout(std::time::Duration::from_secs(2));
+
+        let status = checker.check("health-test-svc").await.expect("check failed");
+        assert_eq!(status.service_name, "health-test-svc");
+        assert_eq!(status.state, ServiceState::Online);
+        assert_eq!(status.version, "1.0.0");
+
+        handle.abort();
     }
 }
