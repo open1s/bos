@@ -34,7 +34,7 @@
 4. Tool schema mismatches produce clear errors, not silent failures
 5. Agent, tools, and streaming all compile with `cargo build -p agent`
 
-**Status:** Planned
+**Status:** Complete
 
 Plans:
 - [x] 01-01-PLAN.md — LlmClient, Agent Core & Reasoning Loop ✅

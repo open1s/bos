@@ -2,20 +2,20 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: planning
-last_updated: "2026-03-19T15:13:44.534Z"
+status: executing
+last_updated: "2026-03-20T00:00:00.000Z"
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 10
-  completed_plans: 5
+  completed_plans: 7
 ---
 
 # BrainOS Agent Framework State
 
 **Project:** BrainOS Agent Framework
-**Updated:** 2026-03-19
-**Status:** Ready to plan
+**Updated:** 2026-03-20
+**Status:** Executing Phase 01
 
 ## Phase Progress
 
@@ -25,24 +25,34 @@ progress:
 | 02 | ● Complete | 3/3 |
 | 03 | ○ Planned | 0/2 |
 
-## Phase 01: Core Agent Foundation ✅
+## Phase 01: Core Agent Foundation ✅ (Complete)
 
 **Goal:** A working single agent that calls tools, streams output, and loads from config.
 
-**Completed:**
-
+**Plan 01-01: LlmClient, Agent Core & Reasoning Loop** ✅
 - `crates/agent/src/lib.rs` — crate root, all re-exports
 - `crates/agent/src/error.rs` — `LlmError`, `ToolError`, `AgentError`
 - `crates/agent/src/llm/mod.rs` — `LlmClient` trait, `LlmResponse`, `LlmRequest`, `OpenAiMessage`
 - `crates/agent/src/llm/client.rs` — `OpenAiClient` implementation
 - `crates/agent/src/agent/mod.rs` — `Message`, `MessageLog`, `Agent`, `AgentConfig`, `AgentOutput`
+- `crates/agent/src/agent/config.rs` — `AgentBuilder`, `TomlAgentConfig`
+- **Summary:** `.planning/phases/01-core-agent/01-01-SUMMARY.md`
+
+**Plan 01-02: Tool System** ✅
 - `crates/agent/src/tools/mod.rs` — `Tool` trait, `ToolDescription`
 - `crates/agent/src/tools/registry.rs` — `ToolRegistry` with tests
 - `crates/agent/src/tools/translator.rs` — JSON schema → human-readable
 - `crates/agent/src/tools/validator.rs` — args validation against schema
 - `crates/agent/src/tools/bus_client.rs` — `BusToolClient` for remote tools via Zenoh
-- `crates/agent/src/streaming/mod.rs` — scaffold (Phase 2 implements SSE)
-- **18 tests pass**, clean build with 0 warnings
+- **Summary:** `.planning/phases/01-core-agent/01-02-SUMMARY.md`
+
+**Plan 01-03: Streaming & Config** ✅
+- `crates/agent/src/streaming/mod.rs` — SSE decoder, token streaming
+- `crates/agent/src/streaming/publisher.rs` — Token publisher
+- `crates/agent/src/streaming/backpressure.rs` — Rate limiting
+- **Summary:** `.planning/phases/01-core-agent/01-03-SUMMARY.md`
+
+**Tests:** 41 tests pass, clean build with 2 warnings
 
 ## Phase 02: Agent Protocols ✅
 
