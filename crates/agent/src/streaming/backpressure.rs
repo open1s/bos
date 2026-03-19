@@ -56,6 +56,7 @@ impl SerializedToken {
 pub struct TokenBatch {
     pub tokens: Vec<SerializedToken>,
     pub token_count: usize,
+    #[serde(skip)]
     pub created_at: Instant,
 }
 

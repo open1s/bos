@@ -3,6 +3,16 @@ use std::pin::Pin;
 
 use crate::llm::StreamToken;
 
+// New modules for bus streaming with backpressure
+pub mod publisher;
+pub mod backpressure;
+
+// Re-exports from new modules
+pub use publisher::{PublisherWrapper, TokenPublisher};
+pub use backpressure::{
+    TokenBatch, SerializedToken, TokenType, RateLimiter, BackpressureController,
+};
+
 pub struct SseDecoder {
     buffer: String,
 }
@@ -80,17 +90,6 @@ mod tests {
         let events = decoder.decode_chunk(b"");
         assert!(events.is_empty());
     }
-
-#[test]
-fn test_sse_decoder_ignore_non_data_lines() {
-    let mut decoder = SseDecoder::new();
-    let events = decoder.decode_chunk(b"event: message\nid: 123\ndata: {\"content\":\"hi\"}\n\n");
-    assert_eq!(events.len(), 1);
-    assert!(matches!(events[0], SseEvent::Data(ref s) if s.contains("hi")));
-}
-
-#[cfg(test)]
-mod integration_tests;
 
     #[test]
     fn test_sse_decoder_ignore_non_data_lines() {
