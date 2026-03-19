@@ -1,22 +1,25 @@
 //! Zenoh queryable wrapper
 
+use rkyv::{Archive, Deserialize, Serialize, api::high::HighDeserializer, ser::{allocator::ArenaHandle, sharing::Share, Serializer}, util::AlignedVec, rancor::{Error, Strategy}};
+
+use crate::{error::ZenohError, Codec, Session};
 use std::sync::Arc;
 use std::pin::Pin;
 use tokio::task::JoinHandle;
-
-use crate::{error::ZenohError, Codec, Session};
-use serde::{de::DeserializeOwned, Serialize};
 use zenoh::query::Query;
 
 pub struct QueryableWrapper<Q, R>
 where
-    Q: DeserializeOwned + Send + 'static,
-    R: Serialize + Send + 'static,
+    Q: Archive + 'static,
+    R: Archive + Send + 'static,
+    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
+    R::Archived: Deserialize<R, HighDeserializer<Error>>,
+    for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+    for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
     topic: String,
     queryable: Option<Arc<zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<Query>>>>,
     handler: Option<Handler<Q, R>>,
-    codec: Codec,
     _phantom_q: std::marker::PhantomData<Q>,
     _phantom_r: std::marker::PhantomData<R>,
 }
@@ -25,23 +28,21 @@ type Handler<Q, R> = Box<dyn Fn(Q) -> Pin<Box<dyn std::future::Future<Output = R
 
 impl<Q, R> QueryableWrapper<Q, R>
 where
-    Q: DeserializeOwned + Send + 'static,
-    R: Serialize + Send + 'static,
+    Q: Archive + 'static,
+    R: Archive + Send + 'static,
+    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
+    R::Archived: Deserialize<R, HighDeserializer<Error>>,
+    for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+    for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
     pub fn new(topic: impl Into<String>) -> Self {
         Self {
             topic: topic.into(),
             queryable: None,
             handler: None,
-            codec: Codec::default(),
             _phantom_q: std::marker::PhantomData,
             _phantom_r: std::marker::PhantomData,
         }
-    }
-
-    pub fn with_codec(mut self, codec: Codec) -> Self {
-        self.codec = codec;
-        self
     }
 
     pub fn with_handler<F, Fut>(mut self, handler: F) -> Self
@@ -72,11 +73,10 @@ where
             .as_ref()
             .ok_or_else(|| ZenohError::Query("No handler registered".to_string()))?;
 
-        let codec = self.codec;
         let topic = self.topic.clone();
 
         while let Ok(query) = queryable.recv_async().await {
-            Self::handle_query(&query, handler, &codec, &topic).await?;
+            Self::handle_query(&query, handler, &topic).await?;
         }
 
         Ok(())
@@ -90,12 +90,11 @@ where
             .take()
             .ok_or_else(|| ZenohError::Query("No handler registered".to_string()))?;
 
-        let codec = self.codec;
         let topic = self.topic.clone();
 
         let handle = tokio::spawn(async move {
             while let Ok(query) = queryable.recv_async().await {
-                Self::handle_query(&query, &handler, &codec, &topic).await?;
+                Self::handle_query(&query, &handler, &topic).await?;
             }
             Ok(())
         });
@@ -106,13 +105,13 @@ where
     async fn handle_query(
         query: &Query,
         handler: &Handler<Q, R>,
-        codec: &Codec,
         topic: &str,
     ) -> Result<(), ZenohError> {
         let Some(payload) = query.payload() else {
             return Err(ZenohError::Query("No payload in query".to_string()));
         };
 
+        let codec = Codec;
         let request: Q = {
             let bytes = payload.to_bytes();
             codec
@@ -152,23 +151,22 @@ where
     pub fn is_running(&self) -> bool {
         self.handler.is_some()
     }
-
-    pub fn codec(&self) -> Codec {
-        self.codec
-    }
 }
 
 impl<Q, R> Clone for QueryableWrapper<Q, R>
 where
-    Q: DeserializeOwned + Send + 'static,
-    R: Serialize + Send + 'static,
+    Q: Archive + 'static,
+    R: Archive + Send + 'static,
+    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
+    R::Archived: Deserialize<R, HighDeserializer<Error>>,
+    for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+    for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
     fn clone(&self) -> Self {
         Self {
             topic: self.topic.clone(),
             queryable: None,
             handler: None,
-            codec: self.codec,
             _phantom_q: std::marker::PhantomData,
             _phantom_r: std::marker::PhantomData,
         }
@@ -177,8 +175,12 @@ where
 
 impl<Q, R> Drop for QueryableWrapper<Q, R>
 where
-    Q: DeserializeOwned + Send + 'static,
-    R: Serialize + Send + 'static,
+    Q: Archive + 'static,
+    R: Archive + Send + 'static,
+    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
+    R::Archived: Deserialize<R, HighDeserializer<Error>>,
+    for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+    for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
     fn drop(&mut self) {
         self.queryable = None;
@@ -188,8 +190,12 @@ where
 
 impl<Q, R> Default for QueryableWrapper<Q, R>
 where
-    Q: DeserializeOwned + Send + 'static,
-    R: Serialize + Send + 'static,
+    Q: Archive + 'static,
+    R: Archive + Send + 'static,
+    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
+    R::Archived: Deserialize<R, HighDeserializer<Error>>,
+    for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+    for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
     fn default() -> Self {
         Self::new("default/queryable")

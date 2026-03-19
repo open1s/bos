@@ -1,63 +1,37 @@
-use serde::{de::DeserializeOwned, Serialize};
+use rkyv::{
+    rancor::{Error, Strategy},
+    ser::{allocator::ArenaHandle, sharing::Share, Serializer},
+    util::AlignedVec,
+    Archive, Serialize,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct JsonCodec;
-
-impl JsonCodec {
-    pub fn encode<T: Serialize>(&self, value: &T) -> anyhow::Result<Vec<u8>> {
-        Ok(serde_json::to_vec(value)?)
-    }
-
-    pub fn decode<T: DeserializeOwned>(&self, data: &[u8]) -> anyhow::Result<T> {
-        Ok(serde_json::from_slice(data)?)
-    }
-}
-
-pub static DEFAULT_CODEC: JsonCodec = JsonCodec;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Codec {
-    Json(JsonCodec),
-    Bincode,
-}
-
-impl Codec {
-    pub fn encode<T: Serialize>(&self, value: &T) -> anyhow::Result<Vec<u8>> {
-        match self {
-            Codec::Json(c) => c.encode(value),
-            Codec::Bincode => Ok(bincode::serialize(value)?),
-        }
-    }
-
-    pub fn decode<T: DeserializeOwned>(&self, data: &[u8]) -> anyhow::Result<T> {
-        match self {
-            Codec::Json(c) => c.decode(data),
-            Codec::Bincode => Ok(bincode::deserialize(data)?),
-        }
-    }
-}
+pub struct Codec;
 
 impl Default for Codec {
     fn default() -> Self {
-        Codec::Json(JsonCodec)
+        Codec
     }
 }
 
-impl From<JsonCodec> for Codec {
-    fn from(c: JsonCodec) -> Self {
-        Codec::Json(c)
+impl Codec {
+    pub fn encode<T>(&self, value: &T) -> anyhow::Result<Vec<u8>>
+    where
+        T: Archive,
+        for<'a> T: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+    {
+        Ok(rkyv::to_bytes::<Error>(value)?.into_vec())
+    }
+
+    pub fn decode<T>(&self, data: &[u8]) -> anyhow::Result<T>
+    where
+        T: Archive,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<Error>>,
+    {
+        Ok(unsafe { rkyv::from_bytes_unchecked::<T, Error>(data)? })
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct BincodeCodec;
+pub static DEFAULT_CODEC: Codec = Codec;
 
-impl BincodeCodec {
-    pub fn encode<T: Serialize>(&self, value: &T) -> anyhow::Result<Vec<u8>> {
-        Ok(bincode::serialize(value)?)
-    }
-
-    pub fn decode<T: DeserializeOwned>(&self, data: &[u8]) -> anyhow::Result<T> {
-        Ok(bincode::deserialize(data)?)
-    }
-}
+pub type RkyvCodec = Codec;

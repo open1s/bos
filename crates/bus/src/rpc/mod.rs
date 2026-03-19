@@ -55,14 +55,14 @@ mod tests {
             match method {
                 "echo" => Ok(payload.to_vec()),
                 "add" => {
-                    let (a, b): (i32, i32) = Codec::default()
+                    let (a, b): (i32, i32) = Codec
                         .decode(payload)
                         .map_err(|e| RpcServiceError::Business {
                             code: 400,
                             message: e.to_string(),
                         })?;
                     let sum = a + b;
-                    Codec::default()
+                    Codec
                         .encode(&sum)
                         .map_err(|e| RpcServiceError::Business {
                             code: 500,
@@ -131,7 +131,7 @@ mod tests {
         sub.init(&session).await.expect("Failed to init subscriber");
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let data = Codec::default()
+        let data = Codec
             .encode(&info)
             .expect("Encode failed");
         let pub_ = session.declare_publisher(&topic).await.unwrap();
@@ -198,14 +198,15 @@ mod tests {
         let mut echo_client = RpcClient::new("test-service", "echo");
         echo_client.init(session.clone()).await.expect("Failed to init echo client");
 
-        let echo_payload: String = "hello".to_string();
+        let echo_payload = Codec.encode(&"hello".to_string()).expect("encode");
         let echo_result: String = echo_client.call(&echo_payload).await.expect("Echo call failed");
         assert_eq!(echo_result, "hello");
 
         let mut add_client = RpcClient::new("test-service", "add");
         add_client.init(session.clone()).await.expect("Failed to init add client");
 
-        let add_payload = (5, 3);
+        let add_payload_tuple = (5, 3);
+        let add_payload = Codec.encode(&add_payload_tuple).expect("encode");
         let add_result: i32 = add_client.call(&add_payload).await.expect("Add call failed");
         assert_eq!(add_result, 8);
     }

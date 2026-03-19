@@ -30,7 +30,7 @@ pub use subscriber::SubscriberWrapper;
 
 pub use zenoh::Session;
 
-pub use codec::{Codec, BincodeCodec, JsonCodec, DEFAULT_CODEC};
+pub use codec::{Codec, RkyvCodec, DEFAULT_CODEC};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ZenohConfig {

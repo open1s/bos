@@ -11,10 +11,10 @@ python-extension = ["pyo3", "pyo3-async-runtimes"]
 zenoh = "1.7.2"
 tokio = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = "1.0"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-bincode = { workspace = true }
+rkyv = { workspace = true }
 async-channel = { workspace = true }
 async-trait = { workspace = true }
 pyo3 = { version = "0.28", optional = true, features = ["extension-module"] }

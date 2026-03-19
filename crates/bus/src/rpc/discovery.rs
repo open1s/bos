@@ -15,7 +15,7 @@ use crate::subscriber::SubscriberWrapper;
 use crate::Session;
 
 /// Discovery information published by RPC services.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct DiscoveryInfo {
 	/// Topic prefix for the service (e.g., "rpc/my-service")
 	pub topic_prefix: String,
@@ -64,7 +64,7 @@ impl RpcDiscovery {
     pub async fn init(&mut self, session: Arc<Session>) -> Result<(), ZenohError> {
         let info = DiscoveryInfo::new(&self.service_name);
         let topic = format!("rpc/services/{}", self.service_name);
-        let data = Codec::default()
+        let data = Codec
             .encode(&info)
             .map_err(|e| ZenohError::Serialization(e.to_string()))?;
 

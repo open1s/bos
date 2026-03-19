@@ -1,32 +1,22 @@
 //! RPC client wrapper
 
+use rkyv::{Archive, Deserialize, api::high::HighDeserializer, rancor::Error};
+
 use std::sync::Arc;
 use std::time::Duration;
 use zenoh::Session;
 
+use crate::codec::Codec;
 use crate::rpc::error::RpcError;
 use crate::rpc::service::RpcRequest;
 use crate::rpc::service::RpcResponseEnvelope;
-use crate::Codec;
 
-/// RPC client for calling remote services.
-///
-/// Uses topic pattern: `rpc/{service}`
-///
-/// # Example
-/// ```rust,ignore
-/// let client = RpcClient::new("calculator".to_string(), "add".to_string())
-///     .timeout(Duration::from_secs(5));
-/// client.init(session).await?;
-/// let result: i32 = client.call(&[1, 2]).await?;
-/// ```
 #[derive(Debug)]
 pub struct RpcClient {
     service: String,
     method: String,
     topic: String,
     session: Option<Arc<Session>>,
-    codec: Codec,
     timeout: Duration,
 }
 
@@ -35,7 +25,6 @@ pub struct RpcClientBuilder {
     service: Option<String>,
     method: Option<String>,
     timeout: Option<Duration>,
-    codec: Option<Codec>,
 }
 
 impl RpcClientBuilder {
@@ -58,11 +47,6 @@ impl RpcClientBuilder {
         self
     }
 
-    pub fn codec(mut self, codec: Codec) -> Self {
-        self.codec = Some(codec);
-        self
-    }
-
     pub fn build(self) -> Result<RpcClient, RpcError> {
         let service = self.service.ok_or_else(|| {
             RpcError::Serialization("RpcClientBuilder: service not set".to_string())
@@ -75,7 +59,6 @@ impl RpcClientBuilder {
             service,
             method,
             session: None,
-            codec: self.codec.unwrap_or_default(),
             timeout: self.timeout.unwrap_or(Duration::from_secs(5)),
         })
     }
@@ -90,18 +73,12 @@ impl RpcClient {
             service,
             method,
             session: None,
-            codec: Codec::default(),
             timeout: Duration::from_secs(5),
         }
     }
 
     pub fn builder() -> RpcClientBuilder {
         RpcClientBuilder::new()
-    }
-
-    pub fn with_codec(mut self, codec: Codec) -> Self {
-        self.codec = codec;
-        self
     }
 
     pub async fn init(&mut self, session: Arc<Session>) -> Result<(), RpcError> {
@@ -117,38 +94,45 @@ impl RpcClient {
         self.session.is_some()
     }
 
-    pub async fn call<T: serde::de::DeserializeOwned>(
+    pub async fn call<T>(
         &self,
-        payload: impl serde::Serialize,
-    ) -> Result<T, RpcError> {
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        payload: &[u8],
+    ) -> Result<T, RpcError>
+    where
+        T: Archive,
+        T::Archived: Deserialize<T, HighDeserializer<Error>>,
+    {
         let req = RpcRequest {
             method: self.method.clone(),
-            payload: payload_bytes,
+            payload: payload.to_vec(),
         };
-        let req_bytes = self.codec.encode(&req)
+        let req_bytes = Codec
+            .encode(&req)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
         let responses = self.call_raw(&req_bytes).await?;
         self.extract_single(responses).await
     }
 
-    pub async fn call_all<T: serde::de::DeserializeOwned>(
+    pub async fn call_all<T>(
         &self,
-        payload: impl serde::Serialize,
-    ) -> Result<Vec<T>, RpcError> {
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        payload: &[u8],
+    ) -> Result<Vec<T>, RpcError>
+    where
+        T: Archive,
+        T::Archived: Deserialize<T, HighDeserializer<Error>>,
+    {
         let req = RpcRequest {
             method: self.method.clone(),
-            payload: payload_bytes,
+            payload: payload.to_vec(),
         };
-        let req_bytes = self.codec.encode(&req)
+        let req_bytes = Codec
+            .encode(&req)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
         let responses = self.call_raw(&req_bytes).await?;
         let mut results = Vec::new();
         for bytes in responses {
-            let envelope: RpcResponseEnvelope = self.codec.decode(&bytes)
+            let envelope: RpcResponseEnvelope = Codec
+                .decode(&bytes)
                 .map_err(|e| RpcError::Serialization(e.to_string()))?;
             if envelope.status == "err" {
                 let err = envelope.err.unwrap();
@@ -160,7 +144,8 @@ impl RpcClient {
             let ok_bytes = envelope.ok.ok_or_else(|| {
                 RpcError::Serialization("Response missing ok data".to_string())
             })?;
-            let result: T = serde_json::from_slice(&ok_bytes)
+            let result: T = Codec
+                .decode(&ok_bytes)
                 .map_err(|e| RpcError::Serialization(e.to_string()))?;
             results.push(result);
         }
@@ -206,10 +191,14 @@ impl RpcClient {
         Ok(results)
     }
 
-    async fn extract_single<T: serde::de::DeserializeOwned>(
+    async fn extract_single<T>(
         &self,
         responses: Vec<Vec<u8>>,
-    ) -> Result<T, RpcError> {
+    ) -> Result<T, RpcError>
+    where
+        T: Archive,
+        T::Archived: Deserialize<T, HighDeserializer<Error>>,
+    {
         if responses.len() > 1 {
             return Err(RpcError::Serialization(format!(
                 "Expected single response but got {} - use call_all() for multiple",
@@ -217,7 +206,8 @@ impl RpcClient {
             )));
         }
         let bytes = responses.into_iter().next().unwrap();
-        let envelope: RpcResponseEnvelope = self.codec.decode(&bytes)
+        let envelope: RpcResponseEnvelope = Codec
+            .decode(&bytes)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
         if envelope.status == "err" {
             let err = envelope.err.unwrap();
@@ -229,7 +219,8 @@ impl RpcClient {
         let ok_bytes = envelope.ok.ok_or_else(|| {
             RpcError::Serialization("Response missing ok data".to_string())
         })?;
-        let result: T = serde_json::from_slice(&ok_bytes)
+        let result: T = Codec
+            .decode(&ok_bytes)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
         Ok(result)
     }
@@ -242,7 +233,6 @@ impl Clone for RpcClient {
             method: self.method.clone(),
             topic: self.topic.clone(),
             session: None,
-            codec: self.codec,
             timeout: self.timeout,
         }
     }

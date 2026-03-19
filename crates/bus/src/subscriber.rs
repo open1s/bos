@@ -1,31 +1,28 @@
 //! Zenoh subscriber wrapper
 
-use std::sync::Arc;
+use rkyv::{Archive, Deserialize, api::high::HighDeserializer, rancor::Error};
 
 use crate::{error::ZenohError, Codec, Session};
-use serde::de::DeserializeOwned;
+use std::sync::Arc;
 use zenoh::sample::Sample;
 
-pub struct SubscriberWrapper<T: DeserializeOwned + Send + Sized + 'static> {
+pub struct SubscriberWrapper<T> {
     topic: String,
     subscriber: Option<zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<Sample>>>,
-    codec: Codec,
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: DeserializeOwned + Send + Sized + 'static> SubscriberWrapper<T> {
+impl<T> SubscriberWrapper<T>
+where
+    T: Archive,
+    T::Archived: Deserialize<T, HighDeserializer<Error>>,
+{
     pub fn new(topic: impl Into<String>) -> Self {
         Self {
             topic: topic.into(),
             subscriber: None,
-            codec: Codec::default(),
             _phantom: std::marker::PhantomData,
         }
-    }
-
-    pub fn with_codec(mut self, codec: Codec) -> Self {
-        self.codec = codec;
-        self
     }
 
     pub async fn init(&mut self, session: &Arc<Session>) -> Result<(), ZenohError> {
@@ -46,7 +43,7 @@ impl<T: DeserializeOwned + Send + Sized + 'static> SubscriberWrapper<T> {
         match result {
             Ok(sample) => {
                 let bytes = sample.payload().to_bytes();
-                self.codec.decode(bytes.as_ref()).ok()
+                Codec.decode(bytes.as_ref()).ok()
             }
             Err(_) => None,
         }
@@ -82,24 +79,19 @@ impl<T: DeserializeOwned + Send + Sized + 'static> SubscriberWrapper<T> {
     ) -> Option<&zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<Sample>>> {
         self.subscriber.as_ref()
     }
-
-    pub fn codec(&self) -> Codec {
-        self.codec
-    }
 }
 
-impl<T: DeserializeOwned + Send + Sized + 'static> Clone for SubscriberWrapper<T> {
+impl<T> Clone for SubscriberWrapper<T> {
     fn clone(&self) -> Self {
         Self {
             topic: self.topic.clone(),
             subscriber: None,
-            codec: self.codec,
             _phantom: self._phantom,
         }
     }
 }
 
-impl<T: DeserializeOwned + Send + Sized + 'static> Drop for SubscriberWrapper<T> {
+impl<T> Drop for SubscriberWrapper<T> {
     fn drop(&mut self) {
         self.subscriber = None;
     }
@@ -125,7 +117,6 @@ mod tests {
     #[tokio::test]
     async fn test_subscriber_recv_timeout_before_init() {
         let mut subscriber: SubscriberWrapper<String> = SubscriberWrapper::new("test/timeout");
-        // Subscriber not initialized, should return None
         let result = subscriber
             .recv_with_timeout(tokio::time::Duration::from_millis(100))
             .await;

@@ -1,12 +1,12 @@
 //! Zenoh publisher wrapper
 
+use rkyv::{Archive, Serialize, ser::{allocator::ArenaHandle, sharing::Share, Serializer}, util::AlignedVec, rancor::{Error, Strategy}};
+
 use crate::{error::ZenohError, Codec, Session};
-use serde::Serialize;
 use std::sync::Arc;
 
 pub struct PublisherWrapper {
     topic: String,
-    codec: Codec,
     session: Option<Arc<Session>>,
 }
 
@@ -14,14 +14,8 @@ impl PublisherWrapper {
     pub fn new(topic: impl Into<String>) -> Self {
         Self {
             topic: topic.into(),
-            codec: Codec::default(),
             session: None,
         }
-    }
-
-    pub fn with_codec(mut self, codec: Codec) -> Self {
-        self.codec = codec;
-        self
     }
 
     pub fn with_session(mut self, session: &Session) -> Self {
@@ -35,10 +29,13 @@ impl PublisherWrapper {
         Ok(wrapper)
     }
 
-    pub async fn publish<T: Serialize>(&self, session: &Session, payload: &T) -> Result<(), ZenohError> {
-        let data: Vec<u8> = self
-            .codec
-            .encode(payload)
+    pub async fn publish<T>(&self, session: &Session, payload: &T) -> Result<(), ZenohError>
+    where
+        T: Archive,
+        for<'a> T: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+    {
+        let codec = Codec;
+        let data: Vec<u8> = codec.encode(payload)
             .map_err(|e: anyhow::Error| ZenohError::Serialization(e.to_string()))?;
 
         let pub_: zenoh::pubsub::Publisher<'_> =
@@ -59,17 +56,12 @@ impl PublisherWrapper {
     pub fn session(&self) -> Option<&Arc<Session>> {
         self.session.as_ref()
     }
-
-    pub fn codec(&self) -> Codec {
-        self.codec
-    }
 }
 
 impl Clone for PublisherWrapper {
     fn clone(&self) -> Self {
         Self {
             topic: self.topic.clone(),
-            codec: self.codec,
             session: None,
         }
     }

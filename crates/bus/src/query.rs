@@ -24,8 +24,12 @@ impl QueryWrapper {
     }
 
     pub async fn query(&self, payload: &str) -> Result<Vec<Vec<u8>>, ZenohError> {
+        self.query_bytes(payload.as_bytes()).await
+    }
+
+    pub async fn query_bytes(&self, payload: &[u8]) -> Result<Vec<Vec<u8>>, ZenohError> {
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
-        self.query_internal(session, payload, None).await
+        self.query_internal_bytes(session, payload, None).await
     }
 
     pub async fn query_with_timeout(
@@ -33,14 +37,22 @@ impl QueryWrapper {
         payload: &str,
         timeout: std::time::Duration,
     ) -> Result<Vec<Vec<u8>>, ZenohError> {
-        let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
-        self.query_internal(session, payload, Some(timeout)).await
+        self.query_bytes_with_timeout(payload.as_bytes(), timeout).await
     }
 
-    async fn query_internal(
+    pub async fn query_bytes_with_timeout(
+        &self,
+        payload: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<Vec<Vec<u8>>, ZenohError> {
+        let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
+        self.query_internal_bytes(session, payload, Some(timeout)).await
+    }
+
+    async fn query_internal_bytes(
         &self,
         session: &Arc<Session>,
-        payload: &str,
+        payload: &[u8],
         timeout: Option<std::time::Duration>,
     ) -> Result<Vec<Vec<u8>>, ZenohError> {
         let replies = match timeout {
@@ -78,7 +90,7 @@ impl QueryWrapper {
 
     pub async fn stream_reply<T>(
         &self,
-        payload: &str,
+        payload: &[u8],
         mut handler: impl FnMut(Vec<u8>) -> anyhow::Result<T>,
     ) -> Result<Vec<T>, ZenohError> {
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
@@ -182,15 +194,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_query_wrapper_integration() {
+        use crate::codec::Codec;
         use crate::QueryableWrapper;
-        use serde::{Deserialize, Serialize};
 
-        #[derive(Debug, Serialize, Deserialize)]
+        #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
         struct TestQuery {
             query: String,
         }
 
-        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq)]
         struct TestResponse {
             result: String,
         }
@@ -223,13 +235,14 @@ mod tests {
             .await
             .expect("Failed to init querier");
 
-        let payload = r#"{"query": "test"}"#;
-        let results = wrapper.query(payload).await.expect("Query failed");
+        let query = TestQuery { query: "test".to_string() };
+        let payload_bytes = Codec.encode(&query).expect("Encode query failed");
+        let results = wrapper.query_bytes(&payload_bytes).await.expect("Query failed");
 
         assert_eq!(results.len(), 1, "Expected exactly one response");
 
         let response: TestResponse =
-            serde_json::from_slice(&results[0]).expect("Failed to deserialize response");
+            Codec.decode(&results[0]).expect("Decode response failed");
 
         assert_eq!(response.result, "TEST");
     }

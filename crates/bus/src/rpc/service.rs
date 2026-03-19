@@ -3,34 +3,32 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+
 use zenoh::Session;
 
+use crate::codec::Codec;
 use crate::queryable::QueryableWrapper;
 use crate::rpc::error::RpcServiceError;
-use crate::Codec;
 
 #[async_trait]
 pub trait RpcHandler: Send + Sync {
     async fn handle(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RpcServiceError>;
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RpcRequest {
     pub method: String,
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RpcResponseEnvelope {
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub ok: Option<Vec<u8>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub err: Option<RpcErrBody>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RpcErrBody {
     pub code: u32,
     pub message: String,
@@ -40,7 +38,6 @@ pub struct RpcErrBody {
 pub struct RpcServiceBuilder {
     service_name: Option<String>,
     topic_prefix: Option<String>,
-    codec: Option<Codec>,
 }
 
 impl RpcServiceBuilder {
@@ -58,11 +55,6 @@ impl RpcServiceBuilder {
         self
     }
 
-    pub fn codec(mut self, codec: Codec) -> Self {
-        self.codec = Some(codec);
-        self
-    }
-
     pub fn build(self) -> Result<RpcServiceUninit, RpcServiceError> {
         let service_name = self.service_name.ok_or_else(|| {
             RpcServiceError::Internal("RpcServiceBuilder: service_name not set".to_string())
@@ -73,16 +65,12 @@ impl RpcServiceBuilder {
             None => format!("rpc/{}", service_name),
         };
 
-        Ok(RpcServiceUninit {
-            topic,
-            codec: self.codec.unwrap_or_default(),
-        })
+        Ok(RpcServiceUninit { topic })
     }
 }
 
 pub struct RpcServiceUninit {
     topic: String,
-    codec: Codec,
 }
 
 impl RpcServiceUninit {
@@ -99,11 +87,9 @@ impl RpcServiceUninit {
         H: RpcHandler + 'static,
     {
         let topic = self.topic.clone();
-        let codec = self.codec;
         let handler = Arc::new(handler);
 
         let mut wrapper = QueryableWrapper::<RpcRequest, RpcResponseEnvelope>::new(&topic)
-            .with_codec(codec)
             .with_handler(move |req: RpcRequest| {
                 let handler = handler.clone();
                 async move {
@@ -168,27 +154,17 @@ impl RpcService {
             .map_err(|e| RpcServiceError::Internal(e.to_string()))
     }
 
-    /// Publish service discovery info to `rpc/services/{service_name}`.
-    /// Call this after init() to announce the service for discovery.
     pub async fn announce(&self) -> Result<(), crate::error::ZenohError> {
         let session = self.session.as_ref().ok_or(crate::error::ZenohError::NotConnected)?;
         let service_name = self.topic.trim_start_matches("rpc/");
         let info = crate::rpc::discovery::DiscoveryInfo::new(service_name);
-        let topic = format!("rpc/services/{}", service_name);
-        let data = self
-            .wrapper
-            .codec()
+        let data = Codec
             .encode(&info)
             .map_err(|e| crate::error::ZenohError::Serialization(e.to_string()))?;
 
-        session
-            .declare_publisher(&topic)
-            .await?
-            .put(data)
-            .await
-            .map_err(|e| crate::error::ZenohError::Publisher(e.to_string()))?;
-
-        Ok(())
+        let topic = format!("rpc/services/{}", service_name);
+        let pub_ = session.declare_publisher(&topic).await?;
+        pub_.put(data).await.map_err(crate::error::ZenohError::from)
     }
 
     pub fn into_task(
@@ -273,10 +249,15 @@ mod tests {
     }
 
     #[test]
-    fn test_rpc_request_deserialize() {
-        let json = r#"{"method":"add","payload":[1,2,3]}"#;
-        let req: RpcRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.method, "add");
-        assert_eq!(req.payload, vec![1, 2, 3]);
+    fn test_rpc_request_rkyv() {
+        let codec = Codec;
+        let req = RpcRequest {
+            method: "add".to_string(),
+            payload: vec![1, 2, 3],
+        };
+        let bytes = codec.encode(&req).unwrap();
+        let decoded: RpcRequest = codec.decode(&bytes).unwrap();
+        assert_eq!(decoded.method, "add");
+        assert_eq!(decoded.payload, vec![1, 2, 3]);
     }
 }

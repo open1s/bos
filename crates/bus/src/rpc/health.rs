@@ -14,7 +14,7 @@ use crate::error::ZenohError;
 use crate::subscriber::SubscriberWrapper;
 
 /// Health status of a service.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct HealthStatus {
     /// Name of the service.
     pub service_name: String,
@@ -27,7 +27,7 @@ pub struct HealthStatus {
 }
 
 /// Possible service states.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ServiceState {
     /// Service is healthy and responding.
     Online,
@@ -103,7 +103,7 @@ impl HealthPublisher {
                         .as_secs(),
                 };
 
-                let data = match Codec::default().encode(&status) {
+                let data = match Codec.encode(&status) {
                     Ok(d) => d,
                     Err(_) => continue,
                 };
