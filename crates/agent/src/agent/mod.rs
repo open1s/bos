@@ -1,11 +1,15 @@
 //! Core agent types: Message, MessageLog, Agent, AgentConfig.
 
+use std::pin::Pin;
 use std::sync::Arc;
+
+use futures::Stream;
+use futures::StreamExt;
 
 pub mod config;
 
 use crate::error::AgentError;
-use crate::llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage};
+use crate::llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
 use crate::tools::ToolRegistry;
 
 /// A message in the conversation history.
@@ -107,6 +111,10 @@ impl Agent {
         }
     }
 
+    pub fn message_log(&self) -> &MessageLog {
+        &self.message_log
+    }
+
     /// Run agent on a task (no tools).
     pub async fn run(&mut self, task: &str) -> Result<String, AgentError> {
         self.message_log.add_user(task.to_string());
@@ -125,6 +133,99 @@ impl Agent {
     ) -> Result<AgentOutput, AgentError> {
         self.message_log.add_user(task.to_string());
         self.run_loop(Some(tools)).await
+    }
+
+    /// Stream agent execution on a task (no tools).
+    /// Returns a stream of tokens as they arrive.
+    pub fn stream_run(
+        &mut self,
+        task: &str,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send>> {
+        self.message_log.add_user(task.to_string());
+        self.stream_loop(None)
+    }
+
+    /// Run agent on a task with tools available, streaming results.
+    pub fn run_streaming_with_tools(
+        &mut self,
+        task: &str,
+        tools: Arc<ToolRegistry>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send>> {
+        self.message_log.add_user(task.to_string());
+        self.stream_loop(Some(tools))
+    }
+
+    /// Internal streaming loop - handles token streaming with optional tools.
+    fn stream_loop(
+        &mut self,
+        tools: Option<Arc<ToolRegistry>>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+
+        let config = self.config.clone();
+        let messages = self.message_log.clone();
+        let llm = self.llm.clone();
+
+        tokio::spawn(async move {
+            let mut messages = messages;
+
+let mut request_messages = vec![OpenAiMessage::System {
+            content: config.system_prompt.clone(),
+        }];
+        request_messages.extend(messages.to_api_format());
+
+        let tools_for_request = tools.as_ref().map(|t| t.to_openai_format());
+
+        let request = LlmRequest {
+            model: config.model.clone(),
+            messages: request_messages,
+            tools: tools_for_request,
+            temperature: config.temperature,
+            max_tokens: config.max_tokens,
+        };
+
+            let stream = llm.stream_complete(request);
+
+            // Pin the stream to use it in a loop
+            let mut stream = Box::pin(stream);
+
+            while let Some(token_result) = stream.next().await {
+                match token_result {
+                    Ok(token) => {
+                        // Track message accumulation
+                        match &token {
+                            StreamToken::Text(s) => {
+                                messages.add_assistant(s.clone());
+                            }
+                            StreamToken::ToolCall { name, args } => {
+                                if let Some(ref registry) = tools {
+                                    let result = registry.execute(name, args.clone()).await;
+                                    match result {
+                                        Ok(res) => {
+                                            messages.add_tool_result(name.clone(), res.to_string());
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(Err(AgentError::Tool(e))).await;
+                                        }
+                                    }
+                                }
+                            }
+                            StreamToken::Done => {}
+                        }
+
+                        if tx.send(Ok(token)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(AgentError::Session(e.to_string()))).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 
     async fn run_loop(

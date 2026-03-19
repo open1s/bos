@@ -9,7 +9,27 @@ use crate::error::AgentError;
 use crate::llm::OpenAiClient;
 use crate::tools::{Tool, ToolRegistry};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct TomlToolRef {
+    pub name: String,
+    pub description: Option<String>,
+    pub schema: Option<serde_json::Value>,
+}
+
+impl TomlToolRef {
+    pub fn to_openai_tool(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description.clone().unwrap_or_default(),
+                "parameters": self.schema.clone().unwrap_or(serde_json::json!({"type": "object", "properties": {}}))
+            }
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct TomlAgentConfig {
     pub name: String,
     pub model: String,
@@ -22,6 +42,8 @@ pub struct TomlAgentConfig {
     pub max_tokens: Option<u32>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub tools: Option<Vec<TomlToolRef>>,
 }
 
 fn default_system_prompt() -> String {
@@ -77,14 +99,25 @@ impl AgentBuilder {
         self
     }
 
+    pub fn config_tools(&self) -> Option<Vec<serde_json::Value>> {
+        self.config.tools.as_ref().map(|tools| {
+            tools.iter().map(|t| t.to_openai_tool()).collect()
+        })
+    }
+
     pub async fn build(self, session: Option<Arc<ZenohSession>>) -> Result<Agent, AgentError> {
         let llm = Arc::new(OpenAiClient::new(
             self.config.base_url.clone(),
             self.config.api_key.clone(),
         ));
-        let agent = Agent::new(self.config.into(), llm);
 
-        let registry = ToolRegistry::new();
+        let config: AgentConfig = self.config.clone().into();
+        let agent = Agent::new(config, llm);
+
+        let mut registry = ToolRegistry::new();
+        for tool in self.tools {
+            registry.register(tool)?;
+        }
 
         if let Some(_session) = session {
             // TODO: register bus tools when session provided

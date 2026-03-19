@@ -13,6 +13,7 @@ pub mod a2a;
 
 pub use error::{AgentError, LlmError, ToolError};
 pub use agent::{Agent, AgentConfig, AgentOutput, Message, MessageLog};
+pub use agent::config::TomlToolRef;
 pub use agent::config::{AgentBuilder, TomlAgentConfig};
 pub use llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, OpenAiClient, StreamToken};
 pub use tools::{Tool, ToolDescription, ToolRegistry};
