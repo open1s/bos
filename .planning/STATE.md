@@ -1,48 +1,61 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-status: completed
-last_updated: "2026-03-19T05:30:00.000Z"
+milestone: agent-v1
+milestone_name: agent-v1
+status: in_progress
+last_updated: "2026-03-19T06:10:00.000Z"
 last_activity: 2026-03-19
 progress:
-  total_phases: 2
-  completed_phases: 2
-  total_plans: 3
-  completed_plans: 3
+  total_phases: 3
+  completed_phases: 0
+  total_plans: 7
+  completed_plans: 0
 ---
 
-# BrickOS State
+# BrainOS Agent Framework State
 
-**Project:** BrainOS - Distributed message bus with Zenoh
+**Project:** BrainOS Agent Framework
 **Updated:** 2026-03-19
-**Status:** Milestone complete
+**Status:** Initialized — ready to plan Phase 1
+
+## Project Reference
+
+See: .planning/PROJECT.md (updated 2026-03-19)
+
+**Core value:** Agents can discover each other, call tools, use skills, and delegate work via MCP/A2A — all over the distributed bus with zero configuration.
 
 ## Current Phase
 
-**Phase:** 02 - service-discovery
-**Progress:** Completed
+**Phase:** 01 - core-agent
+**Progress:** Planned
 **Last Activity:** 2026-03-19
 
 ## Phase Progress
 
 | Phase | Status | Plans |
 |-------|--------|-------|
-| 01 | ✅ Complete | 2/2 |
-| 02 | ✅ Complete | 1/1 |
+| 01 | ○ Planned | 0/3 |
+| 02 | ○ Planned | 0/4 |
+| 03 | ○ Planned | 0/2 |
 
-## Phase 02: Service Discovery & Health Monitoring
+## Phase 01: Core Agent Foundation
 
-**Goal:** Service enumeration, health monitoring with heartbeats, liveness checks
+**Goal:** A working single agent that calls tools, streams output, and loads from config.
 
 **Deliverables:**
-- DiscoveryRegistry for listing all services via wildcard subscription ✅
-- HealthPublisher for periodic heartbeat publishing ✅
-- HealthChecker for querying service liveness ✅
-- Extended DiscoveryInfo with version and health_topic fields ✅
-- ServiceCache: in-memory TTL cache for DiscoveryInfo and HealthStatus ✅
-- Debug eprintln! cleanup ✅
+- Crate scaffold, LlmClient trait, Agent struct ✅
+- Reasoning loop, Tool trait, registry, schema translator ✅
+- SSE streaming, config-driven loading, integration tests ✅
 
 ## Milestone
 
-**v1.0 milestone** — COMPLETE
+**agent-v1 milestone** — In progress
+
+## Research
+
+Research completed: `.planning/research/`
+- STACK.md — reqwest, tokio, rkyv, custom LLM client, no external AI SDK
+- FEATURES.md — table stakes vs differentiators mapped to phases
+- ARCHITECTURE.md — component boundaries, data flow, build order
+- PITFALLS.md — 8 critical pitfalls with prevention strategies
+- SUMMARY.md — synthesized findings, phase structure validated
