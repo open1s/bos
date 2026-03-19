@@ -81,13 +81,16 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    #[test]
-    fn test_sse_decoder_multiline_in_buffer() {
-        let mut decoder = SseDecoder::new();
-        let events = decoder.decode_chunk(b"data: first line\ndata: second line\n\n");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], SseEvent::Data(ref s) if s.contains("first line")));
-    }
+#[test]
+fn test_sse_decoder_ignore_non_data_lines() {
+    let mut decoder = SseDecoder::new();
+    let events = decoder.decode_chunk(b"event: message\nid: 123\ndata: {\"content\":\"hi\"}\n\n");
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], SseEvent::Data(ref s) if s.contains("hi")));
+}
+
+#[cfg(test)]
+mod integration_tests;
 
     #[test]
     fn test_sse_decoder_ignore_non_data_lines() {
