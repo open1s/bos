@@ -14,11 +14,11 @@
 
 ### Tool System
 
-- [ ] **TOOL-01**: Tool trait — `name()`, `description()`, `json_schema()`, `execute()` — sync and async variants
-- [ ] **TOOL-02**: Tool registry — register, lookup, list tools; handles duplicate registration
-- [ ] **TOOL-03**: Schema translator — convert tool JSON Schema to OpenAI format and Anthropic format
-- [ ] **TOOL-04**: Tool error recovery — validation failures return clear errors to LLM, not silent failures
-- [ ] **TOOL-05**: Bus tool execution — tools registered locally but callable over the bus via RpcClient (transparent to agent)
+- [x] **TOOL-01**: Tool trait — `name()`, `description()`, `json_schema()`, `execute()` — sync and async variants
+- [x] **TOOL-02**: Tool registry — register, lookup, list tools; handles duplicate registration
+- [x] **TOOL-03**: Schema translator — convert tool JSON Schema to OpenAI format and Anthropic format
+- [x] **TOOL-04**: Tool error recovery — validation failures return clear errors to LLM, not silent failures
+- [x] **TOOL-05**: Bus tool execution — tools registered locally but callable over the bus via RpcClient (transparent to agent)
 
 ### Streaming
 
@@ -92,11 +92,11 @@
 | CORE-02 | Phase 1 | Pending |
 | CORE-03 | Phase 1 | Pending |
 | CORE-04 | Phase 1 | Pending |
-| TOOL-01 | Phase 1 | Pending |
-| TOOL-02 | Phase 1 | Pending |
-| TOOL-03 | Phase 1 | Pending |
-| TOOL-04 | Phase 1 | Pending |
-| TOOL-05 | Phase 1 | Pending |
+| TOOL-01 | Phase 1 | Complete |
+| TOOL-02 | Phase 1 | Complete |
+| TOOL-03 | Phase 1 | Complete |
+| TOOL-04 | Phase 1 | Complete |
+| TOOL-05 | Phase 1 | Complete |
 | STRM-01 | Phase 1 | Pending |
 | STRM-02 | Phase 2 | Pending |
 | STRM-03 | Phase 2 | Pending |
