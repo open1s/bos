@@ -37,9 +37,9 @@
 **Status:** Planned
 
 Plans:
-- [ ] 01-01-PLAN.md — Crate scaffold, LlmClient trait, Agent struct, reasoning loop
-- [ ] 01-02-PLAN.md — Tool trait, registry, schema translator, error recovery
-- [ ] 01-03-PLAN.md — SSE streaming, config-driven loading, integration tests
+- [x] 01-01-PLAN.md — LlmClient, Agent Core & Reasoning Loop ✅
+- [x] 01-02-PLAN.md — Tool trait, registry, schema translator, error recovery ✅
+- [x] 01-03-PLAN.md — SSE streaming, config-driven loading, integration tests ✅
 
 ---
 
