@@ -10,6 +10,8 @@ progress:
   completed_phases: 0
   total_plans: 7
   completed_plans: 0
+  current_phase: "01-core-agent"
+  current_phase_context: ".planning/phases/01-core-agent/01-CONTEXT.md"
 ---
 
 # BrainOS Agent Framework State
