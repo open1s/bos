@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-last_updated: "2026-03-20T11:41:10.751Z"
+last_updated: "2026-03-20T12:00:00.000Z"
 progress:
   total_phases: 5
   completed_phases: 5
@@ -23,7 +23,9 @@ progress:
 |-------|--------|-------|
 | 01 | ● Complete | 3/3 |
 | 02 | ● Complete | 3/3 |
-| 03 | ○ Planned | 0/2 |
+| 03 | ● Complete | 2/2 |
+| 04 | ○ Planned | 0/0 |
+| 05 | ○ Planned | 0/0 |
 
 ## Phase 01: Core Agent Foundation ✅ (Complete)
 
@@ -57,7 +59,7 @@ progress:
 
 **Tests:** 41 tests pass, clean build with 2 warnings
 
-## Phase 02: Agent Protocols ✅
+## Phase 02: Agent Protocols ✅ (Complete)
 
 **Goal:** Enable multi-agent communication and skill system.
 
@@ -79,3 +81,26 @@ progress:
 - `crates/agent/src/skills/loader.rs` — SkillLoader with lazy discovery
 - `crates/agent/src/skills/injector.rs` — SkillInjector for context injection
 - **30 tests pass**, clean build with 0 errors
+
+## Phase 03: Orchestration & Persistence ✅ (Complete)
+
+**Goal:** Multi-agent workflows and durable agent sessions.
+
+**Plan 03-01: Scheduler - Workflow Execution Engine** ✅
+
+- `crates/agent/src/scheduler/mod.rs` — Core types (Workflow, Step, BackoffStrategy, StepType)
+- `crates/agent/src/scheduler/dsl.rs` — WorkflowBuilder and StepBuilder fluent APIs
+- `crates/agent/src/scheduler/retry.rs` — Backoff calculation and retry logic
+- `crates/agent/src/scheduler/executor.rs` — Scheduler for workflow execution
+- **Summary:** `.planning/phases/03-orchestration-persistence/03-01-SUMMARY.md`
+
+**Plan 03-02: Session Persistence** ✅
+
+- `crates/agent/src/session/mod.rs` — Core types (AgentState, SessionMetadata, SessionError)
+- `crates/agent/src/session/serializer.rs` — JSON serialize/deserialize, compression
+- `crates/agent/src/session/storage.rs` — Async disk I/O layer
+- `crates/agent/src/session/manager.rs` — Session manager with cache and cleanup
+- `crates/agent/src/agent/mod.rs` — save_state(), restore_state(), auto_save()
+- **Summary:** `.planning/phases/03-orchestration-persistence/03-02-SUMMARY.md`
+
+**Tests:** 51 tests pass (6 session tests + scheduler tests), clean build with warnings only
