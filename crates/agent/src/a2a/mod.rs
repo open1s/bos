@@ -13,6 +13,6 @@ pub mod topics;
 
 pub use envelope::{A2AMessage, A2AContent, AgentIdentity};
 pub use task::{Task, TaskState, TaskStatus};
-pub use discovery::{AgentCard, AgentStatus, Capability, A2ADiscovery};
+pub use discovery::{AgentCard, AgentStatus, Capability, Endpoint, A2ADiscovery};
 pub use client::A2AClient;
 pub use idempotency::{IdempotencyStore, ProcessedResult};

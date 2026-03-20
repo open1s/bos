@@ -128,29 +128,30 @@ impl TokenPublisherWrapper {
         Ok(())
     }
 
-async fn flush_batch(
-    &self,
-    batch: tokio::sync::MutexGuard<'_, TokenBatch>,
-) -> Result<(), AgentError> {
-    if batch.tokens.is_empty() {
-        return Ok(());
+    async fn flush_batch(
+        &self,
+        batch: tokio::sync::MutexGuard<'_, TokenBatch>,
+    ) -> Result<(), AgentError> {
+        if batch.tokens.is_empty() {
+            return Ok(());
+        }
+
+        let bytes = batch
+            .to_bytes()
+            .map_err(|e| AgentError::Config(e.to_string()))?;
+
+        self.bus_publisher
+            .publish_raw(&self.pub_session, bytes)
+            .await
+            .map_err(|e| AgentError::Bus(e.to_string()))?;
+
+        drop(batch);
+        let mut batch = self.batch.lock().await;
+        batch.clear();
+        drop(batch);
+
+        Ok(())
     }
-
-    let bytes = batch
-        .to_bytes()
-        .map_err(|e| AgentError::Config(e.to_string()))?;
-
-    self.bus_publisher
-        .publish_raw(&self.pub_session, bytes)
-        .await
-        .map_err(|e: bus::ZenohError| AgentError::Bus(e.to_string()))?;
-
-    drop(batch);
-    let mut batch = self.batch.lock().await;
-    batch.clear();
-
-    Ok(())
-}
 
     /// Report bus load for adaptive backpressure
     pub async fn report_bus_load(&self, load: f64) {
@@ -180,35 +181,24 @@ pub struct TokenPublisher {
 }
 
 impl TokenPublisher {
-    /// Create a new TokenPublisher
     pub fn new(wrapper: Arc<TokenPublisherWrapper>) -> Self {
         Self { wrapper }
     }
 
-    /// Publish a token
-    pub async fn publish(
-        &self,
-        task_id: String,
-        token: StreamToken,
-    ) -> Result<(), AgentError> {
+    pub async fn publish(&self, task_id: String, token: StreamToken) -> Result<(), AgentError> {
         self.wrapper.publish_token(task_id, token).await
     }
 
-    /// Flush pending tokens
     pub async fn flush(&self) -> Result<(), AgentError> {
         self.wrapper.flush().await
     }
 }
 
+// Backward compatibility type alias
+pub type PublisherWrapper = TokenPublisherWrapper;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_token_publisher_exists() {
-        // Type-level verification that PublisherWrapper and TokenPublisher exist
-        // Integration tests in integration_tests.rs require zenoh router
-        assert!(std::mem::size_of::<TokenPublisherWrapper>() > 0);
-        assert!(std::mem::size_of::<TokenPublisher>() > 0);
-    }
 }

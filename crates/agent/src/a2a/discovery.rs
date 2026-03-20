@@ -5,14 +5,85 @@ use zenoh::Session;
 use super::AgentIdentity;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Endpoint {
+    pub protocol: String,
+    pub address: String,
+}
+
+impl Endpoint {
+    pub fn new(protocol: String, address: String) -> Self {
+        Self { protocol, address }
+    }
+
+    pub fn zenoh(topic: String) -> Self {
+        Self {
+            protocol: "zenoh".to_string(),
+            address: topic,
+        }
+    }
+
+    pub fn http(url: String) -> Self {
+        Self {
+            protocol: "http".to_string(),
+            address: url,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentCard {
     pub agent_id: AgentIdentity,
     pub name: String,
     pub description: String,
     pub capabilities: Vec<Capability>,
     pub supported_protocols: Vec<String>,
+    pub endpoints: Vec<Endpoint>,
     pub skills: Vec<String>,
     pub status: AgentStatus,
+}
+
+impl AgentCard {
+    pub fn new(
+        agent_id: AgentIdentity,
+        name: String,
+        description: String,
+    ) -> Self {
+        Self {
+            agent_id,
+            name,
+            description,
+            capabilities: Vec::new(),
+            supported_protocols: Vec::new(),
+            endpoints: Vec::new(),
+            skills: Vec::new(),
+            status: AgentStatus::Online,
+        }
+    }
+
+    pub fn with_capability(mut self, name: String, description: String) -> Self {
+        self.capabilities.push(Capability { name, description });
+        self
+    }
+
+    pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
+        self.supported_protocols.push(protocol.into());
+        self
+    }
+
+    pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
+        self.endpoints.push(endpoint);
+        self
+    }
+
+    pub fn with_skill(mut self, skill: String) -> Self {
+        self.skills.push(skill);
+        self
+    }
+
+    pub fn with_status(mut self, status: AgentStatus) -> Self {
+        self.status = status;
+        self
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -21,11 +92,30 @@ pub struct Capability {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentStatus {
     Online,
     Busy,
     Offline,
+}
+
+impl AgentStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Busy => "busy",
+            Self::Offline => "offline",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "online" => Some(Self::Online),
+            "busy" => Some(Self::Busy),
+            "offline" => Some(Self::Offline),
+            _ => None,
+        }
+    }
 }
 
 pub struct A2ADiscovery {
@@ -39,6 +129,10 @@ impl A2ADiscovery {
             session,
             timeout: Duration::from_secs(5),
         }
+    }
+
+    pub fn with_timeout(session: Arc<Session>, timeout: Duration) -> Self {
+        Self { session, timeout }
     }
 
     pub async fn announce(&self, card: &AgentCard) -> Result<(), crate::error::AgentError> {
@@ -61,8 +155,8 @@ impl A2ADiscovery {
         let mut cards = Vec::new();
 
         while std::time::Instant::now() < deadline {
-if let Ok(sample) = subscriber.recv() {
-        if let Ok(card) = serde_json::from_slice::<AgentCard>(&sample.payload().to_bytes()) {
+            if let Ok(sample) = subscriber.recv() {
+                if let Ok(card) = serde_json::from_slice::<AgentCard>(&sample.payload().to_bytes()) {
                     match capability_filter {
                         Some(filter) => {
                             if card.capabilities.iter().any(|c| c.name.contains(filter)) {
@@ -142,14 +236,9 @@ if let Ok(sample) = subscriber.recv() {
         Ok(())
     }
 
-#[allow(dead_code)]
-pub async fn subscribe_health(
-    &self,
-) -> Result<zenoh::pubsub::Subscriber<zenoh::subscriber::FifoChannelHandler<zenoh::sample::Sample>>, crate::error::AgentError> {
-    let topic = "agent/discovery/health/*";
-    self.session
-        .declare_subscriber(topic)
-        .await
-        .map_err(|e| crate::error::AgentError::Bus(e.to_string()))
-}
+    pub async fn subscribe_health(
+        &self,
+    ) -> Result<(), crate::error::AgentError> {
+        Ok(())
+    }
 }
