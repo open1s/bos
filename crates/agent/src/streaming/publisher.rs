@@ -197,8 +197,3 @@ impl TokenPublisher {
 // Backward compatibility type alias
 pub type PublisherWrapper = TokenPublisherWrapper;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-}

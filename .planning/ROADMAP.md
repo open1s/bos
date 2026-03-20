@@ -69,20 +69,20 @@ Plans:
 4. Task delegation tracks state and times out properly
 5. Streaming tokens reach bus subscribers without flooding the network
 
-**Status:** Planned
+**Status:** Complete
 
-**Plans:** 8/8 plans complete
+Plans: 8/8 plans complete
 
 Original Plans:
-- [x] 02-01-PLAN.md — A2A protocol: envelope, state machine, discovery, delegation
-- [x] 02-02-PLAN.md — MCP bridge: STDIO client, tool adapter, bus integration
-- [x] 02-03-PLAN.md — Skills system: definition schema, registry, composer, namespacing
-- [x] 02-04-PLAN.md — Streaming over bus, backpressure, integration tests
+- [x] 02-01-PLAN.md — A2A protocol: envelope, state machine, discovery, delegation ✅
+- [x] 02-02-PLAN.md — MCP bridge: STDIO client, tool adapter, bus integration ✅
+- [x] 02-03-PLAN.md — Skills system: definition schema, registry, composer, namespacing ✅
+- [x] 02-04-PLAN.md — Streaming over bus, backpressure, integration tests ✅
 
 Gap Closure Plans:
-- [ ] 02-05-PLAN.md — Expand A2A stubs (envelope, task, discovery to line requirements)
+- [x] 02-05-PLAN.md — Expand A2A stubs (envelope, task, discovery to line requirements) ✅
 - [x] 02-06-PLAN.md — Expand Skills module (metadata, injector, mod, loader to line requirements) ✅
-- [ ] 02-07-PLAN.md — Fix topic paths and use bus crate wrapper
+- [x] 02-07-PLAN.md — Fix topic paths and use bus crate wrapper ✅
 - [x] 02-08-PLAN.md — Fix requirements mapping (PROTO-* → A2A-*/MCP-*/SKIL-*/STRM-*) ✅
 
 ---
@@ -108,11 +108,11 @@ Gap Closure Plans:
 3. Agent session survives restart — same agent_id restores message history
 4. Session list shows available sessions with metadata
 
-**Status:** Planned
+**Status:** Ready
 
 Plans:
-- [ ] 03-01-PLAN.md — Scheduler: workflow DSL, sequential/parallel/conditional execution
-- [ ] 03-02-PLAN.md — Session persistence: state serialization, save/restore/manage
+- [x] 03-01-PLAN.md — Scheduler: workflow DSL, sequential/parallel/conditional execution ✅
+- [x] 03-02-PLAN.md — Session persistence: state serialization, save/restore/manage ✅
 
 ---
 
