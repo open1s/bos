@@ -141,4 +141,14 @@ if let Ok(sample) = subscriber.recv() {
             .map_err(|e| crate::error::AgentError::Bus(e.to_string()))?;
         Ok(())
     }
+
+pub async fn subscribe_health(
+    &self,
+) -> crate::error::AgentResult<zenoh::pubsub::Subscriber<zenoh::subscriber::FlumeSubscriber>> {
+    let topic = "agent/discovery/health/*";
+    self.session
+        .declare_subscriber(topic)
+        .await
+        .map_err(|e| crate::error::AgentError::Bus(e.to_string()))
+}
 }

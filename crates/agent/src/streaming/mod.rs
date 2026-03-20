@@ -8,7 +8,10 @@ pub mod publisher;
 pub mod backpressure;
 
 // Re-exports from new modules
-pub use publisher::{PublisherWrapper, TokenPublisher};
+pub use publisher::{TokenPublisherWrapper, TokenPublisher};
+
+// Backward compatibility alias
+pub type PublisherWrapper = TokenPublisherWrapper;
 pub use backpressure::{
     TokenBatch, SerializedToken, TokenType, RateLimiter, BackpressureController,
 };

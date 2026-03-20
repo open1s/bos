@@ -1,6 +1,6 @@
 //! Token publisher for streaming over Zenoh bus.
 //!
-//! This module provides `PublisherWrapper` and `TokenPublisher` for
+//! This module provides `TokenPublisherWrapper` and `TokenPublisher` for
 //! publishing LLM tokens to subscribers over the Zenoh bus with
 //! batching and backpressure support.
 
@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use zenoh::Session;
 
+use bus::PublisherWrapper as BusPublisher;
+
 use super::backpressure::{
     BackpressureController, TokenBatch, SerializedToken, TokenType,
 };
@@ -16,16 +18,17 @@ use crate::llm::StreamToken;
 use crate::error::AgentError;
 
 /// Wrapper around Zenoh publisher with batching and backpressure
-pub struct PublisherWrapper {
-    session: Arc<Session>,
+pub struct TokenPublisherWrapper {
+    pub_session: Arc<Session>,
+    bus_publisher: BusPublisher,
     backpressure: Mutex<BackpressureController>,
     batch: Mutex<TokenBatch>,
     topic_prefix: String,
     agent_id: String,
 }
 
-impl PublisherWrapper {
-    /// Create a new PublisherWrapper
+impl TokenPublisherWrapper {
+    /// Create a new TokenPublisherWrapper
     ///
     /// Default config: 10 tokens/batch, 50ms timeout, 100 tokens/sec rate
     pub fn new(
@@ -35,13 +38,17 @@ impl PublisherWrapper {
     ) -> Self {
         let backpressure = Mutex::new(BackpressureController::new(
             100.0, // tokens_per_second
-            10,    // max_batch_size
-            50,    // max_batch_tokens
+            10, // max_batch_size
+            50, // max_batch_tokens
             Duration::from_millis(50), // batch_timeout
         ));
 
+        let bus_publisher = BusPublisher::new(format!("{}/{}/tokens/stream", topic_prefix, agent_id))
+            .with_session(&session);
+
         Self {
-            session,
+            pub_session: session,
+            bus_publisher,
             backpressure,
             batch: Mutex::new(TokenBatch::new()),
             topic_prefix,
@@ -121,32 +128,29 @@ impl PublisherWrapper {
         Ok(())
     }
 
-    async fn flush_batch(
-        &self,
-        batch: tokio::sync::MutexGuard<'_, TokenBatch>,
-    ) -> Result<(), AgentError> {
-        let topic = format!("{}/{}/tokens/stream", self.topic_prefix, self.agent_id);
-        let bytes = batch
-            .to_bytes()
-            .map_err(|e| AgentError::Config(e.to_string()))?;
-
-        let publisher = self
-            .session
-            .declare_publisher(&topic)
-            .await
-            .map_err(|e| AgentError::Bus(e.to_string()))?;
-
-        publisher
-            .put(bytes)
-            .await
-            .map_err(|e| AgentError::Bus(e.to_string()))?;
-
-        drop(batch);
-        let mut batch = self.batch.lock().await;
-        batch.clear();
-
-        Ok(())
+async fn flush_batch(
+    &self,
+    batch: tokio::sync::MutexGuard<'_, TokenBatch>,
+) -> Result<(), AgentError> {
+    if batch.tokens.is_empty() {
+        return Ok(());
     }
+
+    let bytes = batch
+        .to_bytes()
+        .map_err(|e| AgentError::Config(e.to_string()))?;
+
+    self.bus_publisher
+        .publish_raw(&self.pub_session, bytes)
+        .await
+        .map_err(|e: bus::ZenohError| AgentError::Bus(e.to_string()))?;
+
+    drop(batch);
+    let mut batch = self.batch.lock().await;
+    batch.clear();
+
+    Ok(())
+}
 
     /// Report bus load for adaptive backpressure
     pub async fn report_bus_load(&self, load: f64) {
@@ -172,12 +176,12 @@ impl PublisherWrapper {
 
 /// Convenience type for direct token publishing
 pub struct TokenPublisher {
-    wrapper: Arc<PublisherWrapper>,
+    wrapper: Arc<TokenPublisherWrapper>,
 }
 
 impl TokenPublisher {
     /// Create a new TokenPublisher
-    pub fn new(wrapper: Arc<PublisherWrapper>) -> Self {
+    pub fn new(wrapper: Arc<TokenPublisherWrapper>) -> Self {
         Self { wrapper }
     }
 
@@ -204,7 +208,7 @@ mod tests {
     fn test_token_publisher_exists() {
         // Type-level verification that PublisherWrapper and TokenPublisher exist
         // Integration tests in integration_tests.rs require zenoh router
-        assert!(std::mem::size_of::<PublisherWrapper>() > 0);
+        assert!(std::mem::size_of::<TokenPublisherWrapper>() > 0);
         assert!(std::mem::size_of::<TokenPublisher>() > 0);
     }
 }

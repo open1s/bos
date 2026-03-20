@@ -9,6 +9,8 @@ pub mod discovery;
 pub mod client;
 pub mod idempotency;
 
+pub mod topics;
+
 pub use envelope::{A2AMessage, A2AContent, AgentIdentity};
 pub use task::{Task, TaskState, TaskStatus};
 pub use discovery::{AgentCard, AgentStatus, Capability, A2ADiscovery};
