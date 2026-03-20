@@ -142,9 +142,10 @@ if let Ok(sample) = subscriber.recv() {
         Ok(())
     }
 
+#[allow(dead_code)]
 pub async fn subscribe_health(
     &self,
-) -> crate::error::AgentResult<zenoh::pubsub::Subscriber<zenoh::subscriber::FlumeSubscriber>> {
+) -> Result<zenoh::pubsub::Subscriber<zenoh::subscriber::FifoChannelHandler<zenoh::sample::Sample>>, crate::error::AgentError> {
     let topic = "agent/discovery/health/*";
     self.session
         .declare_subscriber(topic)
