@@ -2,7 +2,6 @@
 
 use crate::skills::metadata::SkillMetadata;
 use crate::skills::{SkillInjector, SkillLoader};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn fixtures_path() -> PathBuf {
@@ -53,17 +52,14 @@ fn test_skill_metadata_parse() {
 
 #[test]
 fn test_skill_injector_available() {
-    let mut skills = HashMap::new();
-    skills.insert(
+    let skills = vec![SkillMetadata::new(
         "test-skill".to_string(),
-        SkillMetadata {
-            name: "test-skill".to_string(),
-            description: "A test skill".to_string(),
-            path: PathBuf::from("/test/path"),
-        },
-    );
+        "A test skill".to_string(),
+        PathBuf::from("/test/path"),
+    )];
 
-    let xml = SkillInjector::inject_available(&skills);
+    let injector = SkillInjector::new();
+    let xml = injector.inject_available(&skills);
     assert!(xml.contains("<available_skills>"));
     assert!(xml.contains("<name>test-skill</name>"));
     assert!(xml.contains("<description>A test skill</description>"));

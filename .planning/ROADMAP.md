@@ -83,7 +83,7 @@ Gap Closure Plans:
 - [ ] 02-05-PLAN.md — Expand A2A stubs (envelope, task, discovery to line requirements)
 - [ ] 02-06-PLAN.md — Expand Skills module (metadata, injector, mod, loader to line requirements)
 - [ ] 02-07-PLAN.md — Fix topic paths and use bus crate wrapper
-- [ ] 02-08-PLAN.md — Fix requirements mapping (PROTO-* → A2A-*/MCP-*/SKIL-*/STRM-*)
+- [x] 02-08-PLAN.md — Fix requirements mapping (PROTO-* → A2A-*/MCP-*/SKIL-*/STRM-*) ✅
 
 ---
 

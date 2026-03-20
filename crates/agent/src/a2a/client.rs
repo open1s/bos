@@ -17,6 +17,10 @@ impl A2AClient {
     /// - `agent/{agent_id}/tasks/incoming` — receive task delegations
     /// - `agent/{agent_id}/tasks/{task_id}/status` — publish status updates
     /// - `agent/{agent_id}/responses/{correlation_id}` — reply to specific request
+    /// Zenoh topic structure (from 02-CONTEXT.md):
+    /// - `agent/{agent_id}/tasks/incoming` — receive task delegations
+    /// - `agent/{agent_id}/tasks/{task_id}/status` — publish status updates
+    /// - `agent/{agent_id}/responses/{correlation_id}` — reply to specific request
     pub fn new(session: Arc<Session>, identity: AgentIdentity) -> Self {
         Self {
             session,
@@ -57,7 +61,7 @@ impl A2AClient {
             content: A2AContent::TaskRequest { task: task.clone() },
         };
 
-        let topic = topics::tasks_incoming(&recipient.id);
+        let topic = format!("agent/{}/tasks/incoming", recipient.id);
         let publisher = self.session.declare_publisher(&topic).await
             .map_err(|e| crate::error::AgentError::Bus(e.to_string()))?;
 
@@ -96,7 +100,8 @@ impl A2AClient {
     }
 
     pub async fn poll_status(&self, task_id: &str) -> Result<TaskState, crate::error::AgentError> {
-        let status_topic = topics::task_status(&self.identity.id, task_id);
+        let status_topic = format!("agent/{}/status/{}", self.identity.id, task_id);
+        let status_topic = format!("agent/{}/status/{}", self.identity.id, task_id);
         let subscriber = self.session.declare_subscriber(&status_topic).await
             .map_err(|e| crate::error::AgentError::Bus(e.to_string()))?;
 
