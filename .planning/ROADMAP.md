@@ -71,7 +71,7 @@ Plans:
 
 **Status:** Planned
 
-**Plans:** 8 plans (4 original + 4 gap closure)
+**Plans:** 8/8 plans complete
 
 Original Plans:
 - [x] 02-01-PLAN.md — A2A protocol: envelope, state machine, discovery, delegation
