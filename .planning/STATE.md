@@ -2,20 +2,22 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
+status: archived
 last_updated: "2026-03-20T12:00:00.000Z"
 progress:
   total_phases: 5
-  completed_phases: 5
+  completed_phases: 3
   total_plans: 16
   completed_plans: 16
+git_tag: v1.0
 ---
 
 # BrainOS Agent Framework State
 
 **Project:** BrainOS Agent Framework
 **Updated:** 2026-03-20
-**Status:** Milestone complete
+**Status:** v1.0 archived, ready for v1.1 planning
+**Git Tag:** v1.0
 
 ## Phase Progress
 
@@ -24,8 +26,6 @@ progress:
 | 01 | ● Complete | 3/3 |
 | 02 | ● Complete | 3/3 |
 | 03 | ● Complete | 2/2 |
-| 04 | ○ Planned | 0/0 |
-| 05 | ○ Planned | 0/0 |
 
 ## Phase 01: Core Agent Foundation ✅ (Complete)
 
@@ -104,3 +104,46 @@ progress:
 - **Summary:** `.planning/phases/03-orchestration-persistence/03-02-SUMMARY.md`
 
 **Tests:** 51 tests pass (6 session tests + scheduler tests), clean build with warnings only
+
+## v1.0 Milestone Summary
+
+### Delivered
+
+**3 phases complete, 16 plans executed, 19 files created:**
+
+Phase 1: Core Agent Foundation (3 plans)
+- AGENT-01: Agent struct with LLM client wrapper
+- AGENT-02: Tool trait + registry for RPC-based tool calls
+- 5 files created, 37 tests
+
+Phase 2: Distributed Integration (3 plans)
+- AGENT-03: MCP client integration
+- AGENT-04: A2A (Agent-to-Agent) protocol
+- AGENT-05: Skills system
+- 8 files created, 41 tests
+
+Phase 3: Orchestration & Persistence (2 plans)
+- AGENT-06: Scheduler (sequential/parallel/conditional workflows)
+- AGENT-07: Session persistence (JSON + disk storage)
+- 8 files created, 51 tests
+
+### Requirements Complete
+
+- [x] AGENT-01: Agent struct
+- [x] AGENT-02: Tool trait + registry
+- [x] AGENT-03: MCP client integration
+- [x] AGENT-04: A2A protocol
+- [x] AGENT-05: Skills system
+- [x] AGENT-06: Scheduler
+- [x] AGENT-07: Session management
+
+### v1.1 Planned
+
+- [ ] AGENT-08: Streaming responses
+- [ ] AGENT-09: Config-driven agents
+
+### Git
+
+- Tag: v1.0
+- Commit: 9ac7ea3
+- Archived: ROADMAP.md, REQUIREMENTS.md → .planning/milestones/v1.0-*
