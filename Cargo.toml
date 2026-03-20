@@ -3,6 +3,10 @@ members = [
     "crates/config",
     "crates/bus",
     "crates/agent",
+    "examples/brainos-common",
+    "examples/basic-communication",
+    "examples/llm-agent-demo",
+    "examples/wechat-demo",
 ]
 resolver = "2"
 
