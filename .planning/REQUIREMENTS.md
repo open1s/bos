@@ -48,16 +48,16 @@
 
 ### Scheduling
 
-- [ ] **SCHD-01**: Sequential workflow — run steps A → B → C, pass output of each as input to next
-- [ ] **SCHD-02**: Parallel workflow — run A, B, C simultaneously, collect all results
-- [ ] **SCHD-03**: Conditional branching — branch based on output of previous step (true/false/pattern match)
-- [ ] **SCHD-04**: Step timeout and retry — configurable timeout per step, retry with exponential backoff
+- [x] **SCHD-01**: Sequential workflow — run steps A → B → C, pass output of each as input to next
+- [x] **SCHD-02**: Parallel workflow — run A, B, C simultaneously, collect all results
+- [x] **SCHD-03**: Conditional branching — branch based on output of previous step (true/false/pattern match)
+- [x] **SCHD-04**: Step timeout and retry — configurable timeout per step, retry with exponential backoff
 
 ### Session Management
 
-- [ ] **SESS-01**: AgentState serialization — serialize message history, context, pending tasks to JSON
-- [ ] **SESS-02**: Session restore — load agent state from disk, continue conversation
-- [ ] **SESS-03**: Session management — save/restore/list/delete sessions by agent_id
+- [x] **SESS-01**: AgentState serialization — serialize message history, context, pending tasks to JSON
+- [x] **SESS-02**: Session restore — load agent state from disk, continue conversation
+- [x] **SESS-03**: Session management — save/restore/list/delete sessions by agent_id
 
 ## v2 Requirements
 
@@ -111,13 +111,13 @@
 | SKIL-02 | Phase 2 | Pending |
 | SKIL-03 | Phase 2 | Pending |
 | SKIL-04 | Phase 2 | Pending |
-| SCHD-01 | Phase 3 | Pending |
-| SCHD-02 | Phase 3 | Pending |
-| SCHD-03 | Phase 3 | Pending |
-| SCHD-04 | Phase 3 | Pending |
-| SESS-01 | Phase 3 | Pending |
-| SESS-02 | Phase 3 | Pending |
-| SESS-03 | Phase 3 | Pending |
+| SCHD-01 | Phase 3 | Complete |
+| SCHD-02 | Phase 3 | Complete |
+| SCHD-03 | Phase 3 | Complete |
+| SCHD-04 | Phase 3 | Complete |
+| SESS-01 | Phase 3 | Complete |
+| SESS-02 | Phase 3 | Complete |
+| SESS-03 | Phase 3 | Complete |
 
 **Coverage:**
 - v1 requirements: 27 total

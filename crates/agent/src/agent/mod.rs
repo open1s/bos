@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use futures::Stream;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 
 pub mod config;
 
@@ -13,7 +14,7 @@ use crate::llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamToken}
 use crate::tools::ToolRegistry;
 
 /// A message in the conversation history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     User(String),
     Assistant(String),
@@ -55,13 +56,10 @@ impl MessageLog {
                 Message::Assistant(content) => OpenAiMessage::Assistant {
                     content: content.clone(),
                 },
-                Message::ToolResult { name, content } => {
-                    // tool_call_id uses the tool name as identifier
-                    OpenAiMessage::ToolResult {
-                        tool_call_id: name.clone(),
-                        content: content.clone(),
-                    }
-                }
+                Message::ToolResult { name, content } => OpenAiMessage::ToolResult {
+                    tool_call_id: name.clone(),
+                    content: content.clone(),
+                },
             })
             .collect()
     }
@@ -115,6 +113,10 @@ impl Agent {
         &self.message_log
     }
 
+    pub fn config(&self) -> &AgentConfig {
+        &self.config
+    }
+
     /// Run agent on a task (no tools).
     pub async fn run(&mut self, task: &str) -> Result<String, AgentError> {
         self.message_log.add_user(task.to_string());
@@ -155,6 +157,41 @@ impl Agent {
         self.stream_loop(Some(tools))
     }
 
+    /// Save current agent state to session
+    pub async fn save_state(
+        &self,
+        manager: &crate::session::SessionManager,
+    ) -> Result<(), crate::session::SessionError> {
+        let metadata =
+            crate::session::serializer::SessionSerializer::new_state(self.config.name.clone())
+                .metadata;
+        let state = crate::session::AgentState {
+            agent_id: self.config.name.clone(),
+            message_log: self.message_log.messages.clone(),
+            context: serde_json::json!({}),
+            metadata,
+        };
+
+        manager.update(&self.config.name, state).await
+    }
+
+    /// Restore agent state from session
+    pub async fn restore_state(
+        &mut self,
+        manager: &crate::session::SessionManager,
+    ) -> Result<(), crate::session::SessionError> {
+        let state = manager.get(&self.config.name).await?;
+        self.message_log.messages = state.message_log;
+        Ok(())
+    }
+
+    /// Auto-save after each turn (optional)
+    pub async fn auto_save(&self, manager: &crate::session::SessionManager) {
+        if let Err(e) = self.save_state(manager).await {
+            eprintln!("Failed to auto-save session: {}", e);
+        }
+    }
+
     /// Internal streaming loop - handles token streaming with optional tools.
     fn stream_loop(
         &mut self,
@@ -169,20 +206,20 @@ impl Agent {
         tokio::spawn(async move {
             let mut messages = messages;
 
-let mut request_messages = vec![OpenAiMessage::System {
-            content: config.system_prompt.clone(),
-        }];
-        request_messages.extend(messages.to_api_format());
+            let mut request_messages = vec![OpenAiMessage::System {
+                content: config.system_prompt.clone(),
+            }];
+            request_messages.extend(messages.to_api_format());
 
-        let tools_for_request = tools.as_ref().map(|t| t.to_openai_format());
+            let tools_for_request = tools.as_ref().map(|t| t.to_openai_format());
 
-        let request = LlmRequest {
-            model: config.model.clone(),
-            messages: request_messages,
-            tools: tools_for_request,
-            temperature: config.temperature,
-            max_tokens: config.max_tokens,
-        };
+            let request = LlmRequest {
+                model: config.model.clone(),
+                messages: request_messages,
+                tools: tools_for_request,
+                temperature: config.temperature,
+                max_tokens: config.max_tokens,
+            };
 
             let stream = llm.stream_complete(request);
 

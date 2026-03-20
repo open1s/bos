@@ -10,6 +10,8 @@ pub mod streaming;
 pub mod skills;
 pub mod mcp;
 pub mod a2a;
+pub mod scheduler;
+pub mod session;
 
 pub use error::{AgentError, LlmError, ToolError};
 pub use agent::{Agent, AgentConfig, AgentOutput, Message, MessageLog};
@@ -18,11 +20,18 @@ pub use agent::config::{AgentBuilder, TomlAgentConfig};
 pub use llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, OpenAiClient, StreamToken};
 pub use tools::{Tool, ToolDescription, ToolRegistry};
 pub use streaming::{
-    SseDecoder, SseEvent, TokenStream,
-    PublisherWrapper, TokenPublisher,
+    SseDecoder, SseEvent, TokenStream, TokenPublisher,
     TokenBatch, SerializedToken, TokenType,
     RateLimiter, BackpressureController,
 };
 pub use skills::{SkillLoader, SkillMetadata, SkillContent, SkillError, SkillInjector};
 pub use mcp::{McpClient, McpToolAdapter, McpError, StdioTransport, ServerCapabilities, ToolDefinition};
 pub use a2a::{A2AMessage, A2AContent, AgentIdentity, Task, TaskState, AgentCard, A2AClient};
+pub use scheduler::BackoffStrategy;
+pub use scheduler::StepType;
+pub use scheduler::{Workflow, Step, WorkflowResult, StepResult, WorkflowStatus, StepStatus};
+pub use scheduler::dsl::{WorkflowBuilder, StepBuilder};
+pub use scheduler::executor::Scheduler;
+pub use session::{AgentState, SessionConfig, SessionError, SessionMetadata, SessionSummary};
+pub use session::manager::SessionManager;
+pub use session::serializer::SessionSerializer;
