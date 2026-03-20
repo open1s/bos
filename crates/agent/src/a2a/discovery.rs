@@ -78,4 +78,67 @@ if let Ok(sample) = subscriber.recv() {
 
         Ok(cards)
     }
+
+    pub async fn discover_by_protocol(
+        &self,
+        protocol: &str,
+    ) -> Result<Vec<AgentCard>, crate::error::AgentError> {
+        let all_cards = self.discover(None).await?;
+        Ok(all_cards
+            .into_iter()
+            .filter(|card| card.supported_protocols.contains(&protocol.to_string()))
+            .collect())
+    }
+
+    pub async fn discover_by_skill(
+        &self,
+        skill: &str,
+    ) -> Result<Vec<AgentCard>, crate::error::AgentError> {
+        let all_cards = self.discover(None).await?;
+        Ok(all_cards
+            .into_iter()
+            .filter(|card| card.skills.contains(&skill.to_string()))
+            .collect())
+    }
+
+    pub async fn discover_by_status(
+        &self,
+        status: AgentStatus,
+    ) -> Result<Vec<AgentCard>, crate::error::AgentError> {
+        let all_cards = self.discover(None).await?;
+        Ok(all_cards.into_iter().filter(|card| card.status == status).collect())
+    }
+
+    pub async fn get_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<AgentCard>, crate::error::AgentError> {
+        let all_cards = self.discover(None).await?;
+        Ok(all_cards.into_iter().find(|card| card.agent_id.id == agent_id))
+    }
+
+    pub async fn publish_health(
+        &self,
+        agent_id: &str,
+        status: AgentStatus,
+    ) -> Result<(), crate::error::AgentError> {
+        let topic = format!("agent/discovery/health/{}", agent_id);
+        let publisher = self.session.declare_publisher(&topic).await
+            .map_err(|e| crate::error::AgentError::Bus(e.to_string()))?;
+
+        let health = serde_json::json!({
+            "agent_id": agent_id,
+            "status": status,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        });
+
+        let data = serde_json::to_vec(&health)
+            .map_err(|e| crate::error::AgentError::Config(e.to_string()))?;
+        publisher.put(data).await
+            .map_err(|e| crate::error::AgentError::Bus(e.to_string()))?;
+        Ok(())
+    }
 }
