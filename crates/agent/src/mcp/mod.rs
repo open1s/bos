@@ -7,6 +7,9 @@ pub mod transport;
 pub mod client;
 pub mod adapter;
 
+#[cfg(test)]
+mod tests;
+
 pub use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, ServerCapabilities, ToolDefinition};
 pub use transport::StdioTransport;
 pub use client::McpClient;

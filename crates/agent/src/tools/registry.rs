@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{Tool, ToolError};
-
-#[cfg(test)]
-use super::ToolDescription;
+use crate::tools::{ToolDescription, async_trait};
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -29,12 +27,93 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Register a tool with a namespace prefix to avoid conflicts.
+    /// Tool name will be `{namespace}/{tool_name}`.
+    pub fn register_with_namespace(
+        &mut self,
+        tool: Arc<dyn Tool>,
+        namespace: &str,
+    ) -> Result<(), ToolError> {
+        let tool_name = tool.name().to_string();
+        let namespaced_name = format!("{}/{}", namespace, tool_name);
+        
+        if self.tools.contains_key(&namespaced_name) {
+            return Err(ToolError::ExecutionFailed(format!(
+                "duplicate tool in namespace '{}': {}",
+                namespace,
+                tool_name
+            )));
+        }
+
+        // Create a wrapper tool with the namespaced name
+        let wrapped = Arc::new(NamespacedTool::new(tool, namespace.to_string(), tool_name.to_string()));
+        self.tools.insert(namespaced_name, wrapped);
+        Ok(())
+    }
+
+    /// Register multiple tools from a skill with automatic namespacing.
+    /// All tools will be prefixed with `{skill_name}/`.
+    pub fn register_from_skill(
+        &mut self,
+        skill_name: &str,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<(), ToolError> {
+        for tool in tools {
+            self.register_with_namespace(tool, skill_name)?;
+        }
+        Ok(())
+    }
+
+    /// Get a tool by name (with or without namespace).
+    /// If no namespace is provided, searches all namespaces.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        // First try exact match (could be namespaced or not)
+        if let Some(tool) = self.tools.get(name).cloned() {
+            return Some(tool);
+        }
+
+        // If not found, search in all namespaces
+        for (key, tool) in &self.tools {
+            if key.ends_with(&format!("/{}", name)) {
+                return Some(tool.clone());
+            }
+        }
+
+        None
+    }
+
+    /// Get a tool from a specific namespace.
+    pub fn get_from_namespace(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Option<Arc<dyn Tool>> {
+        let namespaced_name = format!("{}/{}", namespace, name);
+        self.tools.get(&namespaced_name).cloned()
     }
 
     pub fn list(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
+    }
+
+    /// List tools from a specific namespace.
+    pub fn list_namespace(&self, namespace: &str) -> Vec<String> {
+        self.tools
+            .keys()
+            .filter(|name| name.starts_with(&format!("{}/", namespace)))
+            .cloned()
+            .collect()
+    }
+
+    /// List all available namespaces.
+    pub fn list_namespaces(&self) -> Vec<String> {
+        let mut namespaces: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for name in self.tools.keys() {
+            if let Some(pos) = name.find('/') {
+                namespaces.insert(name[..pos].to_string());
+            }
+        }
+        namespaces.into_iter().collect()
     }
 
     pub async fn execute(
@@ -69,6 +148,42 @@ impl ToolRegistry {
     }
 }
 
+/// A wrapper tool that prefixes its name with a namespace.
+struct NamespacedTool {
+    inner: Arc<dyn Tool>,
+    namespace: String,
+    tool_name: String,
+}
+
+impl NamespacedTool {
+    fn new(tool: Arc<dyn Tool>, namespace: String, tool_name: String) -> Self {
+        Self {
+            inner: tool,
+            namespace,
+            tool_name,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for NamespacedTool {
+    fn name(&self) -> &str {
+        &self.tool_name
+    }
+
+    fn description(&self) -> ToolDescription {
+        self.inner.description()
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        self.inner.json_schema()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        self.inner.execute(args).await
+    }
+}
+
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
@@ -78,6 +193,7 @@ impl Default for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::ToolDescription;
     use async_trait::async_trait;
 
     struct DummyTool;
@@ -150,5 +266,85 @@ mod tests {
         assert_eq!(format.len(), 1);
         assert_eq!(format[0]["type"], "function");
         assert_eq!(format[0]["function"]["name"], "dummy");
+    }
+
+    #[tokio::test]
+    async fn test_namespace_registration() {
+        let mut registry = ToolRegistry::new();
+        let tool = Arc::new(DummyTool);
+        
+        // Register with namespace
+        registry.register_with_namespace(tool.clone(), "calculator").unwrap();
+        
+        // Tool should be accessible with namespaced name
+        assert!(registry.get_from_namespace("dummy", "calculator").is_some());
+        
+        // Tool list should include namespaced name
+        let tools = registry.list_namespace("calculator");
+        assert!(tools.contains(&"calculator/dummy".to_string()));
+        
+        // List namespaces
+        let namespaces = registry.list_namespaces();
+        assert!(namespaces.contains(&"calculator".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_namespace_no_conflict() {
+        let mut registry = ToolRegistry::new();
+        
+        // Same tool name in different namespaces should not conflict
+        let tool1 = Arc::new(DummyTool);
+        let tool2 = Arc::new(DummyTool);
+        
+        registry.register_with_namespace(tool1, "skill1").unwrap();
+        registry.register_with_namespace(tool2, "skill2").unwrap();
+        
+        // Both should be successfully registered
+        assert!(registry.get_from_namespace("dummy", "skill1").is_some());
+        assert!(registry.get_from_namespace("dummy", "skill2").is_some());
+        
+        // Namespace list should have both
+        let namespaces = registry.list_namespaces();
+        assert_eq!(namespaces.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_register_from_skill() {
+        let mut registry = ToolRegistry::new();
+        
+        let tool = Arc::new(DummyTool);
+        registry.register_from_skill("my-skill", vec![tool]).unwrap();
+        
+        // Tool should be registered with skill prefix
+        assert!(registry.get("my-skill/dummy").is_some());
+        
+        // List should include namesspaced tool
+        let tools = registry.list();
+        assert!(tools.contains(&"my-skill/dummy".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_execute_namespaced_tool() {
+        let mut registry = ToolRegistry::new();
+        let tool = Arc::new(DummyTool);
+        
+        registry.register_with_namespace(tool, "calc").unwrap();
+        
+        // Execute with namespaced name
+        let result = registry.execute("calc/dummy", serde_json::json!({})).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), serde_json::json!("executed"));
+    }
+
+    #[tokio::test]
+    async fn test_get_without_namespace_finds_in_namespace() {
+        let mut registry = ToolRegistry::new();
+        let tool = Arc::new(DummyTool);
+        
+        registry.register_with_namespace(tool, "calc").unwrap();
+        
+        // get without namespace should still find it
+        let result = registry.get("dummy");
+        assert!(result.is_some());
     }
 }

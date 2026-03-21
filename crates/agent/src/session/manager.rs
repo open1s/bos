@@ -9,9 +9,9 @@ use tokio::task::JoinHandle;
 use std::path::Path;
 
 pub struct SessionManager {
-    storage: SessionStorage,
+    pub(crate) storage: SessionStorage,
     cache: Arc<RwLock<HashMap<String, AgentState>>>,
-    config: SessionConfig,
+    pub config: SessionConfig,
     cleanup_task: Option<JoinHandle<()>>,
 }
 

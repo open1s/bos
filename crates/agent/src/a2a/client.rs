@@ -101,7 +101,6 @@ impl A2AClient {
 
     pub async fn poll_status(&self, task_id: &str) -> Result<TaskState, crate::error::AgentError> {
         let status_topic = format!("agent/{}/status/{}", self.identity.id, task_id);
-        let status_topic = format!("agent/{}/status/{}", self.identity.id, task_id);
         let subscriber = self.session.declare_subscriber(&status_topic).await
             .map_err(|e| crate::error::AgentError::Bus(e.to_string()))?;
 

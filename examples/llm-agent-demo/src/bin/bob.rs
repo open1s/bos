@@ -215,10 +215,9 @@ impl AddHandler {
 #[async_trait::async_trait]
 impl RpcHandler for AddHandler {
     async fn handle(&self, _method: &str, payload: &[u8]) -> Result<Vec<u8>, RpcServiceError> {
-        let json_payload: JsonPayload = unsafe {
-            rkyv::from_bytes_unchecked::<JsonPayload, rkyv::rancor::Error>(payload)
-                .map_err(|e| RpcServiceError::Internal(e.to_string()))?
-        };
+        // Safe deserialization with validation
+        let json_payload: JsonPayload = rkyv::from_bytes::<JsonPayload, rkyv::rancor::Error>(payload)
+            .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
         let args: Value = serde_json::from_str(&json_payload.json)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
@@ -254,10 +253,9 @@ impl MultiplyHandler {
 #[async_trait::async_trait]
 impl RpcHandler for MultiplyHandler {
     async fn handle(&self, _method: &str, payload: &[u8]) -> Result<Vec<u8>, RpcServiceError> {
-        let json_payload: JsonPayload = unsafe {
-            rkyv::from_bytes_unchecked::<JsonPayload, rkyv::rancor::Error>(payload)
-                .map_err(|e| RpcServiceError::Internal(e.to_string()))?
-        };
+        // Safe deserialization with validation
+        let json_payload: JsonPayload = rkyv::from_bytes::<JsonPayload, rkyv::rancor::Error>(payload)
+            .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
         let args: Value = serde_json::from_str(&json_payload.json)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
@@ -293,10 +291,9 @@ impl SubtractHandler {
 #[async_trait::async_trait]
 impl RpcHandler for SubtractHandler {
     async fn handle(&self, _method: &str, payload: &[u8]) -> Result<Vec<u8>, RpcServiceError> {
-        let json_payload: JsonPayload = unsafe {
-            rkyv::from_bytes_unchecked::<JsonPayload, rkyv::rancor::Error>(payload)
-                .map_err(|e| RpcServiceError::Internal(e.to_string()))?
-        };
+        // Safe deserialization with validation
+        let json_payload: JsonPayload = rkyv::from_bytes::<JsonPayload, rkyv::rancor::Error>(payload)
+            .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
         let args: Value = serde_json::from_str(&json_payload.json)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;

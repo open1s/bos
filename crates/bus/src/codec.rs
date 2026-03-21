@@ -28,7 +28,10 @@ impl Codec {
         T: Archive,
         T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<Error>>,
     {
-        Ok(unsafe { rkyv::from_bytes_unchecked::<T, Error>(data)? })
+        unsafe {
+            rkyv::from_bytes_unchecked::<T, Error>(data)
+                .map_err(|e| anyhow::anyhow!("rkyv deserialization failed: {}", e))
+        }
     }
 }
 

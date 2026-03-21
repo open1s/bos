@@ -9,6 +9,9 @@ pub mod discovery;
 pub mod client;
 pub mod idempotency;
 
+#[cfg(test)]
+mod tests;
+
 pub mod topics;
 
 pub use envelope::{A2AMessage, A2AContent, AgentIdentity};

@@ -2,6 +2,9 @@ pub mod serializer;
 pub mod storage;
 pub mod manager;
 
+#[cfg(test)]
+mod tests;
+
 use crate::agent::Message;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

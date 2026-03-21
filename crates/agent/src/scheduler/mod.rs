@@ -7,6 +7,9 @@ pub mod dsl;
 pub mod retry;
 pub mod executor;
 
+#[cfg(test)]
+mod tests;
+
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

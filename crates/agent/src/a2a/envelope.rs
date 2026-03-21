@@ -1,7 +1,7 @@
 use super::Task;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentIdentity {
     pub id: String,
     pub name: String,
