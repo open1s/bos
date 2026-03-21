@@ -540,6 +540,13 @@
 3. Skills load and compose
 4. MCP tools integrate
 
+**Plans:** 3 plans ready for execution
+
+Plans:
+- [ ] 04-01-PLAN.md — Streaming validation demo
+- [ ] 04-02-PLAN.md — Scheduler executor and demo
+- [ ] 04-03-PLAN.md — Skills and MCP validation
+
 ---
 
 ### Plan 04-01: Streaming Validation
