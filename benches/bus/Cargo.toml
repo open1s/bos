@@ -1,0 +1,24 @@
+[package]
+name = "bus-benches"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bus = { path = "../../crates/bus" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rkyv = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+pprof = { workspace = true }
+
+[[bench]]
+name = "zenoh_pubsub"
+harness = false
+
+[[bench]]
+name = "message_serialization"
+harness = false

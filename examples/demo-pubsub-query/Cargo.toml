@@ -1,0 +1,12 @@
+[package]
+name = "demo-pubsub-query"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bus = { path = "../../crates/bus" }
+brainos-common = { path = "../brainos-common" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+rkyv = { workspace = true }
+uuid = { workspace = true }

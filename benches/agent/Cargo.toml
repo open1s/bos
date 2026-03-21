@@ -1,0 +1,30 @@
+[package]
+name = "agent-benches"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agent = { path = "../../crates/agent" }
+bus = { path = "../../crates/bus" }
+config = { path = "../../crates/config" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+pprof = { workspace = true }
+async-trait = { workspace = true }
+
+[[bench]]
+name = "streaming"
+harness = false
+
+[[bench]]
+name = "tool_registry"
+harness = false
+
+[[bench]]
+name = "llm_client"
+harness = false

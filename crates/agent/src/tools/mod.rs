@@ -25,6 +25,13 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> ToolDescription;
     fn json_schema(&self) -> serde_json::Value;
+    
+    /// Get cached JSON schema as Arc for zero-copy access
+    /// Default implementation wraps json_schema() in Arc
+    fn cached_schema(&self) -> Arc<serde_json::Value> {
+        Arc::new(self.json_schema())
+    }
+    
     async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError>;
 }
 

@@ -8,6 +8,9 @@ use std::sync::Arc;
 pub struct PublisherWrapper {
     topic: String,
     session: Option<Arc<Session>>,
+    // Store declared publisher without caching between sessions
+    // Each publish will create a new publisher if session is available
+    // This avoids 'static lifetime issues with Zenoh Publisher
 }
 
 impl PublisherWrapper {
@@ -38,15 +41,12 @@ impl PublisherWrapper {
         let data: Vec<u8> = codec.encode(payload)
             .map_err(|e: anyhow::Error| ZenohError::Serialization(e.to_string()))?;
 
-        let pub_: zenoh::pubsub::Publisher<'_> =
-            session.declare_publisher(&self.topic).await?;
-        pub_.put(data).await.map_err(ZenohError::from)
+        self.publish_raw(session, data).await
     }
 
     pub async fn publish_raw(&self, session: &Session, data: Vec<u8>) -> Result<(), ZenohError> {
-        let pub_: zenoh::pubsub::Publisher<'_> =
-            session.declare_publisher(&self.topic).await?;
-        pub_.put(data).await.map_err(ZenohError::from)
+        let publisher = session.declare_publisher(&self.topic).await?;
+        publisher.put(data).await.map_err(ZenohError::from)
     }
 
     pub fn topic(&self) -> &str {
@@ -62,7 +62,7 @@ impl Clone for PublisherWrapper {
     fn clone(&self) -> Self {
         Self {
             topic: self.topic.clone(),
-            session: None,
+            session: self.session.clone(),
         }
     }
 }

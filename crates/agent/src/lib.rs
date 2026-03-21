@@ -25,10 +25,12 @@ pub use streaming::{
     RateLimiter, BackpressureController,
 };
 pub use skills::{SkillLoader, SkillMetadata, SkillContent, SkillError, SkillInjector};
-pub use mcp::{McpClient, McpToolAdapter, McpError, StdioTransport, ServerCapabilities, ToolDefinition};
+pub use mcp::{McpClient, McpToolAdapter, McpError, StdioTransport, ServerCapabilities, ToolDefinition,
+    McpResource, McpPrompt, McpPromptArgument, ReadResourceResult, ResourceContents};
 pub use a2a::{A2AMessage, A2AContent, AgentIdentity, Task, TaskState, AgentCard, A2AClient};
 pub use scheduler::BackoffStrategy;
 pub use scheduler::StepType;
+pub use scheduler::ConditionType;
 pub use scheduler::{Workflow, Step, WorkflowResult, StepResult, WorkflowStatus, StepStatus};
 pub use scheduler::dsl::{WorkflowBuilder, StepBuilder};
 pub use scheduler::executor::Scheduler;

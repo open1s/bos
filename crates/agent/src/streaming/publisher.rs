@@ -17,12 +17,17 @@ use super::backpressure::{
 use crate::llm::StreamToken;
 use crate::error::AgentError;
 
+/// Combined state for the publisher to reduce lock contention
+struct PublisherState {
+    batch: TokenBatch,
+    backpressure: BackpressureController,
+}
+
 /// Wrapper around Zenoh publisher with batching and backpressure
 pub struct TokenPublisherWrapper {
     pub_session: Arc<Session>,
     bus_publisher: BusPublisher,
-    backpressure: Mutex<BackpressureController>,
-    batch: Mutex<TokenBatch>,
+    state: Mutex<PublisherState>,
     topic_prefix: String,
     agent_id: String,
 }
@@ -36,12 +41,15 @@ impl TokenPublisherWrapper {
         agent_id: String,
         topic_prefix: String,
     ) -> Self {
-        let backpressure = Mutex::new(BackpressureController::new(
-            100.0, // tokens_per_second
-            10, // max_batch_size
-            50, // max_batch_tokens
-            Duration::from_millis(50), // batch_timeout
-        ));
+        let state = Mutex::new(PublisherState {
+            batch: TokenBatch::new(),
+            backpressure: BackpressureController::new(
+                100.0, // tokens_per_second
+                10, // max_batch_size
+                50, // max_batch_tokens
+                Duration::from_millis(50), // batch_timeout
+            ),
+        });
 
         let bus_publisher = BusPublisher::new(format!("{}/{}/tokens/stream", topic_prefix, agent_id))
             .with_session(&session);
@@ -49,8 +57,7 @@ impl TokenPublisherWrapper {
         Self {
             pub_session: session,
             bus_publisher,
-            backpressure,
-            batch: Mutex::new(TokenBatch::new()),
+            state,
             topic_prefix,
             agent_id,
         }
@@ -59,37 +66,34 @@ impl TokenPublisherWrapper {
     /// Publish a single token, accumulating it into a batch
     pub async fn publish_token(
         &self,
-        task_id: String,
+        task_id: &str,
         token: StreamToken,
     ) -> Result<(), AgentError> {
-        let serialized = Self::serialize_token(task_id, token);
+        let serialized = Self::serialize_token(task_id.to_string(), token);
 
         // Retry loop for rate limiting
         let mut retries = 3;
         while retries > 0 {
+            let mut state = self.state.lock().await;
+
             // Check rate limit
-            {
-                let mut bp = self.backpressure.lock().await;
-                if !bp.should_publish().await {
-                    drop(bp);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    retries -= 1;
-                    continue;
-                }
+            if !state.backpressure.should_publish().await {
+                drop(state);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                retries -= 1;
+                continue;
             }
 
             // Add to batch
-            {
-                let mut batch = self.batch.lock().await;
-                batch.add(serialized);
+            state.batch.add(serialized);
 
-                let bp = self.backpressure.lock().await;
-                if bp.is_batch_ready(&batch) {
-                    drop(bp);
-                    let batch = self.batch.lock().await;
-                    Self::flush_batch(self, batch).await?;
-                }
+            // Check if batch is ready and flush if needed
+            if state.backpressure.is_batch_ready(&state.batch) {
+                let batch = std::mem::take(&mut state.batch);
+                drop(state);
+                Self::flush_batch_internal(self, batch).await?;
             }
+
             return Ok(());
         }
 
@@ -121,16 +125,18 @@ impl TokenPublisherWrapper {
 
     /// Flush any pending tokens in the batch
     pub async fn flush(&self) -> Result<(), AgentError> {
-        let batch = self.batch.lock().await;
-        if !batch.tokens.is_empty() {
-            Self::flush_batch(self, batch).await?;
+        let mut state = self.state.lock().await;
+        if !state.batch.tokens.is_empty() {
+            let batch = std::mem::take(&mut state.batch);
+            drop(state);
+            Self::flush_batch_internal(self, batch).await?;
         }
         Ok(())
     }
 
-    async fn flush_batch(
+    async fn flush_batch_internal(
         &self,
-        batch: tokio::sync::MutexGuard<'_, TokenBatch>,
+        batch: TokenBatch,
     ) -> Result<(), AgentError> {
         if batch.tokens.is_empty() {
             return Ok(());
@@ -145,24 +151,19 @@ impl TokenPublisherWrapper {
             .await
             .map_err(|e| AgentError::Bus(e.to_string()))?;
 
-        drop(batch);
-        let mut batch = self.batch.lock().await;
-        batch.clear();
-        drop(batch);
-
         Ok(())
     }
 
     /// Report bus load for adaptive backpressure
     pub async fn report_bus_load(&self, load: f64) {
-        let mut bp = self.backpressure.lock().await;
-        bp.report_bus_load(load);
+        let mut state = self.state.lock().await;
+        state.backpressure.report_bus_load(load);
     }
 
     /// Get current publish rate
     pub fn get_rate(&self) -> f64 {
-        let bp = self.backpressure.blocking_lock();
-        bp.current_rate()
+        let state = self.state.blocking_lock();
+        state.backpressure.current_rate()
     }
 
     /// Inspect backpressure config with a closure
@@ -170,8 +171,8 @@ impl TokenPublisherWrapper {
     where
         F: FnOnce(&BackpressureController) -> R,
     {
-        let bp = self.backpressure.lock().await;
-        f(&bp)
+        let state = self.state.lock().await;
+        f(&state.backpressure)
     }
 }
 
@@ -185,7 +186,7 @@ impl TokenPublisher {
         Self { wrapper }
     }
 
-    pub async fn publish(&self, task_id: String, token: StreamToken) -> Result<(), AgentError> {
+    pub async fn publish(&self, task_id: &str, token: StreamToken) -> Result<(), AgentError> {
         self.wrapper.publish_token(task_id, token).await
     }
 

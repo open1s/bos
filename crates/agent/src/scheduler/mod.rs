@@ -68,6 +68,24 @@ impl Default for BackoffStrategy {
     }
 }
 
+impl BackoffStrategy {
+    /// Calculate the backoff delay for a given attempt number
+    pub fn calculate_backoff(&self, attempt: u32) -> Duration {
+        match self {
+            BackoffStrategy::Exponential { base, max } => {
+                let delay = *base * 2u32.pow(attempt);
+                if delay > *max {
+                    *max
+                } else {
+                    delay
+                }
+            }
+            BackoffStrategy::Linear { interval } => *interval * (attempt + 1),
+            BackoffStrategy::Fixed { interval } => *interval,
+        }
+    }
+}
+
 /// Workflow execution result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowResult {

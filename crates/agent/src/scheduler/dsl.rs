@@ -9,12 +9,13 @@ pub struct WorkflowBuilder {
     default_timeout: Duration,
     default_retries: u32,
     default_backoff: BackoffStrategy,
+    default_input: Option<serde_json::Value>,
 }
 
 impl WorkflowBuilder {
-    pub fn new(name: String) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             description: String::new(),
             steps: Vec::new(),
             default_timeout: Duration::from_secs(60),
@@ -23,11 +24,12 @@ impl WorkflowBuilder {
                 base: Duration::from_millis(100),
                 max: Duration::from_secs(10),
             },
+            default_input: None,
         }
     }
 
-    pub fn description(mut self, desc: String) -> Self {
-        self.description = desc;
+    pub fn description(mut self, desc: impl Into<String>) -> Self {
+        self.description = desc.into();
         self
     }
 
@@ -38,6 +40,11 @@ impl WorkflowBuilder {
 
     pub fn default_retries(mut self, retries: u32) -> Self {
         self.default_retries = retries;
+        self
+    }
+
+    pub fn with_default_input(mut self, input: serde_json::Value) -> Self {
+        self.default_input = Some(input);
         self
     }
 
@@ -122,9 +129,9 @@ pub struct StepBuilder {
 }
 
 impl StepBuilder {
-    pub fn new(name: String) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             agent_id: None,
             step_type: StepType::Sequential,
             timeout: Duration::from_secs(60),
@@ -134,6 +141,25 @@ impl StepBuilder {
                 max: Duration::from_secs(10),
             },
         }
+    }
+
+    pub fn name(name: impl Into<String>) -> Self {
+        Self::new(name)
+    }
+
+    pub fn sequential(mut self) -> Self {
+        self.step_type = StepType::Sequential;
+        self
+    }
+
+    pub fn parallel(mut self) -> Self {
+        self.step_type = StepType::Parallel;
+        self
+    }
+
+    pub fn conditional(mut self, condition: ConditionType) -> Self {
+        self.step_type = StepType::Conditional { condition };
+        self
     }
 
     pub fn local(mut self) -> Self {

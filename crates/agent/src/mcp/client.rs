@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use thiserror::Error;
 
-use super::protocol::{JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ToolDefinition};
+use super::protocol::{JsonRpcRequest, JsonRpcResponse, McpPrompt, McpResource, ReadResourceResult, ResourceContents, ServerCapabilities, ToolDefinition};
 use super::transport::StdioTransport;
 
 #[derive(Error, Debug)]
@@ -36,6 +36,7 @@ pub struct McpClient {
     transport: Arc<Mutex<StdioTransport>>,
     request_id: std::sync::atomic::AtomicU64,
     capabilities: std::sync::Mutex<Option<ServerCapabilities>>,
+    recv_buffer: std::sync::Mutex<String>,
 }
 
 impl McpClient {
@@ -45,6 +46,7 @@ impl McpClient {
             transport: Arc::new(Mutex::new(transport)),
             request_id: std::sync::atomic::AtomicU64::new(1),
             capabilities: std::sync::Mutex::new(None),
+            recv_buffer: std::sync::Mutex::new(String::with_capacity(8192)),
         })
     }
 
@@ -136,6 +138,74 @@ impl McpClient {
             .ok_or_else(|| McpError::Protocol("No result in response".to_string()))
     }
 
+    pub async fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
+        let resp = self.call("resources/list", None).await?;
+
+        if let Some(error) = resp.error {
+            return Err(McpError::Server {
+                code: error.code,
+                message: error.message,
+            });
+        }
+
+        match resp.result {
+            Some(result) => {
+                let resources: Vec<McpResource> = serde_json::from_value(result)
+                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                Ok(resources)
+            }
+            None => Ok(vec![]),
+        }
+    }
+
+    pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
+        let resp = self
+            .call(
+                "resources/read",
+                Some(serde_json::json!({
+                    "uri": uri
+                })),
+            )
+            .await?;
+
+        if let Some(error) = resp.error {
+            return Err(McpError::Server {
+                code: error.code,
+                message: error.message,
+            });
+        }
+
+        match resp.result {
+            Some(result) => {
+                let content: ReadResourceResult = serde_json::from_value(result)
+                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                Ok(content)
+            }
+            None => Err(McpError::Protocol("No result in response".to_string())),
+        }
+    }
+
+    pub async fn list_prompts(&self) -> Vec<McpPrompt> {
+        match self.call("prompts/list", None).await {
+            Ok(resp) => {
+                if resp.error.is_some() {
+                    return vec![];
+                }
+                
+                match resp.result {
+                    Some(result) => {
+                        match serde_json::from_value(result) {
+                            Ok(prompts) => prompts,
+                            Err(_) => vec![],
+                        }
+                    }
+                    None => vec![],
+                }
+            }
+            Err(_) => vec![],
+        }
+    }
+
     pub async fn get_capabilities(&self) -> Option<ServerCapabilities> {
         self.capabilities.lock().unwrap().clone()
     }
@@ -152,8 +222,13 @@ impl McpClient {
         let json = serde_json::to_vec(&req)?;
         let mut transport = self.transport.lock().await;
         transport.send(&json).await?;
-        let line = transport.recv_line().await?;
-        let resp: JsonRpcResponse = serde_json::from_str(&line)?;
+        
+        let mut buffer = {
+            let lock = self.recv_buffer.lock().unwrap();
+            lock.clone()
+        };
+        transport.recv_line(&mut buffer).await?;
+        let resp: JsonRpcResponse = serde_json::from_str(&buffer)?;
         Ok(resp)
     }
 

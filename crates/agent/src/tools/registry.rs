@@ -1,17 +1,23 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::{Tool, ToolError};
 use crate::tools::{ToolDescription, async_trait};
+use dashmap::DashMap;
+use serde_json::json;
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    tool_name_index: HashMap<String, Vec<Weak<dyn Tool>>>,
+    schema_cache: DashMap<String, Arc<serde_json::Value>>,  // Arc 共享，零拷贝
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            tool_name_index: HashMap::new(),
+            schema_cache: DashMap::new(),
         }
     }
 
@@ -23,6 +29,13 @@ impl ToolRegistry {
                 name
             )));
         }
+
+        let WeakTool = Arc::downgrade(&tool);
+        self.tool_name_index.entry(name.clone()).or_default().push(WeakTool);
+
+        let schema = tool.cached_schema();
+        self.schema_cache.insert(name.clone(), schema);
+
         self.tools.insert(name, tool);
         Ok(())
     }
@@ -47,6 +60,12 @@ impl ToolRegistry {
 
         // Create a wrapper tool with the namespaced name
         let wrapped = Arc::new(NamespacedTool::new(tool, namespace.to_string(), tool_name.to_string()));
+        let WeakWrapped = Arc::downgrade(&wrapped);
+        self.tool_name_index.entry(tool_name.clone()).or_default().push(WeakWrapped);
+        
+        let schema = wrapped.cached_schema();
+        self.schema_cache.insert(namespaced_name.clone(), schema);
+        
         self.tools.insert(namespaced_name, wrapped);
         Ok(())
     }
@@ -65,17 +84,19 @@ impl ToolRegistry {
     }
 
     /// Get a tool by name (with or without namespace).
-    /// If no namespace is provided, searches all namespaces.
+    /// If no namespace is provided, searches all namespaces using index (O(1)).
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         // First try exact match (could be namespaced or not)
         if let Some(tool) = self.tools.get(name).cloned() {
             return Some(tool);
         }
 
-        // If not found, search in all namespaces
-        for (key, tool) in &self.tools {
-            if key.ends_with(&format!("/{}", name)) {
-                return Some(tool.clone());
+        // Fast O(1) lookup using index instead of O(n) scan
+        if let Some(weak_tools) = self.tool_name_index.get(name) {
+            for weak_tool in weak_tools {
+                if let Some(tool) = weak_tool.upgrade() {
+                    return Some(tool);
+                }
             }
         }
 
@@ -93,14 +114,16 @@ impl ToolRegistry {
     }
 
     pub fn list(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        let count = self.tools.len();
+        self.tools.keys().cloned().collect::<Vec<_>>()
     }
 
     /// List tools from a specific namespace.
     pub fn list_namespace(&self, namespace: &str) -> Vec<String> {
+        let namespace_prefix = format!("{}/", namespace);
         self.tools
             .keys()
-            .filter(|name| name.starts_with(&format!("{}/", namespace)))
+            .filter(|name| name.starts_with(&namespace_prefix))
             .cloned()
             .collect()
     }
@@ -125,9 +148,55 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| ToolError::NotFound(name.to_string()))?;
-        let schema = tool.json_schema();
-        super::validate_args(&schema, &args)?;
+
+        let schema = if let Some(cached) = self.schema_cache.get(name).map(|r| r.clone()) {
+            cached
+        } else {
+            let schema = tool.cached_schema();
+            self.schema_cache.insert(name.to_string(), schema.clone());
+            schema
+        };
+
+        super::validate_args(schema.as_ref(), &args)?;
         tool.execute(args).await
+    }
+
+    /// Execute multiple tools in parallel for batch operations
+    /// Returns results in the same order as input requests
+    pub async fn execute_batch(
+        &self,
+        requests: Vec<(String, serde_json::Value)>
+    ) -> Vec<Result<serde_json::Value, ToolError>> {
+        use futures::future::join_all;
+
+        let futures: Vec<_> = requests
+            .into_iter()
+            .map(|(name, args)| {
+                let registry = self;
+                async move {
+                    let tool = registry.tools.get(&name).cloned();
+                    match tool {
+                        Some(tool) => {
+                            let schema = if let Some(cached) = registry.schema_cache.get(&name).map(|r| r.clone()) {
+                                cached
+                            } else {
+                                let schema = tool.cached_schema();
+                                registry.schema_cache.insert(name.clone(), schema.clone());
+                                schema
+                            };
+                            if let Err(e) = super::validate_args(schema.as_ref(), &args) {
+                                Err(e)
+                            } else {
+                                tool.execute(args).await
+                            }
+                        }
+                        None => Err(ToolError::NotFound(name)),
+                    }
+                }
+            })
+            .collect();
+
+        join_all(futures).await
     }
 
     pub fn to_openai_format(&self) -> Vec<serde_json::Value> {
@@ -140,11 +209,12 @@ impl ToolRegistry {
                     "function": {
                         "name": tool.name(),
                         "description": desc.short,
-                        "parameters": tool.json_schema()
+                        // 使用 cached_schema 避免重复分配
+                        "parameters": (*tool.cached_schema()).clone()
                     }
                 })
             })
-            .collect()
+            .collect::<Vec<_>>()
     }
 }
 
@@ -340,11 +410,112 @@ mod tests {
     async fn test_get_without_namespace_finds_in_namespace() {
         let mut registry = ToolRegistry::new();
         let tool = Arc::new(DummyTool);
-        
+
         registry.register_with_namespace(tool, "calc").unwrap();
-        
+
         // get without namespace should still find it
         let result = registry.get("dummy");
         assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_batch_execution_parallel() {
+        let mut registry = ToolRegistry::new();
+        let tool = Arc::new(DummyTool);
+        registry.register(tool.clone()).unwrap();
+
+        let requests = vec![
+            ("dummy".to_string(), serde_json::json!({})),
+            ("dummy".to_string(), serde_json::json!({})),
+            ("dummy".to_string(), serde_json::json!({})),
+        ];
+
+        let results = registry.execute_batch(requests).await;
+
+        assert_eq!(results.len(), 3);
+        for result in results {
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), serde_json::json!("executed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_execution_mixed_success_failure() {
+        let mut registry = ToolRegistry::new();
+        let tool = Arc::new(DummyTool);
+        registry.register(tool.clone()).unwrap();
+
+        let requests = vec![
+            ("dummy".to_string(), serde_json::json!({})),
+            ("nonexistent".to_string(), serde_json::json!({})),
+            ("dummy".to_string(), serde_json::json!({})),
+        ];
+
+        let results = registry.execute_batch(requests).await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err());
+        assert!(results[2].is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_batch_execution_performance() {
+        let mut registry = ToolRegistry::new();
+
+        struct DelayTool {
+            delay_ms: u64,
+        }
+
+        #[async_trait]
+        impl Tool for DelayTool {
+            fn name(&self) -> &str {
+                "delay"
+            }
+
+            fn description(&self) -> ToolDescription {
+                ToolDescription {
+                    short: "Tool with artificial delay".to_string(),
+                    parameters: "none".to_string(),
+                }
+            }
+
+            fn json_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                })
+            }
+
+            async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+                tokio::time::sleep(tokio::time::Duration::from_millis(self.delay_ms)).await;
+                Ok(serde_json::json!("done"))
+            }
+        }
+
+        let tool = Arc::new(DelayTool { delay_ms: 100 });
+        registry.register(tool).unwrap();
+
+        let tool_name = "delay".to_string();
+        let args = serde_json::json!({});
+        let num_calls = 5;
+
+        let requests = vec![(tool_name.clone(), args.clone()); num_calls];
+
+        let start_seq = std::time::Instant::now();
+        for _ in 0..num_calls {
+            let _ = registry.execute(&tool_name, args.clone()).await;
+        }
+        let seq_duration = start_seq.elapsed();
+
+        let start_batch = std::time::Instant::now();
+        let _ = registry.execute_batch(requests).await;
+        let batch_duration = start_batch.elapsed();
+
+        println!("Sequential execution: {:?}", seq_duration);
+        println!("Batch execution: {:?}", batch_duration);
+        println!("Speedup: {:.2}x", seq_duration.as_nanos() as f64 / batch_duration.as_nanos() as f64);
+
+        assert!(batch_duration < seq_duration, "Batch execution should be faster");
     }
 }

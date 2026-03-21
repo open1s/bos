@@ -1,0 +1,171 @@
+   Compiling agent v0.1.0 (/Users/gaosg/Projects/bos/crates/agent)
+warning: unused import: `ResourceContents`
+ --> crates/agent/src/mcp/client.rs:5:100
+  |
+5 | use super::protocol::{JsonRpcRequest, JsonRpcResponse, McpPrompt, McpResource, ReadResourceResult, ResourceContents, ServerCapabilities, ...
+  |                                                                                                    ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::agent::Message`
+ --> crates/agent/src/session/serializer.rs:2:5
+  |
+2 | use crate::agent::Message;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `SystemTime` and `UNIX_EPOCH`
+  --> crates/agent/src/session/mod.rs:11:17
+   |
+11 | use std::time::{SystemTime, UNIX_EPOCH};
+   |                 ^^^^^^^^^^  ^^^^^^^^^^
+
+warning: variable does not need to be mutable
+  --> crates/agent/src/scheduler/executor.rs:27:13
+   |
+27 |         let mut errors = Vec::new();
+   |             ----^^^^^^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Read`
+ --> crates/agent/src/session/serializer.rs:4:15
+  |
+4 | use std::io::{Read, Write};
+  |               ^^^^
+
+warning: unused variable: `name`
+   --> crates/agent/src/skills/loader.rs:353:14
+    |
+353 |         for (name, metadata) in &self.discovered {
+    |              ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `group_name`
+  --> crates/agent/src/scheduler/dsl.rs:75:9
+   |
+75 |         group_name: String,
+   |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_group_name`
+
+warning: unused variable: `identity`
+   --> crates/agent/src/scheduler/executor.rs:218:13
+    |
+218 |         let identity = AgentIdentity::new(
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_identity`
+
+warning: field `namespace` is never read
+   --> crates/agent/src/tools/registry.rs:163:5
+    |
+161 | struct NamespacedTool {
+    |        -------------- field in this struct
+162 |     inner: Arc<dyn Tool>,
+163 |     namespace: String,
+    |     ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `topic_prefix` and `agent_id` are never read
+  --> crates/agent/src/streaming/publisher.rs:31:5
+   |
+27 | pub struct TokenPublisherWrapper {
+   |            --------------------- fields in this struct
+...
+31 |     topic_prefix: String,
+   |     ^^^^^^^^^^^^
+32 |     agent_id: String,
+   |     ^^^^^^^^
+
+warning: function `instant_now` is never used
+  --> crates/agent/src/streaming/backpressure.rs:83:4
+   |
+83 | fn instant_now() -> Instant {
+   |    ^^^^^^^^^^^
+
+warning: associated functions `validate_skill_path`, `validate_frontmatter`, and `parse_frontmatter` are never used
+   --> crates/agent/src/skills/loader.rs:216:8
+    |
+ 12 | impl SkillLoader {
+    | ---------------- associated functions in this implementation
+...
+216 |     fn validate_skill_path(path: &Path) -> Result<(), SkillError> {
+    |        ^^^^^^^^^^^^^^^^^^^
+...
+231 |     fn validate_frontmatter(frontmatter: &serde_yaml::Value) -> Result<(), SkillError> {
+    |        ^^^^^^^^^^^^^^^^^^^^
+...
+291 |     fn parse_frontmatter(content: &str) -> Result<(serde_yaml::Value, String), SkillError> {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: method `execute_remotely` is never used
+   --> crates/agent/src/scheduler/executor.rs:208:14
+    |
+ 12 | impl Scheduler {
+    | -------------- method in this implementation
+...
+208 |     async fn execute_remotely(
+    |              ^^^^^^^^^^^^^^^^
+
+warning: variable `WeakTool` should have a snake case name
+  --> crates/agent/src/tools/registry.rs:29:13
+   |
+29 |         let WeakTool = Arc::downgrade(&tool);
+   |             ^^^^^^^^ help: convert the identifier to snake case: `weak_tool`
+   |
+   = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: variable `WeakWrapped` should have a snake case name
+  --> crates/agent/src/tools/registry.rs:55:13
+   |
+55 |         let WeakWrapped = Arc::downgrade(&wrapped);
+   |             ^^^^^^^^^^^ help: convert the identifier to snake case: `weak_wrapped`
+
+warning: `agent` (lib) generated 15 warnings (run `cargo fix --lib -p agent` to apply 7 suggestions)
+   Compiling agent-benches v0.1.0 (/Users/gaosg/Projects/bos/benches/agent)
+error[E0603]: enum `ToolError` is private
+  --> benches/agent/benches/tool_registry.rs:10:26
+   |
+10 | use agent::tools::{Tool, ToolError, ToolDescription, async_trait};
+   |                          ^^^^^^^^^ private enum
+   |
+note: the enum `ToolError` is defined here
+  --> /Users/gaosg/Projects/bos/crates/agent/src/tools/mod.rs:5:5
+   |
+ 5 | use crate::error::ToolError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+help: import `ToolError` directly
+   |
+10 | use agent::tools::{Tool, agent::error::ToolError, ToolDescription, async_trait};
+   |                          ++++++++++++++
+
+error[E0603]: attribute macro `async_trait` is private
+  --> benches/agent/benches/tool_registry.rs:10:54
+   |
+10 | use agent::tools::{Tool, ToolError, ToolDescription, async_trait};
+   |                                                      ^^^^^^^^^^^ private attribute macro
+   |
+note: the attribute macro `async_trait` is defined here
+  --> /Users/gaosg/Projects/bos/crates/agent/src/tools/mod.rs:3:5
+   |
+ 3 | use async_trait::async_trait;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+help: import `async_trait` directly
+   |
+10 | use agent::tools::{Tool, ToolError, ToolDescription, async_trait::async_trait};
+   |                                                                 +++++++++++++
+
+error[E0195]: lifetime parameters or bounds on method `execute` do not match the trait declaration
+  --> benches/agent/benches/tool_registry.rs:47:21
+   |
+47 |     async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+   |                     ^ lifetimes do not match method in trait
+   |
+  ::: /Users/gaosg/Projects/bos/crates/agent/src/tools/mod.rs:28:5
+   |
+28 |     async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError>;
+   |     ----------------------------------------------------------------------------------------- lifetimes in impl do not match this method in trait
+
+Some errors have detailed explanations: E0195, E0603.
+For more information about an error, try `rustc --explain E0195`.
+error: could not compile `agent-benches` (bench "tool_registry") due to 3 previous errors

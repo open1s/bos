@@ -4,6 +4,15 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 
 use crate::error::AgentError;
 
+fn trim_newline_suffix(s: &mut String) {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+}
+
 pub struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
@@ -80,13 +89,25 @@ impl StdioTransport {
         Ok(())
     }
 
-    pub async fn recv_line(&mut self) -> Result<String, TransportError> {
-        let mut line = String::new();
+    pub async fn recv_line(&mut self, buffer: &mut String) -> Result<(), TransportError> {
+        buffer.clear();
         self.stdout
-            .read_line(&mut line)
+            .read_line(buffer)
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?;
-        Ok(line.trim().to_string())
+        trim_newline_suffix(buffer);
+        Ok(())
+    }
+
+    pub async fn recv_line_with_capacity(
+        &mut self,
+        buffer: &mut String,
+        min_capacity: usize,
+    ) -> Result<(), TransportError> {
+        if buffer.capacity() < min_capacity {
+            buffer.reserve(min_capacity - buffer.capacity());
+        }
+        self.recv_line(buffer).await
     }
 
     pub async fn shutdown(mut self) -> Result<(), TransportError> {

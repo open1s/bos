@@ -6,9 +6,11 @@ use crate::llm::StreamToken;
 // New modules for bus streaming with backpressure
 pub mod publisher;
 pub mod backpressure;
+pub mod subscriber;
 
 // Re-exports from new modules
 pub use publisher::{TokenPublisherWrapper, TokenPublisher};
+pub use subscriber::{TokenSubscriber, SubscriberError, TokenCallback};
 
 // Backward compatibility alias
 pub type PublisherWrapper = TokenPublisherWrapper;

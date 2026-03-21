@@ -1,0 +1,12 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling bus v0.1.0 (/Users/gaosg/Projects/bos/crates/bus)
+error: lifetime may not live long enough
+  --> crates/bus/src/publisher.rs:71:9
+   |
+50 |         &self,
+   |         - let's call the lifetime of this reference `'1`
+...
+71 |         Ok(publisher)
+   |         ^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'static`
+
+error: could not compile `bus` (lib) due to 1 previous error
