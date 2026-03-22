@@ -4,7 +4,6 @@ use std::sync::{Arc, Weak};
 use super::{Tool, ToolError};
 use crate::tools::{ToolDescription, async_trait};
 use dashmap::DashMap;
-use serde_json::json;
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -30,8 +29,11 @@ impl ToolRegistry {
             )));
         }
 
-        let WeakTool = Arc::downgrade(&tool);
-        self.tool_name_index.entry(name.clone()).or_default().push(WeakTool);
+        let weak_tool = Arc::downgrade(&tool);
+        self.tool_name_index
+            .entry(name.clone())
+            .or_default()
+            .push(weak_tool);
 
         let schema = tool.cached_schema();
         self.schema_cache.insert(name.clone(), schema);
@@ -59,9 +61,12 @@ impl ToolRegistry {
         }
 
         // Create a wrapper tool with the namespaced name
-        let wrapped = Arc::new(NamespacedTool::new(tool, namespace.to_string(), tool_name.to_string()));
-        let WeakWrapped = Arc::downgrade(&wrapped);
-        self.tool_name_index.entry(tool_name.clone()).or_default().push(WeakWrapped);
+        let wrapped = Arc::new(NamespacedTool::new(tool, namespaced_name.clone()));
+        let weak_wrapped = Arc::downgrade(&wrapped);
+        self.tool_name_index
+            .entry(tool_name.clone())
+            .or_default()
+            .push(weak_wrapped);
         
         let schema = wrapped.cached_schema();
         self.schema_cache.insert(namespaced_name.clone(), schema);
@@ -114,7 +119,6 @@ impl ToolRegistry {
     }
 
     pub fn list(&self) -> Vec<String> {
-        let count = self.tools.len();
         self.tools.keys().cloned().collect::<Vec<_>>()
     }
 
@@ -221,16 +225,14 @@ impl ToolRegistry {
 /// A wrapper tool that prefixes its name with a namespace.
 struct NamespacedTool {
     inner: Arc<dyn Tool>,
-    namespace: String,
-    tool_name: String,
+    namespaced_name: String,
 }
 
 impl NamespacedTool {
-    fn new(tool: Arc<dyn Tool>, namespace: String, tool_name: String) -> Self {
+    fn new(tool: Arc<dyn Tool>, namespaced_name: String) -> Self {
         Self {
             inner: tool,
-            namespace,
-            tool_name,
+            namespaced_name,
         }
     }
 }
@@ -238,7 +240,7 @@ impl NamespacedTool {
 #[async_trait]
 impl Tool for NamespacedTool {
     fn name(&self) -> &str {
-        &self.tool_name
+        &self.namespaced_name
     }
 
     fn description(&self) -> ToolDescription {
@@ -336,6 +338,19 @@ mod tests {
         assert_eq!(format.len(), 1);
         assert_eq!(format[0]["type"], "function");
         assert_eq!(format[0]["function"]["name"], "dummy");
+    }
+
+    #[test]
+    fn test_namespaced_tool_uses_namespaced_name_in_openai_format() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_with_namespace(Arc::new(DummyTool), "calculator")
+            .unwrap();
+
+        let format = registry.to_openai_format();
+
+        assert_eq!(format.len(), 1);
+        assert_eq!(format[0]["function"]["name"], "calculator/dummy");
     }
 
     #[tokio::test]

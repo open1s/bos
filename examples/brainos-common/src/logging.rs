@@ -5,7 +5,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// # Example
 ///
 /// ```rust
-/// use brainos_examples::common::setup_logging;
+/// use brainos_common::setup_logging;
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,4 +1,4 @@
-use agent::{Agent, AgentConfig, LlmResponse, LlmRequest};
+use agent::{Agent, AgentConfig, LlmResponse};
 use brainos_common::MockLlmClient;
 use std::sync::Arc;
 
@@ -77,10 +77,10 @@ async fn demo_agent_multi_turn() {
     assert!(response1.contains("Hi"));
 
     let response2 = agent.run("Question 2?").await.unwrap();
-    assert!(response2.contains("Hi"));
+    assert!(response2.contains("Answer 2"));
 
     let response3 = agent.run("Question 3?").await.unwrap();
-    assert!(response3.contains("Hi"));
+    assert!(response3.contains("Answer 3"));
 }
 
 #[tokio::test]
@@ -128,9 +128,15 @@ async fn demo_agent_mock() {
         "Third response",
     ];
 
-    let mock_responses: Vec<LlmResponse> = expected_responses.iter().cloned().map(|text| {
-        LlmResponse::Text(text.to_string())
-    }).chain(std::iter::once(LlmResponse::Done)).collect();
+    let mock_responses: Vec<LlmResponse> = expected_responses
+        .iter()
+        .flat_map(|text| {
+            [
+                LlmResponse::Text((*text).to_string()),
+                LlmResponse::Done,
+            ]
+        })
+        .collect();
 
     let mock_llm = Arc::new(MockLlmClient::new(mock_responses));
     let mut agent = Agent::new(config, mock_llm);
@@ -139,9 +145,8 @@ async fn demo_agent_mock() {
     assert_eq!(response1, expected_responses[0]);
 
     let response2 = agent.run("Test 2").await.unwrap();
-    assert_eq!(response2, expected_responses[0]);
+    assert_eq!(response2, expected_responses[1]);
 
     let response3 = agent.run("Test 3").await.unwrap();
-    assert_eq!(response3, expected_responses[0]);
+    assert_eq!(response3, expected_responses[2]);
 }
-

@@ -1,5 +1,6 @@
 use std::pin::Pin;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -30,26 +31,39 @@ pub fn create_llm_client() -> Arc<dyn LlmClient> {
 }
 
 pub struct MockLlmClient {
-    pub responses: Vec<LlmResponse>,
+    responses: Mutex<VecDeque<LlmResponse>>,
 }
 
 impl MockLlmClient {
     pub fn new(responses: Vec<LlmResponse>) -> Self {
-        Self { responses }
+        Self {
+            responses: Mutex::new(responses.into()),
+        }
     }
 }
 
 #[async_trait]
 impl LlmClient for MockLlmClient {
     async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, agent::LlmError> {
-        Ok(self.responses.clone().into_iter().next().unwrap_or(LlmResponse::Done))
+        let response = self
+            .responses
+            .lock()
+            .expect("mock llm responses mutex poisoned")
+            .pop_front()
+            .unwrap_or(LlmResponse::Done);
+        Ok(response)
     }
 
     fn stream_complete(
         &self,
         _req: LlmRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, agent::LlmError>> + Send + '_>> {
-        let responses = self.responses.clone();
+        let responses: Vec<_> = self
+            .responses
+            .lock()
+            .expect("mock llm responses mutex poisoned")
+            .drain(..)
+            .collect();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
 
         tokio::spawn(async move {
