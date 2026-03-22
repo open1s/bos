@@ -53,7 +53,7 @@ impl Tool for BusToolClient {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         let json_args = args.to_string();
 
         let mut client = RpcClient::new(&self.service_name, &self.tool_name);

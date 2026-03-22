@@ -31,13 +31,13 @@ impl SseDecoder {
 
     pub fn decode_chunk(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         let text = String::from_utf8_lossy(chunk);
-        let mut events = Vec::new();
+        let mut events = Vec::with_capacity(4);
 
         for line in text.lines() {
             if line.is_empty() {
                 if !self.buffer.is_empty() {
                     let data = std::mem::take(&mut self.buffer);
-                    if data.trim() == "[DONE]" {
+                    if data == "[DONE]" {
                         events.push(SseEvent::Done);
                     } else {
                         events.push(SseEvent::Data(data));

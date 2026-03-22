@@ -42,14 +42,27 @@ impl MessageLog {
         self.messages.push(Message::Assistant(content));
     }
 
+    pub fn append_assistant_chunk(&mut self, chunk: &str) {
+        match self.messages.last_mut() {
+            Some(Message::Assistant(content)) => content.push_str(chunk),
+            _ => self.messages.push(Message::Assistant(chunk.to_string())),
+        }
+    }
+
     pub fn add_tool_result(&mut self, name: String, content: String) {
         self.messages.push(Message::ToolResult { name, content });
     }
 
     pub fn to_api_format(&self) -> Vec<OpenAiMessage> {
-        self.messages
-            .iter()
-            .map(|m| match m {
+        let mut api_messages = Vec::with_capacity(self.messages.len());
+        self.extend_api_format(&mut api_messages);
+        api_messages
+    }
+
+    pub fn extend_api_format(&self, target: &mut Vec<OpenAiMessage>) {
+        target.reserve(self.messages.len());
+        for message in &self.messages {
+            target.push(match message {
                 Message::User(content) => OpenAiMessage::User {
                     content: content.clone(),
                 },
@@ -60,8 +73,8 @@ impl MessageLog {
                     tool_call_id: name.clone(),
                     content: content.clone(),
                 },
-            })
-            .collect()
+            });
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -70,6 +83,13 @@ impl MessageLog {
 
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+}
+
+fn format_tool_result_content(result: serde_json::Value) -> String {
+    match result {
+        serde_json::Value::String(content) => content,
+        other => other.to_string(),
     }
 }
 
@@ -202,21 +222,21 @@ impl Agent {
         let config = self.config.clone();
         let messages = self.message_log.clone();
         let llm = self.llm.clone();
+        let tools_for_request = tools.as_ref().map(|t| t.to_openai_format_shared());
 
         tokio::spawn(async move {
             let mut messages = messages;
 
-            let mut request_messages = vec![OpenAiMessage::System {
+            let mut request_messages = Vec::with_capacity(messages.len() + 1);
+            request_messages.push(OpenAiMessage::System {
                 content: config.system_prompt.clone(),
-            }];
-            request_messages.extend(messages.to_api_format());
-
-            let tools_for_request = tools.as_ref().map(|t| t.to_openai_format());
+            });
+            messages.extend_api_format(&mut request_messages);
 
             let request = LlmRequest {
                 model: config.model.clone(),
                 messages: request_messages,
-                tools: tools_for_request,
+                tools: tools_for_request.clone(),
                 temperature: config.temperature,
                 max_tokens: config.max_tokens,
             };
@@ -232,14 +252,17 @@ impl Agent {
                         // Track message accumulation
                         match &token {
                             StreamToken::Text(s) => {
-                                messages.add_assistant(s.clone());
+                                messages.append_assistant_chunk(s);
                             }
                             StreamToken::ToolCall { name, args } => {
                                 if let Some(ref registry) = tools {
-                                    let result = registry.execute(name, args.clone()).await;
+                                    let result = registry.execute(name, args).await;
                                     match result {
                                         Ok(res) => {
-                                            messages.add_tool_result(name.clone(), res.to_string());
+                                            messages.add_tool_result(
+                                                name.clone(),
+                                                format_tool_result_content(res),
+                                            );
                                         }
                                         Err(e) => {
                                             let _ = tx.send(Err(AgentError::Tool(e))).await;
@@ -271,17 +294,19 @@ impl Agent {
     ) -> Result<AgentOutput, AgentError> {
         const MAX_ITERATIONS: usize = 10;
         let mut accumulated_text = String::new();
+        let tools_for_request = tools.map(ToolRegistry::to_openai_format_shared);
 
         for _ in 0..MAX_ITERATIONS {
-            let mut messages = vec![OpenAiMessage::System {
+            let mut messages = Vec::with_capacity(self.message_log.len() + 1);
+            messages.push(OpenAiMessage::System {
                 content: self.config.system_prompt.clone(),
-            }];
-            messages.extend(self.message_log.to_api_format());
+            });
+            self.message_log.extend_api_format(&mut messages);
 
             let request = LlmRequest {
                 model: self.config.model.clone(),
                 messages,
-                tools: tools.map(|t| t.to_openai_format()),
+                tools: tools_for_request.clone(),
                 temperature: self.config.temperature,
                 max_tokens: self.config.max_tokens,
             };
@@ -295,8 +320,9 @@ impl Agent {
                 }
                 LlmResponse::ToolCall { name, args } => {
                     if let Some(registry) = tools {
-                        let result = registry.execute(&name, args).await?;
-                        self.message_log.add_tool_result(name, result.to_string());
+                        let result = registry.execute(&name, &args).await?;
+                        self.message_log
+                            .add_tool_result(name, format_tool_result_content(result));
                     }
                 }
                 LlmResponse::Done => break,
@@ -310,6 +336,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_message_log_to_api_format() {
@@ -331,5 +358,41 @@ mod tests {
         assert!(log.is_empty());
         log.add_user("hi".to_string());
         assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn test_append_assistant_chunk_coalesces_stream_tokens() {
+        let mut log = MessageLog::new();
+        log.append_assistant_chunk("Hel");
+        log.append_assistant_chunk("lo");
+        log.add_user("next".to_string());
+        log.append_assistant_chunk("World");
+
+        assert_eq!(log.len(), 3);
+        let api = log.to_api_format();
+        assert!(matches!(
+            &api[0],
+            OpenAiMessage::Assistant { content } if content == "Hello"
+        ));
+        assert!(matches!(
+            &api[2],
+            OpenAiMessage::Assistant { content } if content == "World"
+        ));
+    }
+
+    #[test]
+    fn test_format_tool_result_content_preserves_plain_strings() {
+        assert_eq!(
+            format_tool_result_content(serde_json::Value::String("done".to_string())),
+            "done"
+        );
+    }
+
+    #[test]
+    fn test_format_tool_result_content_serializes_structured_json() {
+        assert_eq!(
+            format_tool_result_content(json!({"value": 42})),
+            r#"{"value":42}"#
+        );
     }
 }

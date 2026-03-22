@@ -32,7 +32,7 @@ pub trait Tool: Send + Sync {
         Arc::new(self.json_schema())
     }
     
-    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError>;
+    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError>;
 }
 
 #[async_trait]
@@ -49,7 +49,7 @@ impl Tool for Box<dyn Tool> {
         (**self).json_schema()
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         (**self).execute(args).await
     }
 }
@@ -68,7 +68,7 @@ impl Tool for Arc<dyn Tool> {
         (**self).json_schema()
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         (**self).execute(args).await
     }
 }

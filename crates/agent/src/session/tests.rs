@@ -336,6 +336,7 @@ async fn test_session_cache_performance() {
 
     // Create session
     manager.create("cache-test".to_string()).await.unwrap();
+    manager.clear_cache().await;
 
     // First read - loads from storage
     let start = std::time::Instant::now();

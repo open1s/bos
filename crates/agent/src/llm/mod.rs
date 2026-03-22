@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -30,7 +31,7 @@ pub enum OpenAiMessage {
 pub struct LlmRequest {
     pub model: String,
     pub messages: Vec<OpenAiMessage>,
-    pub tools: Option<Vec<serde_json::Value>>,
+    pub tools: Option<Arc<Vec<serde_json::Value>>>,
     pub temperature: f32,
     pub max_tokens: Option<u32>,
 }

@@ -45,9 +45,9 @@ impl Tool for McpToolAdapter {
         self.input_schema.clone()
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         self.client
-            .call_tool(&self.tool_name, args)
+            .call_tool(&self.tool_name, args.clone())
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
     }

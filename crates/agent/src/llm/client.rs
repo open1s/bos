@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::borrow::Cow;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -12,7 +13,7 @@ use crate::streaming::{SseDecoder, SseEvent};
 
 pub struct OpenAiClient {
     client: Client,
-    base_url: String,
+    chat_completions_url: String,
     api_key: String,
 }
 
@@ -30,7 +31,7 @@ struct OpenAiRequest {
 
 #[derive(Serialize, Clone)]
 struct OpenAiMessageJson {
-    role: String,
+    role: &'static str,
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
@@ -66,67 +67,73 @@ struct FunctionCall {
 }
 
 #[derive(Deserialize)]
-struct StreamChoice {
-    delta: StreamDelta,
+#[serde(bound(deserialize = "'de: 'a"))]
+struct BorrowedStreamChoice<'a> {
+    #[serde(borrow)]
+    delta: BorrowedStreamDelta<'a>,
 }
 
 #[derive(Deserialize)]
-struct StreamDelta {
-    content: Option<String>,
-    tool_calls: Option<Vec<StreamToolCall>>,
+#[serde(bound(deserialize = "'de: 'a"))]
+struct BorrowedStreamDelta<'a> {
+    content: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    tool_calls: Option<Vec<BorrowedStreamToolCall<'a>>>,
 }
 
 #[derive(Deserialize)]
-struct StreamToolCall {
+#[serde(bound(deserialize = "'de: 'a"))]
+struct BorrowedStreamToolCall<'a> {
+    #[serde(borrow)]
     #[serde(rename = "function")]
-    function: StreamFunctionCall,
+    function: BorrowedStreamFunctionCall<'a>,
 }
 
 #[derive(Deserialize)]
-struct StreamFunctionCall {
-    name: Option<String>,
-    arguments: Option<String>,
+#[serde(bound(deserialize = "'de: 'a"))]
+struct BorrowedStreamFunctionCall<'a> {
+    name: Option<Cow<'a, str>>,
+    arguments: Option<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]
-struct OpenAiStreamResponse {
-    choices: Vec<StreamChoice>,
+#[serde(bound(deserialize = "'de: 'a"))]
+struct BorrowedOpenAiStreamResponse<'a> {
+    #[serde(borrow)]
+    choices: Vec<BorrowedStreamChoice<'a>>,
 }
 
 impl OpenAiClient {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
             client: Client::new(),
-            base_url,
+            chat_completions_url: format!("{}/chat/completions", base_url),
             api_key,
         }
     }
 
     fn build_request(&self, req: LlmRequest, stream: bool) -> OpenAiRequest {
-        let messages = req
-            .messages
-            .into_iter()
-            .map(|m| {
-                let (role, content, tool_call_id) = match m {
-                    OpenAiMessage::System { content } => ("system", content, None),
-                    OpenAiMessage::User { content } => ("user", content, None),
-                    OpenAiMessage::Assistant { content } => ("assistant", content, None),
-                    OpenAiMessage::ToolResult { tool_call_id, content } => {
-                        ("tool", content, Some(tool_call_id))
-                    }
-                };
-                OpenAiMessageJson {
-                    role: role.to_string(),
-                    content,
-                    tool_call_id,
+        let mut messages = Vec::with_capacity(req.messages.len());
+        for message in req.messages {
+            let (role, content, tool_call_id) = match message {
+                OpenAiMessage::System { content } => ("system", content, None),
+                OpenAiMessage::User { content } => ("user", content, None),
+                OpenAiMessage::Assistant { content } => ("assistant", content, None),
+                OpenAiMessage::ToolResult { tool_call_id, content } => {
+                    ("tool", content, Some(tool_call_id))
                 }
-            })
-            .collect();
+            };
+            messages.push(OpenAiMessageJson {
+                role,
+                content,
+                tool_call_id,
+            });
+        }
 
         OpenAiRequest {
             model: req.model,
             messages,
-            tools: req.tools,
+            tools: req.tools.map(|tools| (*tools).clone()),
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             stream,
@@ -134,19 +141,19 @@ impl OpenAiClient {
     }
 
     fn parse_token(line: &str) -> Option<StreamToken> {
-        let data: OpenAiStreamResponse = serde_json::from_str(line).ok()?;
+        let data: BorrowedOpenAiStreamResponse<'_> = serde_json::from_str(line).ok()?;
         for choice in data.choices {
             if let Some(content) = choice.delta.content {
                 if !content.is_empty() {
-                    return Some(StreamToken::Text(content));
+                    return Some(StreamToken::Text(content.into_owned()));
                 }
             }
             if let Some(calls) = choice.delta.tool_calls {
                 for call in calls {
-                    if let (Some(name), Some(args)) = (&call.function.name, &call.function.arguments) {
-                        let args_val: serde_json::Value = serde_json::from_str(args).ok()?;
+                    if let (Some(name), Some(args)) = (call.function.name, call.function.arguments) {
+                        let args_val: serde_json::Value = serde_json::from_str(args.as_ref()).ok()?;
                         return Some(StreamToken::ToolCall {
-                            name: name.clone(),
+                            name: name.into_owned(),
                             args: args_val,
                         });
                     }
@@ -155,16 +162,19 @@ impl OpenAiClient {
         }
         None
     }
+
+    pub fn parse_stream_token(line: &str) -> Option<StreamToken> {
+        Self::parse_token(line)
+    }
 }
 
 #[async_trait]
 impl LlmClient for OpenAiClient {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
         let openai_req = self.build_request(req, false);
-        let url = format!("{}/chat/completions", self.base_url);
         let response = self
             .client
-            .post(&url)
+            .post(&self.chat_completions_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&openai_req)
@@ -208,7 +218,7 @@ impl LlmClient for OpenAiClient {
         &self,
         req: LlmRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send + '_>> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = self.chat_completions_url.clone();
         let api_key = self.api_key.clone();
         let client = self.client.clone();
         let openai_req = serde_json::to_string(&self.build_request(req, true)).ok();
@@ -254,10 +264,9 @@ impl LlmClient for OpenAiClient {
                 }
             };
 
-            let text = String::from_utf8_lossy(&body_bytes);
             let mut decoder = SseDecoder::new();
 
-            for event in decoder.decode_chunk(text.as_bytes()) {
+            for event in decoder.decode_chunk(body_bytes.as_ref()) {
                 let token = match event {
                     SseEvent::Data(line) => {
                         Self::parse_token(&line).map(Ok)
@@ -283,5 +292,34 @@ impl LlmClient for OpenAiClient {
 
     fn provider_name(&self) -> &'static str {
         "openai"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_token_text() {
+        let json = r#"{"choices":[{"delta":{"content":"Hello"}}]}"#;
+        let token = OpenAiClient::parse_token(json);
+
+        assert!(matches!(token, Some(StreamToken::Text(ref text)) if text == "Hello"));
+    }
+
+    #[test]
+    fn test_parse_token_tool_call() {
+        let json = r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"test_tool","arguments":"{\"param\":\"value\"}"}}]}}]}"#;
+        let token = OpenAiClient::parse_token(json);
+
+        assert!(
+            matches!(
+                token,
+                Some(StreamToken::ToolCall { ref name, ref args })
+                    if name == "test_tool" && args["param"] == "value"
+            ),
+            "unexpected token: {:?}",
+            token
+        );
     }
 }

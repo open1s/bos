@@ -6,9 +6,19 @@
 //! - Request building overhead
 //! - Token parsing from SSE events
 
-use agent::llm::{LlmRequest, OpenAiMessage, StreamToken};
+use agent::llm::{OpenAiMessage, OpenAiClient, StreamToken};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use serde::Serialize;
 use std::time::Duration;
+
+#[derive(Serialize)]
+struct BenchRequest {
+    model: String,
+    messages: Vec<OpenAiMessage>,
+    tools: Option<Vec<serde_json::Value>>,
+    temperature: f32,
+    max_tokens: Option<u32>,
+}
 
 /// Benchmark JSON parsing for streaming tokens
 ///
@@ -59,7 +69,7 @@ fn bench_request_building(c: &mut Criterion) {
 
     // Benchmark building simple request
     group.bench_function("simple_request", |b| {
-        let req = LlmRequest {
+        let req = BenchRequest {
             model: "gpt-4".to_string(),
             messages: vec![
                 OpenAiMessage::System {
@@ -90,7 +100,7 @@ fn bench_request_building(c: &mut Criterion) {
             }
         })];
 
-        let req = LlmRequest {
+        let req = BenchRequest {
             model: "gpt-4".to_string(),
             messages: vec![
                 OpenAiMessage::System {
@@ -132,7 +142,7 @@ fn bench_request_building(c: &mut Criterion) {
                     }
                 }
 
-                let req = LlmRequest {
+                let req = BenchRequest {
                     model: "gpt-4".to_string(),
                     messages,
                     tools: None,
@@ -196,6 +206,40 @@ fn bench_token_parsing(c: &mut Criterion) {
             let data: serde_json::Value = serde_json::from_str(black_box(json)).unwrap();
             let content = data["choices"][0]["delta"]["content"].as_str();
             let _is_empty = content.map_or(true, |s| s.is_empty());
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark the real OpenAI stream token parser.
+///
+/// This uses the production parser instead of a hand-written approximation,
+/// so subsequent optimizations can be measured against the actual hot path.
+fn bench_actual_parse_token(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actual_parse_token");
+    group.measurement_time(Duration::from_secs(10));
+    group.warm_up_time(Duration::from_secs(3));
+    group.sample_size(200);
+
+    group.bench_function("text_token", |b| {
+        let json = r#"{"choices":[{"delta":{"content":"Hello"}}]}"#;
+        b.iter(|| {
+            let _token = OpenAiClient::parse_stream_token(black_box(json));
+        });
+    });
+
+    group.bench_function("tool_call_token", |b| {
+        let json = r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"test_tool","arguments":"{\"param\":\"value\"}"}}]}}]}"#;
+        b.iter(|| {
+            let _token = OpenAiClient::parse_stream_token(black_box(json));
+        });
+    });
+
+    group.bench_function("empty_token", |b| {
+        let json = r#"{"choices":[{"delta":{}}]}"#;
+        b.iter(|| {
+            let _token = OpenAiClient::parse_stream_token(black_box(json));
         });
     });
 
@@ -344,6 +388,7 @@ criterion_group!(
     bench_json_parsing,
     bench_request_building,
     bench_token_parsing,
+    bench_actual_parse_token,
     bench_message_serialization,
     bench_tool_serialization
 );

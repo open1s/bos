@@ -311,7 +311,7 @@ impl Tool for BobToolInvoker {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<Value, ToolError> {
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let service_name = format!("agent/{}/tools/{}", self.bob.id, self.name);
 
         let mut client = RpcClient::new(&service_name, &self.name);
@@ -319,7 +319,7 @@ impl Tool for BobToolInvoker {
         client.init(self.session.clone()).await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-        let json = serde_json::to_string(&args)
+        let json = serde_json::to_string(args)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         let payload = JsonPayload { json };

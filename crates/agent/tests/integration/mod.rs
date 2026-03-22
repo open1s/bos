@@ -100,7 +100,7 @@ async fn test_agent_with_tool_call() {
             })
         }
 
-        async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
             let a = args["a"].as_f64().unwrap_or(0.0);
             let b = args["b"].as_f64().unwrap_or(0.0);
             Ok(serde_json::json!(a + b))
@@ -238,7 +238,7 @@ async fn test_tool_schema_validation() {
             })
         }
 
-        async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
             let a = args["a"].as_f64().ok_or_else(|| {
                 ToolError::SchemaMismatch("field 'a' is required".to_string())
             })?;
@@ -252,9 +252,8 @@ async fn test_tool_schema_validation() {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(AddTool)).unwrap();
 
-    let result = registry
-        .execute("add", serde_json::json!({"a": "not a number", "b": 2}))
-        .await;
+    let args = serde_json::json!({"a": "not a number", "b": 2});
+    let result = registry.execute("add", &args).await;
 
     assert!(result.is_err());
 }
@@ -280,7 +279,7 @@ fn test_duplicate_tool_registration() {
             serde_json::json!({})
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        async fn execute(&self, _args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
             Ok(serde_json::json!("executed"))
         }
     }

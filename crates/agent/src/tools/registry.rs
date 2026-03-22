@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::sync::RwLock;
 
 use super::{Tool, ToolError};
 use crate::tools::{ToolDescription, async_trait};
@@ -8,7 +9,11 @@ use dashmap::DashMap;
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     tool_name_index: HashMap<String, Vec<Weak<dyn Tool>>>,
+    namespaced_tool_index: HashMap<String, HashMap<String, Weak<dyn Tool>>>,
+    namespace_index: HashMap<String, Vec<String>>,
+    namespaces: Vec<String>,
     schema_cache: DashMap<String, Arc<serde_json::Value>>,  // Arc 共享，零拷贝
+    openai_format_cache: RwLock<Arc<Vec<serde_json::Value>>>,
 }
 
 impl ToolRegistry {
@@ -16,7 +21,11 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             tool_name_index: HashMap::new(),
+            namespaced_tool_index: HashMap::new(),
+            namespace_index: HashMap::new(),
+            namespaces: Vec::new(),
             schema_cache: DashMap::new(),
+            openai_format_cache: RwLock::new(Arc::new(Vec::new())),
         }
     }
 
@@ -37,6 +46,7 @@ impl ToolRegistry {
 
         let schema = tool.cached_schema();
         self.schema_cache.insert(name.clone(), schema);
+        self.push_openai_format_entry(tool.as_ref());
 
         self.tools.insert(name, tool);
         Ok(())
@@ -66,10 +76,21 @@ impl ToolRegistry {
         self.tool_name_index
             .entry(tool_name.clone())
             .or_default()
-            .push(weak_wrapped);
+            .push(weak_wrapped.clone());
+        self.namespaced_tool_index
+            .entry(namespace.to_string())
+            .or_default()
+            .insert(tool_name.clone(), weak_wrapped);
+
+        let namespace_entry = self.namespace_index.entry(namespace.to_string()).or_default();
+        if namespace_entry.is_empty() {
+            self.namespaces.push(namespace.to_string());
+        }
+        namespace_entry.push(namespaced_name.clone());
         
         let schema = wrapped.cached_schema();
         self.schema_cache.insert(namespaced_name.clone(), schema);
+        self.push_openai_format_entry(wrapped.as_ref());
         
         self.tools.insert(namespaced_name, wrapped);
         Ok(())
@@ -114,8 +135,10 @@ impl ToolRegistry {
         name: &str,
         namespace: &str,
     ) -> Option<Arc<dyn Tool>> {
-        let namespaced_name = format!("{}/{}", namespace, name);
-        self.tools.get(&namespaced_name).cloned()
+        self.namespaced_tool_index
+            .get(namespace)
+            .and_then(|tools| tools.get(name))
+            .and_then(Weak::upgrade)
     }
 
     pub fn list(&self) -> Vec<String> {
@@ -124,29 +147,21 @@ impl ToolRegistry {
 
     /// List tools from a specific namespace.
     pub fn list_namespace(&self, namespace: &str) -> Vec<String> {
-        let namespace_prefix = format!("{}/", namespace);
-        self.tools
-            .keys()
-            .filter(|name| name.starts_with(&namespace_prefix))
+        self.namespace_index
+            .get(namespace)
             .cloned()
-            .collect()
+            .unwrap_or_default()
     }
 
     /// List all available namespaces.
     pub fn list_namespaces(&self) -> Vec<String> {
-        let mut namespaces: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for name in self.tools.keys() {
-            if let Some(pos) = name.find('/') {
-                namespaces.insert(name[..pos].to_string());
-            }
-        }
-        namespaces.into_iter().collect()
+        self.namespaces.clone()
     }
 
     pub async fn execute(
         &self,
         name: &str,
-        args: serde_json::Value,
+        args: &serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
         let tool = self
             .tools
@@ -161,7 +176,7 @@ impl ToolRegistry {
             schema
         };
 
-        super::validate_args(schema.as_ref(), &args)?;
+        super::validate_args(schema.as_ref(), args)?;
         tool.execute(args).await
     }
 
@@ -191,7 +206,7 @@ impl ToolRegistry {
                             if let Err(e) = super::validate_args(schema.as_ref(), &args) {
                                 Err(e)
                             } else {
-                                tool.execute(args).await
+                                tool.execute(&args).await
                             }
                         }
                         None => Err(ToolError::NotFound(name)),
@@ -204,21 +219,34 @@ impl ToolRegistry {
     }
 
     pub fn to_openai_format(&self) -> Vec<serde_json::Value> {
-        self.tools
-            .values()
-            .map(|tool| {
-                let desc = tool.description();
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name(),
-                        "description": desc.short,
-                        // 使用 cached_schema 避免重复分配
-                        "parameters": (*tool.cached_schema()).clone()
-                    }
-                })
-            })
-            .collect::<Vec<_>>()
+        self.to_openai_format_shared().as_ref().clone()
+    }
+
+    pub fn to_openai_format_shared(&self) -> Arc<Vec<serde_json::Value>> {
+        self.openai_format_cache
+            .read()
+            .expect("openai_format_cache poisoned")
+            .clone()
+    }
+
+    fn push_openai_format_entry(&self, tool: &dyn Tool) {
+        let mut cache = self
+            .openai_format_cache
+            .write()
+            .expect("openai_format_cache poisoned");
+        Arc::make_mut(&mut cache).push(Self::build_openai_format_entry(tool));
+    }
+
+    fn build_openai_format_entry(tool: &dyn Tool) -> serde_json::Value {
+        let desc = tool.description();
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": tool.name(),
+                "description": desc.short,
+                "parameters": (*tool.cached_schema()).clone()
+            }
+        })
     }
 }
 
@@ -251,7 +279,7 @@ impl Tool for NamespacedTool {
         self.inner.json_schema()
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         self.inner.execute(args).await
     }
 }
@@ -290,7 +318,7 @@ mod tests {
             })
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        async fn execute(&self, _args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
             Ok(serde_json::json!("executed"))
         }
     }
@@ -318,7 +346,8 @@ mod tests {
     async fn test_execute() {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(DummyTool)).unwrap();
-        let result = registry.execute("dummy", serde_json::json!({})).await;
+        let args = serde_json::json!({});
+        let result = registry.execute("dummy", &args).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), serde_json::json!("executed"));
     }
@@ -326,7 +355,8 @@ mod tests {
     #[tokio::test]
     async fn test_not_found() {
         let registry = ToolRegistry::new();
-        let result = registry.execute("nonexistent", serde_json::json!({})).await;
+        let args = serde_json::json!({});
+        let result = registry.execute("nonexistent", &args).await;
         assert!(matches!(result, Err(ToolError::NotFound(_))));
     }
 
@@ -351,6 +381,24 @@ mod tests {
 
         assert_eq!(format.len(), 1);
         assert_eq!(format[0]["function"]["name"], "calculator/dummy");
+    }
+
+    #[test]
+    fn test_openai_format_cache_stays_in_sync_after_registration() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DummyTool)).unwrap();
+        assert_eq!(registry.to_openai_format().len(), 1);
+
+        registry
+            .register_with_namespace(Arc::new(DummyTool), "calculator")
+            .unwrap();
+
+        let format = registry.to_openai_format();
+        assert_eq!(format.len(), 2);
+        assert!(format.iter().any(|entry| entry["function"]["name"] == "dummy"));
+        assert!(format
+            .iter()
+            .any(|entry| entry["function"]["name"] == "calculator/dummy"));
     }
 
     #[tokio::test]
@@ -416,7 +464,8 @@ mod tests {
         registry.register_with_namespace(tool, "calc").unwrap();
         
         // Execute with namespaced name
-        let result = registry.execute("calc/dummy", serde_json::json!({})).await;
+        let args = serde_json::json!({});
+        let result = registry.execute("calc/dummy", &args).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), serde_json::json!("executed"));
     }
@@ -502,7 +551,7 @@ mod tests {
                 })
             }
 
-            async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            async fn execute(&self, _args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
                 tokio::time::sleep(tokio::time::Duration::from_millis(self.delay_ms)).await;
                 Ok(serde_json::json!("done"))
             }
@@ -519,7 +568,7 @@ mod tests {
 
         let start_seq = std::time::Instant::now();
         for _ in 0..num_calls {
-            let _ = registry.execute(&tool_name, args.clone()).await;
+            let _ = registry.execute(&tool_name, &args).await;
         }
         let seq_duration = start_seq.elapsed();
 

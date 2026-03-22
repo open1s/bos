@@ -46,7 +46,7 @@ impl Tool for DummyTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    async fn execute(&self, _args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         Ok(serde_json::json!("executed"))
     }
 }
@@ -256,7 +256,8 @@ fn bench_tool_execution(c: &mut Criterion) {
         registry.register(Arc::new(DummyTool::new("test_tool"))).unwrap();
 
         b.to_async(&rt).iter(|| async {
-            let result = registry.execute("test_tool", serde_json::json!({})).await;
+            let args = serde_json::json!({});
+            let result = registry.execute("test_tool", &args).await;
             black_box(result.unwrap());
         });
     });
@@ -266,7 +267,8 @@ fn bench_tool_execution(c: &mut Criterion) {
         let registry = ToolRegistry::new();
 
         b.to_async(&rt).iter(|| async {
-            let result = registry.execute("nonexistent", serde_json::json!({})).await;
+            let args = serde_json::json!({});
+            let result = registry.execute("nonexistent", &args).await;
             black_box(result);
         });
     });

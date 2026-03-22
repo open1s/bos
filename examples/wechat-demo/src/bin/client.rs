@@ -33,7 +33,7 @@ impl Tool for StreamingAssistant {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<Value, ToolError> {
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let prompt = args["prompt"]
             .as_str()
             .ok_or_else(|| ToolError::SchemaMismatch { message: "prompt is required".to_string() })?;
