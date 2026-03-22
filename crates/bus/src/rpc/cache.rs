@@ -78,15 +78,19 @@ impl ServiceCache {
     }
 
     /// Get a cached service by name. Returns `None` if expired or missing.
+    /// Removes expired entries lazily on access.
     pub async fn get_service(&self, name: &str) -> Option<DiscoveryInfo> {
-        let services = self.services.read().await;
-        services.get(name).and_then(|e| {
+        let mut services = self.services.write().await;
+        if let Some(e) = services.get(name) {
             if e.is_expired() {
+                services.remove(name);
                 None
             } else {
                 Some(e.value.clone())
             }
-        })
+        } else {
+            None
+        }
     }
 
     /// Get all non-expired cached services.
@@ -125,15 +129,19 @@ impl ServiceCache {
     }
 
     /// Get a cached health status by service name.
+    /// Removes expired entries lazily on access.
     pub async fn get_health(&self, name: &str) -> Option<HealthStatus> {
-        let health = self.health.read().await;
-        health.get(name).and_then(|e| {
+        let mut health = self.health.write().await;
+        if let Some(e) = health.get(name) {
             if e.is_expired() {
+                health.remove(name);
                 None
             } else {
                 Some(e.value.clone())
             }
-        })
+        } else {
+            None
+        }
     }
 
     /// Clean up expired entries from health cache.

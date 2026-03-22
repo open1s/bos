@@ -269,7 +269,7 @@ fn bench_tool_execution(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             let args = serde_json::json!({});
             let result = registry.execute("nonexistent", &args).await;
-            black_box(result);
+            let _ =black_box(result);
         });
     });
 
