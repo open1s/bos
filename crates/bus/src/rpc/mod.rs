@@ -113,7 +113,7 @@ mod tests {
         let topic = "rpc/services/discovery-query-test";
         let mut sub: crate::SubscriberWrapper<crate::rpc::discovery::DiscoveryInfo> =
             crate::SubscriberWrapper::new(topic);
-        sub.init(&session).await.expect("Failed to init subscriber");
+        sub.init(session.clone()).await.expect("Failed to init subscriber");
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Now publish the announcement
@@ -140,7 +140,7 @@ mod tests {
         let info = DiscoveryInfo::new(service_name);
 
         let mut sub: crate::SubscriberWrapper<DiscoveryInfo> = crate::SubscriberWrapper::new(&topic);
-        sub.init(&session).await.expect("Failed to init subscriber");
+        sub.init(session.clone()).await.expect("Failed to init subscriber");
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let data = Codec
@@ -162,10 +162,9 @@ mod tests {
         let topic = "debug/test-pubsub";
         
         let mut sub: crate::SubscriberWrapper<String> = crate::SubscriberWrapper::new(topic);
-        sub.init(&session).await.expect("Failed to init subscriber");
+        sub.init(session.clone()).await.expect("Failed to init subscriber");
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        let pub_: crate::PublisherWrapper = crate::PublisherWrapper::new(topic)
-            .with_session(&session);
+        let pub_: crate::PublisherWrapper = crate::PublisherWrapper::from_session(topic, session.clone());
         pub_.publish(&session, &"hello".to_string()).await.expect("Publish failed");
         let result = sub.recv_with_timeout(tokio::time::Duration::from_secs(1)).await;
         assert!(result.is_some(), "Should have received the published message");
@@ -192,7 +191,7 @@ mod tests {
 
         let mut discovery_sub: crate::SubscriberWrapper<DiscoveryInfo> =
             crate::SubscriberWrapper::new("rpc/services/test-service");
-        discovery_sub.init(&session).await.expect("Failed to init discovery subscriber");
+        discovery_sub.init(session.clone()).await.expect("Failed to init discovery subscriber");
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         service.announce().await.expect("Failed to announce service");

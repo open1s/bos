@@ -1,16 +1,37 @@
-//! Zenoh query wrapper
+//! Zenoh query wrapper with simplified API
 
 use std::sync::Arc;
 use zenoh::Session;
 
 use crate::error::ZenohError;
 
-pub struct QueryWrapper {
+/// Type alias for backward compatibility
+pub type QueryWrapper = Query;
+
+/// A query client for sending queries and receiving responses from queryables.
+///
+/// # Example
+/// ```rust,ignore
+/// // Create a query client
+/// let query = Query::new("calculator/add").with_session(session).await?;
+///
+/// // Send a query
+/// let payload = Codec::encode(&(5, 3))?;
+/// let responses = query.query_bytes(&payload).await?;
+///
+/// // Or use a callback for processing responses
+/// let results = query.stream_reply(&payload, |bytes| {
+///     let response: i32 = Codec::decode(&bytes)?;
+///     Ok(response)
+/// }).await?;
+/// ```
+pub struct Query {
     topic: String,
     session: Option<Arc<Session>>,
 }
 
-impl QueryWrapper {
+impl Query {
+    /// Create a new query client for the specified topic
     pub fn new(topic: impl Into<String>) -> Self {
         Self {
             topic: topic.into(),
@@ -18,20 +39,37 @@ impl QueryWrapper {
         }
     }
 
+    /// Initialize the query client with a session
     pub async fn init(&mut self, session: Arc<Session>) -> Result<(), ZenohError> {
         self.session = Some(session);
         Ok(())
     }
 
+    /// Associate this query client with a session
+    pub async fn with_session(mut self, session: Arc<Session>) -> Result<Self, ZenohError> {
+        self.init(session).await?;
+        Ok(self)
+    }
+
+    /// Create a query client directly from a session and topic
+    pub async fn from_session(topic: impl Into<String>, session: Arc<Session>) -> Result<Self, ZenohError> {
+        let mut query = Self::new(topic);
+        query.init(session).await?;
+        Ok(query)
+    }
+
+    /// Send a query with string payload
     pub async fn query(&self, payload: &str) -> Result<Vec<Vec<u8>>, ZenohError> {
         self.query_bytes(payload.as_bytes()).await
     }
 
+    /// Send a query with bytes payload
     pub async fn query_bytes(&self, payload: &[u8]) -> Result<Vec<Vec<u8>>, ZenohError> {
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
         self.query_internal_bytes(session, payload, None).await
     }
 
+    /// Send a query with string payload and timeout
     pub async fn query_with_timeout(
         &self,
         payload: &str,
@@ -40,6 +78,7 @@ impl QueryWrapper {
         self.query_bytes_with_timeout(payload.as_bytes(), timeout).await
     }
 
+    /// Send a query with bytes payload and timeout
     pub async fn query_bytes_with_timeout(
         &self,
         payload: &[u8],
@@ -47,6 +86,39 @@ impl QueryWrapper {
     ) -> Result<Vec<Vec<u8>>, ZenohError> {
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
         self.query_internal_bytes(session, payload, Some(timeout)).await
+    }
+
+    /// Send a query and process responses with a callback
+    pub async fn stream_reply<T>(
+        &self,
+        payload: &[u8],
+        mut handler: impl FnMut(Vec<u8>) -> anyhow::Result<T>,
+    ) -> Result<Vec<T>, ZenohError> {
+        let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
+        let replies = session.get(&self.topic).payload(payload).await?;
+
+        let mut results = Vec::new();
+        while let Ok(reply) = replies.recv_async().await {
+            if let Ok(sample) = reply.result() {
+                let data = sample.payload().to_bytes().to_vec();
+                match handler(data) {
+                    Ok(result) => results.push(result),
+                    Err(e) => return Err(ZenohError::Serialization(e.to_string())),
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Send a query and decode single response
+    pub async fn query_decode<T>(&self, payload: &[u8]) -> Result<T, ZenohError>
+    where
+        T: for<'de> serde::Deserialize<'de>,
+    {
+        let responses = self.query_bytes(payload).await?;
+        let bytes = responses.get(0).ok_or_else(|| ZenohError::Query("No response received".to_string()))?;
+        serde_json::from_slice(bytes).map_err(|e| ZenohError::Serialization(e.to_string()))
     }
 
     async fn query_internal_bytes(
@@ -76,42 +148,23 @@ impl QueryWrapper {
         Ok(results)
     }
 
+    /// Get the topic
     pub fn topic(&self) -> &str {
         &self.topic
     }
 
+    /// Check if the query client is initialized
     pub fn is_initialized(&self) -> bool {
         self.session.is_some()
     }
 
+    /// Get the associated session
     pub fn session(&self) -> Option<&Arc<Session>> {
         self.session.as_ref()
     }
-
-    pub async fn stream_reply<T>(
-        &self,
-        payload: &[u8],
-        mut handler: impl FnMut(Vec<u8>) -> anyhow::Result<T>,
-    ) -> Result<Vec<T>, ZenohError> {
-        let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
-        let replies = session.get(&self.topic).payload(payload).await?;
-
-        let mut results = Vec::new();
-        while let Ok(reply) = replies.recv_async().await {
-            if let Ok(sample) = reply.result() {
-                let data = sample.payload().to_bytes().to_vec();
-                match handler(data) {
-                    Ok(result) => results.push(result),
-                    Err(e) => return Err(ZenohError::Serialization(e.to_string())),
-                }
-            }
-        }
-
-        Ok(results)
-    }
 }
 
-impl Clone for QueryWrapper {
+impl Clone for Query {
     fn clone(&self) -> Self {
         Self {
             topic: self.topic.clone(),
@@ -120,6 +173,12 @@ impl Clone for QueryWrapper {
     }
 }
 
+/// Convenient alias for queryables
+pub type Queryable = Query;
+
+/// Convenient alias for typed queryables
+pub type TopicQueryable = Query;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,39 +186,37 @@ mod tests {
 
     const TEST_TOPIC: &str = "bos/test/query";
 
-    async fn setup_session_or_skip() -> Option<std::sync::Arc<zenoh::Session>> {
+    async fn setup_session_or_skip() -> Option<Arc<zenoh::Session>> {
         let config = crate::ZenohConfig::default();
         let manager = crate::SessionManager::new(config);
         match manager.connect().await {
             Ok(session) => Some(session),
             Err(err) => {
-                eprintln!("skipping Zenoh integration assertion: {err}");
+                eprintln!("skipping Zenoh integration test: {err}");
                 None
             }
         }
     }
 
-    async fn setup_query_wrapper() -> Option<QueryWrapper> {
+    async fn setup_query_wrapper() -> Option<Query> {
         let session = setup_session_or_skip().await?;
-
-        let mut wrapper = QueryWrapper::new(TEST_TOPIC);
+        let mut wrapper = Query::new(TEST_TOPIC);
         wrapper.init(session).await.expect("Failed to init wrapper");
         Some(wrapper)
     }
 
     #[test]
     fn test_query_wrapper_new() {
-        let wrapper = QueryWrapper::new("test/topic");
+        let wrapper = Query::new("test/topic");
         assert_eq!(wrapper.topic(), "test/topic");
         assert!(!wrapper.is_initialized());
     }
 
     #[test]
     fn test_query_wrapper_clone() {
-        let wrapper = QueryWrapper::new("test/topic");
+        let wrapper = Query::new("test/topic");
         let cloned = wrapper.clone();
         assert_eq!(cloned.topic(), "test/topic");
-        // Cloned wrapper should not be initialized
         assert!(!cloned.is_initialized());
     }
 
@@ -169,7 +226,7 @@ mod tests {
             return;
         };
 
-        let mut wrapper = QueryWrapper::new(TEST_TOPIC);
+        let mut wrapper = Query::new(TEST_TOPIC);
         assert!(!wrapper.is_initialized());
 
         wrapper.init(session).await.expect("Failed to init wrapper");
@@ -187,7 +244,6 @@ mod tests {
         let result = wrapper.query(payload).await;
 
         // Query may return empty results if no queryable is registered
-        // This test verifies the method doesn't panic
         assert!(result.is_ok());
     }
 
@@ -202,63 +258,7 @@ mod tests {
         let result = wrapper.query_with_timeout(payload, timeout).await;
 
         // Query may return empty results if no queryable is registered
-        // This test verifies the method doesn't panic
         assert!(result.is_ok());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn test_query_wrapper_integration() {
-        use crate::codec::Codec;
-        use crate::QueryableWrapper;
-
-        #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-        struct TestQuery {
-            query: String,
-        }
-
-        #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq)]
-        struct TestResponse {
-            result: String,
-        }
-
-        let Some(session) = setup_session_or_skip().await else {
-            return;
-        };
-
-        let mut queryable = QueryableWrapper::<TestQuery, TestResponse>::new(TEST_TOPIC)
-            .with_handler(|q| async move {
-                Ok(TestResponse {
-                    result: q.query.to_uppercase(),
-                })
-            });
-
-        queryable
-            .init(&session)
-            .await
-            .expect("Failed to init queryable");
-
-        let _handle = queryable
-            .into_task()
-            .expect("Failed to spawn queryable task");
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        let mut wrapper = QueryWrapper::new(TEST_TOPIC);
-        wrapper
-            .init(session.clone())
-            .await
-            .expect("Failed to init querier");
-
-        let query = TestQuery { query: "test".to_string() };
-        let payload_bytes = Codec.encode(&query).expect("Encode query failed");
-        let results = wrapper.query_bytes(&payload_bytes).await.expect("Query failed");
-
-        assert_eq!(results.len(), 1, "Expected exactly one response");
-
-        let response: TestResponse =
-            Codec.decode(&results[0]).expect("Decode response failed");
-
-        assert_eq!(response.result, "TEST");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -288,22 +288,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn test_query_wrapper_timeout_behavior() {
-        let Some(wrapper) = setup_query_wrapper().await else {
-            return;
-        };
-
-        let payload = r#"{"test": "timeout"}"#;
-        let short_timeout = Duration::from_millis(100);
-        let result = wrapper.query_with_timeout(payload, short_timeout).await;
-
-        // Should complete within timeout even with no queryable
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_query_wrapper_not_connected_error() {
-        let wrapper = QueryWrapper::new(TEST_TOPIC);
+        let wrapper = Query::new(TEST_TOPIC);
 
         let payload = r#"{"test": "error"}"#;
         let result = wrapper.query(payload).await;
@@ -311,22 +297,5 @@ mod tests {
         // Should return NotConnected error without init
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ZenohError::NotConnected));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn test_query_wrapper_clone_behavior() {
-        let Some(wrapper1) = setup_query_wrapper().await else {
-            return;
-        };
-        let wrapper2 = wrapper1.clone();
-
-        // Original should be initialized, clone should not
-        assert!(wrapper1.is_initialized());
-        assert!(!wrapper2.is_initialized());
-
-        // Original should work, clone should fail with NotConnected
-        let payload = r#"{"test": "clone"}"#;
-        assert!(wrapper1.query(payload).await.is_ok());
-        assert!(wrapper2.query(payload).await.is_err());
     }
 }

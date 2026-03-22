@@ -130,7 +130,7 @@ impl DiscoveryQueryBuilder {
 
         let topic = format!("rpc/services/{}", self.service_name);
         let mut subscriber = SubscriberWrapper::<DiscoveryInfo>::new(&topic);
-        subscriber.init(session).await?;
+        subscriber.init(session.clone()).await?;
 
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut last_seen: Option<DiscoveryInfo> = None;
@@ -194,7 +194,7 @@ impl DiscoveryRegistry {
 		let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
 		let topic = "rpc/services/**";
 		let mut subscriber = SubscriberWrapper::<DiscoveryInfo>::new(topic);
-		subscriber.init(session).await?;
+		subscriber.init(session.clone()).await?;
 
 		let deadline = tokio::time::Instant::now() + self.timeout;
 		let mut services = Vec::new();

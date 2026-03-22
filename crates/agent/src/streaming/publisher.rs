@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use zenoh::Session;
 
-use bus::PublisherWrapper as BusPublisher;
+use bus::publisher::PublisherWrapper as BusPublisher;
 
 use super::backpressure::{
     BackpressureController, TokenBatch, SerializedToken,
@@ -49,8 +49,10 @@ impl TokenPublisherWrapper {
             ),
         });
 
-        let bus_publisher = BusPublisher::new(format!("{}/{}/tokens/stream", topic_prefix, agent_id))
-            .with_session(&session);
+        let bus_publisher = BusPublisher::from_session(
+            format!("{}/{}/tokens/stream", topic_prefix, agent_id),
+            session.clone()
+        );
 
         Self {
             pub_session: session,
@@ -124,9 +126,9 @@ impl TokenPublisherWrapper {
             .map_err(|e| AgentError::Config(e.to_string()))?;
 
         self.bus_publisher
-            .publish_raw(&self.pub_session, bytes)
+            .publish_raw(&self.pub_session, bytes.to_vec())
             .await
-            .map_err(|e| AgentError::Bus(e.to_string()))?;
+            .map_err(|e: bus::ZenohError| AgentError::Bus(e.to_string()))?;
 
         Ok(())
     }

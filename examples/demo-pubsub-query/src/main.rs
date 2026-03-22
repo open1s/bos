@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     println!("✓ Created publisher on topic: {}", publish_topic);
 
     let mut subscriber = bus::SubscriberWrapper::<Message>::new(publish_topic);
-    subscriber.init(&session).await?;
+    subscriber.init(session.clone()).await?;
     println!("✓ Created subscriber on topic: {}", publish_topic);
 
     let mut subscriber_receiver = subscriber.clone();

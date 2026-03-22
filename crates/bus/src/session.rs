@@ -1,4 +1,6 @@
 //! Zenoh session management
+//!
+//! Provides [`SessionManager`] for connection lifecycle and [`Bus`] for easy session access.
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -202,5 +204,99 @@ impl SessionManagerBuilder {
     pub async fn build_and_connect(self) -> Result<Arc<SessionManager>, ZenohError> {
         let sm = self.build();
         sm.connect_and_wrap().await
+    }
+}
+
+// ============================================================================
+// Bus - Simplified session wrapper for common use cases
+// ============================================================================
+
+/// A simplified wrapper around a connected Zenoh session.
+///
+/// Provides convenient methods for creating publishers, subscribers, and RPC services
+/// without explicitly passing the session around.
+///
+/// # Example
+/// ```rust,ignore
+/// let bus = Bus::from(session);
+/// // Use bus.publisher(), bus.subscriber(), etc.
+/// ```
+#[derive(Clone)]
+pub struct Bus {
+    inner: Arc<SessionManager>,
+    session: Arc<Session>,
+}
+
+impl Bus {
+    /// Create a Bus from an existing session
+    pub fn new(session: Arc<Session>) -> Self {
+        Self {
+            inner: Arc::new(SessionManager::new(ZenohConfig::default())),
+            session,
+        }
+    }
+
+    /// Create a Bus from a SessionManager (must be connected)
+    pub async fn from_manager(manager: Arc<SessionManager>) -> Result<Self, ZenohError> {
+        let session = manager.get_session().await?;
+        Ok(Self { inner: manager, session })
+    }
+
+    /// Get the underlying session
+    pub fn session(&self) -> &Arc<Session> {
+        &self.session
+    }
+
+    /// Get the session manager
+    pub fn manager(&self) -> &Arc<SessionManager> {
+        &self.inner
+    }
+}
+
+/// Builder for Bus with fluent configuration.
+#[derive(Debug, Clone, Default)]
+pub struct BusBuilder(SessionManagerBuilder);
+
+impl BusBuilder {
+    /// Set the connection mode
+    pub fn mode(mut self, mode: impl Into<String>) -> Self {
+        self.0 = self.0.mode(mode);
+        self
+    }
+
+    /// Add a connection endpoint
+    pub fn add_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.0 = self.0.connect(endpoint);
+        self
+    }
+
+    /// Add multiple connection endpoints
+    pub fn add_endpoints(mut self, endpoints: Vec<String>) -> Self {
+        self.0 = self.0.connect_many(endpoints);
+        self
+    }
+
+    /// Add a listen endpoint
+    pub fn listen(mut self, endpoint: impl Into<String>) -> Self {
+        self.0 = self.0.listen(endpoint);
+        self
+    }
+
+    /// Add multiple listen endpoints
+    pub fn listen_many(mut self, endpoints: Vec<String>) -> Self {
+        self.0 = self.0.listen_many(endpoints);
+        self
+    }
+
+    /// Build and connect the Bus
+    pub async fn connect(self) -> Result<Bus, ZenohError> {
+        let manager = self.0.build_and_connect().await?;
+        Bus::from_manager(manager).await
+    }
+}
+
+impl From<Arc<Session>> for Bus {
+    fn from(session: Arc<Session>) -> Self {
+        Self::new(session)
     }
 }

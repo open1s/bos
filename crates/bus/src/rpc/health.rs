@@ -149,7 +149,7 @@ impl HealthChecker {
 
         let topic = format!("rpc/health/{}", service_name);
         let mut subscriber = SubscriberWrapper::<HealthStatus>::new(&topic);
-        subscriber.init(session).await?;
+        subscriber.init(session.clone()).await?;
 
         let deadline = Instant::now() + self.timeout;
 
@@ -176,7 +176,7 @@ impl HealthChecker {
 
         let topic = "rpc/health/**";
         let mut subscriber = SubscriberWrapper::<HealthStatus>::new(topic);
-        subscriber.init(session).await?;
+        subscriber.init(session.clone()).await?;
 
         let deadline = Instant::now() + self.timeout;
         let mut statuses = Vec::new();
