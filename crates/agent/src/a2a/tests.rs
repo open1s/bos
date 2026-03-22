@@ -3,8 +3,6 @@
 use super::{
     AgentIdentity, A2AMessage, A2AContent, Task, TaskState, AgentCard,
 };
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[tokio::test]
 async fn test_agent_card_serialization() {

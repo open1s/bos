@@ -89,7 +89,7 @@ You can use tools including a streaming response tool.",
     };
 
     let llm = create_llm_client();
-    let mut agent = Agent::new(config, llm);
+    let _agent = Agent::new(config, llm);
 
     println!("✓ Assistant initialized with model: {}\n", model);
 

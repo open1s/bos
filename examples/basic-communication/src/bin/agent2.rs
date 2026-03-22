@@ -1,13 +1,12 @@
-use std::sync::Arc;
 use std::time::SystemTime;
-use agent::a2a::{AgentIdentity, A2ADiscovery, AgentCard, A2AContent, Task, TaskState};
+use agent::a2a::{AgentIdentity, A2ADiscovery, AgentCard, A2AContent, TaskState};
 use brainos_common::{setup_bus, setup_logging};
 
 #[derive(Debug, Clone)]
 struct ChatMessage {
-    sender: String,
-    content: String,
-    timestamp: u64,
+    _sender: String,
+    _content: String,
+    _timestamp: u64,
 }
 
 #[tokio::main]
@@ -88,9 +87,9 @@ async fn main() -> anyhow::Result<()> {
                     .as_secs();
 
                 message_history.push(ChatMessage {
-                    sender: message.sender.name.clone(),
-                    content: input.to_string(),
-                    timestamp,
+                    _sender: message.sender.name.clone(),
+                    _content: input.to_string(),
+                    _timestamp: timestamp,
                 });
 
                 let response_text = generate_response(input, &message_history);
@@ -119,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn generate_response(input: &str, history: &[ChatMessage]) -> String {
+fn generate_response(input: &str, _history: &[ChatMessage]) -> String {
     let input_lower = input.to_lowercase();
 
     let greetings = vec![

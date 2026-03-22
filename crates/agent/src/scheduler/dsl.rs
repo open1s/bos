@@ -72,7 +72,7 @@ impl WorkflowBuilder {
 
     pub fn parallel_group(
         mut self,
-        group_name: String,
+        _group_name: String,
         steps: Vec<(String, Option<String>, serde_json::Value)>,
     ) -> Self {
         for (name, agent_id, _input) in steps {

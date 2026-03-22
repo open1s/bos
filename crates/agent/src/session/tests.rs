@@ -2,7 +2,7 @@
 
 use super::{
     AgentState, SessionSerializer, SessionManager,
-    SessionConfig, SessionMetadata, SessionSummary,
+    SessionConfig, SessionMetadata,
     SessionError,
 };
 use crate::session::storage::SessionStorage;

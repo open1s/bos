@@ -58,7 +58,7 @@ async fn demo_skill_compose() {
     let skills_dir = PathBuf::from("skills");
     let mut loader = SkillLoader::new(skills_dir.clone());
 
-    let skills = loader.discover().expect("discover should succeed");
+    let _skills = loader.discover().expect("discover should succeed");
 
     // Validate all skills - should succeed since all dependencies exist
     loader.validate_all().expect("validation should succeed");

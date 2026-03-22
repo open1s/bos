@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use zenoh::Session;
 
-use super::backpressure::{SerializedToken, TokenBatch, TokenType, BackpressureError};
+use super::backpressure::{SerializedToken, TokenBatch, TokenType};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SubscriberError {
@@ -65,7 +65,7 @@ impl TokenSubscriber {
                     Ok(sample) => {
                         let bytes = sample.payload().to_bytes();
 
-                        match TokenBatch::from_bytes(&bytes) {
+                        match Self::deserialize_batch(bytes.as_ref()) {
                             Ok(batch) => {
                                 for token in batch.tokens {
                                     if let Err(e) = verify_token_order(&token, &mut last_sequence) {
@@ -113,6 +113,12 @@ impl TokenSubscriber {
 
     pub fn topic_prefix(&self) -> &str {
         &self.topic_prefix
+    }
+
+    fn deserialize_batch(bytes: &[u8]) -> Result<TokenBatch, SubscriberError> {
+        TokenBatch::from_bytes_rkyv(bytes)
+            .or_else(|_| TokenBatch::from_bytes(bytes))
+            .map_err(|e| SubscriberError::Deserialization(e.to_string()))
     }
 }
 

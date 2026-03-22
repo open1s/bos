@@ -1,5 +1,4 @@
 use super::{AgentState, SessionError, SessionMetadata};
-use crate::agent::Message;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,7 +63,6 @@ impl SessionSerializer {
     }
 
     pub fn decompress(data: &[u8]) -> Result<Vec<u8>, SessionError> {
-        use std::io::Read;
         let mut decoder = GzDecoder::new(data);
         let mut decompressed = Vec::new();
         decoder

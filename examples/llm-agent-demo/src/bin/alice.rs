@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::io::{self, Write};
 use agent::{
-    a2a::{AgentIdentity, A2AClient, A2ADiscovery, AgentCard, Task, TaskState},
+    a2a::{AgentIdentity, A2ADiscovery, AgentCard, TaskState},
     Agent, AgentConfig,
     Tool, ToolRegistry, ToolDescription, ToolError,
 };
@@ -122,7 +122,6 @@ Be helpful and conversational. Say what tools you're using when calling them."
     }
 
     let task_topic = format!("agent/{}/tasks/incoming", identity.id);
-    let a2a_client = A2AClient::new(session.clone(), identity.clone());
     let subscriber = session.declare_subscriber(&task_topic).await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe to tasks: {}", e))?;
 

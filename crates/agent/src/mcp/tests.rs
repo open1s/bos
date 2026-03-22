@@ -4,8 +4,6 @@ use super::{
     protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, ServerCapabilities, ToolDefinition},
     McpError,
 };
-use tokio::time::timeout;
-use crate::mcp::transport::TransportError;
 
 #[tokio::test]
 async fn test_json_rpc_request_serialization() {

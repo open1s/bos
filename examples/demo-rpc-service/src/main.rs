@@ -1,8 +1,7 @@
-use std::sync::Arc;
 use tokio::signal;
 
 use bus::{
-    rpc::{RpcServiceBuilder, RpcHandler, RpcServiceError, RpcService},
+    rpc::{RpcHandler, RpcServiceError, RpcService, RpcServiceBuilder},
     DEFAULT_CODEC,
 };
 
@@ -103,26 +102,6 @@ impl RpcHandler for ErrorHandler {
                 message: format!("Method '{}' not found", method),
             }),
         }
-    }
-}
-
-/// Binary handler - demonstrates binary payload processing
-#[derive(Clone)]
-struct BinaryHandler;
-
-#[async_trait::async_trait]
-impl RpcHandler for BinaryHandler {
-    async fn handle(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RpcServiceError> {
-        if method != "binary" {
-            return Err(RpcServiceError::Business {
-                code: 400,
-                message: format!("Method '{}' not supported", method),
-            });
-        }
-
-        // Process binary data: reverse the bytes
-        let reversed: Vec<u8> = payload.iter().rev().copied().collect();
-        Ok(reversed)
     }
 }
 

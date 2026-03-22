@@ -20,7 +20,7 @@ async fn demo_agent_new() {
         LlmResponse::Done,
     ]));
 
-    let mut agent = Agent::new(config, mock_llm);
+    let agent = Agent::new(config, mock_llm);
     assert_eq!(agent.config().name, "test-agent");
 }
 

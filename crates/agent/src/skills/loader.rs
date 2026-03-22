@@ -58,8 +58,9 @@ impl SkillLoader {
     }
 
     fn parse_metadata(path: &Path) -> Result<Option<SkillMetadata>, SkillError> {
+        Self::validate_skill_path(path)?;
         let content = std::fs::read_to_string(path)?;
-        let frontmatter = Self::extract_frontmatter(&content)?;
+        let (frontmatter, _) = Self::parse_frontmatter(&content)?;
 
         let name = frontmatter
             .get("name")
@@ -228,7 +229,7 @@ impl SkillLoader {
         Ok(())
     }
 
-    fn validate_frontmatter(frontmatter: &serde_yaml::Value) -> Result<(), SkillError> {
+    fn validate_frontmatter(frontmatter: &serde_json::Value) -> Result<(), SkillError> {
         if !frontmatter.get("name").is_some() {
             return Err(SkillError::MissingField("name".to_string()));
         }
@@ -288,7 +289,7 @@ impl SkillLoader {
         Ok(())
     }
 
-    fn parse_frontmatter(content: &str) -> Result<(serde_yaml::Value, String), SkillError> {
+    fn parse_frontmatter(content: &str) -> Result<(serde_json::Value, String), SkillError> {
         let lines: Vec<&str> = content.lines().collect();
 
         if lines.len() < 2 {
@@ -313,7 +314,7 @@ impl SkillLoader {
         let frontmatter_str = lines[1..=end_idx].join("\n");
         let instructions = lines[end_idx + 1..].join("\n");
 
-        let frontmatter: serde_yaml::Value = serde_yaml::from_str(&frontmatter_str)
+        let frontmatter: serde_json::Value = serde_yaml::from_str(&frontmatter_str)
             .map_err(|e| SkillError::ParseError(e.to_string()))?;
 
         Self::validate_frontmatter(&frontmatter)?;
@@ -350,7 +351,7 @@ impl SkillLoader {
         let mut by_category = std::collections::HashMap::new();
         let mut total_deps = 0;
 
-        for (name, metadata) in &self.discovered {
+        for metadata in self.discovered.values() {
             *by_category.entry(metadata.category.clone()).or_insert(0) += 1;
             total_deps += metadata.requires.len();
         }

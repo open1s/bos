@@ -1,11 +1,9 @@
 use std::sync::Arc;
 use agent::{
-    a2a::{AgentIdentity, A2ADiscovery, AgentCard, Task, TaskState},
-    Tool, ToolRegistry, ToolDescription, ToolError,
+    a2a::{AgentIdentity, A2ADiscovery, AgentCard, TaskState},
 };
-use async_trait::async_trait;
 use brainos_common::{setup_bus, setup_logging};
-use bus::{RpcService, RpcServiceBuilder, RpcHandler, RpcServiceError};
+use bus::{RpcHandler, RpcServiceError};
 use rkyv::{Archive, Serialize, Deserialize};
 use serde_json::Value;
 
@@ -61,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     
     let tool_base = format!("agent/{}/tools/", identity.id);
 
-    let add_service = bus::RpcServiceBuilder::new()
+    bus::RpcServiceBuilder::new()
         .service_name("add")
         .topic_prefix(&tool_base)
         .build()
@@ -71,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to init add service: {}", e))?;
     println!("✓ Registered RPC service: {}add", tool_base);
 
-    let multiply_service = bus::RpcServiceBuilder::new()
+    bus::RpcServiceBuilder::new()
         .service_name("multiply")
         .topic_prefix(&tool_base)
         .build()
@@ -81,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to init multiply service: {}", e))?;
     println!("✓ Registered RPC service: {}multiply", tool_base);
 
-    let subtract_service = bus::RpcServiceBuilder::new()
+    bus::RpcServiceBuilder::new()
         .service_name("subtract")
         .topic_prefix(&tool_base)
         .build()

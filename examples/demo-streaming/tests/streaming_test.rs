@@ -1,5 +1,5 @@
 use agent::streaming::{SseDecoder, SseEvent};
-use agent::streaming::{TokenPublisherWrapper, SerializedToken, TokenType};
+use agent::streaming::TokenPublisherWrapper;
 use agent::llm::StreamToken;
 
 #[test]

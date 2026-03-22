@@ -24,7 +24,7 @@ impl Scheduler {
     pub async fn execute_workflow(&self, workflow: &Workflow) -> WorkflowResult {
         let start = std::time::Instant::now();
         let mut step_results = Vec::new();
-        let mut errors = Vec::new();
+        let errors = Vec::new();
         let mut prev_output: Option<serde_json::Value> = None;
 
         for step in &workflow.steps {
@@ -205,6 +205,7 @@ impl Scheduler {
         }
     }
 
+    #[allow(dead_code)]
     async fn execute_remotely(
         &self,
         agent_id: &str,
@@ -214,12 +215,6 @@ impl Scheduler {
 
         let client = self.a2a_client.as_ref()
             .ok_or_else(|| anyhow::anyhow!("A2A client not configured"))?;
-
-        let identity = AgentIdentity::new(
-            format!("scheduler-{}", uuid::Uuid::new_v4()),
-            "Scheduler".to_string(),
-            "1.0.0".to_string(),
-        );
 
         let task = Task::new(
             uuid::Uuid::new_v4().to_string(),

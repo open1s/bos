@@ -1,13 +1,12 @@
 use std::sync::Arc;
 use agent::{
     a2a::{AgentIdentity, A2ADiscovery, AgentCard, Task},
-    Agent, AgentConfig,
 };
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use brainos_common::{setup_bus, setup_logging, create_llm_client};
+use brainos_common::{setup_bus, setup_logging};
 
 /// Message in the chat room
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -32,10 +31,10 @@ enum MessageType {
 /// Conversation state
 #[derive(Debug, Clone)]
 struct Conversation {
-    conversation_id: String,
+    _conversation_id: String,
     participants: Vec<AgentIdentity>,
     messages: Vec<ChatMessage>,
-    context: HashMap<String, serde_json::Value>,
+    _context: HashMap<String, serde_json::Value>,
 }
 
 /// WeChat-like chat server
@@ -107,10 +106,10 @@ impl ChatServer {
         let conversation_id = uuid::Uuid::new_v4().to_string();
 
         let conversation = Conversation {
-            conversation_id: conversation_id.clone(),
+            _conversation_id: conversation_id.clone(),
             participants: participants.clone(),
             messages: Vec::new(),
-            context: HashMap::new(),
+            _context: HashMap::new(),
         };
 
         let mut conversations = self.conversations.write().await;

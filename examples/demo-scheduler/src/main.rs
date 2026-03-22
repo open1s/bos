@@ -1,5 +1,5 @@
 use agent::{
-    WorkflowBuilder, StepBuilder, Scheduler, BackoffStrategy, StepType, ConditionType,
+    WorkflowBuilder, StepBuilder, Scheduler, BackoffStrategy, ConditionType,
 };
 use anyhow::Result;
 use brainos_common::{setup_bus, setup_logging};
@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     setup_logging()?;
 
     let args = Args::parse();
-    let session = setup_bus(None).await?;
+    let _session = setup_bus(None).await?;
 
     println!("╔══════════════════════════════════════╗");
     println!("║  Scheduler Demo - Phase 4 Plan 02    ║");

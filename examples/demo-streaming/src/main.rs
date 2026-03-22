@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use agent::llm::{OpenAiClient, OpenAiMessage, LlmRequest, StreamToken, LlmClient as LlmClientTrait};
+use agent::llm::{OpenAiClient, OpenAiMessage, LlmRequest, LlmClient as LlmClientTrait};
 use agent::streaming::TokenPublisherWrapper;
 use anyhow::Result;
 use brainos_common::{setup_bus, setup_logging};

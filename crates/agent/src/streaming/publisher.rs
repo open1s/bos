@@ -12,7 +12,7 @@ use zenoh::Session;
 use bus::PublisherWrapper as BusPublisher;
 
 use super::backpressure::{
-    BackpressureController, TokenBatch, SerializedToken, TokenType,
+    BackpressureController, TokenBatch, SerializedToken,
 };
 use crate::llm::StreamToken;
 use crate::error::AgentError;
@@ -28,8 +28,6 @@ pub struct TokenPublisherWrapper {
     pub_session: Arc<Session>,
     bus_publisher: BusPublisher,
     state: Mutex<PublisherState>,
-    topic_prefix: String,
-    agent_id: String,
 }
 
 impl TokenPublisherWrapper {
@@ -58,8 +56,6 @@ impl TokenPublisherWrapper {
             pub_session: session,
             bus_publisher,
             state,
-            topic_prefix,
-            agent_id,
         }
     }
 
@@ -101,26 +97,7 @@ impl TokenPublisherWrapper {
     }
 
     fn serialize_token(task_id: String, token: StreamToken) -> SerializedToken {
-        match token {
-            StreamToken::Text(content) => SerializedToken {
-                task_id,
-                token_type: TokenType::Text,
-                content,
-            },
-            StreamToken::ToolCall { name, args } => {
-                let payload = serde_json::to_string(&(name, args)).unwrap_or_default();
-                SerializedToken {
-                    task_id,
-                    token_type: TokenType::ToolCall,
-                    content: payload,
-                }
-            }
-            StreamToken::Done => SerializedToken {
-                task_id,
-                token_type: TokenType::Done,
-                content: String::new(),
-            },
-        }
+        SerializedToken::from_stream_token(task_id, token)
     }
 
     /// Flush any pending tokens in the batch
@@ -143,7 +120,7 @@ impl TokenPublisherWrapper {
         }
 
         let bytes = batch
-            .to_bytes()
+            .to_bytes_rkyv()
             .map_err(|e| AgentError::Config(e.to_string()))?;
 
         self.bus_publisher
@@ -197,4 +174,3 @@ impl TokenPublisher {
 
 // Backward compatibility type alias
 pub type PublisherWrapper = TokenPublisherWrapper;
-

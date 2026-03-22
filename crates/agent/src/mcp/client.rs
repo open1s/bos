@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use thiserror::Error;
 
-use super::protocol::{JsonRpcRequest, JsonRpcResponse, McpPrompt, McpResource, ReadResourceResult, ResourceContents, ServerCapabilities, ToolDefinition};
+use super::protocol::{JsonRpcRequest, JsonRpcResponse, McpPrompt, McpResource, ReadResourceResult, ServerCapabilities, ToolDefinition};
 use super::transport::StdioTransport;
 
 #[derive(Error, Debug)]

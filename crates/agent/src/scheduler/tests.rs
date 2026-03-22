@@ -1,6 +1,6 @@
 //! Integration tests for Scheduler workflow execution
 
-use crate::scheduler::{Workflow, Step, StepType, ConditionType, BackoffStrategy, WorkflowStatus, StepStatus};
+use crate::scheduler::{Workflow, Step, StepType, ConditionType, BackoffStrategy, WorkflowStatus};
 use crate::scheduler::executor::Scheduler;
 
 #[tokio::test]
