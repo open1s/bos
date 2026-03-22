@@ -11,8 +11,7 @@ use zenoh::Session;
 
 use crate::Codec;
 use crate::error::ZenohError;
-use crate::subscriber::SubscriberWrapper;
-
+use crate::subscriber::Subscriber;
 /// Health status of a service.
 #[derive(Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct HealthStatus {
@@ -148,7 +147,7 @@ impl HealthChecker {
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
 
         let topic = format!("rpc/health/{}", service_name);
-        let mut subscriber = SubscriberWrapper::<HealthStatus>::new(&topic);
+        let mut subscriber = Subscriber::<HealthStatus>::new(&topic);
         subscriber.init(session.clone()).await?;
 
         let deadline = Instant::now() + self.timeout;
@@ -175,7 +174,7 @@ impl HealthChecker {
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
 
         let topic = "rpc/health/**";
-        let mut subscriber = SubscriberWrapper::<HealthStatus>::new(topic);
+        let mut subscriber = Subscriber::<HealthStatus>::new(topic);
         subscriber.init(session.clone()).await?;
 
         let deadline = Instant::now() + self.timeout;

@@ -46,10 +46,10 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", "-".repeat(40));
 
     let publish_topic = "demo/pubsub/events";
-    let publisher = bus::PublisherWrapper::new(publish_topic);
+    let publisher = bus::Publisher::new(publish_topic);
     println!("✓ Created publisher on topic: {}", publish_topic);
 
-    let mut subscriber = bus::SubscriberWrapper::<Message>::new(publish_topic);
+    let mut subscriber = bus::Subscriber::<Message>::new(publish_topic);
     subscriber.init(session.clone()).await?;
     println!("✓ Created subscriber on topic: {}", publish_topic);
 

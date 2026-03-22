@@ -101,7 +101,7 @@ pub mod subscriber;
 pub mod python;
 
 pub use error::ZenohError;
-pub use publisher::{Publisher, PublisherWrapper};
+pub use publisher::{Publisher};
 pub use query::{Query, QueryWrapper, Queryable, TopicQueryable};
 pub use queryable::QueryableWrapper;
 pub use rpc::cache::{CacheStats, ServiceCache};
@@ -112,7 +112,7 @@ pub use rpc::health::{HealthChecker, HealthPublisher, HealthStatus, ServiceState
 pub use rpc::service::{RpcHandler, RpcService, RpcServiceBuilder};
 pub use rpc::types::RpcResponse;
 pub use session::{Bus, BusBuilder, SessionManager, SessionManagerBuilder};
-pub use subscriber::{Subscriber, SubscriberWrapper};
+pub use subscriber::{Subscriber};
 
 pub use zenoh::Session;
 

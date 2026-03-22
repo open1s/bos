@@ -97,9 +97,6 @@ impl Clone for Publisher {
     }
 }
 
-/// Type alias for backward compatibility
-pub type PublisherWrapper = Publisher;
-
 #[cfg(test)]
 mod tests {
     use super::*;

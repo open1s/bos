@@ -111,8 +111,8 @@ mod tests {
 
         // Subscribe first so we don't miss the announcement
         let topic = "rpc/services/discovery-query-test";
-        let mut sub: crate::SubscriberWrapper<crate::rpc::discovery::DiscoveryInfo> =
-            crate::SubscriberWrapper::new(topic);
+        let mut sub: crate::Subscriber<crate::rpc::discovery::DiscoveryInfo> =
+            crate::Subscriber::new(topic);
         sub.init(session.clone()).await.expect("Failed to init subscriber");
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -139,7 +139,7 @@ mod tests {
         let topic = format!("rpc/services/{}", service_name);
         let info = DiscoveryInfo::new(service_name);
 
-        let mut sub: crate::SubscriberWrapper<DiscoveryInfo> = crate::SubscriberWrapper::new(&topic);
+        let mut sub: crate::Subscriber<DiscoveryInfo> = crate::Subscriber::new(&topic);
         sub.init(session.clone()).await.expect("Failed to init subscriber");
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -161,10 +161,10 @@ mod tests {
 
         let topic = "debug/test-pubsub";
         
-        let mut sub: crate::SubscriberWrapper<String> = crate::SubscriberWrapper::new(topic);
+        let mut sub: crate::Subscriber<String> = crate::Subscriber::new(topic);
         sub.init(session.clone()).await.expect("Failed to init subscriber");
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        let pub_: crate::PublisherWrapper = crate::PublisherWrapper::from_session(topic, session.clone());
+        let pub_: crate::Publisher = crate::Publisher::from_session(topic, session.clone());
         pub_.publish(&session, &"hello".to_string()).await.expect("Publish failed");
         let result = sub.recv_with_timeout(tokio::time::Duration::from_secs(1)).await;
         assert!(result.is_some(), "Should have received the published message");
@@ -189,8 +189,8 @@ mod tests {
             .await
             .expect("Failed to init service");
 
-        let mut discovery_sub: crate::SubscriberWrapper<DiscoveryInfo> =
-            crate::SubscriberWrapper::new("rpc/services/test-service");
+        let mut discovery_sub: crate::Subscriber<DiscoveryInfo> =
+            crate::Subscriber::new("rpc/services/test-service");
         discovery_sub.init(session.clone()).await.expect("Failed to init discovery subscriber");
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 

@@ -1,6 +1,5 @@
 // Zenoh Pub/Sub Benchmarks for Bus Crate
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use bus::{PublisherWrapper, SubscriberWrapper};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use tokio::runtime::Runtime;
 
 fn custom_criterion() -> Criterion {

@@ -6,9 +6,6 @@ use crate::{error::ZenohError, Codec, Session};
 use std::sync::Arc;
 use zenoh::sample::Sample;
 
-/// Type alias for backward compatibility
-pub type SubscriberWrapper<T> = Subscriber<T>;
-
 /// A subscriber for receiving messages from a Zenoh topic.
 ///
 /// # Example

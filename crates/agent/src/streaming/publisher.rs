@@ -9,12 +9,11 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use zenoh::Session;
 
-use bus::publisher::PublisherWrapper as BusPublisher;
-
 use super::backpressure::{
     BackpressureController, TokenBatch, SerializedToken,
 };
 use crate::llm::StreamToken;
+use bus::publisher::Publisher;
 use crate::error::AgentError;
 
 /// Combined state for the publisher to reduce lock contention
@@ -26,7 +25,7 @@ struct PublisherState {
 /// Wrapper around Zenoh publisher with batching and backpressure
 pub struct TokenPublisherWrapper {
     pub_session: Arc<Session>,
-    bus_publisher: BusPublisher,
+    bus_publisher: Publisher,
     state: Mutex<PublisherState>,
 }
 
@@ -49,7 +48,7 @@ impl TokenPublisherWrapper {
             ),
         });
 
-        let bus_publisher = BusPublisher::from_session(
+        let bus_publisher = Publisher::from_session(
             format!("{}/{}/tokens/stream", topic_prefix, agent_id),
             session.clone()
         );

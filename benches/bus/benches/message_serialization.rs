@@ -11,7 +11,7 @@ fn bench_rkyv_serialization(c: &mut Criterion) {
     let mut group = c.benchmark_group("rkyv_serialization");
 
     for size in [100, 500, 1000, 5000].iter() {
-        let data: Vec<u8> = (0..*size).map(|i| (i % 256) as u8).collect();
+        let _data: Vec<u8> = (0..*size).map(|i| (i % 256) as u8).collect();
         group.throughput(Throughput::Bytes(*size as u64));
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, data| {

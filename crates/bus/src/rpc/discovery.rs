@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Codec;
 use crate::error::ZenohError;
-use crate::subscriber::SubscriberWrapper;
+use crate::subscriber::Subscriber;
 use crate::Session;
 
 /// Discovery information published by RPC services.
@@ -129,7 +129,7 @@ impl DiscoveryQueryBuilder {
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
 
         let topic = format!("rpc/services/{}", self.service_name);
-        let mut subscriber = SubscriberWrapper::<DiscoveryInfo>::new(&topic);
+        let mut subscriber = Subscriber::<DiscoveryInfo>::new(&topic);
         subscriber.init(session.clone()).await?;
 
         let deadline = tokio::time::Instant::now() + self.timeout;
@@ -193,7 +193,7 @@ impl DiscoveryRegistry {
 	pub async fn list_services(&self) -> Result<Vec<DiscoveryInfo>, ZenohError> {
 		let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
 		let topic = "rpc/services/**";
-		let mut subscriber = SubscriberWrapper::<DiscoveryInfo>::new(topic);
+		let mut subscriber = Subscriber::<DiscoveryInfo>::new(topic);
 		subscriber.init(session.clone()).await?;
 
 		let deadline = tokio::time::Instant::now() + self.timeout;
