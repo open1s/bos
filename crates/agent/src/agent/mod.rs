@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod config;
 
-use crate::error::AgentError;
+use crate::error::{AgentError, ToolError};
 use crate::llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
-use crate::tools::ToolRegistry;
+use crate::tools::{Tool, ToolRegistry};
 
 /// A message in the conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +118,7 @@ pub struct Agent {
     config: AgentConfig,
     llm: Arc<dyn LlmClient>,
     message_log: MessageLog,
+    tool_registry: Option<Arc<ToolRegistry>>,
 }
 
 impl Agent {
@@ -126,6 +127,16 @@ impl Agent {
             config,
             llm,
             message_log: MessageLog::new(),
+            tool_registry: None,
+        }
+    }
+
+    pub fn new_with_registry(config: AgentConfig, llm: Arc<dyn LlmClient>, registry: Arc<ToolRegistry>) -> Self {
+        Self {
+            config,
+            llm,
+            message_log: MessageLog::new(),
+            tool_registry: Some(registry),
         }
     }
 
@@ -135,6 +146,45 @@ impl Agent {
 
     pub fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// Get the tool registry if one is attached.
+    pub fn get_tool_registry(&self) -> Option<&Arc<ToolRegistry>> {
+        self.tool_registry.as_ref()
+    }
+
+    /// Register a tool with the internal registry.
+    pub fn register_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolError> {
+        match self.tool_registry.take() {
+            Some(registry) => {
+                let mut new_registry = ToolRegistry::new();
+                for name in registry.list() {
+                    if let Some(t) = registry.get(&name) {
+                        new_registry.register(t)?;
+                    }
+                }
+                new_registry.register(tool)?;
+                self.tool_registry = Some(Arc::new(new_registry));
+                Ok(())
+            }
+            None => {
+                let mut registry = ToolRegistry::new();
+                registry.register(tool)?;
+                self.tool_registry = Some(Arc::new(registry));
+                Ok(())
+            }
+        }
+    }
+
+    /// Register a tool, panics on error (convenience method).
+    pub fn add_tool(&mut self, tool: Arc<dyn Tool>) {
+        self.register_tool(tool).expect("failed to add tool");
+    }
+
+    /// Builder-style method to add a tool and return self.
+    pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.add_tool(tool);
+        self
     }
 
     /// Run agent on a task (no tools).
@@ -148,13 +198,21 @@ impl Agent {
     }
 
     /// Run agent on a task with tools available.
+    /// Uses internal registry if available, falls back to external parameter.
     pub async fn run_with_tools(
         &mut self,
         task: &str,
-        tools: &ToolRegistry,
+        tools: Option<&ToolRegistry>,
     ) -> Result<AgentOutput, AgentError> {
         self.message_log.add_user(task.to_string());
-        self.run_loop(Some(tools)).await
+        if self.tool_registry.is_some() {
+            let registry = self.tool_registry.take().unwrap();
+            let result = self.run_loop(Some(&registry)).await;
+            self.tool_registry = Some(registry);
+            result
+        } else {
+            self.run_loop(tools).await
+        }
     }
 
     /// Stream agent execution on a task (no tools).
@@ -168,13 +226,19 @@ impl Agent {
     }
 
     /// Run agent on a task with tools available, streaming results.
+    /// Uses internal registry if available, falls back to external parameter.
     pub fn run_streaming_with_tools(
         &mut self,
         task: &str,
-        tools: Arc<ToolRegistry>,
+        tools: Option<Arc<ToolRegistry>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send>> {
         self.message_log.add_user(task.to_string());
-        self.stream_loop(Some(tools))
+
+        if self.tool_registry.is_some() {
+            self.stream_loop(self.tool_registry.clone())
+        } else {
+            self.stream_loop(tools)
+        }
     }
 
     /// Save current agent state to session

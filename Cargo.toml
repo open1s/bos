@@ -13,9 +13,7 @@ members = [
     "examples/demo-rpc-service",
     "examples/demo-discovery",
     "examples/demo-pubsub-query",
-    "examples/demo-agent-lifecycle",
-    "benches/agent",
-    "benches/bus",
+    "examples/demo-agent-lifecycle"
 ]
 resolver = "2"
 

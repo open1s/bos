@@ -154,7 +154,7 @@ Be helpful and conversational. Say what tools you're using when calling them."
         }
         
         println!();
-        match agent.run_with_tools(input, &tool_registry).await {
+        match agent.run_with_tools(input, Some(&tool_registry)).await {
             Ok(output) => {
                 match output {
                     agent::AgentOutput::Text(text) => {
