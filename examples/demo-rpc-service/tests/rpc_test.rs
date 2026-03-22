@@ -4,7 +4,7 @@ use rkyv::{Archive, Serialize, Deserialize};
 
 #[derive(Archive, Serialize, Deserialize)]
 struct JsonPayload {
-    json: String,
+    json: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -18,13 +18,13 @@ impl RpcHandler for TestHandler {
                 let json_payload = rkyv::from_bytes::<JsonPayload, rkyv::rancor::Error>(payload)
                     .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
-                let value: serde_json::Value = serde_json::from_str(&json_payload.json).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&json_payload.json).unwrap();
                 let a = value.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
                 let b = value.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
                 let result = a + b;
                 let response = serde_json::json!({ "result": result });
-                let response_str = serde_json::to_string(&response).unwrap();
-                let response_payload = JsonPayload { json: response_str };
+                let response_bytes = serde_json::to_vec(&response).unwrap();
+                let response_payload = JsonPayload { json: response_bytes };
                 let encoded = DEFAULT_CODEC.encode(&response_payload).unwrap();
                 Ok(encoded)
             }
@@ -45,8 +45,8 @@ impl RpcHandler for TestHandler {
 async fn demo_rpc_add() {
     let handler = TestHandler;
     let response = serde_json::json!({ "a": 5i64, "b": 3i64 });
-    let response_str = serde_json::to_string(&response).unwrap();
-    let json_payload = JsonPayload { json: response_str };
+    let response_bytes = serde_json::to_vec(&response).unwrap();
+    let json_payload = JsonPayload { json: response_bytes };
     
     let payload = DEFAULT_CODEC.encode(&json_payload).unwrap();
     
@@ -55,7 +55,7 @@ async fn demo_rpc_add() {
     
     let result_bytes = result.unwrap();
     let result_payload: JsonPayload = rkyv::from_bytes::<JsonPayload, rkyv::rancor::Error>(&result_bytes).unwrap();
-    let result_value: serde_json::Value = serde_json::from_str(&result_payload.json).unwrap();
+    let result_value: serde_json::Value = serde_json::from_slice(&result_payload.json).unwrap();
     assert_eq!(result_value["result"], 8);
 }
 
@@ -109,8 +109,8 @@ async fn demo_rpc_concurrent() {
         let handler_clone = handler.clone();
         tasks.spawn(async move {
             let response = serde_json::json!({ "a": i, "b": i });
-            let response_str = serde_json::to_string(&response).unwrap();
-            let json_payload = JsonPayload { json: response_str };
+            let response_bytes = serde_json::to_vec(&response).unwrap();
+            let json_payload = JsonPayload { json: response_bytes };
             let payload = DEFAULT_CODEC.encode(&json_payload).unwrap();
             handler_clone.handle("add", &payload).await
         });

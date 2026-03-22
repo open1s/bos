@@ -11,6 +11,7 @@ config = { path = "../../crates/config" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rkyv = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -27,4 +28,8 @@ harness = false
 
 [[bench]]
 name = "llm_client"
+harness = false
+
+[[bench]]
+name = "rpc_payload"
 harness = false

@@ -10,7 +10,7 @@ use bus::{Codec, RpcClient};
 
 #[derive(Archive, Serialize, Deserialize)]
 struct JsonPayload {
-    json: String,
+    json: Vec<u8>,
 }
 
 pub struct BusToolClient {
@@ -54,7 +54,8 @@ impl Tool for BusToolClient {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
-        let json_args = args.to_string();
+        let json_args = serde_json::to_vec(args)
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         let mut client = RpcClient::new(&self.service_name, &self.tool_name);
         client
@@ -71,7 +72,7 @@ impl Tool for BusToolClient {
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-        serde_json::from_str(&result.json)
+        serde_json::from_slice(&result.json)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
     }
 }

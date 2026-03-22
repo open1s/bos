@@ -65,6 +65,7 @@ dependencies = [
  "config",
  "criterion",
  "pprof",
+ "rkyv",
  "serde",
  "serde_json",
  "tokio",

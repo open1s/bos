@@ -9,7 +9,7 @@ use serde_json::Value;
 
 #[derive(Archive, Serialize, Deserialize)]
 struct JsonPayload {
-    json: String,
+    json: Vec<u8>,
 }
 
 #[tokio::main]
@@ -217,7 +217,7 @@ impl RpcHandler for AddHandler {
         let json_payload: JsonPayload = rkyv::from_bytes::<JsonPayload, rkyv::rancor::Error>(payload)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
-        let args: Value = serde_json::from_str(&json_payload.json)
+        let args: Value = serde_json::from_slice(&json_payload.json)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
         let a = args["a"].as_f64()
@@ -232,7 +232,7 @@ impl RpcHandler for AddHandler {
             "operation": format!("{} + {} = {}", a, b, result)
         });
 
-        let json = serde_json::to_string(&response)
+        let json = serde_json::to_vec(&response)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
         let result_payload = JsonPayload { json };
@@ -255,7 +255,7 @@ impl RpcHandler for MultiplyHandler {
         let json_payload: JsonPayload = rkyv::from_bytes::<JsonPayload, rkyv::rancor::Error>(payload)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
-        let args: Value = serde_json::from_str(&json_payload.json)
+        let args: Value = serde_json::from_slice(&json_payload.json)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
         let a = args["a"].as_f64()
@@ -270,7 +270,7 @@ impl RpcHandler for MultiplyHandler {
             "operation": format!("{} × {} = {}", a, b, result)
         });
 
-        let json = serde_json::to_string(&response)
+        let json = serde_json::to_vec(&response)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
         let result_payload = JsonPayload { json };
@@ -293,7 +293,7 @@ impl RpcHandler for SubtractHandler {
         let json_payload: JsonPayload = rkyv::from_bytes::<JsonPayload, rkyv::rancor::Error>(payload)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
-        let args: Value = serde_json::from_str(&json_payload.json)
+        let args: Value = serde_json::from_slice(&json_payload.json)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
         let a = args["a"].as_f64()
@@ -308,7 +308,7 @@ impl RpcHandler for SubtractHandler {
             "operation": format!("{} - {} = {}", a, b, result)
         });
 
-        let json = serde_json::to_string(&response)
+        let json = serde_json::to_vec(&response)
             .map_err(|e| RpcServiceError::Internal(e.to_string()))?;
 
         let result_payload = JsonPayload { json };

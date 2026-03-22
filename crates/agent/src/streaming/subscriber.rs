@@ -178,6 +178,8 @@ mod tests {
         let token = SerializedToken {
             task_id: "task-1".to_string(),
             token_type: TokenType::Text,
+            tool_name: None,
+            tool_args: None,
             content: "hello".to_string(),
         };
 
@@ -191,6 +193,8 @@ mod tests {
         let token = SerializedToken {
             task_id: "task-1".to_string(),
             token_type: TokenType::Done,
+            tool_name: None,
+            tool_args: None,
             content: String::new(),
         };
 

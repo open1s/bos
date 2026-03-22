@@ -10,7 +10,7 @@ use rkyv::{Archive, Serialize, Deserialize};
 
 #[derive(Archive, Serialize, Deserialize)]
 struct JsonPayload {
-    json: String,
+    json: Vec<u8>,
 }
 
 /// Add service handler - demonstrates basic arithmetic
@@ -32,7 +32,7 @@ impl RpcHandler for AddHandler {
             .map_err(|e| RpcServiceError::Internal(format!("rkyv deserialization failed: {}", e)))?;
 
         // Parse JSON from the string
-        let value: serde_json::Value = serde_json::from_str(&json_payload.json)
+        let value: serde_json::Value = serde_json::from_slice(&json_payload.json)
             .map_err(|e| RpcServiceError::Business {
                 code: 400,
                 message: format!("Invalid JSON: {}", e),
@@ -54,8 +54,8 @@ impl RpcHandler for AddHandler {
 
         let result = a + b;
         let response = serde_json::json!({ "result": result });
-        let response_str = serde_json::to_string(&response).unwrap();
-        let response_payload = JsonPayload { json: response_str };
+        let response_bytes = serde_json::to_vec(&response).unwrap();
+        let response_payload = JsonPayload { json: response_bytes };
 
         // Serialize using rkyv
         DEFAULT_CODEC.encode(&response_payload)

@@ -44,6 +44,8 @@ impl TokenType {
 pub struct SerializedToken {
     pub task_id: String,
     pub token_type: TokenType,
+    pub tool_name: Option<String>,
+    pub tool_args: Option<Vec<u8>>,
     pub content: String,
 }
 
@@ -53,19 +55,24 @@ impl SerializedToken {
             StreamToken::Text(content) => Self {
                 task_id,
                 token_type: TokenType::Text,
+                tool_name: None,
+                tool_args: None,
                 content,
             },
             StreamToken::ToolCall { name, args } => {
-                let payload = serde_json::to_string(&(name, args)).unwrap_or_default();
                 Self {
                     task_id,
                     token_type: TokenType::ToolCall,
-                    content: payload,
+                    tool_name: Some(name),
+                    tool_args: Some(args.to_string().into_bytes()),
+                    content: String::new(),
                 }
             }
             StreamToken::Done => Self {
                 task_id,
                 token_type: TokenType::Done,
+                tool_name: None,
+                tool_args: None,
                 content: String::new(),
             },
         }
@@ -246,7 +253,9 @@ mod tests {
         let token = SerializedToken {
             task_id: "test_task".to_string(),
             token_type: TokenType::ToolCall,
-            content: "test_content".to_string(),
+            tool_name: Some("test_tool".to_string()),
+            tool_args: Some(br#"{"value":42}"#.to_vec()),
+            content: String::new(),
         };
 
         let bytes = token.to_bytes_rkyv().unwrap();
@@ -254,6 +263,8 @@ mod tests {
 
         assert_eq!(token.task_id, deserialized.task_id);
         assert_eq!(token.token_type, deserialized.token_type);
+        assert_eq!(token.tool_name, deserialized.tool_name);
+        assert_eq!(token.tool_args, deserialized.tool_args);
         assert_eq!(token.content, deserialized.content);
     }
 
@@ -264,12 +275,16 @@ mod tests {
         let token1 = SerializedToken {
             task_id: "task1".to_string(),
             token_type: TokenType::Text,
+            tool_name: None,
+            tool_args: None,
             content: "Hello".to_string(),
         };
 
         let token2 = SerializedToken {
             task_id: "task2".to_string(),
             token_type: TokenType::Done,
+            tool_name: None,
+            tool_args: None,
             content: String::new(),
         };
 
@@ -290,6 +305,8 @@ mod tests {
                 SerializedToken {
                     task_id: "task1".to_string(),
                     token_type: TokenType::Text,
+                    tool_name: None,
+                    tool_args: None,
                     content: "Test content".to_string(),
                 }
             ],
@@ -306,6 +323,8 @@ mod tests {
         assert_eq!(rkyv_batch.token_count, json_batch.token_count);
         assert_eq!(rkyv_batch.tokens[0].task_id, json_batch.tokens[0].task_id);
         assert_eq!(rkyv_batch.tokens[0].token_type, json_batch.tokens[0].token_type);
+        assert_eq!(rkyv_batch.tokens[0].tool_name, json_batch.tokens[0].tool_name);
+        assert_eq!(rkyv_batch.tokens[0].tool_args, json_batch.tokens[0].tool_args);
         assert_eq!(rkyv_batch.tokens[0].content, json_batch.tokens[0].content);
     }
 
@@ -316,11 +335,15 @@ mod tests {
                 SerializedToken {
                     task_id: "task1".to_string(),
                     token_type: TokenType::Text,
+                    tool_name: None,
+                    tool_args: None,
                     content: "This is a longer piece of content to demonstrate size difference".to_string(),
                 },
                 SerializedToken {
                     task_id: "task2".to_string(),
                     token_type: TokenType::Done,
+                    tool_name: None,
+                    tool_args: None,
                     content: String::new(),
                 }
             ],
@@ -336,5 +359,21 @@ mod tests {
 
         // rkyv should generally produce smaller output
         assert!(rkyv_bytes.len() <= json_bytes.len());
+    }
+
+    #[test]
+    fn test_tool_call_token_stores_name_separately() {
+        let token = SerializedToken::from_stream_token(
+            "task-1".to_string(),
+            StreamToken::ToolCall {
+                name: "get_weather".to_string(),
+                args: serde_json::json!({"city": "Shanghai"}),
+            },
+        );
+
+        assert!(matches!(token.token_type, TokenType::ToolCall));
+        assert_eq!(token.tool_name.as_deref(), Some("get_weather"));
+        assert_eq!(token.tool_args, Some(br#"{"city":"Shanghai"}"#.to_vec()));
+        assert!(token.content.is_empty());
     }
 }

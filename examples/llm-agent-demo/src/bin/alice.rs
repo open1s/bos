@@ -13,7 +13,7 @@ use serde_json::Value;
 
 #[derive(Archive, Serialize, Deserialize)]
 struct JsonPayload {
-    json: String,
+    json: Vec<u8>,
 }
 
 #[tokio::main]
@@ -318,7 +318,7 @@ impl Tool for BobToolInvoker {
         client.init(self.session.clone()).await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-        let json = serde_json::to_string(args)
+        let json = serde_json::to_vec(args)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         let payload = JsonPayload { json };
@@ -332,7 +332,7 @@ impl Tool for BobToolInvoker {
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-        let mut result: Value = serde_json::from_str(&response.json)
+        let mut result: Value = serde_json::from_slice(&response.json)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         result["operation"] = Value::String(format!("via Bob's {} tool", self.name));
