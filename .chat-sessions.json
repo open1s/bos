@@ -1679,11 +1679,193 @@
           "showThinking": false
         },
         "timestamp": 1774250049243
+      },
+      {
+        "userFeishuMsgId": "",
+        "openCodeMsgId": "msg_d198e5be7001p3Z8ue0e9s23W8",
+        "botFeishuMsgIds": [
+          "om_x100b533adfda10bcb31c229415cb3b6"
+        ],
+        "type": "normal",
+        "cardData": {
+          "text": "",
+          "thinking": "",
+          "chatId": "oc_0706e13493fd44ba8fb5752ddff7a663",
+          "messageId": "om_x100b533adfda10bcb31c229415cb3b6",
+          "tools": [],
+          "segments": [],
+          "status": "completed",
+          "showThinking": false
+        },
+        "timestamp": 1774250257911
+      },
+      {
+        "userFeishuMsgId": "",
+        "openCodeMsgId": "msg_d198e5be7001p3Z8ue0e9s23W8",
+        "botFeishuMsgIds": [
+          "om_x100b533adf8d3480b4b9ed06d2ad693"
+        ],
+        "type": "normal",
+        "cardData": {
+          "text": "\n\n❌ 会话已中断：The operation was aborted.",
+          "thinking": "",
+          "chatId": "oc_0706e13493fd44ba8fb5752ddff7a663",
+          "messageId": "om_x100b533adf8d3480b4b9ed06d2ad693",
+          "tools": [],
+          "segments": [
+            {
+              "type": "note",
+              "text": "❌ 会话已中断：The operation was aborted.",
+              "variant": "error"
+            }
+          ],
+          "status": "failed",
+          "showThinking": false
+        },
+        "timestamp": 1774250260494
+      },
+      {
+        "userFeishuMsgId": "",
+        "openCodeMsgId": "msg_d198f64f9001Gx4bvPfQg58Mnf",
+        "botFeishuMsgIds": [
+          "om_x100b533af6c75c74b34b988ba4137d7"
+        ],
+        "type": "normal",
+        "cardData": {
+          "text": "",
+          "thinking": "",
+          "chatId": "oc_0706e13493fd44ba8fb5752ddff7a663",
+          "messageId": "om_x100b533af6c75c74b34b988ba4137d7",
+          "tools": [],
+          "segments": [],
+          "status": "completed",
+          "showThinking": false
+        },
+        "timestamp": 1774250881179
+      },
+      {
+        "userFeishuMsgId": "",
+        "openCodeMsgId": "msg_d198f64f9001Gx4bvPfQg58Mnf",
+        "botFeishuMsgIds": [
+          "om_x100b533af77aa4bcb39ab0b1ec5b77c"
+        ],
+        "type": "normal",
+        "cardData": {
+          "text": "\n\n❌ 会话已中断：The operation was aborted.",
+          "thinking": "",
+          "chatId": "oc_0706e13493fd44ba8fb5752ddff7a663",
+          "messageId": "om_x100b533af77aa4bcb39ab0b1ec5b77c",
+          "tools": [],
+          "segments": [
+            {
+              "type": "note",
+              "text": "❌ 会话已中断：The operation was aborted.",
+              "variant": "error"
+            }
+          ],
+          "status": "failed",
+          "showThinking": false
+        },
+        "timestamp": 1774250907900
+      },
+      {
+        "userFeishuMsgId": "",
+        "openCodeMsgId": "msg_d1997f85c001AL1XHQlFFagTiH",
+        "botFeishuMsgIds": [
+          "om_x100b533af3c218acb4c1747e4f13848"
+        ],
+        "type": "normal",
+        "cardData": {
+          "text": "\n\n❌ 会话已中断：The operation was aborted.",
+          "thinking": "",
+          "chatId": "oc_0706e13493fd44ba8fb5752ddff7a663",
+          "messageId": "om_x100b533af3c218acb4c1747e4f13848",
+          "tools": [],
+          "segments": [
+            {
+              "type": "note",
+              "text": "❌ 会话已中断：The operation was aborted.",
+              "variant": "error"
+            }
+          ],
+          "status": "failed",
+          "showThinking": false
+        },
+        "timestamp": 1774250961433
+      },
+      {
+        "userFeishuMsgId": "",
+        "openCodeMsgId": "msg_d199981d0001EC9rFyQ2kokAeC",
+        "botFeishuMsgIds": [
+          "om_x100b533a9ee108acb33b3b2d892cd84"
+        ],
+        "type": "normal",
+        "cardData": {
+          "text": "",
+          "thinking": "",
+          "chatId": "oc_0706e13493fd44ba8fb5752ddff7a663",
+          "messageId": "om_x100b533a9ee108acb33b3b2d892cd84",
+          "tools": [],
+          "segments": [],
+          "status": "completed",
+          "showThinking": false
+        },
+        "timestamp": 1774251267266
+      },
+      {
+        "userFeishuMsgId": "",
+        "openCodeMsgId": "msg_d199e1271001Gwh9QjmU4A0fVa",
+        "botFeishuMsgIds": [
+          "om_x100b533a9f954ce4b39d76ce5d82e84"
+        ],
+        "type": "normal",
+        "cardData": {
+          "text": "\n\n❌ 会话已中断：The operation was aborted.",
+          "thinking": "",
+          "chatId": "oc_0706e13493fd44ba8fb5752ddff7a663",
+          "messageId": "om_x100b533a9f954ce4b39d76ce5d82e84",
+          "tools": [],
+          "segments": [
+            {
+              "type": "note",
+              "text": "❌ 会话已中断：The operation was aborted.",
+              "variant": "error"
+            }
+          ],
+          "status": "failed",
+          "showThinking": false
+        },
+        "timestamp": 1774251286437
+      },
+      {
+        "userFeishuMsgId": "",
+        "openCodeMsgId": "msg_d199ea40e0013qCIWDJQDKBizI",
+        "botFeishuMsgIds": [
+          "om_x100b533a963a6d7cb3f850078150086"
+        ],
+        "type": "normal",
+        "cardData": {
+          "text": "\n\n❌ UnknownError：AI_InvalidResponseDataError: Expected 'id' to be a string.",
+          "thinking": "",
+          "chatId": "oc_0706e13493fd44ba8fb5752ddff7a663",
+          "messageId": "om_x100b533a963a6d7cb3f850078150086",
+          "tools": [],
+          "segments": [
+            {
+              "type": "note",
+              "text": "❌ UnknownError：AI_InvalidResponseDataError: Expected 'id' to be a string.",
+              "variant": "error"
+            }
+          ],
+          "status": "failed",
+          "showThinking": false
+        },
+        "timestamp": 1774251408359
       }
     ],
     "defaultDirectory": "/Users/gaosg/Projects/bos",
     "preferredModel": "nvidia:z-ai/glm5",
     "lastFeishuUserMsgId": "om_x100b533a0c9d8480b2c704839d29267",
-    "lastFeishuAiMsgId": "om_x100b533a2051c480b3ce0ef3fda36bb"
+    "lastFeishuAiMsgId": "om_x100b533a963a6d7cb3f850078150086"
   }
 }

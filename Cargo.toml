@@ -1,20 +1,9 @@
 [workspace]
 members = [
-    "crates/config",
-    "crates/bus",
-    "crates/agent",
-    "benchmarks",
-    "examples/brainos-common",
-    "examples/basic-communication",
-    "examples/llm-agent-demo",
-    "examples/wechat-demo",
-    "examples/demo-skills-mcp",
-    "examples/demo-streaming",
-    "examples/demo-scheduler",
-    "examples/demo-rpc-service",
-    "examples/demo-discovery",
-    "examples/demo-pubsub-query",
-    "examples/demo-agent-lifecycle"
+"crates/config",
+"crates/bus",
+"crates/agent",
+"benchmarks",
 ]
 resolver = "2"
 
