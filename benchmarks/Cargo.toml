@@ -1,0 +1,14 @@
+[package]
+name = "benchmarks"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent = { path = "../crates/agent" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "backpressure"
+harness = false

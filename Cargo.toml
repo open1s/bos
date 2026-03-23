@@ -3,6 +3,7 @@ members = [
     "crates/config",
     "crates/bus",
     "crates/agent",
+    "benchmarks",
     "examples/brainos-common",
     "examples/basic-communication",
     "examples/llm-agent-demo",

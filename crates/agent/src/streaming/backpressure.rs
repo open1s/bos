@@ -369,7 +369,6 @@ pub struct BackpressureController {
     max_batch_tokens: usize,
     /// Batch timeout (unused in async context, kept for API compatibility)
     _batch_timeout: Duration,
-    /// Current load factor (scaled by 10000 to avoid floating point)
     load_factor_scaled: std::sync::atomic::AtomicU64,
     /// Base tokens per second (for rate adjustment)
     base_rate: f64,
@@ -743,13 +742,19 @@ mod tests {
             Duration::from_millis(50),
         );
 
-        controller.report_bus_load(0.3);
+        for _ in 0..10 {
+            controller.report_bus_load(0.3);
+        }
         assert_eq!(controller.current_rate(), 100.0);
 
-        controller.report_bus_load(0.6);
+        for _ in 0..10 {
+            controller.report_bus_load(0.6);
+        }
         assert_eq!(controller.current_rate(), 80.0);
 
-        controller.report_bus_load(0.9);
+        for _ in 0..10 {
+            controller.report_bus_load(0.9);
+        }
         assert_eq!(controller.current_rate(), 50.0);
     }
 
