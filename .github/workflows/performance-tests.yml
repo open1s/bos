@@ -1,3 +1,4 @@
+uses: actions/upload-artifact@v4
 name: Performance Tests
 
 on:
