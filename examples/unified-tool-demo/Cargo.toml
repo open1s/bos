@@ -1,0 +1,32 @@
+[package]
+name = "unified-tool-demo"
+version = "0.1.0"
+edition = "2021"
+description = "Demo showing tool definition patterns: local, RPC, function, A2A"
+
+[dependencies]
+# Agent crate
+agent = { path = "../../crates/agent" }
+# Bus crate for Zenoh
+bus = { path = "../../crates/bus" }
+# Config crate
+config = { path = "../../crates/config" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Zenoh
+zenoh = "1.0"
+
+# LLM client (OpenAI-compatible)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Utilities
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"

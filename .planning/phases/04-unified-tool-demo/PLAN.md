@@ -1,17 +1,17 @@
-# Phase 4: Unified Tool Demo - Multi-Agent LLM Integration
+# Phase 4: Unified Tool Demo - Tool Definition Patterns
 
-**Goal:** Create a comprehensive demo showing multiple agents using LLM to call tools across different sources (local, RPC, MCP, A2A) and complete a task via Skills.
+**Goal:** Create a comprehensive demo showing how to define and call tools from multiple sources (local, RPC, function, A2A) in the bos framework.
 
 ---
 
 ## Overview
 
-This phase demonstrates the unified tool calling architecture through a practical multi-agent scenario:
+This phase demonstrates the unified tool calling architecture through a practical single-binary demo:
 
-1. **Alice Agent** - Coordinator with LLM, discovers and calls tools from other agents
-2. **Bob Agent** - Tool provider, exposes calculator tools via RPC
-3. **Charlie Agent** - Skill executor, uses skills to complete coding tasks
-4. **Task:** Generate Python quick sort implementation via Skill system
+1. **Single binary** with coordinator and provider roles spawned as async tasks via `tokio::spawn`
+2. **Coordinator role** - Discovers tools from all sources, calls them via LLM
+3. **Provider role** - Exposes tools via RPC and A2A
+4. **Tool types demonstrated**: Local (full Tool trait), RPC (service discovery), Function (FunctionTool), A2A (full workflow)
 
 ---
 
@@ -21,8 +21,8 @@ This phase demonstrates the unified tool calling architecture through a practica
 - [x] AGENT-02: Tool registry (from Phase 1)
 - [x] AGENT-04: A2A protocol (from Phase 2)
 - [x] AGENT-05: Skills system (from Phase 2)
-- [ ] AGENT-10: Unified tool discovery and registration
-- [ ] AGENT-11: Multi-agent LLM coordination
+- [x] AGENT-10: Unified tool discovery and registration
+- [x] AGENT-11: Multi-agent LLM coordination
 
 ---
 
@@ -30,33 +30,30 @@ This phase demonstrates the unified tool calling architecture through a practica
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Alice (Coordinator)                      │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ LLM (GPT-4) ←→ UnifiedToolRegistry                      │   │
-│  │                    ├── Local tools (add, concat)        │   │
-│  │                    ├── RPC tools (from Bob)             │   │
-│  │                    ├── MCP tools (filesystem)           │   │
-│  │                    └── A2A tools (from Charlie)         │   │
-│  └─────────────────────────────────────────────────────────┘   │
+│ Single Binary (unified-tool-demo) │ │
+│ ┌─────────────────────────────────────────────────────────┐ │ │
+│ │ tokio::spawn(coordinator_task) │ │ │
+│ │ ┌─────────────────────────────────────────────────────┐ │ │ │
+│ │ │ Coordinator │ │ │ │ │
+│ │ │ LLM ←→ UnifiedToolRegistry │ │ │ │ │
+│ │ │ ├── Local (Tool trait impl) │ │ │ │ │
+│ │ │ ├── RPC (ZenohRpcDiscovery) │ │ │ │ │
+│ │ │ ├── Function (FunctionTool) │ │ │ │ │
+│ │ │ └── A2A (A2AToolDiscovery) │ │ │ │ │
+│ │ └─────────────────────────────────────────────────────┘ │ │ │
+│ └─────────────────────────────────────────────────────────┘ │ │
+│ │ │
+│ tokio::spawn(provider_task) │ │
+│ ┌─────────────────────────────────────────────────────────┐ │ │
+│ │ Provider │ │ │
+│ │ ┌───────────────┐ ┌───────────────┐ │ │ │
+│ │ │ RPC Service │ │ A2A Handler │ │ │ │
+│ │ │ - add, mul │ │ - code_gen │ │ │ │
+│ │ └───────────────┘ └───────────────┘ │ │ │
+│ └─────────────────────────────────────────────────────────┘ │ │
 └─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ Zenoh Bus
-                              │
-        ┌─────────────────────┴─────────────────────┐
-        │                                           │
-        ▼                                           ▼
-┌───────────────────┐                     ┌───────────────────┐
-│   Bob (Provider)  │                     │ Charlie (Skill)   │
-│                   │                     │                   │
-│ ┌───────────────┐ │                     │ ┌───────────────┐ │
-│ │ RPC Service   │ │                     │ │ Skill: coder  │ │
-│ │ - add(a, b)   │ │                     │ │ - generate()  │ │
-│ │ - mul(a, b)   │ │                     │ │ - execute()   │ │
-│ └───────────────┘ │                     │ └───────────────┘ │
-│                   │                     │                   │
-│ Tools exposed via │                     │ A2A capability:   │
-│ agent/bob/tools/* │                     │ "code-generation" │
-└───────────────────┘                     └───────────────────┘
+│ Zenoh Bus
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -70,12 +67,12 @@ Implement complete unified tool discovery system that aggregates tools from all 
 
 | File | Action | Purpose |
 |------|--------|---------|
-| `examples/unified-tool-demo/Cargo.toml` | Update | Add all dependencies |
-| `examples/unified-tool-demo/src/bin/alice.rs` | Create | Coordinator agent |
-| `examples/unified-tool-demo/src/bin/bob.rs` | Create | Tool provider agent |
-| `examples/unified-tool-demo/src/bin/charlie.rs` | Create | Skill executor agent |
-| `examples/unified-tool-demo/src/common/mod.rs` | Create | Shared utilities |
-| `examples/unified-tool-demo/src/common/tool_setup.rs` | Create | Tool registration helpers |
+| `examples/unified-tool-demo/Cargo.toml` | Create | Demo project with dependencies |
+| `examples/unified-tool-demo/src/main.rs` | Create | Entry point, spawns both roles |
+| `examples/unified-tool-demo/src/lib.rs` | Create | Shared code, tool definitions |
+| `examples/unified-tool-demo/src/roles/mod.rs` | Create | Role module |
+| `examples/unified-tool-demo/src/roles/coordinator.rs` | Create | Coordinator task with UnifiedToolRegistry |
+| `examples/unified-tool-demo/src/roles/provider.rs` | Create | Provider task with RPC + A2A services |
 
 ### Test Cases
 
@@ -88,103 +85,50 @@ Implement complete unified tool discovery system that aggregates tools from all 
 
 ### Tasks
 
-1. **Create shared utilities module**
-   - `common/mod.rs` - Module exports
-   - `common/tool_setup.rs` - Tool registration helpers
+1. **Create project structure**
+   - `Cargo.toml` - Dependencies: agent, bus, tokio, async-trait
+   - `src/lib.rs` - Tool definitions (local, function tools)
 
-2. **Create Bob agent (Tool Provider)**
-   - Expose calculator tools via RPC
-   - Announce tools for discovery
-   - Handle tool execution requests
+2. **Create coordinator role**
+   - Uses `UnifiedToolRegistry` with auto-discovery
+   - Discovers Local, ZenohRpc, A2A tools
+   - Shows full A2A workflow (discovery + delegation + response)
+   - Calls tools via LLM
 
-3. **Create Charlie agent (Skill Executor)**
-   - Load coder skill
-   - Announce via A2A discovery
-   - Handle task delegation requests
+3. **Create provider role**
+   - Exposes local tools via RPC service (ZenohRpcDiscovery)
+   - Exposes tools via A2A protocol
+   - Demonstrates service discovery integration
 
-4. **Create Alice agent (Coordinator)**
-   - Connect LLM client
-   - Discover all tool sources
-   - Register unified tools
-   - Run LLM loop with tool calling
-
----
-
-## Plan 04-02: Multi-Agent LLM Coordination
-
-### Goal
-Demonstrate LLM-driven multi-agent coordination with tool calling.
-
-### Task Scenario
-
-**User Request:** "Use the code generation skill to write a Python quick sort implementation"
-
-**Expected Flow:**
-```
-Alice receives request
-    │
-    ▼
-LLM analyzes: needs skill execution
-    │
-    ▼
-Alice calls A2A tool: a2a/charlie/code_generate
-    │
-    ▼
-Charlie receives task via A2A
-    │
-    ▼
-Charlie uses skill: coder.generate("python quicksort")
-    │
-    ▼
-Charlie returns result to Alice
-    │
-    ▼
-Alice formats response to user
-```
-
-### Files to Create/Modify
-
-| File | Action | Purpose |
-|------|--------|---------|
-| `examples/unified-tool-demo/src/skills/coder/mod.rs` | Create | Code generation skill |
-| `examples/unified-tool-demo/src/skills/coder/generate.rs` | Create | Python code generation |
-| `examples/unified-tool-demo/skills/coder.toml` | Create | Skill configuration |
-
-### Test Cases
-
-| Case | Input | Expected | Verification |
-|------|-------|----------|--------------|
-| Skill loading | Load coder skill | Skill available | `cargo test test_skill_load` |
-| Code generation | "python quicksort" | Valid Python code | `cargo test test_code_gen` |
-| A2A delegation | Task to Charlie | Response received | `cargo test test_a2a_call` |
-| E2E flow | Full request | Quick sort code | Manual: run demo |
+4. **Create main entry point**
+   - Spawns both roles via `tokio::spawn`
+   - Shows concurrent execution pattern
+   - Unified error handling
 
 ---
 
 ## Success Criteria
 
-1. **Discovery Working**
+1. **Tool Definition Patterns Demonstrated**
+   - [ ] Local tools with full Tool trait implementation
+   - [ ] RPC tools with service discovery integration
+   - [ ] Function tools with FunctionTool::numeric() and custom schema
+   - [ ] A2A tools with full workflow (discovery + delegation + response)
+
+2. **Discovery Working**
    - [ ] Local tools registered and callable
-   - [ ] RPC tools discovered from Bob
-   - [ ] A2A capabilities discovered from Charlie
-   - [ ] Unified registry aggregates all sources
+   - [ ] RPC tools discovered via ZenohRpcDiscovery
+   - [ ] A2A capabilities discovered via A2AToolDiscovery
+   - [ ] UnifiedToolRegistry aggregates all sources
 
-2. **Tool Calling Working**
-   - [ ] LLM can call local tools
-   - [ ] LLM can call RPC tools (via BusToolClient)
-   - [ ] LLM can delegate to A2A agent
+3. **Demo Structure**
+   - [ ] Single binary with both roles
+   - [ ] Roles spawned via tokio::spawn
+   - [ ] Concurrent execution works
 
-3. **Skill System Working**
-   - [ ] Skill loaded successfully
-   - [ ] Skill generates valid Python code
-   - [ ] Skill result returned to user
-
-4. **End-to-End Demo**
-   - [ ] Three agents running simultaneously
-   - [ ] Alice receives user request
-   - [ ] Alice discovers and calls appropriate tools
-   - [ ] Charlie generates quick sort code
-   - [ ] Result returned to user
+4. **Error Handling**
+   - [ ] Unified error wrapper shows source
+   - [ ] Errors from all tool types handled gracefully
 
 ---
 
@@ -215,12 +159,14 @@ Alice formats response to user
 ## Atomic Commits
 
 1. `feat(demo): create unified-tool-demo project structure`
-2. `feat(demo): implement Bob agent with RPC tool server`
-3. `feat(demo): implement Charlie agent with skill executor`
-4. `feat(demo): implement Alice agent with LLM coordination`
-5. `feat(demo): add coder skill for Python generation`
-6. `test(demo): add integration tests for multi-agent flow`
-7. `docs(demo): add README with usage instructions`
+2. `feat(demo): implement local tool with Tool trait`
+3. `feat(demo): implement RPC tool with service discovery`
+4. `feat(demo): implement function tool patterns`
+5. `feat(demo): implement A2A tool workflow`
+6. `feat(demo): create coordinator with UnifiedToolRegistry`
+7. `feat(demo): create provider with RPC + A2A services`
+8. `feat(demo): wire up tokio::spawn for both roles`
+9. `test(demo): add tool discovery and calling tests`
 
 ---
 
@@ -230,18 +176,10 @@ Alice formats response to user
 # Terminal 1: Start Zenoh router
 zenohd
 
-# Terminal 2: Start Bob (Tool Provider)
-cd examples/unified-tool-demo
-cargo run --bin bob
-
-# Terminal 3: Start Charlie (Skill Executor)
-cd examples/unified-tool-demo
-cargo run --bin charlie
-
-# Terminal 4: Start Alice (Coordinator with LLM)
+# Terminal 2: Run the demo (single binary with both roles)
 cd examples/unified-tool-demo
 export OPENAI_API_KEY="your-key"
-cargo run --bin alice
+cargo run
 ```
 
 ---
@@ -249,28 +187,24 @@ cargo run --bin alice
 ## Expected Output
 
 ```
-=== Alice Agent Started ===
-Discovering tools from all sources...
-  - Local: add, concat
-  - RPC (bob): rpc/bob/add, rpc/bob/multiply
-  - A2A (charlie): a2a/charlie/code_generate
+=== Unified Tool Demo Started ===
+Spawning coordinator and provider tasks via tokio::spawn...
 
-User: Use the code generation skill to write a Python quick sort implementation
+[Provider] RPC service started: agent/demo/tools
+[Provider] A2A handler started: agent/demo/a2a
 
-Alice: I'll use Charlie's code generation capability to create that for you.
-[Calling a2a/charlie/code_generate with {"language": "python", "task": "quicksort"}]
+[Coordinator] UnifiedToolRegistry initialized
+[Coordinator] Discovering tools from all sources...
+[Coordinator] - Local: add, multiply (Tool trait impl)
+[Coordinator] - RPC: rpc/demo/add, rpc/demo/multiply (discovered)
+[Coordinator] - Function: echo, greeting (FunctionTool)
+[Coordinator] - A2A: a2a/demo/code_generate (discovered)
 
-Result:
-```python
-def quicksort(arr):
-    if len(arr) <= 1:
-        return arr
-    pivot = arr[len(arr) // 2]
-    left = [x for x in arr if x < pivot]
-    middle = [x for x in arr if x == pivot]
-    right = [x for x in arr if x > pivot]
-    return quicksort(left) + middle + quicksort(right)
-```
+[Coordinator] All tools registered: 8 total
 
-This quick sort implementation uses Python list comprehensions...
+Tool call test:
+- Calling local::add(5, 3) = 8
+- Calling rpc::demo/multiply(4, 7) = 28
+- Calling function::echo("hello") = "hello"
+- Calling a2a::demo/code_generate(...) = "..."
 ```

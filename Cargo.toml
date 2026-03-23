@@ -1,9 +1,10 @@
 [workspace]
 members = [
-"crates/config",
-"crates/bus",
-"crates/agent",
-"benchmarks",
+    "crates/config",
+    "crates/bus",
+    "crates/agent",
+    "benchmarks",
+    "examples/unified-tool-demo",
 ]
 resolver = "2"
 
