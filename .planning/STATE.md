@@ -156,3 +156,4 @@ Phase 3: Orchestration & Persistence (2 plans)
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 260322-vo6 | Agent Development Guide | 2026-03-22 | 232601b5 | [260322-vo6-agent](./quick/260322-vo6-agent/) |
+| 260323-bs7 | Agent Tool/Function Registration API | 2026-03-23 | 9c473856 | [260323-bs7-agent-api](./quick/260323-bs7-agent-api/) |
