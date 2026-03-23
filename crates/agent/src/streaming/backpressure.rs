@@ -191,11 +191,13 @@ impl<'de> SerdeDeserialize<'de> for TokenBatch {
 /// # Example
 ///
 /// ```rust
+/// use agent::RateLimiter;
+///
 /// let limiter = RateLimiter::new(100.0, 50.0); // 100 tokens/sec, 50 burst capacity
 ///
 /// // Allow publishing if tokens available
 /// if limiter.should_publish() {
-///     publish_token();
+///     // publish_token();
 /// }
 /// ```
 #[derive(Debug)]
@@ -223,6 +225,8 @@ impl RateLimiter {
     /// # Example
     ///
     /// ```rust
+    /// use agent::RateLimiter;
+    ///
     /// // 100 tokens/second, 50 burst capacity
     /// let limiter = RateLimiter::new(100.0, 50.0);
     /// ```

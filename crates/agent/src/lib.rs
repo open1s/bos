@@ -19,6 +19,12 @@ pub use agent::config::TomlToolRef;
 pub use agent::config::{AgentBuilder, TomlAgentConfig};
 pub use llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, OpenAiClient, StreamToken};
 pub use tools::{Tool, ToolDescription, ToolRegistry};
+pub use tools::{
+    UnifiedToolRegistry, UnifiedRegistryConfig,
+    A2AToolClient,
+    ToolDiscovery, DiscoveredTool, ToolSource, LocalDiscovery,
+    ZenohRpcDiscovery, McpDiscovery, A2AToolDiscovery,
+};
 pub use streaming::{
     SseDecoder, SseEvent, TokenStream, TokenPublisher,
     TokenBatch, SerializedToken, TokenType,
