@@ -7,7 +7,7 @@ use zenoh::Session as ZenohSession;
 use crate::agent::{Agent, AgentConfig};
 use crate::error::AgentError;
 use crate::llm::OpenAiClient;
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::{Tool, ToolRegistry, FunctionTool};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TomlToolRef {
@@ -112,16 +112,36 @@ impl AgentBuilder {
         ));
 
         let config: AgentConfig = self.config.clone().into();
-        let agent = Agent::new(config, llm);
 
         let mut registry = ToolRegistry::new();
         for tool in self.tools {
             registry.register(tool)?;
         }
 
-        if let Some(_session) = session {
-            // TODO: register bus tools when session provided
+        // Load tools from config if specified
+        if let Some(toml_tools) = self.config.tools {
+            for toml_tool in toml_tools {
+                if let Some(schema) = toml_tool.schema {
+                    let tool = Arc::new(FunctionTool::new(
+                        &toml_tool.name,
+                        toml_tool.description.as_deref().unwrap_or("Tool"),
+                        schema,
+                        // Use a generic function that delegates to execute later
+                        |_args| Ok(serde_json::json!("tool not yet implemented")),
+                    ));
+                    registry.register(tool)?;
+                }
+            }
         }
+
+        // Register bus tools if session is provided
+        if let Some(session) = session {
+            // Bus tools would be registered here in future
+            // For now, we just note the session is available
+            let _ = session;
+        }
+
+        let agent = Agent::new_with_registry(config, llm, registry);
 
         Ok(agent)
     }

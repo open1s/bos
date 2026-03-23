@@ -11,7 +11,7 @@ pub mod config;
 
 use crate::error::{AgentError, ToolError};
 use crate::llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::{Tool, ToolRegistry, FunctionTool};
 
 /// A message in the conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,13 +131,10 @@ impl Agent {
         }
     }
 
-    pub fn new_with_registry(config: AgentConfig, llm: Arc<dyn LlmClient>, registry: Arc<ToolRegistry>) -> Self {
-        Self {
-            config,
-            llm,
-            message_log: MessageLog::new(),
-            tool_registry: Some(registry),
-        }
+    pub fn new_with_registry(config: AgentConfig, llm: Arc<dyn LlmClient>, registry: ToolRegistry) -> Self {
+        let mut agent = Self::new(config, llm);
+        agent.tool_registry = Some(Arc::new(registry));
+        agent
     }
 
     pub fn message_log(&self) -> &MessageLog {
@@ -185,6 +182,37 @@ impl Agent {
     pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.add_tool(tool);
         self
+    }
+
+    /// Register a function as a tool using FunctionTool wrapper.
+    pub fn register_function<F>(
+        &mut self,
+        name: &str,
+        description: &str,
+        schema: serde_json::Value,
+        func: F,
+    ) -> Result<(), ToolError>
+    where
+        F: Fn(&serde_json::Value) -> Result<serde_json::Value, ToolError> + Send + Sync + 'static,
+    {
+        let tool = Arc::new(FunctionTool::new(name, description, schema, func));
+        self.register_tool(tool)
+    }
+
+    /// Register a numeric function as a tool with auto-generated schema.
+    /// The function should accept `&serde_json::Value` and return `Result<serde_json::Value, ToolError>`.
+    pub fn register_numeric_function<F>(
+        &mut self,
+        name: &str,
+        description: &str,
+        num_params: usize,
+        func: F,
+    ) -> Result<(), ToolError>
+    where
+        F: Fn(&serde_json::Value) -> Result<serde_json::Value, ToolError> + Send + Sync + 'static,
+    {
+        let tool = Arc::new(FunctionTool::numeric(name, description, num_params, func));
+        self.register_tool(tool)
     }
 
     /// Run agent on a task (no tools).

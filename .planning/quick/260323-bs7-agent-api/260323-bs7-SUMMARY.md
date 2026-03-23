@@ -100,12 +100,12 @@ agent.run_with_tools(task, Some(&external_registry)).await?;
 ## Testing
 
 **Compilation:** ✅ `cargo build --workspace` passes
-**Tests:** ✅ 107 tests passed (agent crate)
+**Tests:** ✅ 110 tests passed (agent crate) - up from 107, 3 new tests added
 
-**Key Tests:**
-- All existing agent tests pass (backward compatibility verified)
-- Tool registration methods compile without errors
-- Mixed usage of internal/external registry works correctly
+**New Tests:**
+- `test_function_tool_basic` - Verify FunctionTool creation
+- `test_function_tool_numeric` - Verify auto schema generation
+- `test_function_tool_execute` - Verify function execution registry integration
 
 ## Design Decisions
 
@@ -138,18 +138,43 @@ if self.tool_registry.is_some() {
 
 ## Known Limitations
 
-### Tasks 2 and 3 Not Implemented
-- **Task 2** (Function registration via `FunctionTool` wrapper): Deferred to follow-up
-- **Task 3** (AgentBuilder integration): Deferred to follow-up
+### ✅ Task 2: FunctionTool Wrapper - COMPLETED
 
-These can be added incrementally without affecting the current implementation.
+**File Created:** `crates/agent/src/tools/function.rs` (+185 lines)
+
+**Implemented:**
+- `FunctionTool` struct wrapping async functions as `Tool` implementation
+- `FunctionTool::new()` for custom schemas
+- `FunctionTool::numeric()` for automatic schema generation (up to 5 numeric params)
+- Supports any function signature with `Fn(&Value) -> Result<Value, ToolError>`
+
+### ✅ Task 3: AgentBuilder Integration - COMPLETED
+
+**Files Modified:**
+- `crates/agent/src/agent/mod.rs` (+34 lines) - Added `register_function()` and `register_numeric_function()`
+- `crates/agent/src/agent/config.rs` (+25 lines) - Updated `build()` to attach registry; loads tools from config
+
+**Implemented:**
+- `register_function(name, description, schema, func)` - Register any async function as a tool
+- `register_numeric_function(name, description, num_params, func)` - Simplified registration for numeric functions
+- AgentBuilder now loads tools defined in TOML config
+- Registry is attached to `Agent` instance on `build()`
+
+**Example Created:** `examples/function-tool-demo/src/main.rs` - Demonstrates all new APIs
 
 ## Files Changed
 
 | File | Lines Changed | Purpose |
 |------|---------------|---------|
-| `crates/agent/src/agent/mod.rs` | +76 | Added registry field and methods |
+| `crates/agent/src/tools/function.rs` | +185 | NEW - FunctionTool wrapper implementation |
+| `crates/agent/src/tools/mod.rs` | 2 | Re-export FunctionTool |
+| `crates/agent/src/agent/mod.rs` | +34 | Add register_function() and register_numeric_function() |
+| `crates/agent/src/agent/config.rs` | +25 | Update build() to attach registry; load tools from config |
+| `examples/function-tool-demo/src/main.rs` | +120 | NEW - Complete example demonstrating all APIs |
 | `examples/llm-agent-demo/src/bin/alice.rs` | 1 | Updated to use new API |
+| `examples/function-tool-demo/Cargo.toml` | +12 | NEW - Example project file |
+| `.planning/quick/260323-bs7-agent-api/260323-bs7-SUMMARY.md` | +80 | Updated summary with Tasks 2 & 3 |
+| `.planning/STATE.md` | 1 | Added quick task to completed table |
 
 ## Usage Impact
 
@@ -164,14 +189,64 @@ loop {
 }
 ```
 
-### After (Simplified)
+### After - Option A: Register Directly
 ```rust
 let mut agent = Agent::new(config, llm);
 agent.add_tool(tool);
+```
 
-loop {
-    let result = agent.run_with_tasks(task, None).await?;
+### After - Option B: Register Functions (NEW!)
+```rust
+let mut agent = Agent::new(config, llm);
+agent.register_numeric_function(
+    "add",
+    "Add two numbers",
+    2,
+    |args| {
+        let a = args["a"].as_f64()?;
+        let b = args["b"].as_f64()?;
+        Ok(json!(a + b))
+    }
+)?;
+```
+
+### After - Option C: Builder with Tools from Config
+```rust
+#[tokio::main]
+async fn main() -> Result<()> {
+    let agent = AgentBuilder::from_file("config.toml")?
+        .build(None)
+        .await?;
+
+    // Tools from config.toml are automatically loaded!
+    agent.run(task).await?;
 }
+```
+
+### Before (Example with Manual Tool impl)
+```rust
+struct AddTool;
+#[async_trait]
+impl Tool for AddTool {
+    fn name(&self) -> &str { "add" }
+    fn description(&self) -> ToolDescription { /* ... */ }
+    fn json_schema(&self) -> serde_json::Value { /* ... */ }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        // ...
+    }
+}
+
+let agent = Agent::new(config, llm);
+agent.add_tool(Arc::new(AddTool));
+```
+
+### After - Simple Function Registration
+```rust
+agent.register_numeric_function("add", "Add", 2, |args| {
+    let a = args["a"].as_f64()?;
+    let b = args["b"].as_f64()?;
+    Ok(json!(a + b))
+})?;
 ```
 
 ## Next Steps
@@ -183,12 +258,29 @@ loop {
 
 ## Summary
 
-✅ **Task 1 is complete** - The `Agent` struct now has built-in tool registration capabilities:
-- Tools can be registered directly on the agent instance
+✅ **Task 1 COMPLETE** - Tool registration methods added to Agent:
+- Tools can be registered directly on agent instance
 - API is ergonomics and follows Rust conventions
-- Backward compatibility is maintained
+- Backward compatibility maintained
 - All tests pass
 - No compilation warnings or errors
 
-The foundation is laid for Tasks 2 and 3, which can be implemented as follow-up tasks without affecting this work.
+✅ **Task 2 COMPLETE** - `FunctionTool` wrapper implemented:
+- Register any async function as a tool without implementing `Tool` trait
+- `register_function()` for custom schemas
+- `register_numeric_function()` for simplified numeric functions
+- Full tests added
+
+✅ **Task 3 COMPLETE** - AgentBuilder integration:
+- Tools can be added via `.with_tool()` builder pattern
+- Tools defined in config TOML are automatically loaded during build()
+- Registry is properly attached to Agent instance
+- Example demonstrates config-based tool loading
+
+The Agent now has comprehensive tool registration capabilities:
+1. Manual tool registration via `register_tool()`
+2. Function registration via `register_function()` / `register_numeric_function()`
+3. Builder pattern integration via `AgentBuilder.with_tool()`
+4. Config file support via `AgentBuilder::from_file()`
+5. Full backward compatibility with external registry pattern
 

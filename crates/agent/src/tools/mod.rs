@@ -8,11 +8,13 @@ pub mod registry;
 pub mod translator;
 pub mod validator;
 pub mod bus_client;
+pub mod function;
 
 pub use registry::ToolRegistry;
 pub use translator::describe_schema;
 pub use validator::validate_args;
 pub use bus_client::BusToolClient;
+pub use function::FunctionTool;
 
 #[derive(Debug, Clone)]
 pub struct ToolDescription {
