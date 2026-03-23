@@ -1,0 +1,46 @@
+uses: actions/upload-artifact@v4
+name: Rust CI
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        rust: [stable]  # 可以加 beta / nightly
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ⚡ Rust toolchain
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # ⚡ Cache（核心，不然 CI 慢到爆）
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # 🔍 格式检查（直接挡脏代码）
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # 🔍 Clippy（比 review 还狠）
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # 🏗 编译检查（比 test 更快发现问题）
+      - name: Build
+        run: cargo build --all --all-features
+
+      # 🧪 单元测试
+      - name: Test
+        run: cargo test --all --all-features -- --nocapture
