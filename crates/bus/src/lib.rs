@@ -97,9 +97,6 @@ pub mod rpc;
 pub mod session;
 pub mod subscriber;
 
-#[cfg(feature = "python-extension")]
-pub mod python;
-
 pub use error::ZenohError;
 pub use publisher::{Publisher};
 pub use query::{Query, QueryWrapper, Queryable, TopicQueryable};
