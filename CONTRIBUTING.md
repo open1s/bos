@@ -39,7 +39,7 @@
 ### 报告 Bug
 
 如果您发现了 bug，请：
-1. 检查 [Issues](https://github.com/your-org/bos/issues) 确认问题未被报告
+1. 检查 [Issues](https://github.com/open1s/bos/issues) 确认问题未被报告
 2. 创建新的 Issue，包含：
    - 清晰的标题
    - 详细的问题描述
@@ -51,7 +51,7 @@
 ### 提出新功能
 
 如果您有新功能的想法：
-1. 先在 [Discussions](https://github.com/your-org/bos/discussions) 讨论
+1. 先在 [Discussions](https://github.com/open1s/bos/discussions) 讨论
 2. 创建 Issue 描述功能需求
 3. 说明用例和预期收益
 4. 等待维护者反馈后再开始实现
@@ -66,7 +66,7 @@ git clone https://github.com/your-username/bos.git
 cd bos
 
 # 添加上游仓库
-git remote add upstream https://github.com/your-org/bos.git
+git remote add upstream https://github.com/open1s/bos.git
 ```
 
 #### 2. 创建分支
@@ -140,7 +140,7 @@ git push origin feature/your-feature-name
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-org/bos.git
+git clone https://github.com/open1s/bos.git
 cd bos
 
 # 安装开发依赖
@@ -492,9 +492,9 @@ pub fn example() -> Result<()> {
 
 ## 📧 联系方式
 
-- GitHub Issues: [问题反馈](https://github.com/your-org/bos/issues)
-- GitHub Discussions: [讨论区](https://github.com/your-org/bos/discussions)
-- Email: [your-email@example.com](mailto:your-email@example.com)
+- GitHub Issues: [问题反馈](https://github.com/open1s/bos/issues)
+- GitHub Discussions: [讨论区](https://github.com/open1s/bos/discussions)
+- Email: [gao.brian@gmail.com](mailto:gao.brian@gmail.com)
 
 ---
 
