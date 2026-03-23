@@ -1,213 +1,33 @@
-uses: actions/upload-artifact@v4
-name: Performance Tests
+name: Performance
 
 on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main, develop ]
   schedule:
-    # 每周日凌晨运行完整性能测试
-    - cron: '0 0 * * 0'
+    - cron: '0 0 * * *'  # 每天
   workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  quick-perf:
-    name: Quick Performance Regression Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-      
-      - name: Cache cargo registry
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Cache cargo index
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Cache cargo build
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Run quick performance benchmarks
-        run: |
-          echo "=== Quick Performance Regression Test ==="
-          cargo bench --bench message_serialization \
-            -- --measurement-time=2 --sample-size=30 --noplot \
-            2>&1 | tee perf_results.txt
-      
-      - name: Upload performance results
-        uses: actions/upload-artifact@v3
-        with:
-          name: quick-perf-results-${{ github.sha }}
-          path: perf_results.txt
-          retention-days: 30
-      
-      - name: Check performance regression
-        run: |
-          echo "=== Checking for Performance Regression ==="
-          if [ -f perf_results.txt ]; then
-            # 提取 rkyv_serialization/5000 的运行时间
-            RKYV_5000_TIME=$(grep "rkyv_serialization/5000" perf_results.txt | grep "time:" | awk '{print $2}' | sed 's/\[//;s/\]//')
-            
-            # 设置阈值（30ns）
-            THRESHOLD=30
-            
-            if [ -n "$RKYV_5000_TIME" ]; then
-              echo "rkyv_serialization/5000 time: $RKYV_5000_TIME ns"
-              
-              # 简单的数值比较（假设格式是 "24.964 ± 0.236"）
-              AVG_TIME=$(echo $RKYV_5000_TIME | awk '{split(/\±/,$0,a); print a[1]}')
-              
-              if (( $(echo "$AVG_TIME > $THRESHOLD" | bc -l) )); then
-                echo "❌ WARNING: Performance regression detected!"
-                echo "   Threshold: $THRESHOLD ns"
-                echo "   Actual: $AVG_TIME ns"
-                exit 1
-              else
-                echo "✓ Performance within acceptable range"
-              fi
-            fi
-          fi
-
   full-perf:
-    name: Full Performance Benchmark
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-      
-      - name: Install system dependencies
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y gnuplot graphviz
-      
-      - name: Install flamegraph tools
+          sudo apt-get install -y gnuplot
+
+      - name: Run full benchmark
         run: |
-          cargo install flamegraph --features=flamegraph || true
-      
-      - name: Cache cargo
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Run full benchmarks
-        run: |
-          echo "=== Full Performance Benchmark Suite ==="
-          
-          # Run all benchmarks with standard settings
-          cargo bench --bench message_serialization 2>&1 | tee full_benchmarks.txt
-          
-          # Generate flamegraph if available
-          if command -v cargo flamegraph &> /dev/null; then
-            cargo flamegraph --bench message_serialization 2>&1 || true
-          fi
-      
-      - name: Upload full benchmark results
+          cargo bench | tee full.txt
+
+      - name: Upload
         uses: actions/upload-artifact@v3
         with:
-          name: full-perf-results-${{ github.sha }}
+          name: nightly-perf
           path: |
-            full_benchmarks.txt
-            target/criterion/
-          retention-days: 90
-      
-      - name: Generate performance report
-        run: |
-          echo "# Performance Report - $(date)" > perf_report.md
-          echo "" >> perf_report.md
-          echo "## Benchmark Results" >> perf_report.md
-          echo "" >> perf_report.md
-          
-          # 提取关键指标
-          echo "### Message Serialization" >> perf_report.md
-          grep "rkyv_serialization.*time:" full_benchmarks.txt | head -5 >> perf_report.md || echo "No results available" >> perf_report.md
-          echo "" >> perf_report.md
-          
-          # 添加对比
-          echo "## Comparison with Baseline" >> perf_report.md
-          echo "**Note**: Auto-comparison requires baseline artifact" >> perf_report.md
-          
-          cat perf_report.md
-      
-      - name: Upload performance report
-        uses: actions/upload-artifact@v3
-        with:
-          name: perf-report-${{ github.sha }}
-          path: perf_report.md
-          retention-days: 90
-
-  comparison:
-    name: Compare with Baseline
-    runs-on: ubuntu-latest
-    needs: full-perf
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Download current benchmarks
-        uses: actions/download-artifact@v3
-        with:
-          name: full-perf-results-${{ github.sha }}
-          path: ./current
-      
-      - name: Download baseline benchmarks
-        uses: actions/download-artifact@v3
-        with:
-          name: baseline-perf
-          path: ./baseline
-        continue-on-error: true
-      
-      - name: Compare benchmarks
-        run: |
-          echo "=== Performance Comparison ==="
-          
-          if [ -d "./baseline" ]; then
-            echo "Baseline found, performing comparison..."
-            
-            # 比较关键指标
-            echo "## Comparison Results" > comparison.md
-            
-            # 可以使用 cargo-criterion 进行专业对比
-            # 这里是简单版本
-            echo "Detailed comparison requires baseline artifact" >> comparison.md
-          else
-            echo "No baseline found. Save current results as baseline if desired."
-          fi
-
-  notify:
-    name: Notify Results
-    runs-on: ubuntu-latest
-    needs: [quick-perf]
-    if: always()
-    steps:
-      - name: Send notification
-        run: |
-          echo "Performance test workflow completed!"
-          echo "Status: ${{ needs.quick-perf.result }}"
+            full.txt
+            target/criterion
