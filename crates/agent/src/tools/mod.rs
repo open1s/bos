@@ -7,25 +7,12 @@ use crate::error::ToolError;
 pub mod registry;
 pub mod translator;
 pub mod validator;
-pub mod bus_client;
 pub mod function;
-pub mod discovery;
-pub mod unified_registry;
-pub mod a2a_client;
 
 pub use registry::ToolRegistry;
 pub use translator::describe_schema;
 pub use validator::validate_args;
-pub use bus_client::BusToolClient;
 pub use function::FunctionTool;
-pub use unified_registry::{UnifiedToolRegistry, UnifiedRegistryConfig};
-pub use a2a_client::A2AToolClient;
-
-// Re-export discovery types
-pub use discovery::{
-    ToolDiscovery, DiscoveredTool, ToolSource, LocalDiscovery,
-    ZenohRpcDiscovery, McpDiscovery, A2AToolDiscovery,
-};
 
 #[derive(Debug, Clone)]
 pub struct ToolDescription {

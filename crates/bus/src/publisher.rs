@@ -5,21 +5,6 @@ use rkyv::{Archive, Serialize, ser::{allocator::ArenaHandle, sharing::Share, Ser
 use crate::{error::ZenohError, Codec, Session};
 use std::sync::Arc;
 
-/// A publisher for sending messages to a Zenoh topic.
-///
-/// # Example
-/// ```rust,ignore
-/// // Create a publisher for a topic
-/// let mut publisher = Publisher::new("chat/general");
-/// publisher = publisher.with_session(session).await?;
-///
-/// // Publish a message
-/// publisher.publish(&session, &"Hello, world!").await?;
-///
-/// // Or use with associated session
-/// let publisher = Publisher::from_session("chat/general", session);
-/// publisher.publish_with("Hello!").await?;
-/// ```
 pub struct Publisher {
     topic: String,
     session: Option<Arc<Session>>,
@@ -35,7 +20,7 @@ impl Publisher {
     }
 
     /// Associate this publisher with a session and return it
-    pub async fn with_session(mut self, session: Arc<Session>) -> Result<Self, ZenohError> {
+    pub fn with_session(mut self, session: Arc<Session>) -> Result<Self, ZenohError> {
         self.session = Some(session);
         Ok(self)
     }
@@ -49,11 +34,12 @@ impl Publisher {
     }
 
     /// Publish a message to the topic
-    pub async fn publish<T>(&self, session: &Session, payload: &T) -> Result<(), ZenohError>
+    pub async fn publish<T>(&self, payload: &T) -> Result<(), ZenohError>
     where
         T: Archive,
         for<'a> T: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
     {
+        let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
         let codec = Codec;
         let data: Vec<u8> = codec.encode(payload)
             .map_err(|e: anyhow::Error| ZenohError::Serialization(e.to_string()))?;
@@ -62,19 +48,9 @@ impl Publisher {
     }
 
     /// Publish raw bytes to the topic
-    pub async fn publish_raw(&self, session: &Session, data: Vec<u8>) -> Result<(), ZenohError> {
+    async fn publish_raw(&self, session: &Session, data: Vec<u8>) -> Result<(), ZenohError> {
         let publisher = session.declare_publisher(&self.topic).await?;
         publisher.put(data).await.map_err(ZenohError::from)
-    }
-
-    /// Publish using the associated session (must have called `with_session` or `from_session`)
-    pub async fn publish_with<T>(&self, payload: &T) -> Result<(), ZenohError>
-    where
-        T: Archive,
-        for<'a> T: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
-    {
-        let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
-        self.publish(session, payload).await
     }
 
     /// Get the topic
@@ -99,19 +75,26 @@ impl Clone for Publisher {
 
 #[cfg(test)]
 mod tests {
+    use crate::{Bus, BusConfig, Subscriber};
     use super::*;
 
-    #[test]
-    fn test_publisher_new() {
-        let publisher = Publisher::new("test/topic");
-        assert_eq!(publisher.topic(), "test/topic");
-        assert!(publisher.session().is_none());
-    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_publisher_new() {
+        let config = BusConfig::default();
+        let bus = Bus::from(config).await;
 
-    #[test]
-    fn test_publisher_clone() {
-        let publisher = Publisher::new("test/topic");
-        let cloned = publisher.clone();
-        assert_eq!(cloned.topic(), publisher.topic());
+        let subscriber = Subscriber::<String>::new("test/topic").with_session(bus.clone().into()).await.unwrap();
+        subscriber.run(|mesage| {
+            println!("RE: {:?}", mesage);
+        }).await.expect("TODO: panic message");
+
+        let publisher = Publisher::new("test/topic").with_session(bus.clone().into()).unwrap();
+        assert_eq!(publisher.topic(), "test/topic");
+
+        let _a = publisher.publish(&String::from("This is from publisher")).await;
+
+        //sleep
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // h.abort()
     }
 }

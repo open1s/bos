@@ -5,6 +5,7 @@ use rkyv::{Archive, Deserialize, Serialize, api::high::HighDeserializer, ser::{a
 use crate::{error::ZenohError, Codec, Session};
 use std::sync::Arc;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use tokio::task::JoinHandle;
 use zenoh::query::Query;
 
@@ -20,11 +21,13 @@ where
     topic: String,
     queryable: Option<Arc<zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<Query>>>>,
     handler: Option<Handler<Q, R>>,
+    handle: Option<JoinHandle<Result<(), String>>>,
+    started: AtomicBool,
     _phantom_q: std::marker::PhantomData<Q>,
     _phantom_r: std::marker::PhantomData<R>,
 }
 
-type Handler<Q, R> = Box<dyn Fn(Q) -> Pin<Box<dyn std::future::Future<Output = Result<R, ZenohError>> + Send>> + Send + Sync>;
+pub(crate) type Handler<Q, R> = Box<dyn Fn(Q) -> Pin<Box<dyn std::future::Future<Output = Result<R, ZenohError>> + Send>> + Send + Sync>;
 
 impl<Q, R> QueryableWrapper<Q, R>
 where
@@ -40,6 +43,8 @@ where
             topic: topic.into(),
             queryable: None,
             handler: None,
+            started: AtomicBool::new(false),
+            handle: None,
             _phantom_q: std::marker::PhantomData,
             _phantom_r: std::marker::PhantomData,
         }
@@ -65,41 +70,37 @@ where
         Ok(())
     }
 
-    pub async fn run(&self) -> Result<(), ZenohError> {
-        let queryable = self.queryable.as_ref().ok_or(ZenohError::NotConnected)?;
+    pub fn run(mut self){
+        let queryable = self.queryable.take().ok_or(ZenohError::NotConnected);
+        let queryable = match queryable {
+            Ok(it) => it,
+            Err(_) => {
+                return;
+            }
+        };
 
-        let handler = self
-            .handler
-            .as_ref()
-            .ok_or_else(|| ZenohError::Query("No handler registered".to_string()))?;
-
-        let topic = self.topic.clone();
-
-        while let Ok(query) = queryable.recv_async().await {
-            Self::handle_query(&query, handler, &topic).await?;
+        if self.started.fetch_and(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
         }
 
-        Ok(())
-    }
-
-    pub fn into_task(mut self) -> Result<JoinHandle<Result<(), ZenohError>>, ZenohError> {
-        let queryable = self.queryable.take().ok_or(ZenohError::NotConnected)?;
-
         let handler = self
             .handler
-            .take()
-            .ok_or_else(|| ZenohError::Query("No handler registered".to_string()))?;
+            .take();
+        let handler = match handler {
+            Some(handler) => handler,
+            None => return
+        };
 
         let topic = self.topic.clone();
 
+        self.started.store(true, std::sync::atomic::Ordering::Relaxed);
         let handle = tokio::spawn(async move {
             while let Ok(query) = queryable.recv_async().await {
-                Self::handle_query(&query, &handler, &topic).await?;
+               let _ = Self::handle_query(&query, &handler, &topic).await;
             }
             Ok(())
         });
-
-        Ok(handle)
+        self.handle = Some(handle);
     }
 
     async fn handle_query(
@@ -143,15 +144,30 @@ where
     pub fn topic(&self) -> &str {
         &self.topic
     }
+}
 
-    pub fn is_initialized(&self) -> bool {
-        self.queryable.is_some()
-    }
+impl<Q, R> Drop for QueryableWrapper<Q, R>
+where
+    Q: Archive + 'static,
+    R: Archive + Send + 'static,
+    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
+    R::Archived: Deserialize<R, HighDeserializer<Error>>,
+    for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+    for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+{
+    fn drop(&mut self) {
+        self.queryable = None;
+        self.handler = None;
 
-    pub fn is_running(&self) -> bool {
-        self.handler.is_some()
+        if self.started.load(std::sync::atomic::Ordering::Relaxed) {
+            self.started.store(false, std::sync::atomic::Ordering::Relaxed);
+            // let handle = self.handle.take().unwrap();
+            // handle.abort();
+            // println!("Drop Queryable");
+        }
     }
 }
+
 
 impl<Q, R> Clone for QueryableWrapper<Q, R>
 where
@@ -167,24 +183,11 @@ where
             topic: self.topic.clone(),
             queryable: None,
             handler: None,
+            started: AtomicBool::new(false),
+            handle: None,
             _phantom_q: std::marker::PhantomData,
             _phantom_r: std::marker::PhantomData,
         }
-    }
-}
-
-impl<Q, R> Drop for QueryableWrapper<Q, R>
-where
-    Q: Archive + 'static,
-    R: Archive + Send + 'static,
-    Q::Archived: Deserialize<Q, HighDeserializer<Error>>,
-    R::Archived: Deserialize<R, HighDeserializer<Error>>,
-    for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
-    for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
-{
-    fn drop(&mut self) {
-        self.queryable = None;
-        self.handler = None;
     }
 }
 
@@ -204,40 +207,38 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{Bus, BusConfig, QueryableWrapper, ZenohError};
 
-    #[test]
-    fn test_queryable_wrapper_new() {
-        let queryable = QueryableWrapper::<String, String>::new("test/topic");
-        assert_eq!(queryable.topic(), "test/topic");
-        assert!(!queryable.is_initialized());
-        assert!(!queryable.is_running());
-    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_queryable_wrapper_with_handler() {
+        let config = BusConfig::default();
+        let bus = Bus::from(config).await;
 
-    #[test]
-    fn test_queryable_wrapper_with_handler() {
-        let queryable = QueryableWrapper::<String, String>::new("test/topic")
-            .with_handler(|q| async move { Ok(q.to_uppercase()) });
 
-        assert_eq!(queryable.topic(), "test/topic");
-        assert!(queryable.is_running());
-    }
+        let mut queryable = QueryableWrapper::<String, String>::new("test/topic")
+            .with_handler(|q| async move {
+                println!("IN {:?}", q);
+                Ok(q.to_uppercase())
+            });
 
-    #[test]
-    fn test_queryable_wrapper_clone() {
-        let queryable =
-            QueryableWrapper::<i32, i32>::new("test/topic").with_handler(|q| async move { Ok(q * 2) });
+        queryable.init(&bus.clone().into()).await.unwrap();
+        queryable.run();
 
-        let cloned = queryable.clone();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        assert_eq!(cloned.topic(), "test/topic");
-        assert!(!cloned.is_initialized());
-        assert!(!cloned.is_running());
-    }
+        let client = crate::query::Query::new("test/topic")
+            .with_session(bus.into()).await.unwrap();
+        
+        let results: Result<String, ZenohError> = client.query(&"hello world".to_string()).await;
 
-    #[test]
-    fn test_queryable_wrapper_default() {
-        let queryable = QueryableWrapper::<String, String>::default();
-        assert_eq!(queryable.topic(), "default/queryable");
+        assert!(results.is_ok());
+        println!("{:?}", results.unwrap());
+
+        let result = client.stream_with_handler::<String, String>(&"Hello Zenoh".to_string(), |response| {
+            println!("R: {}",response);
+            Ok(response)
+        }).await;
+
+        println!("{:?}", result.unwrap());
     }
 }

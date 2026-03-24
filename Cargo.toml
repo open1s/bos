@@ -2,9 +2,7 @@
 members = [
     "crates/config",
     "crates/bus",
-    "crates/agent",
-    "benchmarks",
-    "examples/unified-tool-demo",
+    "crates/agent"
 ]
 resolver = "2"
 

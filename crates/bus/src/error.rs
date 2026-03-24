@@ -27,6 +27,9 @@ pub enum ZenohError {
     #[error("Already connected")]
     AlreadyConnected,
 
+    #[error("Already started")]
+    AlreadyStarted,
+
     #[error("Operation timed out")]
     Timeout,
 }

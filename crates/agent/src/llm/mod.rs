@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::error::LlmError;
+pub(crate) use crate::error::LlmError;
 
 pub mod client;
 
@@ -14,6 +14,7 @@ pub use client::OpenAiClient;
 #[derive(Debug, Clone)]
 pub enum LlmResponse {
     Text(String),
+    Patial(String),
     ToolCall { name: String, args: serde_json::Value },
     Done,
 }

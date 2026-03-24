@@ -3,21 +3,6 @@ use std::pin::Pin;
 
 use crate::llm::StreamToken;
 
-// New modules for bus streaming with backpressure
-pub mod publisher;
-pub mod backpressure;
-pub mod subscriber;
-
-// Re-exports from new modules
-pub use publisher::{TokenPublisherWrapper, TokenPublisher};
-pub use subscriber::{TokenSubscriber, SubscriberError, TokenCallback};
-
-// Backward compatibility alias
-pub type PublisherWrapper = TokenPublisherWrapper;
-pub use backpressure::{
-    TokenBatch, SerializedToken, TokenType, RateLimiter, BackpressureController,
-};
-
 pub struct SseDecoder {
     buffer: String,
 }
@@ -64,7 +49,7 @@ pub enum SseEvent {
 }
 
 pub type TokenStream =
-    Pin<Box<dyn Stream<Item = Result<StreamToken, crate::error::LlmError>> + Send>>;
+Pin<Box<dyn Stream<Item = Result<StreamToken, crate::error::LlmError>> + Send>>;
 
 #[cfg(test)]
 mod tests {

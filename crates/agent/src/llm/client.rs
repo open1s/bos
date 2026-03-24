@@ -7,9 +7,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-
-use super::{LlmClient, LlmError, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
 use crate::streaming::{SseDecoder, SseEvent};
+use super::{LlmClient, LlmError, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
 
 pub struct OpenAiClient {
     client: Client,

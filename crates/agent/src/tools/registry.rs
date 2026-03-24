@@ -16,6 +16,20 @@ pub struct ToolRegistry {
     openai_format_cache: RwLock<Arc<Vec<serde_json::Value>>>,
 }
 
+impl Clone for ToolRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            tool_name_index: self.tool_name_index.clone(),
+            namespaced_tool_index: self.namespaced_tool_index.clone(),
+            namespace_index: self.namespace_index.clone(),
+            namespaces: self.namespaces.clone(),
+            schema_cache: DashMap::new(),
+            openai_format_cache: RwLock::new(Arc::new(Vec::new())),
+        }
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {

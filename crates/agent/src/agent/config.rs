@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use zenoh::Session as ZenohSession;
 
-use crate::agent::{Agent, AgentConfig};
+use crate::agent::agentic::{Agent, AgentConfig};
 use crate::error::AgentError;
 use crate::llm::OpenAiClient;
 use crate::tools::{Tool, ToolRegistry, FunctionTool};

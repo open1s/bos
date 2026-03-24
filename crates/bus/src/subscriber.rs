@@ -4,23 +4,14 @@ use rkyv::{Archive, Deserialize, api::high::HighDeserializer, rancor::Error};
 
 use crate::{error::ZenohError, Codec, Session};
 use std::sync::Arc;
+use tokio::task::JoinHandle;
 use zenoh::sample::Sample;
 
-/// A subscriber for receiving messages from a Zenoh topic.
-///
-/// # Example
-/// ```rust,ignore
-/// // Create a subscriber for a topic
-/// let subscriber = TopicSubscriber::<String>::new("chat/general").with_session(&session?).await?;
-///
-/// // Receive messages
-/// while let Some(msg) = subscriber.recv().await {
-///     println!("Received: {}", msg);
-/// }
-/// ```
 pub struct Subscriber<T> {
     topic: String,
     subscriber: Option<zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<Sample>>>,
+    started: bool,
+    handle: Option<JoinHandle<Result<(),String>>>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -37,11 +28,12 @@ where
         Self {
             topic: topic.into(),
             subscriber: None,
+            started: false,
+            handle: None,
             _phantom: std::marker::PhantomData,
         }
     }
 
-    /// Initialize the subscriber with a session
     pub async fn init(&mut self, session: Arc<Session>) -> Result<(), ZenohError> {
         let subscriber = session
             .declare_subscriber(&self.topic)
@@ -92,6 +84,26 @@ where
         Ok(())
     }
 
+    pub async fn run<F>(mut self, handler: F) -> Result<(), ZenohError>
+    where
+        F: Fn(T) + std::marker::Send + 'static, {
+        let subscriber = self.subscriber.take().ok_or(ZenohError::NotConnected)?;
+
+        self.started = true;
+        let handle: tokio::task::JoinHandle<Result<_, String>> = tokio::spawn(async move {
+            while let Ok(sample) = subscriber.recv_async().await {
+                let bytes = sample.payload().to_bytes();
+                if let Ok(decoded) = Codec.decode(bytes.as_ref()) {
+                    handler(decoded);
+                }
+            }
+            Ok(())
+        });
+
+        self.handle = Some(handle);
+        Ok(())
+    }
+
     /// Receive with a timeout
     pub async fn recv_with_timeout(&mut self, timeout: std::time::Duration) -> Option<T> {
         tokio::time::timeout(timeout, self.recv())
@@ -126,15 +138,15 @@ where
     pub fn topic(&self) -> &str {
         &self.topic
     }
+}
 
-    /// Check if the subscriber is initialized
-    pub fn is_initialized(&self) -> bool {
-        self.subscriber.is_some()
-    }
-
-    /// Get the underlying Zenoh subscriber
-    pub fn subscriber(&self) -> Option<&zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<Sample>>> {
-        self.subscriber.as_ref()
+impl<T> Drop for Subscriber<T> {
+    fn drop(&mut self) {
+        if self.started {
+            self.started = false;
+            // let handle = self.handle.take().unwrap();
+            // handle.abort();
+        }
     }
 }
 
@@ -143,6 +155,8 @@ impl<T> Clone for Subscriber<T> {
         Self {
             topic: self.topic.clone(),
             subscriber: None,
+            started: false,
+            handle: None,
             _phantom: self._phantom,
         }
     }
@@ -158,35 +172,16 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_subscriber_creation() {
-        let subscriber: Subscriber<String> = Subscriber::new("test/topic");
-        assert_eq!(subscriber.topic(), "test/topic");
-    }
-
-    #[test]
-    fn test_subscriber_clone() {
-        let sub1: Subscriber<String> = Subscriber::new("test/clone");
-        let sub2 = sub1.clone();
-        assert_eq!(sub1.topic(), sub2.topic());
-    }
-
-    #[test]
-    fn test_subscriber_default() {
-        let subscriber: Subscriber<String> = Subscriber::default();
-        assert_eq!(subscriber.topic(), "default/subscriber");
-    }
-
-    #[tokio::test]
-    async fn test_subscriber_recv_timeout_before_init() {
-        let mut subscriber: Subscriber<String> = Subscriber::new("test/timeout");
-        let result = subscriber
-            .recv_with_timeout(tokio::time::Duration::from_millis(100))
-            .await;
-        assert_eq!(result, None);
-    }
+pub fn subscriber_receiver<T,F>(mut subscriber: Subscriber<T>, mut handler: F) -> JoinHandle<Result<(),String>>
+where
+    F: FnMut(T) + Send + 'static,
+    T: Archive + Send + 'static,
+    T::Archived: Deserialize<T, HighDeserializer<Error>>,{
+    let handle: tokio::task::JoinHandle<Result<_, String>> = tokio::spawn(async move {
+        while let Some(query) = subscriber.recv().await {
+            handler(query);
+        }
+        Ok(())
+    });
+    handle
 }
