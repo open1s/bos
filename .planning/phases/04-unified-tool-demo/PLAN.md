@@ -1,17 +1,18 @@
 # Phase 4: Unified Tool Demo - Tool Definition Patterns
 
-**Goal:** Create a comprehensive demo showing how to define and call tools from multiple sources (local, RPC, function, A2A) in the bos framework.
+**Goal:** Create a comprehensive demo showing multi-agent LLM coordination with tools from multiple sources (local, RPC, function, A2A, skills) in the bos framework.
 
 ---
 
 ## Overview
 
-This phase demonstrates the unified tool calling architecture through a practical single-binary demo:
+This phase demonstrates multi-agent LLM coordination with tools from multiple sources in the bos framework:
 
 1. **Single binary** with coordinator and provider roles spawned as async tasks via `tokio::spawn`
 2. **Coordinator role** - Discovers tools from all sources, calls them via LLM
 3. **Provider role** - Exposes tools via RPC and A2A
 4. **Tool types demonstrated**: Local (full Tool trait), RPC (service discovery), Function (FunctionTool), A2A (full workflow)
+5. **Skills system**: Demonstrateates the use of skills to extend the capabilities of the LLM
 
 ---
 
