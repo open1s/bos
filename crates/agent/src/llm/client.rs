@@ -31,35 +31,53 @@ struct OpenAiRequest {
 #[derive(Serialize, Clone)]
 struct OpenAiMessageJson {
     role: &'static str,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallJson>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Clone)]
+struct ToolCallJson {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: &'static str,
+    function: FunctionCallJson,
+}
+
+#[derive(Serialize, Clone)]
+struct FunctionCallJson {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAiResponse {
     choices: Vec<Choice>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Choice {
     message: MessageContent,
     #[serde(default)]
     finish_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct MessageContent {
     content: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ToolCall {
+    id: Option<String>,
     function: FunctionCall,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct FunctionCall {
     name: String,
     arguments: String,
@@ -104,8 +122,12 @@ struct BorrowedOpenAiStreamResponse<'a> {
 
 impl OpenAiClient {
     pub fn new(base_url: String, api_key: String) -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
         Self {
-            client: Client::new(),
+            client,
             chat_completions_url: format!("{}/chat/completions", base_url),
             api_key,
         }
@@ -114,19 +136,49 @@ impl OpenAiClient {
     fn build_request(&self, req: LlmRequest, stream: bool) -> OpenAiRequest {
         let mut messages = Vec::with_capacity(req.messages.len());
         for message in req.messages {
-            let (role, content, tool_call_id) = match message {
-                OpenAiMessage::System { content } => ("system", content, None),
-                OpenAiMessage::User { content } => ("user", content, None),
-                OpenAiMessage::Assistant { content } => ("assistant", content, None),
-                OpenAiMessage::ToolResult { tool_call_id, content } => {
-                    ("tool", content, Some(tool_call_id))
+            let json_msg = match message {
+                OpenAiMessage::System { content } => OpenAiMessageJson {
+                    role: "system",
+                    content: Some(content),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                OpenAiMessage::User { content } => OpenAiMessageJson {
+                    role: "user",
+                    content: Some(content),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                OpenAiMessage::Assistant { content } => OpenAiMessageJson {
+                    role: "assistant",
+                    content: Some(content),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                OpenAiMessage::AssistantToolCall { id, name, args } => {
+                    let args_str = serde_json::to_string(&args).unwrap_or_default();
+                    OpenAiMessageJson {
+                        role: "assistant",
+                        content: None,
+                        tool_call_id: None,
+                        tool_calls: Some(vec![ToolCallJson {
+                            id,
+                            call_type: "function",
+                            function: FunctionCallJson {
+                                name,
+                                arguments: args_str,
+                            },
+                        }]),
+                    }
+                }
+                OpenAiMessage::ToolResult { tool_call_id, content } => OpenAiMessageJson {
+                    role: "tool",
+                    content: Some(content),
+                    tool_call_id: Some(tool_call_id),
+                    tool_calls: None,
                 }
             };
-            messages.push(OpenAiMessageJson {
-                role,
-                content,
-                tool_call_id,
-            });
+            messages.push(json_msg);
         }
 
         OpenAiRequest {
@@ -154,6 +206,7 @@ impl OpenAiClient {
                         return Some(StreamToken::ToolCall {
                             name: name.into_owned(),
                             args: args_val,
+                            id: None,
                         });
                     }
                 }
@@ -199,17 +252,19 @@ impl LlmClient for OpenAiClient {
                 return Ok(LlmResponse::ToolCall {
                     name: tc.function.name,
                     args,
+                    id: tc.id,
                 });
             }
         }
 
-        if choice.finish_reason.as_deref() == Some("stop") {
-            return Ok(LlmResponse::Done);
-        }
-
         match choice.message.content {
             Some(content) => Ok(LlmResponse::Text(content)),
-            None => Ok(LlmResponse::Done),
+            None => {
+                if choice.finish_reason.as_deref() == Some("stop") {
+                    return Ok(LlmResponse::Done);
+                }
+                Ok(LlmResponse::Done)
+            }
         }
     }
 
@@ -314,7 +369,7 @@ mod tests {
         assert!(
             matches!(
                 token,
-                Some(StreamToken::ToolCall { ref name, ref args })
+                Some(StreamToken::ToolCall { ref name, ref args, .. })
                     if name == "test_tool" && args["param"] == "value"
             ),
             "unexpected token: {:?}",

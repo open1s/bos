@@ -1,5 +1,5 @@
-use crate::{OpenAiMessage};
 use crate::agent::message::Message;
+use crate::OpenAiMessage;
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageContext {
@@ -17,6 +17,10 @@ impl MessageContext {
         self.messages.push(Message::User(content));
     }
 
+    pub fn add_system(&mut self, profile: String) {
+        self.messages.push(Message::System(profile));
+    }
+
     pub fn add_assistant(&mut self, content: String) {
         self.messages.push(Message::Assistant(content));
     }
@@ -26,6 +30,10 @@ impl MessageContext {
             Some(Message::Assistant(content)) => content.push_str(chunk),
             _ => self.messages.push(Message::Assistant(chunk.to_string())),
         }
+    }
+
+    pub fn add_tool_call(&mut self, id: String, name: String, args: serde_json::Value) {
+        self.messages.push(Message::ToolCall { id, name, args });
     }
 
     pub fn add_tool_result(&mut self, name: String, content: String) {
@@ -45,8 +53,16 @@ impl MessageContext {
                 Message::User(content) => OpenAiMessage::User {
                     content: content.clone(),
                 },
+                Message::System(profile) => OpenAiMessage::System{
+                    content: profile.clone(),
+                },
                 Message::Assistant(content) => OpenAiMessage::Assistant {
                     content: content.clone(),
+                },
+                Message::ToolCall { id, name, args } => OpenAiMessage::AssistantToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
                 },
                 Message::ToolResult { name, content } => OpenAiMessage::ToolResult {
                     tool_call_id: name.clone(),

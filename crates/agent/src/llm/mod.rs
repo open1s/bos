@@ -15,7 +15,7 @@ pub use client::OpenAiClient;
 pub enum LlmResponse {
     Text(String),
     Patial(String),
-    ToolCall { name: String, args: serde_json::Value },
+    ToolCall { name: String, args: serde_json::Value, id: Option<String> },
     Done,
 }
 
@@ -25,6 +25,7 @@ pub enum OpenAiMessage {
     System { content: String },
     User { content: String },
     Assistant { content: String },
+    AssistantToolCall { id: String, name: String, args: serde_json::Value },
     ToolResult { tool_call_id: String, content: String },
 }
 
@@ -40,7 +41,7 @@ pub struct LlmRequest {
 #[derive(Debug)]
 pub enum StreamToken {
     Text(String),
-    ToolCall { name: String, args: serde_json::Value },
+    ToolCall { name: String, args: serde_json::Value, id: Option<String> },
     Done,
 }
 

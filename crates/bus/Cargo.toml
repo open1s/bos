@@ -19,6 +19,8 @@ async-channel = { workspace = true }
 async-trait = { workspace = true }
 pyo3 = { version = "0.28", optional = true, features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.28", optional = true, features = ["tokio-runtime"] }
+log = "0.4.29"
+logging = {path="../logging"}
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

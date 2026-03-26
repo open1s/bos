@@ -1,31 +1,46 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum JsonRpcId {
+    Number(u64),
+    String(String),
+}
+
+impl Default for JsonRpcId {
+    fn default() -> Self {
+        JsonRpcId::Number(0)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     #[serde(default = "default_jsonrpc")]
     pub jsonrpc: String,
-    pub id: u64,
+    #[serde(default)]
+    pub id: serde_json::Value,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
 }
 
-fn default_jsonrpc() -> String {
-    "2.0".to_string()
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
     #[serde(default = "default_jsonrpc")]
     pub jsonrpc: String,
-    pub id: u64,
+    #[serde(default)]
+    pub id: serde_json::Value,
     #[serde(default)]
     pub result: Option<serde_json::Value>,
     #[serde(default)]
     pub error: Option<JsonRpcError>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+fn default_jsonrpc() -> String {
+    "2.0".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i32,
     pub message: String,
@@ -35,15 +50,29 @@ pub struct JsonRpcError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCapabilities {
-    pub tools: bool,
-    pub resources: bool,
-    pub prompts: bool,
+    #[serde(default)]
+    pub tools: serde_json::Value,
+    #[serde(default)]
+    pub resources: serde_json::Value,
+    #[serde(default)]
+    pub prompts: serde_json::Value,
+}
+
+impl Default for ServerCapabilities {
+    fn default() -> Self {
+        Self {
+            tools: serde_json::Value::Bool(false),
+            resources: serde_json::Value::Bool(false),
+            prompts: serde_json::Value::Bool(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
+    #[serde(alias = "inputSchema")]
     pub input_schema: serde_json::Value,
 }
 
@@ -51,7 +80,7 @@ impl JsonRpcRequest {
     pub fn new(method: impl Into<String>, params: Option<serde_json::Value>, id: u64) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
-            id,
+            id: serde_json::json!(id),
             method: method.into(),
             params,
         }
@@ -62,7 +91,7 @@ impl JsonRpcResponse {
     pub fn success(id: u64, result: serde_json::Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
-            id,
+            id: serde_json::json!(id),
             result: Some(result),
             error: None,
         }
@@ -71,7 +100,7 @@ impl JsonRpcResponse {
     pub fn error(id: u64, error: JsonRpcError) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
-            id,
+            id: serde_json::json!(id),
             result: None,
             error: Some(error),
         }

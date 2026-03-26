@@ -40,6 +40,7 @@ impl Caller {
 
 #[cfg(test)]
 mod tests {
+    use log::info;
     use crate::caller::Arc;
     use crate::{Bus, BusConfig};
     use crate::callable::Callable;
@@ -52,7 +53,7 @@ mod tests {
 
         let callable = Callable::<String, String>::new("hello",bus.clone().into());
         let mut callable = callable.with_handler(|q| async move {
-            println!("IN {:?}", q);
+            info!("IN {:?}", q);
             Ok(q.to_uppercase())
         });
 
@@ -65,14 +66,14 @@ mod tests {
         let  handle1 = tokio::spawn(async move {
             let caller = Caller::new("hello".into(), Some(Arc::new(session)));
             let result = caller.call::<String,String>(&"hello call".to_string()).await.unwrap();
-            println!("{}", result);
+            info!("{}", result);
         });
 
         let session: zenoh::Session = bus.clone().into();
         let handle2 = tokio::spawn(async move {
             let caller = Caller::new("hello".into(), Some(Arc::new(session)));
             let result = caller.call::<String,String>(&"hello call 001".to_string()).await.unwrap();
-            println!("{}", result);
+            info!("{}", result);
         });
 
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

@@ -2,7 +2,8 @@
 members = [
     "crates/config",
     "crates/bus",
-    "crates/agent"
+    "crates/agent",
+    "crates/logging"
 ]
 resolver = "2"
 

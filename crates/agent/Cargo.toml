@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 bus = { path = "../bus" }
 config = { path = "../config" }
+logging = { path = "../logging"}
+log = "0.4.29"
 tokio = { workspace = true, features = ["full"] }
 reqwest = { workspace = true }
 futures = { workspace = true }
@@ -25,3 +27,4 @@ dashmap = "5.5"
 flate2 = "1.0"
 tempfile = "3.8"
 anyhow = { workspace = true }
+ctor = "0.6.3"

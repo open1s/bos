@@ -1,0 +1,13 @@
+[package]
+name = "logging"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ctor = "0.6.3"
+log = "0.4.29"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+flexi_logger = "0.31.8"
+serde_json = "1.0.149"

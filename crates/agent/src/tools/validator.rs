@@ -57,7 +57,9 @@ fn validate_field(
 
     let matches = match expected_type {
         "string" => value.is_string(),
-        "number" | "integer" => value.is_number(),
+        "number" | "integer" => {
+            value.is_number() || (value.is_string() && can_parse_as_number(value))
+        }
         "boolean" => value.is_boolean(),
         "array" => value.is_array(),
         "object" => value.is_object(),
@@ -92,6 +94,14 @@ fn validate_field(
     }
 
     Ok(())
+}
+
+fn can_parse_as_number(value: &serde_json::Value) -> bool {
+    if let Some(s) = value.as_str() {
+        s.parse::<f64>().is_ok()
+    } else {
+        false
+    }
 }
 
 fn value_type(value: &serde_json::Value) -> &'static str {

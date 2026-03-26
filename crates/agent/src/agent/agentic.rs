@@ -1,10 +1,13 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use futures::{Stream, StreamExt};
+use log::info;
 use crate::{AgentError, LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamToken, Tool, ToolError, ToolRegistry};
 use crate::agent::context::MessageContext;
 use crate::agent::format_tool_result_content;
 use crate::tools::FunctionTool;
+use crate::skills::{SkillContent, SkillLoader, SkillInjector, SkillMetadata};
+use crate::mcp::{McpClient, McpToolAdapter};
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -29,6 +32,8 @@ pub struct Agent {
     llm: Arc<dyn LlmClient>,
     context: MessageContext,
     registry: Option<Arc<ToolRegistry>>,
+    skills: Vec<SkillMetadata>,
+    skills_dir: Option<std::path::PathBuf>,
 }
 
 impl Agent {
@@ -38,6 +43,8 @@ impl Agent {
             llm,
             context: MessageContext::new(),
             registry: Some(Arc::new(ToolRegistry::new())),
+            skills: Vec::new(),
+            skills_dir: None,
         }
     }
 
@@ -47,6 +54,8 @@ impl Agent {
             llm,
             context: MessageContext::new(),
             registry: Some(Arc::new(registry)),
+            skills: Vec::new(),
+            skills_dir: None,
         }
     }
 
@@ -112,6 +121,67 @@ impl Agent {
     {
         let tool = Arc::new(FunctionTool::numeric(name, description, num_params, func));
         self.register_tool(tool)
+    }
+
+    /// Register a skill with the agent.
+    pub fn register_skill(&mut self, skill: SkillMetadata) {
+        self.skills.push(skill);
+    }
+
+    /// Register skills from a directory using SkillLoader.
+    pub fn register_skills_from_dir(&mut self, skills_dir: std::path::PathBuf) -> Result<(), crate::skills::SkillError> {
+        let mut loader = SkillLoader::new(skills_dir.clone());
+        loader.discover()?;
+
+        for skill_metadata in loader.list() {
+            self.register_skill(skill_metadata.clone());
+        }
+
+        self.skills_dir = Some(skills_dir);
+        Ok(())
+    }
+
+    /// Get the skills schemas for sending to LLM.
+    pub fn get_skills_schemas(&self) -> Vec<serde_json::Value> {
+        self.skills.iter().map(|skill| {
+            serde_json::json!({
+                "name": skill.name,
+                "description": skill.description,
+                "category": skill.category.as_str(),
+                "tags": skill.tags,
+                "requires": skill.requires,
+                "provides": skill.provides
+            })
+        }).collect()
+    }
+
+    /// Load full skill content by name.
+    pub fn load_skill_content(&self, skill_name: &str) -> Result<SkillContent, crate::skills::SkillError> {
+        if let Some(ref skills_dir) = self.skills_dir {
+            let mut loader = SkillLoader::new(skills_dir.clone());
+            loader.discover()?;
+            loader.load(skill_name)
+        } else {
+            Err(crate::skills::SkillError::NotFound("No skills directory configured".to_string()))
+        }
+    }
+
+    /// Register MCP tools from an MCP client.
+    pub async fn register_mcp_tools(&mut self, client: Arc<McpClient>) -> Result<(), crate::mcp::McpError> {
+        let tools = client.list_tools().await?;
+
+        for tool in tools {
+            let schema = tool.input_schema.clone();
+            let mcp_tool = Arc::new(McpToolAdapter::new(
+                client.clone(),
+                tool.name.clone(),
+                tool.description.clone(),
+                schema,
+            ));
+            self.add_tool(mcp_tool);
+        }
+
+        Ok(())
     }
 
     pub async fn run(&mut self, task: &str) -> Result<String, AgentError> {
@@ -181,62 +251,112 @@ impl Agent {
         let tools = self.registry.clone();
         let tools_for_request = tools.as_ref().map(|t| t.to_openai_format_shared());
 
+        let skills_schemas = self.get_skills_schemas();
+        let skills_dir = self.skills_dir.clone();
+
         tokio::spawn(async move {
             let mut messages = messages;
 
-            let mut request_messages = Vec::with_capacity(messages.len() + 1);
-            request_messages.push(OpenAiMessage::System {
-                content: config.system_prompt.clone(),
-            });
-            messages.extend_api_format(&mut request_messages);
+            loop {
+                let mut request_messages = Vec::with_capacity(messages.len() + 1);
+                let mut system_prompt = config.system_prompt.clone();
 
-            let request = LlmRequest {
-                model: config.model.clone(),
-                messages: request_messages,
-                tools: tools_for_request.clone(),
-                temperature: config.temperature,
-                max_tokens: config.max_tokens,
-            };
+                if !skills_schemas.is_empty() {
+                    let skills_json = serde_json::to_string_pretty(&skills_schemas).unwrap();
+                    system_prompt = format!("{}\n\nAvailable skills:\n{}\n\nWhen you need to use a skill, respond with a special message in this format: USE_SKILL: skill_name\n\nFor example, if you need to perform calculations, respond with: USE_SKILL: calculator\n\nThe system will then load the skill content and provide it to you.", system_prompt, skills_json);
+                }
 
-            let stream = llm.stream_complete(request);
+                request_messages.push(OpenAiMessage::System {
+                    content: system_prompt,
+                });
+                messages.extend_api_format(&mut request_messages);
 
-            // Pin the stream to use it in a loop
-            let mut stream = Box::pin(stream);
+                let request = LlmRequest {
+                    model: config.model.clone(),
+                    messages: request_messages,
+                    tools: tools_for_request.clone(),
+                    temperature: config.temperature,
+                    max_tokens: config.max_tokens,
+                };
 
-            while let Some(token_result) = stream.next().await {
-                match token_result {
-                    Ok(token) => {
-                        // Track message accumulation
-                        match &token {
-                            StreamToken::Text(s) => {
-                                messages.append_assistant_chunk(s);
-                            }
-                            StreamToken::ToolCall { name, args } => {
-                                if let Some(ref registry) = tools {
-                                    let result = registry.execute(name, args).await;
-                                    match result {
-                                        Ok(res) => {
-                                            messages.add_tool_result(
-                                                name.clone(),
-                                                format_tool_result_content(res),
-                                            );
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(Err(AgentError::Tool(e))).await;
+                info!("loop: {:?}", request);
+                let stream = llm.stream_complete(request);
+
+                let mut stream = Box::pin(stream);
+                let mut tool_call_made = false;
+                let mut accumulated_text = String::new();
+                let mut skill_requested = false;
+
+                while let Some(token_result) = stream.next().await {
+                    match token_result {
+                        Ok(token) => {
+                            match &token {
+                                StreamToken::Text(s) => {
+                                    messages.append_assistant_chunk(s);
+                                    accumulated_text.push_str(s);
+
+                                    if accumulated_text.contains("USE_SKILL:") {
+                                        if let Some(skill_name) = accumulated_text.split("USE_SKILL:").nth(1) {
+                                            let skill_name = skill_name.trim().split_whitespace().next().unwrap_or("");
+                                            if !skill_name.is_empty() {
+                                                skill_requested = true;
+                                                if let Some(ref skills_dir) = skills_dir {
+                                                    let mut loader = SkillLoader::new(skills_dir.clone());
+                                                    if loader.discover().is_ok() {
+                                                        if let Ok(skill_content) = loader.load(skill_name) {
+                                                            let injector = SkillInjector::new();
+                                                            let skill_xml = injector.inject_specific(&[skill_content], &[skill_name]);
+                                                            messages.add_assistant(format!("\n\n[SKILL LOADED: {}]\n{}\n", skill_name, skill_xml));
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
+                                StreamToken::ToolCall { name, args, id } => {
+                                    tool_call_made = true;
+                                    let tool_call_id = id.as_ref().map(|s| s.as_str()).unwrap_or_else(|| name.as_str());
+                                    messages.add_tool_call(
+                                        tool_call_id.to_string(),
+                                        name.clone(),
+                                        args.clone(),
+                                    );
+                                    if let Some(ref registry) = tools {
+                                        let result = registry.execute(name, args).await;
+                                        match result {
+                                            Ok(res) => {
+                                                messages.add_tool_result(
+                                                    tool_call_id.to_string(),
+                                                    format_tool_result_content(res),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(Err(AgentError::Tool(e))).await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                                StreamToken::Done => {
+                                    if skill_requested {
+                                        skill_requested = false;
+                                        continue;
+                                    }
+                                    if !tool_call_made {
+                                        return;
+                                    }
+                                }
                             }
-                            StreamToken::Done => {}
-                        }
 
-                        if tx.send(Ok(token)).await.is_err() {
-                            break;
+                            if tx.send(Ok(token)).await.is_err() {
+                                return;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(AgentError::Session(e.to_string()))).await;
-                        break;
+                        Err(e) => {
+                            let _ = tx.send(Err(AgentError::Session(e.to_string()))).await;
+                            return;
+                        }
                     }
                 }
             }
@@ -251,12 +371,21 @@ impl Agent {
         const MAX_ITERATIONS: usize = 10;
         let tools = self.registry.clone();
         let tools_for_request = tools.as_ref().map(|t| t.to_openai_format_shared());
+        let skills_schemas = self.get_skills_schemas();
+        let skills_dir = self.skills_dir.clone();
         let mut accumulated_text = String::new();
 
-        for _ in 0..MAX_ITERATIONS {
+        for _i in 0..MAX_ITERATIONS {
             let mut messages = Vec::with_capacity(self.context.len() + 1);
+            let mut system_prompt = self.config.system_prompt.clone();
+
+            if !skills_schemas.is_empty() {
+                let skills_json = serde_json::to_string_pretty(&skills_schemas).unwrap();
+                system_prompt = format!("{}\n\nAvailable skills:\n{}\n\nWhen you need to use a skill, respond with a special message in this format: USE_SKILL: skill_name\n\nFor example, if you need to perform calculations, respond with: USE_SKILL: calculator\n\nThe system will then load the skill content and provide it to you.", system_prompt, skills_json);
+            }
+
             messages.push(OpenAiMessage::System {
-                content: self.config.system_prompt.clone(),
+                content: system_prompt,
             });
             self.context.extend_api_format(&mut messages);
 
@@ -267,27 +396,53 @@ impl Agent {
                 temperature: self.config.temperature,
                 max_tokens: self.config.max_tokens,
             };
-
+            info!("iteraton:{}, llm request: {:?}",_i, request);
             let response = self.llm.complete(request).await?;
+            info!("iteraton:{}, llm response: {:?}",_i, response);
 
             match response {
                 LlmResponse::Text(text) => {
                     accumulated_text.push_str(&text);
+                    self.context.add_assistant(text.clone());
+
+                    if text.contains("USE_SKILL:") {
+                        if let Some(skill_name) = text.split("USE_SKILL:").nth(1) {
+                            let skill_name = skill_name.trim().split_whitespace().next().unwrap_or("");
+                            if !skill_name.is_empty() {
+                                if let Some(ref skills_dir) = skills_dir {
+                                    let mut loader = SkillLoader::new(skills_dir.clone());
+                                    if loader.discover().is_ok() {
+                                        if let Ok(skill_content) = loader.load(skill_name) {
+                                            let injector = SkillInjector::new();
+                                            let skill_xml = injector.inject_specific(&[skill_content], &[skill_name]);
+                                            self.context.add_assistant(format!("\n\n[SKILL LOADED: {}]\n{}\n", skill_name, skill_xml));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     break;
                 }
                 LlmResponse::Patial(part) => {
                     accumulated_text.push_str(&part);
                     self.context.add_assistant(part);
                 }
-                LlmResponse::ToolCall { name, args } => {
+                LlmResponse::ToolCall { name, args, id } => {
+                    let tool_call_id = id.unwrap_or_else(|| name.clone());
+                    self.context.add_tool_call(
+                        tool_call_id.clone(),
+                        name.clone(),
+                        args.clone(),
+                    );
                     if let Some(ref registry) = tools {
                         let result = registry.execute(&name, &args).await?;
                         self.context
-                            .add_tool_result(name, format_tool_result_content(result));
+                            .add_tool_result(tool_call_id, format_tool_result_content(result));
                     }
                 }
                 LlmResponse::Done => {
-                    println!("Llm response: {:?}", accumulated_text);
                     break
                 },
             }

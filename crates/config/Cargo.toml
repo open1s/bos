@@ -10,15 +10,16 @@ python = ["pyo3", "pyo3-async-runtimes"]
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
-serde_yaml = "0.9"
+toml = "1.1"
+serde_yaml = "0.9.33"
 anyhow = { version = "1.0" }
 thiserror = "1.0"
-tracing = "0.1"
+logging = { path = "../logging" }
 tokio = { version = "1.50", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 pyo3 = { version = "0.28", optional = true, features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.28", optional = true, features = ["tokio-runtime"] }
+log = "0.4.29"
 
 [dev-dependencies]
 tempfile = "3.0"

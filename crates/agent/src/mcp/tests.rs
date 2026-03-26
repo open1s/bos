@@ -21,7 +21,7 @@ async fn test_json_rpc_request_serialization() {
 
     let deserialized: JsonRpcRequest = serde_json::from_str(&serialized).unwrap();
     assert_eq!(deserialized.method, "test_method");
-    assert_eq!(deserialized.id, 1);
+    assert_eq!(deserialized.id, serde_json::json!(1));
     assert!(deserialized.params.is_some());
 }
 
@@ -79,17 +79,17 @@ async fn test_jsonrpc_error_codes() {
 #[tokio::test]
 async fn test_server_capabilities_serialization() {
     let caps = ServerCapabilities {
-        tools: true,
-        resources: false,
-        prompts: true,
+        tools: serde_json::Value::Bool(true),
+        resources: serde_json::Value::Bool(false),
+        prompts: serde_json::Value::Bool(true),
     };
 
     let serialized = serde_json::to_string(&caps).unwrap();
     
     let deserialized: ServerCapabilities = serde_json::from_str(&serialized).unwrap();
-    assert_eq!(deserialized.tools, true);
-    assert_eq!(deserialized.resources, false);
-    assert_eq!(deserialized.prompts, true);
+    assert_eq!(deserialized.tools, serde_json::Value::Bool(true));
+    assert_eq!(deserialized.resources, serde_json::Value::Bool(false));
+    assert_eq!(deserialized.prompts, serde_json::Value::Bool(true));
 }
 
 #[tokio::test]
@@ -131,7 +131,7 @@ async fn test_jsonrpc_request_with_params() {
     let request = JsonRpcRequest::new("do_operation", Some(params), 3);
 
     assert_eq!(request.method, "do_operation");
-    assert_eq!(request.id, 3);
+    assert_eq!(request.id, serde_json::json!(3));
     
     let request_json = serde_json::to_string(&request).unwrap();
     assert!(request_json.contains("do_operation"));
