@@ -242,6 +242,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_run_tool_call_using_nvidia() {
+        if std::env::var("CI_SKIP_NVIDIA").is_ok() { return; }
+        if std::env::var("CI_SKIP_NVIDIA").is_ok() { return; }
         use crate::llm::OpenAiClient;
 
         let api_key = std::env::var("API_KEY").unwrap();
@@ -341,6 +343,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_stream_run_tool_call_using_nvidia() {
+        if std::env::var("CI_SKIP_NVIDIA").is_ok() { return; }
+        if std::env::var("CI_SKIP_NVIDIA").is_ok() { return; }
         use crate::llm::OpenAiClient;
 
         let api_key = std::env::var("API_KEY").unwrap();
@@ -448,6 +452,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_stream_run_mcp_using_nvidia() {
+        if std::env::var("CI_SKIP_NVIDIA").is_ok() { return; }
+        if std::env::var("CI_SKIP_NVIDIA").is_ok() { return; }
         use crate::llm::OpenAiClient;
         use crate::mcp::McpClient;
 
