@@ -1,4 +1,4 @@
-use crate::{Action, Memory, Observation, SimpleExecutor, ToolRegistry};
+use react::{Action, Memory, Observation, SimpleExecutor, ToolRegistry};
 use serde_json::{json, Value};
 
 #[test]
