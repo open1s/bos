@@ -40,6 +40,12 @@ impl MessageContext {
         self.messages.push(Message::ToolResult { name, content });
     }
 
+    // Patch D placeholder: record a policy decision for a given tool.
+    // Currently a no-op; wired later when real policy hooks are introduced.
+    pub fn add_policy_decision(&mut self, _tool: &str, _allowed: bool, _reason: &str) {
+        // no-op for now
+    }
+
     pub fn to_api_format(&self) -> Vec<OpenAiMessage> {
         let mut api_messages = Vec::with_capacity(self.messages.len());
         self.extend_api_format(&mut api_messages);
@@ -53,7 +59,7 @@ impl MessageContext {
                 Message::User(content) => OpenAiMessage::User {
                     content: content.clone(),
                 },
-                Message::System(profile) => OpenAiMessage::System{
+                Message::System(profile) => OpenAiMessage::System {
                     content: profile.clone(),
                 },
                 Message::Assistant(content) => OpenAiMessage::Assistant {

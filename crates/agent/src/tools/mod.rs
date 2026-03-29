@@ -5,6 +5,9 @@ use async_trait::async_trait;
 use crate::error::ToolError;
 
 pub mod registry;
+pub mod policy;
+pub mod circuit_breaker;
+pub mod rate_limiter;
 pub mod translator;
 pub mod validator;
 pub mod function;

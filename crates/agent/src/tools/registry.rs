@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use crate::tools::policy::{ToolPolicy, PolicyContext, BoxedPolicy};
+use serde_json;
 use std::sync::{Arc, Weak};
 use std::sync::RwLock;
 
@@ -14,6 +16,7 @@ pub struct ToolRegistry {
     namespaces: Vec<String>,
     schema_cache: DashMap<String, Arc<serde_json::Value>>,  // Arc 共享，零拷贝
     openai_format_cache: RwLock<Arc<Vec<serde_json::Value>>>,
+    policies: std::collections::HashMap<String, BoxedPolicy>,
 }
 
 impl Clone for ToolRegistry {
@@ -26,6 +29,7 @@ impl Clone for ToolRegistry {
             namespaces: self.namespaces.clone(),
             schema_cache: DashMap::new(),
             openai_format_cache: RwLock::new(Arc::new(Vec::new())),
+            policies: self.policies.clone(),
         }
     }
 }
@@ -40,6 +44,7 @@ impl ToolRegistry {
             namespaces: Vec::new(),
             schema_cache: DashMap::new(),
             openai_format_cache: RwLock::new(Arc::new(Vec::new())),
+            policies: std::collections::HashMap::new(),
         }
     }
 
@@ -177,6 +182,13 @@ impl ToolRegistry {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
+        // Patch D: policy check before tool execution
+        if let Some(policy) = self.policies.get(name) {
+            if !policy.is_allowed(name, &PolicyContext::new()) {
+                return Err(ToolError::ExecutionFailed("policy_denied".to_string()));
+            }
+        }
+
         let tool = self
             .tools
             .get(name)
@@ -192,6 +204,22 @@ impl ToolRegistry {
 
         super::validate_args(schema.as_ref(), args)?;
         tool.execute(args).await
+    }
+
+    // Patch D: policy-enabled configure (bind a policy to a tool)
+    pub fn configure_policy(&mut self, tool_name: &str, policy: BoxedPolicy) {
+        self.policies.insert(tool_name.to_string(), policy);
+    }
+
+    // Patch D skeleton: policy-enabled execute (no-op policy hook)
+    pub async fn execute_with_policy(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        // Future: consult per-tool policy here
+        // Currently, delegate to existing execute path for compatibility
+        self.execute(name, args).await
     }
 
     /// Execute multiple tools in parallel for batch operations
