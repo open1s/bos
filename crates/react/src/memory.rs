@@ -9,34 +9,34 @@ pub struct MemoryRecord {
     pub observation: Value,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Memory {
-    records: Vec<MemoryRecord>,
+    pub history: Vec<MemoryRecord>,
 }
 
 impl Memory {
     pub fn new() -> Self {
         Self {
-            records: Vec::new(),
+            history: Vec::new(),
         }
     }
     pub fn push(&mut self, thought: String, action: String, observation: Value) {
-        self.records.push(MemoryRecord {
+        self.history.push(MemoryRecord {
             thought,
             action,
             observation,
         });
     }
     pub fn last_observation(&self) -> Option<&Value> {
-        self.records.last().map(|r| &r.observation)
+        self.history.last().map(|r| &r.observation)
     }
     pub fn save_to_file(&self, path: &str) -> Result<(), std::io::Error> {
-        let data = serde_json::to_string(&self.records).unwrap_or_else(|_| "[]".to_string());
+        let data = serde_json::to_string(&self.history).unwrap_or_else(|_| "[]".to_string());
         fs::write(path, data)
     }
     pub fn load_from_file(path: &str) -> Result<Self, std::io::Error> {
         let data = fs::read_to_string(path)?;
         let records: Vec<MemoryRecord> = serde_json::from_str(&data).unwrap_or_else(|_| Vec::new());
-        Ok(Memory { records })
+        Ok(Memory { history: records })
     }
 }

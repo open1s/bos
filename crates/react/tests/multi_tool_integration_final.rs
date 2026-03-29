@@ -1,4 +1,5 @@
-use react::{Action, Memory, Observation, SimpleExecutor, ToolRegistry};
+use react::tool::FnTool;
+use react::{Action, Memory, Observation, SimpleExecutor, Tool, ToolRegistry};
 use serde_json::{json, Value};
 
 #[test]
@@ -7,12 +8,15 @@ fn multi_tool_integration_final() {
     let mut registry = ToolRegistry::new();
     registry.tools.insert(
         "WeatherAPI".to_string(),
-        Box::new(|args: &Value| {
-            let city = args
-                .get("city")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            json!({"city": city, "forecast": "sunny"})
+        Box::new(FnTool {
+            name: "WeatherAPI".to_string(),
+            f: Box::new(|args: &Value| {
+                let city = args
+                    .get("city")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                json!({"city": city, "forecast": "sunny"})
+            }),
         }),
     );
 

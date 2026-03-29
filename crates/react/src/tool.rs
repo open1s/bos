@@ -18,6 +18,24 @@ pub struct ToolOutput {
     pub result: Value,
 }
 
+// Lightweight wrapper to allow function closures as tools
+pub struct FnTool {
+    pub name: String,
+    pub f: Box<dyn Fn(&Value) -> Value + Send + Sync>,
+}
+
+impl Tool for FnTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "closure tool"
+    }
+    fn run(&self, input: &Value) -> Result<Value, ToolError> {
+        Ok((self.f)(input))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("Tool not found: {0}")]
@@ -33,7 +51,13 @@ pub trait Tool: Send + Sync {
 }
 
 pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn Tool>>,
+    pub tools: HashMap<String, Box<dyn Tool>>,
+}
+
+impl std::fmt::Debug for ToolRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ToolRegistry {{ tools: {} }}", self.tools.len())
+    }
 }
 
 impl ToolRegistry {
@@ -43,6 +67,10 @@ impl ToolRegistry {
         }
     }
     pub fn register(&mut self, t: Box<dyn Tool>) {
+        self.tools.insert(t.name().to_string(), t);
+    }
+    // Allow direct insertion from tests or external callers
+    pub fn insert(&mut self, t: Box<dyn Tool>) {
         self.tools.insert(t.name().to_string(), t);
     }
     pub fn call(&self, name: &str, input: &Value) -> Result<Value, ToolError> {

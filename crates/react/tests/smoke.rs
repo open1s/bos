@@ -1,4 +1,5 @@
-use react::{Action, ExecutionOutput, Memory, SimpleExecutor, ToolRegistry};
+use react::tool::FnTool;
+use react::{Action, ExecutionOutput, Memory, SimpleExecutor, Tool, ToolRegistry};
 use serde_json::{json, Value};
 
 #[test]
@@ -7,7 +8,10 @@ fn smoke_react_basic_integration() {
     let mut registry = ToolRegistry::new();
     registry.tools.insert(
         "echo".to_string(),
-        Box::new(|args: &Value| json!({"echo": args})),
+        Box::new(FnTool {
+            name: "echo".to_string(),
+            f: Box::new(|args: &Value| json!({"echo": args})),
+        }),
     );
 
     // Prepare memory and executor
