@@ -1,6 +1,7 @@
 use crate::llm::{Llm, LlmError};
 use tokio::time::{timeout, Duration};
 use log::info;
+use crate::telemetry::{Telemetry, TelemetryEvent};
 use crate::tool::{ToolRegistry, Tool};
 use crate::memory::Memory;
 use serde_json::Value;
@@ -45,16 +46,17 @@ pub struct ReActEngine {
   tools: ToolRegistry,
   memory: Memory,
   max_steps: usize,
+  telemetry: Telemetry,
 }
 
 impl ReActEngine {
   pub fn new(llm: Box<dyn Llm>, max_steps: usize) -> Self {
-    Self { llm, tools: ToolRegistry::new(), memory: Memory::new(), max_steps }
+    Self { llm, tools: ToolRegistry::new(), memory: Memory::new(), max_steps, telemetry: Telemetry::new(true) }
   }
   pub fn register_tool(&mut self, t: Box<dyn Tool>) {
      self.tools.register(t);
   }
-    pub async fn run(&mut self, user_input: &str) -> Result<String, ReactError> {
+  pub async fn run(&mut self, user_input: &str) -> Result<String, ReactError> {
      // Minimal ReAct loop with Action/Observation pattern
      let mut thought = String::new();
      for _ in 0..self.max_steps {
@@ -67,26 +69,37 @@ impl ReActEngine {
           Err(_) => return Err(ReactError::Timeout("LLM prediction timed out".to_string())),
         };
         thought = llm_out;
-        info!("[ReActEngine] received Thought: {}", thought);
+        self.telemetry.emit(&TelemetryEvent::ThoughtGenerated { thought: thought.clone() });
+        info!("[ReActEngine] ThoughtGenerated: {}", thought);
         // 2) Parse Action and Input from Thought (via helper for robustness)
         let (tool_name, input) = parse_action_input(thought.as_str());
         let tool_name = match tool_name { Some(n) => n, None => return Err(ReactError::Malformed("Missing Action in llm output".to_string())) };
         let res = self.tools.call(&tool_name, &input).map_err(|e| ReactError::ToolError(format!("{:?}", e)))?;
         self.memory.push(thought.clone(), tool_name.clone(), res.clone());
+        self.telemetry.emit(&TelemetryEvent::ToolInvocation { tool: tool_name.clone(), input: input.clone(), output: res.clone() });
         info!("[ReActEngine] tool '{}' produced observation: {}", tool_name, res);
         // 3) Next LLM prompt with observation
         let prompt2 = format!("Observation: {}\nThought:", res);
         thought = self.llm.predict(&prompt2).await.map_err(ReactError::Llm)?;
+        self.telemetry.emit(&TelemetryEvent::ThoughtGenerated { thought: thought.clone() });
         // 4) Check for final
         if thought.to_lowercase().contains("final answer") {
            if let Some(pos) = thought.find("Final Answer:") {
-              let ans = thought[(pos + "Final Answer:".len())..].trim().to_string();
-              return Ok(ans);
+               let ans = thought[(pos + "Final Answer:".len())..].trim().to_string();
+               self.telemetry.emit(&TelemetryEvent::FinalAnswer { answer: ans.clone() });
+               return Ok(ans);
            } else {
-              return Ok(thought.trim().to_string());
+               let ans = thought.trim().to_string();
+               self.telemetry.emit(&TelemetryEvent::FinalAnswer { answer: ans.clone() });
+               return Ok(ans);
            }
         }
      }
-     Err(ReactError::Malformed("Max steps reached without final answer".to_string()))
+    Err(ReactError::Malformed("Max steps reached without final answer".to_string()))
+  }
+
+  // Expose a simple memory checkpoint API for testing/observability
+  pub fn save_memory_checkpoint(&self, path: &str) -> Result<(), std::io::Error> {
+    self.memory.save_to_file(path)
   }
 }
