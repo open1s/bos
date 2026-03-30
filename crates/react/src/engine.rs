@@ -18,6 +18,28 @@ pub enum ReactError {
   Timeout(String),
 }
 
+fn parse_action_input(thought: &str) -> (Option<String>, Value) {
+  let mut tool_name: Option<String> = None;
+  let mut input: Value = Value::Null;
+  for line in thought.lines() {
+    let l = line.trim();
+    let lower = l.to_ascii_lowercase();
+    if lower.starts_with("action:") || lower.starts_with("tool:") {
+      if let Some(pos) = l.find(':') {
+        tool_name = Some(l[(pos+1)..].trim().to_string());
+      }
+    } else if lower.starts_with("input:") || lower.starts_with("parameters:") {
+      if let Some(pos) = l.find(':') {
+        let raw = l[(pos+1)..].trim();
+        if !raw.is_empty() {
+          if let Ok(v) = serde_json::from_str(raw) { input = v; }
+        }
+      }
+    }
+  }
+  (tool_name, input)
+}
+
 pub struct ReActEngine {
   llm: Box<dyn Llm>,
   tools: ToolRegistry,
@@ -32,7 +54,7 @@ impl ReActEngine {
   pub fn register_tool(&mut self, t: Box<dyn Tool>) {
      self.tools.register(t);
   }
-  pub async fn run(&mut self, user_input: &str) -> Result<String, ReactError> {
+    pub async fn run(&mut self, user_input: &str) -> Result<String, ReactError> {
      // Minimal ReAct loop with Action/Observation pattern
      let mut thought = String::new();
      for _ in 0..self.max_steps {
@@ -46,26 +68,8 @@ impl ReActEngine {
         };
         thought = llm_out;
         info!("[ReActEngine] received Thought: {}", thought);
-        // 2) Parse Action and Input from Thought
-        let mut tool_name: Option<String> = None;
-        let mut input: Value = Value::Null;
-        // Robust parsing: support Action/Tool and Input/Parameters (case-insensitive)
-        for line in thought.lines() {
-           let l = line.trim();
-           let lower = l.to_ascii_lowercase();
-           if lower.starts_with("action:") || lower.starts_with("tool:") {
-              if let Some(pos) = l.find(':') {
-                 tool_name = Some(l[(pos+1)..].trim().to_string());
-              }
-           } else if lower.starts_with("input:") || lower.starts_with("parameters:") {
-              if let Some(pos) = l.find(':') {
-                 let raw = l[(pos+1)..].trim();
-                 if !raw.is_empty() {
-                    if let Ok(v) = serde_json::from_str(raw) { input = v; }
-                 }
-              }
-           }
-        }
+        // 2) Parse Action and Input from Thought (via helper for robustness)
+        let (tool_name, input) = parse_action_input(thought.as_str());
         let tool_name = match tool_name { Some(n) => n, None => return Err(ReactError::Malformed("Missing Action in llm output".to_string())) };
         let res = self.tools.call(&tool_name, &input).map_err(|e| ReactError::ToolError(format!("{:?}", e)))?;
         self.memory.push(thought.clone(), tool_name.clone(), res.clone());
