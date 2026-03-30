@@ -2,17 +2,19 @@
 //!
 //! This module provides STDIO-based MCP server communication with JSON-RPC 2.0 protocol.
 
+pub mod adapter;
+pub mod client;
 pub mod protocol;
 pub mod transport;
-pub mod client;
-pub mod adapter;
 
 #[cfg(test)]
 mod tests;
 
-pub use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, ServerCapabilities, ToolDefinition,
-    McpResource, McpPrompt, McpPromptArgument, ReadResourceResult, ResourceContents};
-pub use transport::StdioTransport;
-pub use client::McpClient;
 pub use adapter::McpToolAdapter;
+pub use client::McpClient;
 pub use client::McpError;
+pub use protocol::{
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpPrompt, McpPromptArgument, McpResource,
+    ReadResourceResult, ResourceContents, ServerCapabilities, ToolDefinition,
+};
+pub use transport::StdioTransport;

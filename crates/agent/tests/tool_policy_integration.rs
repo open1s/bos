@@ -1,22 +1,27 @@
 // Patch D: Skeleton integration test for per-tool policy integration points
 // This test builds a tiny local Tool and a DenyPolicy to verify policy gate is exercised.
 
-use std::sync::Arc;
-use serde_json::json;
+use agent::tools::policy::{BoxedPolicy, PolicyContext, ToolPolicy};
 use agent::tools::registry::ToolRegistry;
 use agent::tools::{Tool, ToolDescription};
-use async_trait::async_trait;
 use agent::ToolError;
-use agent::tools::policy::{ToolPolicy, PolicyContext, BoxedPolicy};
+use async_trait::async_trait;
+use serde_json::json;
+use std::sync::Arc;
 // Use crate-local ToolError type via the Tool trait re-export
 
 // Minimal local tool for testing
 struct MinimalTool;
 #[async_trait]
 impl Tool for MinimalTool {
-    fn name(&self) -> &str { "dummy" }
+    fn name(&self) -> &str {
+        "dummy"
+    }
     fn description(&self) -> ToolDescription {
-        ToolDescription { short: "A dummy tool".to_string(), parameters: "none".to_string() }
+        ToolDescription {
+            short: "A dummy tool".to_string(),
+            parameters: "none".to_string(),
+        }
     }
     fn json_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {}})
@@ -29,7 +34,9 @@ impl Tool for MinimalTool {
 // Deny policy for testing
 struct DenyPolicy;
 impl ToolPolicy for DenyPolicy {
-    fn is_allowed(&self, _tool_name: &str, _ctx: &PolicyContext) -> bool { false }
+    fn is_allowed(&self, _tool_name: &str, _ctx: &PolicyContext) -> bool {
+        false
+    }
 }
 
 #[tokio::test]

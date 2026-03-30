@@ -1,20 +1,20 @@
 //! Zenoh Bus management
 
-use std::ops::Deref;
-use std::sync::Arc;
+use crate::{Publisher, Session, Subscriber, ZenohError};
 use rkyv::api::high::HighDeserializer;
-use rkyv::{Archive, Deserialize, Serialize};
 use rkyv::rancor::{Error, Strategy};
 use rkyv::ser::allocator::ArenaHandle;
-use rkyv::ser::Serializer;
 use rkyv::ser::sharing::Share;
+use rkyv::ser::Serializer;
 use rkyv::util::AlignedVec;
-use serde_json::from_value;
+use rkyv::{Archive, Deserialize, Serialize};
+use std::ops::Deref;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use zenoh::Config;
-use crate::{Publisher, Session, Subscriber, ZenohError};
 
 #[derive(Clone)]
+#[allow(clippy::type_complexity)]
 pub struct Bus {
     session: Arc<Session>,
     handles: Arc<tokio::sync::Mutex<Vec<JoinHandle<Result<(), String>>>>>,
@@ -30,26 +30,29 @@ impl Bus {
     }
 
     ///load from config
-    pub async fn from(config: BusConfig) -> Self{
+    pub async fn from(config: BusConfig) -> Self {
         let zenoh_config: Config = config.into();
         let session = zenoh::open(zenoh_config).await.unwrap();
-        Self{
+        Self {
             session: Arc::new(session),
             handles: Arc::new(tokio::sync::Mutex::new(vec![])),
         }
     }
 
-    pub async fn subscrible<T,F>(&mut self, topic: &str, mut handler: F)
+    pub async fn subscribe<T, F>(&mut self, topic: &str, mut handler: F)
     where
         F: FnMut(T) + Send + 'static,
         T: Archive + Send + 'static,
-        T::Archived: Deserialize<T, HighDeserializer<Error>>,{
-
+        T::Archived: Deserialize<T, HighDeserializer<Error>>,
+    {
         let bus = self.session.clone();
         let topic = String::from(topic);
 
-        let handle: tokio::task::JoinHandle<Result<_, String>> = tokio::spawn(async move {
-            let mut sub = Subscriber::<T>::new(topic).with_session(bus).await.unwrap();
+        let handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
+            let mut sub = Subscriber::<T>::new(topic)
+                .with_session(bus)
+                .await
+                .map_err(|e| e.to_string())?;
             while let Some(query) = sub.recv().await {
                 handler(query);
             }
@@ -58,14 +61,17 @@ impl Bus {
         self.handles.lock().await.push(handle);
     }
 
-    pub async fn publish<T>(&mut self, topic: &str,payload: &T) -> Result<(), ZenohError>
+    pub async fn publish<T>(&mut self, topic: &str, payload: &T) -> Result<(), ZenohError>
     where
         T: Archive,
-        for<'a> T: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,{
+        for<'a> T: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+    {
         let bus = self.session.clone();
         let topic = String::from(topic);
 
-        let publisher = Publisher::new(topic).with_session(bus).unwrap();
+        let publisher = Publisher::new(topic)
+            .with_session(bus)
+            .map_err(|e| ZenohError::Publisher(e.to_string()))?;
         publisher.publish(payload).await
     }
 }
@@ -86,15 +92,15 @@ impl From<Arc<Session>> for Bus {
     }
 }
 
-impl Into<Arc<Session>> for Bus {
-    fn into(self) -> Arc<Session> {
-        self.session.clone()
+impl From<Bus> for Arc<Session> {
+    fn from(val: Bus) -> Self {
+        val.session.clone()
     }
 }
 
-impl Into<Session>  for Bus {
-    fn into(self) -> Session {
-        self.session.deref().clone()
+impl From<Bus> for Session {
+    fn from(val: Bus) -> Session {
+        val.session.deref().clone()
     }
 }
 
@@ -108,7 +114,7 @@ pub struct BusConfig {
 
 impl BusConfig {
     pub fn new(mode: &str) -> Self {
-        Self{
+        Self {
             mode: mode.to_string(),
             connect: None,
             listen: None,
@@ -117,31 +123,11 @@ impl BusConfig {
     }
 }
 
-impl Into<zenoh::config::Config> for BusConfig {
-    fn into(self) -> Config {
-        let zenoh_config_json = serde_json::json!({
-            "mode": self.mode,
-            "scouting": {
-                "multicast": {
-                    "enabled": true
-                }
-            },
-            "transport": {
-                "unicast": {
-                    "accept_timeout": 100
-                }
-            }
-        });
-
-        let config = from_value::<zenoh::config::Config>(zenoh_config_json);
-        match config {
-            Ok(cfg) => {
-                return cfg;
-            }
-            Err(_) => {
-                zenoh::config::Config::default()
-            }
-        }
+impl From<BusConfig> for zenoh::config::Config {
+    fn from(_value: BusConfig) -> Config {
+        // This implementation is used for compatibility.
+        // Zenoh config mapping can be expanded later; for now default is safe.
+        zenoh::config::Config::default()
     }
 }
 

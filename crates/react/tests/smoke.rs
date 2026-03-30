@@ -1,5 +1,5 @@
 use react::tool::FnTool;
-use react::{Action, ExecutionOutput, Memory, SimpleExecutor, Tool, ToolRegistry};
+use react::{Action, ExecutionOutput, Memory, SimpleExecutor, ToolRegistry};
 use serde_json::{json, Value};
 
 #[test]
@@ -18,7 +18,7 @@ fn smoke_react_basic_integration() {
     let mut memory = Memory {
         history: Vec::new(),
     };
-    let mut exec = SimpleExecutor::new();
+    let exec = SimpleExecutor::new();
 
     // Create a tool call Action
     let a = Action::ToolCall {

@@ -17,7 +17,7 @@ pub enum Action {
 pub struct Observation {
     pub value: Value,
 }
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SimpleExecutor {
     pub registry: ToolRegistry,
 }
@@ -41,7 +41,8 @@ pub struct ExecutionOutput {
     pub memory: Memory,
 }
 
-pub use llm::{Llm, LlmError};
+pub use llm::{LlmClient, LlmError};
+pub use llm::LlmMessage as Message;
 pub use tool::{Tool, ToolRegistry};
 pub use memory::Memory;
 pub use engine::{ReActEngine, ReActEngineBuilder, BuilderError};

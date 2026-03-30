@@ -11,6 +11,9 @@ async fn test_engine_with_resilience_enabled() {
         rate_limiter: RateLimiterConfig {
             capacity: 10,
             window: Duration::from_secs(1),
+            max_retries: 3,
+            retry_backoff: Duration::from_secs(1),
+            auto_wait: false,
         },
     };
 
@@ -24,5 +27,5 @@ async fn test_engine_with_resilience_enabled() {
 async fn test_engine_without_resilience() {
     let config = ResilienceConfig::default();
     assert_eq!(config.circuit_breaker.max_failures, 5);
-    assert_eq!(config.rate_limiter.capacity, 10);
+    assert_eq!(config.rate_limiter.capacity, 40);
 }

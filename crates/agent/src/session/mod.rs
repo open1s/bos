@@ -1,7 +1,7 @@
+pub mod manager;
 pub mod serializer;
 pub mod storage;
-pub mod manager;
-
+use react::llm::LlmMessage as Message;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -70,4 +70,3 @@ pub enum SessionError {
 
 pub use manager::SessionManager;
 pub use serializer::SessionSerializer;
-use crate::agent::message::Message;

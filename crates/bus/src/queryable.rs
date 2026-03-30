@@ -1,11 +1,17 @@
 //! Zenoh queryable wrapper
 
-use rkyv::{Archive, Deserialize, Serialize, api::high::HighDeserializer, ser::{allocator::ArenaHandle, sharing::Share, Serializer}, util::AlignedVec, rancor::{Error, Strategy}};
+use rkyv::{
+    api::high::HighDeserializer,
+    rancor::{Error, Strategy},
+    ser::{allocator::ArenaHandle, sharing::Share, Serializer},
+    util::AlignedVec,
+    Archive, Deserialize, Serialize,
+};
 
 use crate::{error::ZenohError, Codec, Session};
-use std::sync::Arc;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use zenoh::query::Query;
 
@@ -27,7 +33,11 @@ where
     _phantom_r: std::marker::PhantomData<R>,
 }
 
-pub(crate) type Handler<Q, R> = Box<dyn Fn(Q) -> Pin<Box<dyn std::future::Future<Output = Result<R, ZenohError>> + Send>> + Send + Sync>;
+pub(crate) type Handler<Q, R> = Box<
+    dyn Fn(Q) -> Pin<Box<dyn std::future::Future<Output = Result<R, ZenohError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl<Q, R> QueryableWrapper<Q, R>
 where
@@ -70,37 +80,28 @@ where
         Ok(())
     }
 
-    pub fn run(mut self){
-        let queryable = self.queryable.take().ok_or(ZenohError::NotConnected);
-        let queryable = match queryable {
-            Ok(it) => it,
-            Err(_) => {
-                return;
-            }
-        };
+    pub fn run(&mut self) -> Result<(), ZenohError> {
+        let queryable = self.queryable.take().ok_or(ZenohError::NotConnected)?;
 
-        if self.started.fetch_and(true, std::sync::atomic::Ordering::Relaxed) {
-            return;
+        if self
+            .started
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(ZenohError::AlreadyStarted);
         }
 
-        let handler = self
-            .handler
-            .take();
-        let handler = match handler {
-            Some(handler) => handler,
-            None => return
-        };
-
+        let handler = self.handler.take().ok_or(ZenohError::NotConnected)?;
         let topic = self.topic.clone();
 
-        self.started.store(true, std::sync::atomic::Ordering::Relaxed);
         let handle = tokio::spawn(async move {
             while let Ok(query) = queryable.recv_async().await {
-               let _ = Self::handle_query(&query, &handler, &topic).await;
+                let _ = Self::handle_query(&query, &handler, &topic).await;
             }
             Ok(())
         });
+
         self.handle = Some(handle);
+        Ok(())
     }
 
     async fn handle_query(
@@ -160,14 +161,15 @@ where
         self.handler = None;
 
         if self.started.load(std::sync::atomic::Ordering::Relaxed) {
-            self.started.store(false, std::sync::atomic::Ordering::Relaxed);
-            // let handle = self.handle.take().unwrap();
-            // handle.abort();
-            // println!("Drop Queryable");
+            self.started
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }
-
 
 impl<Q, R> Clone for QueryableWrapper<Q, R>
 where
@@ -214,30 +216,33 @@ mod tests {
         let config = BusConfig::default();
         let bus = Bus::from(config).await;
 
-
-        let mut queryable = QueryableWrapper::<String, String>::new("test/topic")
-            .with_handler(|q| async move {
+        let mut queryable =
+            QueryableWrapper::<String, String>::new("test/topic").with_handler(|q| async move {
                 println!("IN {:?}", q);
                 Ok(q.to_uppercase())
             });
 
         queryable.init(&bus.clone().into()).await.unwrap();
-        queryable.run();
+        let _ = queryable.run();
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let client = crate::query::Query::new("test/topic")
-            .with_session(bus.into()).await.unwrap();
-        
+            .with_session(bus.into())
+            .await
+            .unwrap();
+
         let results: Result<String, ZenohError> = client.query(&"hello world".to_string()).await;
 
         assert!(results.is_ok());
         println!("{:?}", results.unwrap());
 
-        let result = client.stream_with_handler::<String, String>(&"Hello Zenoh".to_string(), |response| {
-            println!("R: {}",response);
-            Ok(response)
-        }).await;
+        let result = client
+            .stream_with_handler::<String, String>(&"Hello Zenoh".to_string(), |response| {
+                println!("R: {}", response);
+                Ok(response)
+            })
+            .await;
 
         println!("{:?}", result.unwrap());
     }

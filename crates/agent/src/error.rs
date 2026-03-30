@@ -2,6 +2,8 @@
 //!
 //! Provides typed errors for the agent crate following the pattern from `brainos-bus`.
 
+use crate::skills::SkillError;
+use react::llm::LlmError as ReactLlmError;
 use thiserror::Error;
 
 /// Errors from LLM client operations.
@@ -29,6 +31,19 @@ impl From<reqwest::Error> for LlmError {
             LlmError::Timeout
         } else {
             LlmError::Http(e.to_string())
+        }
+    }
+}
+
+impl From<ReactLlmError> for LlmError {
+    fn from(e: ReactLlmError) -> Self {
+        match e {
+            ReactLlmError::Http(s) => LlmError::Http(s),
+            ReactLlmError::Parse(s) => LlmError::Parse(s),
+            ReactLlmError::Timeout => LlmError::Timeout,
+            ReactLlmError::ApiKeyMissing => LlmError::ApiKeyMissing,
+            ReactLlmError::RateLimited => LlmError::RateLimited,
+            ReactLlmError::Other(s) => LlmError::Http(s),
         }
     }
 }
@@ -66,4 +81,16 @@ pub enum AgentError {
 
     #[error("Bus error: {0}")]
     Bus(String),
+}
+
+impl From<ReactLlmError> for AgentError {
+    fn from(e: ReactLlmError) -> Self {
+        AgentError::Llm(e.into())
+    }
+}
+
+impl From<SkillError> for AgentError {
+    fn from(e: SkillError) -> Self {
+        AgentError::Session(e.to_string())
+    }
 }

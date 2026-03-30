@@ -1,14 +1,14 @@
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use crate::{QueryableWrapper, ZenohError};
 use rkyv::api::high::HighDeserializer;
-use rkyv::{Archive, Deserialize, Serialize};
 use rkyv::rancor::{Error, Strategy};
 use rkyv::ser::allocator::ArenaHandle;
-use rkyv::ser::Serializer;
 use rkyv::ser::sharing::Share;
+use rkyv::ser::Serializer;
 use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use zenoh::Session;
-use crate::{QueryableWrapper, ZenohError};
 
 pub struct Callable<Q, R>
 where
@@ -47,17 +47,20 @@ where
     for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
     for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
-    pub fn new(uri: &str,session: Arc<Session>)->Self{
-        let inner = QueryableWrapper::<Q,R>::new(
-            uri,
-        );
-        Self{inner:Some(inner), session:session, started: AtomicBool::new(false)}
+    pub fn new(uri: &str, session: Arc<Session>) -> Self {
+        let inner = QueryableWrapper::<Q, R>::new(uri);
+        Self {
+            inner: Some(inner),
+            session,
+            started: AtomicBool::new(false),
+        }
     }
 
     pub fn with_handler<F, Fut>(mut self, handler: F) -> Self
     where
         F: Fn(Q) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<R, ZenohError>> + Send + 'static,{
+        Fut: std::future::Future<Output = Result<R, ZenohError>> + Send + 'static,
+    {
         self.inner = Some(self.inner.take().unwrap().with_handler(handler));
         self
     }
@@ -67,17 +70,11 @@ where
             return Err(ZenohError::AlreadyStarted);
         }
 
-        let inner = self.inner.take();
-        match inner {
-            Some(mut inner) => {
-                let _ = inner.init(&self.session).await;
-                self.started.store(true, std::sync::atomic::Ordering::Relaxed);
-                inner.run();
-                Ok(())
-            }
-            None => {
-                Err(ZenohError::NotConnected)
-            }
-        }
+        let inner = self.inner.as_mut().ok_or(ZenohError::NotConnected)?;
+        inner.init(&self.session).await?;
+        inner.run()?;
+        self.started
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 }

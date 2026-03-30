@@ -4,18 +4,16 @@ use async_trait::async_trait;
 
 use crate::error::ToolError;
 
-pub mod registry;
+pub mod function;
 pub mod policy;
-pub mod circuit_breaker;
-pub mod rate_limiter;
+pub mod registry;
 pub mod translator;
 pub mod validator;
-pub mod function;
 
+pub use function::FunctionTool;
 pub use registry::ToolRegistry;
 pub use translator::describe_schema;
 pub use validator::validate_args;
-pub use function::FunctionTool;
 
 #[derive(Debug, Clone)]
 pub struct ToolDescription {
@@ -28,13 +26,13 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> ToolDescription;
     fn json_schema(&self) -> serde_json::Value;
-    
+
     /// Get cached JSON schema as Arc for zero-copy access
     /// Default implementation wraps json_schema() in Arc
     fn cached_schema(&self) -> Arc<serde_json::Value> {
         Arc::new(self.json_schema())
     }
-    
+
     async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError>;
 }
 

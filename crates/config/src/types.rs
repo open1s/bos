@@ -57,25 +57,20 @@ impl ConfigMergeStrategy {
     }
 }
 
+use std::sync::Arc;
+
 /// 配置源
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ConfigSource {
     File(String),
     Directory(String),
     Inline(serde_json::Value),
-    Custom(Box<dyn CustomConfigSource + Send + Sync>),
+    Custom(Arc<dyn CustomConfigSource>),
 }
 
-impl Clone for ConfigSource {
-    fn clone(&self) -> Self {
-        match self {
-            ConfigSource::File(s) => ConfigSource::File(s.clone()),
-            ConfigSource::Directory(s) => ConfigSource::Directory(s.clone()),
-            ConfigSource::Inline(v) => ConfigSource::Inline(v.clone()),
-            ConfigSource::Custom(_) => {
-                panic!("Cannot clone Custom config source. Use a different approach.");
-            }
-        }
+impl ConfigSource {
+    pub fn custom(source: Arc<dyn CustomConfigSource>) -> Self {
+        ConfigSource::Custom(source)
     }
 }
 
@@ -94,7 +89,7 @@ impl ConfigSource {
 }
 
 /// 自定义配置源 trait
-pub trait CustomConfigSource: std::fmt::Debug {
+pub trait CustomConfigSource: std::fmt::Debug + Send + Sync {
     fn load(&self) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -256,8 +251,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Cannot clone Custom config source")]
-    fn test_config_source_clone_custom_panics() {
+    fn test_config_source_clone_custom() {
         #[derive(Debug)]
         struct MockCustomSource;
         impl CustomConfigSource for MockCustomSource {
@@ -265,8 +259,9 @@ mod tests {
                 Ok(serde_json::json!({}))
             }
         }
-        let source = ConfigSource::Custom(Box::new(MockCustomSource));
-        let _ = source.clone();
+        let source = ConfigSource::custom(Arc::new(MockCustomSource));
+        let cloned = source.clone();
+        assert!(matches!(cloned, ConfigSource::Custom(_)));
     }
 
     // ========== ConfigMetadata Tests ==========

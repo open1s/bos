@@ -1,11 +1,12 @@
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use super::{Tool, ToolDescription, ToolError};
 
 /// A wrapper that converts an async function into a Tool implementation.
 ///
 /// The function must accept `&serde_json::Value` as input and return `Result<serde_json::Value, ToolError>`.
+#[allow(clippy::type_complexity)]
 pub struct FunctionTool {
     name: String,
     description: ToolDescription,
@@ -43,8 +44,7 @@ impl FunctionTool {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
 
-        for i in 0..num_params {
-            let param_name = params[i];
+        for param_name in params.iter().take(num_params) {
             properties.insert(
                 param_name.to_string(),
                 serde_json::json!({
@@ -94,9 +94,7 @@ mod tests {
             "echo",
             "Echo the input",
             serde_json::json!({"type": "object", "properties": {"message": {"type": "string"}}}),
-            |args: &serde_json::Value| {
-                Ok(args.clone())
-            },
+            |args: &serde_json::Value| Ok(args.clone()),
         );
 
         assert_eq!(tool.name(), "echo");
@@ -105,16 +103,16 @@ mod tests {
 
     #[test]
     fn test_function_tool_numeric() {
-        let tool = FunctionTool::numeric(
-            "add",
-            "Add two numbers",
-            2,
-            |args: &serde_json::Value| {
-                let a = args["a"].as_f64().ok_or_else(|| ToolError::ExecutionFailed("a required".to_string()))?;
-                let b = args["b"].as_f64().ok_or_else(|| ToolError::ExecutionFailed("b required".to_string()))?;
+        let tool =
+            FunctionTool::numeric("add", "Add two numbers", 2, |args: &serde_json::Value| {
+                let a = args["a"]
+                    .as_f64()
+                    .ok_or_else(|| ToolError::ExecutionFailed("a required".to_string()))?;
+                let b = args["b"]
+                    .as_f64()
+                    .ok_or_else(|| ToolError::ExecutionFailed("b required".to_string()))?;
                 Ok(serde_json::json!(a + b))
-            },
-        );
+            });
 
         assert_eq!(tool.name(), "add");
         let schema = tool.json_schema();
@@ -130,8 +128,12 @@ mod tests {
             "Multiply two numbers",
             2,
             |args: &serde_json::Value| {
-                let a = args["a"].as_f64().ok_or_else(|| ToolError::ExecutionFailed("a required".to_string()))?;
-                let b = args["b"].as_f64().ok_or_else(|| ToolError::ExecutionFailed("b required".to_string()))?;
+                let a = args["a"]
+                    .as_f64()
+                    .ok_or_else(|| ToolError::ExecutionFailed("a required".to_string()))?;
+                let b = args["b"]
+                    .as_f64()
+                    .ok_or_else(|| ToolError::ExecutionFailed("b required".to_string()))?;
                 Ok(serde_json::json!(a * b))
             },
         );

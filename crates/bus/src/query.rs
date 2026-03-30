@@ -1,12 +1,16 @@
 //! Zenoh query wrapper with simplified API
 
-use std::sync::Arc;
 use rkyv::{
-    Archive, Serialize, rancor::{Error, Strategy}, ser::{Serializer, allocator::ArenaHandle, sharing::Share}, util::AlignedVec
+    rancor::{Error, Strategy},
+    ser::{allocator::ArenaHandle, sharing::Share, Serializer},
+    util::AlignedVec,
+    Archive, Serialize,
 };
+use std::sync::Arc;
 use zenoh::Session;
+use zenoh::query::ConsolidationMode;
 
-use crate::{DEFAULT_CODEC, error::ZenohError};
+use crate::{error::ZenohError, DEFAULT_CODEC};
 
 /// Type alias for backward compatibility
 pub type QueryWrapper = Query;
@@ -32,45 +36,57 @@ impl Query {
     }
 
     /// Create a query client directly from a session and topic
-    pub async fn from_session(topic: impl Into<String>, session: Arc<Session>) -> Result<Self, ZenohError> {
+    pub async fn from_session(
+        topic: impl Into<String>,
+        session: Arc<Session>,
+    ) -> Result<Self, ZenohError> {
         let mut query = Self::new(topic);
         query.session = Some(session);
         Ok(query)
     }
 
     /// Send a query with string payload
-    pub async fn query<Q, R>(&self, payload: &Q) -> Result<R, ZenohError> where 
+    pub async fn query<Q, R>(&self, payload: &Q) -> Result<R, ZenohError>
+    where
         Q: Archive,
         for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
         R: Archive,
         R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
     {
         let codec = DEFAULT_CODEC;
-        let bytes = codec.encode(payload).unwrap();
+        let bytes = codec
+            .encode(payload)
+            .map_err(|e| ZenohError::Serialization(e.to_string()))?;
 
         let results = self.query_internal_bytes(&bytes, None).await?;
 
-        let result: R = codec.decode(results[0].as_slice()).unwrap();
+        let result: R = codec
+            .decode(results[0].as_slice())
+            .map_err(|e| ZenohError::Serialization(e.to_string()))?;
         Ok(result)
     }
 
     /// Send a query with string payload and timeout
-    pub async fn query_with_timeoutquery<Q, R>(
+    pub async fn query_with_timeout<Q, R>(
         &self,
         payload: &Q,
         timeout: std::time::Duration,
-    ) -> Result<R, ZenohError>  
-    where 
+    ) -> Result<R, ZenohError>
+    where
         Q: Archive,
         for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
         R: Archive,
         R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
     {
         let codec = DEFAULT_CODEC;
-        let bytes = codec.encode(payload).unwrap();
+        let bytes = codec
+            .encode(payload)
+            .map_err(|e| ZenohError::Serialization(e.to_string()))?;
 
         let results = self.query_internal_bytes(&bytes, Some(timeout)).await?;
-        let result: R = codec.decode(results[0].as_slice()).unwrap();
+        let result: R = codec
+            .decode(results[0].as_slice())
+            .map_err(|e| ZenohError::Serialization(e.to_string()))?;
         Ok(result)
     }
 
@@ -79,22 +95,30 @@ impl Query {
         &self,
         payload: &Q,
         mut handler: impl FnMut(R) -> anyhow::Result<R>,
-    ) -> Result<Vec<R>, ZenohError> where 
+    ) -> Result<Vec<R>, ZenohError>
+    where
         Q: Archive,
-        for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,  
         for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
         R: Archive,
         R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
     {
         let codec = DEFAULT_CODEC;
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
-        let bytes = codec.encode(payload).unwrap();
-        let replies = session.get(&self.topic).payload(bytes).await?;
+        let bytes = codec
+            .encode(payload)
+            .map_err(|e| ZenohError::Serialization(e.to_string()))?;
+        let replies = session
+            .get(&self.topic)
+            .payload(bytes)
+            .consolidation(ConsolidationMode::None)
+            .await?;
 
         let mut results = Vec::new();
         while let Ok(reply) = replies.recv_async().await {
             if let Ok(sample) = reply.result() {
-                let result: R = codec.decode(&sample.payload().to_bytes().to_vec()).unwrap();
+                let result: R = codec
+                    .decode(sample.payload().to_bytes().as_ref())
+                    .map_err(|e| ZenohError::Serialization(e.to_string()))?;
                 match handler(result) {
                     Ok(result) => results.push(result),
                     Err(e) => return Err(ZenohError::Serialization(e.to_string())),
@@ -105,29 +129,31 @@ impl Query {
     }
 
     /// Send a query and process responses with a callback
-    pub async fn stream<Q, R>(
-        &self,
-        payload: &Q
-    ) -> Result<Vec<R>, ZenohError> where
+    pub async fn stream<Q, R>(&self, payload: &Q) -> Result<Vec<R>, ZenohError>
+    where
         Q: Archive,
-        for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
         for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
         R: Archive,
         R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
     {
         let codec = DEFAULT_CODEC;
-        let bytes = codec.encode(payload).unwrap();
+        let bytes = codec
+            .encode(payload)
+            .map_err(|e| ZenohError::Serialization(e.to_string()))?;
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
-        let replies = session.get(&self.topic).payload(bytes).await?;
-        
+        let replies = session
+            .get(&self.topic)
+            .payload(bytes)
+            .consolidation(ConsolidationMode::None)
+            .await?;
+
         let mut results = Vec::new();
         while let Ok(reply) = replies.recv_async().await {
             if let Ok(sample) = reply.result() {
-                let decoded= codec.decode(&sample.payload().to_bytes().to_vec());
-                match decoded {
-                    Ok(result) => results.push(result),
-                    Err(e) => return Err(ZenohError::Serialization(e.to_string())),
-                }
+                let decoded = codec
+                    .decode(sample.payload().to_bytes().as_ref())
+                    .map_err(|e| ZenohError::Serialization(e.to_string()))?;
+                results.push(decoded);
             }
         }
         Ok(results)
@@ -159,6 +185,21 @@ impl Query {
         }
 
         Ok(results)
+    }
+
+    /// Compat shim for old naming
+    pub async fn query_with_timeoutquery<Q, R>(
+        &self,
+        payload: &Q,
+        timeout: std::time::Duration,
+    ) -> Result<R, ZenohError>
+    where
+        Q: Archive,
+        for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
+        R: Archive,
+        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
+    {
+        self.query_with_timeout(payload, timeout).await
     }
 
     /// Get the topic

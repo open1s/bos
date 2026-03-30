@@ -1,16 +1,13 @@
 use std::sync::{Arc, Mutex};
-use std::pin::Pin;
-use futures::Future;
-use serde_json::{json, Value};
+use async_trait::async_trait;
+use serde_json::Value;
 
-use react::llm::{Llm, LlmError};
+use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, TokenStream};
 use react::engine::{ReActEngineBuilder, BuilderError};
-use react::tool::{Tool, ToolError};
 use react::tool::FnTool;
 
 #[test]
 fn test_builder_pattern() {
-    // Simple mock LLM that returns a fixed action then final answer
     struct MockLlm {
         responses: Arc<Mutex<Vec<String>>>,
     }
@@ -21,19 +18,25 @@ fn test_builder_pattern() {
             }
         }
     }
-    impl Llm for MockLlm {
-        fn predict(&self, _prompt: &str) -> Pin<Box<dyn Future<Output = Result<String, LlmError>> + Send>> {
+
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn complete(&self, _request: LlmRequest) -> LlmResponseResult {
             let responses = self.responses.clone();
-            Box::pin(async move {
-                let mut lock = responses.lock().unwrap();
-                if lock.is_empty() {
-                    Ok("Final Answer: 0".to_string())
-                } else {
-                    let resp = lock.remove(0);
-                    Ok(resp)
-                }
-            })
+            let mut lock = responses.lock().unwrap();
+            if lock.is_empty() {
+                Ok(LlmResponse::Text("Final Answer: 0".to_string()))
+            } else {
+                Ok(LlmResponse::Text(lock.remove(0)))
+            }
         }
+
+        async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        fn supports_tools(&self) -> bool { false }
+        fn provider_name(&self) -> &'static str { "mock" }
     }
 
     let mock_llm = MockLlm::new(vec![
@@ -41,14 +44,12 @@ fn test_builder_pattern() {
         "Final Answer: 5".to_string(),
     ]);
 
-    // Build engine using builder
     let mut engine = ReActEngineBuilder::new()
         .llm(Box::new(mock_llm))
         .with_tool(Box::new(FnTool {
             name: "calculator".to_string(),
             f: Box::new(|input: &Value| {
                 let expr = input.get("expression").and_then(|v| v.as_str()).unwrap_or("0");
-                // Simple eval for 2+3 only for demo
                 if expr == "2+3" {
                     Value::String("5".to_string())
                 } else {
@@ -60,7 +61,6 @@ fn test_builder_pattern() {
         .build()
         .expect("Failed to build engine");
 
-    // Use a tokio runtime to run the async method
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(async { engine.run("2+3").await });
     assert_eq!(result.unwrap(), "5");

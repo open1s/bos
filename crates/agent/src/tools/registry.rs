@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-use crate::tools::policy::{ToolPolicy, PolicyContext, BoxedPolicy};
+use crate::tools::policy::{BoxedPolicy, PolicyContext};
 use serde_json;
-use std::sync::{Arc, Weak};
+use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::{Arc, Weak};
 
 use super::{Tool, ToolError};
-use crate::tools::{ToolDescription, async_trait};
+use crate::tools::{async_trait, ToolDescription};
 use dashmap::DashMap;
 
 pub struct ToolRegistry {
@@ -14,7 +14,7 @@ pub struct ToolRegistry {
     namespaced_tool_index: HashMap<String, HashMap<String, Weak<dyn Tool>>>,
     namespace_index: HashMap<String, Vec<String>>,
     namespaces: Vec<String>,
-    schema_cache: DashMap<String, Arc<serde_json::Value>>,  // Arc 共享，零拷贝
+    schema_cache: DashMap<String, Arc<serde_json::Value>>, // Arc 共享，零拷贝
     openai_format_cache: RwLock<Arc<Vec<serde_json::Value>>>,
     policies: std::collections::HashMap<String, BoxedPolicy>,
 }
@@ -80,12 +80,11 @@ impl ToolRegistry {
     ) -> Result<(), ToolError> {
         let tool_name = tool.name().to_string();
         let namespaced_name = format!("{}/{}", namespace, tool_name);
-        
+
         if self.tools.contains_key(&namespaced_name) {
             return Err(ToolError::ExecutionFailed(format!(
                 "duplicate tool in namespace '{}': {}",
-                namespace,
-                tool_name
+                namespace, tool_name
             )));
         }
 
@@ -101,16 +100,19 @@ impl ToolRegistry {
             .or_default()
             .insert(tool_name.clone(), weak_wrapped);
 
-        let namespace_entry = self.namespace_index.entry(namespace.to_string()).or_default();
+        let namespace_entry = self
+            .namespace_index
+            .entry(namespace.to_string())
+            .or_default();
         if namespace_entry.is_empty() {
             self.namespaces.push(namespace.to_string());
         }
         namespace_entry.push(namespaced_name.clone());
-        
+
         let schema = wrapped.cached_schema();
         self.schema_cache.insert(namespaced_name.clone(), schema);
         self.push_openai_format_entry(wrapped.as_ref());
-        
+
         self.tools.insert(namespaced_name, wrapped);
         Ok(())
     }
@@ -149,11 +151,7 @@ impl ToolRegistry {
     }
 
     /// Get a tool from a specific namespace.
-    pub fn get_from_namespace(
-        &self,
-        name: &str,
-        namespace: &str,
-    ) -> Option<Arc<dyn Tool>> {
+    pub fn get_from_namespace(&self, name: &str, namespace: &str) -> Option<Arc<dyn Tool>> {
         self.namespaced_tool_index
             .get(namespace)
             .and_then(|tools| tools.get(name))
@@ -162,6 +160,11 @@ impl ToolRegistry {
 
     pub fn list(&self) -> Vec<String> {
         self.tools.keys().cloned().collect::<Vec<_>>()
+    }
+
+    /// Iterate over all registered tools.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Arc<dyn Tool>)> {
+        self.tools.iter()
     }
 
     /// List tools from a specific namespace.
@@ -226,7 +229,7 @@ impl ToolRegistry {
     /// Returns results in the same order as input requests
     pub async fn execute_batch(
         &self,
-        requests: Vec<(String, serde_json::Value)>
+        requests: Vec<(String, serde_json::Value)>,
     ) -> Vec<Result<serde_json::Value, ToolError>> {
         use futures::future::join_all;
 
@@ -238,7 +241,9 @@ impl ToolRegistry {
                     let tool = registry.tools.get(&name).cloned();
                     match tool {
                         Some(tool) => {
-                            let schema = if let Some(cached) = registry.schema_cache.get(&name).map(|r| r.clone()) {
+                            let schema = if let Some(cached) =
+                                registry.schema_cache.get(&name).map(|r| r.clone())
+                            {
                                 cached
                             } else {
                                 let schema = tool.cached_schema();
@@ -334,8 +339,8 @@ impl Default for ToolRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::ToolDescription;
+    use super::*;
     use async_trait::async_trait;
 
     struct DummyTool;
@@ -437,7 +442,9 @@ mod tests {
 
         let format = registry.to_openai_format();
         assert_eq!(format.len(), 2);
-        assert!(format.iter().any(|entry| entry["function"]["name"] == "dummy"));
+        assert!(format
+            .iter()
+            .any(|entry| entry["function"]["name"] == "dummy"));
         assert!(format
             .iter()
             .any(|entry| entry["function"]["name"] == "calculator/dummy"));
@@ -447,17 +454,19 @@ mod tests {
     async fn test_namespace_registration() {
         let mut registry = ToolRegistry::new();
         let tool = Arc::new(DummyTool);
-        
+
         // Register with namespace
-        registry.register_with_namespace(tool.clone(), "calculator").unwrap();
-        
+        registry
+            .register_with_namespace(tool.clone(), "calculator")
+            .unwrap();
+
         // Tool should be accessible with namespaced name
         assert!(registry.get_from_namespace("dummy", "calculator").is_some());
-        
+
         // Tool list should include namespaced name
         let tools = registry.list_namespace("calculator");
         assert!(tools.contains(&"calculator/dummy".to_string()));
-        
+
         // List namespaces
         let namespaces = registry.list_namespaces();
         assert!(namespaces.contains(&"calculator".to_string()));
@@ -466,18 +475,18 @@ mod tests {
     #[tokio::test]
     async fn test_namespace_no_conflict() {
         let mut registry = ToolRegistry::new();
-        
+
         // Same tool name in different namespaces should not conflict
         let tool1 = Arc::new(DummyTool);
         let tool2 = Arc::new(DummyTool);
-        
+
         registry.register_with_namespace(tool1, "skill1").unwrap();
         registry.register_with_namespace(tool2, "skill2").unwrap();
-        
+
         // Both should be successfully registered
         assert!(registry.get_from_namespace("dummy", "skill1").is_some());
         assert!(registry.get_from_namespace("dummy", "skill2").is_some());
-        
+
         // Namespace list should have both
         let namespaces = registry.list_namespaces();
         assert_eq!(namespaces.len(), 2);
@@ -486,13 +495,15 @@ mod tests {
     #[tokio::test]
     async fn test_register_from_skill() {
         let mut registry = ToolRegistry::new();
-        
+
         let tool = Arc::new(DummyTool);
-        registry.register_from_skill("my-skill", vec![tool]).unwrap();
-        
+        registry
+            .register_from_skill("my-skill", vec![tool])
+            .unwrap();
+
         // Tool should be registered with skill prefix
         assert!(registry.get("my-skill/dummy").is_some());
-        
+
         // List should include namesspaced tool
         let tools = registry.list();
         assert!(tools.contains(&"my-skill/dummy".to_string()));
@@ -502,9 +513,9 @@ mod tests {
     async fn test_execute_namespaced_tool() {
         let mut registry = ToolRegistry::new();
         let tool = Arc::new(DummyTool);
-        
+
         registry.register_with_namespace(tool, "calc").unwrap();
-        
+
         // Execute with namespaced name
         let args = serde_json::json!({});
         let result = registry.execute("calc/dummy", &args).await;
@@ -593,7 +604,10 @@ mod tests {
                 })
             }
 
-            async fn execute(&self, _args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            async fn execute(
+                &self,
+                _args: &serde_json::Value,
+            ) -> Result<serde_json::Value, ToolError> {
                 tokio::time::sleep(tokio::time::Duration::from_millis(self.delay_ms)).await;
                 Ok(serde_json::json!("done"))
             }
@@ -620,8 +634,14 @@ mod tests {
 
         println!("Sequential execution: {:?}", seq_duration);
         println!("Batch execution: {:?}", batch_duration);
-        println!("Speedup: {:.2}x", seq_duration.as_nanos() as f64 / batch_duration.as_nanos() as f64);
+        println!(
+            "Speedup: {:.2}x",
+            seq_duration.as_nanos() as f64 / batch_duration.as_nanos() as f64
+        );
 
-        assert!(batch_duration < seq_duration, "Batch execution should be faster");
+        assert!(
+            batch_duration < seq_duration,
+            "Batch execution should be faster"
+        );
     }
 }

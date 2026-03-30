@@ -1,6 +1,6 @@
 //! Zenoh subscriber wrapper with simplified API
 
-use rkyv::{Archive, Deserialize, api::high::HighDeserializer, rancor::Error};
+use rkyv::{api::high::HighDeserializer, rancor::Error, Archive, Deserialize};
 
 use crate::{error::ZenohError, Codec, Session};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ pub struct Subscriber<T> {
     topic: String,
     subscriber: Option<zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<Sample>>>,
     started: bool,
-    handle: Option<JoinHandle<Result<(),String>>>,
+    handle: Option<JoinHandle<Result<(), String>>>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -51,7 +51,10 @@ where
     }
 
     /// Create a subscriber directly from a session and topic
-    pub async fn from_session(topic: impl Into<String>, session: Arc<Session>) -> Result<Self, ZenohError> {
+    pub async fn from_session(
+        topic: impl Into<String>,
+        session: Arc<Session>,
+    ) -> Result<Self, ZenohError> {
         let mut sub = Self::new(topic);
         sub.init(session).await?;
         Ok(sub)
@@ -84,13 +87,14 @@ where
         Ok(())
     }
 
-    pub async fn run<F>(mut self, handler: F) -> Result<(), ZenohError>
+    pub async fn run<F>(&mut self, handler: F) -> Result<(), ZenohError>
     where
-        F: Fn(T) + std::marker::Send + 'static, {
+        F: Fn(T) + std::marker::Send + 'static,
+    {
         let subscriber = self.subscriber.take().ok_or(ZenohError::NotConnected)?;
 
         self.started = true;
-        let handle: tokio::task::JoinHandle<Result<_, String>> = tokio::spawn(async move {
+        let handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
             while let Ok(sample) = subscriber.recv_async().await {
                 let bytes = sample.payload().to_bytes();
                 if let Ok(decoded) = Codec.decode(bytes.as_ref()) {
@@ -120,7 +124,7 @@ where
             tokio::spawn(async move {
                 while let Ok(sample) = sub.recv_async().await {
                     let bytes = sample.payload().to_bytes();
-                    if let Some(result) = Codec.decode::<T>(bytes.as_ref()).ok() {
+                    if let Ok(result) = Codec.decode::<T>(bytes.as_ref()) {
                         // Move ownership of the decoded message
                         let msg = result;
                         if tx.send(msg).await.is_err() {
@@ -144,8 +148,10 @@ impl<T> Drop for Subscriber<T> {
     fn drop(&mut self) {
         if self.started {
             self.started = false;
-            // let handle = self.handle.take().unwrap();
-            // handle.abort();
+        }
+
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }
@@ -172,11 +178,15 @@ where
     }
 }
 
-pub fn subscriber_receiver<T,F>(mut subscriber: Subscriber<T>, mut handler: F) -> JoinHandle<Result<(),String>>
+pub fn subscriber_receiver<T, F>(
+    mut subscriber: Subscriber<T>,
+    mut handler: F,
+) -> JoinHandle<Result<(), String>>
 where
     F: FnMut(T) + Send + 'static,
     T: Archive + Send + 'static,
-    T::Archived: Deserialize<T, HighDeserializer<Error>>,{
+    T::Archived: Deserialize<T, HighDeserializer<Error>>,
+{
     let handle: tokio::task::JoinHandle<Result<_, String>> = tokio::spawn(async move {
         while let Some(query) = subscriber.recv().await {
             handler(query);

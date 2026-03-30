@@ -1,4 +1,4 @@
-use super::{AgentState, SessionError, SessionConfig};
+use super::{AgentState, SessionConfig, SessionError};
 use std::path::PathBuf;
 use tokio::fs;
 
@@ -82,7 +82,7 @@ impl SessionStorage {
         let mut files = Vec::new();
         while let Some(entry) = entries.next_entry().await.map_err(SessionError::Io)? {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
+            if path.extension().is_some_and(|ext| ext == "json") {
                 files.push(path);
             }
         }

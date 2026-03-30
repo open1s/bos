@@ -28,8 +28,8 @@ impl Tool for FnTool {
     fn name(&self) -> &str {
         &self.name
     }
-    fn description(&self) -> &str {
-        "closure tool"
+    fn description(&self) -> String {
+        "closure tool".to_string()
     }
     fn run(&self, input: &Value) -> Result<Value, ToolError> {
         Ok((self.f)(input))
@@ -46,7 +46,7 @@ pub enum ToolError {
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
-    fn description(&self) -> &str;
+    fn description(&self) -> String;
     fn run(&self, input: &Value) -> Result<Value, ToolError>;
 }
 
@@ -79,5 +79,11 @@ impl ToolRegistry {
         } else {
             Err(ToolError::NotFound(name.to_string()))
         }
+    }
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }

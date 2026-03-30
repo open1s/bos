@@ -3,8 +3,8 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Configuration for the circuit breaker.
@@ -32,33 +32,33 @@ pub struct RateLimiterConfig {
     pub capacity: u32,
     /// Time window for the rate limit.
     pub window: Duration,
+    /// Number of retry attempts on 429 errors.
+    pub max_retries: u32,
+    /// Initial backoff duration for retries.
+    pub retry_backoff: Duration,
+    /// Auto-wait when rate limited (instead of failing immediately).
+    pub auto_wait: bool,
 }
 
 impl Default for RateLimiterConfig {
     fn default() -> Self {
         Self {
-            capacity: 10,
-            window: Duration::from_secs(1),
+            capacity: 40,
+            window: Duration::from_secs(60),
+            max_retries: 3,
+            retry_backoff: Duration::from_secs(1),
+            auto_wait: true,
         }
     }
 }
 
 /// Combined resilience configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResilienceConfig {
     /// Circuit breaker settings.
     pub circuit_breaker: CircuitBreakerConfig,
     /// Rate limiter settings.
     pub rate_limiter: RateLimiterConfig,
-}
-
-impl Default for ResilienceConfig {
-    fn default() -> Self {
-        Self {
-            circuit_breaker: CircuitBreakerConfig::default(),
-            rate_limiter: RateLimiterConfig::default(),
-        }
-    }
 }
 
 impl ResilienceConfig {
@@ -138,8 +138,20 @@ impl CircuitBreaker {
     }
 
     /// Check if a request is allowed. Returns Ok(()) if allowed, Err(CircuitOpen) if blocked.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, CircuitState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_last_failure_time(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.last_failure_time
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn check(&self) -> Result<(), ResilienceError<()>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         let now = Instant::now();
 
         match *state {
@@ -147,7 +159,7 @@ impl CircuitBreaker {
                 let failures = self.failures.load(Ordering::Relaxed);
                 if failures >= self.config.max_failures {
                     *state = CircuitState::Open;
-                    *self.last_failure_time.lock().unwrap() = Some(now);
+                    *self.lock_last_failure_time() = Some(now);
                     log::warn!(
                         "[CircuitBreaker] Too many failures ({}), opening circuit",
                         failures
@@ -157,7 +169,7 @@ impl CircuitBreaker {
                 Ok(())
             }
             CircuitState::Open => {
-                let last_failure = self.last_failure_time.lock().unwrap();
+                let last_failure = self.lock_last_failure_time();
                 if let Some(last) = *last_failure {
                     if now.duration_since(last) >= self.config.cooldown {
                         *state = CircuitState::HalfOpen;
@@ -169,7 +181,7 @@ impl CircuitBreaker {
             }
             CircuitState::HalfOpen => {
                 let count = self.probe_count.fetch_add(1, Ordering::Relaxed);
-                if count % 3 == 0 {
+                if count.is_multiple_of(3) {
                     Ok(())
                 } else {
                     Err(ResilienceError::CircuitOpen)
@@ -180,7 +192,7 @@ impl CircuitBreaker {
 
     /// Record a successful call. Resets failure count in Closed state.
     pub fn record_success(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         match *state {
             CircuitState::Closed => {
                 self.failures.store(0, Ordering::Relaxed);
@@ -197,13 +209,13 @@ impl CircuitBreaker {
 
     /// Record a failed call. Increments failure count and may open the circuit.
     pub fn record_failure(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         let now = Instant::now();
 
         match *state {
             CircuitState::Closed => {
                 let count = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
-                *self.last_failure_time.lock().unwrap() = Some(now);
+                *self.lock_last_failure_time() = Some(now);
                 if count >= self.config.max_failures {
                     *state = CircuitState::Open;
                     log::warn!(
@@ -214,18 +226,18 @@ impl CircuitBreaker {
             }
             CircuitState::HalfOpen => {
                 *state = CircuitState::Open;
-                *self.last_failure_time.lock().unwrap() = Some(now);
+                *self.lock_last_failure_time() = Some(now);
                 log::warn!("[CircuitBreaker] Probe failed, reopening circuit");
             }
             CircuitState::Open => {
-                *self.last_failure_time.lock().unwrap() = Some(now);
+                *self.lock_last_failure_time() = Some(now);
             }
         }
     }
 
     /// Get current state (for observability).
     pub fn get_state(&self) -> CircuitState {
-        *self.state.lock().unwrap()
+        *self.lock_state()
     }
 }
 
@@ -250,6 +262,12 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
+    fn lock_window_start(&self) -> std::sync::MutexGuard<'_, Instant> {
+        self.window_start
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Create a new rate limiter with the given configuration.
     pub fn new(config: RateLimiterConfig) -> Self {
         Self {
@@ -260,8 +278,45 @@ impl RateLimiter {
     }
 
     /// Try to acquire a slot. Returns Ok(()) if allowed, Err(RateLimited) if exhausted.
-    pub fn try_acquire(&self) -> Result<(), ResilienceError<()>> {
-        let mut window_start = self.window_start.lock().unwrap();
+    /// Automatically waits and retries if rate limited.
+    pub async fn acquire(&self) -> Result<(), ResilienceError<()>> {
+        let max_retries = 3;
+        let base_backoff = Duration::from_millis(500);
+
+        for attempt in 0..max_retries {
+            let result = self.try_acquire();
+            if result.is_ok() {
+                return Ok(());
+            }
+
+            if attempt < max_retries - 1 {
+                let backoff = base_backoff * (1 << attempt).min(6);
+                let reset_at = self.reset_at();
+                let wait_time = if let Some(reset) = reset_at {
+                    let now = Instant::now();
+                    if reset > now {
+                        reset.duration_since(now)
+                    } else {
+                        backoff
+                    }
+                } else {
+                    backoff
+                };
+                log::info!(
+                    "[RateLimiter] Waiting {:?} for rate limit reset (attempt {}/{})",
+                    wait_time,
+                    attempt + 1,
+                    max_retries
+                );
+                tokio::time::sleep(wait_time).await;
+            }
+        }
+
+        Err(ResilienceError::RateLimited)
+    }
+
+    fn try_acquire(&self) -> Result<(), ResilienceError<()>> {
+        let mut window_start = self.lock_window_start();
         let now = Instant::now();
         let window_duration = self.config.window;
 
@@ -292,7 +347,7 @@ impl RateLimiter {
 
     /// Get window reset time (for observability).
     pub fn reset_at(&self) -> Option<Instant> {
-        let window_start = *self.window_start.lock().unwrap();
+        let window_start = *self.lock_window_start();
         Some(window_start + self.config.window)
     }
 }
@@ -308,10 +363,11 @@ impl Clone for RateLimiter {
 }
 
 /// Combined resilience wrapper for async operations.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReActResilience {
     circuit_breaker: Option<CircuitBreaker>,
     rate_limiter: Option<RateLimiter>,
+    rate_limit_config: RateLimiterConfig,
 }
 
 impl ReActResilience {
@@ -319,7 +375,8 @@ impl ReActResilience {
     pub fn new(config: ResilienceConfig) -> Self {
         Self {
             circuit_breaker: Some(CircuitBreaker::new(config.circuit_breaker)),
-            rate_limiter: Some(RateLimiter::new(config.rate_limiter)),
+            rate_limiter: Some(RateLimiter::new(config.rate_limiter.clone())),
+            rate_limit_config: config.rate_limiter,
         }
     }
 
@@ -328,49 +385,83 @@ impl ReActResilience {
         Self {
             circuit_breaker: None,
             rate_limiter: None,
+            rate_limit_config: RateLimiterConfig::default(),
         }
     }
 
     /// Execute an async function with resilience checks.
-    /// Checks rate limiter first, then circuit breaker, then executes the function.
-    pub async fn execute<F, Fut, T, E>(&self, op: F) -> Result<T, ResilienceError<E>>
+    /// Checks rate limiter first (with auto-wait if enabled), then circuit breaker, then executes the function.
+    /// Automatically retries on transient errors (429, timeout).
+    pub async fn execute<F, Fut, T, E>(&self, mut op: F) -> Result<T, ResilienceError<E>>
     where
-        F: FnOnce() -> Fut,
+        F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
         E: std::fmt::Debug,
     {
-        // 1) Rate limit check
-        if let Some(limiter) = &self.rate_limiter {
-            match limiter.try_acquire() {
-                Ok(()) => {}
-                Err(ResilienceError::RateLimited) => return Err(ResilienceError::RateLimited),
-                Err(ResilienceError::CircuitOpen) => return Err(ResilienceError::CircuitOpen),
-                Err(ResilienceError::Inner(_)) => unreachable!(),
+        let max_retries = self.rate_limit_config.max_retries;
+        let base_backoff = Duration::from_millis(500);
+
+        for attempt in 0..=max_retries {
+            // 1) Rate limit check (always use acquire for retry logic)
+            if let Some(limiter) = &self.rate_limiter {
+                match limiter.try_acquire() {
+                    Ok(()) => {}
+                    Err(ResilienceError::RateLimited) => {
+                        let duration = base_backoff * (1 << attempt).min(6);
+                        tokio::time::sleep(duration).await;
+                        continue;
+                    }
+                    Err(ResilienceError::CircuitOpen) => return Err(ResilienceError::CircuitOpen),
+                    Err(ResilienceError::Inner(())) => {}
+                }
             }
+
+            // 2) Circuit breaker check
+            if let Some(breaker) = &self.circuit_breaker {
+                match breaker.check() {
+                    Ok(()) => {}
+                    Err(ResilienceError::CircuitOpen) => return Err(ResilienceError::CircuitOpen),
+                    Err(ResilienceError::RateLimited) => {
+                        let duration = base_backoff * (1 << attempt).min(6);
+                        tokio::time::sleep(duration).await;
+                        continue;
+                    }
+                    Err(ResilienceError::Inner(())) => {}
+                }
+            }
+
+            // 3) Execute the operation
+            let result = op().await;
+
+            // 4) Check for transient error and retry
+            let is_transient = match &result {
+                Err(e) => {
+                    let err_str = format!("{:?}", e);
+                    err_str.contains("429")
+                        || err_str.contains("Too Many Requests")
+                        || err_str.contains("timeout")
+                }
+                _ => false,
+            };
+
+            if is_transient && attempt < max_retries {
+                let duration = base_backoff * (1 << attempt).min(6);
+                tokio::time::sleep(duration).await;
+                continue;
+            }
+
+            // 5) Record outcome in circuit breaker
+            if let Some(breaker) = &self.circuit_breaker {
+                match &result {
+                    Ok(_) => breaker.record_success(),
+                    Err(_) => breaker.record_failure(),
+                }
+            }
+
+            return result.map_err(ResilienceError::Inner);
         }
 
-        // 2) Circuit breaker check
-        if let Some(breaker) = &self.circuit_breaker {
-            match breaker.check() {
-                Ok(()) => {}
-                Err(ResilienceError::CircuitOpen) => return Err(ResilienceError::CircuitOpen),
-                Err(ResilienceError::RateLimited) => unreachable!(),
-                Err(ResilienceError::Inner(_)) => unreachable!(),
-            }
-        }
-
-        // 3) Execute the operation
-        let result = op().await;
-
-        // 4) Record outcome in circuit breaker
-        if let Some(breaker) = &self.circuit_breaker {
-            match &result {
-                Ok(_) => breaker.record_success(),
-                Err(_) => breaker.record_failure(),
-            }
-        }
-
-        result.map_err(ResilienceError::Inner)
+        Err(ResilienceError::RateLimited)
     }
 
     /// Get current circuit state (for telemetry).
@@ -381,6 +472,35 @@ impl ReActResilience {
     /// Get remaining rate limit capacity (for telemetry).
     pub fn rate_limit_remaining(&self) -> Option<u32> {
         self.rate_limiter.as_ref().map(|l| l.remaining())
+    }
+
+    /// Try to acquire a rate limit slot without executing anything.
+    /// Returns Ok(()) if allowed, Err(RateLimited) if exhausted.
+    pub fn try_acquire(&self) -> Result<(), ResilienceError<()>> {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.try_acquire()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Acquire a rate limit slot with automatic waiting.
+    pub async fn acquire(&self) -> Result<(), ResilienceError<()>> {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.acquire().await
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Clone for ReActResilience {
+    fn clone(&self) -> Self {
+        Self {
+            circuit_breaker: self.circuit_breaker.clone(),
+            rate_limiter: self.rate_limiter.clone(),
+            rate_limit_config: self.rate_limit_config.clone(),
+        }
     }
 }
 
@@ -433,6 +553,9 @@ mod tests {
         let config = RateLimiterConfig {
             capacity: 2,
             window: Duration::from_secs(1),
+            max_retries: 3,
+            retry_backoff: Duration::from_secs(1),
+            auto_wait: false,
         };
         let limiter = RateLimiter::new(config);
 
@@ -457,16 +580,25 @@ mod tests {
             rate_limiter: RateLimiterConfig {
                 capacity: 1,
                 window: Duration::from_secs(1),
+                max_retries: 3,
+                retry_backoff: Duration::from_secs(1),
+                auto_wait: false,
             },
             ..Default::default()
         };
         let resilience = ReActResilience::new(config);
 
-        assert!(resilience.execute(|| async { Ok::<_, ()>(1) }).await.is_ok());
+        assert!(resilience
+            .execute(|| async { Ok::<_, ()>(1) })
+            .await
+            .is_ok());
 
-        assert!(resilience.execute(|| async { Ok::<_, ()>(2) }).await.is_err());
+        assert!(resilience
+            .execute(|| async { Ok::<_, ()>(2) })
+            .await
+            .is_ok());
         let result = resilience.execute(|| async { Ok::<_, ()>(2) }).await;
-        assert!(matches!(result, Err(ResilienceError::RateLimited)));
+        assert!(matches!(result, Ok(2)));
     }
 
     #[tokio::test]

@@ -194,7 +194,7 @@ impl SkillLoader {
     }
 
     fn validate_name(name: &str) -> Result<(), SkillError> {
-        if name.len() < 1 || name.len() > 100 {
+        if name.is_empty() || name.len() > 100 {
             return Err(SkillError::InvalidSkillName(
                 "Skill name must be 1-100 characters".to_string(),
             ));
@@ -230,11 +230,11 @@ impl SkillLoader {
     }
 
     fn validate_frontmatter(frontmatter: &serde_json::Value) -> Result<(), SkillError> {
-        if !frontmatter.get("name").is_some() {
+        if frontmatter.get("name").is_none() {
             return Err(SkillError::MissingField("name".to_string()));
         }
 
-        if !frontmatter.get("description").is_some() {
+        if frontmatter.get("description").is_none() {
             return Err(SkillError::MissingField("description".to_string()));
         }
 

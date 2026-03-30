@@ -1,12 +1,12 @@
-use super::{AgentState, SessionSummary, SessionConfig, SessionError};
-use super::storage::SessionStorage;
 use super::serializer::SessionSerializer;
+use super::storage::SessionStorage;
+use super::{AgentState, SessionConfig, SessionError, SessionSummary};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use std::time::Duration;
-use tokio::task::JoinHandle;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 pub struct SessionManager {
     pub(crate) storage: SessionStorage,
@@ -40,10 +40,7 @@ impl SessionManager {
         }));
     }
 
-    async fn cleanup_expired(
-        cache: &Arc<RwLock<HashMap<String, AgentState>>>,
-        base_dir: &Path,
-    ) {
+    async fn cleanup_expired(cache: &Arc<RwLock<HashMap<String, AgentState>>>, base_dir: &Path) {
         let mut cache_guard = cache.write().await;
         let mut to_remove = Vec::new();
 

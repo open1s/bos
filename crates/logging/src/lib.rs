@@ -34,14 +34,14 @@ fn pretty_msg(msg: &str) -> String {
     }
 
     // 👉 Agent log 特化（你的场景）
-    if msg.contains("LlmRequest") {
-        return msg
-            .replace("messages:", "\n📨 messages:\n")
-            .replace("System", "\n  🧠 System")
-            .replace("User", "\n  👤 User")
-            .replace("AssistantToolCall", "\n  🔧 ToolCall")
-            .replace("ToolResult", "\n  ✅ ToolResult");
-    }
+    // if msg.contains("LlmRequest") {
+    //     return msg
+    //         .replace("messages:", "\n📨 messages:\n")
+    //         .replace("System", "\n  🧠 System")
+    //         .replace("User", "\n  👤 User")
+    //         .replace("AssistantToolCall", "\n  🔧 ToolCall")
+    //         .replace("ToolResult", "\n  ✅ ToolResult");
+    // }
 
     msg.to_string()
 }
@@ -56,10 +56,10 @@ pub fn auto_init_tracing() {
     let level = level.to_lowercase();
 
     let valid_levels = ["error", "warn", "info", "debug", "trace"];
-    let level = if valid_levels.contains(&&**&level) {
+    let level = if valid_levels.contains(&level.as_str()) {
         level
     } else {
-        "error".parse().unwrap()
+        "error".to_string()
     };
 
 

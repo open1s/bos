@@ -1,6 +1,11 @@
 //! Zenoh publisher wrapper with simplified API
 
-use rkyv::{Archive, Serialize, ser::{allocator::ArenaHandle, sharing::Share, Serializer}, util::AlignedVec, rancor::{Error, Strategy}};
+use rkyv::{
+    rancor::{Error, Strategy},
+    ser::{allocator::ArenaHandle, sharing::Share, Serializer},
+    util::AlignedVec,
+    Archive, Serialize,
+};
 
 use crate::{error::ZenohError, Codec, Session};
 use std::sync::Arc;
@@ -41,7 +46,8 @@ impl Publisher {
     {
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
         let codec = Codec;
-        let data: Vec<u8> = codec.encode(payload)
+        let data: Vec<u8> = codec
+            .encode(payload)
             .map_err(|e: anyhow::Error| ZenohError::Serialization(e.to_string()))?;
 
         self.publish_raw(session, data).await
@@ -75,23 +81,33 @@ impl Clone for Publisher {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Bus, BusConfig, Subscriber};
     use super::*;
+    use crate::{Bus, BusConfig, Subscriber};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_publisher_new() {
         let config = BusConfig::default();
         let bus = Bus::from(config).await;
 
-        let subscriber = Subscriber::<String>::new("test/topic").with_session(bus.clone().into()).await.unwrap();
-        subscriber.run(|mesage| {
-            println!("RE: {:?}", mesage);
-        }).await.expect("TODO: panic message");
+        let mut subscriber = Subscriber::<String>::new("test/topic")
+            .with_session(bus.clone().into())
+            .await
+            .unwrap();
+        subscriber
+            .run(|mesage| {
+                println!("RE: {:?}", mesage);
+            })
+            .await
+            .expect("TODO: panic message");
 
-        let publisher = Publisher::new("test/topic").with_session(bus.clone().into()).unwrap();
+        let publisher = Publisher::new("test/topic")
+            .with_session(bus.clone().into())
+            .unwrap();
         assert_eq!(publisher.topic(), "test/topic");
 
-        let _a = publisher.publish(&String::from("This is from publisher")).await;
+        let _a = publisher
+            .publish(&String::from("This is from publisher"))
+            .await;
 
         //sleep
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

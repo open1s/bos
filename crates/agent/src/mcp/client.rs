@@ -1,8 +1,11 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
-use super::protocol::{JsonRpcRequest, JsonRpcResponse, McpPrompt, McpResource, ReadResourceResult, ServerCapabilities, ToolDefinition};
+use super::protocol::{
+    JsonRpcRequest, JsonRpcResponse, McpPrompt, McpResource, ReadResourceResult,
+    ServerCapabilities, ToolDefinition,
+};
 use super::transport::StdioTransport;
 
 #[derive(Error, Debug)]
@@ -79,8 +82,8 @@ impl McpClient {
             .cloned()
             .unwrap_or(serde_json::json!({"tools": false, "resources": false, "prompts": false}));
 
-        let caps: ServerCapabilities = serde_json::from_value(capabilities)
-            .map_err(|e| McpError::Protocol(e.to_string()))?;
+        let caps: ServerCapabilities =
+            serde_json::from_value(capabilities).map_err(|e| McpError::Protocol(e.to_string()))?;
 
         *self.capabilities.lock().unwrap() = Some(caps.clone());
 
@@ -106,8 +109,8 @@ impl McpClient {
             .cloned()
             .unwrap_or(serde_json::json!([]));
 
-        let defs: Vec<ToolDefinition> = serde_json::from_value(tools)
-            .map_err(|e| McpError::Protocol(e.to_string()))?;
+        let defs: Vec<ToolDefinition> =
+            serde_json::from_value(tools).map_err(|e| McpError::Protocol(e.to_string()))?;
 
         Ok(defs)
     }
@@ -134,8 +137,11 @@ impl McpClient {
             });
         }
 
-        resp.result
-            .ok_or_else(|| McpError::Protocol("No result in response".to_string()))
+        let result = resp
+            .result
+            .ok_or_else(|| McpError::Protocol("No result in response".to_string()))?;
+
+        Self::parse_tool_call_result(result)
     }
 
     pub async fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
@@ -191,14 +197,9 @@ impl McpClient {
                 if resp.error.is_some() {
                     return vec![];
                 }
-                
+
                 match resp.result {
-                    Some(result) => {
-                        match serde_json::from_value(result) {
-                            Ok(prompts) => prompts,
-                            Err(_) => vec![],
-                        }
-                    }
+                    Some(result) => serde_json::from_value(result).unwrap_or_default(),
                     None => vec![],
                 }
             }
@@ -222,7 +223,7 @@ impl McpClient {
         let json = serde_json::to_vec(&req)?;
         let mut transport = self.transport.lock().await;
         transport.send(&json).await?;
-        
+
         let mut buffer = {
             let lock = self.recv_buffer.lock().unwrap();
             lock.clone()
@@ -232,7 +233,11 @@ impl McpClient {
         Ok(resp)
     }
 
-    async fn notify(&self, method: &str, params: Option<serde_json::Value>) -> Result<(), McpError> {
+    async fn notify(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), McpError> {
         let req = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -242,5 +247,60 @@ impl McpClient {
         let mut transport = self.transport.lock().await;
         transport.send(&json).await?;
         Ok(())
+    }
+
+    fn parse_tool_call_result(result: serde_json::Value) -> Result<serde_json::Value, McpError> {
+        if result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let message = result
+                .get("content")
+                .and_then(|v| v.as_array())
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find_map(|item| item.get("text").and_then(|v| v.as_str()))
+                })
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    result
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "MCP tool call returned isError=true".to_string());
+
+            return Err(McpError::Protocol(message));
+        }
+
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::McpClient;
+
+    #[test]
+    fn parse_tool_call_result_accepts_success_payload() {
+        let payload = serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}]
+        });
+
+        let parsed = McpClient::parse_tool_call_result(payload.clone()).unwrap();
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn parse_tool_call_result_rejects_is_error_payload() {
+        let payload = serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "tool failed"}]
+        });
+
+        let err = McpClient::parse_tool_call_result(payload).unwrap_err();
+        assert!(err.to_string().contains("tool failed"));
     }
 }

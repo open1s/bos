@@ -33,7 +33,7 @@ fn describe_object(schema: &serde_json::Value) -> String {
 fn describe_array(schema: &serde_json::Value) -> String {
     let items = schema
         .get("items")
-        .map(|i| describe_schema(i))
+        .map(describe_schema)
         .unwrap_or_else(|| "any".to_string());
     format!("array[{}]", items)
 }

@@ -11,6 +11,12 @@ impl PolicyContext {
     }
 }
 
+impl Default for PolicyContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Core policy trait: per-tool decision point.
 pub trait ToolPolicy: Send + Sync {
     fn is_allowed(&self, tool_name: &str, _ctx: &PolicyContext) -> bool;

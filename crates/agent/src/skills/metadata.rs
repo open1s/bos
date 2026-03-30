@@ -19,6 +19,7 @@ pub enum SkillCategory {
 
 impl SkillCategory {
     /// Parse from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "analysis" => Self::Analysis,
@@ -61,6 +62,14 @@ impl SkillCategory {
             Self::Utility => "Utility",
             Self::Other => "Other",
         }
+    }
+}
+
+impl std::str::FromStr for SkillCategory {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(SkillCategory::from_str(s))
     }
 }
 

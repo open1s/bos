@@ -7,8 +7,8 @@ impl Tool for CalculatorTool {
     fn name(&self) -> &str {
         "calculator"
     }
-    fn description(&self) -> &str {
-        "Evaluate simple arithmetic expressions"
+    fn description(&self) -> String {
+        "Evaluate simple arithmetic expressions".to_string()
     }
     fn run(&self, input: &Value) -> Result<Value, ToolError> {
         let expr = input

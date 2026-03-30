@@ -7,8 +7,8 @@ impl Tool for SearchTool {
     fn name(&self) -> &str {
         "search"
     }
-    fn description(&self) -> &str {
-        "Perform a lightweight search over a fixed dataset"
+    fn description(&self) -> String {
+        "Perform a lightweight search over a fixed dataset".to_string()
     }
     fn run(&self, input: &Value) -> Result<Value, ToolError> {
         let q = input.get("query").and_then(|v| v.as_str()).unwrap_or("");

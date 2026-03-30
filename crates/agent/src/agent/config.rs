@@ -6,8 +6,8 @@ use zenoh::Session as ZenohSession;
 
 use crate::agent::agentic::{Agent, AgentConfig};
 use crate::error::AgentError;
-use crate::llm::OpenAiClient;
-use crate::tools::{Tool, ToolRegistry, FunctionTool};
+use crate::tools::{FunctionTool, Tool, ToolRegistry};
+use react::llm::vendor::OpenAiClient;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TomlToolRef {
@@ -42,6 +42,16 @@ pub struct TomlAgentConfig {
     pub max_tokens: Option<u32>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    #[serde(default = "default_context_compaction_threshold_tokens")]
+    pub context_compaction_threshold_tokens: usize,
+    #[serde(default = "default_context_compaction_trigger_ratio")]
+    pub context_compaction_trigger_ratio: f32,
+    #[serde(default = "default_context_compaction_keep_recent_messages")]
+    pub context_compaction_keep_recent_messages: usize,
+    #[serde(default = "default_context_compaction_max_summary_chars")]
+    pub context_compaction_max_summary_chars: usize,
+    #[serde(default = "default_context_compaction_summary_max_tokens")]
+    pub context_compaction_summary_max_tokens: u32,
     #[serde(default)]
     pub tools: Option<Vec<TomlToolRef>>,
 }
@@ -58,6 +68,26 @@ fn default_timeout() -> u64 {
     60
 }
 
+fn default_context_compaction_threshold_tokens() -> usize {
+    24_000
+}
+
+fn default_context_compaction_trigger_ratio() -> f32 {
+    0.85
+}
+
+fn default_context_compaction_keep_recent_messages() -> usize {
+    12
+}
+
+fn default_context_compaction_max_summary_chars() -> usize {
+    4_000
+}
+
+fn default_context_compaction_summary_max_tokens() -> u32 {
+    600
+}
+
 impl From<TomlAgentConfig> for AgentConfig {
     fn from(t: TomlAgentConfig) -> Self {
         Self {
@@ -69,16 +99,22 @@ impl From<TomlAgentConfig> for AgentConfig {
             temperature: t.temperature,
             max_tokens: t.max_tokens,
             timeout_secs: t.timeout_secs,
+            rate_limit: None,
+            context_compaction_threshold_tokens: t.context_compaction_threshold_tokens,
+            context_compaction_trigger_ratio: t.context_compaction_trigger_ratio,
+            context_compaction_keep_recent_messages: t.context_compaction_keep_recent_messages,
+            context_compaction_max_summary_chars: t.context_compaction_max_summary_chars,
+            context_compaction_summary_max_tokens: t.context_compaction_summary_max_tokens,
         }
     }
 }
 
-pub struct AgentBuilder {
+pub struct TomlAgentBuilder {
     config: TomlAgentConfig,
     tools: Vec<Arc<dyn Tool>>,
 }
 
-impl AgentBuilder {
+impl TomlAgentBuilder {
     pub fn from_toml(toml_str: &str) -> Result<Self, AgentError> {
         let config: TomlAgentConfig = toml::from_str(toml_str)
             .map_err(|e| AgentError::Config(format!("TOML parse error: {}", e)))?;
@@ -89,8 +125,8 @@ impl AgentBuilder {
     }
 
     pub fn from_file(path: &Path) -> Result<Self, AgentError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| AgentError::Config(e.to_string()))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| AgentError::Config(e.to_string()))?;
         Self::from_toml(&content)
     }
 
@@ -100,14 +136,16 @@ impl AgentBuilder {
     }
 
     pub fn config_tools(&self) -> Option<Vec<serde_json::Value>> {
-        self.config.tools.as_ref().map(|tools| {
-            tools.iter().map(|t| t.to_openai_tool()).collect()
-        })
+        self.config
+            .tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|t| t.to_openai_tool()).collect())
     }
 
     pub async fn build(self, session: Option<Arc<ZenohSession>>) -> Result<Agent, AgentError> {
         let llm = Arc::new(OpenAiClient::new(
             self.config.base_url.clone(),
+            self.config.model.clone(),
             self.config.api_key.clone(),
         ));
 
@@ -126,7 +164,6 @@ impl AgentBuilder {
                         &toml_tool.name,
                         toml_tool.description.as_deref().unwrap_or("Tool"),
                         schema,
-                        // Use a generic function that delegates to execute later
                         |_args| Ok(serde_json::json!("tool not yet implemented")),
                     ));
                     registry.register(tool)?;
@@ -136,12 +173,25 @@ impl AgentBuilder {
 
         // Register bus tools if session is provided
         if let Some(session) = session {
-            // Bus tools would be registered here in future
-            // For now, we just note the session is available
             let _ = session;
         }
 
-        let agent = Agent::new_with_registry(config, llm, registry);
+        let agent = Agent::builder()
+            .name(config.name.clone())
+            .model(config.model.clone())
+            .base_url(config.base_url.clone())
+            .api_key(config.api_key.clone())
+            .system_prompt(config.system_prompt.clone())
+            .temperature(config.temperature)
+            .max_tokens(config.max_tokens.unwrap_or(4096))
+            .timeout(config.timeout_secs)
+            .context_compaction_threshold_tokens(config.context_compaction_threshold_tokens)
+            .context_compaction_trigger_ratio(config.context_compaction_trigger_ratio)
+            .context_compaction_keep_recent_messages(config.context_compaction_keep_recent_messages)
+            .context_compaction_max_summary_chars(config.context_compaction_max_summary_chars)
+            .context_compaction_summary_max_tokens(config.context_compaction_summary_max_tokens)
+            .tools(registry.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>())
+            .build_with_llm(llm)?;
 
         Ok(agent)
     }

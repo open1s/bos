@@ -2,26 +2,32 @@
 //!
 //! Provides the core agent infrastructure for distributed AI agents.
 
-pub mod error;
 pub mod agent;
-pub mod llm;
-pub mod tools;
-pub mod skills;
+pub mod bus_rpc;
+pub mod error;
 pub mod mcp;
 pub mod session;
-pub mod streaming;
+pub mod skills;
+pub mod tools;
 
+//AI NOT ALLOW TO REMOVE
 #[allow(unused)]
 use logging;
 
-pub use error::{AgentError, LlmError, ToolError};
+pub use agent::config::TomlAgentBuilder as AgentBuilder;
+pub use agent::config::TomlAgentConfig;
 pub use agent::config::TomlToolRef;
-pub use agent::config::{AgentBuilder, TomlAgentConfig};
-pub use llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, OpenAiClient, StreamToken};
-pub use tools::{Tool, ToolDescription, ToolRegistry};
-pub use skills::{SkillLoader, SkillMetadata, SkillContent, SkillError, SkillInjector};
-pub use mcp::{McpClient, McpToolAdapter, McpError, StdioTransport, ServerCapabilities, ToolDefinition,
-    McpResource, McpPrompt, McpPromptArgument, ReadResourceResult, ResourceContents};
-pub use session::{AgentState, SessionConfig, SessionError, SessionMetadata, SessionSummary};
+pub use agent::{Agent, AgentBuilder as SimpleAgentBuilder, AgentConfig, AgentOutput};
+pub use bus_rpc::{AgentCallableServer, AgentCallerTool, AgentRpcClient};
+pub use error::{AgentError, LlmError, ToolError};
+pub use mcp::{
+    McpClient, McpError, McpPrompt, McpPromptArgument, McpResource, McpToolAdapter,
+    ReadResourceResult, ResourceContents, ServerCapabilities, StdioTransport, ToolDefinition,
+};
+pub use react::llm::vendor::OpenAiVendor;
+pub use react::llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
 pub use session::manager::SessionManager;
 pub use session::serializer::SessionSerializer;
+pub use session::{AgentState, SessionConfig, SessionError, SessionMetadata, SessionSummary};
+pub use skills::{SkillContent, SkillError, SkillInjector, SkillLoader, SkillMetadata};
+pub use tools::{Tool, ToolDescription, ToolRegistry};

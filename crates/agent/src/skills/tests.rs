@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::skills::metadata::SkillMetadata;
 use crate::skills::{SkillInjector, SkillLoader};
 use std::path::PathBuf;
@@ -11,21 +9,20 @@ fn fixtures_path() -> PathBuf {
         .join("skills")
 }
 
-#[ignore]
 #[test]
 fn test_skill_loader_discover() {
     let mut loader = SkillLoader::new(fixtures_path());
     loader.discover().unwrap();
 
     let skills = loader.list();
-    assert_eq!(skills.len(), 2);
+    assert_eq!(skills.len(), 3);
 
     let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains(&"code-review"));
     assert!(names.contains(&"filesystem"));
+    assert!(names.contains(&"calculator"));
 }
 
-#[ignore]
 #[test]
 fn test_skill_loader_load() {
     let mut loader = SkillLoader::new(fixtures_path());
@@ -36,7 +33,6 @@ fn test_skill_loader_load() {
     assert!(content.instructions.contains("Read all changed files"));
 }
 
-#[ignore]
 #[test]
 fn test_skill_metadata_parse() {
     let mut loader = SkillLoader::new(fixtures_path());

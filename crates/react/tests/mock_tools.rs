@@ -8,3 +8,9 @@ impl WeatherAPIMock {
         42
     }
 }
+
+impl Default for WeatherAPIMock {
+    fn default() -> Self {
+        Self::new()
+    }
+}

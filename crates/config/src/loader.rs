@@ -310,10 +310,20 @@ impl ConfigLoader {
         metadata: &mut ConfigMetadata,
     ) -> Result<serde_json::Value, ConfigError> {
         let (source_name, value) = match source {
-            ConfigSource::File(path) => self.load_file_sync(path)?,
-            ConfigSource::Directory(dir) => self.load_directory_sync(dir, metadata)?,
+            ConfigSource::File(path) => {
+                let res = self.load_file_sync(path)?;
+                if let Some(format) = ConfigFormat::from_path(path) {
+                    metadata.format = Some(format);
+                }
+                res
+            }
+            ConfigSource::Directory(dir) => {
+                metadata.format = None;
+                self.load_directory_sync(dir, metadata)?
+            }
             ConfigSource::Inline(value) => ("inline".to_string(), value.clone()),
             ConfigSource::Custom(custom) => {
+                metadata.format = None;
                 let value = custom
                     .load()
                     .map_err(|e| ConfigError::Custom(e.to_string()))?;
@@ -358,7 +368,14 @@ impl ConfigLoader {
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let path = e.path();
-                path.is_file() && ConfigFormat::from_path(path.to_str().unwrap_or("")).is_some()
+                if !path.is_file() {
+                    return false;
+                }
+                if let Some(path_str) = path.to_str() {
+                    ConfigFormat::from_path(path_str).is_some()
+                } else {
+                    false
+                }
             })
             .collect();
 
@@ -366,7 +383,14 @@ impl ConfigLoader {
 
         for entry in files {
             let path = entry.path();
-            match self.load_file_sync(path.to_str().unwrap_or("")) {
+            let path_str = match path.to_str() {
+                Some(s) => s,
+                None => {
+                    debug!("跳过无法转换为 UTF-8 的文件路径: {:?}", path);
+                    continue;
+                }
+            };
+            match self.load_file_sync(path_str) {
                 Ok((_, value)) => {
                     merged = Self::deep_merge_json(merged, value);
                 }
@@ -502,10 +526,20 @@ impl ConfigLoader {
         metadata: &mut ConfigMetadata,
     ) -> ConfigResult<serde_json::Value> {
         let (source_name, value) = match source {
-            ConfigSource::File(path) => self.load_file(path).await?,
-            ConfigSource::Directory(dir) => self.load_directory(dir, metadata).await?,
+            ConfigSource::File(path) => {
+                let res = self.load_file(path).await?;
+                if let Some(format) = ConfigFormat::from_path(path) {
+                    metadata.format = Some(format);
+                }
+                res
+            }
+            ConfigSource::Directory(dir) => {
+                metadata.format = None;
+                self.load_directory(dir, metadata).await?
+            }
             ConfigSource::Inline(value) => ("inline".to_string(), value.clone()),
             ConfigSource::Custom(custom) => {
+                metadata.format = None;
                 let value = custom
                     .load()
                     .map_err(|e| ConfigError::Custom(e.to_string()))?;
@@ -558,7 +592,14 @@ impl ConfigLoader {
 
         for entry in files {
             let path = entry.path();
-            match self.load_file(path.to_str().unwrap_or("")).await {
+            let path_str = match path.to_str() {
+                Some(s) => s,
+                None => {
+                    debug!("跳过无法转换为 UTF-8 的文件路径: {:?}", path);
+                    continue;
+                }
+            };
+            match self.load_file(path_str).await {
                 Ok((_, value)) => {
                     merged = Self::deep_merge_json(merged, value);
                 }

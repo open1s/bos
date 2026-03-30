@@ -1,6 +1,5 @@
-use crate::agent::message::Message;
 use crate::OpenAiMessage;
-
+use react::Message;
 #[derive(Debug, Clone, Default)]
 pub struct MessageContext {
     pub(crate) messages: Vec<Message>,
@@ -14,30 +13,36 @@ impl MessageContext {
     }
 
     pub fn add_user(&mut self, content: String) {
-        self.messages.push(Message::User(content));
+        self.messages.push(Message::User { content });
     }
 
     pub fn add_system(&mut self, profile: String) {
-        self.messages.push(Message::System(profile));
+        self.messages.push(Message::System { content: profile });
     }
 
     pub fn add_assistant(&mut self, content: String) {
-        self.messages.push(Message::Assistant(content));
+        self.messages.push(Message::Assistant { content });
     }
 
     pub fn append_assistant_chunk(&mut self, chunk: &str) {
         match self.messages.last_mut() {
-            Some(Message::Assistant(content)) => content.push_str(chunk),
-            _ => self.messages.push(Message::Assistant(chunk.to_string())),
+            Some(Message::Assistant { content }) => content.push_str(chunk),
+            _ => self.messages.push(Message::Assistant {
+                content: chunk.to_string(),
+            }),
         }
     }
 
     pub fn add_tool_call(&mut self, id: String, name: String, args: serde_json::Value) {
-        self.messages.push(Message::ToolCall { id, name, args });
+        self.messages
+            .push(Message::AssistantToolCall { id, name, args });
     }
 
     pub fn add_tool_result(&mut self, name: String, content: String) {
-        self.messages.push(Message::ToolResult { name, content });
+        self.messages.push(Message::ToolResult {
+            tool_call_id: name,
+            content,
+        });
     }
 
     // Patch D placeholder: record a policy decision for a given tool.
@@ -56,22 +61,25 @@ impl MessageContext {
         target.reserve(self.messages.len());
         for message in &self.messages {
             target.push(match message {
-                Message::User(content) => OpenAiMessage::User {
+                Message::User { content } => OpenAiMessage::User {
                     content: content.clone(),
                 },
-                Message::System(profile) => OpenAiMessage::System {
+                Message::System { content: profile } => OpenAiMessage::System {
                     content: profile.clone(),
                 },
-                Message::Assistant(content) => OpenAiMessage::Assistant {
+                Message::Assistant { content } => OpenAiMessage::Assistant {
                     content: content.clone(),
                 },
-                Message::ToolCall { id, name, args } => OpenAiMessage::AssistantToolCall {
+                Message::AssistantToolCall { id, name, args } => OpenAiMessage::AssistantToolCall {
                     id: id.clone(),
                     name: name.clone(),
                     args: args.clone(),
                 },
-                Message::ToolResult { name, content } => OpenAiMessage::ToolResult {
-                    tool_call_id: name.clone(),
+                Message::ToolResult {
+                    tool_call_id,
+                    content,
+                } => OpenAiMessage::ToolResult {
+                    tool_call_id: tool_call_id.clone(),
                     content: content.clone(),
                 },
             });

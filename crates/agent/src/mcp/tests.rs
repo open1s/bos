@@ -1,7 +1,7 @@
 //! Integration tests for MCP (Model Context Protocol) client
 
 use super::{
-    protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, ServerCapabilities, ToolDefinition},
+    protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ToolDefinition},
     McpError,
 };
 
@@ -14,7 +14,7 @@ async fn test_json_rpc_request_serialization() {
     );
 
     let serialized = serde_json::to_string(&request).unwrap();
-    
+
     assert!(serialized.contains("test_method"));
     assert!(serialized.contains("\"id\":1"));
     assert!(serialized.contains("\"param\""));
@@ -27,13 +27,10 @@ async fn test_json_rpc_request_serialization() {
 
 #[tokio::test]
 async fn test_json_rpc_response_success() {
-    let response = JsonRpcResponse::success(
-        1,
-        serde_json::json!({"result": "success"}),
-    );
+    let response = JsonRpcResponse::success(1, serde_json::json!({"result": "success"}));
 
     let serialized = serde_json::to_string(&response).unwrap();
-    
+
     let deserialized: JsonRpcResponse = serde_json::from_str(&serialized).unwrap();
     assert!(deserialized.result.is_some());
     assert!(deserialized.error.is_none());
@@ -45,7 +42,7 @@ async fn test_json_rpc_response_error() {
     let response = JsonRpcResponse::error(2, error);
 
     let serialized = serde_json::to_string(&response).unwrap();
-    
+
     let deserialized: JsonRpcResponse = serde_json::from_str(&serialized).unwrap();
     assert!(deserialized.result.is_none());
     assert!(deserialized.error.is_some());
@@ -54,11 +51,7 @@ async fn test_json_rpc_response_error() {
 
 #[tokio::test]
 async fn test_default_jsonrpc_version() {
-    let request = JsonRpcRequest::new(
-        "test",
-        None,
-        42,
-    );
+    let request = JsonRpcRequest::new("test", None, 42);
 
     assert_eq!(request.jsonrpc, "2.0");
 }
@@ -85,7 +78,7 @@ async fn test_server_capabilities_serialization() {
     };
 
     let serialized = serde_json::to_string(&caps).unwrap();
-    
+
     let deserialized: ServerCapabilities = serde_json::from_str(&serialized).unwrap();
     assert_eq!(deserialized.tools, serde_json::Value::Bool(true));
     assert_eq!(deserialized.resources, serde_json::Value::Bool(false));
@@ -110,7 +103,7 @@ async fn test_tool_definition_serialization() {
     };
 
     let serialized = serde_json::to_string(&tool).unwrap();
-    
+
     let deserialized: ToolDefinition = serde_json::from_str(&serialized).unwrap();
     assert_eq!(deserialized.name, "search");
     assert_eq!(deserialized.description, "Search the web");
@@ -132,7 +125,7 @@ async fn test_jsonrpc_request_with_params() {
 
     assert_eq!(request.method, "do_operation");
     assert_eq!(request.id, serde_json::json!(3));
-    
+
     let request_json = serde_json::to_string(&request).unwrap();
     assert!(request_json.contains("do_operation"));
     assert!(request_json.contains("create"));
@@ -167,7 +160,13 @@ async fn test_tool_definition_complete_schema() {
     };
 
     assert_eq!(tool.input_schema["required"].as_array().unwrap().len(), 3);
-    assert_eq!(tool.input_schema["properties"]["operator"]["enum"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        tool.input_schema["properties"]["operator"]["enum"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
 }
 
 #[test]
@@ -207,5 +206,7 @@ fn test_tool_definition_nested_schema() {
 
     assert!(tool.input_schema["properties"]["config"]["type"] == "object");
     assert!(tool.input_schema["properties"]["items"]["type"] == "array");
-    assert!(tool.input_schema["properties"]["config"]["properties"]["priority"]["type"] == "number");
+    assert!(
+        tool.input_schema["properties"]["config"]["properties"]["priority"]["type"] == "number"
+    );
 }

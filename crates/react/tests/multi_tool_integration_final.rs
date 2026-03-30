@@ -1,5 +1,5 @@
 use react::tool::FnTool;
-use react::{Action, Memory, Observation, SimpleExecutor, Tool, ToolRegistry};
+use react::{Action, Memory, SimpleExecutor, ToolRegistry};
 use serde_json::{json, Value};
 
 #[test]
@@ -23,7 +23,7 @@ fn multi_tool_integration_final() {
     let mut memory = Memory {
         history: Vec::new(),
     };
-    let mut exec = SimpleExecutor::new();
+    let exec = SimpleExecutor::new();
 
     let a = Action::ToolCall {
         name: "WeatherAPI".to_string(),

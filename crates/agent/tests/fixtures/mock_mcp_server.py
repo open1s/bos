@@ -47,6 +47,17 @@ def handle_tools_list(request):
                     },
                     "required": ["message"]
                 }
+            },
+            {
+                "name": "echo_tool_upper",
+                "description": "Echo a message in upper",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"}
+                    },
+                    "required": ["message"]
+                }
             }
         ]
     }, request["id"])
@@ -62,7 +73,17 @@ def handle_tools_call(request):
             "content": [
                 {
                     "type": "text",
-                    "text": f"Echoed: {message}"
+                    "text": f"echo: {message}"
+                }
+            ]
+        }, request["id"])
+    elif name == "echo_tool_upper":
+        message = arguments.get("message", "")
+        send_response({
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"ECHO: {message.upper()}"
                 }
             ]
         }, request["id"])
