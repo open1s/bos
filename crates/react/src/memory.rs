@@ -2,14 +2,39 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryRecord {
     pub thought: String,
     pub action: String,
     pub observation: Value,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[cfg(test)]
+mod tests_memory {
+    use super::*;
+    use std::fs;
+    #[test]
+    fn memory_serialize_roundtrip() {
+        let mut mem = Memory::new();
+        mem.push(
+            "think".to_string(),
+            "act".to_string(),
+            serde_json::json!("obs1"),
+        );
+        mem.push(
+            "think2".to_string(),
+            "act2".to_string(),
+            serde_json::json!("obs2"),
+        );
+        let path = std::env::temp_dir().join("bos_react_memory.json");
+        mem.save_to_file(path.to_str().unwrap()).unwrap();
+        let loaded = Memory::load_from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded, mem);
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Memory {
     pub history: Vec<MemoryRecord>,
 }

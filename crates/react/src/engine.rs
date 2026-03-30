@@ -1,10 +1,10 @@
 use crate::llm::{Llm, LlmError};
+use tokio::time::{timeout, Duration};
+use log::info;
 use crate::tool::{ToolRegistry, Tool};
 use crate::memory::Memory;
 use serde_json::Value;
 use thiserror::Error;
-use std::pin::Pin;
-use futures::Future;
 
 #[derive(Debug, Error)]
 pub enum ReactError {
@@ -14,6 +14,8 @@ pub enum ReactError {
   ToolError(String),
   #[error("Malformed response: {0}")]
   Malformed(String),
+  #[error("Engine timeout: {0}")]
+  Timeout(String),
 }
 
 pub struct ReActEngine {
@@ -34,9 +36,16 @@ impl ReActEngine {
      // Minimal ReAct loop with Action/Observation pattern
      let mut thought = String::new();
      for _ in 0..self.max_steps {
-        // 1) Prompt LLM with user_input to generate Thought + Action
+        // 1) Prompt LLM with user_input to generate Thought + Action (with timeout)
         let prompt = format!("User input: {}\nThought:", user_input);
-        thought = self.llm.predict(&prompt).await.map_err(ReactError::Llm)?;
+        info!("[ReActEngine] sending prompt to LLM: {}", prompt);
+        let llm_out = match timeout(Duration::from_millis(1000), self.llm.predict(&prompt)).await {
+          Ok(Ok(s)) => s,
+          Ok(Err(e)) => return Err(ReactError::Llm(e)),
+          Err(_) => return Err(ReactError::Timeout("LLM prediction timed out".to_string())),
+        };
+        thought = llm_out;
+        info!("[ReActEngine] received Thought: {}", thought);
         // 2) Parse Action and Input from Thought
         let mut tool_name: Option<String> = None;
         let mut input: Value = Value::Null;
@@ -60,6 +69,7 @@ impl ReActEngine {
         let tool_name = match tool_name { Some(n) => n, None => return Err(ReactError::Malformed("Missing Action in llm output".to_string())) };
         let res = self.tools.call(&tool_name, &input).map_err(|e| ReactError::ToolError(format!("{:?}", e)))?;
         self.memory.push(thought.clone(), tool_name.clone(), res.clone());
+        info!("[ReActEngine] tool '{}' produced observation: {}", tool_name, res);
         // 3) Next LLM prompt with observation
         let prompt2 = format!("Observation: {}\nThought:", res);
         thought = self.llm.predict(&prompt2).await.map_err(ReactError::Llm)?;

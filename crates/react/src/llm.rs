@@ -1,4 +1,3 @@
-use futures::future::BoxFuture;
 use std::future::Future;
 use std::pin::Pin;
 use thiserror::Error;

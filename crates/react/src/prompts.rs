@@ -35,3 +35,12 @@ impl PromptTemplate {
             .replace("{final_answer}", final_answer)
     }
 }
+
+// Simple structured prompt helper for Plan B improvements
+// Produces a compact prompt hinting at memory size to guide the LLM's reasoning
+pub fn render_structured_prompt(user_input: &str, memory_len: usize) -> String {
+    format!(
+        "Structured Prompt - Input: {} | Memory items: {}",
+        user_input, memory_len
+    )
+}
