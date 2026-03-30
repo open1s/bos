@@ -6,6 +6,7 @@ pub mod calculator_tool;
 pub mod search_tool;
 pub mod engine;
 pub mod telemetry;
+pub mod resilience;
 use serde_json::Value;
 use std::collections::HashMap;
 #[derive(Debug, Clone)]
@@ -46,3 +47,7 @@ pub use memory::Memory;
 pub use engine::{ReActEngine, ReActEngineBuilder, BuilderError};
 pub use prompts::PromptTemplate;
 pub use telemetry::{Telemetry, TelemetryEvent};
+pub use resilience::{
+    ResilienceConfig, ReActResilience, CircuitBreaker, RateLimiter,
+    ResilienceError, CircuitState, CircuitBreakerConfig, RateLimiterConfig,
+};

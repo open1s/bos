@@ -10,7 +10,6 @@ pub mod skills;
 pub mod mcp;
 pub mod session;
 pub mod streaming;
-mod react;
 
 #[allow(unused)]
 use logging;
