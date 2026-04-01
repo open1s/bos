@@ -1,4 +1,4 @@
-use react::{ResilienceConfig, CircuitBreakerConfig, RateLimiterConfig};
+use react::{CircuitBreakerConfig, RateLimiterConfig, ResilienceConfig};
 use std::time::Duration;
 
 #[tokio::test]

@@ -102,7 +102,9 @@ impl RpcTransport for BusCallerTransport {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(ToolError::ExecutionFailed(e.to_string()))).await;
+                        let _ = tx
+                            .send(Err(ToolError::ExecutionFailed(e.to_string())))
+                            .await;
                         break;
                     }
                 }
@@ -164,7 +166,10 @@ impl AgentRpcClient {
         }
     }
 
-    async fn invoke_rpc_stream(&self, req: AgentRpcRequest) -> Result<RpcResponseStream, ToolError> {
+    async fn invoke_rpc_stream(
+        &self,
+        req: AgentRpcRequest,
+    ) -> Result<RpcResponseStream, ToolError> {
         let payload = serde_json::to_string(&req)
             .map_err(|e| ToolError::ExecutionFailed(format!("encode request failed: {}", e)))?;
         self.transport.request_stream(&payload).await

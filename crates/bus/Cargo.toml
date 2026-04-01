@@ -15,8 +15,6 @@ serde_json = "1.0"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rkyv = { workspace = true }
-async-channel = { workspace = true }
-async-trait = { workspace = true }
 pyo3 = { version = "0.28", optional = true, features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.28", optional = true, features = ["tokio-runtime"] }
 log = "0.4.29"

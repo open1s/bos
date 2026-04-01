@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.6,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pybos"
+version = "0.1.0"
+description = "Python bindings for BrainOS (agent/config/bus)"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+]
+
+[tool.maturin]
+module-name = "pybos"
+python-packages = ["brainos"]

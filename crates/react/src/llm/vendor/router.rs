@@ -18,13 +18,14 @@ impl LlmRouter {
     }
 
     fn split_model(model: &str) -> (Option<&str>, &str) {
-        let parts: Vec<&str> = model.split('/').collect();
-        match parts.as_slice() {
-            [vendor_id, model_id] if !vendor_id.is_empty() && !model_id.is_empty() => {
-                (Some(*vendor_id), *model_id)
+        if let Some(pos) = model.find('/') {
+            let vendor = &model[..pos];
+            let model_id = &model[pos + 1..];
+            if !vendor.is_empty() && !model_id.is_empty() {
+                return (Some(vendor), model_id);
             }
-            _ => (None, model),
         }
+        (None, model)
     }
 }
 

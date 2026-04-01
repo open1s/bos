@@ -1,8 +1,8 @@
 use crate::error::{ConfigError, ConfigResult};
 use crate::types::{ConfigFormat, ConfigMergeStrategy, ConfigMetadata, ConfigSource};
+use log::{debug, info, warn};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use log::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct ConfigLoader {
@@ -66,8 +66,28 @@ impl ConfigLoader {
         self
     }
 
-    // Mutable builder methods for Python bindings
-    pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
+    /// Discover config files from standard locations.
+    ///
+    /// Searches in priority order (later overwrites earlier):
+    /// 1. `/etc/bos/conf`
+    /// 2. `~/.bos/conf`
+    /// 3. `~/.config/bos/conf`
+    /// 4. `./bos/conf` (current working directory)
+    ///
+    /// Supports `.toml`, `.yaml`, `.yml`, `.json` files.
+    /// Skips directories that don't exist — no error.
+    pub fn discover(mut self) -> Self {
+        self.discover_locations();
+        self
+    }
+
+// Mutable builder methods for Python bindings
+pub fn discover_mut(&mut self) -> &mut Self {
+    self.discover_locations();
+    self
+}
+
+pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
         let path = path.as_ref().to_string_lossy().to_string();
         self.sources.push(ConfigSource::File(path));
         self.cached_config = None;
@@ -98,6 +118,29 @@ impl ConfigLoader {
         self.sources.push(ConfigSource::Inline(value));
         self.cached_config = None;
         self
+    }
+
+    fn discover_locations(&mut self) {
+        let dirs = [
+            "/etc/bos/conf",
+            "~/.bos/conf",
+            "~/.config/bos/conf",
+            "./bos/conf",
+        ];
+
+        for dir in &dirs {
+            let expanded = shellexpand::tilde(dir);
+            let path = Path::new(expanded.as_ref());
+            if path.exists() && path.is_dir() {
+                debug!("发现配置目录: {}", expanded);
+                self.sources
+                    .push(ConfigSource::Directory(expanded.into_owned()));
+            } else {
+                debug!("跳过不存在的配置目录: {}", expanded);
+            }
+        }
+
+        self.cached_config = None;
     }
 
     pub async fn load(&mut self) -> ConfigResult<&serde_json::Value> {
@@ -346,8 +389,21 @@ impl ConfigLoader {
         let format = ConfigFormat::from_path(path)
             .ok_or_else(|| ConfigError::UnsupportedFormat(path.to_string()))?;
 
-        let content = fs::read_to_string(path_obj)?;
-        let value = Self::parse_content(&content, format)?;
+        let content = match fs::read_to_string(path_obj) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to read config file '{}': {}", path, e);
+                return Err(ConfigError::LoadError(anyhow::anyhow!("Failed to read {}: {}", path, e)));
+            }
+        };
+        
+        let value = match Self::parse_content(&content, format) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Failed to parse config file '{}': {}", path, e);
+                return Err(e);
+            }
+        };
 
         Ok((path.to_string(), value))
     }
@@ -560,8 +616,21 @@ impl ConfigLoader {
         let format = ConfigFormat::from_path(path)
             .ok_or_else(|| ConfigError::UnsupportedFormat(path.to_string()))?;
 
-        let content = tokio::fs::read_to_string(path_obj).await?;
-        let value = Self::parse_content(&content, format)?;
+        let content = match tokio::fs::read_to_string(path_obj).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to read config file '{}': {}", path, e);
+                return Err(ConfigError::LoadError(anyhow::anyhow!("Failed to read {}: {}", path, e)));
+            }
+        };
+        
+        let value = match Self::parse_content(&content, format) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Failed to parse config file '{}': {}", path, e);
+                return Err(e);
+            }
+        };
 
         Ok((path.to_string(), value))
     }
@@ -692,10 +761,88 @@ impl Default for ConfigLoader {
 mod tests {
     use super::*;
 
-   #[tokio::test]
-   async fn test_load_config() {
-       let mut loader = crate::loader::ConfigLoader::new();
-       let config = loader.load().await.unwrap();
-       info!("Loaded config: {:#?}", config);
-   }
+    #[tokio::test]
+    async fn test_load_config() {
+        let mut loader = crate::loader::ConfigLoader::new();
+        let config = loader.load().await.unwrap();
+        info!("Loaded config: {:#?}", config);
+    }
+
+    #[tokio::test]
+    async fn test_discover_add_existing_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bos").join("config");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.toml"), r#"key = "a""#).unwrap();
+
+        let mut loader = ConfigLoader::new()
+            .discover()
+            .add_source(ConfigSource::Directory(dir.to_string_lossy().to_string()));
+        loader.load().await.unwrap();
+        let config = loader.get().unwrap();
+        assert_eq!(config.get("key").unwrap(), "a");
+    }
+
+    #[tokio::test]
+    async fn test_discover_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let override_dir = tmp.path().join("override");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&override_dir).unwrap();
+        std::fs::write(base.join("config.toml"), r#"x = 1
+y = 1"#).unwrap();
+        std::fs::write(override_dir.join("config.toml"), r#"y = 2"#).unwrap();
+
+        let mut loader = ConfigLoader::new();
+        loader
+            .add_directory_mut(base.to_string_lossy().to_string())
+            .unwrap();
+        loader
+            .add_directory_mut(override_dir.to_string_lossy().to_string())
+            .unwrap();
+        loader.load().await.unwrap();
+        let config = loader.get().unwrap();
+        assert_eq!(config.get("x").unwrap(), 1);
+        assert_eq!(config.get("y").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_discover_skips_nonexistent_dirs() {
+        let loader = ConfigLoader::new();
+        let loader = loader.discover();
+        let sources = loader.sources();
+
+        for src in sources {
+            match src {
+                ConfigSource::Directory(dir) => {
+                    assert!(Path::new(dir).exists(), "discover should only add existing dirs");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discover_loads_home_config() {
+        let home = std::env::var("HOME").ok();
+        if home.is_none() {
+            return;
+        }
+
+        let home_conf = PathBuf::from(home.unwrap()).join(".bos/conf");
+        if !home_conf.exists() || !home_conf.is_dir() {
+            return;
+        }
+
+        let mut loader = ConfigLoader::new()
+            .discover();
+        let config = loader.load().await.unwrap();
+
+        assert!(!config.as_object().unwrap().is_empty());
+        assert_eq!(
+            config.get("general").and_then(|v| v.get("name")).and_then(|v| v.as_str()),
+            Some("brainos")
+        );
+    }
 }

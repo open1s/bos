@@ -27,6 +27,7 @@ where
     topic: String,
     queryable: Option<Arc<zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<Query>>>>,
     handler: Option<Handler<Q, R>>,
+    stream_handler: Option<StreamHandler<Q, R>>,
     handle: Option<JoinHandle<Result<(), String>>>,
     started: AtomicBool,
     _phantom_q: std::marker::PhantomData<Q>,
@@ -35,6 +36,13 @@ where
 
 pub(crate) type Handler<Q, R> = Box<
     dyn Fn(Q) -> Pin<Box<dyn std::future::Future<Output = Result<R, ZenohError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub(crate) type StreamHandler<Q, R> = Box<
+    dyn Fn(Q, tokio::sync::mpsc::Sender<Result<R, ZenohError>>)
+            -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send
         + Sync,
 >;
@@ -53,6 +61,7 @@ where
             topic: topic.into(),
             queryable: None,
             handler: None,
+            stream_handler: None,
             started: AtomicBool::new(false),
             handle: None,
             _phantom_q: std::marker::PhantomData,
@@ -67,6 +76,17 @@ where
     {
         let handler: Handler<Q, R> = Box::new(move |q| Box::pin(handler(q)));
         self.handler = Some(handler);
+        self
+    }
+
+    pub fn with_stream_handler<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Q, tokio::sync::mpsc::Sender<Result<R, ZenohError>>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handler: StreamHandler<Q, R> =
+            Box::new(move |q, tx| Box::pin(handler(q, tx)));
+        self.stream_handler = Some(handler);
         self
     }
 
@@ -90,12 +110,17 @@ where
             return Err(ZenohError::AlreadyStarted);
         }
 
-        let handler = self.handler.take().ok_or(ZenohError::NotConnected)?;
+        let handler = self.handler.take();
+        let stream_handler = self.stream_handler.take();
         let topic = self.topic.clone();
 
         let handle = tokio::spawn(async move {
             while let Ok(query) = queryable.recv_async().await {
-                let _ = Self::handle_query(&query, &handler, &topic).await;
+                if let Some(ref sh) = stream_handler {
+                    let _ = Self::handle_query_stream(&query, sh, &topic).await;
+                } else if let Some(ref h) = handler {
+                    let _ = Self::handle_query(&query, h, &topic).await;
+                }
             }
             Ok(())
         });
@@ -142,8 +167,86 @@ where
         Ok(())
     }
 
+    async fn handle_query_stream(
+        query: &Query,
+        handler: &StreamHandler<Q, R>,
+        topic: &str,
+    ) -> Result<(), ZenohError> {
+        let Some(payload) = query.payload() else {
+            return Err(ZenohError::Query("No payload in query".to_string()));
+        };
+
+        let codec = Codec;
+        let request: Q = {
+            let bytes = payload.to_bytes();
+            codec
+                .decode(bytes.as_ref())
+                .map_err(|e| ZenohError::Serialization(e.to_string()))?
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<R, ZenohError>>(32);
+        handler(request, tx.clone()).await;
+        drop(tx);
+
+        while let Some(result) = rx.recv().await {
+            match result {
+                Ok(response) => {
+                    let data = codec
+                        .encode(&response)
+                        .map_err(|e| ZenohError::Serialization(e.to_string()))?;
+                    if let Err(e) = query.reply(topic, data).await {
+                        let _ = query
+                            .reply_err(format!("Reply error: {}", e))
+                            .await;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = query
+                        .reply_err(format!("Stream handler error: {}", e))
+                        .await;
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn topic(&self) -> &str {
         &self.topic
+    }
+
+    pub fn set_handler<F, Fut>(&mut self, handler: F) -> Result<(), ZenohError>
+    where
+        F: Fn(Q) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<R, ZenohError>> + Send + 'static,
+    {
+        if self.started.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(ZenohError::AlreadyStarted);
+        }
+        let handler: Handler<Q, R> = Box::new(move |q| Box::pin(handler(q)));
+        self.handler = Some(handler);
+        Ok(())
+    }
+
+    pub fn set_stream_handler<F, Fut>(&mut self, handler: F) -> Result<(), ZenohError>
+    where
+        F: Fn(Q, tokio::sync::mpsc::Sender<Result<R, ZenohError>>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if self.started.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(ZenohError::AlreadyStarted);
+        }
+        let handler: StreamHandler<Q, R> =
+            Box::new(move |q, tx| Box::pin(handler(q, tx)));
+        self.stream_handler = Some(handler);
+        Ok(())
+    }
+
+    pub async fn init_and_run(&mut self, session: &Arc<Session>) -> Result<(), ZenohError> {
+        self.init(session).await?;
+        self.run()
     }
 }
 
@@ -185,6 +288,7 @@ where
             topic: self.topic.clone(),
             queryable: None,
             handler: None,
+            stream_handler: None,
             started: AtomicBool::new(false),
             handle: None,
             _phantom_q: std::marker::PhantomData,

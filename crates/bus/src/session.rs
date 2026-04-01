@@ -29,6 +29,10 @@ impl Bus {
         }
     }
 
+    pub fn session(&self) -> Arc<Session> {
+        self.session.clone()
+    }
+
     ///load from config
     pub async fn from(config: BusConfig) -> Self {
         let zenoh_config: Config = config.into();
@@ -124,10 +128,24 @@ impl BusConfig {
 }
 
 impl From<BusConfig> for zenoh::config::Config {
-    fn from(_value: BusConfig) -> Config {
-        // This implementation is used for compatibility.
-        // Zenoh config mapping can be expanded later; for now default is safe.
-        zenoh::config::Config::default()
+    fn from(value: BusConfig) -> Config {
+        let mut json = if value.mode == "router" {
+            r#"{"mode": "router""#.to_string()
+        } else {
+            r#"{"mode": "peer""#.to_string()
+        };
+        
+        if let Some(listen) = &value.listen {
+            json.push_str(&format!(r#", "listen": {{"endpoints": {}}}"#, serde_json::to_string(listen).unwrap()));
+        }
+        
+        if let Some(connect) = &value.connect {
+            json.push_str(&format!(r#", "connect": {{"endpoints": {}}}"#, serde_json::to_string(connect).unwrap()));
+        }
+        
+        json.push('}');
+        
+        zenoh::config::Config::from_json5(&json).unwrap_or_default()
     }
 }
 

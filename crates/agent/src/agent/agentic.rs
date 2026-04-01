@@ -367,17 +367,35 @@ impl AgentBuilder {
         Ok(agent)
     }
 
-    /// Build with OpenAI client (convenience).
+    /// Build with auto-detected LLM client using LlmRouter.
+    /// Model names like "nvidia/meta/llama-3.1-8b-instruct" are routed automatically.
     pub fn build(self) -> Result<Agent, AgentError> {
-        use react::llm::vendor::OpenAiClient;
+        use react::llm::vendor::{
+            nvidia::NvidiaVendor, openai::OpenAiClient, router::LlmRouter,
+        };
 
-        let llm = Arc::new(OpenAiClient::new(
-            self.config.base_url.clone(),
-            self.config.model.clone(),
-            self.config.api_key.clone(),
-        ));
+        let mut router = LlmRouter::new();
+        router.register_vendor(
+            "nvidia".to_string(),
+            Box::new(
+                NvidiaVendor::builder()
+                    .endpoint(self.config.base_url.clone())
+                    .model(self.config.model.clone())
+                    .api_key(self.config.api_key.clone())
+                    .build()
+                    .map_err(|e| AgentError::Session(format!("Nvidia build error: {}", e)))?,
+            ),
+        );
+        router.register_vendor(
+            "openai".to_string(),
+            Box::new(OpenAiClient::new(
+                self.config.base_url.clone(),
+                self.config.model.clone(),
+                self.config.api_key.clone(),
+            )),
+        );
 
-        self.build_with_llm(llm)
+        self.build_with_llm(Arc::new(router))
     }
 
     /// Build with custom LLM client and start a session immediately.
@@ -504,6 +522,8 @@ impl Agent {
         }
 
         builder = builder.resilience(self.resilience.clone());
+        builder = builder.llm_timeout(self.config.timeout_secs);
+        builder = builder.model(self.config.model.clone());
 
         let mut engine = builder
             .build()

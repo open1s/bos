@@ -77,4 +77,26 @@ where
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
+
+    pub fn set_handler<F, Fut>(&mut self, handler: F) -> Result<(), ZenohError>
+    where
+        F: Fn(Q) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<R, ZenohError>> + Send + 'static,
+    {
+        let inner = self.inner.as_mut().ok_or(ZenohError::NotConnected)?;
+        inner.set_handler(handler)
+    }
+
+    pub async fn init_and_run(&mut self) -> Result<(), ZenohError> {
+        if self.started.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(ZenohError::AlreadyStarted);
+        }
+
+        let inner = self.inner.as_mut().ok_or(ZenohError::NotConnected)?;
+        inner.init(&self.session).await?;
+        inner.run()?;
+        self.started
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
 }

@@ -7,8 +7,8 @@ use rkyv::{
     Archive, Serialize,
 };
 use std::sync::Arc;
-use zenoh::Session;
 use zenoh::query::ConsolidationMode;
+use zenoh::Session;
 
 use crate::{error::ZenohError, DEFAULT_CODEC};
 
@@ -128,6 +128,36 @@ impl Query {
         Ok(results)
     }
 
+    /// Send a query and yield individual results as they arrive.
+    /// Returns a channel receiver that yields decoded results one at a time.
+    pub async fn stream_channel(
+        &self,
+        payload: &[u8],
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<Vec<u8>, ZenohError>>, ZenohError> {
+        let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
+        let replies = session
+            .get(&self.topic)
+            .payload(payload)
+            .consolidation(ConsolidationMode::None)
+            .await?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            while let Ok(reply) = replies.recv_async().await {
+                match reply.result() {
+                    Ok(sample) => {
+                        let _ = tx.send(Ok(sample.payload().to_bytes().to_vec())).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(ZenohError::Query(e.to_string()))).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(rx)
+    }
+
     /// Send a query and process responses with a callback
     pub async fn stream<Q, R>(&self, payload: &Q) -> Result<Vec<R>, ZenohError>
     where
@@ -212,7 +242,7 @@ impl Clone for Query {
     fn clone(&self) -> Self {
         Self {
             topic: self.topic.clone(),
-            session: None,
+            session: self.session.clone(),
         }
     }
 }

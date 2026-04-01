@@ -13,12 +13,9 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rkyv = { workspace = true }
-tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 zenoh = { workspace = true }
-uuid = { workspace = true }
 tokio-stream = { workspace = true }
 react = { path = "../react" }
 async-stream = { workspace = true }

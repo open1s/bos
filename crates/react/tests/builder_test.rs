@@ -1,9 +1,9 @@
-use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 
+use react::engine::{BuilderError, ReActEngineBuilder};
 use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, TokenStream};
-use react::engine::{ReActEngineBuilder, BuilderError};
 use react::tool::FnTool;
 
 #[test]
@@ -35,8 +35,12 @@ fn test_builder_pattern() {
             Ok(Box::pin(futures::stream::empty()))
         }
 
-        fn supports_tools(&self) -> bool { false }
-        fn provider_name(&self) -> &'static str { "mock" }
+        fn supports_tools(&self) -> bool {
+            false
+        }
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
     }
 
     let mock_llm = MockLlm::new(vec![
@@ -49,7 +53,10 @@ fn test_builder_pattern() {
         .with_tool(Box::new(FnTool {
             name: "calculator".to_string(),
             f: Box::new(|input: &Value| {
-                let expr = input.get("expression").and_then(|v| v.as_str()).unwrap_or("0");
+                let expr = input
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0");
                 if expr == "2+3" {
                     Value::String("5".to_string())
                 } else {

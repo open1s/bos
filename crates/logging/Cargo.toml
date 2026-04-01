@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ctor = "0.6.3"
 log = "0.4.29"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 flexi_logger = "0.31.8"
 serde_json = "1.0.149"
+dirs = "6.0.0"
+config = { path = "../config" }
