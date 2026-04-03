@@ -1,15 +1,13 @@
-use pyo3::prelude::*;
-use pyo3::types::PyType;
-use std::sync::Arc;
-use pyo3::IntoPyObjectExt;
-use tokio::sync::mpsc;
-use bus::{Query, QueryableWrapper};
 use crate::bus::PyBus;
 use crate::utils::{
-    session_from_bus,
-    invoke_python_handler_to_pyany,
-    invoke_python_string_handler,
+    invoke_python_handler_to_pyany, invoke_python_string_handler, session_from_bus,
 };
+use bus::{Query, QueryableWrapper};
+use pyo3::prelude::*;
+use pyo3::types::PyType;
+use pyo3::IntoPyObjectExt;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Python-exposed sender for streaming query replies.
 /// Python handlers call `sender.send(chunk)` to push replies.
@@ -29,10 +27,7 @@ impl PyStreamSender {
     fn send(&self, chunk: String) -> PyResult<()> {
         if let Some(tx) = &self.inner {
             tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(async {
-                        tx.send(Ok(chunk)).await
-                    })
+                tokio::runtime::Handle::current().block_on(async { tx.send(Ok(chunk)).await })
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         }
@@ -59,29 +54,35 @@ impl PyQueryStreamIterator {
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         let receiver = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
-        
-        let future = pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let mut guard = receiver.lock().await;
-            let rx = guard.as_mut().ok_or_else(|| {
-                pyo3::exceptions::PyStopAsyncIteration::new_err("Stream exhausted")
-            })?;
-            
-            match rx.recv().await {
-                Some(Ok(bytes)) => {
-                    let codec = bus::DEFAULT_CODEC;
-                    let text: String = codec
-                        .decode(&bytes)
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                    Ok(text)
+
+        let future = pyo3_async_runtimes::tokio::future_into_py_with_locals(
+            py,
+            current_locals,
+            async move {
+                let mut guard = receiver.lock().await;
+                let rx = guard.as_mut().ok_or_else(|| {
+                    pyo3::exceptions::PyStopAsyncIteration::new_err("Stream exhausted")
+                })?;
+
+                match rx.recv().await {
+                    Some(Ok(bytes)) => {
+                        let codec = bus::DEFAULT_CODEC;
+                        let text: String = codec.decode(&bytes).map_err(|e| {
+                            pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+                        })?;
+                        Ok(text)
+                    }
+                    Some(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+                    None => {
+                        *guard = None;
+                        Err(pyo3::exceptions::PyStopAsyncIteration::new_err(
+                            "Stream complete",
+                        ))
+                    }
                 }
-                Some(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
-                None => {
-                    *guard = None;
-                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err("Stream complete"))
-                }
-            }
-        });
-        
+            },
+        );
+
         match future {
             Ok(bound) => Ok(Some(bound)),
             Err(e) => Err(e),
@@ -163,12 +164,12 @@ impl PyQuery {
             let bytes = codec
                 .encode(&payload)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            
+
             let rx = query
                 .stream_channel(&bytes)
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            
+
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let iter = PyQueryStreamIterator {
                     inner: Arc::new(tokio::sync::Mutex::new(Some(rx))),
@@ -248,13 +249,11 @@ impl PyQueryable {
             let handler_fn = move |input: String| {
                 let handler = handler.clone();
                 async move {
-                    let py_arg = Python::attach(|py| -> PyResult<Py<PyAny>> {
-                        Ok(input.into_py_any(py)?)
-                    })
-                    .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
+                    let py_arg =
+                        Python::attach(|py| -> PyResult<Py<PyAny>> { Ok(input.into_py_any(py)?) })
+                            .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
 
-                    let output = invoke_python_handler_to_pyany(&handler, py_arg)
-                        .await?;
+                    let output = invoke_python_handler_to_pyany(&handler, py_arg).await?;
 
                     let out_str = Python::attach(|py| {
                         output
@@ -296,8 +295,7 @@ impl PyQueryable {
                     })
                     .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
 
-                    let output = invoke_python_handler_to_pyany(&handler, py_arg)
-                        .await?;
+                    let output = invoke_python_handler_to_pyany(&handler, py_arg).await?;
 
                     let out_json = Python::attach(|py| -> PyResult<String> {
                         let py_out = crate::utils::py_to_json(output.bind(py))?;
@@ -325,17 +323,22 @@ impl PyQueryable {
 
             let handler = std::sync::Arc::new(handler);
 
-            let handler_fn = move |input: String, tx: tokio::sync::mpsc::Sender<Result<String, bus::ZenohError>>| {
+            let handler_fn = move |input: String,
+                                   tx: tokio::sync::mpsc::Sender<
+                Result<String, bus::ZenohError>,
+            >| {
                 let handler = handler.clone();
                 async move {
                     let tx_wrapper = PyStreamSender::new(tx);
 
                     let _ = Python::attach(|py| {
-                        let py_arg = input.into_py_any(py)
+                        let py_arg = input
+                            .into_py_any(py)
                             .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
                         let py_tx = Py::new(py, tx_wrapper)
                             .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
-                        handler.call1(py, (py_arg, py_tx))
+                        handler
+                            .call1(py, (py_arg, py_tx))
                             .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
                         Ok::<_, bus::ZenohError>(())
                     });

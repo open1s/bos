@@ -16,7 +16,6 @@ pub async fn session_from_bus(inner: Arc<tokio::sync::Mutex<Bus>>) -> Arc<bus::S
     bus_copy.session()
 }
 
-
 pub async fn invoke_python_handler_to_pyany(
     callback: &Py<PyAny>,
     arg: Py<PyAny>,
@@ -49,7 +48,9 @@ pub async fn invoke_python_string_handler(
     .map_err(|e| bus::ZenohError::Query(e.to_string()))
 }
 
-pub fn parse_merge_strategy(strategy: Option<&str>) -> PyResult<config::types::ConfigMergeStrategy> {
+pub fn parse_merge_strategy(
+    strategy: Option<&str>,
+) -> PyResult<config::types::ConfigMergeStrategy> {
     match strategy.unwrap_or("override").to_ascii_lowercase().as_str() {
         "override" => Ok(config::types::ConfigMergeStrategy::Override),
         "deep_merge" | "deepmerge" => Ok(config::types::ConfigMergeStrategy::DeepMerge),

@@ -2,7 +2,7 @@ use crate::agent::context::MessageContext;
 use crate::agent::format_tool_result_content;
 use crate::tools::FunctionTool;
 use crate::{
-    AgentError, LlmClient, LlmContext, LlmRequest, LlmResponse, OpenAiMessage, StreamToken, Tool, ToolRegistry,
+    AgentError, LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamToken, Tool, ToolRegistry,
 };
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -10,10 +10,11 @@ use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use react::engine::ReActEngineBuilder;
 use react::llm::{
-    LlmClient as ReactLlmTrait, LlmError as ReactLlmError, LlmMessage as ReactLlmMessage,
+    LlmClient as ReactLlmTrait, LlmContext, LlmError as ReactLlmError,
     LlmRequest as ReactLlmRequest, LlmResponse as ReactLlmResponse,
     StreamToken as ReactStreamToken, TokenStream as ReactTokenStream,
 };
@@ -25,6 +26,18 @@ struct ToolGuardRule {
     tool_name: String,
     forbidden_markers: Vec<String>,
     rejection_text: String,
+}
+
+/// Outcome of handling a tool call in the run_loop.
+/// Used to signal whether the loop should continue or proceed normally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolCallOutcome {
+    /// Tool was executed successfully
+    Executed,
+    /// Tool was blocked by skill guard rules
+    Blocked,
+    /// A skill was loaded (no tool execution)
+    SkillLoaded,
 }
 
 // ============================================================================
@@ -79,40 +92,18 @@ impl AgentLlmAdapter {
 impl ReactLlmTrait for AgentLlmAdapter {
     async fn complete(&self, request: ReactLlmRequest) -> Result<ReactLlmResponse, ReactLlmError> {
         let inner = self.inner.clone();
-        let agent_req = LlmRequest {
-            model: request.model,
-            context: LlmContext {
-                system: String::new(),
-                tools: Vec::new(),
-                skills: Vec::new(),
-                history: request
-                    .messages
-                    .into_iter()
-                    .map(|msg| match msg {
-                        ReactLlmMessage::System { content } => OpenAiMessage::System { content },
-                        ReactLlmMessage::User { content } => OpenAiMessage::User { content },
-                        ReactLlmMessage::Assistant { content } => OpenAiMessage::Assistant { content },
-                        ReactLlmMessage::AssistantToolCall { id, name, args } => {
-                            OpenAiMessage::AssistantToolCall { id, name, args }
-                        }
-                        ReactLlmMessage::ToolResult {
-                            tool_call_id,
-                            content,
-                        } => OpenAiMessage::ToolResult {
-                            tool_call_id,
-                            content,
-                        },
-                    })
-                    .collect(),
-                user_input: String::new(),
-            },
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-        };
-
-        let result = inner.complete(agent_req).await;
+        let result = inner.complete(request).await;
         match result {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                if let LlmResponse::ToolCall { name, args, id } = &resp {
+                    return Ok(ReactLlmResponse::ToolCall {
+                        name: name.clone(),
+                        args: args.clone(),
+                        id: id.clone(),
+                    });
+                }
+                Ok(resp)
+            }
             Err(e) => Err(ReactLlmError::Other(e.to_string())),
         }
     }
@@ -122,34 +113,7 @@ impl ReactLlmTrait for AgentLlmAdapter {
         request: ReactLlmRequest,
     ) -> Result<ReactTokenStream, ReactLlmError> {
         let inner = self.inner.clone();
-        let agent_req = LlmRequest {
-            model: request.model,
-            messages: request
-                .messages
-                .into_iter()
-                .map(|msg| match msg {
-                    ReactLlmMessage::System { content } => OpenAiMessage::System { content },
-                    ReactLlmMessage::User { content } => OpenAiMessage::User { content },
-                    ReactLlmMessage::Assistant { content } => OpenAiMessage::Assistant { content },
-                    ReactLlmMessage::AssistantToolCall { id, name, args } => {
-                        OpenAiMessage::AssistantToolCall { id, name, args }
-                    }
-                    ReactLlmMessage::ToolResult {
-                        tool_call_id,
-                        content,
-                    } => OpenAiMessage::ToolResult {
-                        tool_call_id,
-                        content,
-                    },
-                })
-                .collect(),
-            tools: None,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            skills: None,
-        };
-
-        let stream_result = inner.stream_complete(agent_req).await;
+        let stream_result = inner.stream_complete(request).await;
 
         match stream_result {
             Ok(stream) => {
@@ -158,10 +122,10 @@ impl ReactLlmTrait for AgentLlmAdapter {
 
                 while let Some(token) = stream.next().await {
                     match token {
-                        Ok(StreamToken::Text(t)) => tokens.push(Ok(ReactStreamToken::Text(t))),
                         Ok(StreamToken::ToolCall { name, args, id }) => {
-                            tokens.push(Ok(ReactStreamToken::ToolCall { name, args, id }))
+                            tokens.push(Ok(ReactStreamToken::ToolCall { name, args, id }));
                         }
+                        Ok(StreamToken::Text(t)) => tokens.push(Ok(ReactStreamToken::Text(t))),
                         Ok(StreamToken::Done) => tokens.push(Ok(ReactStreamToken::Done)),
                         Err(e) => tokens.push(Err(ReactLlmError::Other(e.to_string()))),
                     }
@@ -376,20 +340,67 @@ impl AgentBuilder {
             ..Agent::default_internal()
         };
 
-        // Load skills if directory is set
         if let Some(ref dir) = agent.skills_dir {
             agent.register_skills_from_dir(dir.clone())?;
+        }
+
+        let skills = agent.skills.clone();
+        if let Some(ref reg) = agent.registry {
+            let mut new_registry = (**reg).clone();
+            Self::register_load_skill_tool(&mut new_registry, &skills);
+            agent.registry = Some(Arc::new(new_registry));
         }
 
         Ok(agent)
     }
 
+    fn register_load_skill_tool(
+        registry: &mut ToolRegistry,
+        skills: &[crate::skills::SkillContent],
+    ) {
+        let skill_names: Vec<String> = skills.iter().map(|s| s.metadata.name.clone()).collect();
+        let load_skill_tool = Arc::new(FunctionTool::new(
+            "load_skill",
+            "Load a skill by name to get its instructions",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the skill to load"
+                    }
+                },
+                "required": ["name"]
+            }),
+            {
+                let skills = skills.to_vec();
+                move |args: &serde_json::Value| {
+                    let name = args
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let found = skills.iter().find(|s| s.metadata.name == name);
+                    if let Some(skill) = found {
+                        Ok(serde_json::json!({
+                            "name": skill.metadata.name,
+                            "description": skill.metadata.description,
+                            "instructions": skill.instructions
+                        }))
+                    } else {
+                        Ok(serde_json::json!({
+                            "error": format!("Skill '{}' not found. Available: {}", name, skill_names.join(", "))
+                        }))
+                    }
+                }
+            },
+        ));
+        registry.register(load_skill_tool).ok();
+    }
+
     /// Build with auto-detected LLM client using LlmRouter.
     /// Model names like "nvidia/meta/llama-3.1-8b-instruct" are routed automatically.
     pub fn build(self) -> Result<Agent, AgentError> {
-        use react::llm::vendor::{
-            nvidia::NvidiaVendor, openai::OpenAiClient, router::LlmRouter,
-        };
+        use react::llm::vendor::{nvidia::NvidiaVendor, openai::OpenAiClient, router::LlmRouter};
 
         let mut router = LlmRouter::new();
         router.register_vendor(
@@ -540,8 +551,8 @@ impl Agent {
 
         // Inject skill catalog and load_skill tool into ReAct engine
         let has_skills = !self.skills.is_empty();
+        let skills_schemas = self.get_skills_schemas();
         if has_skills {
-            let schemas = self.get_skills_schemas();
             let skill_names: Vec<String> = self
                 .skills
                 .iter()
@@ -617,7 +628,35 @@ impl Agent {
             if !system_prompt.is_empty() {
                 system_prompt.push_str("\n\n");
             }
-            system_prompt.push_str("Skills are available as separate tools. Use them when their domain matches the user's request.");
+            let skills_catalog = AgentSession::render_skills_catalog(&skills_schemas);
+            system_prompt.push_str(&format!(
+                "Available skills (call load_skill tool to get instructions):\n{}",
+                skills_catalog
+            ));
+        }
+
+        // Add strict format instructions with tool schemas
+        if !system_prompt.is_empty() {
+            system_prompt.push_str("\n\n");
+        }
+
+        // Build tool schema descriptions
+        let mut tool_schemas = String::new();
+        if let Some(ref registry) = self.registry {
+            for (name, tool) in registry.iter() {
+                let schema = tool.json_schema();
+                tool_schemas.push_str(&format!("- {}: {:?}\n", name, schema));
+            }
+        }
+
+        if !tool_schemas.is_empty() {
+            system_prompt.push_str(&format!(
+                "Available tools (MUST follow each tool's schema exactly):\n{}\n\
+                Use keyword arguments matching the schema. Final answer: Final Answer: your answer",
+                tool_schemas
+            ));
+        } else {
+            system_prompt.push_str("Final answer: Final Answer: your answer");
         }
 
         builder = builder.resilience(self.resilience.clone());
@@ -1055,9 +1094,13 @@ impl AgentSession {
                 | react::Message::Assistant { content } => {
                     Self::approx_tokens_for_text(content) + 4
                 }
-                react::Message::AssistantToolCall { id, name, args } => {
+                react::Message::AssistantToolCall {
+                    tool_call_id,
+                    name,
+                    args,
+                } => {
                     let args_s = serde_json::to_string(args).unwrap_or_default();
-                    Self::approx_tokens_for_text(id)
+                    Self::approx_tokens_for_text(tool_call_id)
                         + Self::approx_tokens_for_text(name)
                         + Self::approx_tokens_for_text(&args_s)
                         + 8
@@ -1162,21 +1205,27 @@ impl AgentSession {
         let prompt = Self::build_compaction_prompt(compacted_slice, max_summary_chars);
         let req = LlmRequest {
             model,
-            messages: vec![
-                OpenAiMessage::System {
-                    content: "You compress chat history for an agent. Produce a concise factual summary preserving user goals, constraints, decisions, unresolved tasks, and important tool outcomes. Do not invent details.".to_string(),
-                },
-                OpenAiMessage::User {
-                    content: format!(
-                        "Summarize the following prior conversation for future turns.\nOutput plain text, max 12 bullets.\n{}",
-                        prompt
-                    ),
-                },
-            ],
-            tools: None,
-            temperature: 0.1,
+            temperature: Some(0.1),
+            top_p: None,
+            top_k: None,
             max_tokens: Some(summary_max_tokens),
-            skills: None,
+            context: LlmContext {
+                tools: vec![],
+                skills: vec![],
+                conversations: vec![
+                    OpenAiMessage::System {
+                        content: "You compress chat history for an agent. Produce a concise factual summary preserving user goals, constraints, decisions, unresolved tasks, and important tool outcomes. Do not invent details.".to_string(),
+                    },
+                    OpenAiMessage::User {
+                        content: format!(
+                            "Summarize the following prior conversation for future turns.\nOutput plain text, max 12 bullets.\n{}",
+                            prompt
+                        ),
+                    },
+                ],
+                rules: vec![],
+                instructions: vec![],
+            }
         };
 
         let response = resilience
@@ -1358,6 +1407,157 @@ impl AgentSession {
         }
     }
 
+    fn build_system_prompt_for_iteration(
+        &self,
+        loaded_skills: &[String],
+        skills_schemas: &[serde_json::Value],
+        skills_content: &[(String, String)],
+    ) -> String {
+        let mut system_prompt = self.agent.config.system_prompt.clone();
+
+        if !skills_schemas.is_empty() {
+            let skills_catalog = Self::render_skills_catalog(skills_schemas);
+            let mut loaded_instr = String::new();
+            for loaded in loaded_skills {
+                if let Some((_, instr)) = skills_content.iter().find(|(n, _)| n == loaded) {
+                    loaded_instr.push_str(&format!("\n\n=== Skill: {} ===\n{}\n", loaded, instr));
+                }
+            }
+            system_prompt = format!(
+                "{}\n\nAvailable skills catalog (load with tool `load_skill`):\n{}\n\nLoaded skill instructions:\n{}\n",
+                system_prompt, skills_catalog, loaded_instr
+            );
+        }
+
+        system_prompt
+    }
+
+    fn build_llm_request_for_iteration(
+        &self,
+        system_prompt: &str,
+        tools: &Option<Arc<Vec<serde_json::Value>>>,
+        skills_schemas: &[serde_json::Value],
+    ) -> LlmRequest {
+        let mut messages = Vec::with_capacity(self.context.len() + 1);
+        messages.push(OpenAiMessage::System {
+            content: system_prompt.to_string(),
+        });
+        self.context.extend_api_format(&mut messages);
+
+        let llm_tools: Vec<react::llm::LlmTool> = tools
+            .as_ref()
+            .map(|t| {
+                t.iter()
+                    .filter_map(|v| {
+                        let func_obj = v.get("function")?;
+                        let result =
+                            serde_json::from_value::<react::llm::LlmTool>(func_obj.clone());
+                        result.ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let llm_skills: Vec<react::llm::Skill> = skills_schemas
+            .iter()
+            .filter_map(|schema| {
+                let name = schema.get("name")?.as_str()?.to_string();
+                let category = schema.get("category")?.as_str()?.to_string();
+                let description = schema.get("description")?.as_str()?.to_string();
+                Some(react::llm::Skill {
+                    name,
+                    category,
+                    description,
+                })
+            })
+            .collect();
+
+        LlmRequest {
+            model: self.agent.config.model.clone(),
+            temperature: Some(self.agent.config.temperature),
+            top_p: None,
+            top_k: None,
+            max_tokens: self.agent.config.max_tokens,
+            context: LlmContext {
+                tools: llm_tools,
+                skills: llm_skills,
+                conversations: messages,
+                rules: vec![],
+                instructions: vec![react::llm::Instruction {
+                    name: "end_conversation".to_string(),
+                    instruction: "To end the conversation, prepend your response with 'Final Answer:'\nExample: Final Answer: The result is 42".to_string(),
+                    description: "How to end the conversation".to_string(),
+                    dependon: None,
+                }],
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_tool_call(
+        &mut self,
+        name: String,
+        args: serde_json::Value,
+        tool_call_id: String,
+        loaded_skills: &mut Vec<String>,
+        skill_name_index: &HashMap<String, String>,
+        skills_content: &[(String, String)],
+        skill_guard_rules: &HashMap<String, Vec<ToolGuardRule>>,
+        tool_registry: &Option<Arc<ToolRegistry>>,
+    ) -> Result<ToolCallOutcome, AgentError> {
+        let requested_skill = Self::extract_requested_skill(&name, &args);
+        let resolved_skill = Self::resolve_skill_name(&name, &args, skill_name_index)
+            .or_else(|| Self::infer_skill_for_tool_call(&name, loaded_skills, skills_content));
+
+        if let Some(skill_name) = resolved_skill {
+            let already_loaded = loaded_skills.contains(&skill_name);
+            let call_name = "load_skill".to_string();
+            let call_args = serde_json::json!({ "name": skill_name.clone() });
+            if !already_loaded {
+                loaded_skills.push(skill_name.clone());
+            }
+            self.context
+                .add_tool_call(tool_call_id.clone(), call_name.clone(), call_args.clone());
+            let msg = if already_loaded {
+                format!("Skill '{}' already loaded. DO NOT call load_skill again. Use its instructions to answer.", skill_name)
+            } else {
+                format!("Loaded skill: {}", skill_name)
+            };
+            self.context.add_tool_result(tool_call_id, msg);
+            return Ok(ToolCallOutcome::SkillLoaded);
+        }
+
+        if requested_skill.is_some() {
+            let requested = requested_skill.unwrap_or_default();
+            self.context
+                .add_tool_call(tool_call_id.clone(), name.clone(), args.clone());
+            self.context
+                .add_tool_result(tool_call_id, format!("Skill not found: {}", requested));
+            return Ok(ToolCallOutcome::Executed);
+        }
+
+        self.context
+            .add_tool_call(tool_call_id.clone(), name.clone(), args.clone());
+
+        if let Some(blocked) = Self::blocked_tool_result_for_skill(
+            &name,
+            loaded_skills,
+            Self::latest_user_message(&self.context).as_deref(),
+            skill_guard_rules,
+        ) {
+            self.context.add_tool_result(tool_call_id, blocked);
+            return Ok(ToolCallOutcome::Blocked);
+        }
+
+        if let Some(ref registry) = tool_registry {
+            let result = registry.execute(&name, &args).await?;
+            self.context
+                .add_tool_result(tool_call_id, format_tool_result_content(result));
+        }
+
+        Ok(ToolCallOutcome::Executed)
+    }
+
     /// Run the agent on a task.
     pub async fn run(&mut self, task: &str) -> Result<String, AgentError> {
         self.context.add_user(task.to_string());
@@ -1376,8 +1576,8 @@ impl AgentSession {
     /// Internal run loop.
     async fn run_loop(&mut self) -> Result<String, AgentError> {
         const MAX_ITERATIONS: usize = 10;
-        let tools = self.agent.registry.clone();
-        let tools_for_request = tools.as_ref().map(|t| t.to_openai_format_shared());
+        let tool_registry = self.agent.registry.clone();
+        let tools = tool_registry.as_ref().map(|t| t.to_openai_format_shared());
         let skills_schemas = self.agent.get_skills_schemas();
         let skills_content: Vec<(String, String)> = self
             .agent
@@ -1392,6 +1592,7 @@ impl AgentSession {
         let skill_guard_rules = Self::parse_skill_guard_rules(&skills_content);
         let mut loaded_skills: Vec<String> = Vec::new();
         let mut accumulated_text = String::new();
+        let mut recent_tool_calls: Vec<(String, serde_json::Value)> = Vec::new();
 
         for _ in 0..MAX_ITERATIONS {
             Self::maybe_compact_context_with_llm(
@@ -1402,38 +1603,15 @@ impl AgentSession {
                 self.agent.config.model.clone(),
             )
             .await;
-            let mut messages = Vec::with_capacity(self.context.len() + 1);
-            let mut system_prompt = self.agent.config.system_prompt.clone();
 
-            if !skills_schemas.is_empty() {
-                let skills_catalog = Self::render_skills_catalog(&skills_schemas);
-                let mut loaded_instr = String::new();
-                for loaded in &loaded_skills {
-                    if let Some((_, instr)) = skills_content.iter().find(|(n, _)| n == loaded) {
-                        loaded_instr
-                            .push_str(&format!("\n\n=== Skill: {} ===\n{}\n", loaded, instr));
-                    }
-                }
-                system_prompt =
-                    format!(
-                        "{}\n\nAvailable skills catalog (load with tool `load_skill`):\n{}\n\nLoaded skill instructions:\n{}\n",
-                        system_prompt, skills_catalog, loaded_instr
-                    );
-            }
+            let system_prompt = self.build_system_prompt_for_iteration(
+                &loaded_skills,
+                &skills_schemas,
+                &skills_content,
+            );
 
-            messages.push(OpenAiMessage::System {
-                content: system_prompt,
-            });
-            self.context.extend_api_format(&mut messages);
-
-            let request = LlmRequest {
-                model: self.agent.config.model.clone(),
-                messages,
-                tools: tools_for_request.clone(),
-                temperature: self.agent.config.temperature,
-                max_tokens: self.agent.config.max_tokens,
-                skills: None,
-            };
+            let request =
+                self.build_llm_request_for_iteration(&system_prompt, &tools, &skills_schemas);
 
             info!("iteration:\n{:?}\n--------------", request);
             let response = {
@@ -1458,25 +1636,11 @@ impl AgentSession {
                     self.context.add_assistant(part);
                 }
                 LlmResponse::ToolCall { name, args, id } => {
-                    let tool_call_id = id.unwrap_or_else(|| name.clone());
-                    let requested_skill = Self::extract_requested_skill(&name, &args);
-                    let resolved_skill = Self::resolve_skill_name(&name, &args, &skill_name_index)
-                        .or_else(|| {
-                            Self::infer_skill_for_tool_call(&name, &loaded_skills, &skills_content)
-                        });
+                    let tool_call_id =
+                        id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
 
-                    if let Some(skill_name) = resolved_skill {
-                        let call_name = "load_skill".to_string();
-                        let call_args = serde_json::json!({ "name": skill_name.clone() });
-                        if !loaded_skills.contains(&skill_name) {
-                            loaded_skills.push(skill_name.clone());
-                        }
-                        self.context
-                            .add_tool_call(tool_call_id.clone(), call_name, call_args);
-                        self.context
-                            .add_tool_result(tool_call_id, format!("Loaded skill: {}", skill_name));
-                    } else if requested_skill.is_some() {
-                        let requested = requested_skill.unwrap_or_default();
+                    let call_key = (name.clone(), args.clone());
+                    if recent_tool_calls.iter().any(|k| k == &call_key) {
                         self.context.add_tool_call(
                             tool_call_id.clone(),
                             name.clone(),
@@ -1484,29 +1648,28 @@ impl AgentSession {
                         );
                         self.context.add_tool_result(
                             tool_call_id,
-                            format!("Skill not found: {}", requested),
+                            format!("Tool '{}' was already called with these arguments. Please use the previous result to answer.", name),
                         );
-                    } else {
-                        self.context.add_tool_call(
-                            tool_call_id.clone(),
-                            name.clone(),
-                            args.clone(),
-                        );
-                        if let Some(blocked) = Self::blocked_tool_result_for_skill(
-                            &name,
-                            &loaded_skills,
-                            Self::latest_user_message(&self.context).as_deref(),
-                            &skill_guard_rules,
-                        ) {
-                            self.context.add_tool_result(tool_call_id, blocked);
-                            continue;
-                        }
-                        if let Some(ref registry) = tools {
-                            let result = registry.execute(&name, &args).await?;
-                            self.context
-                                .add_tool_result(tool_call_id, format_tool_result_content(result));
-                        }
+                        continue;
                     }
+                    recent_tool_calls.push(call_key);
+                    if recent_tool_calls.len() > 5 {
+                        recent_tool_calls.remove(0);
+                    }
+
+                    let _outcome = self
+                        .handle_tool_call(
+                            name,
+                            args,
+                            tool_call_id,
+                            &mut loaded_skills,
+                            &skill_name_index,
+                            &skills_content,
+                            &skill_guard_rules,
+                            &tool_registry,
+                        )
+                        .await?;
+                    continue;
                 }
                 LlmResponse::Done => break,
             }
@@ -1515,14 +1678,91 @@ impl AgentSession {
         Ok(accumulated_text)
     }
 
-    /// Internal streaming loop.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_tool_call_stream(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        tool_call_id: &str,
+        loaded_skills: &mut Vec<String>,
+        skill_name_index: &HashMap<String, String>,
+        skills_content: &[(String, String)],
+        skill_guard_rules: &HashMap<String, Vec<ToolGuardRule>>,
+        tool_registry: &Option<Arc<ToolRegistry>>,
+    ) -> Result<Option<StreamToken>, AgentError> {
+        let requested_skill = Self::extract_requested_skill(name, args);
+        let resolved_skill = Self::resolve_skill_name(name, args, skill_name_index)
+            .or_else(|| Self::infer_skill_for_tool_call(name, loaded_skills, skills_content));
+
+        if let Some(skill_name) = resolved_skill {
+            let already_loaded = loaded_skills.contains(&skill_name);
+            let call_name = "load_skill".to_string();
+            let call_args = serde_json::json!({ "name": skill_name.clone() });
+            if !already_loaded {
+                loaded_skills.push(skill_name.clone());
+            }
+            self.context.add_tool_call(
+                tool_call_id.to_string(),
+                call_name.clone(),
+                call_args.clone(),
+            );
+            let msg = if already_loaded {
+                format!("Skill '{}' already loaded. DO NOT call load_skill again. Use its instructions to answer.", skill_name)
+            } else {
+                format!("Loaded skill: {}", skill_name)
+            };
+            self.context.add_tool_result(tool_call_id.to_string(), msg);
+            return Ok(Some(StreamToken::ToolCall {
+                name: call_name,
+                args: call_args,
+                id: Some(tool_call_id.to_string()),
+            }));
+        }
+
+        if requested_skill.is_some() {
+            let requested = requested_skill.unwrap_or_default();
+            self.context
+                .add_tool_call(tool_call_id.to_string(), name.to_string(), args.clone());
+            self.context.add_tool_result(
+                tool_call_id.to_string(),
+                format!("Skill not found: {}", requested),
+            );
+            return Ok(None);
+        }
+
+        self.context
+            .add_tool_call(tool_call_id.to_string(), name.to_string(), args.clone());
+
+        if let Some(blocked) = Self::blocked_tool_result_for_skill(
+            name,
+            loaded_skills,
+            Self::latest_user_message(&self.context).as_deref(),
+            skill_guard_rules,
+        ) {
+            self.context
+                .add_tool_result(tool_call_id.to_string(), blocked);
+            return Ok(None);
+        }
+
+        if let Some(ref registry) = tool_registry {
+            let result = registry
+                .execute(name, args)
+                .await
+                .map_err(AgentError::Tool)?;
+            self.context
+                .add_tool_result(tool_call_id.to_string(), format_tool_result_content(result));
+        }
+
+        Ok(None)
+    }
+
     fn stream_loop(
         &mut self,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send + '_>> {
         let config = self.agent.config.clone();
         let llm = self.agent.llm.clone();
-        let tools = self.agent.registry.clone();
-        let tools_for_request = tools.as_ref().map(|t| t.to_openai_format_shared());
+        let tool_registry = self.agent.registry.clone();
+        let tools = tool_registry.as_ref().map(|t| t.to_openai_format_shared());
         let skills_schemas = self.agent.get_skills_schemas();
         let skills_content: Vec<(String, String)> = self
             .agent
@@ -1538,185 +1778,124 @@ impl AgentSession {
         let resilience = self.agent.resilience.clone();
 
         Box::pin(async_stream::stream! {
-            let mut iteration = 1;
-            let mut loaded_skills: Vec<String> = Vec::new();
-            loop {
-                Self::maybe_compact_context_with_llm(
-                    &mut self.context,
-                    &config,
-                    llm.clone(),
-                    resilience.clone(),
-                    config.model.clone(),
-                )
-                .await;
-                let mut request_messages = Vec::with_capacity(self.context.len() + 1);
-                let mut system_prompt = config.system_prompt.clone();
-
-                if !skills_schemas.is_empty() {
-                    let skills_catalog = Self::render_skills_catalog(&skills_schemas);
-                    let mut loaded_instr = String::new();
-                    for loaded in &loaded_skills {
-                        if let Some((_, instr)) = skills_content.iter().find(|(n, _)| n == loaded) {
-                            loaded_instr
-                                .push_str(&format!("\n\n=== Skill: {} ===\n{}\n", loaded, instr));
-                        }
-                    }
-                    system_prompt = format!(
-                        "{}\n\nAvailable skills catalog (load with tool `load_skill`):\n{}\n\nLoaded skill instructions:\n{}\n",
-                        system_prompt, skills_catalog, loaded_instr
-                    );
-                }
-
-                request_messages.push(OpenAiMessage::System {
-                    content: system_prompt,
-                });
-                self.context.extend_api_format(&mut request_messages);
-
-                let request = LlmRequest {
-                    model: config.model.clone(),
-                    messages: request_messages,
-                    tools: tools_for_request.clone(),
-                    temperature: config.temperature,
-                    max_tokens: config.max_tokens,
-                    skills: None,
-                };
-
-                info!(
-                    "Iteration:{} LLM Request:\n{:?}\n-----------------\n",
-                    iteration, request
-                );
-                iteration += 1;
-                let stream: react::llm::TokenStream = {
-                    let llm = llm.clone();
-                    let req = request.clone();
-                    match resilience
-                        .execute(|| async { llm.stream_complete(req.clone()).await })
-                        .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            yield Err(AgentError::Session(format!("Stream error: {:?}", e)));
+                    let mut iteration = 1;
+                    let mut loaded_skills: Vec<String> = Vec::new();
+                    let mut recent_tool_calls: Vec<(String, serde_json::Value)> = Vec::new();
+                    const MAX_ITERATIONS: usize = 10;
+                    loop {
+                        if iteration > MAX_ITERATIONS {
                             return;
                         }
-                    }
-                };
 
-                let mut stream = Box::pin(stream);
-                let mut tool_call_made = false;
+                        Self::maybe_compact_context_with_llm(
+                            &mut self.context,
+                            &config,
+                            llm.clone(),
+                            resilience.clone(),
+                            config.model.clone(),
+                        )
+                        .await;
 
-                while let Some(token_result) = stream.next().await {
-                    match token_result {
-                        Ok(token) => {
-                            let mut outbound_token: Option<StreamToken> = Some(token.clone());
-                            match &token {
-                                StreamToken::Text(s) => {
-                                    self.context.append_assistant_chunk(s);
-                                }
-                                StreamToken::ToolCall { name, args, id } => {
-                                    tool_call_made = true;
-                                    let tool_call_id = id
-                                        .as_ref()
-                                        .map(|s| s.as_str())
-                                        .unwrap_or_else(|| name.as_str());
+                        let system_prompt = self.build_system_prompt_for_iteration(
+                            &loaded_skills,
+                            &skills_schemas,
+                            &skills_content,
+                        );
 
-                                    let requested_skill = Self::extract_requested_skill(name, args);
-                                    let resolved_skill =
-                                        Self::resolve_skill_name(name, args, &skill_name_index)
-                                            .or_else(|| {
-                                                Self::infer_skill_for_tool_call(
-                                                    name,
-                                                    &loaded_skills,
-                                                    &skills_content,
-                                                )
-                                            });
+                        let request = self.build_llm_request_for_iteration(
+                            &system_prompt,
+                            &tools,
+                            &skills_schemas,
+                        );
 
-                                    if let Some(skill_name) = resolved_skill {
-                                        let call_name = "load_skill".to_string();
-                                        let call_args =
-                                            serde_json::json!({ "name": skill_name.clone() });
-                                        if !loaded_skills.contains(&skill_name) {
-                                            loaded_skills.push(skill_name.clone());
-                                        }
-                                        self.context.add_tool_call(
-                                            tool_call_id.to_string(),
-                                            call_name.clone(),
-                                            call_args.clone(),
-                                        );
-                                        self.context.add_tool_result(
-                                            tool_call_id.to_string(),
-                                            format!("Loaded skill: {}", skill_name),
-                                        );
-                                        outbound_token = Some(StreamToken::ToolCall {
-                                            name: call_name,
-                                            args: call_args,
-                                            id: Some(tool_call_id.to_string()),
-                                        });
-                                    } else if requested_skill.is_some() {
-                                        let requested = requested_skill.unwrap_or_default();
-                                        self.context.add_tool_call(
-                                            tool_call_id.to_string(),
-                                            name.clone(),
-                                            args.clone(),
-                                        );
-                                        self.context.add_tool_result(
-                                            tool_call_id.to_string(),
-                                            format!("Skill not found: {}", requested),
-                                        );
-                                    } else {
-                                        self.context.add_tool_call(
-                                            tool_call_id.to_string(),
-                                            name.clone(),
-                                            args.clone(),
-                                        );
-                                        if let Some(blocked) = Self::blocked_tool_result_for_skill(
-                                            name,
-                                            &loaded_skills,
-                                            Self::latest_user_message(&self.context).as_deref(),
-                                            &skill_guard_rules,
-                                        ) {
-                                            self.context
-                                                .add_tool_result(tool_call_id.to_string(), blocked);
-                                            continue;
-                                        }
-                                        if let Some(ref registry) = tools {
-                                            let result = registry.execute(name, args).await;
-                                            match result {
-                                                Ok(res) => {
-                                                    self.context.add_tool_result(
-                                                        tool_call_id.to_string(),
-                                                        format_tool_result_content(res),
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    yield Err(AgentError::Tool(e));
-                                                    return;
-                                                }
-                                            }
-                                        }
+                            info!(
+                                "Iteration:{} LLM Request:\n{:?}\n-----------------\n",
+                                iteration, request
+                            );
+                            iteration += 1;
+                            let stream: react::llm::TokenStream = {
+                                let llm = llm.clone();
+                                let req = request.clone();
+                                match resilience
+                                    .execute(|| async { llm.stream_complete(req.clone()).await })
+                                    .await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        yield Err(AgentError::Session(format!("Stream error: {:?}", e)));
+                                        return;
                                     }
                                 }
-                                StreamToken::Done => {
-                                    if !tool_call_made {
-                                        if let Some(out_token) = outbound_token.take() {
-                                            yield Ok(out_token);
+                            };
+
+                            let mut stream = Box::pin(stream);
+                            let mut tool_call_made = false;
+                            while let Some(token_result) = stream.next().await {
+                                match token_result {
+                                    Ok(token) => {
+                                        match &token {
+                                            StreamToken::Text(s) => {
+                                                self.context.append_assistant_chunk(s);
+                                                yield Ok(StreamToken::Text(s.clone()));
+                                            }
+                                            StreamToken::ToolCall { name, args, id } => {
+                                                tool_call_made = true;
+                                                let tool_call_id = id
+                                                    .as_ref()
+                                                    .map(|s| s.clone())
+                                                    .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+
+                                                let call_key = (name.clone(), args.clone());
+                                                if recent_tool_calls.iter().any(|k| k == &call_key) {
+                                                    self.context.add_tool_call(tool_call_id.clone(), name.clone(), args.clone());
+                                                    self.context.add_tool_result(
+                                                        tool_call_id.clone(),
+                                                        format!("Tool '{}' was already called with these arguments. Please use the previous result to answer.", name),
+                                                    );
+                                                    continue;
+                                                }
+                                                recent_tool_calls.push(call_key);
+                                                if recent_tool_calls.len() > 5 {
+                                                    recent_tool_calls.remove(0);
+                                                }
+
+                                                yield Ok(StreamToken::ToolCall {
+                                                    name: name.clone(),
+                                                    args: args.clone(),
+                                                    id: Some(tool_call_id.clone()),
+                                                });
+
+        let outcome = self.handle_tool_call_stream(
+                                name,
+                                args,
+                                &tool_call_id,
+                                &mut loaded_skills,
+                                &skill_name_index,
+                                &skills_content,
+                                &skill_guard_rules,
+                                &tool_registry,
+                            ).await?;
+
+                                                if let Some(out_tok) = outcome {
+                                                    yield Ok(out_tok);
+                                                }
+                                            }
+        StreamToken::Done => {
+                            if !tool_call_made {
+                                return;
+                            }
+                            tool_call_made = false;
+                        }
                                         }
+                                    }
+                                    Err(e) => {
+                                        yield Err(AgentError::Llm(e.into()));
                                         return;
                                     }
                                 }
                             }
-
-                            if let Some(out_token) = outbound_token {
-                                yield Ok(out_token);
-                            }
                         }
-                        Err(e) => {
-                            yield Err(AgentError::Llm(e.into()));
-                            return;
-                        }
-                    }
-                }
-            }
-        })
+                    })
     }
 }
 
@@ -2204,7 +2383,8 @@ mod tests {
         );
 
         let second_system_prompt = requests[1]
-            .messages
+            .context
+            .conversations
             .first()
             .and_then(|m| match m {
                 OpenAiMessage::System { content } => Some(content.as_str()),
@@ -2246,7 +2426,8 @@ mod tests {
         );
 
         let second_system_prompt = requests[1]
-            .messages
+            .context
+            .conversations
             .first()
             .and_then(|m| match m {
                 OpenAiMessage::System { content } => Some(content.as_str()),
@@ -2283,7 +2464,8 @@ mod tests {
         );
 
         let second_system_prompt = requests[1]
-            .messages
+            .context
+            .conversations
             .first()
             .and_then(|m| match m {
                 OpenAiMessage::System { content } => Some(content.as_str()),
@@ -2316,7 +2498,8 @@ mod tests {
         );
 
         let second_system_prompt = requests[1]
-            .messages
+            .context
+            .conversations
             .first()
             .and_then(|m| match m {
                 OpenAiMessage::System { content } => Some(content.as_str()),
@@ -2546,7 +2729,7 @@ mod tests {
         let _ = session.run("final question").await.unwrap();
         let requests = llm.requests.lock().unwrap();
         let saw_compaction_prompt = requests.iter().any(|req| {
-            req.messages.iter().any(|m| match m {
+            req.context.conversations.iter().any(|m| match m {
                 OpenAiMessage::User { content } => {
                     content.contains("Summarize the following prior conversation for future turns")
                 }
@@ -2559,7 +2742,7 @@ mod tests {
         );
 
         let saw_compaction = requests.iter().any(|req| {
-            req.messages.iter().any(|m| match m {
+            req.context.conversations.iter().any(|m| match m {
                 OpenAiMessage::System { content } => {
                     content.contains(AgentSession::CONTEXT_COMPACTION_HEADER)
                 }
@@ -2590,7 +2773,7 @@ mod tests {
 
         let requests = llm.requests.lock().unwrap();
         let saw_compaction_prompt = requests.iter().any(|req| {
-            req.messages.iter().any(|m| match m {
+            req.context.conversations.iter().any(|m| match m {
                 OpenAiMessage::User { content } => {
                     content.contains("Summarize the following prior conversation for future turns")
                 }
@@ -2603,7 +2786,7 @@ mod tests {
         );
 
         let saw_compaction = requests.iter().any(|req| {
-            req.messages.iter().any(|m| match m {
+            req.context.conversations.iter().any(|m| match m {
                 OpenAiMessage::System { content } => {
                     content.contains(AgentSession::CONTEXT_COMPACTION_HEADER)
                 }

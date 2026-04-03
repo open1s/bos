@@ -1,19 +1,17 @@
-use pyo3::prelude::*;
-use pyo3::types::PyType;
-use std::sync::Arc;
-use pyo3::IntoPyObjectExt;
-use bus::{Caller, Callable};
 use crate::bus::PyBus;
 use crate::utils::{
-    session_from_bus,
-    invoke_python_handler_to_pyany,
-    invoke_python_string_handler,
+    invoke_python_handler_to_pyany, invoke_python_string_handler, session_from_bus,
 };
+use bus::{Callable, Caller};
+use pyo3::prelude::*;
+use pyo3::types::PyType;
+use pyo3::IntoPyObjectExt;
+use std::sync::Arc;
 
 #[pyclass(name = "Caller", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyCaller {
-    pub inner: Arc<Caller>,  
+    pub inner: Arc<Caller>,
 }
 
 #[pymethods]
@@ -97,7 +95,10 @@ impl PyCallable {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = inner.lock().await;
-            guard.start().await.map_err(crate::utils::to_py_runtime_error)?;
+            guard
+                .start()
+                .await
+                .map_err(crate::utils::to_py_runtime_error)?;
             Ok(())
         })
     }
@@ -122,13 +123,11 @@ impl PyCallable {
             let handler_fn = move |input: String| {
                 let handler = handler.clone();
                 async move {
-                    let py_arg = Python::attach(|py| -> PyResult<Py<PyAny>> {
-                        Ok(input.into_py_any(py)?)
-                    })
-                    .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
+                    let py_arg =
+                        Python::attach(|py| -> PyResult<Py<PyAny>> { Ok(input.into_py_any(py)?) })
+                            .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
 
-                    let output = invoke_python_handler_to_pyany(&handler, py_arg)
-                        .await?;
+                    let output = invoke_python_handler_to_pyany(&handler, py_arg).await?;
 
                     let out_str = Python::attach(|py| {
                         output
@@ -146,7 +145,10 @@ impl PyCallable {
                 .set_handler(handler_fn)
                 .map_err(crate::utils::to_py_runtime_error)?;
 
-            guard.init_and_run().await.map_err(crate::utils::to_py_runtime_error)?;
+            guard
+                .init_and_run()
+                .await
+                .map_err(crate::utils::to_py_runtime_error)?;
             Ok(())
         })
     }
@@ -169,8 +171,7 @@ impl PyCallable {
                     })
                     .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
 
-                    let output = invoke_python_handler_to_pyany(&handler, py_arg)
-                        .await?;
+                    let output = invoke_python_handler_to_pyany(&handler, py_arg).await?;
 
                     let out_json = Python::attach(|py| -> PyResult<String> {
                         let py_out = crate::utils::py_to_json(output.bind(py))?;
@@ -186,7 +187,10 @@ impl PyCallable {
                 .set_handler(handler_fn)
                 .map_err(crate::utils::to_py_runtime_error)?;
 
-            guard.init_and_run().await.map_err(crate::utils::to_py_runtime_error)?;
+            guard
+                .init_and_run()
+                .await
+                .map_err(crate::utils::to_py_runtime_error)?;
             Ok(())
         })
     }

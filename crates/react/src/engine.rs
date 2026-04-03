@@ -1,4 +1,7 @@
-use crate::llm::{LlmClient, LlmContext, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken};
+use crate::llm::{
+    LlmClient, LlmContext, LlmError, LlmMessage, LlmRequest, LlmResponse, LlmTool, Skill,
+    StreamToken,
+};
 use crate::memory::Memory;
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::telemetry::{Telemetry, TelemetryEvent};
@@ -6,10 +9,12 @@ use crate::tool::{Tool, ToolRegistry};
 use futures::Stream;
 use log::info;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::time::{timeout, Duration};
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum ReactError {
@@ -31,45 +36,324 @@ pub enum BuilderError {
     MissingLlm,
 }
 
-fn parse_action_input(thought: &str) -> (Option<String>, Value) {
-    // Check for native tool-calling format: <|python_tag|>{"name": "...", "parameters": {...}}
-    if let Some(json_start) = thought.find("{") {
-        let json_str = &thought[json_start..];
-        if let Ok(obj) = serde_json::from_str::<Value>(json_str) {
-            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-                let args = obj.get("parameters").cloned().unwrap_or(Value::Null);
-                return (Some(name.to_string()), args);
+/// Parse result indicating whether the LLM output is a tool call or text
+#[derive(Debug)]
+enum ParsedIntent {
+    /// LLM explicitly requested a tool call (structured, from LLM API)
+    ToolCall {
+        name: String,
+        input: Value,
+        call_id: Option<String>,
+    },
+    /// LLM is providing a final answer (text only)
+    FinalAnswer { text: String },
+}
+
+/// Parse LLM output into a clear intent using a strict boundary mechanism.
+///
+/// Boundary rules:
+/// 1. "Final Answer:" prefix → absolute boundary, everything after is text
+/// 2. Tool call format → only valid if tool exists in registry
+/// 3. Plain text → always final answer
+fn parse_llm_intent(
+    thought: &str,
+    available_tools: &HashMap<String, Box<dyn Tool>>,
+) -> ParsedIntent {
+    let thought = thought.trim();
+    if thought.is_empty() {
+        return ParsedIntent::FinalAnswer {
+            text: String::new(),
+        };
+    }
+
+    // "Final Answer:" is an absolute boundary — never parse as tool call
+    if let Some(pos) = thought.find("Final Answer:") {
+        let answer = thought[(pos + "Final Answer:".len())..].trim().to_string();
+        return ParsedIntent::FinalAnswer { text: answer };
+    }
+
+    // Tool call only if format matches AND tool exists in registry
+    if let Some((name, input)) = parse_unified_tool_call(thought) {
+        if available_tools.contains_key(&name) {
+            return ParsedIntent::ToolCall {
+                name,
+                input,
+                call_id: None,
+            };
+        }
+    }
+
+    // Everything else is text
+    ParsedIntent::FinalAnswer {
+        text: thought.to_string(),
+    }
+}
+
+/// Unified tool call parser supporting 5 formats with correct priority:
+/// Priority 1: JSON object: {"name": "tool", "parameters": {...}}
+/// Priority 2: ReAct: Action: tool\nInput: {...}
+/// Priority 3: Function call: tool_name({"arg": "value"})
+/// Priority 4: XML tags: <tool>args</tool>
+/// Priority 5: LaTeX boxed: $\boxed{...}
+///
+/// Each parser validates its output and returns None if type checking fails.
+fn parse_unified_tool_call(thought: &str) -> Option<(String, Value)> {
+    let thought = thought.trim();
+    if thought.is_empty() {
+        return None;
+    }
+
+    // Priority order: JSON > ReAct > Function > XML > LaTeX
+    parse_json_object(thought)
+        .or_else(|| parse_react_format(thought))
+        .or_else(|| parse_function_call(thought))
+        .or_else(|| parse_xml_tags(thought))
+        .or_else(|| parse_latex_boxed(thought))
+}
+
+/// Parse function call format: tool_name({"key": "value"}) or tool_name("value")
+/// Returns: Option<(tool_name: String, args: Value)> where args must be an Object
+fn parse_function_call(thought: &str) -> Option<(String, Value)> {
+    let cleaned = thought
+        .strip_prefix("<|python_tag|>")
+        .or_else(|| thought.strip_prefix("<|python_tag|> "))
+        .unwrap_or(thought);
+
+    let paren_pos = cleaned.find('(')?;
+    let func_name = cleaned[..paren_pos].trim().to_string();
+
+    // Valid tool name: alphanumeric, underscore, slash, hyphen, dot
+    if func_name.is_empty()
+        || !func_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '/' || c == '-' || c == '.')
+    {
+        return None;
+    }
+
+    let rest = &cleaned[paren_pos..];
+    let close_paren = rest.find(')')?;
+    let args_str = rest[1..close_paren].trim();
+
+    if args_str.is_empty() {
+        return Some((func_name, Value::Object(serde_json::Map::new())));
+    }
+
+    // Try parsing as JSON object - type check: must be Object
+    if let Ok(obj) = serde_json::from_str::<Value>(args_str) {
+        if obj.is_object() {
+            return Some((func_name, obj));
+        }
+        // Single value: wrap in object with "value" key
+        return Some((func_name, serde_json::json!({ "value": obj })));
+    }
+
+    // Try quoted string - type check: convert to Object with "value" key
+    let stripped = args_str
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            args_str
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        });
+
+    if let Some(s) = stripped {
+        return Some((func_name, serde_json::json!({ "value": s })));
+    }
+
+    // Try comma-separated args: arg1, arg2, arg3 (or single key=value)
+    // Type check: always returns Object
+    let args: Vec<&str> = args_str.split(',').collect();
+    if !args.is_empty() {
+        let mut obj = serde_json::Map::new();
+        for (i, arg) in args.iter().enumerate() {
+            let arg_trimmed = arg.trim();
+            if let Some(eq_pos) = arg_trimmed.find('=') {
+                let key = arg_trimmed[..eq_pos].trim();
+                let val = arg_trimmed[eq_pos + 1..].trim();
+                if let Ok(v) = serde_json::from_str(val) {
+                    obj.insert(key.to_string(), v);
+                } else {
+                    obj.insert(key.to_string(), Value::String(val.to_string()));
+                }
+            } else {
+                obj.insert(format!("arg{}", i), Value::String(arg_trimmed.to_string()));
+            }
+        }
+        return Some((func_name, Value::Object(obj)));
+    }
+
+    None
+}
+
+/// Parse JSON object format: {"name": "tool", "parameters": {...}}
+/// Type check: returns (name: String, args: Value) where name must be non-empty string
+fn parse_json_object(thought: &str) -> Option<(String, Value)> {
+    let start = thought.find('{')?;
+
+    let mut depth = 0;
+    let mut end = None;
+    for (i, c) in thought.chars().enumerate() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let end = end?;
+    if end <= start {
+        return None;
+    }
+
+    let mut json_str = &thought[start..end];
+
+    // Handle double-brace wrapping: {{...}} → {...}
+    if json_str.starts_with("{{") && json_str.ends_with("}}") {
+        json_str = &json_str[1..json_str.len() - 1];
+    }
+
+    let val: Value = serde_json::from_str(json_str).ok()?;
+
+    if let (Some(name), Some(params)) = (
+        val.get("name").and_then(|v| v.as_str()),
+        val.get("parameters")
+            .or_else(|| val.get("args"))
+            .or_else(|| val.get("arguments")),
+    ) {
+        // Type check: name must be non-empty
+        if name.is_empty() {
+            return None;
+        }
+        return Some((name.to_string(), params.clone()));
+    }
+
+    if let Some(obj) = val.as_object() {
+        if obj.len() == 1 {
+            if let Some((name, params)) = obj.iter().next() {
+                return Some((name.clone(), params.clone()));
             }
         }
     }
 
-    // Check for ReAct format: Action: <tool name>\nAction Input: <json>
+    None
+}
+
+/// Parse ReAct format: Action: tool\nAction Input: {...}
+/// Type check: returns (name: String, args: Value) where name must be non-empty
+fn parse_react_format(thought: &str) -> Option<(String, Value)> {
     let mut tool_name: Option<String> = None;
-    let mut input: Value = Value::Null;
+    let mut input = Value::Null;
+
     for line in thought.lines() {
-        let l = line.trim();
-        let lower = l.to_ascii_lowercase();
-        if lower.starts_with("action:") || lower.starts_with("tool:") {
-            if let Some(pos) = l.find(':') {
-                tool_name = Some(l[(pos + 1)..].trim().to_string());
+        let l = line.trim().to_lowercase();
+
+        if l.starts_with("action:") || l.starts_with("tool:") || l.starts_with("invoke:") {
+            if let Some(pos) = line.find(':') {
+                tool_name = Some(line[pos + 1..].trim().to_string());
             }
-        } else if lower.starts_with("input:")
-            || lower.starts_with("parameters:")
-            || lower.starts_with("action input:")
+        } else if l.starts_with("input:")
+            || l.starts_with("parameters:")
+            || l.starts_with("action input:")
+            || l.starts_with("args:")
         {
-            if let Some(pos) = l.find(':') {
-                let raw = l[(pos + 1)..].trim();
+            if let Some(pos) = line.find(':') {
+                let raw = line[pos + 1..].trim();
                 if !raw.is_empty() {
-                    if let Ok(v) = serde_json::from_str::<Value>(raw) {
-                        input = v;
-                    } else {
-                        input = serde_json::json!({ "expression": raw });
-                    }
+                    input = serde_json::from_str(raw)
+                        .unwrap_or_else(|_| Value::String(raw.to_string()));
                 }
             }
         }
     }
-    (tool_name, input)
+
+    // Type check: name must be non-empty
+    tool_name
+        .filter(|name| !name.is_empty())
+        .map(|name| (name, input))
+}
+
+/// Parse LaTeX boxed format: $\boxed{"name": "tool", "parameters": {...}}$
+/// Type check: delegates to parse_json_object and parse_function_call which have type validation
+fn parse_latex_boxed(thought: &str) -> Option<(String, Value)> {
+    let cleaned = thought
+        .replace("$", "")
+        .replace("\\$", "")
+        .replace("\\boxed{", "")
+        .replace("boxed{", "");
+
+    let cleaned = if cleaned.ends_with("}}") {
+        &cleaned[..cleaned.len() - 1]
+    } else {
+        &cleaned
+    };
+
+    parse_json_object(cleaned).or_else(|| parse_function_call(cleaned))
+}
+
+/// Parse XML tag format: <tool_name>args</tool_name> or <tool_name/>
+/// Type check: tag name must be non-empty and have valid characters
+fn parse_xml_tags(thought: &str) -> Option<(String, Value)> {
+    let start_tag = thought.find('<')?;
+    let end_tag = thought.find('>')?;
+    if end_tag <= start_tag + 1 {
+        return None;
+    }
+
+    let tag_content = &thought[start_tag + 1..end_tag];
+    if tag_content.starts_with('/') || tag_content.starts_with('!') {
+        return None;
+    }
+
+    // Self-closing or with content
+    let is_self_closing = tag_content.ends_with('/');
+    let tag_name = if is_self_closing {
+        tag_content[..tag_content.len() - 1].trim().to_string()
+    } else {
+        tag_content
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+
+    if tag_name.is_empty() {
+        return None;
+    }
+
+    // Valid tool name characters
+    if !tag_name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '/' || c == '-' || c == '.')
+    {
+        return None;
+    }
+
+    // Find closing tag if not self-closing
+    let args = if is_self_closing {
+        Value::Object(serde_json::Map::new())
+    } else {
+        let close_pattern = format!("</{}>", tag_name);
+        if let Some(close_pos) = thought.find(&close_pattern) {
+            let args_content = &thought[end_tag + 1..close_pos];
+            if let Ok(v) = serde_json::from_str(args_content) {
+                v
+            } else {
+                Value::String(args_content.to_string())
+            }
+        } else {
+            Value::Object(serde_json::Map::new())
+        }
+    };
+
+    Some((tag_name, args))
 }
 
 pub struct ReActEngine {
@@ -196,42 +480,19 @@ impl ReActEngine {
         self.tools.register(t);
     }
 
+    #[allow(unused)]
     fn tools_descriptions(&self) -> String {
         self.tools
             .tools
             .iter()
             .filter(|(_, tool)| !tool.is_skill())
-            .map(|(name, tool)| {
-                format!("- {}: {}", name, tool.description())
-            })
+            .map(|(name, tool)| format!("- {}: {}", name, tool.description()))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    fn try_parse_tool_call(content: &str) -> Option<(String, Value)> {
-        if let Ok(val) = serde_json::from_str::<Value>(content) {
-            if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
-                let input = val.get("parameters").cloned().unwrap_or(Value::Null);
-                return Some((name.to_string(), input));
-            }
-        }
-        // Try to find a JSON object within the content
-        if let Some(start) = content.find('{') {
-            if let Some(end) = content.rfind('}') {
-                let json_str = &content[start..=end];
-                if let Ok(val) = serde_json::from_str::<Value>(json_str) {
-                    if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
-                        let input = val.get("parameters").cloned().unwrap_or(Value::Null);
-                        return Some((name.to_string(), input));
-                    }
-                }
-            }
-        }
-        None
-    }
-
     /// Call LLM with optional resilience wrapper.
-    async fn call_llm(&self, request: LlmRequest) -> Result<String, ReactError> {
+    async fn call_llm(&self, request: LlmRequest) -> Result<LlmResponse, ReactError> {
         let result = if let Some(ref resilience) = self.resilience {
             let llm = &self.llm;
             let request = request.clone();
@@ -243,15 +504,16 @@ impl ReActEngine {
             self.llm.complete(request).await.map_err(ReactError::from)?
         };
 
-        match result {
-            LlmResponse::Text(s) => Ok(s),
-            LlmResponse::Partial(s) => Ok(s),
-            LlmResponse::Done => Ok(String::new()),
-            LlmResponse::ToolCall { name, args, id: _ } => Err(ReactError::Malformed(format!(
-                "Unexpected tool call: {} {:?}",
-                name, args
-            ))),
+        match &result {
+            LlmResponse::Text(s) => info!("[ReAct] RECV: {}", s),
+            LlmResponse::Partial(s) => info!("[ReAct] RECV: {}", s),
+            LlmResponse::Done => info!("[ReAct] RECV: (done)"),
+            LlmResponse::ToolCall { name, args, id } => {
+                info!("[ReAct] RECV ToolCall: {} {:?} id={:?}", name, args, id);
+            }
         }
+
+        Ok(result)
     }
 
     /// Call LLM for streaming with optional resilience wrapper.
@@ -277,83 +539,55 @@ impl ReActEngine {
         }
     }
 
-    /// Call tool with optional resilience wrapper.
+    /// Call tool - no resilience wrapper (only LLM calls need rate limiting)
     async fn call_tool(&self, name: &str, input: &Value) -> Result<Value, ReactError> {
-        if let Some(ref resilience) = self.resilience {
-            let name = name.to_string();
-            let input = input.clone();
-            let tools = &self.tools;
-            let name = name.clone();
-            resilience
-                .execute(move || {
-                    let tools = tools;
-                    let input = input.clone();
-                    let name = name.clone();
-                    async move { tools.call(&name, &input).map_err(|e| format!("{:?}", e)) }
-                })
-                .await
-                .map_err(|e| ReactError::ToolError(format!("{:?}", e)))
-        } else {
-            self.tools
-                .call(name, input)
-                .map_err(|e| ReactError::ToolError(format!("{:?}", e)))
-        }
+        self.tools
+            .call(name, input)
+            .map_err(|e| ReactError::ToolError(format!("{:?}", e)))
     }
 
     pub async fn react(&mut self, user_input: &str) -> Result<String, ReactError> {
-        let tool_descriptions = self.tools_descriptions();
-        let user_input_prompt = if tool_descriptions.is_empty() {
-            user_input.to_string()
-        } else {
-            format!(
-                "{}\n\nUser input: {}",
-                user_input,
-                user_input
-            )
-        };
-
-        let mut system = self.system_prompt.to_string();
-        if !tool_descriptions.is_empty() {
-            system.push_str(
-                "\nYou have access to the following tools:\n",
-            );
-            system.push_str(&tool_descriptions);
-        }
-
-        let openai_tools: Vec<Value> = self.tools
+        let openai_tools: Vec<LlmTool> = self
+            .tools
             .tools
             .iter()
             .filter(|(_, tool)| !tool.is_skill())
-            .map(|(name, tool)| {
-                serde_json::json!({
-                    "name": name,
-                    "description": tool.description(),
-                    "parameters": tool.json_schema(),
-                })
+            .map(|(name, tool)| LlmTool {
+                name: name.to_string(),
+                description: tool.description(),
+                parameters: tool.json_schema(),
             })
             .collect();
-        let openai_skills: Vec<Value> = self.tools
+        let openai_skills: Vec<Skill> = self
+            .tools
             .tools
             .iter()
             .filter(|(_, tool)| tool.is_skill())
-            .map(|(name, tool)| {
-                serde_json::json!({
-                    "name": name,
-                    "description": tool.description(),
-                    "parameters": tool.json_schema(),
-                })
+            .map(|(name, tool)| Skill {
+                category: tool.category(),
+                name: name.to_string(),
+                description: tool.description(),
             })
             .collect();
 
         let mut context = LlmContext {
-            system,
             tools: openai_tools,
             skills: openai_skills,
-            history: Vec::new(),
-            user_input: user_input_prompt,
+            conversations: Vec::new(),
+            rules: Vec::new(),
+            instructions: Vec::new(),
         };
 
-        let mut thought: String;
+        context
+            .conversations
+            .push(LlmMessage::system(self.system_prompt.clone()));
+        context
+            .conversations
+            .push(LlmMessage::user(user_input.to_string()));
+
+        let mut thought = String::new();
+        let mut loaded_skills: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for _ in 0..self.max_steps {
             let request = LlmRequest {
                 model: self.model.clone(),
@@ -361,114 +595,188 @@ impl ReActEngine {
                 ..Default::default()
             };
 
-            info!("[ReACT] Sending request: {:?}", request);
-            let llm_out = match timeout(Duration::from_secs(self.llm_timeout_secs), self.call_llm(request)).await {
-                Ok(Ok(s)) => s,
+            info!("[ReACT] SEND: {:?}", request);
+            let llm_response = match timeout(
+                Duration::from_secs(self.llm_timeout_secs),
+                self.call_llm(request),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Err(ReactError::Timeout("LLM prediction timed out".to_string())),
             };
-            thought = llm_out;
-            info!("[ReAct] LLM output: {}", thought);
-            self.telemetry.emit(&TelemetryEvent::ThoughtGenerated {
-                thought: thought.clone(),
-            });
 
-            if thought.to_lowercase().contains("final answer") {
-                let ans = if let Some(pos) = thought.find("Final Answer:") {
-                    thought[(pos + "Final Answer:".len())..].trim().to_string()
-                } else {
-                    thought.trim().to_string()
-                };
-                if let Some((tool_name, input)) = Self::try_parse_tool_call(&ans) {
-                    if self.tools.tools.get(&tool_name).is_some() {
-                        let res = self.call_tool(&tool_name, &input).await?;
+            match llm_response {
+                LlmResponse::ToolCall { name, args, id } => {
+                    let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+
+                    if name == "load_skill" {
+                        let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        if loaded_skills.contains_key(skill_name) {
+                            let cached = loaded_skills.get(skill_name).unwrap();
+                            context.conversations.push(LlmMessage::AssistantToolCall {
+                                tool_call_id: call_id.clone(),
+                                name: name.clone(),
+                                args: args.clone(),
+                            });
+                            context.conversations.push(LlmMessage::ToolResult {
+                                tool_call_id: call_id,
+                                content: format!(
+                                    "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.\n\n{}",
+                                    skill_name, cached
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+
+                    let result = self.call_tool(&name, &args).await;
+
+                    if let Ok(ret) = &result {
+                        if name == "load_skill" {
+                            let skill_name =
+                                args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let instructions = ret
+                                .get("instructions")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !instructions.is_empty() {
+                                loaded_skills
+                                    .insert(skill_name.to_string(), instructions.to_string());
+                            }
+                        }
+
                         self.telemetry.emit(&TelemetryEvent::ToolInvocation {
-                            tool: tool_name.clone(),
-                            input: input.clone(),
-                            output: res.clone(),
+                            tool: name.clone(),
+                            input: args.clone(),
+                            output: ret.clone(),
                         });
-                        return Ok(res.to_string());
+
+                        context.conversations.push(LlmMessage::AssistantToolCall {
+                            tool_call_id: call_id.clone(),
+                            name: name.clone(),
+                            args: args.clone(),
+                        });
+                        context.conversations.push(LlmMessage::ToolResult {
+                            tool_call_id: call_id,
+                            content: ret.to_string(),
+                        });
+                    } else {
+                        context.conversations.push(LlmMessage::AssistantToolCall {
+                            tool_call_id: call_id.clone(),
+                            name: name.clone(),
+                            args: args.clone(),
+                        });
+                        context.conversations.push(LlmMessage::ToolResult {
+                            tool_call_id: call_id,
+                            content: format!("Error: {:?}", result),
+                        });
                     }
                 }
-                self.telemetry.emit(&TelemetryEvent::FinalAnswer {
-                    answer: ans.clone(),
-                });
-                return Ok(ans);
-            }
+                LlmResponse::Text(text) | LlmResponse::Partial(text) => {
+                    thought = text.clone();
+                    info!("[ReAct] RECV: {}", thought);
 
-            let (tool_name, input) = parse_action_input(thought.as_str());
-            let tool_name = match tool_name {
-                Some(n) => n,
-                None => {
-                    return Err(ReactError::Malformed(
-                        "Missing Action in llm output".to_string(),
-                    ))
+                    self.telemetry.emit(&TelemetryEvent::ThoughtGenerated {
+                        thought: thought.clone(),
+                    });
+
+                    match parse_llm_intent(&thought, &self.tools.tools) {
+                        ParsedIntent::ToolCall {
+                            name,
+                            input,
+                            call_id,
+                        } => {
+                            let call_id = call_id
+                                .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+
+                            if name == "load_skill" {
+                                let skill_name =
+                                    input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                if loaded_skills.contains_key(skill_name) {
+                                    let cached = loaded_skills.get(skill_name).unwrap();
+                                    context.conversations.push(LlmMessage::AssistantToolCall {
+                                        tool_call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        args: input.clone(),
+                                    });
+                                    context.conversations.push(LlmMessage::ToolResult {
+                                        tool_call_id: call_id,
+                                        content: format!(
+                                            "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.\n\n{}",
+                                            skill_name, cached
+                                        ),
+                                    });
+                                    continue;
+                                }
+                            }
+
+                            let result = self.call_tool(&name, &input).await;
+
+                            if let Ok(ret) = &result {
+                                if name == "load_skill" {
+                                    let skill_name =
+                                        input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let instructions = ret
+                                        .get("instructions")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if !instructions.is_empty() {
+                                        loaded_skills.insert(
+                                            skill_name.to_string(),
+                                            instructions.to_string(),
+                                        );
+                                    }
+                                }
+
+                                self.telemetry.emit(&TelemetryEvent::ToolInvocation {
+                                    tool: name.clone(),
+                                    input: input.clone(),
+                                    output: ret.clone(),
+                                });
+
+                                context.conversations.push(LlmMessage::AssistantToolCall {
+                                    tool_call_id: call_id.clone(),
+                                    name: name.clone(),
+                                    args: input.clone(),
+                                });
+                                context.conversations.push(LlmMessage::ToolResult {
+                                    tool_call_id: call_id,
+                                    content: ret.to_string(),
+                                });
+                            } else {
+                                context.conversations.push(LlmMessage::AssistantToolCall {
+                                    tool_call_id: call_id.clone(),
+                                    name: name.clone(),
+                                    args: input.clone(),
+                                });
+                                context.conversations.push(LlmMessage::ToolResult {
+                                    tool_call_id: call_id,
+                                    content: format!("Error: {:?}", result),
+                                });
+                            }
+                        }
+                        ParsedIntent::FinalAnswer { text } => {
+                            self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                                answer: text.clone(),
+                            });
+                            return Ok(text);
+                        }
+                    }
                 }
-            };
-            let res = self.call_tool(&tool_name, &input).await?;
-            self.memory
-                .push(thought.clone(), tool_name.clone(), res.clone());
-            self.telemetry.emit(&TelemetryEvent::ToolInvocation {
-                tool: tool_name.clone(),
-                input: input.clone(),
-                output: res.clone(),
-            });
-
-            context.history.push(LlmMessage::Assistant { content: thought.clone() });
-            context.history.push(LlmMessage::ToolResult {
-                tool_call_id: tool_name.clone(),
-                content: res.to_string(),
-            });
-
-            let request = LlmRequest {
-                model: self.model.clone(),
-                context: context.clone(),
-                ..Default::default()
-            };
-            thought = self.call_llm(request).await?;
-            info!("[ReAct] Post-tool LLM output: {}", thought);
-            self.telemetry.emit(&TelemetryEvent::ThoughtGenerated {
-                thought: thought.clone(),
-            });
-
-            if thought.to_lowercase().contains("final answer") {
-                let ans = if let Some(pos) = thought.find("Final Answer:") {
-                    thought[(pos + "Final Answer:".len())..].trim().to_string()
-                } else {
-                    thought.trim().to_string()
-                };
-                self.telemetry.emit(&TelemetryEvent::FinalAnswer {
-                    answer: ans.clone(),
-                });
-                return Ok(ans);
+                LlmResponse::Done => {
+                    self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                        answer: thought.clone(),
+                    });
+                    return Ok(thought);
+                }
             }
-
-            let (next_tool_name, next_input) = parse_action_input(thought.as_str());
-            if let Some(next_tool) = next_tool_name {
-                context.history.push(LlmMessage::Assistant { content: thought.clone() });
-                let res = self.call_tool(&next_tool, &next_input).await?;
-                self.memory
-                    .push(thought.clone(), next_tool.clone(), res.clone());
-                self.telemetry.emit(&TelemetryEvent::ToolInvocation {
-                    tool: next_tool.clone(),
-                    input: next_input.clone(),
-                    output: res.clone(),
-                });
-                context.history.push(LlmMessage::ToolResult {
-                    tool_call_id: next_tool.clone(),
-                    content: res.to_string(),
-                });
-                continue;
-            }
-
-            self.telemetry.emit(&TelemetryEvent::FinalAnswer {
-                answer: thought.clone(),
-            });
-            return Ok(thought.trim().to_string());
         }
-        Err(ReactError::Malformed(
-            "Max steps reached without final answer".to_string(),
-        ))
+        self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+            answer: thought.clone(),
+        });
+        Ok(thought)
     }
 
     // Expose a simple memory checkpoint API for testing/observability

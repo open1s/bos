@@ -59,7 +59,13 @@ def tool(
         params = _extract_params(func) if schema is None else schema
 
         def wrapper(args: dict) -> str:
-            kwargs = {k: args.get(k) for k in params.get("properties", {})}
+            kwargs = {}
+            properties = params.get("properties", {})
+            for k, spec in properties.items():
+                value = args.get(k)
+                if value is not None:
+                    json_type = spec.get("type", "string")
+                    kwargs[k] = _coerce_type(value, json_type)
             result = func(**kwargs)
             if isinstance(result, str):
                 return result
@@ -106,6 +112,22 @@ def _extract_params(func: Callable) -> dict[str, Any]:
             properties[param_name]["default"] = param.default
 
     return {"type": "object", "properties": properties, "required": required}
+
+
+def _coerce_type(value: Any, json_type: str) -> Any:
+    if json_type == "integer":
+        if isinstance(value, str):
+            return int(value)
+        return int(value)
+    elif json_type == "number":
+        if isinstance(value, str):
+            return float(value)
+        return float(value)
+    elif json_type == "boolean":
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes")
+        return bool(value)
+    return value
 
 
 def _build_schema(params: dict) -> dict[str, Any]:

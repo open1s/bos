@@ -134,17 +134,23 @@ impl From<BusConfig> for zenoh::config::Config {
         } else {
             r#"{"mode": "peer""#.to_string()
         };
-        
+
         if let Some(listen) = &value.listen {
-            json.push_str(&format!(r#", "listen": {{"endpoints": {}}}"#, serde_json::to_string(listen).unwrap()));
+            json.push_str(&format!(
+                r#", "listen": {{"endpoints": {}}}"#,
+                serde_json::to_string(listen).unwrap()
+            ));
         }
-        
+
         if let Some(connect) = &value.connect {
-            json.push_str(&format!(r#", "connect": {{"endpoints": {}}}"#, serde_json::to_string(connect).unwrap()));
+            json.push_str(&format!(
+                r#", "connect": {{"endpoints": {}}}"#,
+                serde_json::to_string(connect).unwrap()
+            ));
         }
-        
+
         json.push('}');
-        
+
         zenoh::config::Config::from_json5(&json).unwrap_or_default()
     }
 }

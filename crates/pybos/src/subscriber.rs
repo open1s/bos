@@ -2,9 +2,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 use std::sync::Arc;
 
-use bus::Subscriber;
 use crate::bus::PyBus;
 use crate::utils::session_from_bus;
+use bus::Subscriber;
 
 #[pyclass(name = "Subscriber", skip_from_py_object)]
 #[derive(Clone)]
@@ -78,7 +78,7 @@ impl PySubscriber {
             let out = guard
                 .recv_with_timeout(std::time::Duration::from_millis(timeout_ms))
                 .await;
-            
+
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 match out {
                     Some(json_str) => {
@@ -99,7 +99,7 @@ impl PySubscriber {
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let mut guard = inner.lock().await;
-            
+
             // Continuously receive messages and call the callback
             loop {
                 match guard.recv().await {
@@ -125,7 +125,7 @@ impl PySubscriber {
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let mut guard = inner.lock().await;
-            
+
             // Continuously receive messages and call the callback with JSON
             loop {
                 match guard.recv().await {

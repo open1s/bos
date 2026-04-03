@@ -6,7 +6,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::llm::{
-    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken, TokenStream,
+    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken, Stringfy,
+    TokenStream,
 };
 
 pub struct OpenRouterVendor {
@@ -22,7 +23,8 @@ struct OpenRouterRequest {
     messages: Vec<OpenRouterMessageJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     stream: bool,
@@ -139,16 +141,7 @@ impl OpenRouterVendor {
     fn convert_request(&self, req: LlmRequest) -> OpenRouterRequest {
         let mut messages = Vec::new();
 
-        if !req.context.system.is_empty() {
-            messages.push(OpenRouterMessageJson {
-                role: "system",
-                content: Some(req.context.system.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
-
-        for message in req.context.history {
+        for message in req.context.conversations {
             let json_msg = match message {
                 crate::llm::LlmMessage::System { content } => OpenRouterMessageJson {
                     role: "system",
@@ -168,7 +161,11 @@ impl OpenRouterVendor {
                     tool_call_id: None,
                     tool_calls: None,
                 },
-                crate::llm::LlmMessage::AssistantToolCall { id, name, args } => {
+                crate::llm::LlmMessage::AssistantToolCall {
+                    tool_call_id: id,
+                    name,
+                    args,
+                } => {
                     let args_str = serde_json::to_string(&args).unwrap_or_default();
                     OpenRouterMessageJson {
                         role: "assistant",
@@ -197,17 +194,14 @@ impl OpenRouterVendor {
             messages.push(json_msg);
         }
 
-        if !req.context.user_input.is_empty() {
-            messages.push(OpenRouterMessageJson {
-                role: "user",
-                content: Some(req.context.user_input.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
-
         let tools = if !req.context.tools.is_empty() {
-            Some(req.context.tools.clone())
+            let tools = req
+                .context
+                .tools
+                .into_iter()
+                .map(|t| t.to_value().unwrap())
+                .collect::<Vec<_>>();
+            Some(tools)
         } else {
             None
         };

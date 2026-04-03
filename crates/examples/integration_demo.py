@@ -32,10 +32,12 @@ async def demo_config_and_bus():
 
     async with BusManager() as bus:
         print(f"  🚌 Bus started (mode=peer)")
+        
+        sub = await bus.create_subscriber("system/ready")
+        
         await bus.publish_text("system/ready", "all components online")
         print(f"  📨 Published: system/ready = 'all components online'")
 
-        sub = await bus.create_subscriber("system/ready")
         msg = await sub.recv_with_timeout_ms(1000)
         print(f"  📨 Received: '{msg}'")
 
@@ -52,7 +54,7 @@ async def demo_pubsub():
         sub = await bus.create_subscriber("events/user-action")
 
         async def recv_one():
-            return await sub.recv_with_timeout_ms(2000)
+            return await sub.recv_json_with_timeout_ms(2000)
 
         task = asyncio.create_task(recv_one())
         await asyncio.sleep(0.1)

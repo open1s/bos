@@ -1,9 +1,9 @@
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
-use bus::Publisher;
 use crate::bus::PyBus;
 use crate::utils::session_from_bus;
+use bus::Publisher;
 
 #[pyclass(name = "Publisher", skip_from_py_object)]
 #[derive(Clone)]
@@ -50,12 +50,16 @@ impl PyPublisher {
         })
     }
 
-    fn publish_json<'py>(&self, py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn publish_json<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         // Convert Python dict to serde_json::Value
         let json_value = crate::utils::py_to_json(data)?;
         // Convert to JSON string
         let json_str = json_value.to_string();
-        
+
         let publisher = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {

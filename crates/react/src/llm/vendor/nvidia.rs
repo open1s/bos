@@ -6,7 +6,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::llm::{
-    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken, TokenStream,
+    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken, Stringfy,
+    TokenStream,
 };
 
 pub struct NvidiaVendor {
@@ -22,10 +23,16 @@ struct NvidiaRequest {
     messages: Vec<NvidiaMessageJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
-    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Serialize, Clone)]
@@ -138,17 +145,7 @@ impl NvidiaVendor {
 
     fn convert_request(&self, req: LlmRequest) -> NvidiaRequest {
         let mut messages = Vec::new();
-
-        if !req.context.system.is_empty() {
-            messages.push(NvidiaMessageJson {
-                role: "system",
-                content: Some(req.context.system.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
-
-        for message in req.context.history {
+        for message in req.context.conversations {
             let json_msg = match message {
                 crate::llm::LlmMessage::System { content } => NvidiaMessageJson {
                     role: "system",
@@ -168,7 +165,11 @@ impl NvidiaVendor {
                     tool_call_id: None,
                     tool_calls: None,
                 },
-                crate::llm::LlmMessage::AssistantToolCall { id, name, args } => {
+                crate::llm::LlmMessage::AssistantToolCall {
+                    tool_call_id: id,
+                    name,
+                    args,
+                } => {
                     let args_str = serde_json::to_string(&args).unwrap_or_default();
                     NvidiaMessageJson {
                         role: "assistant",
@@ -197,17 +198,94 @@ impl NvidiaVendor {
             messages.push(json_msg);
         }
 
-        if !req.context.user_input.is_empty() {
-            messages.push(NvidiaMessageJson {
-                role: "user",
-                content: Some(req.context.user_input.clone()),
+        //Availale Skill as system
+        let available_skills = if !req.context.skills.is_empty() {
+            let available_skills = req
+                .context
+                .skills
+                .into_iter()
+                .map(|s| s.json())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let skill_schema = format!(
+                "You have access to the following skills(call load_skill to read it when needed):\n{}\n",
+                available_skills
+            );
+            Some(skill_schema)
+        } else {
+            None
+        };
+
+        let available_rules = if !req.context.rules.is_empty() {
+            let available_rules = req
+                .context
+                .rules
+                .into_iter()
+                .map(|r| r.json())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let rules = format!("You should follow below rules:\n{}\n", available_rules);
+            Some(rules)
+        } else {
+            None
+        };
+
+        let available_instructions = if !req.context.instructions.is_empty() {
+            let available_insts = req
+                .context
+                .instructions
+                .into_iter()
+                .map(|i| i.yaml())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let insts = format!("You should follow below rules:\n{}\n", available_insts);
+            Some(insts)
+        } else {
+            None
+        };
+
+        let mut extra_system_prompt = if let Some(skills) = available_skills {
+            skills
+        } else {
+            String::new()
+        };
+
+        extra_system_prompt.push('\n');
+        if let Some(rules) = available_rules {
+            extra_system_prompt.push_str(&rules);
+        }
+
+        if let Some(instructions) = available_instructions {
+            extra_system_prompt.push_str(&instructions);
+        }
+
+        if !extra_system_prompt.is_empty() {
+            let meta = NvidiaMessageJson {
+                role: "system",
+                content: Some(extra_system_prompt),
                 tool_call_id: None,
                 tool_calls: None,
-            });
+            };
+            messages.insert(0, meta);
         }
 
         let tools = if !req.context.tools.is_empty() {
-            Some(req.context.tools.clone())
+            let tools: Vec<serde_json::Value> = req
+                .context
+                .tools
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
+                })
+                .collect();
+            Some(tools)
         } else {
             None
         };
@@ -218,7 +296,9 @@ impl NvidiaVendor {
             tools,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
-            stream: false,
+            stream: Some(false),
+            top_p: req.top_p,
+            top_k: req.top_k,
         }
     }
 
@@ -228,7 +308,7 @@ impl NvidiaVendor {
         }
 
         let mut nvidia_req = self.convert_request(req);
-        nvidia_req.stream = true;
+        nvidia_req.stream = Some(true);
         nvidia_req
     }
 }

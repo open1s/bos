@@ -64,7 +64,9 @@ impl McpClient {
 
     pub fn connect_http(base_url: impl Into<String>) -> Self {
         Self {
-            transport: Arc::new(Mutex::new(TransportBackend::Http(HttpTransport::new(base_url)))),
+            transport: Arc::new(Mutex::new(TransportBackend::Http(HttpTransport::new(
+                base_url,
+            )))),
             request_id: std::sync::atomic::AtomicU64::new(1),
             capabilities: std::sync::Mutex::new(None),
             initialized: std::sync::atomic::AtomicBool::new(false),
@@ -72,7 +74,10 @@ impl McpClient {
     }
 
     pub async fn initialize(&self) -> Result<ServerCapabilities, McpError> {
-        if self.initialized.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .initialized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(McpError::InitFailed("Already initialized".into()));
         }
         let resp = self
@@ -178,10 +183,7 @@ impl McpClient {
         match resp.result {
             Some(result) => {
                 // MCP returns: { "resources": [...], "nextCursor": ... }
-                let resources = result
-                    .get("resources")
-                    .cloned()
-                    .unwrap_or(result);
+                let resources = result.get("resources").cloned().unwrap_or(result);
                 let res: Vec<McpResource> = serde_json::from_value(resources)
                     .map_err(|e| McpError::Protocol(e.to_string()))?;
                 Ok(res)
@@ -227,10 +229,7 @@ impl McpClient {
                 match resp.result {
                     Some(result) => {
                         // MCP returns: { "prompts": [...], "nextCursor": ... }
-                        let prompts = result
-                            .get("prompts")
-                            .cloned()
-                            .unwrap_or(result);
+                        let prompts = result.get("prompts").cloned().unwrap_or(result);
                         serde_json::from_value(prompts).unwrap_or_default()
                     }
                     None => vec![],
@@ -289,7 +288,9 @@ impl McpClient {
                 }
             }
             TransportBackend::Http(transport) => {
-                let body = transport.send(&serde_json::to_value(&req)?).await
+                let body = transport
+                    .send(&serde_json::to_value(&req)?)
+                    .await
                     .map_err(|e| McpError::HttpTransport(e.to_string()))?;
                 serde_json::from_str(&body)
                     .map_err(|e| McpError::Protocol(format!("HTTP response parse error: {e}")))
@@ -314,7 +315,9 @@ impl McpClient {
                 transport.send(&json).await?;
             }
             TransportBackend::Http(transport) => {
-                transport.send(&req).await
+                transport
+                    .send(&req)
+                    .await
                     .map_err(|e| McpError::HttpTransport(e.to_string()))?;
             }
         }

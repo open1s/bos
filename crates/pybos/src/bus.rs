@@ -1,8 +1,8 @@
-use pyo3::prelude::*;
-use std::sync::Arc;
-use pyo3::types::PyType;
 use bus::Bus;
 use bus::BusConfig;
+use pyo3::prelude::*;
+use pyo3::types::PyType;
+use std::sync::Arc;
 
 #[pyclass(name = "BusConfig", skip_from_py_object)]
 #[derive(Clone)]

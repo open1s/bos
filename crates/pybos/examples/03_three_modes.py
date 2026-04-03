@@ -39,11 +39,11 @@ async def main():
             .register_many(current_time, weather)
         )
 
-        # ── Mode 1: run_simple() — Direct conversation, no tools ──
-        print("=== Mode 1: agent.run_simple() — Direct conversation ===")
+        # ── Mode 1: react() — Direct conversation, no tools ──
+        print("=== Mode 1: agent.react() — Direct conversation ===")
         for q in ["What time is it?", "Weather in Paris?"]:
             print(f"  Q: {q}")
-            result = await agent.run_simple(q)
+            result = await agent.react(q)
             print(f"  A: {result}\n")
 
         # ── Mode 2: run_simple() — Knowledge / computation ──

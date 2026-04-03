@@ -16,7 +16,8 @@ struct EchoLlm;
 impl LlmClient for EchoLlm {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, react::llm::LlmError> {
         let last_user = req
-            .messages
+            .context
+            .conversations
             .iter()
             .rev()
             .find_map(|m| match m {

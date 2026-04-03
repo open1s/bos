@@ -62,7 +62,8 @@ impl Query {
 
         if results.is_empty() {
             return Err(ZenohError::Query(
-                "No replies received — query may have timed out or no callable is listening".to_string(),
+                "No replies received — query may have timed out or no callable is listening"
+                    .to_string(),
             ));
         }
 

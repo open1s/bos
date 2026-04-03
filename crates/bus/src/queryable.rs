@@ -41,8 +41,10 @@ pub(crate) type Handler<Q, R> = Box<
 >;
 
 pub(crate) type StreamHandler<Q, R> = Box<
-    dyn Fn(Q, tokio::sync::mpsc::Sender<Result<R, ZenohError>>)
-            -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    dyn Fn(
+            Q,
+            tokio::sync::mpsc::Sender<Result<R, ZenohError>>,
+        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send
         + Sync,
 >;
@@ -84,8 +86,7 @@ where
         F: Fn(Q, tokio::sync::mpsc::Sender<Result<R, ZenohError>>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let handler: StreamHandler<Q, R> =
-            Box::new(move |q, tx| Box::pin(handler(q, tx)));
+        let handler: StreamHandler<Q, R> = Box::new(move |q, tx| Box::pin(handler(q, tx)));
         self.stream_handler = Some(handler);
         self
     }
@@ -195,9 +196,7 @@ where
                         .encode(&response)
                         .map_err(|e| ZenohError::Serialization(e.to_string()))?;
                     if let Err(e) = query.reply(topic, data).await {
-                        let _ = query
-                            .reply_err(format!("Reply error: {}", e))
-                            .await;
+                        let _ = query.reply_err(format!("Reply error: {}", e)).await;
                         break;
                     }
                 }
@@ -238,8 +237,7 @@ where
         if self.started.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(ZenohError::AlreadyStarted);
         }
-        let handler: StreamHandler<Q, R> =
-            Box::new(move |q, tx| Box::pin(handler(q, tx)));
+        let handler: StreamHandler<Q, R> = Box::new(move |q, tx| Box::pin(handler(q, tx)));
         self.stream_handler = Some(handler);
         Ok(())
     }

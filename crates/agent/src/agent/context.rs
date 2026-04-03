@@ -33,9 +33,12 @@ impl MessageContext {
         }
     }
 
-    pub fn add_tool_call(&mut self, id: String, name: String, args: serde_json::Value) {
-        self.messages
-            .push(Message::AssistantToolCall { id, name, args });
+    pub fn add_tool_call(&mut self, tool_call_id: String, name: String, args: serde_json::Value) {
+        self.messages.push(Message::AssistantToolCall {
+            tool_call_id,
+            name,
+            args,
+        });
     }
 
     pub fn add_tool_result(&mut self, name: String, content: String) {
@@ -70,8 +73,12 @@ impl MessageContext {
                 Message::Assistant { content } => OpenAiMessage::Assistant {
                     content: content.clone(),
                 },
-                Message::AssistantToolCall { id, name, args } => OpenAiMessage::AssistantToolCall {
-                    id: id.clone(),
+                Message::AssistantToolCall {
+                    tool_call_id,
+                    name,
+                    args,
+                } => OpenAiMessage::AssistantToolCall {
+                    tool_call_id: tool_call_id.clone(),
                     name: name.clone(),
                     args: args.clone(),
                 },

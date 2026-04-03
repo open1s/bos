@@ -106,11 +106,15 @@ class McpHttpHandler(BaseHTTPRequestHandler):
             if name == "greet":
                 return {"content": [{"type": "text", "text": f"Hello, {args.get('name', 'World')}!"}]}
             elif name == "calc":
-                a, b = args.get("a", 0), args.get("b", 0)
-                op = args.get("op", "add")
-                ops = {"add": a + b, "sub": a - b, "mul": a * b, "div": a / b if b else "error"}
+                try:
+                    a = float(args.get("a", args.get("a", "0")))
+                    b = float(args.get("b", args.get("b", "0")))
+                except (ValueError, TypeError):
+                    a, b = 0.0, 0.0
+                op = str(args.get("op", args.get("op", "add")))
+                ops = {"add": a + b, "sub": a - b, "mul": a * b, "div": a / b if b != 0 else "error"}
                 result = ops.get(op, "unknown")
-                return {"content": [{"type": "text", "text": str(result)}]}
+                return {"content": [{"type": "text", "text": str(int(result) if result == int(result) else result)}]}
             elif name == "time":
                 return {"content": [{"type": "text", "text": str(int(time.time()))}]}
             return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}

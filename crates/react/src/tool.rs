@@ -34,6 +34,9 @@ impl Tool for FnTool {
     fn run(&self, input: &Value) -> Result<Value, ToolError> {
         Ok((self.f)(input))
     }
+    fn category(&self) -> String {
+        "builtin".to_string()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -47,6 +50,9 @@ pub enum ToolError {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> String;
+    fn category(&self) -> String {
+        "builtin".to_string()
+    }
     fn run(&self, input: &Value) -> Result<Value, ToolError>;
     fn json_schema(&self) -> Value {
         serde_json::json!({})

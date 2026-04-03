@@ -2,12 +2,12 @@
 //!
 //! Provides `PyMcpClient` — a Python-accessible wrapper around the Rust `McpClient`.
 
-use pyo3::prelude::*;
 use agent::McpClient;
+use pyo3::prelude::*;
 
 use std::sync::Arc;
 
-use crate::utils::{to_py_runtime_error, json_to_py};
+use crate::utils::{json_to_py, to_py_runtime_error};
 
 /// A Python-accessible MCP client.
 ///
@@ -34,7 +34,11 @@ impl PyMcpClient {
     /// Returns:
     ///     McpClient instance (not yet initialized)
     #[staticmethod]
-    fn spawn<'py>(py: Python<'py>, command: String, args: Vec<String>) -> PyResult<Bound<'py, PyAny>> {
+    fn spawn<'py>(
+        py: Python<'py>,
+        command: String,
+        args: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -43,7 +47,13 @@ impl PyMcpClient {
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
             Python::attach(|py| {
-                Ok(Py::new(py, PyMcpClient { inner: Arc::new(client) })?.into_any())
+                Ok(Py::new(
+                    py,
+                    PyMcpClient {
+                        inner: Arc::new(client),
+                    },
+                )?
+                .into_any())
             })
         })
     }
@@ -58,7 +68,9 @@ impl PyMcpClient {
     #[staticmethod]
     fn connect_http(url: String) -> PyResult<Self> {
         let client = McpClient::connect_http(url);
-        Ok(PyMcpClient { inner: Arc::new(client) })
+        Ok(PyMcpClient {
+            inner: Arc::new(client),
+        })
     }
 
     /// Initialize the MCP connection.
@@ -69,10 +81,7 @@ impl PyMcpClient {
         let client = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let caps = client
-                .initialize()
-                .await
-                .map_err(to_py_runtime_error)?;
+            let caps = client.initialize().await.map_err(to_py_runtime_error)?;
 
             let caps_json = serde_json::to_value(&caps)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -89,10 +98,7 @@ impl PyMcpClient {
         let client = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let tools = client
-                .list_tools()
-                .await
-                .map_err(to_py_runtime_error)?;
+            let tools = client.list_tools().await.map_err(to_py_runtime_error)?;
 
             let tools_json: serde_json::Value = serde_json::to_value(&tools)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -141,10 +147,7 @@ impl PyMcpClient {
         let client = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let resources = client
-                .list_resources()
-                .await
-                .map_err(to_py_runtime_error)?;
+            let resources = client.list_resources().await.map_err(to_py_runtime_error)?;
 
             let resources_json: serde_json::Value = serde_json::to_value(&resources)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

@@ -91,7 +91,8 @@ impl StdioTransport {
 
     pub async fn recv_line(&mut self, buffer: &mut String) -> Result<(), TransportError> {
         buffer.clear();
-        let bytes_read = self.stdout
+        let bytes_read = self
+            .stdout
             .read_line(buffer)
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?;

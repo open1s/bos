@@ -1,6 +1,8 @@
 use crate::bus::PyBus;
 use crate::utils::{invoke_python_handler_to_pyany, json_to_py, to_py_runtime_error};
-use agent::{Agent, AgentCallableServer, AgentConfig, AgentRpcClient, StreamToken, Tool, ToolDescription};
+use agent::{
+    Agent, AgentCallableServer, AgentConfig, AgentRpcClient, StreamToken, Tool, ToolDescription,
+};
 use async_trait::async_trait;
 use bus;
 use futures::StreamExt;
@@ -27,23 +29,29 @@ impl PyStreamIterator {
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         let receiver = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
-        
-        let future = pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let mut guard = receiver.lock().await;
-            let rx = guard.as_mut().ok_or_else(|| {
-                pyo3::exceptions::PyStopAsyncIteration::new_err("Stream exhausted")
-            })?;
-            
-            match rx.recv().await {
-                Some(Ok(text)) => Ok(text),
-                Some(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
-                None => {
-                    *guard = None;
-                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err("Stream complete"))
+
+        let future = pyo3_async_runtimes::tokio::future_into_py_with_locals(
+            py,
+            current_locals,
+            async move {
+                let mut guard = receiver.lock().await;
+                let rx = guard.as_mut().ok_or_else(|| {
+                    pyo3::exceptions::PyStopAsyncIteration::new_err("Stream exhausted")
+                })?;
+
+                match rx.recv().await {
+                    Some(Ok(text)) => Ok(text),
+                    Some(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+                    None => {
+                        *guard = None;
+                        Err(pyo3::exceptions::PyStopAsyncIteration::new_err(
+                            "Stream complete",
+                        ))
+                    }
                 }
-            }
-        });
-        
+            },
+        );
+
         match future {
             Ok(bound) => Ok(Some(bound)),
             Err(e) => Err(e),
@@ -100,10 +108,17 @@ impl Tool for PyPythonTool {
         self.schema.clone()
     }
 
-    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, agent::ToolError> {
+    async fn execute(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, agent::ToolError> {
         let py_arg = Python::attach(|py| -> Result<Py<PyAny>, agent::ToolError> {
-            let arg_json = serde_json::to_string(args).map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-            Ok(arg_json.into_bound_py_any(py).map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?.unbind())
+            let arg_json = serde_json::to_string(args)
+                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
+            Ok(arg_json
+                .into_bound_py_any(py)
+                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?
+                .unbind())
         })?;
 
         let result = invoke_python_handler_to_pyany(&self.callback, py_arg)
@@ -112,9 +127,12 @@ impl Tool for PyPythonTool {
 
         // Convert the result back to serde_json::Value
         let result_json = Python::attach(|py| -> Result<serde_json::Value, agent::ToolError> {
-            let result_str = result.bind(py).extract::<String>()
+            let result_str = result
+                .bind(py)
+                .extract::<String>()
                 .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-            serde_json::from_str(&result_str).map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))
+            serde_json::from_str(&result_str)
+                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))
         })?;
 
         Ok(result_json)
@@ -144,7 +162,10 @@ impl Tool for PyPythonToolWrapper {
         self.schema.clone()
     }
 
-    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, agent::ToolError> {
+    async fn execute(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, agent::ToolError> {
         let args_clone = args.clone();
         let py_arg = Python::attach(|py| -> Result<Py<PyAny>, agent::ToolError> {
             let inner = self.inner.clone_ref(py);
@@ -152,18 +173,25 @@ impl Tool for PyPythonToolWrapper {
             let arg_json = serde_json::to_string(&args_clone)
                 .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
             // Parse JSON string into Python dict
-            let json_mod = py.import("json")
+            let json_mod = py
+                .import("json")
                 .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-            let args_dict = json_mod.call_method1("loads", (arg_json,))
+            let args_dict = json_mod
+                .call_method1("loads", (arg_json,))
                 .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-            tool.callback.clone_ref(py).call1(py, (args_dict,))
+            tool.callback
+                .clone_ref(py)
+                .call1(py, (args_dict,))
                 .map_err(|e: PyErr| agent::ToolError::ExecutionFailed(e.to_string()))
         })?;
 
         Python::attach(|py| -> Result<serde_json::Value, agent::ToolError> {
-            let result_str = py_arg.bind(py).extract::<String>()
+            let result_str = py_arg
+                .bind(py)
+                .extract::<String>()
                 .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-            serde_json::from_str(&result_str).map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))
+            serde_json::from_str(&result_str)
+                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))
         })
     }
 }
@@ -344,9 +372,9 @@ impl PyAgentRpcClient {
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let rpc = {
-                let guard = client
-                    .lock()
-                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned"))?;
+                let guard = client.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned")
+                })?;
                 guard.clone()
             };
             let result = rpc.list().await.map_err(to_py_runtime_error)?;
@@ -366,12 +394,15 @@ impl PyAgentRpcClient {
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let rpc = {
-                let guard = client
-                    .lock()
-                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned"))?;
+                let guard = client.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned")
+                })?;
                 guard.clone()
             };
-            let result = rpc.call(&tool_name, args).await.map_err(to_py_runtime_error)?;
+            let result = rpc
+                .call(&tool_name, args)
+                .await
+                .map_err(to_py_runtime_error)?;
             Python::attach(|py| json_to_py(py, &result))
         })
     }
@@ -381,9 +412,9 @@ impl PyAgentRpcClient {
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let rpc = {
-                let guard = client
-                    .lock()
-                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned"))?;
+                let guard = client.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned")
+                })?;
                 guard.clone()
             };
             let result = rpc.llm_run(&task).await.map_err(to_py_runtime_error)?;
@@ -476,7 +507,9 @@ impl PyAgent {
                 .timeout(cfg.timeout_secs)
                 .context_compaction_threshold_tokens(cfg.context_compaction_threshold_tokens)
                 .context_compaction_trigger_ratio(cfg.context_compaction_trigger_ratio)
-                .context_compaction_keep_recent_messages(cfg.context_compaction_keep_recent_messages)
+                .context_compaction_keep_recent_messages(
+                    cfg.context_compaction_keep_recent_messages,
+                )
                 .context_compaction_max_summary_chars(cfg.context_compaction_max_summary_chars)
                 .context_compaction_summary_max_tokens(cfg.context_compaction_summary_max_tokens)
                 .build()
@@ -544,15 +577,17 @@ impl PyAgent {
             let mut guard = agent
                 .lock()
                 .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-            
+
             // Extract server name from endpoint (e.g., "zenoh://python_agent" -> "python_agent/tool_name")
             let endpoint_path = if server_endpoint.starts_with("zenoh/") {
-                let server_name = server_endpoint.strip_prefix("zenoh/").unwrap_or("python_agent");
+                let server_name = server_endpoint
+                    .strip_prefix("zenoh/")
+                    .unwrap_or("python_agent");
                 format!("{}/{}", server_name, tool_name)
             } else {
                 format!("{}/{}", server_endpoint, tool_name)
             };
-            
+
             guard
                 .add_remote_agent_tool(tool_name, endpoint_path, session)
                 .map_err(to_py_runtime_error)?;
@@ -593,27 +628,27 @@ impl PyAgent {
     fn stream<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
         let agent = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
-        
+
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let agent_clone = agent.lock()
+            let agent_clone = agent
+                .lock()
                 .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?
                 .clone();
-            
+
             let (tx, rx) = mpsc::channel::<Result<String, String>>(32);
-            
+
             tokio::spawn(async move {
                 let mut stream = agent_clone.stream(&task);
                 while let Some(token_result) = stream.next().await {
                     let item = match token_result {
                         Ok(StreamToken::Text(text)) => Ok(text),
-                        Ok(StreamToken::ToolCall { name, args, id }) => Ok(
-                            serde_json::json!({
-                                "type": "tool_call",
-                                "name": name,
-                                "args": args,
-                                "id": id
-                            }).to_string()
-                        ),
+                        Ok(StreamToken::ToolCall { name, args, id }) => Ok(serde_json::json!({
+                            "type": "tool_call",
+                            "name": name,
+                            "args": args,
+                            "id": id
+                        })
+                        .to_string()),
                         Ok(StreamToken::Done) => break,
                         Err(e) => Err(e.to_string()),
                     };
@@ -622,7 +657,7 @@ impl PyAgent {
                     }
                 }
             });
-            
+
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let iter = PyStreamIterator {
                     inner: Arc::new(tokio::sync::Mutex::new(Some(rx))),
@@ -632,7 +667,7 @@ impl PyAgent {
         })
     }
 
-fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let guard = self
             .inner
             .lock()
@@ -663,7 +698,9 @@ fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
             "temperature".to_string(),
             serde_json::Value::Number(
                 serde_json::Number::from_f64(cfg.temperature as f64).ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err("Unable to convert temperature to JSON")
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "Unable to convert temperature to JSON",
+                    )
                 })?,
             ),
         );
@@ -697,9 +734,9 @@ fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
                 std::sync::Arc::<bus::Session>::from(bus_copy)
             };
             let client = {
-                let guard = agent
-                    .lock()
-                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+                let guard = agent.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
+                })?;
                 guard.rpc_client(endpoint, session)
             };
             Ok(PyAgentRpcClient {
@@ -725,12 +762,12 @@ fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
             };
             // Create the server in a nested scope so the guard is dropped before await
             let mut server = {
-                let guard = agent
-                    .lock()
-                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+                let guard = agent.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
+                })?;
                 guard.as_callable_server(endpoint, session)
             }; // guard is dropped here
-            // Start the server
+               // Start the server
             if let Err(e) = server.start().await {
                 return Err(to_py_runtime_error(e));
             }
@@ -811,18 +848,24 @@ fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let agent = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let client = agent::McpClient::spawn(&command, args.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice())
-                .await
-                .map_err(to_py_runtime_error)?;
+            let client = agent::McpClient::spawn(
+                &command,
+                args.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )
+            .await
+            .map_err(to_py_runtime_error)?;
             let client = Arc::new(client);
 
             client.initialize().await.map_err(to_py_runtime_error)?;
             let mcp_tools = client.list_tools().await.map_err(to_py_runtime_error)?;
 
             {
-                let mut guard = agent
-                    .lock()
-                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+                let mut guard = agent.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
+                })?;
                 for tool_def in &mcp_tools {
                     let namespaced = format!("{}/{}", namespace, tool_def.name);
                     let adapter = agent::McpToolAdapter::new(
@@ -855,9 +898,9 @@ fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
             let mcp_tools = client.list_tools().await.map_err(to_py_runtime_error)?;
 
             {
-                let mut guard = agent
-                    .lock()
-                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+                let mut guard = agent.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
+                })?;
                 for tool_def in &mcp_tools {
                     let namespaced = format!("{}/{}", namespace, tool_def.name);
                     let adapter = agent::McpToolAdapter::new(
@@ -904,7 +947,11 @@ fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         })
     }
 
-    fn list_mcp_resources<'py>(&self, py: Python<'py>, namespace: String) -> PyResult<Bound<'py, PyAny>> {
+    fn list_mcp_resources<'py>(
+        &self,
+        py: Python<'py>,
+        namespace: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let agent = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {

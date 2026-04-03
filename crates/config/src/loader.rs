@@ -81,13 +81,13 @@ impl ConfigLoader {
         self
     }
 
-// Mutable builder methods for Python bindings
-pub fn discover_mut(&mut self) -> &mut Self {
-    self.discover_locations();
-    self
-}
+    // Mutable builder methods for Python bindings
+    pub fn discover_mut(&mut self) -> &mut Self {
+        self.discover_locations();
+        self
+    }
 
-pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
+    pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
         let path = path.as_ref().to_string_lossy().to_string();
         self.sources.push(ConfigSource::File(path));
         self.cached_config = None;
@@ -393,10 +393,14 @@ pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Failed to read config file '{}': {}", path, e);
-                return Err(ConfigError::LoadError(anyhow::anyhow!("Failed to read {}: {}", path, e)));
+                return Err(ConfigError::LoadError(anyhow::anyhow!(
+                    "Failed to read {}: {}",
+                    path,
+                    e
+                )));
             }
         };
-        
+
         let value = match Self::parse_content(&content, format) {
             Ok(v) => v,
             Err(e) => {
@@ -620,10 +624,14 @@ pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to read config file '{}': {}", path, e);
-                return Err(ConfigError::LoadError(anyhow::anyhow!("Failed to read {}: {}", path, e)));
+                return Err(ConfigError::LoadError(anyhow::anyhow!(
+                    "Failed to read {}: {}",
+                    path,
+                    e
+                )));
             }
         };
-        
+
         let value = match Self::parse_content(&content, format) {
             Ok(v) => v,
             Err(e) => {
@@ -792,8 +800,12 @@ mod tests {
         let override_dir = tmp.path().join("override");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::create_dir_all(&override_dir).unwrap();
-        std::fs::write(base.join("config.toml"), r#"x = 1
-y = 1"#).unwrap();
+        std::fs::write(
+            base.join("config.toml"),
+            r#"x = 1
+y = 1"#,
+        )
+        .unwrap();
         std::fs::write(override_dir.join("config.toml"), r#"y = 2"#).unwrap();
 
         let mut loader = ConfigLoader::new();
@@ -818,7 +830,10 @@ y = 1"#).unwrap();
         for src in sources {
             match src {
                 ConfigSource::Directory(dir) => {
-                    assert!(Path::new(dir).exists(), "discover should only add existing dirs");
+                    assert!(
+                        Path::new(dir).exists(),
+                        "discover should only add existing dirs"
+                    );
                 }
                 _ => {}
             }
@@ -837,13 +852,15 @@ y = 1"#).unwrap();
             return;
         }
 
-        let mut loader = ConfigLoader::new()
-            .discover();
+        let mut loader = ConfigLoader::new().discover();
         let config = loader.load().await.unwrap();
 
         assert!(!config.as_object().unwrap().is_empty());
         assert_eq!(
-            config.get("general").and_then(|v| v.get("name")).and_then(|v| v.as_str()),
+            config
+                .get("general")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str()),
             Some("brainos")
         );
     }

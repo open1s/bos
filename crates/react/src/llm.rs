@@ -1,7 +1,6 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -30,6 +29,22 @@ pub enum LlmError {
     Other(String),
 }
 
+pub trait Stringfy: Serialize + for<'de> Deserialize<'de> {
+    fn yaml(&self) -> String;
+    fn json(&self) -> String;
+
+    fn to_value(&self) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(&self)
+    }
+
+    fn from_value(value: &Value) -> Result<Self, serde_json::Error>
+    where
+        Self: Sized,
+    {
+        serde_json::from_value(value.clone())
+    }
+}
+
 impl From<reqwest::Error> for LlmError {
     fn from(e: reqwest::Error) -> Self {
         if e.is_timeout() {
@@ -52,7 +67,7 @@ pub enum LlmMessage {
         content: String,
     },
     AssistantToolCall {
-        id: String,
+        tool_call_id: String,
         name: String,
         args: Value,
     },
@@ -89,7 +104,7 @@ impl LlmMessage {
         args: Value,
     ) -> Self {
         Self::AssistantToolCall {
-            id: id.into(),
+            tool_call_id: id.into(),
             name: name.into(),
             args,
         }
@@ -109,24 +124,100 @@ impl<T: Into<String>> From<T> for LlmMessage {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmRequest {
     pub model: String,
     pub context: LlmContext,
-    pub temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Skill {
+    pub category: String,
+    pub description: String,
+    pub name: String,
+}
+
+impl Stringfy for Skill {
+    fn yaml(&self) -> String {
+        serde_yaml::to_string(&self).unwrap()
+    }
+
+    fn json(&self) -> String {
+        serde_json::to_string(&self).unwrap()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl Stringfy for LlmTool {
+    fn yaml(&self) -> String {
+        serde_yaml::to_string(&self).unwrap()
+    }
+
+    fn json(&self) -> String {
+        serde_json::to_string(&self).unwrap()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Rule {
+    pub name: String,
+    pub content: String,
+}
+
+impl Stringfy for Rule {
+    fn yaml(&self) -> String {
+        serde_yaml::to_string(&self).unwrap()
+    }
+
+    fn json(&self) -> String {
+        serde_json::to_string(&self).unwrap()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Instruction {
+    pub instruction: String,
+    pub description: String,
+    pub name: String,
+    pub dependon: Option<Vec<String>>,
+}
+
+impl Stringfy for Instruction {
+    fn yaml(&self) -> String {
+        serde_yaml::to_string(&self).unwrap()
+    }
+
+    fn json(&self) -> String {
+        serde_json::to_string(&self).unwrap()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmContext {
-    pub system: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<Value>,
+    pub tools: Vec<LlmTool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub skills: Vec<Value>,
+    pub skills: Vec<Skill>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub history: Vec<LlmMessage>,
-    pub user_input: String,
+    pub conversations: Vec<LlmMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<Rule>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub instructions: Vec<Instruction>,
 }
 
 impl LlmRequest {
@@ -134,14 +225,16 @@ impl LlmRequest {
         Self {
             model: model.into(),
             context: LlmContext {
-                system: String::new(),
                 tools: Vec::new(),
                 skills: Vec::new(),
-                history: Vec::new(),
-                user_input: String::new(),
+                conversations: Vec::new(),
+                rules: Vec::new(),
+                instructions: Vec::new(),
             },
-            temperature: 0.7,
+            temperature: Some(0.7),
             max_tokens: None,
+            top_p: None,
+            top_k: None,
         }
     }
 
@@ -150,27 +243,27 @@ impl LlmRequest {
     }
 
     pub fn message(mut self, msg: LlmMessage) -> Self {
-        self.context.history.push(msg);
+        self.context.conversations.push(msg);
         self
     }
 
     pub fn user_message(mut self, content: impl Into<String>) -> Self {
-        self.context.user_input = content.into();
+        self.context.conversations.push(LlmMessage::user(content));
         self
     }
 
     pub fn system_message(mut self, content: impl Into<String>) -> Self {
-        self.context.system = content.into();
+        self.context.conversations.push(LlmMessage::system(content));
         self
     }
 
     pub fn messages(mut self, msgs: impl IntoIterator<Item = LlmMessage>) -> Self {
-        self.context.history.extend(msgs);
+        self.context.conversations.extend(msgs);
         self
     }
 
     pub fn temperature(mut self, temp: f32) -> Self {
-        self.temperature = temp;
+        self.temperature = Some(temp);
         self
     }
 
@@ -179,13 +272,33 @@ impl LlmRequest {
         self
     }
 
-    pub fn tools(mut self, tools: Vec<Value>) -> Self {
+    pub fn tools(mut self, tools: Vec<LlmTool>) -> Self {
         self.context.tools = tools;
         self
     }
 
-    pub fn skills(mut self, skills: Vec<Value>) -> Self {
+    pub fn skills(mut self, skills: Vec<Skill>) -> Self {
         self.context.skills = skills;
+        self
+    }
+
+    pub fn rules(mut self, rules: Vec<Rule>) -> Self {
+        self.context.rules = rules;
+        self
+    }
+
+    pub fn instructions(mut self, instructions: Vec<Instruction>) -> Self {
+        self.context.instructions = instructions;
+        self
+    }
+
+    pub fn top_p(mut self, top_p: f32) -> Self {
+        self.top_p = Some(top_p);
+        self
+    }
+
+    pub fn top_k(mut self, top_k: u32) -> Self {
+        self.top_k = Some(top_k);
         self
     }
 }
@@ -206,10 +319,12 @@ impl fmt::Debug for LlmRequest {
             context: &'a LlmContext,
         }
 
-        let rounded_temperature = (self.temperature as f64 * 1000.0).round() / 1000.0;
+        let rounded_temperature = self
+            .temperature
+            .map(|t| (t as f64 * 1000.0).round() / 1000.0);
         let payload = PrettyRequest {
             model: &self.model,
-            temperature: rounded_temperature,
+            temperature: rounded_temperature.unwrap_or(0.7),
             max_tokens: self.max_tokens,
             context: &self.context,
         };
@@ -220,8 +335,12 @@ impl fmt::Debug for LlmRequest {
                 .debug_struct("LlmRequest")
                 .field("model", &self.model)
                 .field("temperature", &self.temperature)
+                .field("top_p", &self.top_p)
+                .field("top_k", &self.top_k)
                 .field("max_tokens", &self.max_tokens)
                 .field("context", &self.context)
+                .field("rules", &self.context.rules)
+                .field("instructions", &self.context.instructions)
                 .finish(),
         }
     }

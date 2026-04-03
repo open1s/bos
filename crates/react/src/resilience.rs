@@ -1,6 +1,7 @@
 // Resilience layer for ReAct engine: Circuit Breaker and Rate Limiter.
 // This module provides simple, production-friendly resilience patterns.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -253,17 +254,18 @@ impl Clone for CircuitBreaker {
     }
 }
 
-/// Thread-safe rate limiter using fixed-window algorithm.
+/// Thread-safe rate limiter using sliding window algorithm.
+/// Tracks individual request timestamps for more accurate rate limiting.
 #[derive(Debug)]
 pub struct RateLimiter {
     config: RateLimiterConfig,
-    used: Arc<AtomicU64>,
-    window_start: Arc<Mutex<Instant>>,
+    /// Sorted timestamps of recent requests (oldest first).
+    timestamps: Arc<Mutex<VecDeque<Instant>>>,
 }
 
 impl RateLimiter {
-    fn lock_window_start(&self) -> std::sync::MutexGuard<'_, Instant> {
-        self.window_start
+    fn lock_timestamps(&self) -> std::sync::MutexGuard<'_, VecDeque<Instant>> {
+        self.timestamps
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -272,8 +274,7 @@ impl RateLimiter {
     pub fn new(config: RateLimiterConfig) -> Self {
         Self {
             config,
-            used: Arc::new(AtomicU64::new(0)),
-            window_start: Arc::new(Mutex::new(Instant::now())),
+            timestamps: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -316,39 +317,50 @@ impl RateLimiter {
     }
 
     fn try_acquire(&self) -> Result<(), ResilienceError<()>> {
-        let mut window_start = self.lock_window_start();
+        let mut timestamps = self.lock_timestamps();
         let now = Instant::now();
-        let window_duration = self.config.window;
+        let window = self.config.window;
 
-        if now.duration_since(*window_start) >= window_duration {
-            *window_start = now;
-            self.used.store(0, Ordering::Relaxed);
+        while let Some(oldest) = timestamps.front() {
+            if now.duration_since(*oldest) >= window {
+                timestamps.pop_front();
+            } else {
+                break;
+            }
         }
 
-        let current = self.used.load(Ordering::Relaxed) as u32;
-        if current < self.config.capacity {
-            self.used.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        } else {
+        let current_count = timestamps.len() as u32;
+        if current_count >= self.config.capacity {
             log::warn!(
                 "[RateLimiter] Rate limit exceeded (capacity: {}, window: {:?})",
                 self.config.capacity,
-                window_duration
+                window
             );
-            Err(ResilienceError::RateLimited)
+            return Err(ResilienceError::RateLimited);
         }
+
+        timestamps.push_back(now);
+        Ok(())
     }
 
-    /// Get remaining capacity (for observability).
     pub fn remaining(&self) -> u32 {
-        let used = self.used.load(Ordering::Relaxed) as u32;
-        self.config.capacity.saturating_sub(used)
+        let timestamps = self.lock_timestamps();
+        let now = Instant::now();
+        let window = self.config.window;
+
+        let valid_count = timestamps
+            .iter()
+            .filter(|t| now.duration_since(**t) < window)
+            .count() as u32;
+        self.config.capacity.saturating_sub(valid_count)
     }
 
     /// Get window reset time (for observability).
     pub fn reset_at(&self) -> Option<Instant> {
-        let window_start = *self.lock_window_start();
-        Some(window_start + self.config.window)
+        let timestamps = self.lock_timestamps();
+        timestamps
+            .front()
+            .map(|oldest| *oldest + self.config.window)
     }
 }
 
@@ -356,8 +368,7 @@ impl Clone for RateLimiter {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            used: Arc::clone(&self.used),
-            window_start: Arc::clone(&self.window_start),
+            timestamps: Arc::clone(&self.timestamps),
         }
     }
 }
@@ -390,7 +401,7 @@ impl ReActResilience {
     }
 
     /// Execute an async function with resilience checks.
-    /// Checks rate limiter first (with auto-wait if enabled), then circuit breaker, then executes the function.
+    /// Checks rate limiter first (with auto-wait), then circuit breaker, then executes the function.
     /// Automatically retries on transient errors (429, timeout).
     pub async fn execute<F, Fut, T, E>(&self, mut op: F) -> Result<T, ResilienceError<E>>
     where
@@ -402,17 +413,15 @@ impl ReActResilience {
         let base_backoff = Duration::from_millis(500);
 
         for attempt in 0..=max_retries {
-            // 1) Rate limit check (always use acquire for retry logic)
+            // Rate limit check - use acquire() to wait when about to exceed
             if let Some(limiter) = &self.rate_limiter {
-                match limiter.try_acquire() {
-                    Ok(()) => {}
-                    Err(ResilienceError::RateLimited) => {
+                if let Err(_) = limiter.acquire().await {
+                    if attempt < max_retries {
                         let duration = base_backoff * (1 << attempt).min(6);
                         tokio::time::sleep(duration).await;
                         continue;
                     }
-                    Err(ResilienceError::CircuitOpen) => return Err(ResilienceError::CircuitOpen),
-                    Err(ResilienceError::Inner(())) => {}
+                    return Err(ResilienceError::RateLimited);
                 }
             }
 

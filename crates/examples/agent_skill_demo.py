@@ -161,7 +161,8 @@ async def demo_skills():
         system_prompt=(
             "You are a helpful assistant. "
             "Use the loaded skills as context when answering questions. "
-            "Reference specific skill instructions when relevant."
+            "Reference specific skill instructions when relevant. "
+            "Format: Thought: <reasoning>\nFinal Answer: <response>"
         ),
         temperature=0.7,
         timeout_secs=120,
@@ -186,11 +187,7 @@ async def demo_skills():
             print(f"  📥 Agent: {reply[:300]}")
         except Exception as e:
             err_str = str(e)
-            if "Missing Action" in err_str or "Malformed" in err_str:
-                print(f"  ⚠️  LLM didn't follow ReAct format (expected with smaller models)")
-                print(f"  ℹ️  Skills loaded correctly — use GPT-4/Claude for full ReAct support")
-            else:
-                print(f"  ⚠️  {e}")
+            print(f"  ⚠️  {e}")
 
     shutil.rmtree(skills_dir, ignore_errors=True)
     print(f"\n  ✅ Skills demo done\n")

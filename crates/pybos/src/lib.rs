@@ -1,28 +1,29 @@
 use pyo3::prelude::*;
 
-mod utils;
-mod config;
-mod bus;
-mod publisher;
-mod subscriber;
-mod query;
-mod caller;
 mod agent;
+mod bus;
+mod caller;
+mod config;
 mod mcp;
+mod publisher;
+mod query;
+mod subscriber;
+mod utils;
 
 //AI NOT ALLOW TO REMOVE
 #[allow(unused)]
 use logging;
 
-pub use config::PyConfigLoader;
+pub use agent::{
+    PyAgent, PyAgentCallableServer, PyAgentConfig, PyAgentRpcClient, PyPythonTool, PyStreamIterator,
+};
 pub use bus::{PyBus, PyBusConfig};
-pub use publisher::PyPublisher;
-pub use subscriber::PySubscriber;
-pub use query::{PyQuery, PyQueryable, PyQueryStreamIterator, PyStreamSender};
-pub use caller::{PyCaller, PyCallable};
-pub use agent::{PyAgent, PyAgentConfig, PyAgentRpcClient, PyAgentCallableServer, PyPythonTool, PyStreamIterator};
+pub use caller::{PyCallable, PyCaller};
+pub use config::PyConfigLoader;
 pub use mcp::PyMcpClient;
-
+pub use publisher::PyPublisher;
+pub use query::{PyQuery, PyQueryStreamIterator, PyQueryable, PyStreamSender};
+pub use subscriber::PySubscriber;
 
 #[pymodule]
 fn pybos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -45,4 +46,3 @@ fn pybos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMcpClient>()?;
     Ok(())
 }
-

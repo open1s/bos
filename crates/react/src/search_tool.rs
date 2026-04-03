@@ -10,6 +10,11 @@ impl Tool for SearchTool {
     fn description(&self) -> String {
         "Perform a lightweight search over a fixed dataset".to_string()
     }
+
+    fn category(&self) -> String {
+        "search".to_string()
+    }
+
     fn run(&self, input: &Value) -> Result<Value, ToolError> {
         let q = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
         if q.is_empty() {

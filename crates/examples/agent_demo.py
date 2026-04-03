@@ -15,17 +15,21 @@ from datetime import datetime, timezone
 
 from pybos import Agent, AgentConfig, Bus, BusConfig, PythonTool
 
-API_KEY = os.environ.get(
-    "OPENAI_API_KEY",
-    "nvapi-xxxx",
-)
+from pybos import Agent, AgentConfig, Bus, BusConfig, PythonTool, ConfigLoader
+
+loader = ConfigLoader()
+loader.discover()
+_config = loader.load_sync()
+_global = _config.get("global_model", {})
+
+API_KEY = os.environ.get("OPENAI_API_KEY") or _global.get("api_key", "")
 
 BASE_URL = os.environ.get(
     "LLM_BASE_URL",
-    "https://integrate.api.nvidia.com/v1",
+    _global.get("base_url", "https://integrate.api.nvidia.com/v1"),
 )
 
-MODEL = os.environ.get("LLM_MODEL", "nvidia/meta/llama-3.1-8b-instruct")
+MODEL = os.environ.get("LLM_MODEL", _global.get("model", "nvidia/meta/llama-3.1-8b-instruct"))
 
 
 # ── Tool implementations ──────────────────────────────────────────────
