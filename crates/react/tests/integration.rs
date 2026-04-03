@@ -61,7 +61,7 @@ async fn test_react_engine_basic() {
         .build()
         .unwrap();
 
-    let result = engine.run("What is 2+2?").await;
+    let result = engine.react("What is 2+2?").await;
     if let Err(e) = &result {
         eprintln!("Error: {:?}", e);
     }
@@ -78,6 +78,6 @@ async fn test_react_engine_no_tool() {
         .build()
         .unwrap();
 
-    let result = engine.run("What is the answer?").await;
+    let result = engine.react("What is the answer?").await;
     assert!(result.is_ok());
 }

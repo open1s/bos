@@ -74,7 +74,11 @@ impl HFVendor {
     fn build_input(&self, req: &LlmRequest) -> String {
         let mut input = String::new();
 
-        for message in &req.messages {
+        if !req.context.system.is_empty() {
+            input.push_str(&format!("System: {}\n", req.context.system));
+        }
+
+        for message in &req.context.history {
             match message {
                 crate::llm::LlmMessage::System { content } => {
                     input.push_str(&format!("System: {}\n", content));
@@ -95,6 +99,10 @@ impl HFVendor {
                     input.push_str(&format!("Tool result: {}\n", content));
                 }
             }
+        }
+
+        if !req.context.user_input.is_empty() {
+            input.push_str(&format!("User: {}\n", req.context.user_input));
         }
 
         input

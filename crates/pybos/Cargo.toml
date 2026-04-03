@@ -18,7 +18,7 @@ config = { path = "../config" }
 logging = { path = "../logging" }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39", "serde"] }
+pyo3 = { version = "0.28", features = ["extension-module", "serde"] }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 async-trait = "0.1"
 futures = { workspace = true }

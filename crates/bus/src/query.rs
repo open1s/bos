@@ -60,6 +60,12 @@ impl Query {
 
         let results = self.query_internal_bytes(&bytes, None).await?;
 
+        if results.is_empty() {
+            return Err(ZenohError::Query(
+                "No replies received — query may have timed out or no callable is listening".to_string(),
+            ));
+        }
+
         let result: R = codec
             .decode(results[0].as_slice())
             .map_err(|e| ZenohError::Serialization(e.to_string()))?;

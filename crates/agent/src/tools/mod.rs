@@ -26,6 +26,9 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> ToolDescription;
     fn json_schema(&self) -> serde_json::Value;
+    fn is_skill(&self) -> bool {
+        false
+    }
 
     /// Get cached JSON schema as Arc for zero-copy access
     /// Default implementation wraps json_schema() in Arc
@@ -53,6 +56,10 @@ impl Tool for Box<dyn Tool> {
     async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         (**self).execute(args).await
     }
+
+    fn is_skill(&self) -> bool {
+        (**self).is_skill()
+    }
 }
 
 #[async_trait]
@@ -71,5 +78,9 @@ impl Tool for Arc<dyn Tool> {
 
     async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         (**self).execute(args).await
+    }
+
+    fn is_skill(&self) -> bool {
+        (**self).is_skill()
     }
 }

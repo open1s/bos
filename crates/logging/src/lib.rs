@@ -95,7 +95,9 @@ pub fn auto_init_tracing() {
         "error".to_string()
     };
 
-    let level = format!("bus={level},agent={level},pybos={level},zenoh=off,h2=off,rustls=off");
+    let level = format!(
+        "bus={level},agent={level},react={level},pybos={level},zenoh=off,h2=off,rustls=off"
+    );
 
     let logger = Logger::try_with_str(level)
         .unwrap()
@@ -135,6 +137,6 @@ mod tests {
             .and_then(|l| l.get("level"))
             .and_then(|v| v.as_str())
             .unwrap_or("error");
-        assert_eq!(level, "warn");
+        assert_eq!(level, "debug");
     }
 }

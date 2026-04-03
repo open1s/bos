@@ -56,7 +56,7 @@ fn plan_d_observability_memory_checkpoint() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let res = engine.run("2+3").await;
+        let res = engine.react("2+3").await;
         assert!(res.is_ok());
         let path = std::env::temp_dir().join("plan-d-observability-memory.json");
         engine

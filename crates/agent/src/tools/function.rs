@@ -12,6 +12,7 @@ pub struct FunctionTool {
     description: ToolDescription,
     schema: serde_json::Value,
     func: Arc<dyn Fn(&serde_json::Value) -> Result<serde_json::Value, ToolError> + Send + Sync>,
+    skill: bool,
 }
 
 impl FunctionTool {
@@ -30,6 +31,23 @@ impl FunctionTool {
             },
             schema,
             func: Arc::new(func),
+            skill: false,
+        }
+    }
+
+    pub fn skill<F>(name: &str, description: &str, schema: serde_json::Value, func: F) -> Self
+    where
+        F: Fn(&serde_json::Value) -> Result<serde_json::Value, ToolError> + Send + Sync + 'static,
+    {
+        Self {
+            name: name.to_string(),
+            description: ToolDescription {
+                short: description.to_string(),
+                parameters: "JSON object with function parameters".to_string(),
+            },
+            schema,
+            func: Arc::new(func),
+            skill: true,
         }
     }
 
@@ -81,6 +99,10 @@ impl Tool for FunctionTool {
 
     async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         (self.func)(args)
+    }
+
+    fn is_skill(&self) -> bool {
+        self.skill
     }
 }
 

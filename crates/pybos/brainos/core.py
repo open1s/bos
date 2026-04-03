@@ -85,6 +85,12 @@ class Agent:
             self._tools.append(t)
         return self
 
+    # ── Skills ─────────────────────────────────────────────────────
+
+    def register_skills(self, dir_path: str) -> Agent:
+        self._skills_dir = dir_path
+        return self
+
     # ── Lifecycle ──────────────────────────────────────────────────
 
     async def start(self) -> Agent:
@@ -99,6 +105,8 @@ class Agent:
                 callback=t.callback,
             )
             await self._agent.add_tool(py_tool)
+        if hasattr(self, '_skills_dir') and self._skills_dir:
+            await self._agent.register_skills_from_dir(self._skills_dir)
         return self
 
     # ── Interaction ────────────────────────────────────────────────
@@ -132,6 +140,12 @@ class Agent:
         if self._agent is None:
             await self.start()
         return await self._agent.stream(task)
+
+    async def react(self, task: str) -> str:
+        """Run the agent with ReAct reasoning (tool use)."""
+        if self._agent is None:
+            await self.start()
+        return await self._agent.react(task)
 
     @property
     def tools(self) -> list[str]:

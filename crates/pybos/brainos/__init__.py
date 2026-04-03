@@ -22,6 +22,17 @@ Usage:
 
 from brainos.core import BrainOS, Agent
 from brainos.tool import tool, ToolDef
+from brainos.bus import BusManager, Publisher, Subscriber
+from brainos.query import Query, Queryable
+from brainos.caller import Caller, Callable
+from brainos.config import Config
 
-__all__ = ["BrainOS", "Agent", "tool", "ToolDef"]
+__all__ = [
+    "BrainOS", "Agent",
+    "tool", "ToolDef",
+    "BusManager", "Publisher", "Subscriber",
+    "Query", "Queryable",
+    "Caller", "Callable",
+    "Config",
+]
 __version__ = "0.1.0"

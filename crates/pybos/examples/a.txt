@@ -1,0 +1,74 @@
+struct LlmContext {
+    system: String,
+    tools: Vec<Tool>,
+    skills: Vec<Skill>,
+    history: Vec<Message>,
+    user_input: Message,
+    runtime: RuntimeContext,
+}
+
+
+messages:
+- System
+  content: |
+    You are a helpful assistant. Use the loaded skills as context when answering questions. Reference specific skill instructions when relevant.
+    -----------------------------------------
+    You MUST respond using this exact format:
+    Thought: <your reasoning>
+    Action: <tool name>
+    Action Input: <tool input as JSON>
+    ------------------------------------------
+    When you have the final answer, respond with:
+    Thought: <your reasoning>
+    Final Answer: <your answer>
+    ------------------------------------------
+- User
+  content: |-
+    You response should follow below rule:
+    -----------------------------------------
+    To use a tool, respond with:
+    Thought: <your reasoning>
+    Action: <tool name>
+    Action Input: <tool input as JSON>
+    -----------------------------------------
+    When you have the final answer, respond with:
+    Thought: <your reasoning>
+    Final Answer: <your answer>
+    -----------------------------------------
+    User input: How should I handle database connections and retries?
+- Assistant
+  content: |-
+    Thought: The user is asking about handling database connections and retries, which suggests they want to load a skill related to database management or error handling.
+    Action: load_skill
+    Action Input: {"skill_name": "Database Connection Management"}
+- ToolResult
+  tool_call_id: load_skill
+  content: '{"error":"Skill ''unknown'' not found. Available: python-coding, database-ops, api-design"}'
+- Assistant
+  content: |-
+    Thought: The user's request for database connection management doesn't match the available skills. I'll try to find a related skill.
+    Action: load_skill
+    Action Input: {"skill_name": "python-coding"}
+- !ToolResult
+  tool_call_id: load_skill
+  content: '{"error":"Skill ''unknown'' not found. Available: python-coding, database-ops, api-design"}'
+tools(call should follow parameters schema ):
+- "name": "web_search",
+  "description": "Search the web for up-to-date information",
+  "parameters": {
+        "type": "object",
+        "properties": {
+            "query": { "type": "string" }
+        },
+        "required": ["query"]
+   }
+Available skills (use `load_skill` tool to load instructions):
+- category: other
+  description: Database query patterns and connection management
+  name: database-ops
+- category: other
+  description: REST API design patterns and conventions
+  name: api-design
+- category: other
+  description: Python coding conventions and best practices for the project
+  name: python-coding

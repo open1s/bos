@@ -48,6 +48,12 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> String;
     fn run(&self, input: &Value) -> Result<Value, ToolError>;
+    fn json_schema(&self) -> Value {
+        serde_json::json!({})
+    }
+    fn is_skill(&self) -> bool {
+        false
+    }
 }
 
 pub struct ToolRegistry {
@@ -73,6 +79,22 @@ impl ToolRegistry {
     pub fn insert(&mut self, t: Box<dyn Tool>) {
         self.tools.insert(t.name().to_string(), t);
     }
+
+    pub fn to_openai_tools(&self) -> Vec<serde_json::Value> {
+        self.tools
+            .values()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name(),
+                        "description": tool.description(),
+                    }
+                })
+            })
+            .collect()
+    }
+
     pub fn call(&self, name: &str, input: &Value) -> Result<Value, ToolError> {
         if let Some(t) = self.tools.get(name) {
             t.run(input)

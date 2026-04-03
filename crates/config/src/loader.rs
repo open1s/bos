@@ -1,6 +1,6 @@
 use crate::error::{ConfigError, ConfigResult};
 use crate::types::{ConfigFormat, ConfigMergeStrategy, ConfigMetadata, ConfigSource};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -619,7 +619,7 @@ pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
         let content = match tokio::fs::read_to_string(path_obj).await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Failed to read config file '{}': {}", path, e);
+                error!("Failed to read config file '{}': {}", path, e);
                 return Err(ConfigError::LoadError(anyhow::anyhow!("Failed to read {}: {}", path, e)));
             }
         };
@@ -627,10 +627,12 @@ pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
         let value = match Self::parse_content(&content, format) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Failed to parse config file '{}': {}", path, e);
+                error!("Failed to parse config file '{}': {}", path, e);
                 return Err(e);
             }
         };
+
+        info!("Loaded config file '{}'", path);
 
         Ok((path.to_string(), value))
     }
@@ -664,7 +666,7 @@ pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
             let path_str = match path.to_str() {
                 Some(s) => s,
                 None => {
-                    debug!("跳过无法转换为 UTF-8 的文件路径: {:?}", path);
+                    error!("跳过无法转换为 UTF-8 的文件路径: {:?}", path);
                     continue;
                 }
             };
@@ -673,7 +675,7 @@ pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
                     merged = Self::deep_merge_json(merged, value);
                 }
                 Err(e) => {
-                    debug!("跳过文件 {:?}: {:#}", path, e);
+                    error!("跳过文件 {:?}: {:#}", path, e);
                     continue;
                 }
             }

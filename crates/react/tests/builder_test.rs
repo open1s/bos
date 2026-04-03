@@ -69,7 +69,7 @@ fn test_builder_pattern() {
         .expect("Failed to build engine");
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async { engine.run("2+3").await });
+    let result = rt.block_on(async { engine.react("2+3").await });
     assert_eq!(result.unwrap(), "5");
 }
 

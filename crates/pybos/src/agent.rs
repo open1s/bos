@@ -1,15 +1,15 @@
+use crate::bus::PyBus;
+use crate::utils::{invoke_python_handler_to_pyany, json_to_py, to_py_runtime_error};
+use agent::{Agent, AgentCallableServer, AgentConfig, AgentRpcClient, StreamToken, Tool, ToolDescription};
+use async_trait::async_trait;
+use bus;
+use futures::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use pyo3::IntoPyObjectExt;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use async_trait::async_trait;
-use futures::StreamExt;
 use tokio::sync::mpsc;
-use agent::{Agent, AgentConfig, AgentCallableServer, AgentRpcClient, StreamToken, Tool, ToolDescription};
-use bus;
-use crate::bus::PyBus;
-use crate::utils::{to_py_runtime_error, json_to_py, invoke_python_handler_to_pyany};
 
 /// Async iterator that yields tokens from the agent stream.
 /// Implements Python's async iteration protocol (__anext__).
@@ -188,6 +188,8 @@ pub struct PyAgentConfig {
     #[pyo3(get, set)]
     pub timeout_secs: u64,
     #[pyo3(get, set)]
+    pub max_steps: usize,
+    #[pyo3(get, set)]
     pub context_compaction_threshold_tokens: usize,
     #[pyo3(get, set)]
     pub context_compaction_trigger_ratio: f32,
@@ -211,6 +213,7 @@ impl Default for PyAgentConfig {
             temperature: c.temperature,
             max_tokens: c.max_tokens,
             timeout_secs: c.timeout_secs,
+            max_steps: 10,
             context_compaction_threshold_tokens: c.context_compaction_threshold_tokens,
             context_compaction_trigger_ratio: c.context_compaction_trigger_ratio,
             context_compaction_keep_recent_messages: c.context_compaction_keep_recent_messages,
@@ -231,6 +234,7 @@ impl From<PyAgentConfig> for AgentConfig {
             temperature: value.temperature,
             max_tokens: value.max_tokens,
             timeout_secs: value.timeout_secs,
+            max_steps: value.max_steps,
             rate_limit: None,
             context_compaction_threshold_tokens: value.context_compaction_threshold_tokens,
             context_compaction_trigger_ratio: value.context_compaction_trigger_ratio,
@@ -334,6 +338,58 @@ impl PyAgentRpcClient {
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned"))?;
         Ok(guard.endpoint().to_string())
     }
+
+    fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let rpc = {
+                let guard = client
+                    .lock()
+                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned"))?;
+                guard.clone()
+            };
+            let result = rpc.list().await.map_err(to_py_runtime_error)?;
+            Python::attach(|py| json_to_py(py, &result))
+        })
+    }
+
+    fn call<'py>(
+        &self,
+        py: Python<'py>,
+        tool_name: String,
+        args_json: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let args: serde_json::Value = serde_json::from_str(&args_json)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let rpc = {
+                let guard = client
+                    .lock()
+                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned"))?;
+                guard.clone()
+            };
+            let result = rpc.call(&tool_name, args).await.map_err(to_py_runtime_error)?;
+            Python::attach(|py| json_to_py(py, &result))
+        })
+    }
+
+    fn llm_run<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let rpc = {
+                let guard = client
+                    .lock()
+                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Client lock poisoned"))?;
+                guard.clone()
+            };
+            let result = rpc.llm_run(&task).await.map_err(to_py_runtime_error)?;
+            Python::attach(|py| json_to_py(py, &result))
+        })
+    }
 }
 
 #[pyclass(name = "AgentCallableServer", skip_from_py_object)]
@@ -350,6 +406,11 @@ impl PyAgentCallableServer {
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Server lock poisoned"))?;
         Ok(guard.endpoint().to_string())
+    }
+
+    fn is_started(&self) -> PyResult<bool> {
+        // CallableServer auto-starts on creation; always true after construction
+        Ok(true)
     }
 
     // Note: start() is called automatically when the server is created
@@ -499,7 +560,7 @@ impl PyAgent {
         })
     }
 
-    fn run<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
+    fn react<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
         let agent = {
             let guard = self
                 .inner
@@ -509,25 +570,25 @@ impl PyAgent {
         };
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let out = agent.run(&task).await.map_err(to_py_runtime_error)?;
+            let out = agent.react(&task).await.map_err(to_py_runtime_error)?;
             Ok(out)
         })
     }
 
-fn run_simple<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
-    let agent = {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        guard.clone()
-    };
-    let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
-    pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-        let out = agent.run_simple(&task).await.map_err(to_py_runtime_error)?;
-        Ok(out)
-    })
-}
+    fn run_simple<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
+        let agent = {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+            guard.clone()
+        };
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let out = agent.run_simple(&task).await.map_err(to_py_runtime_error)?;
+            Ok(out)
+        })
+    }
 
     fn stream<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
         let agent = self.inner.clone();
@@ -743,7 +804,7 @@ fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
     fn add_mcp_server<'py>(
         &self,
         py: Python<'py>,
-        _namespace: String,
+        namespace: String,
         command: String,
         args: Vec<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -763,8 +824,45 @@ fn config(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
                     .lock()
                     .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
                 for tool_def in &mcp_tools {
+                    let namespaced = format!("{}/{}", namespace, tool_def.name);
                     let adapter = agent::McpToolAdapter::new(
                         client.clone(),
+                        namespaced,
+                        tool_def.name.clone(),
+                        tool_def.description.clone(),
+                        tool_def.input_schema.clone(),
+                    );
+                    guard.add_tool(Arc::new(adapter));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn add_mcp_server_http<'py>(
+        &self,
+        py: Python<'py>,
+        namespace: String,
+        url: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let agent = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let client = agent::McpClient::connect_http(&url);
+            let client = Arc::new(client);
+
+            client.initialize().await.map_err(to_py_runtime_error)?;
+            let mcp_tools = client.list_tools().await.map_err(to_py_runtime_error)?;
+
+            {
+                let mut guard = agent
+                    .lock()
+                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+                for tool_def in &mcp_tools {
+                    let namespaced = format!("{}/{}", namespace, tool_def.name);
+                    let adapter = agent::McpToolAdapter::new(
+                        client.clone(),
+                        namespaced,
                         tool_def.name.clone(),
                         tool_def.description.clone(),
                         tool_def.input_schema.clone(),

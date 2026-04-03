@@ -137,9 +137,18 @@ impl OpenRouterVendor {
     }
 
     fn convert_request(&self, req: LlmRequest) -> OpenRouterRequest {
-        let mut messages = Vec::with_capacity(req.messages.len());
+        let mut messages = Vec::new();
 
-        for message in req.messages {
+        if !req.context.system.is_empty() {
+            messages.push(OpenRouterMessageJson {
+                role: "system",
+                content: Some(req.context.system.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
+        for message in req.context.history {
             let json_msg = match message {
                 crate::llm::LlmMessage::System { content } => OpenRouterMessageJson {
                     role: "system",
@@ -188,10 +197,25 @@ impl OpenRouterVendor {
             messages.push(json_msg);
         }
 
+        if !req.context.user_input.is_empty() {
+            messages.push(OpenRouterMessageJson {
+                role: "user",
+                content: Some(req.context.user_input.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
+        let tools = if !req.context.tools.is_empty() {
+            Some(req.context.tools.clone())
+        } else {
+            None
+        };
+
         OpenRouterRequest {
             model: req.model,
             messages,
-            tools: req.tools.map(|t| (*t).clone()),
+            tools,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             stream: false,

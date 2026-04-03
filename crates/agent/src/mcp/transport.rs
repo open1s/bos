@@ -91,10 +91,16 @@ impl StdioTransport {
 
     pub async fn recv_line(&mut self, buffer: &mut String) -> Result<(), TransportError> {
         buffer.clear();
-        self.stdout
+        let bytes_read = self.stdout
             .read_line(buffer)
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?;
+        // Cap line size at 16MB to prevent memory exhaustion
+        if bytes_read > 16 * 1024 * 1024 {
+            return Err(TransportError::Io(format!(
+                "Line too large: {bytes_read} bytes (max 16MB)"
+            )));
+        }
         trim_newline_suffix(buffer);
         Ok(())
     }

@@ -109,7 +109,7 @@ async def main():
         base_url="https://api.openai.com/v1",
     )
     agent = Agent.from_config(cfg)
-    text = await agent.run("Say hello in one sentence")
+    text = await agent.react("Say hello in one sentence")
     print(text)
 
 asyncio.run(main())

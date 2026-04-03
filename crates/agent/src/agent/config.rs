@@ -42,6 +42,7 @@ pub struct TomlAgentConfig {
     pub max_tokens: Option<u32>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    pub max_steps: Option<usize>,
     #[serde(default = "default_context_compaction_threshold_tokens")]
     pub context_compaction_threshold_tokens: usize,
     #[serde(default = "default_context_compaction_trigger_ratio")]
@@ -99,6 +100,7 @@ impl From<TomlAgentConfig> for AgentConfig {
             temperature: t.temperature,
             max_tokens: t.max_tokens,
             timeout_secs: t.timeout_secs,
+            max_steps: t.max_steps.unwrap_or(10),
             rate_limit: None,
             context_compaction_threshold_tokens: t.context_compaction_threshold_tokens,
             context_compaction_trigger_ratio: t.context_compaction_trigger_ratio,

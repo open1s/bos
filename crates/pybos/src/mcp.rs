@@ -48,6 +48,19 @@ impl PyMcpClient {
         })
     }
 
+    /// Connect to an MCP server via HTTP (Streamable HTTP transport).
+    ///
+    /// Args:
+    ///     url: The MCP server endpoint URL (e.g. "http://localhost:8080/mcp")
+    ///
+    /// Returns:
+    ///     McpClient instance (not yet initialized)
+    #[staticmethod]
+    fn connect_http(url: String) -> PyResult<Self> {
+        let client = McpClient::connect_http(url);
+        Ok(PyMcpClient { inner: Arc::new(client) })
+    }
+
     /// Initialize the MCP connection.
     ///
     /// Returns:

@@ -32,7 +32,7 @@ impl Telemetry {
     }
     pub fn emit(&self, event: &TelemetryEvent) {
         if self.enabled {
-            log::info!("[telemetry] {:?}", event);
+            //log::info!("[telemetry] {:?}", event);
         }
     }
 }

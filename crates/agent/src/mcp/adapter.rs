@@ -7,7 +7,8 @@ use crate::tools::{Tool, ToolDescription};
 
 pub struct McpToolAdapter {
     client: Arc<McpClient>,
-    tool_name: String,
+    registry_name: String,
+    mcp_tool_name: String,
     description: String,
     input_schema: serde_json::Value,
 }
@@ -15,13 +16,15 @@ pub struct McpToolAdapter {
 impl McpToolAdapter {
     pub fn new(
         client: Arc<McpClient>,
-        name: String,
+        registry_name: String,
+        mcp_tool_name: String,
         description: String,
         input_schema: serde_json::Value,
     ) -> Self {
         Self {
             client,
-            tool_name: name,
+            registry_name,
+            mcp_tool_name,
             description,
             input_schema,
         }
@@ -31,7 +34,7 @@ impl McpToolAdapter {
 #[async_trait]
 impl Tool for McpToolAdapter {
     fn name(&self) -> &str {
-        &self.tool_name
+        &self.registry_name
     }
 
     fn description(&self) -> ToolDescription {
@@ -47,7 +50,7 @@ impl Tool for McpToolAdapter {
 
     async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         self.client
-            .call_tool(&self.tool_name, args.clone())
+            .call_tool(&self.mcp_tool_name, args.clone())
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
     }
@@ -70,12 +73,13 @@ mod tests {
         let client = Arc::new(McpClient::spawn("echo", &["hello"]).await.unwrap());
         let adapter = McpToolAdapter::new(
             client,
+            "hello/test_tool".to_string(),
             "test_tool".to_string(),
             "A test tool".to_string(),
             schema.clone(),
         );
 
-        assert_eq!(adapter.name(), "test_tool");
+        assert_eq!(adapter.name(), "hello/test_tool");
         assert_eq!(adapter.description().short, "A test tool");
         assert_eq!(adapter.json_schema(), schema);
     }

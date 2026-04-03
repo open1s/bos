@@ -1,7 +1,8 @@
 use crate::agent::context::MessageContext;
 use crate::agent::format_tool_result_content;
+use crate::tools::FunctionTool;
 use crate::{
-    AgentError, LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamToken, Tool, ToolRegistry,
+    AgentError, LlmClient, LlmContext, LlmRequest, LlmResponse, OpenAiMessage, StreamToken, Tool, ToolRegistry,
 };
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -49,10 +50,18 @@ impl ReactToolTrait for ReactToolAdapter {
         self.inner.description().short
     }
 
+    fn json_schema(&self) -> serde_json::Value {
+        self.inner.json_schema()
+    }
+
     fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ReactToolError> {
         let result =
             tokio::task::block_in_place(|| futures::executor::block_on(self.inner.execute(input)));
         result.map_err(|e| ReactToolError::Failed(e.to_string()))
+    }
+
+    fn is_skill(&self) -> bool {
+        self.inner.is_skill()
     }
 }
 
@@ -72,26 +81,31 @@ impl ReactLlmTrait for AgentLlmAdapter {
         let inner = self.inner.clone();
         let agent_req = LlmRequest {
             model: request.model,
-            messages: request
-                .messages
-                .into_iter()
-                .map(|msg| match msg {
-                    ReactLlmMessage::System { content } => OpenAiMessage::System { content },
-                    ReactLlmMessage::User { content } => OpenAiMessage::User { content },
-                    ReactLlmMessage::Assistant { content } => OpenAiMessage::Assistant { content },
-                    ReactLlmMessage::AssistantToolCall { id, name, args } => {
-                        OpenAiMessage::AssistantToolCall { id, name, args }
-                    }
-                    ReactLlmMessage::ToolResult {
-                        tool_call_id,
-                        content,
-                    } => OpenAiMessage::ToolResult {
-                        tool_call_id,
-                        content,
-                    },
-                })
-                .collect(),
-            tools: None,
+            context: LlmContext {
+                system: String::new(),
+                tools: Vec::new(),
+                skills: Vec::new(),
+                history: request
+                    .messages
+                    .into_iter()
+                    .map(|msg| match msg {
+                        ReactLlmMessage::System { content } => OpenAiMessage::System { content },
+                        ReactLlmMessage::User { content } => OpenAiMessage::User { content },
+                        ReactLlmMessage::Assistant { content } => OpenAiMessage::Assistant { content },
+                        ReactLlmMessage::AssistantToolCall { id, name, args } => {
+                            OpenAiMessage::AssistantToolCall { id, name, args }
+                        }
+                        ReactLlmMessage::ToolResult {
+                            tool_call_id,
+                            content,
+                        } => OpenAiMessage::ToolResult {
+                            tool_call_id,
+                            content,
+                        },
+                    })
+                    .collect(),
+                user_input: String::new(),
+            },
             temperature: request.temperature,
             max_tokens: request.max_tokens,
         };
@@ -132,6 +146,7 @@ impl ReactLlmTrait for AgentLlmAdapter {
             tools: None,
             temperature: request.temperature,
             max_tokens: request.max_tokens,
+            skills: None,
         };
 
         let stream_result = inner.stream_complete(agent_req).await;
@@ -183,6 +198,7 @@ pub struct AgentConfig {
     pub temperature: f32,
     pub max_tokens: Option<u32>,
     pub timeout_secs: u64,
+    pub max_steps: usize,
     pub rate_limit: Option<RateLimiterConfig>,
     pub context_compaction_threshold_tokens: usize,
     pub context_compaction_trigger_ratio: f32,
@@ -202,6 +218,7 @@ impl Default for AgentConfig {
             temperature: 0.7,
             max_tokens: None,
             timeout_secs: 60,
+            max_steps: 10,
             rate_limit: None,
             context_compaction_threshold_tokens: 24_000,
             context_compaction_trigger_ratio: 0.85,
@@ -510,7 +527,7 @@ impl Agent {
     }
 
     /// Run the agent using ReAct engine.
-    pub async fn run(&self, task: &str) -> Result<String, AgentError> {
+    pub async fn react(&self, task: &str) -> Result<String, AgentError> {
         let react_llm = Box::new(AgentLlmAdapter::new(self.llm.clone()));
         let mut builder = ReActEngineBuilder::new().llm(react_llm);
 
@@ -521,15 +538,99 @@ impl Agent {
             }
         }
 
+        // Inject skill catalog and load_skill tool into ReAct engine
+        let has_skills = !self.skills.is_empty();
+        if has_skills {
+            let schemas = self.get_skills_schemas();
+            let skill_names: Vec<String> = self
+                .skills
+                .iter()
+                .map(|s| s.metadata.name.clone())
+                .collect();
+
+            // Register each skill as a callable tool that returns its instructions
+            for skill in &self.skills {
+                let skill_name = skill.metadata.name.clone();
+                let skill_desc = format!("Get instructions for the {} skill", skill_name);
+                let skill_instructions = skill.instructions.clone();
+                let skill_name_for_closure = skill_name.clone();
+                let skill_tool = Arc::new(FunctionTool::skill(
+                    &skill_name,
+                    &skill_desc,
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }),
+                    move |_args: &serde_json::Value| {
+                        Ok(serde_json::json!({
+                            "skill": skill_name_for_closure,
+                            "instructions": skill_instructions
+                        }))
+                    },
+                ));
+                builder = builder.with_tool(Box::new(ReactToolAdapter::new(skill_tool)));
+            }
+
+            // Also register load_skill for compatibility
+            let load_skill_tool = Arc::new(FunctionTool::new(
+                "load_skill",
+                "Load a skill by name to get its instructions",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the skill to load"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+                {
+                    let skills = self.skills.clone();
+                    move |args: &serde_json::Value| {
+                        let name = args
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let found = skills.iter().find(|s| s.metadata.name == name);
+                        if let Some(skill) = found {
+                            Ok(serde_json::json!({
+                                "name": skill.metadata.name,
+                                "description": skill.metadata.description,
+                                "instructions": skill.instructions
+                            }))
+                        } else {
+                            Ok(serde_json::json!({
+                                "error": format!("Skill '{}' not found. Available: {}", name, skill_names.join(", "))
+                            }))
+                        }
+                    }
+                },
+            ));
+            builder = builder.with_tool(Box::new(ReactToolAdapter::new(load_skill_tool)));
+        }
+
+        // Build system prompt with skill context
+        let mut system_prompt = self.config.system_prompt.clone();
+        if has_skills {
+            if !system_prompt.is_empty() {
+                system_prompt.push_str("\n\n");
+            }
+            system_prompt.push_str("Skills are available as separate tools. Use them when their domain matches the user's request.");
+        }
+
         builder = builder.resilience(self.resilience.clone());
         builder = builder.llm_timeout(self.config.timeout_secs);
+        builder = builder.max_steps(self.config.max_steps);
         builder = builder.model(self.config.model.clone());
+        builder = builder.system_prompt(system_prompt);
 
         let mut engine = builder
             .build()
             .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))?;
         let result = engine
-            .run(task)
+            .react(task)
             .await
             .map_err(|e| AgentError::Session(format!("ReAct run error: {}", e)))?;
         Ok(result)
@@ -682,6 +783,7 @@ impl Agent {
             let tool_name = tool.name.clone();
             let mcp_tool = std::sync::Arc::new(McpToolAdapter::new(
                 client.clone(),
+                tool_name.clone(),
                 tool_name.clone(),
                 tool.description.clone(),
                 schema,
@@ -1074,6 +1176,7 @@ impl AgentSession {
             tools: None,
             temperature: 0.1,
             max_tokens: Some(summary_max_tokens),
+            skills: None,
         };
 
         let response = resilience
@@ -1329,6 +1432,7 @@ impl AgentSession {
                 tools: tools_for_request.clone(),
                 temperature: self.agent.config.temperature,
                 max_tokens: self.agent.config.max_tokens,
+                skills: None,
             };
 
             info!("iteration:\n{:?}\n--------------", request);
@@ -1474,6 +1578,7 @@ impl AgentSession {
                     tools: tools_for_request.clone(),
                     temperature: config.temperature,
                     max_tokens: config.max_tokens,
+                    skills: None,
                 };
 
                 info!(

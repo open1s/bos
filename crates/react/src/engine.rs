@@ -1,9 +1,10 @@
-use crate::llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken};
+use crate::llm::{LlmClient, LlmContext, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken};
 use crate::memory::Memory;
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::telemetry::{Telemetry, TelemetryEvent};
 use crate::tool::{Tool, ToolRegistry};
 use futures::Stream;
+use log::info;
 use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -31,6 +32,18 @@ pub enum BuilderError {
 }
 
 fn parse_action_input(thought: &str) -> (Option<String>, Value) {
+    // Check for native tool-calling format: <|python_tag|>{"name": "...", "parameters": {...}}
+    if let Some(json_start) = thought.find("{") {
+        let json_str = &thought[json_start..];
+        if let Ok(obj) = serde_json::from_str::<Value>(json_str) {
+            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                let args = obj.get("parameters").cloned().unwrap_or(Value::Null);
+                return (Some(name.to_string()), args);
+            }
+        }
+    }
+
+    // Check for ReAct format: Action: <tool name>\nAction Input: <json>
     let mut tool_name: Option<String> = None;
     let mut input: Value = Value::Null;
     for line in thought.lines() {
@@ -68,6 +81,7 @@ pub struct ReActEngine {
     resilience: Option<Arc<ReActResilience>>,
     llm_timeout_secs: u64,
     model: String,
+    system_prompt: String,
 }
 
 pub struct ReActEngineBuilder {
@@ -78,6 +92,7 @@ pub struct ReActEngineBuilder {
     resilience: Option<ReActResilience>,
     llm_timeout_secs: u64,
     model: String,
+    system_prompt: String,
 }
 
 impl ReActEngineBuilder {
@@ -85,11 +100,12 @@ impl ReActEngineBuilder {
         Self {
             llm: None,
             tools: ToolRegistry::new(),
-            max_steps: 3,
+            max_steps: 10,
             telemetry: Telemetry::new(true),
             resilience: None,
             llm_timeout_secs: 120,
             model: String::new(),
+            system_prompt: String::new(),
         }
     }
 }
@@ -136,6 +152,11 @@ impl ReActEngineBuilder {
         self
     }
 
+    pub fn system_prompt(mut self, prompt: String) -> Self {
+        self.system_prompt = prompt;
+        self
+    }
+
     pub fn build(self) -> Result<ReActEngine, BuilderError> {
         let llm = self.llm.ok_or(BuilderError::MissingLlm)?;
         Ok(ReActEngine {
@@ -147,6 +168,7 @@ impl ReActEngineBuilder {
             resilience: self.resilience.map(Arc::new),
             llm_timeout_secs: self.llm_timeout_secs,
             model: self.model,
+            system_prompt: self.system_prompt,
         })
     }
 }
@@ -162,6 +184,7 @@ impl ReActEngine {
             resilience: None,
             llm_timeout_secs: 120,
             model: String::new(),
+            system_prompt: String::new(),
         }
     }
 
@@ -177,6 +200,7 @@ impl ReActEngine {
         self.tools
             .tools
             .iter()
+            .filter(|(_, tool)| !tool.is_skill())
             .map(|(name, tool)| {
                 format!("- {}: {}", name, tool.description())
             })
@@ -276,39 +300,75 @@ impl ReActEngine {
         }
     }
 
-    pub async fn run(&mut self, user_input: &str) -> Result<String, ReactError> {
+    pub async fn react(&mut self, user_input: &str) -> Result<String, ReactError> {
         let tool_descriptions = self.tools_descriptions();
-        let prompt = if tool_descriptions.is_empty() {
-            format!("User input: {}\nThought:", user_input)
+        let user_input_prompt = if tool_descriptions.is_empty() {
+            user_input.to_string()
         } else {
             format!(
-                "Available tools:\n{}\n\n\
-                 To use a tool, respond with:\n\
-                 Thought: <your reasoning>\n\
-                 Action: <tool name>\n\
-                 Action Input: <tool input as JSON>\n\n\
-                 When you have the final answer, respond with:\n\
-                 Thought: <your reasoning>\n\
-                 Final Answer: <your answer>\n\n\
-                 User input: {}\nThought:",
-                tool_descriptions, user_input
+                "{}\n\nUser input: {}",
+                user_input,
+                user_input
             )
+        };
+
+        let mut system = self.system_prompt.to_string();
+        if !tool_descriptions.is_empty() {
+            system.push_str(
+                "\nYou have access to the following tools:\n",
+            );
+            system.push_str(&tool_descriptions);
+        }
+
+        let openai_tools: Vec<Value> = self.tools
+            .tools
+            .iter()
+            .filter(|(_, tool)| !tool.is_skill())
+            .map(|(name, tool)| {
+                serde_json::json!({
+                    "name": name,
+                    "description": tool.description(),
+                    "parameters": tool.json_schema(),
+                })
+            })
+            .collect();
+        let openai_skills: Vec<Value> = self.tools
+            .tools
+            .iter()
+            .filter(|(_, tool)| tool.is_skill())
+            .map(|(name, tool)| {
+                serde_json::json!({
+                    "name": name,
+                    "description": tool.description(),
+                    "parameters": tool.json_schema(),
+                })
+            })
+            .collect();
+
+        let mut context = LlmContext {
+            system,
+            tools: openai_tools,
+            skills: openai_skills,
+            history: Vec::new(),
+            user_input: user_input_prompt,
         };
 
         let mut thought: String;
         for _ in 0..self.max_steps {
             let request = LlmRequest {
                 model: self.model.clone(),
-                messages: vec![LlmMessage::User { content: prompt.clone() }],
+                context: context.clone(),
                 ..Default::default()
             };
+
+            info!("[ReACT] Sending request: {:?}", request);
             let llm_out = match timeout(Duration::from_secs(self.llm_timeout_secs), self.call_llm(request)).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Err(ReactError::Timeout("LLM prediction timed out".to_string())),
             };
             thought = llm_out;
-            log::debug!("[ReAct] LLM output: {}", thought);
+            info!("[ReAct] LLM output: {}", thought);
             self.telemetry.emit(&TelemetryEvent::ThoughtGenerated {
                 thought: thought.clone(),
             });
@@ -319,7 +379,6 @@ impl ReActEngine {
                 } else {
                     thought.trim().to_string()
                 };
-                // Check if Final Answer content is actually a tool call
                 if let Some((tool_name, input)) = Self::try_parse_tool_call(&ans) {
                     if self.tools.tools.get(&tool_name).is_some() {
                         let res = self.call_tool(&tool_name, &input).await?;
@@ -355,15 +414,19 @@ impl ReActEngine {
                 output: res.clone(),
             });
 
+            context.history.push(LlmMessage::Assistant { content: thought.clone() });
+            context.history.push(LlmMessage::ToolResult {
+                tool_call_id: tool_name.clone(),
+                content: res.to_string(),
+            });
+
             let request = LlmRequest {
                 model: self.model.clone(),
-                messages: vec![LlmMessage::User {
-                    content: format!("Observation: {}\nThought:", res),
-                }],
+                context: context.clone(),
                 ..Default::default()
             };
             thought = self.call_llm(request).await?;
-            log::debug!("[ReAct] Post-tool LLM output: {}", thought);
+            info!("[ReAct] Post-tool LLM output: {}", thought);
             self.telemetry.emit(&TelemetryEvent::ThoughtGenerated {
                 thought: thought.clone(),
             });
@@ -380,7 +443,24 @@ impl ReActEngine {
                 return Ok(ans);
             }
 
-            // If LLM didn't produce Final Answer, use its response as the answer
+            let (next_tool_name, next_input) = parse_action_input(thought.as_str());
+            if let Some(next_tool) = next_tool_name {
+                context.history.push(LlmMessage::Assistant { content: thought.clone() });
+                let res = self.call_tool(&next_tool, &next_input).await?;
+                self.memory
+                    .push(thought.clone(), next_tool.clone(), res.clone());
+                self.telemetry.emit(&TelemetryEvent::ToolInvocation {
+                    tool: next_tool.clone(),
+                    input: next_input.clone(),
+                    output: res.clone(),
+                });
+                context.history.push(LlmMessage::ToolResult {
+                    tool_call_id: next_tool.clone(),
+                    content: res.to_string(),
+                });
+                continue;
+            }
+
             self.telemetry.emit(&TelemetryEvent::FinalAnswer {
                 answer: thought.clone(),
             });

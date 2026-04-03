@@ -112,18 +112,34 @@ impl<T: Into<String>> From<T> for LlmMessage {
 #[derive(Clone)]
 pub struct LlmRequest {
     pub model: String,
-    pub messages: Vec<LlmMessage>,
-    pub tools: Option<Arc<Vec<Value>>>,
+    pub context: LlmContext,
     pub temperature: f32,
     pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmContext {
+    pub system: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<LlmMessage>,
+    pub user_input: String,
 }
 
 impl LlmRequest {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
-            messages: Vec::new(),
-            tools: None,
+            context: LlmContext {
+                system: String::new(),
+                tools: Vec::new(),
+                skills: Vec::new(),
+                history: Vec::new(),
+                user_input: String::new(),
+            },
             temperature: 0.7,
             max_tokens: None,
         }
@@ -134,22 +150,22 @@ impl LlmRequest {
     }
 
     pub fn message(mut self, msg: LlmMessage) -> Self {
-        self.messages.push(msg);
+        self.context.history.push(msg);
         self
     }
 
     pub fn user_message(mut self, content: impl Into<String>) -> Self {
-        self.messages.push(LlmMessage::user(content));
+        self.context.user_input = content.into();
         self
     }
 
     pub fn system_message(mut self, content: impl Into<String>) -> Self {
-        self.messages.push(LlmMessage::system(content));
+        self.context.system = content.into();
         self
     }
 
     pub fn messages(mut self, msgs: impl IntoIterator<Item = LlmMessage>) -> Self {
-        self.messages.extend(msgs);
+        self.context.history.extend(msgs);
         self
     }
 
@@ -164,7 +180,12 @@ impl LlmRequest {
     }
 
     pub fn tools(mut self, tools: Vec<Value>) -> Self {
-        self.tools = Some(Arc::new(tools));
+        self.context.tools = tools;
+        self
+    }
+
+    pub fn skills(mut self, skills: Vec<Value>) -> Self {
+        self.context.skills = skills;
         self
     }
 }
@@ -182,8 +203,7 @@ impl fmt::Debug for LlmRequest {
             model: &'a str,
             temperature: f64,
             max_tokens: Option<u32>,
-            messages: &'a [LlmMessage],
-            tools: Option<&'a [Value]>,
+            context: &'a LlmContext,
         }
 
         let rounded_temperature = (self.temperature as f64 * 1000.0).round() / 1000.0;
@@ -191,8 +211,7 @@ impl fmt::Debug for LlmRequest {
             model: &self.model,
             temperature: rounded_temperature,
             max_tokens: self.max_tokens,
-            messages: &self.messages,
-            tools: self.tools.as_ref().map(|t| t.as_ref().as_slice()),
+            context: &self.context,
         };
 
         match serde_yaml::to_string(&payload) {
@@ -202,8 +221,7 @@ impl fmt::Debug for LlmRequest {
                 .field("model", &self.model)
                 .field("temperature", &self.temperature)
                 .field("max_tokens", &self.max_tokens)
-                .field("messages", &self.messages)
-                .field("tools", &self.tools)
+                .field("context", &self.context)
                 .finish(),
         }
     }

@@ -71,8 +71,9 @@ impl Default for ServerCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
+    #[serde(default)]
     pub description: String,
-    #[serde(alias = "inputSchema")]
+    #[serde(default, alias = "inputSchema")]
     pub input_schema: serde_json::Value,
 }
 
@@ -157,6 +158,7 @@ impl JsonRpcError {
 pub struct McpResource {
     pub uri: String,
     pub name: String,
+    #[serde(default)]
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
@@ -165,6 +167,7 @@ pub struct McpResource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpPrompt {
     pub name: String,
+    #[serde(default)]
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Vec<McpPromptArgument>>,
