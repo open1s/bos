@@ -1,0 +1,23 @@
+[package]
+name = "jsbos"
+version = "0.1.0"
+edition = "2021"
+description = "JavaScript/Node.js bindings for BrainOS (agent/config/bus) via NAPI-RS"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+agent = { path = "../agent" }
+bus = { path = "../bus" }
+config = { path = "../config" }
+logging = { path = "../logging" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+napi = { version = "2", features = ["async", "serde-json", "tokio_rt", "napi8"] }
+napi-derive = "2"
+async-trait = "0.1"
+futures = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"

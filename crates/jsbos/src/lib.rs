@@ -1,0 +1,30 @@
+use napi::bindgen_prelude::*;
+use napi_derive::napi;
+
+mod agent;
+mod bus;
+mod caller;
+mod config;
+mod jsany;
+mod mcp;
+mod publisher;
+mod query;
+mod subscriber;
+mod utils;
+
+pub use agent::{Agent, AgentConfig, AgentCallableServer, AgentRpcClient};
+pub use bus::{Bus, BusConfig, Session};
+pub use caller::{Callable, Caller};
+pub use config::ConfigLoader;
+pub use mcp::McpClient;
+pub use publisher::Publisher;
+pub use query::{Query, Queryable};
+pub use subscriber::Subscriber;
+
+#[allow(unused)]
+use logging;
+
+#[napi]
+pub fn version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}

@@ -86,6 +86,38 @@ class BusManager:
         raw = await PySubscriber.create(self._bus, topic)
         return Subscriber(raw)
 
+    async def create_query(self, topic: str):
+        from brainos.query import Query
+        if self._bus is None:
+            raise RuntimeError("Bus not started. Use 'async with' context.")
+        raw = await self._bus.create_query(topic)
+        return Query(raw)
+
+    async def create_queryable(self, topic: str, handler=None):
+        from brainos.query import Queryable
+        if self._bus is None:
+            raise RuntimeError("Bus not started. Use 'async with' context.")
+        raw = await self._bus.create_queryable(topic)
+        if handler:
+            raw.set_handler(handler)
+        return Queryable(raw)
+
+    async def create_caller(self, name: str):
+        from brainos.caller import Caller
+        if self._bus is None:
+            raise RuntimeError("Bus not started. Use 'async with' context.")
+        raw = await self._bus.create_caller(name)
+        return Caller(raw)
+
+    async def create_callable(self, uri: str, handler=None):
+        from brainos.caller import Callable
+        if self._bus is None:
+            raise RuntimeError("Bus not started. Use 'async with' context.")
+        raw = await self._bus.create_callable(uri)
+        if handler:
+            raw.set_handler(handler)
+        return Callable(raw)
+
     @property
     def bus(self) -> PyBus:
         if self._bus is None:

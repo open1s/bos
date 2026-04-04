@@ -2,327 +2,141 @@
 
 A modular Rust-based operating system and runtime framework for building intelligent AI-powered applications with support for multi-agent coordination, event streaming, and extensible tool systems.
 
-## 📦 Project Overview
-
-BrainOS is a comprehensive framework designed to enable seamless integration of AI agents, messaging systems, configuration management, and tool execution. It provides production-ready components for building scalable, distributed AI systems.
-
-### Key Features
+## Key Features
 
 - **🤖 Agent Framework**: Multi-agent coordination with LLM integration and skill management
-- **🚌 Event Bus**: High-performance pub/sub messaging system with zenoh support
-- **⚙️ Configuration Management**: Flexible config loading from TOML, YAML, and environment variables
+- **🚌 Event Bus**: High-performance pub/sub messaging with query/response, RPC patterns
+- **⚙️ Configuration**: Flexible config loading from TOML, YAML, and environment variables
 - **🧠 ReAct Engine**: Reasoning + Acting loop scaffold for AI agent workflows
-- **📊 Logging & Telemetry**: Integrated tracing and observability
-- **🛠️ Extensible Tools**: Circuit breaker, HTTP client, search, calculator, and more
+- **🐍 Python Bindings**: `pip install brainos` - unified Python API
+- **📦 Node.js Bindings**: `npm install brainos` - unified JavaScript API
 - **🔄 Memory Persistence**: Cross-session memory support for agents
 
 ---
 
-## 🏗️ Project Structure
+## Quick Start
+
+### Rust
+
+```rust
+use agent::{Agent, AgentConfig};
+
+let config = AgentConfig::default().name("assistant");
+let agent = Agent::builder().config(config).build()?;
+let result = agent.run_simple("Hello").await?;
+```
+
+### Python
+
+```python
+from brainos import BrainOS, tool
+
+@tool("Add two numbers")
+def add(a: int, b: int) -> int:
+    return a + b
+
+async with BrainOS() as brain:
+    agent = brain.agent("assistant").register(add)
+    result = await agent.ask("What is 2+2?")
+```
+
+### JavaScript
+
+```javascript
+const { BrainOS, ToolDef } = require('brainos');
+
+const addTool = new ToolDef('add', 'Add', (args) => args.a + args.b, ...);
+const brain = new BrainOS();
+await brain.start();
+const agent = brain.agent('assistant').register(addTool);
+const result = await agent.ask('What is 2+2?');
+```
+
+---
+
+## Project Structure
 
 ```
 bos/
 ├── crates/
-│   ├── agent/          # AI agent framework with LLM, skills, and tool management
-│   ├── bus/            # Event streaming and pub/sub messaging
-│   ├── config/         # Configuration loading and management
-│   ├── logging/        # Logging and instrumentation
-│   └── react/          # ReAct (Reasoning + Acting) AI engine
-├── examples/           # Example applications and use cases
-├── tools/              # Build and utility scripts
-├── Cargo.toml          # Workspace configuration
-├── CHANGELOG.md        # Version history and releases
-└── CONTRIBUTING.md     # Contribution guidelines
-```
-
-### 📚 Crates
-
-#### `agent` - AI Agent Framework
-Core framework for building intelligent agents with LLM integration, dynamic skills, and plugin-based tool support.
-
-**Key modules:**
-- `llm/` - Language Model interface and integration
-- `skills/` - Skill management and composition
-- `tools/` - Tool registry, circuit breaker, and execution
-- `mcp/` - Model Context Protocol support
-- `session/` - Agent session management
-- `error.rs` - Error types and handling
-
-**Run tests:**
-```bash
-cargo test -p agent --lib
-```
-
-#### `bus` - Event Streaming & Messaging
-High-performance pub/sub event bus with Zenoh integration for distributed messaging.
-
-**Key modules:**
-- `publisher.rs` - Event publishing interface
-- `subscriber.rs` - Event subscription and consumption
-- `callable.rs` - Callable event handlers
-- `query.rs` - Query/response patterns
-- `session.rs` - Session management
-
-**Run tests:**
-```bash
-cargo test -p bus --lib
-```
-
-#### `config` - Configuration Management
-Flexible configuration loading supporting TOML, YAML, environment variables, and glob patterns.
-
-**Key modules:**
-- `loader.rs` - Config file loading logic
-- `types.rs` - Configuration types and schemas
-- `error.rs` - Configuration errors
-
-**Run tests:**
-```bash
-cargo test -p config --lib
-```
-
-#### `logging` - Logging & Instrumentation
-Centralized logging setup with tracing integration for observability.
-
-**Run tests:**
-```bash
-cargo test -p logging --lib
-```
-
-#### `react` - ReAct AI Engine
-Reasoning + Acting loop scaffold providing a minimal yet extensible AI agent engine with tool support, timeouts, and memory persistence.
-
-**Key features:**
-- Pluggable tool registry
-- LLM call timeouts
-- Memory persistence (save/load to disk)
-- Multi-tool integration
-- Resilience and observability
-
-**Run tests:**
-```bash
-cargo test -p react --lib
+│   ├── agent/      # AI agent framework with LLM, skills, tools
+│   ├── bus/        # Pub/sub, queryable, caller/callable
+│   ├── config/     # TOML/YAML config loading
+│   ├── logging/    # Tracing and instrumentation
+│   ├── react/      # ReAct reasoning engine
+│   ├── pybos/      # Python bindings (brainos package)
+│   └── jsbos/      # Node.js bindings (brainos package)
+├── docs/           # User guides
+│   ├── python-user-guide.md
+│   ├── javascript-user-guide.md
+│   └── rust-user-guide.md
+└── Cargo.toml      # Workspace
 ```
 
 ---
 
-## 🚀 Getting Started
+## Crates
 
-### Prerequisites
+| Crate | Description |
+|-------|-------------|
+| `agent` | Core agent with LLM integration, tools, skills, MCP |
+| `bus` | Pub/sub, query/response, RPC messaging |
+| `config` | Config loading from TOML, YAML, env vars |
+| `logging` | Tracing and observability |
+| `react` | ReAct reasoning + acting engine |
+| `pybos` | Python bindings (`pip install brainos`) |
+| `jsbos` | Node.js bindings (`npm install brainos`) |
 
-- **Rust** 1.70+ (Edition 2021)
-- **Cargo**
-- **Tokio** runtime (async support)
+---
 
-### Installation
-
-Clone the repository:
-
-```bash
-git clone https://github.com/your-org/bos.git
-cd bos
-```
-
-### Building
-
-Build the entire workspace:
+## Commands
 
 ```bash
-cargo build --release
-```
+# Build all
+cargo build --all
 
-Build a specific crate:
-
-```bash
-cargo build -p react --release
-```
-
-### Running Tests
-
-Run all tests:
-
-```bash
+# Test all
 cargo test --all
-```
 
-Run tests for a specific crate:
+# Lint
+cargo clippy --all
+cargo fmt --all
 
-```bash
-cargo test -p react --all
-cargo test -p agent --all
-```
+# Python bindings
+cd crates/pybos && maturin develop
 
-Run a specific test with output:
-
-```bash
-cargo test -p react -- --nocapture
-```
-
-### Running Examples
-
-Navigate to the `examples/` directory and run:
-
-```bash
-cargo run --example <example-name>
+# Node.js bindings
+cd crates/jsbos && npm install && npm run build
 ```
 
 ---
 
-## 📖 Core Concepts
+## User Guides
 
-### Agent System
-
-Agents are autonomous entities that can:
-- Understand LLM outputs and reasoning
-- Execute tools and skills
-- Manage sessions and state
-- Integrate with external systems
-
-### Event Bus
-
-The bus provides:
-- Topic-based pub/sub messaging
-- Query/response patterns
-- Session-scoped communication
-- Support for distributed systems via Zenoh
-
-### Tool Execution
-
-Tools are composable units that:
-- Support circuit breakers for resilience
-- Integrate with LLM action outputs
-- Provide observability and telemetry
-- Can be chained and composed
-
-### Memory Persistence
-
-- In-memory storage for fast access
-- File-based persistence for durability
-- Cross-session state management
+- **Python**: [docs/python-user-guide.md](docs/python-user-guide.md)
+- **JavaScript**: [docs/javascript-user-guide.md](docs/javascript-user-guide.md)  
+- **Rust**: [docs/rust-user-guide.md](docs/rust-user-guide.md)
 
 ---
 
-## 🛠️ Development Workflow
+## Unified API
 
-### Code Style
+Python and JavaScript APIs are consistent:
 
-- Follows Rust edition 2021 best practices
-- Uses clippy for linting
-- Enforces formatting with rustfmt
-
-### Benchmarking
-
-The project includes criterion-based benchmarks:
-
-```bash
-cargo bench --all
-```
-
-### Profiling
-
-With flamegraph support:
-
-```bash
-cargo flamegraph --bin <bin-name>
-```
-
-### Running QA Checks
-
-Full workspace QA:
-
-```bash
-cargo test --workspace
-```
-
-Integration tests:
-
-```bash
-cargo test --test '*'
-```
+| Feature | Python | JavaScript |
+|---------|--------|------------|
+| Create agent | `brain.agent("name")` | `brain.agent("name")` |
+| Fluent config | `.with_model("gpt-4")` | `.withModel("gpt-4")` |
+| Register tools | `.register(tool)` | `.register(toolDef)` |
+| Run | `await agent.ask("...")` | `await agent.ask("...")` |
+| Bus factory | `BusManager()` | `BusManager.create()` |
 
 ---
 
-## 📋 Contributing
+## License
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for:
-- Code of conduct
-- Development process
-- Coding standards
-- Commit conventions
-- Testing requirements
-
-### Key Guidelines
-
-1. **Fork & Branch**: Create a feature branch
-2. **Code Quality**: Run `cargo clippy` and `cargo fmt`
-3. **Tests**: Add tests for new features
-4. **Documentation**: Document public APIs
-5. **Commit Messages**: Follow conventional commits
+MIT OR Apache-2.0
 
 ---
 
-## 📝 Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for release history, current status, and upcoming features.
-
-### Current Status
-
-- **Plan A**: ReAct crate QA, warnings cleanup, release notes
-- **Plan B**: Production-ready scaffolding (robust prompts, memory persistence, multi-tool integration)
-
----
-
-## 🔧 Dependencies
-
-### Key Workspace Dependencies
-
-- **`tokio`** - Async runtime
-- **`serde/serde_json`** - Serialization
-- **`zenoh`** - Distributed pub/sub
-- **`tracing`** - Structured logging
-- **`reqwest`** - HTTP client
-- **`anyhow/thiserror`** - Error handling
-- **`async-trait`** - Async trait support
-
-See `Cargo.toml` for complete dependency list.
-
----
-
-## 📄 License
-
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE) or http://opensource.org/licenses/MIT)
-
-at your option.
-
----
-
-## 👥 Authors
-
-- **BrickOS Team**
-
----
-
-## 🤝 Support
-
-For issues, questions, or discussions:
-
-1. Check existing [issues](https://github.com/your-org/bos/issues)
-2. Review [CONTRIBUTING.md](CONTRIBUTING.md)
-3. Open a new issue with clear description
-
----
-
-## 📚 Additional Resources
-
-- [ReAct Framework](https://arxiv.org/abs/2210.03629) - Reasoning + Acting in Language Models
-- [Zenoh](https://zenoh.io/) - Pub/sub routing system
-- [Tokio](https://tokio.rs/) - Async Rust runtime
-
----
-
-**Version**: 0.1.0  
-**Edition**: 2021  
-**Last Updated**: 2026-03-30
+**Version**: 0.1.0 | **Last Updated**: 2026-04-05
