@@ -67,7 +67,10 @@ impl Callable {
     #[napi]
     pub async fn start(&self) -> Result<()> {
         if self.is_started.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(napi::Error::new(napi::Status::GenericFailure, "Callable already started"));
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "Callable already started",
+            ));
         }
 
         let mut guard = self.inner.lock().await;
@@ -93,9 +96,9 @@ impl Callable {
                         match rx.recv() {
                             Ok(Ok(result)) => Ok(result),
                             Ok(Err(e)) => Err(bus::ZenohError::Query(e.to_string())),
-                            Err(_) => Err(bus::ZenohError::Query(
-                                "handler channel closed".to_string(),
-                            )),
+                            Err(_) => {
+                                Err(bus::ZenohError::Query("handler channel closed".to_string()))
+                            }
                         }
                     }
                 })
@@ -106,8 +109,9 @@ impl Callable {
             .start()
             .await
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        
-        self.is_started.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        self.is_started
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

@@ -1,8 +1,8 @@
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::jsany::JSAny;
 
@@ -54,7 +54,10 @@ impl Subscriber {
     }
 
     #[napi]
-    pub async fn recv_json_with_timeout_ms(&self, timeout_ms: i64) -> Result<Option<serde_json::Value>> {
+    pub async fn recv_json_with_timeout_ms(
+        &self,
+        timeout_ms: i64,
+    ) -> Result<Option<serde_json::Value>> {
         let mut guard = self.inner.lock().await;
         let msg = guard
             .recv_with_timeout(std::time::Duration::from_millis(timeout_ms as u64))
@@ -74,22 +77,25 @@ impl Subscriber {
         let inner = self.inner.clone();
         let tsfn = handler;
         let running = self.running.clone();
-        
+
         if running.swap(true, Ordering::SeqCst) {
-            return Err(napi::Error::new(napi::Status::GenericFailure, "already running"));
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "already running",
+            ));
         }
-        
+
         tokio::spawn(async move {
             loop {
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
-                
+
                 let message = {
                     let mut guard = inner.lock().await;
                     guard.recv().await
                 };
-                
+
                 match message {
                     Some(msg) => {
                         let tsfn_clone = tsfn.clone();
@@ -104,7 +110,7 @@ impl Subscriber {
             }
             running.store(false, Ordering::SeqCst);
         });
-        
+
         Ok(())
     }
 

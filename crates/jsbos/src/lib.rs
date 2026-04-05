@@ -1,4 +1,3 @@
-use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 mod agent;
@@ -12,7 +11,7 @@ mod query;
 mod subscriber;
 mod utils;
 
-pub use agent::{Agent, AgentConfig, AgentCallableServer, AgentRpcClient};
+pub use agent::{Agent, AgentCallableServer, AgentConfig, AgentRpcClient};
 pub use bus::{Bus, BusConfig, Session};
 pub use caller::{Callable, Caller};
 pub use config::ConfigLoader;

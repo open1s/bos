@@ -1,6 +1,5 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use std::sync::Arc;
 
 #[napi]
 pub struct McpClient {

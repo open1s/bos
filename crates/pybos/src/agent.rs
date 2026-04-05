@@ -4,7 +4,6 @@ use agent::{
     Agent, AgentCallableServer, AgentConfig, AgentRpcClient, StreamToken, Tool, ToolDescription,
 };
 use async_trait::async_trait;
-use bus;
 use futures::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::PyType;

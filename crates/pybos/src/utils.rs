@@ -23,7 +23,7 @@ pub async fn invoke_python_handler_to_pyany(
     // Call the Python callback (sync for now)
     let result: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
         let raw_out = callback.bind(py).call1((arg.as_ref(),))?;
-        Ok(raw_out.into_py_any(py)?)
+        raw_out.into_py_any(py)
     })
     .map_err(|e: PyErr| bus::ZenohError::Query(e.to_string()))?;
 
@@ -34,7 +34,7 @@ pub async fn invoke_python_string_handler(
     callback: &Py<PyAny>,
     input: String,
 ) -> Result<String, bus::ZenohError> {
-    let py_arg = Python::attach(|py| -> PyResult<Py<PyAny>> { Ok(input.into_py_any(py)?) })
+    let py_arg = Python::attach(|py| -> PyResult<Py<PyAny>> { input.into_py_any(py) })
         .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
 
     let result_obj = invoke_python_handler_to_pyany(callback, py_arg).await?;

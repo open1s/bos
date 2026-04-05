@@ -88,9 +88,10 @@ impl Bus {
     #[napi]
     pub async fn publish_text(&self, topic: String, payload: String) -> Result<()> {
         let mut guard = self.inner.lock().await;
-        guard.publish(&topic, &payload).await.map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, e.to_string())
-        })?;
+        guard
+            .publish(&topic, &payload)
+            .await
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(())
     }
 
@@ -98,9 +99,10 @@ impl Bus {
     pub async fn publish_json(&self, topic: String, data: serde_json::Value) -> Result<()> {
         let json_str = data.to_string();
         let mut guard = self.inner.lock().await;
-        guard.publish(&topic, &json_str).await.map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, e.to_string())
-        })?;
+        guard
+            .publish(&topic, &json_str)
+            .await
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(())
     }
 
@@ -152,12 +154,13 @@ impl Bus {
             guard.session().clone()
         };
         let mut wrapper = bus::QueryableWrapper::<String, String>::new(topic);
-        wrapper.set_handler(|input| async move { Ok(input) }).map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, e.to_string())
-        })?;
-        wrapper.init(&session).await.map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, e.to_string())
-        })?;
+        wrapper
+            .set_handler(|input| async move { Ok(input) })
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        wrapper
+            .init(&session)
+            .await
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(crate::Queryable {
             inner: std::sync::Arc::new(tokio::sync::Mutex::new(wrapper)),
             handler: std::sync::Arc::new(std::sync::Mutex::new(None)),

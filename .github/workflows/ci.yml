@@ -59,7 +59,8 @@ jobs:
         run: |
           cd crates/pybos
           maturin build --release
-          pip install --force-reinstall target/wheels/*.whl
+          WHEEL_PATH=$(ls target/wheels/pybos-*.whl)
+          pip install "$WHEEL_PATH" --force-reinstall --no-deps
 
   jsbos:
     runs-on: ${{ matrix.os }}

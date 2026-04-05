@@ -25,9 +25,18 @@ fn test_builder_pattern() {
             let responses = self.responses.clone();
             let mut lock = responses.lock().unwrap();
             if lock.is_empty() {
-                Ok(LlmResponse::Text("Final Answer: 0".to_string()))
+                Ok(LlmResponse::Text("Final Answer: 5".to_string()))
             } else {
-                Ok(LlmResponse::Text(lock.remove(0)))
+                let resp = lock.remove(0);
+                if resp.contains("Action:") {
+                    Ok(LlmResponse::ToolCall {
+                        name: "calculator".to_string(),
+                        args: serde_json::json!({"expression": "2+3"}),
+                        id: Some("1".to_string()),
+                    })
+                } else {
+                    Ok(LlmResponse::Text(resp))
+                }
             }
         }
 
@@ -36,7 +45,7 @@ fn test_builder_pattern() {
         }
 
         fn supports_tools(&self) -> bool {
-            false
+            true
         }
         fn provider_name(&self) -> &'static str {
             "mock"

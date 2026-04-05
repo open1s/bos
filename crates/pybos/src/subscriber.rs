@@ -84,7 +84,7 @@ impl PySubscriber {
                     Some(json_str) => {
                         // Parse JSON string to serde_json::Value
                         let json_value: serde_json::Value = serde_json::from_str(&json_str)
-                            .map_err(|e| crate::utils::to_py_runtime_error(e))?;
+                            .map_err(crate::utils::to_py_runtime_error)?;
                         // Convert serde_json::Value to Python object
                         crate::utils::json_to_py(py, &json_value)
                     }
@@ -133,7 +133,7 @@ impl PySubscriber {
                         // Parse JSON string and call callback
                         Python::attach(|py| -> PyResult<()> {
                             let json_value: serde_json::Value = serde_json::from_str(&json_str)
-                                .map_err(|e| crate::utils::to_py_runtime_error(e))?;
+                                .map_err(crate::utils::to_py_runtime_error)?;
                             let py_dict = crate::utils::json_to_py(py, &json_value)?;
                             callback.bind(py).call1((py_dict,))?;
                             Ok(())

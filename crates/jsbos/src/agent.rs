@@ -5,7 +5,6 @@ use napi_derive::napi;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::bus;
 use crate::jsany::JSAny;
 
 struct JSTool {
@@ -29,13 +28,16 @@ impl agent::Tool for JSTool {
         self.schema.clone()
     }
 
-    async fn execute(&self, args: &serde_json::Value) -> std::result::Result<serde_json::Value, agent::ToolError> {
+    async fn execute(
+        &self,
+        args: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, agent::ToolError> {
         let args_json = args.clone();
         let callback = self.callback.clone();
-        
+
         let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<serde_json::Value, String>>();
         let tx_clone = tx.clone();
-        
+
         callback.call_with_return_value::<JSAny, _>(
             Ok(JSAny(args_json)),
             ThreadsafeFunctionCallMode::Blocking,
@@ -44,11 +46,15 @@ impl agent::Tool for JSTool {
                 Ok(())
             },
         );
-        
+
         match rx.recv() {
             Ok(Ok(result)) => std::result::Result::Ok(result),
-            Ok(Err(e)) => std::result::Result::Err(agent::ToolError::ExecutionFailed(e.to_string())),
-            Err(_) => std::result::Result::Err(agent::ToolError::ExecutionFailed("handler channel closed".to_string())),
+            Ok(Err(e)) => {
+                std::result::Result::Err(agent::ToolError::ExecutionFailed(e.to_string()))
+            }
+            Err(_) => std::result::Result::Err(agent::ToolError::ExecutionFailed(
+                "handler channel closed".to_string(),
+            )),
         }
     }
 }
@@ -106,11 +112,20 @@ impl From<AgentConfig> for agent::AgentConfig {
             timeout_secs: value.timeout_secs as u64,
             max_steps: value.max_steps.unwrap_or(10) as usize,
             rate_limit: None,
-            context_compaction_threshold_tokens: value.context_compaction_threshold_tokens.unwrap_or(0) as usize,
-            context_compaction_trigger_ratio: value.context_compaction_trigger_ratio.unwrap_or(0.0) as f32,
-            context_compaction_keep_recent_messages: value.context_compaction_keep_recent_messages.unwrap_or(0) as usize,
-            context_compaction_max_summary_chars: value.context_compaction_max_summary_chars.unwrap_or(0) as usize,
-            context_compaction_summary_max_tokens: value.context_compaction_summary_max_tokens.unwrap_or(0) as u32,
+            context_compaction_threshold_tokens: value
+                .context_compaction_threshold_tokens
+                .unwrap_or(0) as usize,
+            context_compaction_trigger_ratio: value.context_compaction_trigger_ratio.unwrap_or(0.0)
+                as f32,
+            context_compaction_keep_recent_messages: value
+                .context_compaction_keep_recent_messages
+                .unwrap_or(0) as usize,
+            context_compaction_max_summary_chars: value
+                .context_compaction_max_summary_chars
+                .unwrap_or(0) as usize,
+            context_compaction_summary_max_tokens: value
+                .context_compaction_summary_max_tokens
+                .unwrap_or(0) as u32,
         }
     }
 }
@@ -261,11 +276,14 @@ impl Agent {
         let client = agent::mcp::McpClient::spawn(&command, &args_ref)
             .await
             .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        
-        client.initialize().await.map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        
+
+        client
+            .initialize()
+            .await
+            .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+
         let client = std::sync::Arc::new(client);
-        
+
         let mut guard = self.inner.lock().await;
         guard
             .register_mcp_tools_with_namespace(client, &namespace)
@@ -274,16 +292,15 @@ impl Agent {
     }
 
     #[napi]
-    pub async fn add_mcp_server_http(
-        &self,
-        namespace: String,
-        url: String,
-    ) -> Result<()> {
+    pub async fn add_mcp_server_http(&self, namespace: String, url: String) -> Result<()> {
         let client = agent::mcp::McpClient::connect_http(&url);
         let client = std::sync::Arc::new(client);
-        
-        client.initialize().await.map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        
+
+        client
+            .initialize()
+            .await
+            .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+
         let mut guard = self.inner.lock().await;
         guard
             .register_mcp_tools_with_namespace(client, &namespace)
@@ -408,7 +425,10 @@ impl AgentRpcClient {
 
     #[napi]
     pub async fn list(&self) -> Result<serde_json::Value> {
-        let tools = self.inner.list().await
+        let tools = self
+            .inner
+            .list()
+            .await
             .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(tools)
     }
@@ -417,14 +437,20 @@ impl AgentRpcClient {
     pub async fn call(&self, tool_name: String, args_json: String) -> Result<serde_json::Value> {
         let args: serde_json::Value = serde_json::from_str(&args_json)
             .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        let result = self.inner.call(&tool_name, args).await
+        let result = self
+            .inner
+            .call(&tool_name, args)
+            .await
             .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(result)
     }
 
     #[napi]
     pub async fn llm_run(&self, task: String) -> Result<serde_json::Value> {
-        let result = self.inner.llm_run(&task).await
+        let result = self
+            .inner
+            .llm_run(&task)
+            .await
             .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(result)
     }

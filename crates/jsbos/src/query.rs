@@ -66,9 +66,9 @@ impl Queryable {
     #[napi(factory)]
     pub async fn new(topic: String) -> Result<Self> {
         let mut wrapper = bus::QueryableWrapper::<String, String>::new(topic);
-        wrapper.set_handler(|input| async move { Ok(input) }).map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, e.to_string())
-        })?;
+        wrapper
+            .set_handler(|input| async move { Ok(input) })
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(Queryable {
             inner: Arc::new(tokio::sync::Mutex::new(wrapper)),
             handler: Arc::new(std::sync::Mutex::new(None)),
@@ -104,25 +104,25 @@ impl Queryable {
                         match rx.recv() {
                             Ok(Ok(result)) => Ok(result),
                             Ok(Err(e)) => Err(bus::ZenohError::Query(e.to_string())),
-                            Err(_) => Err(bus::ZenohError::Query(
-                                "handler channel closed".to_string(),
-                            )),
+                            Err(_) => {
+                                Err(bus::ZenohError::Query("handler channel closed".to_string()))
+                            }
                         }
                     }
                 })
                 .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         }
 
-        guard.run().map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, e.to_string())
-        })?;
+        guard
+            .run()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(())
     }
 
     #[napi]
     pub async fn run(&self, handler: ThreadsafeFunction<String>) -> Result<()> {
         let mut guard = self.inner.lock().await;
-        
+
         let tsfn = handler;
         guard
             .set_handler(move |input: String| {
@@ -141,17 +141,15 @@ impl Queryable {
                     match rx.recv() {
                         Ok(Ok(result)) => Ok(result),
                         Ok(Err(e)) => Err(bus::ZenohError::Query(e.to_string())),
-                        Err(_) => Err(bus::ZenohError::Query(
-                            "handler channel closed".to_string(),
-                        )),
+                        Err(_) => Err(bus::ZenohError::Query("handler channel closed".to_string())),
                     }
                 }
             })
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
 
-        guard.run().map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, e.to_string())
-        })?;
+        guard
+            .run()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(())
     }
 

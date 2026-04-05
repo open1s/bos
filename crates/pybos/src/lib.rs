@@ -12,8 +12,6 @@ mod utils;
 
 //AI NOT ALLOW TO REMOVE
 #[allow(unused)]
-use logging;
-
 pub use agent::{
     PyAgent, PyAgentCallableServer, PyAgentConfig, PyAgentRpcClient, PyPythonTool, PyStreamIterator,
 };

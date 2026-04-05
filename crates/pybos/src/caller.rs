@@ -124,7 +124,7 @@ impl PyCallable {
                 let handler = handler.clone();
                 async move {
                     let py_arg =
-                        Python::attach(|py| -> PyResult<Py<PyAny>> { Ok(input.into_py_any(py)?) })
+                        Python::attach(|py| -> PyResult<Py<PyAny>> { input.into_py_any(py) })
                             .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
 
                     let output = invoke_python_handler_to_pyany(&handler, py_arg).await?;
@@ -166,7 +166,7 @@ impl PyCallable {
                 async move {
                     let py_arg = Python::attach(|py| -> PyResult<Py<PyAny>> {
                         let json_value: serde_json::Value = serde_json::from_str(&json_str)
-                            .map_err(|e| crate::utils::to_py_runtime_error(e))?;
+                            .map_err(crate::utils::to_py_runtime_error)?;
                         crate::utils::json_to_py(py, &json_value)
                     })
                     .map_err(|e| bus::ZenohError::Query(e.to_string()))?;

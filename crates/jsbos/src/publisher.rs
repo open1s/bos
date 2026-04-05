@@ -32,18 +32,20 @@ impl Publisher {
 
     #[napi]
     pub async fn publish_text(&self, payload: String) -> Result<()> {
-        self.inner.publish(&payload).await.map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, e.to_string())
-        })?;
+        self.inner
+            .publish(&payload)
+            .await
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(())
     }
 
     #[napi]
     pub async fn publish_json(&self, data: serde_json::Value) -> Result<()> {
         let json_str = data.to_string();
-        self.inner.publish(&json_str).await.map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, e.to_string())
-        })?;
+        self.inner
+            .publish(&json_str)
+            .await
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(())
     }
 }
