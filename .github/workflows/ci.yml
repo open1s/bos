@@ -1,9 +1,9 @@
-name: CI
+name: DAILY CI
 
 on:
-  push:
-    branches: [ "main", "dev" ]
-  pull_request:
+  schedule:
+    - cron: '0 0 * * *'  # 每天
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
