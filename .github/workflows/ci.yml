@@ -57,9 +57,8 @@ jobs:
 
       - name: Build pybos
         run: |
-          cd crates/pybos
-          maturin build --release
-          WHEEL_PATH=$(ls target/wheels/pybos-*.whl)
+          maturin build -m crates/pybos/Cargo.toml --release -o dist
+          WHEEL_PATH=$(ls dist/pybos-*.whl)
           pip install "$WHEEL_PATH" --force-reinstall --no-deps
 
   jsbos:
