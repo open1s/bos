@@ -1,2 +1,7 @@
+# Use extension-module to avoid linking Python statically
+[build]
+rustflags = ["-C", "link-args=-Wl,-undefined,dynamic_lookup"]
+
 [env]
-PYO3_USE_ABI3 = "1"
+# Let maturin auto-detect Python
+PYO3_USE_ABI3 = "0"
