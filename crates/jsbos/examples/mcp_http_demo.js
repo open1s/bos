@@ -16,7 +16,7 @@
  *     # Then this demo can connect to http://127.0.0.1:8765/mcp
  */
 
-const { McpClient, version } = require('../index.js');
+const { McpClient, version } = require('../jsbos.js');
 
 async function demoHttpConnect() {
   console.log('═'.repeat(60));

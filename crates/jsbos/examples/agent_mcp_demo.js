@@ -12,7 +12,7 @@
  *     node crates/jsbos/examples/agent_mcp_demo.js
  */
 
-const { Bus, Agent, AgentConfig, ConfigLoader, version } = require('../index.js');
+const { Bus, Agent, AgentConfig, ConfigLoader, version } = require('../jsbos.js');
 
 const loader = new ConfigLoader();
 loader.discover();

@@ -1,23 +1,56 @@
 {
-  "name": "@brainos/jsbos",
+  "name": "@open1s/jsbos",
   "version": "0.1.0",
   "description": "JavaScript/Node.js bindings for BrainOS",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "main": "jsbos.js",
+  "types": "jsbos.d.ts",
   "files": [
-    "index.js",
-    "index.d.ts",
+    "jsbos.js",
+    "jsbos.d.ts",
     "*.node"
   ],
-  "napi": {
-    "name": "jsbos"
-  },
   "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
+    "build": "napi build --platform --release --js jsbos.js --dts jsbos.d.ts",
+    "build:debug": "napi build --platform --js jsbos.js --dts jsbos.d.ts",
     "test": "node test.js"
   },
+  "napi": {
+    "binaryName": "jsbos",
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu",
+      "i686-pc-windows-msvc",
+      "aarch64-apple-darwin",
+      "aarch64-linux-android",
+      "aarch64-unknown-linux-musl",
+      "aarch64-pc-windows-msvc"
+    ]
+  },
+  "engines": {
+    "node": ">= 12.22.0 < 13 || >= 14.17.0 < 15 || >= 15.12.0 < 16 || >= 16.0.0"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.0"
+    "@emnapi/core": "^1.5.0",
+    "@emnapi/runtime": "^1.5.0",
+    "@napi-rs/cli": "^3.2.0",
+    "@oxc-node/core": "^0.1.0",
+    "@taplo/cli": "^0.7.0",
+    "@tybys/wasm-util": "^0.10.0",
+    "ava": "^7.0.0",
+    "chalk": "^5.6.2",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.1.6",
+    "npm-run-all2": "^8.0.4",
+    "oxlint": "^1.14.0",
+    "prettier": "^3.6.2",
+    "tinybench": "^6.0.0",
+    "typescript": "^6.0.0"
   }
 }

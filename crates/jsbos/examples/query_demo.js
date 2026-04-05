@@ -11,7 +11,7 @@
  *     node crates/jsbos/examples/query_demo.js
  */
 
-const { Bus, version } = require('../index.js');
+const { Bus, version } = require('../jsbos.js');
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));

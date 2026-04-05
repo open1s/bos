@@ -1,4 +1,4 @@
-const { version, ConfigLoader, Bus, Agent } = require('./index.js');
+const { version, ConfigLoader, Bus, Agent } = require('./jsbos.js');
 
 const loader = new ConfigLoader();
 loader.discover();

@@ -12,7 +12,7 @@
  *     node crates/jsbos/examples/agent_skill_demo.js
  */
 
-const { Bus, Agent, ConfigLoader, version } = require('../index.js');
+const { Bus, Agent, ConfigLoader, version } = require('../jsbos.js');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');

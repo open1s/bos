@@ -26,7 +26,7 @@ const {
   Publisher,
   Subscriber,
   version: getVersion,
-} = require('./index.js');
+} = require('./jsbos.js');
 
 class ToolDef {
   constructor(name, description, callback, parameters = {}, schema = {}) {
