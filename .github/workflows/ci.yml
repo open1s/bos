@@ -1,4 +1,4 @@
-name: Rust CI
+name: CI
 
 on:
   push:
@@ -9,29 +9,92 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  rust:
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        rust: [stable]  # 可以加 beta / nightly
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ⚡ Rust toolchain
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # ⚡ Cache（核心，不然 CI 慢到爆）
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # 🏗 编译检查（比 test 更快发现问题）
       - name: Build
         run: cargo build --all --all-features
 
-      # 🧪 单元测试
       - name: Test
         run: cargo test --all --all-features -- --nocapture
+
+      - name: Clippy
+        run: cargo clippy --all --all-features -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  pybos:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: macos-latest
+            python-version: '3.11'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build pybos
+        run: |
+          PYTHON_PATH=$(python -c "import sys; print(sys.executable)")
+          export PYO3_PYTHON=$PYTHON_PATH
+          cd crates/pybos && maturin develop
+
+  jsbos:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node-version: ['20']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: crates/jsbos/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install npm deps
+        run: cd crates/jsbos && npm install
+
+      - name: Build jsbos
+        run: cd crates/jsbos && npm run build
