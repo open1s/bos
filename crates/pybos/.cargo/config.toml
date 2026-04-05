@@ -1,3 +1,2 @@
 [env]
 PYO3_USE_ABI3 = "1"
-PYO3_PYTHON = "/opt/homebrew/bin/python3"

@@ -35,15 +35,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   pybos:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        include:
-          - os: ubuntu-latest
-            python-version: '3.11'
-          - os: macos-latest
-            python-version: '3.11'
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
@@ -52,22 +44,31 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: crates/pybos/pyproject.toml
 
       - name: Install maturin
         run: pip install maturin
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          cache-targets: false
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "pybos-ubuntu-3.11"
+
+      - name: Clean pyo3 cache
+        run: rm -rf target/debug/.fingerprint/pyo3-build-config* target/release/.fingerprint/pyo3-build-config*
 
       - name: Build pybos
         run: |
-          PYTHON_PATH=$(python -c "import sys; print(sys.executable)")
-          export PYO3_PYTHON=$PYTHON_PATH
-          cd crates/pybos && maturin develop
+          cd crates/pybos
+          maturin build --release
+          pip install --force-reinstall target/wheels/*.whl
 
   jsbos:
     runs-on: ${{ matrix.os }}
