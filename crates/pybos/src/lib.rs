@@ -1,3 +1,7 @@
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+#![allow(clippy::while_let_loop, clippy::redundant_pub_crate)]
+#![allow(clippy::needless_lifetimes, clippy::extra_unused_lifetimes)]
+
 use pyo3::prelude::*;
 
 mod agent;

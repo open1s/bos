@@ -46,6 +46,7 @@ pub struct McpClient {
     initialized: std::sync::atomic::AtomicBool,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum TransportBackend {
     Stdio(StdioTransport),
     Http(HttpTransport),

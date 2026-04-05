@@ -20,8 +20,7 @@ pub use publisher::Publisher;
 pub use query::{Query, Queryable};
 pub use subscriber::Subscriber;
 
-#[allow(unused)]
-use logging;
+// Note: logging is a dependency but used in binaries
 
 #[napi]
 pub fn version() -> String {

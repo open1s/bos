@@ -1841,8 +1841,7 @@ impl AgentSession {
                                             StreamToken::ToolCall { name, args, id } => {
                                                 tool_call_made = true;
                                                 let tool_call_id = id
-                                                    .as_ref()
-                                                    .map(|s| s.clone())
+                                                    .clone()
                                                     .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
 
                                                 let call_key = (name.clone(), args.clone());

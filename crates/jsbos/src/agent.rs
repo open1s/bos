@@ -1,3 +1,5 @@
+#![allow(clippy::unnecessary_cast)]
+
 use async_trait::async_trait;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};

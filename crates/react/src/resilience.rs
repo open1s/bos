@@ -415,7 +415,7 @@ impl ReActResilience {
         for attempt in 0..=max_retries {
             // Rate limit check - use acquire() to wait when about to exceed
             if let Some(limiter) = &self.rate_limiter {
-                if let Err(_) = limiter.acquire().await {
+                if limiter.acquire().await.is_err() {
                     if attempt < max_retries {
                         let duration = base_backoff * (1 << attempt).min(6);
                         tokio::time::sleep(duration).await;

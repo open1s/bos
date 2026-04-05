@@ -256,11 +256,7 @@ impl OpenAiVendor {
             None
         };
 
-        let mut extra_system_prompt = if let Some(skills) = available_skills {
-            skills
-        } else {
-            String::new()
-        };
+        let mut extra_system_prompt = available_skills.unwrap_or_default();
 
         extra_system_prompt.push('\n');
         if let Some(rules) = available_rules {

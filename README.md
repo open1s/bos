@@ -1,6 +1,5 @@
+English | [中文版本](./README-ZH.md)
 # BrainOS (BOS)
-
-[中文版本](./README-ZH.md) | English
 
 A modular Rust-based operating system and runtime framework for building intelligent AI-powered applications with support for multi-agent coordination, event streaming, and extensible tool systems.
 

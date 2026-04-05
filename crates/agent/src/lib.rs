@@ -10,9 +10,8 @@ pub mod session;
 pub mod skills;
 pub mod tools;
 
-//AI NOT ALLOW TO REMOVE
-#[allow(unused)]
-use logging;
+// NOTE: logging is a dependency and used via the `log` crate macros
+// The `logging` crate is initialized in binary builds
 
 pub use agent::config::TomlAgentBuilder as AgentBuilder;
 pub use agent::config::TomlAgentConfig;

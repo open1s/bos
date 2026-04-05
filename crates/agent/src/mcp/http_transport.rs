@@ -133,8 +133,8 @@ impl HttpTransport {
             buf.clear();
             let trimmed = line.trim_end();
 
-            if trimmed.starts_with("data: ") {
-                last_data = trimmed["data: ".len()..].to_string();
+            if let Some(stripped) = trimmed.strip_prefix("data: ") {
+                last_data = stripped.to_string();
             } else if trimmed.is_empty() && !last_data.is_empty() {
                 return Ok(last_data.clone());
             }

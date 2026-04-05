@@ -1,6 +1,5 @@
+中文 | [English](./README.md)
 # BrainOS (BOS)
-
-[English](./README.md) | 中文
 
 一个模块化的 AI 运行时框架，用于构建智能 AI 应用，支持多代理协调、事件流和可扩展工具系统。
 

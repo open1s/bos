@@ -34,7 +34,7 @@ pub trait Stringfy: Serialize + for<'de> Deserialize<'de> {
     fn json(&self) -> String;
 
     fn to_value(&self) -> Result<Value, serde_json::Error> {
-        serde_json::to_value(&self)
+        serde_json::to_value(self)
     }
 
     fn from_value(value: &Value) -> Result<Self, serde_json::Error>
