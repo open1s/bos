@@ -5,9 +5,14 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -26,6 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -33,12 +40,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
 
-      - name: Install deps
-        run: npm install
+      - run: npm ci
 
-      - name: Install napi
-        run: npm install -g @napi-rs/cli
+      - run: npm install -g @napi-rs/cli
 
       - name: Build
         run: napi build --platform --release
