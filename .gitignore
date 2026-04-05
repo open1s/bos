@@ -8,6 +8,9 @@ env/
 venv/
 .venv
 
+node_modules/
+jsbos.node
+
 # Virtual environment
 .env
 .venv
