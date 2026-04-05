@@ -13,13 +13,16 @@ This guide provides a unified, consistent API for using BrainOS in JavaScript/No
 7. [Query/Queryable](#queryqueryable)
 8. [Caller/Callable](#callercallable)
 9. [Configuration](#configuration)
-10. [API Reference](#api-reference)
+10. [MCP Client](#mcp-client-model-context-protocol)
+11. [API Reference](#api-reference)
 
 ---
 
 ## Installation
 
 ```bash
+npm install @open1s/jsbos
+# Or use the alias:
 npm install brainos
 ```
 
@@ -99,7 +102,8 @@ const agent = brain.agent('assistant');
 // Agent with custom config
 const agent = brain.agent('coder', {
   systemPrompt: 'You are a helpful coding assistant.',
-  model: 'gpt-4',
+  model: 'nvidia/meta/llama-3.1-8b-instruct',
+  baseUrl: 'https://integrate.api.nvidia.com/v1',
   temperature: 0.5,
   timeoutSecs: 180,
 });
@@ -111,7 +115,7 @@ Use chainable methods to configure the agent:
 
 ```javascript
 const agent = brain.agent('assistant')
-  .withModel('gpt-4')
+  .withModel('nvidia/meta/llama-3.1-8b-instruct')
   .withTemperature(0.3)
   .withPrompt('You are a math tutor.')
   .withTimeout(300);
@@ -424,6 +428,69 @@ const config = JSON.parse(loader.loadSync());
 
 ---
 
+## MCP Client (Model Context Protocol)
+
+BrainOS supports MCP (Model Context Protocol) for connecting to external tools and services.
+
+### Using MCP Client
+
+```javascript
+const { McpClient } = require('brainos');
+
+async function main() {
+  // Spawn an MCP server process
+  const client = await McpClient.spawn('npx', ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']);
+  await client.initialize();
+
+  // List available tools
+  const tools = await client.listTools();
+  console.log('Available tools:', tools);
+
+  // Call a tool
+  const result = await client.callTool('tool_name', JSON.stringify({ arg: 'value' }));
+  console.log(result);
+
+  // List prompts
+  const prompts = await client.listPrompts();
+  console.log(prompts);
+
+  // List resources
+  const resources = await client.listResources();
+  console.log(resources);
+
+  // Read a resource
+  const resource = await client.readResource('resource://path/to/resource');
+  console.log(resource);
+}
+
+main().catch(console.error);
+```
+
+### Connect via HTTP
+
+```javascript
+const { McpClient } = require('brainos');
+
+const client = McpClient.connectHttp('http://localhost:3000');
+await client.initialize();
+const tools = await client.listTools();
+```
+
+### MCP Client API
+
+| Method | Description |
+|--------|-------------|
+| `McpClient.spawn(command, args)` | Spawn an MCP server process |
+| `McpClient.connect_http(url)` | Connect via HTTP |
+| `initialize()` | Initialize MCP connection |
+| `list_tools()` | List available tools |
+| `call_tool(name, args_json)` | Call a tool with JSON args |
+| `list_prompts()` | List available prompts |
+| `list_resources()` | List available resources |
+| `read_resource(uri)` | Read a resource by URI |
+
+---
+
 ## API Reference
 
 ### `BrainOS`
@@ -456,6 +523,7 @@ LLM-powered agent with tool support.
 ```javascript
 new Agent(bus, options = {})
 // options: { name, model, baseUrl, apiKey, systemPrompt, temperature, timeoutSecs }
+// Defaults: model: 'nvidia/meta/llama-3.1-8b-instruct', baseUrl: 'https://integrate.api.nvidia.com/v1'
 ```
 
 **Methods:**
@@ -605,6 +673,26 @@ new ConfigLoader()
 | `reset()` | Reset config |
 | `loadSync()` | Load configuration |
 | `reloadSync()` | Reload configuration |
+
+### `McpClient`
+
+MCP (Model Context Protocol) client for connecting to external tools and services.
+
+**Static Factory Methods:**
+| Method | Description |
+|--------|-------------|
+| `McpClient.spawn(command, args)` | Spawn an MCP server process |
+| `McpClient.connect_http(url)` | Connect via HTTP URL |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `initialize()` | Initialize MCP connection |
+| `list_tools()` | List available tools |
+| `call_tool(name, args_json)` | Call a tool with JSON string args |
+| `list_prompts()` | List available prompts |
+| `list_resources()` | List available resources |
+| `read_resource(uri)` | Read a resource by URI |
 
 ---
 

@@ -25,6 +25,7 @@ const {
   Callable,
   Publisher,
   Subscriber,
+  McpClient,
   version: getVersion,
 } = require('./jsbos.js');
 
@@ -440,5 +441,6 @@ module.exports = {
   Queryable: QueryableServer,
   Caller: CallerClient,
   Callable: CallableServer,
+  McpClient,
   version: getVersion,
 };
