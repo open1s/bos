@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build agent and start a session from persistent state.
     let agent = Agent::new(AgentConfig::default(), Arc::new(EchoLlm));
-    let created = manager.create(agent_id.to_string()).await?;
+    let created = manager.create(agent_id.to_string(), None).await?;
     let mut session = AgentSession::restore_from_state(agent.clone(), created);
 
     let first = session.run("hello from storage session").await?;

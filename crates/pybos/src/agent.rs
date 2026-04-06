@@ -447,10 +447,12 @@ impl PyAgentCallableServer {
     // The server starts listening for requests immediately
 }
 
-#[pyclass(name = "Agent", skip_from_py_object)]
+#[pyclass(name = "Agent", frozen, unsendable, subclass)]
 #[derive(Clone)]
 pub struct PyAgent {
     pub inner: std::sync::Arc<Mutex<Agent>>,
+    /// Stored MCP clients for restart/health_status operations
+    pub mcp_clients: std::sync::Arc<Mutex<Vec<std::sync::Arc<agent::mcp::McpClient>>>>,
 }
 
 #[pymethods]
@@ -481,6 +483,7 @@ impl PyAgent {
 
         Ok(Self {
             inner: std::sync::Arc::new(Mutex::new(agent)),
+            mcp_clients: Default::default(),
         })
     }
 
@@ -519,6 +522,7 @@ impl PyAgent {
                     py,
                     PyAgent {
                         inner: std::sync::Arc::new(Mutex::new(agent)),
+                        mcp_clients: Default::default(),
                     },
                 )?;
                 Ok(py_agent.into_any())

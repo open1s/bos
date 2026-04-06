@@ -27,6 +27,7 @@ flate2 = "1.0"
 tempfile = "3.8"
 anyhow = { workspace = true }
 ctor = "0.6.3"
+dirs = "5.0"
 
 [features]
 internal-api = []

@@ -164,6 +164,7 @@ impl Bus {
         Ok(crate::Queryable {
             inner: std::sync::Arc::new(tokio::sync::Mutex::new(wrapper)),
             handler: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            stream_handler: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 

@@ -6,6 +6,7 @@ use crate::memory::Memory;
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::telemetry::{Telemetry, TelemetryEvent};
 use crate::tool::{Tool, ToolRegistry};
+use crate::token_counter::{TokenBudgetReport, TokenCounter, TokenUsage};
 use futures::Stream;
 use log::info;
 use serde_json::Value;
@@ -34,6 +35,45 @@ pub enum ReactError {
 pub enum BuilderError {
     #[error("LLM is required")]
     MissingLlm,
+}
+
+/// Plan mode configuration - controls how plans are generated and displayed
+#[derive(Debug, Clone)]
+pub enum PlanMode {
+    /// No plan mode - execute immediately (default)
+    None,
+    /// Generate plan before first action, show to user for approval
+    ShowFirst,
+    /// Always show plan before executing any tool
+    AlwaysShow,
+    /// Generate plan but execute without waiting for approval (informational only)
+    Silent,
+}
+
+/// Represents a generated plan from the ReAct engine
+#[derive(Debug, Clone)]
+pub struct ExecutionPlan {
+    /// The user's original request
+    pub user_input: String,
+    /// Steps the agent intends to take
+    pub steps: Vec<PlanStep>,
+    /// Whether this plan requires user approval before execution
+    pub requires_approval: bool,
+    /// Estimated number of tool calls
+    pub estimated_steps: usize,
+}
+
+/// A single step in an execution plan
+#[derive(Debug, Clone)]
+pub struct PlanStep {
+    /// Step number (1-indexed)
+    pub step_number: usize,
+    /// The tool to call (if any)
+    pub tool_name: Option<String>,
+    /// The reasoning for this step
+    pub reasoning: String,
+    /// Input parameters for the tool
+    pub parameters: Value,
 }
 
 /// Parse result indicating whether the LLM output is a tool call or text
@@ -356,6 +396,7 @@ fn parse_xml_tags(thought: &str) -> Option<(String, Value)> {
     Some((tag_name, args))
 }
 
+#[allow(dead_code)]
 pub struct ReActEngine {
     llm: Box<dyn LlmClient>,
     tools: ToolRegistry,
@@ -366,6 +407,10 @@ pub struct ReActEngine {
     llm_timeout_secs: u64,
     model: String,
     system_prompt: String,
+    plan_mode: PlanMode,
+    auto_continue: bool,
+    checkpoint_interval: usize,
+    token_counter: TokenCounter,
 }
 
 pub struct ReActEngineBuilder {
@@ -377,6 +422,10 @@ pub struct ReActEngineBuilder {
     llm_timeout_secs: u64,
     model: String,
     system_prompt: String,
+    plan_mode: PlanMode,
+    auto_continue: bool,
+    checkpoint_interval: usize,
+    token_counter: TokenCounter,
 }
 
 impl ReActEngineBuilder {
@@ -390,6 +439,10 @@ impl ReActEngineBuilder {
             llm_timeout_secs: 120,
             model: String::new(),
             system_prompt: String::new(),
+            plan_mode: PlanMode::None,
+            auto_continue: false,
+            checkpoint_interval: 5,
+            token_counter: TokenCounter::with_default(),
         }
     }
 }
@@ -441,6 +494,21 @@ impl ReActEngineBuilder {
         self
     }
 
+    pub fn plan_mode(mut self, mode: PlanMode) -> Self {
+        self.plan_mode = mode;
+        self
+    }
+
+    pub fn auto_continue(mut self, enabled: bool) -> Self {
+        self.auto_continue = enabled;
+        self
+    }
+
+    pub fn checkpoint_interval(mut self, interval: usize) -> Self {
+        self.checkpoint_interval = interval;
+        self
+    }
+
     pub fn build(self) -> Result<ReActEngine, BuilderError> {
         let llm = self.llm.ok_or(BuilderError::MissingLlm)?;
         Ok(ReActEngine {
@@ -453,6 +521,10 @@ impl ReActEngineBuilder {
             llm_timeout_secs: self.llm_timeout_secs,
             model: self.model,
             system_prompt: self.system_prompt,
+            plan_mode: self.plan_mode,
+            auto_continue: self.auto_continue,
+            checkpoint_interval: self.checkpoint_interval,
+            token_counter: self.token_counter,
         })
     }
 }
@@ -469,6 +541,10 @@ impl ReActEngine {
             llm_timeout_secs: 120,
             model: String::new(),
             system_prompt: String::new(),
+            plan_mode: PlanMode::None,
+            auto_continue: false,
+            checkpoint_interval: 5,
+            token_counter: TokenCounter::with_default(),
         }
     }
 
@@ -478,6 +554,137 @@ impl ReActEngine {
 
     pub fn register_tool(&mut self, t: Box<dyn Tool>) {
         self.tools.register(t);
+    }
+
+    pub fn set_plan_mode(&mut self, mode: PlanMode) {
+        self.plan_mode = mode;
+    }
+
+    /// Generate an execution plan for the given user input without executing it.
+    /// This is the core Plan Mode implementation - shows plan before action.
+    pub async fn plan(&mut self, user_input: &str) -> Result<ExecutionPlan, ReactError> {
+        let openai_tools: Vec<LlmTool> = self
+            .tools
+            .tools
+            .iter()
+            .filter(|(_, tool)| !tool.is_skill())
+            .map(|(name, tool)| LlmTool {
+                name: name.to_string(),
+                description: tool.description(),
+                parameters: tool.json_schema(),
+            })
+            .collect();
+
+        let plan_prompt = format!(
+            "You are a planning agent. Given the user's request below, create a detailed execution plan.\n\
+            Available tools:\n{}\n\n\
+            User request: {}\n\n\
+            Your plan should:\n\
+            1. Analyze the request to understand what needs to be done\n\
+            2. Identify which tools to use and in what order\n\
+            3. Estimate the number of steps required\n\
+            4. Output your plan in the following format:\n\
+            PLAN:\n\
+            Step 1: [tool_name] - [reasoning] - params: [input]\n\
+            Step 2: [tool_name] - [reasoning] - params: [input]\n\
+            ...\n\
+            END_PLAN",
+            self.tools_descriptions(),
+            user_input
+        );
+
+        let context = LlmContext {
+            tools: openai_tools,
+            skills: Vec::new(),
+            conversations: vec![LlmMessage::system(plan_prompt)],
+            rules: Vec::new(),
+            instructions: Vec::new(),
+        };
+
+        let request = LlmRequest {
+            model: self.model.clone(),
+            context,
+            ..Default::default()
+        };
+
+        let llm_response = self.call_llm(request).await?;
+
+        let steps = match llm_response {
+            LlmResponse::Text(text) | LlmResponse::Partial(text) => {
+                self.parse_plan_steps(&text)
+            }
+            LlmResponse::Done => Vec::new(),
+            LlmResponse::ToolCall { .. } => Vec::new(),
+        };
+
+        let requires_approval = matches!(self.plan_mode, PlanMode::ShowFirst | PlanMode::AlwaysShow);
+
+        Ok(ExecutionPlan {
+            user_input: user_input.to_string(),
+            steps,
+            requires_approval,
+            estimated_steps: 0,
+        })
+    }
+
+    fn parse_plan_steps(&self, text: &str) -> Vec<PlanStep> {
+        let mut steps = Vec::new();
+        let mut step_number = 1;
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with("Step ") || line.starts_with("step ") {
+                if let Some(colon_pos) = line.find(':') {
+                    let content = line[colon_pos + 1..].trim();
+                    let (tool_name, reasoning) = if let Some(dash_pos) = content.find('-') {
+                        (
+                            Some(content[..dash_pos].trim().to_string()),
+                            content[dash_pos + 1..].trim().to_string(),
+                        )
+                    } else {
+                        (None, content.to_string())
+                    };
+                    steps.push(PlanStep {
+                        step_number,
+                        tool_name,
+                        reasoning,
+                        parameters: Value::Null,
+                    });
+                    step_number += 1;
+                }
+            }
+        }
+
+        steps
+    }
+
+    /// Execute with plan mode - shows plan first, then executes if approved
+    pub async fn react_with_plan(&mut self, user_input: &str) -> Result<String, ReactError> {
+        match self.plan_mode {
+            PlanMode::None => self.react(user_input).await,
+            PlanMode::Silent => {
+                let _ = self.plan(user_input).await;
+                self.react(user_input).await
+            }
+PlanMode::ShowFirst | PlanMode::AlwaysShow => {
+        let plan = self.plan(user_input).await?;
+        // Log the plan for visibility
+        if !plan.steps.is_empty() {
+            info!("[Plan Mode] Generated plan with {} steps", plan.steps.len());
+            for step in &plan.steps {
+                info!(
+                    "[Plan] Step {}: {:?} - {}",
+                    step.step_number, step.tool_name, step.reasoning
+                );
+            }
+            // TODO: Implement actual user approval mechanism
+            // For now, we log the plan and continue. In production, this would
+            // integrate with an interactive approval system (e.g., TUI, webhook, etc.)
+            info!("[Plan Mode] Execute? (approval not yet implemented - use PlanMode::Silent for auto-execute)");
+        }
+        self.react(user_input).await
+    }
+        }
     }
 
     #[allow(unused)]
@@ -585,10 +792,22 @@ impl ReActEngine {
             .conversations
             .push(LlmMessage::user(user_input.to_string()));
 
-        let mut thought = String::new();
-        let mut loaded_skills: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for _ in 0..self.max_steps {
+let mut thought = String::new();
+    let mut loaded_skills: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut step_count = 0;
+
+    for _ in 0..self.max_steps {
+        step_count += 1;
+
+        if self.checkpoint_interval > 0 && step_count % self.checkpoint_interval == 0 {
+            let checkpoint = serde_json::json!({
+                "step": step_count,
+                "thought": thought,
+                "context_size": context.conversations.len(),
+            });
+            self.telemetry.emit(&TelemetryEvent::Checkpoint(checkpoint));
+        }
             let request = LlmRequest {
                 model: self.model.clone(),
                 context: context.clone(),
@@ -782,5 +1001,20 @@ impl ReActEngine {
     // Expose a simple memory checkpoint API for testing/observability
     pub fn save_memory_checkpoint(&self, path: &str) -> Result<(), std::io::Error> {
         self.memory.save_to_file(path)
+    }
+
+    /// Get current token usage for this session
+    pub fn token_usage(&self) -> TokenUsage {
+        self.token_counter.usage()
+    }
+
+    /// Get a budget report showing usage vs limits
+    pub fn token_budget_report(&self) -> TokenBudgetReport {
+        self.token_counter.report()
+    }
+
+    /// Reset the token counter for a new session
+    pub fn reset_token_counter(&mut self) {
+        self.token_counter = TokenCounter::with_default();
     }
 }

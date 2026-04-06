@@ -14,7 +14,7 @@ impl SessionSerializer {
         serde_json::from_slice(bytes).map_err(|e| SessionError::Serialization(e.to_string()))
     }
 
-    pub fn new_state(agent_id: String) -> AgentState {
+    pub fn new_state(agent_id: String, workspace: Option<String>) -> AgentState {
         let now = Self::now_timestamp();
         AgentState {
             agent_id: agent_id.clone(),
@@ -27,6 +27,8 @@ impl SessionSerializer {
                 message_count: 0,
                 agent_version: "1.0.0".to_string(),
                 labels: Vec::new(),
+                workspace,
+                alias: None,
             },
         }
     }
@@ -78,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize() {
-        let state = SessionSerializer::new_state("test-agent".to_string());
+        let state = SessionSerializer::new_state("test-agent".to_string(), None);
         let bytes = SessionSerializer::serialize(&state).unwrap();
         let restored = SessionSerializer::deserialize(&bytes).unwrap();
 
@@ -100,7 +102,7 @@ mod tests {
 
     #[test]
     fn test_is_expired() {
-        let mut state = SessionSerializer::new_state("test-agent".to_string());
+        let mut state = SessionSerializer::new_state("test-agent".to_string(), None);
         assert!(!SessionSerializer::is_expired(&state));
 
         state.metadata.expires_at = Some(SessionSerializer::now_timestamp() - 100);

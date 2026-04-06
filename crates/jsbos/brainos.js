@@ -119,7 +119,7 @@ class Agent {
   }
 
   async start() {
-    const { Agent: RawAgent } = require('./index.js');
+    const { Agent: RawAgent } = require('./jsbos.js');
     this._inner = await RawAgent.create(this._config);
     for (const t of this._tools) {
       const schema = JSON.stringify(t.schema);
@@ -179,7 +179,7 @@ class BusManager {
   }
 
   async start() {
-    const { Bus: RawBus } = require('./index.js');
+    const { Bus: RawBus } = require('./jsbos.js');
     const cfg = {
       mode: this._mode,
       connect: this._connect,

@@ -19,6 +19,7 @@ pub enum TelemetryEvent {
     FinalAnswer {
         answer: String,
     },
+    Checkpoint(Value),
 }
 
 #[derive(Debug, Clone)]

@@ -6,7 +6,8 @@ members = [
     "crates/logging",
     "crates/react",
     "crates/pybos",
-    "crates/jsbos"
+    "crates/jsbos",
+    "crates/cli"
 ]
 resolver = "2"
 

@@ -51,3 +51,19 @@ impl From<tokio::time::error::Elapsed> for ZenohError {
         ZenohError::Timeout
     }
 }
+
+impl AsRef<str> for ZenohError {
+    fn as_ref(&self) -> &str {
+        match self {
+            ZenohError::Session(s) => s,
+            ZenohError::Publisher(s) => s,
+            ZenohError::Subscriber(s) => s,
+            ZenohError::Query(s) => s,
+            ZenohError::Serialization(s) => s,
+            ZenohError::NotConnected => "Not connected",
+            ZenohError::AlreadyConnected => "Already connected",
+            ZenohError::AlreadyStarted => "Already started",
+            ZenohError::Timeout => "Operation timed out",
+        }
+    }
+}

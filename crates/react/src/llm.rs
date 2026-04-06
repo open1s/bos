@@ -382,4 +382,54 @@ pub trait LlmClient: Send + Sync {
 
 pub type LlmResponseResultFuture<'a> = Pin<Box<dyn Future<Output = LlmResponseResult> + Send + 'a>>;
 
+pub struct ModelFallback {
+    primary: Box<dyn LlmClient>,
+    fallback: Box<dyn LlmClient>,
+    fallback_on_error: bool,
+}
+
+impl ModelFallback {
+    pub fn new(primary: Box<dyn LlmClient>, fallback: Box<dyn LlmClient>) -> Self {
+        Self {
+            primary,
+            fallback,
+            fallback_on_error: true,
+        }
+    }
+
+    pub fn with_fallback_enabled(mut self, enabled: bool) -> Self {
+        self.fallback_on_error = enabled;
+        self
+    }
+}
+
+#[async_trait]
+impl LlmClient for ModelFallback {
+    async fn complete(&self, req: LlmRequest) -> LlmResponseResult {
+        let result = self.primary.complete(req.clone()).await;
+        if result.is_err() && self.fallback_on_error {
+            self.fallback.complete(req).await
+        } else {
+            result
+        }
+    }
+
+    async fn stream_complete(&self, req: LlmRequest) -> Result<TokenStream, LlmError> {
+        let result = self.primary.stream_complete(req.clone()).await;
+        if result.is_err() && self.fallback_on_error {
+            self.fallback.stream_complete(req).await
+        } else {
+            result
+        }
+    }
+
+    fn supports_tools(&self) -> bool {
+        self.primary.supports_tools()
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "model_fallback"
+    }
+}
+
 pub mod vendor;

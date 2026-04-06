@@ -179,10 +179,10 @@ impl PyMcpClient {
         })
     }
 
-    /// List available prompts from the MCP server.
+/// List available prompts from the MCP server.
     ///
     /// Returns:
-    ///     List of dicts, each with keys: name, description, arguments
+    /// List of dicts, each with keys: name, description, arguments
     fn list_prompts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
@@ -194,5 +194,61 @@ impl PyMcpClient {
 
             Python::attach(|py| json_to_py(py, &prompts_json))
         })
+    }
+
+    /// Restart the MCP client connection.
+    ///
+    /// This will reinitialize the connection to the MCP server,
+    /// useful for recovering from connection failures.
+    ///
+    /// Returns:
+    /// dict with server capabilities after reinitialization
+    fn restart<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let caps = client.restart().await.map_err(to_py_runtime_error)?;
+
+            let caps_json = serde_json::to_value(&caps)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+            Python::attach(|py| json_to_py(py, &caps_json))
+        })
+    }
+
+    /// Get detailed health status of the MCP client.
+    ///
+    /// Returns:
+    /// dict with keys: state, initialized, last_ping, last_error, restart_count, idle_duration
+    fn health_status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let status = self.inner.health_status();
+
+        // Convert ConnectionState to string
+        let state = match status.state {
+            agent::mcp::client::ConnectionState::Disconnected => "disconnected",
+            agent::mcp::client::ConnectionState::Connecting => "connecting",
+            agent::mcp::client::ConnectionState::Connected => "connected",
+            agent::mcp::client::ConnectionState::Reconnecting => "reconnecting",
+            agent::mcp::client::ConnectionState::Failed(ref msg) => {
+                return json_to_py(py, &serde_json::json!({ 
+                    "state": "failed",
+                    "error": msg,
+                    "initialized": status.initialized,
+                    "last_ping": status.last_ping.map(|i| i.elapsed().as_secs_f64()),
+                    "last_error": status.last_error,
+                    "restart_count": status.restart_count,
+                    "idle_duration": status.idle_duration.map(|d| d.as_secs_f64()),
+                }));
+            }
+        };
+
+        json_to_py(py, &serde_json::json!({
+            "state": state,
+            "initialized": status.initialized,
+            "last_ping": status.last_ping.map(|i| i.elapsed().as_secs_f64()),
+            "last_error": status.last_error,
+            "restart_count": status.restart_count,
+            "idle_duration": status.idle_duration.map(|d| d.as_secs_f64()),
+        }))
     }
 }

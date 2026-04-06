@@ -1350,12 +1350,12 @@ impl AgentSession {
                     context: serde_json::Value::Null,
                     metadata: meta.clone(),
                 }
-            } else {
-                crate::session::SessionSerializer::new_state(agent_id.clone())
-            }
-        } else {
-            crate::session::SessionSerializer::new_state(agent_id.clone())
-        };
+} else {
+            crate::session::SessionSerializer::new_state(agent_id.clone(), None)
+        }
+    } else {
+        crate::session::SessionSerializer::new_state(agent_id.clone(), None)
+    };
         state.agent_id = agent_id;
         state.message_log = self.context.messages.clone();
         state.context = serde_json::json!({
@@ -2825,7 +2825,7 @@ mod tests {
         });
         let agent = Agent::new(AgentConfig::default(), llm);
 
-        let mut state = crate::session::SessionSerializer::new_state("meta-agent".to_string());
+        let mut state = crate::session::SessionSerializer::new_state("meta-agent".to_string(), None);
         state.metadata.created_at = 111;
         state.metadata.updated_at = 222;
         state.metadata.expires_at = Some(333);

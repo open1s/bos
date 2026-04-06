@@ -13,6 +13,7 @@ pub struct FunctionTool {
     schema: serde_json::Value,
     func: Arc<dyn Fn(&serde_json::Value) -> Result<serde_json::Value, ToolError> + Send + Sync>,
     skill: bool,
+    category: String,
 }
 
 impl FunctionTool {
@@ -32,6 +33,7 @@ impl FunctionTool {
             schema,
             func: Arc::new(func),
             skill: false,
+            category: "general".to_string(),
         }
     }
 
@@ -48,7 +50,13 @@ impl FunctionTool {
             schema,
             func: Arc::new(func),
             skill: true,
+            category: "skill".to_string(),
         }
+    }
+
+    pub fn with_category(mut self, category: &str) -> Self {
+        self.category = category.to_string();
+        self
     }
 
     /// Create a FunctionTool with automatic schema generation for simple numeric functions.
@@ -103,6 +111,10 @@ impl Tool for FunctionTool {
 
     fn is_skill(&self) -> bool {
         self.skill
+    }
+
+    fn category(&self) -> &str {
+        &self.category
     }
 }
 

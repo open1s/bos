@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent::new(AgentConfig::default(), Arc::new(EchoLlm));
 
     // Create a fresh session from an empty persisted state.
-    let initial_state = SessionSerializer::new_state("demo-session".to_string());
+    let initial_state = SessionSerializer::new_state("demo-session".to_string(), None);
     let mut session = AgentSession::restore_from_state(agent.clone(), initial_state);
 
     let first = session.run("Hello from original session").await?;

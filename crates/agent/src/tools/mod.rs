@@ -4,12 +4,14 @@ use async_trait::async_trait;
 
 use crate::error::ToolError;
 
+pub mod bash;
 pub mod function;
 pub mod policy;
 pub mod registry;
 pub mod translator;
 pub mod validator;
 
+pub use bash::BashTool;
 pub use function::FunctionTool;
 pub use registry::ToolRegistry;
 pub use translator::describe_schema;
@@ -26,9 +28,8 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> ToolDescription;
     fn json_schema(&self) -> serde_json::Value;
-    fn is_skill(&self) -> bool {
-        false
-    }
+    fn is_skill(&self) -> bool { false }
+    fn category(&self) -> &str { "general" }
 
     /// Get cached JSON schema as Arc for zero-copy access
     /// Default implementation wraps json_schema() in Arc
@@ -36,7 +37,7 @@ pub trait Tool: Send + Sync {
         Arc::new(self.json_schema())
     }
 
-    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError>;
+async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError>;
 }
 
 #[async_trait]
@@ -60,6 +61,10 @@ impl Tool for Box<dyn Tool> {
     fn is_skill(&self) -> bool {
         (**self).is_skill()
     }
+
+    fn category(&self) -> &str {
+        (**self).category()
+    }
 }
 
 #[async_trait]
@@ -82,5 +87,9 @@ impl Tool for Arc<dyn Tool> {
 
     fn is_skill(&self) -> bool {
         (**self).is_skill()
+    }
+
+    fn category(&self) -> &str {
+        (**self).category()
     }
 }

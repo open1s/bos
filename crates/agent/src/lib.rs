@@ -6,6 +6,7 @@ pub mod agent;
 pub mod bus_rpc;
 pub mod error;
 pub mod mcp;
+pub mod security;
 pub mod session;
 pub mod skills;
 pub mod tools;
@@ -28,5 +29,7 @@ pub use react::llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamTo
 pub use session::manager::SessionManager;
 pub use session::serializer::SessionSerializer;
 pub use session::{AgentState, SessionConfig, SessionError, SessionMetadata, SessionSummary};
+pub use security::{SecurityError, WorkspaceValidator};
 pub use skills::{SkillContent, SkillError, SkillInjector, SkillLoader, SkillMetadata};
-pub use tools::{Tool, ToolDescription, ToolRegistry};
+pub use tools::{Tool, ToolDescription, ToolRegistry, BashTool};
+pub use tools::bash::BashExecutionResult;

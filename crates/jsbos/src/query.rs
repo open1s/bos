@@ -55,10 +55,12 @@ impl Query {
     }
 }
 
+#[allow(dead_code)]
 #[napi]
 pub struct Queryable {
     pub(crate) inner: Arc<tokio::sync::Mutex<bus::QueryableWrapper<String, String>>>,
     pub(crate) handler: Arc<std::sync::Mutex<Option<ThreadsafeFunction<String>>>>,
+    pub(crate) stream_handler: Arc<std::sync::Mutex<Option<ThreadsafeFunction<String>>>>,
 }
 
 #[napi]
@@ -72,6 +74,7 @@ impl Queryable {
         Ok(Queryable {
             inner: Arc::new(tokio::sync::Mutex::new(wrapper)),
             handler: Arc::new(std::sync::Mutex::new(None)),
+            stream_handler: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -160,6 +163,43 @@ impl Queryable {
 
     #[napi]
     pub async fn run_stream(&self, handler: ThreadsafeFunction<String>) -> Result<()> {
-        self.run(handler).await
+        let mut guard = self.inner.lock().await;
+
+        let tsfn = handler;
+        guard
+            .set_stream_handler(
+                move |input: String, tx| {
+                    let tsfn_clone = tsfn.clone();
+                    async move {
+                        let (response_tx, response_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+                        let tx_clone = tx.clone();
+                        tsfn_clone.call_with_return_value::<String, _>(
+                            Ok(input.clone()),
+                            ThreadsafeFunctionCallMode::Blocking,
+                            move |result: String| -> napi::Result<()> {
+                                let _ = response_tx.send(Ok(result));
+                                Ok(())
+                            },
+                        );
+                        match response_rx.recv() {
+                            Ok(Ok(result)) => {
+                                let _ = tx_clone.send(Ok(result));
+                            }
+                            Ok(Err(e)) => {
+                                let _ = tx_clone.send(Err(bus::ZenohError::Query(format!("Handler error: {}", e))));
+                            }
+                            Err(_) => {
+                                let _ = tx_clone.send(Err(bus::ZenohError::Query("handler channel closed".to_string())));
+                            }
+                        }
+                    }
+                },
+            )
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+
+        guard
+            .run()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        Ok(())
     }
 }

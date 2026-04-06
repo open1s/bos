@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -8,6 +9,38 @@ use super::protocol::{
     ServerCapabilities, ToolDefinition,
 };
 use super::transport::StdioTransport;
+
+/// Connection state for MCP client
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnectionState {
+    /// Not yet initialized
+    Disconnected,
+    /// Attempting to connect
+    Connecting,
+    /// Successfully connected and initialized
+    Connected,
+    /// Connection lost, attempting to recover
+    Reconnecting,
+    /// Connection failed
+    Failed(String),
+}
+
+/// Detailed health status for MCP client
+#[derive(Debug, Clone)]
+pub struct McpHealthStatus {
+    /// Current connection state
+    pub state: ConnectionState,
+    /// Whether the client is initialized
+    pub initialized: bool,
+    /// Last successful ping time (None if never pinged successfully)
+    pub last_ping: Option<Instant>,
+    /// Last error message if any
+    pub last_error: Option<String>,
+    /// Number of restart attempts
+    pub restart_count: u32,
+    /// Time since last successful communication
+    pub idle_duration: Option<Duration>,
+}
 
 #[derive(Error, Debug)]
 pub enum McpError {
@@ -44,6 +77,12 @@ pub struct McpClient {
     request_id: std::sync::atomic::AtomicU64,
     capabilities: std::sync::Mutex<Option<ServerCapabilities>>,
     initialized: std::sync::atomic::AtomicBool,
+    // Health tracking
+    state: std::sync::Mutex<ConnectionState>,
+    last_ping: std::sync::Mutex<Option<Instant>>,
+    last_error: std::sync::Mutex<Option<String>>,
+    restart_count: std::sync::atomic::AtomicU32,
+    last_communication: std::sync::Mutex<Option<Instant>>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -60,6 +99,11 @@ impl McpClient {
             request_id: std::sync::atomic::AtomicU64::new(1),
             capabilities: std::sync::Mutex::new(None),
             initialized: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::Mutex::new(ConnectionState::Disconnected),
+            last_ping: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            restart_count: std::sync::atomic::AtomicU32::new(0),
+            last_communication: std::sync::Mutex::new(None),
         })
     }
 
@@ -71,6 +115,11 @@ impl McpClient {
             request_id: std::sync::atomic::AtomicU64::new(1),
             capabilities: std::sync::Mutex::new(None),
             initialized: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::Mutex::new(ConnectionState::Disconnected),
+            last_ping: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            restart_count: std::sync::atomic::AtomicU32::new(0),
+            last_communication: std::sync::Mutex::new(None),
         }
     }
 
@@ -117,6 +166,73 @@ impl McpClient {
         self.notify("notifications/initialized", None).await?;
 
         Ok(caps)
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.is_initialized()
+    }
+
+    /// Get detailed health status of the MCP client
+    pub fn health_status(&self) -> McpHealthStatus {
+        let state = self.state.lock().unwrap().clone();
+        let initialized = self.is_initialized();
+        let last_ping = self.last_ping.lock().unwrap().clone();
+        let last_error = self.last_error.lock().unwrap().clone();
+        let restart_count = self.restart_count.load(std::sync::atomic::Ordering::SeqCst);
+        
+        let idle_duration = self.last_communication.lock().unwrap().map(|instant| {
+            instant.elapsed()
+        });
+
+        McpHealthStatus {
+            state,
+            initialized,
+            last_ping,
+            last_error,
+            restart_count,
+            idle_duration,
+        }
+    }
+
+    /// Restart the MCP client connection
+    pub async fn restart(&self) -> Result<ServerCapabilities, McpError> {
+        // Update state to reconnecting
+        *self.state.lock().unwrap() = ConnectionState::Reconnecting;
+        
+        // Increment restart count
+        self.restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        
+        // Reset initialized flag to allow re-initialization
+        self.initialized.store(false, std::sync::atomic::Ordering::SeqCst);
+        
+        // Clear capabilities to force re-fetch
+        *self.capabilities.lock().unwrap() = None;
+        
+        // Re-initialize
+        match self.initialize().await {
+            Ok(caps) => {
+                *self.state.lock().unwrap() = ConnectionState::Connected;
+                *self.last_error.lock().unwrap() = None;
+                Ok(caps)
+            }
+            Err(e) => {
+                *self.state.lock().unwrap() = ConnectionState::Failed(e.to_string());
+                *self.last_error.lock().unwrap() = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn health_check(&self) -> Result<bool, McpError> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
+        let resp = self.call("ping", None).await?;
+        Ok(resp.error.is_none())
     }
 
     pub async fn list_tools(&self) -> Result<Vec<ToolDefinition>, McpError> {

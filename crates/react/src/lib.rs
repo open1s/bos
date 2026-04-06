@@ -6,6 +6,7 @@ pub mod prompts;
 pub mod resilience;
 pub mod search_tool;
 pub mod telemetry;
+pub mod token_counter;
 pub mod tool;
 use serde_json::Value;
 use std::collections::HashMap;

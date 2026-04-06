@@ -1,0 +1,21 @@
+[package]
+name = "bos-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+agent = { path = "../agent" }
+bus = { path = "../bus" }
+config = { path = "../config" }
+react = { path = "../react" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+anyhow.workspace = true
+
+[[bin]]
+name = "bos"
+path = "src/main.rs"

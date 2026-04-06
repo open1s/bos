@@ -30,6 +30,7 @@ dependencies = [
  "config",
  "ctor 0.6.3",
  "dashmap",
+ "dirs 5.0.1",
  "flate2",
  "futures",
  "log",
@@ -319,6 +320,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bos-cli"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "anyhow",
+ "bus",
+ "clap",
+ "config",
+ "react",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

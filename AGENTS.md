@@ -16,7 +16,41 @@ crates/
 ├── jsbos/     # Node.js bindings (NAPI-RS)
 └── react/     # ReAct engine, LLM integration
 ```
+---
+## Version Control
+This repo use jj(jujutsu) for version management
+Core Concepts
+- change_id: Unique identifier for a change (use this, NOT commit hash)
+- stack: Ordered list of changes (your working history)
+- working copy: Always attached to a change
 
+Key difference from Git:
+jj is stack-based, not branch-based. You are expected to edit, reorder, and clean history before pushing.
+```bash
+# Status
+jj status
+
+# Create new change
+jj new
+
+# Describe change
+jj describe -m "<crate>: <title>"
+
+# View stack
+jj log
+
+# Edit change
+jj edit <change_id>
+
+# Split change
+jj split
+
+# Squash into parent
+jj squash
+
+# Reorder changes
+jj rebase -r <change_id> -d <destination>
+```
 ---
 
 ## Essential Commands

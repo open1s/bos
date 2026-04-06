@@ -21,6 +21,8 @@ pub struct SessionMetadata {
     pub message_count: usize,
     pub agent_version: String,
     pub labels: Vec<String>,
+    pub workspace: Option<String>,
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,8 @@ pub struct SessionSummary {
     pub message_count: usize,
     pub labels: Vec<String>,
     pub expires_at: Option<u64>,
+    pub workspace: Option<String>,
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone)]
