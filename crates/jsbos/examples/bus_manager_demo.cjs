@@ -10,7 +10,7 @@
  * 5. Subscriber with callback loop
  */
 
-const { Bus, BusConfig } = require('../jsbos.cjs');
+const { Bus, BusConfig } = require('../index.js');
 
 async function demoDirectPublish() {
   console.log('═'.repeat(60));

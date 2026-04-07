@@ -12,7 +12,7 @@
  *     node crates/jsbos/examples/bus_demo.js
  */
 
-const { Bus, version } = require('../jsbos.cjs');
+const { Bus, version } = require('../index.js');
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));

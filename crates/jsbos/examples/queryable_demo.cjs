@@ -11,7 +11,7 @@
  *     node crates/jsbos/examples/queryable_demo.js
  */
 
-const { Bus, Query, Queryable, version } = require('../jsbos.cjs');
+const { Bus, Query, Queryable, version } = require('../index.js');
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));

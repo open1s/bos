@@ -16,7 +16,7 @@
  *     node crates/jsbos/examples/mcp_demo.js
  */
 
-const { McpClient, version } = require('../jsbos.cjs');
+const { McpClient, version } = require('../index.js');
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));

@@ -17,10 +17,10 @@ impl Publisher {
     }
 
     #[napi(factory)]
-    pub async fn with_session(topic: String, session: External<Arc<bus::Session>>) -> Result<Self> {
+    pub async fn with_session(topic: String, session: &External<bus::Session>) -> Result<Self> {
         Ok(Publisher {
             inner: bus::Publisher::new(topic)
-                .with_session(Arc::clone(&session))
+                .with_session(Arc::new((**session).clone()))
                 .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?,
         })
     }

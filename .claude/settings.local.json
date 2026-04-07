@@ -8,7 +8,11 @@
       "Bash(npm install:*)",
       "Bash(node:*)",
       "Bash(npm run:*)",
-      "Bash(grep -l \"require.*jsbos\" examples/*.cjs)"
+      "Bash(grep -l \"require.*jsbos\" examples/*.cjs)",
+      "Bash(awk 'NR>=12 && NR<=20' /Users/gaosg/Projects/bos/crates/jsbos/src/agent.rs)",
+      "Bash(xxd)",
+      "Bash(awk 'NR==253' /Users/gaosg/Projects/bos/crates/jsbos/src/agent.rs)",
+      "Bash(awk 'NR==252' /Users/gaosg/Projects/bos/crates/jsbos/src/agent.rs)"
     ]
   }
 }

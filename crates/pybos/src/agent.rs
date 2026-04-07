@@ -447,7 +447,7 @@ impl PyAgentCallableServer {
     // The server starts listening for requests immediately
 }
 
-#[pyclass(name = "Agent", frozen, unsendable, subclass)]
+#[pyclass(name = "Agent", frozen, unsendable, subclass, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyAgent {
     pub inner: std::sync::Arc<Mutex<Agent>>,

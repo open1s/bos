@@ -13,7 +13,7 @@
  *     node crates/jsbos/examples/integration_demo.js
  */
 
-const { Bus, ConfigLoader, version } = require('../jsbos.cjs');
+const { Bus, ConfigLoader, version } = require('../index.js');
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));

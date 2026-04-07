@@ -19,7 +19,7 @@
  *     node crates/jsbos/examples/agent_rpc_demo.js
  */
 
-const { Bus, Agent, AgentConfig, ConfigLoader, version } = require('../jsbos.cjs');
+const { Bus, Agent, AgentConfig, ConfigLoader, version } = require('../index.js');
 
 const loader = new ConfigLoader();
 loader.discover();

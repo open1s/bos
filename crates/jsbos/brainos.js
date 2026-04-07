@@ -27,7 +27,7 @@ const {
   Subscriber,
   McpClient,
   version: getVersion,
-} = require('./jsbos.js');
+} = require('./index.js');
 
 class ToolDef {
   constructor(name, description, callback, parameters = {}, schema = {}) {

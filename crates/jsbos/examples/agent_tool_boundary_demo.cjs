@@ -15,7 +15,7 @@
  *     node crates/jsbos/examples/agent_tool_boundary_demo.js
  */
 
-const { Bus, Agent, ConfigLoader, version } = require('../jsbos.cjs');
+const { Bus, Agent, ConfigLoader, version } = require('../index.js');
 
 const loader = new ConfigLoader();
 loader.discover();

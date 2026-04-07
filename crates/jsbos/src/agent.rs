@@ -13,7 +13,7 @@ struct JSTool {
     name: String,
     description: agent::ToolDescription,
     schema: serde_json::Value,
-    callback: ThreadsafeFunction<JSAny>,
+    callback: Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>>>,
 }
 
 #[async_trait]
@@ -40,11 +40,19 @@ impl agent::Tool for JSTool {
         let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<serde_json::Value, String>>();
         let tx_clone = tx.clone();
 
-        callback.call_with_return_value::<JSAny, _>(
+        callback.call_with_return_value(
             Ok(JSAny(args_json)),
             ThreadsafeFunctionCallMode::Blocking,
-            move |result: JSAny| -> napi::Result<()> {
-                let _ = tx_clone.send(Ok(result.0));
+            move |result: std::result::Result<napi::Unknown<'_>, napi::Error>, _env| -> napi::Result<()> {
+                match result {
+                    Ok(val) => {
+                        let json_val: serde_json::Value = val.coerce_to_string()?.into_utf8()?.as_str()?.parse().unwrap_or(serde_json::Value::Null);
+                        let _ = tx_clone.send(Ok(json_val));
+                    }
+                    Err(e) => {
+                        let _ = tx_clone.send(Err(e.to_string()));
+                    }
+                }
                 Ok(())
             },
         );
@@ -164,7 +172,7 @@ impl Agent {
     #[napi]
     pub async fn create_with_bus(
         config: AgentConfig,
-        bus: External<Arc<crate::Session>>,
+        _bus: &External<Arc<crate::Session>>,
     ) -> Result<Self> {
         let cfg: agent::AgentConfig = config.into();
         let agent = agent::Agent::builder()
@@ -181,7 +189,7 @@ impl Agent {
 
         Ok(Agent {
             inner: Arc::new(Mutex::new(agent)),
-            bus_session: Some((*bus).clone()),
+            bus_session: None,
         })
     }
 
@@ -250,7 +258,7 @@ impl Agent {
                 parameters,
             },
             schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
-            callback,
+            callback: callback.into(),
         };
         let mut guard = self.inner.lock().await;
         guard
@@ -374,7 +382,7 @@ impl Agent {
     pub async fn rpc_client(
         &self,
         endpoint: String,
-        _bus: External<Arc<crate::Session>>,
+        _bus: &External<Arc<crate::Session>>,
     ) -> Result<AgentRpcClient> {
         let session = self.bus_session.clone().ok_or_else(|| {
             napi::Error::new(napi::Status::GenericFailure, "Agent not created with bus")
@@ -393,7 +401,7 @@ impl Agent {
     pub async fn as_callable_server(
         &self,
         endpoint: String,
-        _bus: External<Arc<crate::Session>>,
+        _bus: &External<Arc<crate::Session>>,
     ) -> Result<AgentCallableServer> {
         let session = self.bus_session.clone().ok_or_else(|| {
             napi::Error::new(napi::Status::GenericFailure, "Agent not created with bus")

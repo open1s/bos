@@ -328,7 +328,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/cli@npm:^3.2.0":
+"@napi-rs/cli@npm:^3.6.0":
   version: 3.6.0
   resolution: "@napi-rs/cli@npm:3.6.0"
   dependencies:
@@ -1062,7 +1062,7 @@ __metadata:
   dependencies:
     "@emnapi/core": "npm:^1.5.0"
     "@emnapi/runtime": "npm:^1.5.0"
-    "@napi-rs/cli": "npm:^3.2.0"
+    "@napi-rs/cli": "npm:^3.6.0"
     "@oxc-node/core": "npm:^0.1.0"
     "@taplo/cli": "npm:^0.7.0"
     "@tybys/wasm-util": "npm:^0.10.0"

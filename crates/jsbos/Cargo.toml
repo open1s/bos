@@ -17,8 +17,8 @@ config = { path = "../config" }
 logging = { path = "../logging" }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-napi = { version = "2.16", features = ["async", "serde-json", "tokio_rt", "napi8"] }
-napi-derive = "2.16"
+napi = { version = "3", features = ["async", "serde-json", "tokio_rt"] }
+napi-derive = "3"
 async-trait = "0.1"
 futures = { workspace = true }
 

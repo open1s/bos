@@ -23,9 +23,9 @@ impl Subscriber {
     }
 
     #[napi(factory)]
-    pub async fn with_session(topic: String, session: External<Arc<bus::Session>>) -> Result<Self> {
+    pub async fn with_session(topic: String, session: &External<bus::Session>) -> Result<Self> {
         let sub = bus::Subscriber::<String>::new(topic)
-            .with_session(Arc::clone(&session))
+            .with_session(Arc::new((**session).clone()))
             .await
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(Subscriber {
@@ -75,7 +75,7 @@ impl Subscriber {
     #[napi]
     pub async fn run(&self, handler: ThreadsafeFunction<JSAny>) -> Result<()> {
         let inner = self.inner.clone();
-        let tsfn = handler;
+        let tsfn = Arc::new(handler);
         let running = self.running.clone();
 
         if running.swap(true, Ordering::SeqCst) {
@@ -98,11 +98,11 @@ impl Subscriber {
 
                 match message {
                     Some(msg) => {
-                        let tsfn_clone = tsfn.clone();
+                        let tsfn_clone = Arc::clone(&tsfn);
                         tsfn_clone.call_with_return_value(
                             Ok(JSAny(serde_json::Value::String(msg))),
                             ThreadsafeFunctionCallMode::NonBlocking,
-                            |_result: JSAny| Ok(()),
+                            |_result, _env| Ok(()),
                         );
                     }
                     None => break,

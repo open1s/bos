@@ -11,7 +11,7 @@
  *     node crates/jsbos/examples/config_demo.js
  */
 
-const { ConfigLoader, version } = require('../jsbos.cjs');
+const { ConfigLoader, version } = require('../index.js');
 
 function demoDiscover() {
   console.log('═'.repeat(60));
