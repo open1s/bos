@@ -179,7 +179,7 @@ impl PyMcpClient {
         })
     }
 
-/// List available prompts from the MCP server.
+    /// List available prompts from the MCP server.
     ///
     /// Returns:
     /// List of dicts, each with keys: name, description, arguments
@@ -230,25 +230,31 @@ impl PyMcpClient {
             agent::mcp::client::ConnectionState::Connected => "connected",
             agent::mcp::client::ConnectionState::Reconnecting => "reconnecting",
             agent::mcp::client::ConnectionState::Failed(ref msg) => {
-                return json_to_py(py, &serde_json::json!({ 
-                    "state": "failed",
-                    "error": msg,
-                    "initialized": status.initialized,
-                    "last_ping": status.last_ping.map(|i| i.elapsed().as_secs_f64()),
-                    "last_error": status.last_error,
-                    "restart_count": status.restart_count,
-                    "idle_duration": status.idle_duration.map(|d| d.as_secs_f64()),
-                }));
+                return json_to_py(
+                    py,
+                    &serde_json::json!({
+                        "state": "failed",
+                        "error": msg,
+                        "initialized": status.initialized,
+                        "last_ping": status.last_ping.map(|i| i.elapsed().as_secs_f64()),
+                        "last_error": status.last_error,
+                        "restart_count": status.restart_count,
+                        "idle_duration": status.idle_duration.map(|d| d.as_secs_f64()),
+                    }),
+                );
             }
         };
 
-        json_to_py(py, &serde_json::json!({
-            "state": state,
-            "initialized": status.initialized,
-            "last_ping": status.last_ping.map(|i| i.elapsed().as_secs_f64()),
-            "last_error": status.last_error,
-            "restart_count": status.restart_count,
-            "idle_duration": status.idle_duration.map(|d| d.as_secs_f64()),
-        }))
+        json_to_py(
+            py,
+            &serde_json::json!({
+                "state": state,
+                "initialized": status.initialized,
+                "last_ping": status.last_ping.map(|i| i.elapsed().as_secs_f64()),
+                "last_error": status.last_error,
+                "restart_count": status.restart_count,
+                "idle_duration": status.idle_duration.map(|d| d.as_secs_f64()),
+            }),
+        )
     }
 }

@@ -5,8 +5,8 @@ use crate::llm::{
 use crate::memory::Memory;
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::telemetry::{Telemetry, TelemetryEvent};
-use crate::tool::{Tool, ToolRegistry};
 use crate::token_counter::{TokenBudgetReport, TokenCounter, TokenUsage};
+use crate::tool::{Tool, ToolRegistry};
 use futures::Stream;
 use log::info;
 use serde_json::Value;
@@ -610,14 +610,13 @@ impl ReActEngine {
         let llm_response = self.call_llm(request).await?;
 
         let steps = match llm_response {
-            LlmResponse::Text(text) | LlmResponse::Partial(text) => {
-                self.parse_plan_steps(&text)
-            }
+            LlmResponse::Text(text) | LlmResponse::Partial(text) => self.parse_plan_steps(&text),
             LlmResponse::Done => Vec::new(),
             LlmResponse::ToolCall { .. } => Vec::new(),
         };
 
-        let requires_approval = matches!(self.plan_mode, PlanMode::ShowFirst | PlanMode::AlwaysShow);
+        let requires_approval =
+            matches!(self.plan_mode, PlanMode::ShowFirst | PlanMode::AlwaysShow);
 
         Ok(ExecutionPlan {
             user_input: user_input.to_string(),
@@ -666,24 +665,24 @@ impl ReActEngine {
                 let _ = self.plan(user_input).await;
                 self.react(user_input).await
             }
-PlanMode::ShowFirst | PlanMode::AlwaysShow => {
-        let plan = self.plan(user_input).await?;
-        // Log the plan for visibility
-        if !plan.steps.is_empty() {
-            info!("[Plan Mode] Generated plan with {} steps", plan.steps.len());
-            for step in &plan.steps {
-                info!(
-                    "[Plan] Step {}: {:?} - {}",
-                    step.step_number, step.tool_name, step.reasoning
-                );
+            PlanMode::ShowFirst | PlanMode::AlwaysShow => {
+                let plan = self.plan(user_input).await?;
+                // Log the plan for visibility
+                if !plan.steps.is_empty() {
+                    info!("[Plan Mode] Generated plan with {} steps", plan.steps.len());
+                    for step in &plan.steps {
+                        info!(
+                            "[Plan] Step {}: {:?} - {}",
+                            step.step_number, step.tool_name, step.reasoning
+                        );
+                    }
+                    // TODO: Implement actual user approval mechanism
+                    // For now, we log the plan and continue. In production, this would
+                    // integrate with an interactive approval system (e.g., TUI, webhook, etc.)
+                    info!("[Plan Mode] Execute? (approval not yet implemented - use PlanMode::Silent for auto-execute)");
+                }
+                self.react(user_input).await
             }
-            // TODO: Implement actual user approval mechanism
-            // For now, we log the plan and continue. In production, this would
-            // integrate with an interactive approval system (e.g., TUI, webhook, etc.)
-            info!("[Plan Mode] Execute? (approval not yet implemented - use PlanMode::Silent for auto-execute)");
-        }
-        self.react(user_input).await
-    }
         }
     }
 
@@ -792,22 +791,22 @@ PlanMode::ShowFirst | PlanMode::AlwaysShow => {
             .conversations
             .push(LlmMessage::user(user_input.to_string()));
 
-let mut thought = String::new();
-    let mut loaded_skills: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut step_count = 0;
+        let mut thought = String::new();
+        let mut loaded_skills: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut step_count = 0;
 
-    for _ in 0..self.max_steps {
-        step_count += 1;
+        for _ in 0..self.max_steps {
+            step_count += 1;
 
-        if self.checkpoint_interval > 0 && step_count % self.checkpoint_interval == 0 {
-            let checkpoint = serde_json::json!({
-                "step": step_count,
-                "thought": thought,
-                "context_size": context.conversations.len(),
-            });
-            self.telemetry.emit(&TelemetryEvent::Checkpoint(checkpoint));
-        }
+            if self.checkpoint_interval > 0 && step_count % self.checkpoint_interval == 0 {
+                let checkpoint = serde_json::json!({
+                    "step": step_count,
+                    "thought": thought,
+                    "context_size": context.conversations.len(),
+                });
+                self.telemetry.emit(&TelemetryEvent::Checkpoint(checkpoint));
+            }
             let request = LlmRequest {
                 model: self.model.clone(),
                 context: context.clone(),

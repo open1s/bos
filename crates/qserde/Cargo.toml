@@ -1,0 +1,16 @@
+[package]
+name = "qserde"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Small ergonomic helpers and derive macros for BOS rkyv byte serialization"
+
+[dependencies]
+rkyv = { workspace = true }
+thiserror = { workspace = true }
+serde_derive = { path = "../serde_derive" }
+
+[lib]
+name = "qserde"
+path = "src/lib.rs"

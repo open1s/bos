@@ -183,10 +183,12 @@ impl McpClient {
         let last_ping = self.last_ping.lock().unwrap().clone();
         let last_error = self.last_error.lock().unwrap().clone();
         let restart_count = self.restart_count.load(std::sync::atomic::Ordering::SeqCst);
-        
-        let idle_duration = self.last_communication.lock().unwrap().map(|instant| {
-            instant.elapsed()
-        });
+
+        let idle_duration = self
+            .last_communication
+            .lock()
+            .unwrap()
+            .map(|instant| instant.elapsed());
 
         McpHealthStatus {
             state,
@@ -202,16 +204,18 @@ impl McpClient {
     pub async fn restart(&self) -> Result<ServerCapabilities, McpError> {
         // Update state to reconnecting
         *self.state.lock().unwrap() = ConnectionState::Reconnecting;
-        
+
         // Increment restart count
-        self.restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        
+        self.restart_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         // Reset initialized flag to allow re-initialization
-        self.initialized.store(false, std::sync::atomic::Ordering::SeqCst);
-        
+        self.initialized
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
         // Clear capabilities to force re-fetch
         *self.capabilities.lock().unwrap() = None;
-        
+
         // Re-initialize
         match self.initialize().await {
             Ok(caps) => {

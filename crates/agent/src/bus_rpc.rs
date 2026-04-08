@@ -809,7 +809,6 @@ async fn handle_incoming_query(
 mod tests {
     use super::*;
     use crate::tools::FunctionTool;
-    use bus::{Bus, BusConfig};
     use futures::Stream;
     use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, StreamToken};
     use std::pin::Pin;
@@ -1135,9 +1134,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_agent_to_agent_tool_call_via_bus() {
-        let bus = Bus::from(BusConfig::default()).await;
-        let session: Session = bus.clone().into();
-        let session = Arc::new(session);
+        let mut config = zenoh::Config::default();
+        config.listen.endpoints.set(vec![]).unwrap();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.scouting.gossip.set_enabled(Some(false)).unwrap();
+        let session = Arc::new(zenoh::open(config).await.unwrap());
 
         let llm = Arc::new(react::llm::vendor::OpenAiClient::new(
             "https://api.openai.com/v1".to_string(),

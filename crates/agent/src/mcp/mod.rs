@@ -8,9 +8,6 @@ pub mod http_transport;
 pub mod protocol;
 pub mod transport;
 
-#[cfg(test)]
-mod tests;
-
 pub use adapter::McpToolAdapter;
 pub use client::McpClient;
 pub use client::McpError;

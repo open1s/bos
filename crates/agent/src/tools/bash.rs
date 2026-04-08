@@ -1,7 +1,7 @@
-use async_trait::async_trait;
 use super::{Tool, ToolDescription};
 use crate::error::ToolError;
 use crate::security::WorkspaceValidator;
+use async_trait::async_trait;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,7 +54,9 @@ impl BashTool {
     }
 
     pub fn with_workspace(mut self, workspace_root: &str) -> Self {
-        self.validator = Some(WorkspaceValidator::new(std::path::PathBuf::from(workspace_root)));
+        self.validator = Some(WorkspaceValidator::new(std::path::PathBuf::from(
+            workspace_root,
+        )));
         self.config.workspace_root = Some(workspace_root.to_string());
         self
     }
@@ -68,7 +70,10 @@ impl BashTool {
             ));
         }
         if WorkspaceValidator::requires_elevated_privilege(command) {
-            warn!("[BashTool] Elevated privilege command detected: {}", command);
+            warn!(
+                "[BashTool] Elevated privilege command detected: {}",
+                command
+            );
             return Err(format!(
                 "Elevated privilege command not allowed: {}",
                 command
@@ -90,10 +95,7 @@ impl BashTool {
         Ok(())
     }
 
-    async fn execute_streaming(
-        &self,
-        command: &str,
-    ) -> Result<BashExecutionResult, String> {
+    async fn execute_streaming(&self, command: &str) -> Result<BashExecutionResult, String> {
         let validation = self.validate_command(command);
         if let Err(e) = validation {
             return Err(e);
@@ -193,8 +195,10 @@ impl Tool for BashTool {
 
     fn description(&self) -> ToolDescription {
         ToolDescription {
-            short: "Execute shell commands with streaming output and exit code propagation".to_string(),
-            parameters: "JSON object with 'command' (required) and 'working_directory' (optional)".to_string(),
+            short: "Execute shell commands with streaming output and exit code propagation"
+                .to_string(),
+            parameters: "JSON object with 'command' (required) and 'working_directory' (optional)"
+                .to_string(),
         }
     }
 
@@ -224,12 +228,17 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
-        let command = input
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or(ToolError::ExecutionFailed("Missing required field: command".to_string()))?;
+        let command =
+            input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .ok_or(ToolError::ExecutionFailed(
+                    "Missing required field: command".to_string(),
+                ))?;
 
-        let result = self.execute_streaming(command).await
+        let result = self
+            .execute_streaming(command)
+            .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
 
         Ok(serde_json::to_value(result).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?)

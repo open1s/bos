@@ -28,8 +28,12 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> ToolDescription;
     fn json_schema(&self) -> serde_json::Value;
-    fn is_skill(&self) -> bool { false }
-    fn category(&self) -> &str { "general" }
+    fn is_skill(&self) -> bool {
+        false
+    }
+    fn category(&self) -> &str {
+        "general"
+    }
 
     /// Get cached JSON schema as Arc for zero-copy access
     /// Default implementation wraps json_schema() in Arc
@@ -37,7 +41,7 @@ pub trait Tool: Send + Sync {
         Arc::new(self.json_schema())
     }
 
-async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError>;
+    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError>;
 }
 
 #[async_trait]

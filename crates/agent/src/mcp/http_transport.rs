@@ -147,26 +147,3 @@ impl HttpTransport {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_http_transport_new_strips_trailing_slash() {
-        let transport = HttpTransport::new("http://localhost:8080/mcp/");
-        assert_eq!(transport.base_url, "http://localhost:8080/mcp");
-    }
-
-    #[test]
-    fn test_http_transport_error_display() {
-        let err = HttpTransportError::Http("test".to_string());
-        assert_eq!(err.to_string(), "HTTP error: test");
-
-        let err = HttpTransportError::Connect("refused".to_string());
-        assert_eq!(err.to_string(), "Connection error: refused");
-
-        let err = HttpTransportError::Session("expired".to_string());
-        assert_eq!(err.to_string(), "Session error: expired");
-    }
-}

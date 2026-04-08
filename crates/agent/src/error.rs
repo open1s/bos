@@ -81,6 +81,9 @@ pub enum AgentError {
 
     #[error("Bus error: {0}")]
     Bus(String),
+
+    #[error("Serialization error: {0}")]
+    Serde(String),
 }
 
 impl From<ReactLlmError> for AgentError {
@@ -92,5 +95,11 @@ impl From<ReactLlmError> for AgentError {
 impl From<SkillError> for AgentError {
     fn from(e: SkillError) -> Self {
         AgentError::Session(e.to_string())
+    }
+}
+
+impl From<qserde::Error> for AgentError {
+    fn from(e: qserde::Error) -> Self {
+        AgentError::Serde(e.to_string())
     }
 }

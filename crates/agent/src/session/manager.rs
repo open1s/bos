@@ -56,7 +56,11 @@ impl SessionManager {
         }
     }
 
-    pub async fn create(&self, agent_id: String, workspace: Option<String>) -> Result<AgentState, SessionError> {
+    pub async fn create(
+        &self,
+        agent_id: String,
+        workspace: Option<String>,
+    ) -> Result<AgentState, SessionError> {
         if self.exists(&agent_id).await {
             return Err(SessionError::AlreadyExists(agent_id));
         }
@@ -127,16 +131,16 @@ impl SessionManager {
             if let Some(stem) = file.file_stem() {
                 if let Some(agent_id) = stem.to_str() {
                     if let Ok(state) = self.storage.load(agent_id).await {
-summaries.push(SessionSummary {
-                agent_id: agent_id.to_string(),
-                created_at: state.metadata.created_at,
-                updated_at: state.metadata.updated_at,
-                message_count: state.metadata.message_count,
-                labels: state.metadata.labels.clone(),
-                expires_at: state.metadata.expires_at,
-                workspace: state.metadata.workspace.clone(),
-                alias: state.metadata.alias.clone(),
-            });
+                        summaries.push(SessionSummary {
+                            agent_id: agent_id.to_string(),
+                            created_at: state.metadata.created_at,
+                            updated_at: state.metadata.updated_at,
+                            message_count: state.metadata.message_count,
+                            labels: state.metadata.labels.clone(),
+                            expires_at: state.metadata.expires_at,
+                            workspace: state.metadata.workspace.clone(),
+                            alias: state.metadata.alias.clone(),
+                        });
                     }
                 }
             }
@@ -161,7 +165,11 @@ summaries.push(SessionSummary {
         cache.clear();
     }
 
-    pub async fn set_alias(&self, agent_id: &str, alias: String) -> Result<AgentState, SessionError> {
+    pub async fn set_alias(
+        &self,
+        agent_id: &str,
+        alias: String,
+    ) -> Result<AgentState, SessionError> {
         let mut state = self.get(agent_id).await?;
         state.metadata.alias = Some(alias);
         self.update(agent_id, state.clone()).await?;
@@ -175,7 +183,10 @@ summaries.push(SessionSummary {
                 return self.get(&summary.agent_id).await;
             }
         }
-        Err(SessionError::NotFound(format!("No session with alias: {}", alias)))
+        Err(SessionError::NotFound(format!(
+            "No session with alias: {}",
+            alias
+        )))
     }
 
     pub async fn delete_by_alias(&self, alias: &str) -> Result<(), SessionError> {
@@ -185,11 +196,17 @@ summaries.push(SessionSummary {
                 return self.delete(&summary.agent_id).await;
             }
         }
-        Err(SessionError::NotFound(format!("No session with alias: {}", alias)))
+        Err(SessionError::NotFound(format!(
+            "No session with alias: {}",
+            alias
+        )))
     }
 
     /// List sessions filtered by workspace directory
-    pub async fn list_by_workspace(&self, workspace: &str) -> Result<Vec<SessionSummary>, SessionError> {
+    pub async fn list_by_workspace(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<SessionSummary>, SessionError> {
         let summaries = self.list().await?;
         Ok(summaries
             .into_iter()
@@ -198,18 +215,28 @@ summaries.push(SessionSummary {
     }
 
     /// Get the most recent session for a given workspace
-    pub async fn get_latest_for_workspace(&self, workspace: &str) -> Result<SessionSummary, SessionError> {
+    pub async fn get_latest_for_workspace(
+        &self,
+        workspace: &str,
+    ) -> Result<SessionSummary, SessionError> {
         let summaries = self.list_by_workspace(workspace).await?;
         summaries
             .into_iter()
             .max_by_key(|s| s.updated_at)
-            .ok_or_else(|| SessionError::NotFound(format!("No sessions found for workspace: {}", workspace)))
+            .ok_or_else(|| {
+                SessionError::NotFound(format!("No sessions found for workspace: {}", workspace))
+            })
     }
 
     /// Branch a new session from an existing one (experimental workflow support)
-    pub async fn branch(&self, source_agent_id: &str, new_agent_id: String, new_alias: Option<String>) -> Result<AgentState, SessionError> {
+    pub async fn branch(
+        &self,
+        source_agent_id: &str,
+        new_agent_id: String,
+        new_alias: Option<String>,
+    ) -> Result<AgentState, SessionError> {
         let source_state = self.get(source_agent_id).await?;
-        
+
         if self.exists(&new_agent_id).await {
             return Err(SessionError::AlreadyExists(new_agent_id));
         }
@@ -221,7 +248,7 @@ summaries.push(SessionSummary {
             context: source_state.context.clone(),
             metadata: source_state.metadata.clone(),
         };
-        
+
         // Update metadata for the branch
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -230,10 +257,18 @@ summaries.push(SessionSummary {
         new_state.metadata.created_at = now;
         new_state.metadata.updated_at = now;
         new_state.metadata.labels.push("branched".to_string());
-        if let Some(ref parent) = source_state.metadata.labels.iter().find(|l| l.starts_with("parent:")) {
+        if let Some(ref parent) = source_state
+            .metadata
+            .labels
+            .iter()
+            .find(|l| l.starts_with("parent:"))
+        {
             new_state.metadata.labels.push((*parent).clone());
         }
-        new_state.metadata.labels.push(format!("parent:{}", source_agent_id));
+        new_state
+            .metadata
+            .labels
+            .push(format!("parent:{}", source_agent_id));
         new_state.metadata.alias = new_alias;
 
         // Save the new branch
@@ -249,7 +284,10 @@ summaries.push(SessionSummary {
     /// Get parent session ID if this is a branch
     pub async fn get_parent_id(&self, agent_id: &str) -> Result<Option<String>, SessionError> {
         let state = self.get(agent_id).await?;
-        let parent_label = state.metadata.labels.iter()
+        let parent_label = state
+            .metadata
+            .labels
+            .iter()
             .find(|l| l.starts_with("parent:"));
         Ok(parent_label.map(|l| l.strip_prefix("parent:").unwrap().to_string()))
     }
@@ -269,7 +307,10 @@ mod tests {
         };
 
         let manager = SessionManager::new(config);
-        let state = manager.create("test-agent".to_string(), None).await.unwrap();
+        let state = manager
+            .create("test-agent".to_string(), None)
+            .await
+            .unwrap();
 
         assert_eq!(state.agent_id, "test-agent");
         assert_eq!(state.message_log.len(), 0);
@@ -284,9 +325,12 @@ mod tests {
         };
 
         let manager = SessionManager::new(config);
-manager.create("test-agent".to_string(), None).await.unwrap();
+        manager
+            .create("test-agent".to_string(), None)
+            .await
+            .unwrap();
 
-    let mut state = manager.get("test-agent").await.unwrap();
+        let mut state = manager.get("test-agent").await.unwrap();
         state.metadata.labels.push("test".to_string());
 
         manager.update("test-agent", state).await.unwrap();
@@ -303,10 +347,13 @@ manager.create("test-agent".to_string(), None).await.unwrap();
             ..Default::default()
         };
 
-let manager = SessionManager::new(config);
-    manager.create("test-agent".to_string(), None).await.unwrap();
+        let manager = SessionManager::new(config);
+        manager
+            .create("test-agent".to_string(), None)
+            .await
+            .unwrap();
 
-    manager.delete("test-agent").await.unwrap();
+        manager.delete("test-agent").await.unwrap();
 
         let result = manager.get("test-agent").await;
         assert!(matches!(result, Err(SessionError::NotFound(_))));

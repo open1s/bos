@@ -35,6 +35,7 @@ dependencies = [
  "futures",
  "log",
  "logging",
+ "qserde",
  "react",
  "reqwest 0.12.28",
  "serde",
@@ -323,21 +324,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bos-cli"
-version = "0.1.0"
-dependencies = [
- "agent",
- "anyhow",
- "bus",
- "clap",
- "config",
- "react",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "boxcar"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -454,7 +440,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ada53f7339c78084fb37d7e17f34e76537541c4fbb02fa3a2baa14b8faad37"
 dependencies = [
  "serde",
- "serde_derive",
+ "serde_derive 1.0.228",
  "toml 1.1.0+spec-1.1.0",
 ]
 
@@ -3417,6 +3403,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "qserde"
+version = "0.1.0"
+dependencies = [
+ "rkyv",
+ "serde_derive 0.1.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3883,7 +3878,7 @@ dependencies = [
  "bitflags",
  "once_cell",
  "serde",
- "serde_derive",
+ "serde_derive 1.0.228",
  "typeid",
  "unicode-ident",
 ]
@@ -4181,7 +4176,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
- "serde_derive",
+ "serde_derive 1.0.228",
 ]
 
 [[package]]
@@ -4212,7 +4207,16 @@ version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
 dependencies = [
- "serde_derive",
+ "serde_derive 1.0.228",
+]
+
+[[package]]
+name = "serde_derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5341,7 +5345,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
- "serde_derive",
+ "serde_derive 1.0.228",
 ]
 
 [[package]]
@@ -6147,7 +6151,7 @@ dependencies = [
  "indexmap 2.13.0",
  "log",
  "serde",
- "serde_derive",
+ "serde_derive 1.0.228",
  "serde_json",
  "wasm-encoder",
  "wasm-metadata",
@@ -6167,7 +6171,7 @@ dependencies = [
  "log",
  "semver",
  "serde",
- "serde_derive",
+ "serde_derive 1.0.228",
  "serde_json",
  "unicode-xid",
  "wasmparser",

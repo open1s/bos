@@ -7,7 +7,8 @@ members = [
     "crates/react",
     "crates/pybos",
     "crates/jsbos",
-    "crates/cli"
+    "crates/qserde",
+    "crates/serde_derive"
 ]
 resolver = "2"
 

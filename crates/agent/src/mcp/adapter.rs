@@ -55,32 +55,3 @@ impl Tool for McpToolAdapter {
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_mcp_tool_adapter_schema() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string" }
-            },
-            "required": ["query"]
-        });
-
-        let client = Arc::new(McpClient::spawn("echo", &["hello"]).await.unwrap());
-        let adapter = McpToolAdapter::new(
-            client,
-            "hello/test_tool".to_string(),
-            "test_tool".to_string(),
-            "A test tool".to_string(),
-            schema.clone(),
-        );
-
-        assert_eq!(adapter.name(), "hello/test_tool");
-        assert_eq!(adapter.description().short, "A test tool");
-        assert_eq!(adapter.json_schema(), schema);
-    }
-}

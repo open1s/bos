@@ -105,3 +105,4 @@ $RECYCLE.BIN/
 
 # Git worktrees
 .worktrees/
+.opencode

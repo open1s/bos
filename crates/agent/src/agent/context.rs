@@ -48,12 +48,6 @@ impl MessageContext {
         });
     }
 
-    // Patch D placeholder: record a policy decision for a given tool.
-    // Currently a no-op; wired later when real policy hooks are introduced.
-    pub fn add_policy_decision(&mut self, _tool: &str, _allowed: bool, _reason: &str) {
-        // no-op for now
-    }
-
     pub fn to_api_format(&self) -> Vec<OpenAiMessage> {
         let mut api_messages = Vec::with_capacity(self.messages.len());
         self.extend_api_format(&mut api_messages);
