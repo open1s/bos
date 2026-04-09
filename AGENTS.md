@@ -138,7 +138,8 @@ const result = await agent.ask('What is 2+2?');
 - **Tools**: Implement `Tool` trait, register via `ToolRegistry`
 - **Bus**: `create_publisher()`, `create_subscriber()`, `create_query()`, `create_caller()`
 - **Config**: Use `ConfigLoader.discover()` for auto-loading `~/.bos/conf/config.toml`
+- **Solutions**: `docs/solutions/` — documented solutions (bugs, best practices, patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`)
 
 ---
 
-## Last Updated: 2026-04-05
+## Last Updated: 2026-04-09

@@ -5,6 +5,7 @@ use super::SkillError;
 
 /// Skill category for classification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[qserde::Archive]
 pub enum SkillCategory {
     Analysis,
     Code,
@@ -75,6 +76,7 @@ impl std::str::FromStr for SkillCategory {
 
 /// Skill version following semantic versioning
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[qserde::Archive]
 pub struct SkillVersion {
     pub major: u32,
     pub minor: u32,
@@ -137,9 +139,11 @@ impl SkillVersion {
 
 /// Metadata for a skill
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[qserde::Archive]
 pub struct SkillMetadata {
     pub name: String,
     pub description: String,
+    #[rkyv(with = qserde::rkyv::with::AsString)]
     pub path: PathBuf,
     pub category: SkillCategory,
     pub version: SkillVersion,
@@ -232,6 +236,7 @@ impl std::fmt::Display for SkillMetadata {
 
 /// Content of a skill including instructions and references
 #[derive(Debug, Clone)]
+#[qserde::Archive]
 pub struct SkillContent {
     pub metadata: SkillMetadata,
     pub instructions: String,
@@ -307,7 +312,9 @@ impl std::fmt::Display for SkillContent {
 
 /// A reference file associated with a skill
 #[derive(Debug, Clone)]
+#[qserde::Archive]
 pub struct ReferenceFile {
     pub name: String,
+    #[rkyv(with = qserde::rkyv::with::AsString)]
     pub path: PathBuf,
 }

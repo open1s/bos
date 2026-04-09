@@ -8,7 +8,7 @@ members = [
     "crates/pybos",
     "crates/jsbos",
     "crates/qserde",
-    "crates/serde_derive"
+    "crates/qserde_derive"
 ]
 resolver = "2"
 

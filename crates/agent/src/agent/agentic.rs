@@ -1,42 +1,20 @@
 use crate::tools::FunctionTool;
-use crate::{
-    AgentError, LlmClient, LlmResponse, StreamToken, Tool, ToolRegistry,
-};
+use crate::{AgentError, LlmClient, LlmResponse, StreamToken, Tool, ToolRegistry};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use log::{info, warn};
-use qserde::{archive, Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use log::warn;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use react::engine::ReActEngineBuilder;
 use react::llm::{
-    LlmClient as ReactLlmTrait, LlmError as ReactLlmError,
-    LlmRequest as ReactLlmRequest, LlmResponse as ReactLlmResponse,
-    StreamToken as ReactStreamToken, TokenStream as ReactTokenStream,
+    LlmClient as ReactLlmTrait, LlmError as ReactLlmError, LlmRequest as ReactLlmRequest,
+    LlmResponse as ReactLlmResponse, StreamToken as ReactStreamToken,
+    TokenStream as ReactTokenStream,
 };
 use react::tool::{Tool as ReactToolTrait, ToolError as ReactToolError};
 use react::{RateLimiterConfig, ReActResilience};
-
-#[derive(Debug, Clone)]
-struct ToolGuardRule {
-    tool_name: String,
-    forbidden_markers: Vec<String>,
-    rejection_text: String,
-}
-
-/// Outcome of handling a tool call in the run_loop.
-/// Used to signal whether the loop should continue or proceed normally.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ToolCallOutcome {
-    /// Tool was executed successfully
-    Executed,
-    /// Tool was blocked by skill guard rules
-    Blocked,
-    /// A skill was loaded (no tool execution)
-    SkillLoaded,
-}
 
 // ============================================================================
 // ReAct Adapters - Bridge between Agent and React crate
@@ -151,6 +129,7 @@ impl ReactLlmTrait for AgentLlmAdapter {
 
 /// Agent builder for fluent configuration.
 #[derive(Debug, Clone)]
+#[qserde::Archive]
 pub struct AgentConfig {
     pub name: String,
     pub model: String,
@@ -444,25 +423,20 @@ pub enum AgentOutput {
     Error(String),
 }
 
-
-// Note: Removed rkyv/qserde serialization attempts as they require implementing 
-// Archive on all nested types (AgentConfig, ReActResilience, SkillContent).
-// For proper serialization, consider using serde with bincode, or implement
-// rkyv::Archive for all dependent types first.
-// The manual Clone impl exists at line 843 for this reason.
-
 /// Agent is the main abstraction for AI agents with LLM integration,
 /// tool registries, and skill management.
-/// Serialization via qserde (rkyv) - llm field is skipped as it's a trait object.
-#[derive(Debug)]
-#[archive(crate_path = qserde)]
+#[qserde::Archive]
+#[rkyv(crate = qserde::rkyv)]
 pub struct Agent {
     config: AgentConfig,
     /// The LLM client - not serializable (trait object)
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     llm: Arc<dyn LlmClient>,
-    /// Tool registry for available tools
+    /// Tool registry for available tools - contains Arc<dyn Tool>
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     registry: Option<Arc<ToolRegistry>>,
     /// Directory for loading skills
+    #[rkyv(with = qserde::rkyv::with::Map<qserde::rkyv::with::AsString>)]
     skills_dir: Option<std::path::PathBuf>,
     /// Loaded skills
     skills: Vec<crate::skills::SkillContent>,
@@ -690,8 +664,51 @@ impl Agent {
     /// Run the agent using simple loop (no ReAct).
     /// Useful for testing or when ReAct format is not needed.
     pub async fn run_simple(&self, task: &str) -> Result<String, AgentError> {
-        let mut session = AgentSession::new(self.clone());
-        session.run(task).await
+        use react::llm::{LlmContext, LlmMessage, LlmRequest};
+
+        let system_prompt = self.config.system_prompt.clone();
+        let conversations = if system_prompt.is_empty() {
+            vec![LlmMessage::User {
+                content: task.to_string(),
+            }]
+        } else {
+            vec![
+                LlmMessage::System {
+                    content: system_prompt,
+                },
+                LlmMessage::User {
+                    content: task.to_string(),
+                },
+            ]
+        };
+
+        let context = LlmContext {
+            conversations,
+            ..Default::default()
+        };
+
+        let req = LlmRequest {
+            model: self.config.model.clone(),
+            context,
+            temperature: Some(self.config.temperature),
+            ..Default::default()
+        };
+
+        let response = self
+            .llm
+            .complete(req)
+            .await
+            .map_err(|e| AgentError::Session(format!("LLM call failed: {}", e)))?;
+
+        match response {
+            react::llm::LlmResponse::Text(content) => Ok(content),
+            react::llm::LlmResponse::Partial(content) => Ok(content),
+            react::llm::LlmResponse::Done => Ok(String::new()),
+            react::llm::LlmResponse::ToolCall { name, args, id } => Ok(format!(
+                "Tool call: {} with args {:?} (id: {:?})",
+                name, args, id
+            )),
+        }
     }
 
     /// Stream the agent response using simple approach.
@@ -863,5 +880,158 @@ impl Clone for Agent {
             skills: self.skills.clone(),
             resilience: self.resilience.clone(),
         }
+    }
+}
+
+/// Session wrapper for Agent that provides simplified execution.
+/// This is a convenience wrapper for running agents without the ReAct engine.
+#[derive(Clone)]
+pub struct AgentSession {
+    agent: Agent,
+}
+
+impl AgentSession {
+    /// Create a new session from an Agent.
+    pub fn new(agent: Agent) -> Self {
+        Self { agent }
+    }
+
+    /// Run a task using the simple loop (non-ReAct).
+    pub async fn run(&mut self, task: &str) -> Result<String, AgentError> {
+        self.agent.run_simple(task).await
+    }
+
+    /// Stream the agent response.
+    pub fn into_stream(
+        self,
+        task: &str,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send>> {
+        self.agent.stream(task)
+    }
+
+    /// Render the skills catalog for the system prompt.
+    /// Takes skill schemas and formats them for display.
+    pub fn render_skills_catalog(skills_schemas: &[serde_json::Value]) -> String {
+        let mut catalog = String::new();
+        catalog.push_str("Available skills:\n\n");
+        for schema in skills_schemas {
+            if let Some(name) = schema.get("name").and_then(|v| v.as_str()) {
+                catalog.push_str(&format!("- {}: ", name));
+                if let Some(desc) = schema.get("description").and_then(|v| v.as_str()) {
+                    catalog.push_str(desc);
+                }
+                catalog.push('\n');
+            }
+        }
+        catalog
+    }
+}
+
+/// Manual Debug implementation that skips the non-Debug llm field.
+impl std::fmt::Debug for Agent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Agent")
+            .field("config", &self.config)
+            .field("registry", &self.registry)
+            .field("skills_dir", &self.skills_dir)
+            .field("skills", &self.skills)
+            .field("resilience", &self.resilience)
+.finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod agent_serialization_tests {
+    use super::*;
+    use qserde::prelude::*;
+
+    /// Test AgentConfig serialization - the core serializable part of Agent
+    #[test]
+    fn test_agent_config_serialize() {
+        let config = AgentConfig::default();
+        let bytes = config.dump().expect("AgentConfig should be serializable");
+        let loaded = bytes.load::<AgentConfig>().expect("AgentConfig should be deserializable");
+        assert_eq!(loaded.name, config.name);
+        assert_eq!(loaded.model, config.model);
+    }
+
+    /// Test that Agent can be serialized using qserde after adding #[qserde::Archive]
+    #[test]
+    fn test_agent_serialize() {
+        use react::llm::LlmClient;
+
+        let config = AgentConfig::default();
+
+        struct MockLlmClient;
+        #[async_trait]
+        impl LlmClient for MockLlmClient {
+            async fn complete(&self, _req: react::llm::LlmRequest) -> react::llm::LlmResponseResult {
+                todo!()
+            }
+            async fn stream_complete(
+                &self,
+                _req: react::llm::LlmRequest,
+            ) -> std::result::Result<react::llm::TokenStream, react::llm::LlmError> {
+                todo!()
+            }
+            fn supports_tools(&self) -> bool {
+                false
+            }
+            fn provider_name(&self) -> &'static str {
+                "mock"
+            }
+        }
+
+        let agent = Agent {
+            config,
+            llm: Arc::new(MockLlmClient) as Arc<dyn LlmClient>,
+            registry: None,
+            skills_dir: None,
+            skills: Vec::new(),
+            resilience: ReActResilience::new(react::ResilienceConfig::default()),
+        };
+
+        let bytes = agent.dump().expect("Agent should be serializable");
+        assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
+    }
+
+/// Test that Agent can be serialized (serialize-only, cannot deserialize due to dyn LlmClient)
+    #[test]
+    fn test_agent_serialize_only() {
+        use react::llm::LlmClient;
+
+        let config = AgentConfig::default();
+
+        struct MockLlmClient;
+        #[async_trait]
+        impl LlmClient for MockLlmClient {
+            async fn complete(&self, _req: react::llm::LlmRequest) -> react::llm::LlmResponseResult {
+                todo!()
+            }
+            async fn stream_complete(
+                &self,
+                _req: react::llm::LlmRequest,
+            ) -> std::result::Result<react::llm::TokenStream, react::llm::LlmError> {
+                todo!()
+            }
+            fn supports_tools(&self) -> bool {
+                false
+            }
+            fn provider_name(&self) -> &'static str {
+                "mock"
+            }
+        }
+
+        let agent = Agent {
+            config,
+            llm: Arc::new(MockLlmClient) as Arc<dyn LlmClient>,
+            registry: None,
+            skills_dir: None,
+            skills: Vec::new(),
+            resilience: ReActResilience::new(react::ResilienceConfig::default()),
+        };
+
+        let bytes = agent.dump().expect("Agent should be serializable");
+        assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
     }
 }

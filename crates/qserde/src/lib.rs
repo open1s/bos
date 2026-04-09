@@ -1,22 +1,45 @@
+//! Ergonomic, typed helpers on top of `rkyv`.
+//!
+//! Quick start:
+//! ```rust
+//! use qserde::prelude::*;
+//!
+//! #[qserde::Archive]
+//! #[derive(Debug, PartialEq)]
+//! struct User {
+//!     id: u64,
+//!     name: String,
+//! }
+//!
+//! let user = User { id: 1, name: "Ada".into() };
+//! let bytes = user.dump()?;
+//! let restored = bytes.load::<User>()?;
+//! assert_eq!(restored, user);
+//! # Ok::<(), qserde::Error>(())
+//! ```
+
 use rkyv::{
     api::high::HighDeserializer,
-    rancor::{Error as RkyvError, Strategy},
+    rancor::{Error as RkyvError, Fallible, Strategy},
     ser::{allocator::ArenaHandle, sharing::Share, Serializer},
     util::AlignedVec,
-    Archive as RkyvArchive,
+    with::{ArchiveWith, DeserializeWith, SerializeWith},
+    Archive as RkyvArchive, Place,
 };
 use thiserror::Error;
 
+pub use qserde_derive::{archive, snapshot, Archive, Snapshot};
 pub use rkyv;
-pub use serde_derive::{archive, snapshot, Archive, Snapshot};
 
 type SerializeStrategy<'a> = Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, RkyvError>;
 type DeserializeStrategy = HighDeserializer<RkyvError>;
 
+pub mod ergonomic;
 pub mod prelude {
+    pub use crate::ergonomic::{DeserializeExt2, SerializeExt};
     pub use crate::{
-        archive, dump, load, snapshot, Archive, Archived, Deserialize, DeserializeExt, Result,
-        Serialize, Snapshot,
+        archive, decode, dump, encode, load, snapshot, Archive, Archived, Deserialize,
+        DeserializeExt, Result, Serialize, SkipNone, Snapshot,
     };
 }
 
@@ -56,6 +79,14 @@ where
         Self: Sized,
     {
         to_bytes(self)
+    }
+
+    #[inline]
+    fn snapshot(&self) -> Result<Archived<Self>>
+    where
+        Self: Sized,
+    {
+        Archived::from_value(self)
     }
 }
 
@@ -98,27 +129,28 @@ pub trait DeserializeExt {
     where
         T: RkyvArchive,
         T::Archived: rkyv::Deserialize<T, DeserializeStrategy>;
-}
 
-impl DeserializeExt for [u8] {
     #[inline]
-    fn load<T>(&self) -> Result<T>
+    fn decode<T>(&self) -> Result<T>
     where
         T: RkyvArchive,
         T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
     {
-        from_bytes(self)
+        self.load()
     }
 }
 
-impl DeserializeExt for Vec<u8> {
+impl<TBytes> DeserializeExt for TBytes
+where
+    TBytes: AsRef<[u8]> + ?Sized,
+{
     #[inline]
     fn load<T>(&self) -> Result<T>
     where
         T: RkyvArchive,
         T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
     {
-        self.as_slice().load()
+        from_bytes(self.as_ref())
     }
 }
 
@@ -140,6 +172,16 @@ impl<T> Archived<T> {
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 
     #[inline]
@@ -172,6 +214,27 @@ where
     #[inline]
     pub fn load(&self) -> Result<T> {
         self.deserialize()
+    }
+}
+
+impl<T> AsRef<[u8]> for Archived<T> {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl<T> From<Vec<u8>> for Archived<T> {
+    #[inline]
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl<T> From<Archived<T>> for Vec<u8> {
+    #[inline]
+    fn from(value: Archived<T>) -> Self {
+        value.into_bytes()
     }
 }
 
@@ -209,4 +272,68 @@ where
     T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
 {
     from_bytes(bytes)
+}
+
+#[inline]
+pub fn encode<T>(value: &T) -> Result<Vec<u8>>
+where
+    T: RkyvArchive,
+    for<'a> T: rkyv::Serialize<SerializeStrategy<'a>>,
+{
+    to_bytes(value)
+}
+
+#[inline]
+pub fn decode<T>(bytes: &[u8]) -> Result<T>
+where
+    T: RkyvArchive,
+    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
+{
+    from_bytes(bytes)
+}
+
+#[inline]
+pub fn snapshot<T>(value: &T) -> Result<Archived<T>>
+where
+    T: RkyvArchive,
+    for<'a> T: rkyv::Serialize<SerializeStrategy<'a>>,
+{
+    Archived::from_value(value)
+}
+
+/// A wrapper that skips serializing a field and uses `None` for Option types during deserialization.
+/// This is similar to `rkyv::with::Skip` but works with `Option<T>` where `T` doesn't need `Default`.
+///
+/// # Example
+/// ```rust
+/// use qserde::prelude::*;
+///
+/// #[qserde::Archive]
+/// struct Example {
+///     #[rkyv(with = qserde::SkipNone)]
+///     optional_field: Option<Box<dyn std::any::Any>>,
+/// }
+/// ```
+pub struct SkipNone;
+
+impl<T> ArchiveWith<Option<T>> for SkipNone {
+    type Archived = ();
+    type Resolver = ();
+
+    #[inline]
+    fn resolve_with(_: &Option<T>, _: Self::Resolver, _: Place<Self::Archived>) {}
+}
+
+impl<T, S: Fallible + ?Sized> SerializeWith<Option<T>, S> for SkipNone {
+    #[inline]
+    fn serialize_with(_: &Option<T>, _: &mut S) -> core::result::Result<(), S::Error> {
+        Ok(())
+    }
+}
+
+impl<T, D: Fallible + ?Sized> DeserializeWith<(), Option<T>, D> for SkipNone {
+    #[inline]
+    fn deserialize_with(_: &(), _: &mut D) -> core::result::Result<Option<T>, D::Error> {
+        Ok(None)
+    }
 }

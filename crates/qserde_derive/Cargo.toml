@@ -1,5 +1,5 @@
 [package]
-name = "serde_derive"
+name = "qserde_derive"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -10,6 +10,7 @@ use thiserror::Error;
 
 /// Configuration for the circuit breaker.
 #[derive(Debug, Clone)]
+#[qserde::Archive]
 pub struct CircuitBreakerConfig {
     /// Maximum number of failures before opening the circuit.
     pub max_failures: usize,
@@ -28,6 +29,7 @@ impl Default for CircuitBreakerConfig {
 
 /// Configuration for the rate limiter.
 #[derive(Debug, Clone)]
+#[qserde::Archive]
 pub struct RateLimiterConfig {
     /// Maximum number of requests allowed per window.
     pub capacity: u32,
@@ -117,12 +119,17 @@ impl<E: std::fmt::Debug> From<ResilienceError<E>> for String {
 
 /// Thread-safe circuit breaker implementation.
 #[derive(Debug)]
+#[qserde::Archive]
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     failures: Arc<AtomicUsize>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     last_failure_time: Arc<Mutex<Option<Instant>>>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     state: Arc<Mutex<CircuitState>>,
     /// Counter for half-open probe attempts.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     probe_count: Arc<AtomicU64>,
 }
 
@@ -257,9 +264,11 @@ impl Clone for CircuitBreaker {
 /// Thread-safe rate limiter using sliding window algorithm.
 /// Tracks individual request timestamps for more accurate rate limiting.
 #[derive(Debug)]
+#[qserde::Archive]
 pub struct RateLimiter {
     config: RateLimiterConfig,
     /// Sorted timestamps of recent requests (oldest first).
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     timestamps: Arc<Mutex<VecDeque<Instant>>>,
 }
 
@@ -375,8 +384,11 @@ impl Clone for RateLimiter {
 
 /// Combined resilience wrapper for async operations.
 #[derive(Debug)]
+#[qserde::Archive]
 pub struct ReActResilience {
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     circuit_breaker: Option<CircuitBreaker>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     rate_limiter: Option<RateLimiter>,
     rate_limit_config: RateLimiterConfig,
 }

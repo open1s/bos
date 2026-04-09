@@ -34,6 +34,18 @@ impl Clone for ToolRegistry {
     }
 }
 
+impl std::fmt::Debug for ToolRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tool_names: Vec<_> = self.tools.keys().collect();
+        f.debug_struct("ToolRegistry")
+            .field("tools_count", &tool_names.len())
+            .field("tool_names", &tool_names)
+            .field("namespaces", &self.namespaces)
+            .field("namespace_count", &self.namespace_index.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {

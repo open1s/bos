@@ -1,4 +1,7 @@
-use qserde::{from_bytes, load, to_bytes, Archived, Deserialize, DeserializeExt, Serialize};
+use qserde::{
+    decode, encode, from_bytes, load, snapshot, to_bytes, Archived, Deserialize, DeserializeExt,
+    Serialize,
+};
 
 #[qserde::Archive]
 #[derive(Debug, PartialEq)]
@@ -69,4 +72,35 @@ fn prelude_feels_small() {
     let restored = SessionState::load(&bytes).expect("type load should succeed");
 
     assert_eq!(restored, state);
+}
+
+#[test]
+fn expressive_aliases_stay_small() {
+    let state = SessionState {
+        id: 128,
+        name: "epsilon".to_string(),
+        tags: vec!["alias".to_string(), "clean".to_string()],
+    };
+
+    let bytes = encode(&state).expect("encode should succeed");
+    let restored = decode::<SessionState>(&bytes).expect("decode should succeed");
+
+    assert_eq!(restored, state);
+}
+
+#[test]
+fn typed_snapshot_flow() {
+    let state = SessionState {
+        id: 2048,
+        name: "zeta".to_string(),
+        tags: vec!["typed".to_string()],
+    };
+
+    let packet = snapshot(&state).expect("snapshot should succeed");
+    let raw = packet.as_bytes().to_vec();
+    let packet2 = Archived::<SessionState>::from(raw);
+
+    assert!(!packet2.is_empty());
+    assert_eq!(packet2.len(), packet2.as_ref().len());
+    assert_eq!(packet2.load().expect("packet load should succeed"), state);
 }

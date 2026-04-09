@@ -12,7 +12,15 @@
       "Bash(awk 'NR>=12 && NR<=20' /Users/gaosg/Projects/bos/crates/jsbos/src/agent.rs)",
       "Bash(xxd)",
       "Bash(awk 'NR==253' /Users/gaosg/Projects/bos/crates/jsbos/src/agent.rs)",
-      "Bash(awk 'NR==252' /Users/gaosg/Projects/bos/crates/jsbos/src/agent.rs)"
+      "Bash(awk 'NR==252' /Users/gaosg/Projects/bos/crates/jsbos/src/agent.rs)",
+      "Bash(git -C /Users/gaosg/Projects/bos log --oneline --all -- 'crates/qserde/' 'crates/serde_derive/')",
+      "Bash(git -C /Users/gaosg/Projects/bos log --format=\"%H %s\" --all -- 'crates/qserde/' 'crates/serde_derive/')",
+      "Bash(git -C /Users/gaosg/Projects/bos log --format=\"%H|%s\" --all -- 'crates/qserde/' 'crates/serde_derive/')",
+      "Bash(git -C /Users/gaosg/Projects/bos log --format=\"%H|%s\" -20 -- 'crates/qserde/' 'crates/serde_derive/')",
+      "Bash(git -C /Users/gaosg/Projects/bos log -20 --pretty=format:\"%h - %s\" -- 'crates/qserde/' 'crates/serde_derive/')",
+      "Bash(git -C /Users/gaosg/Projects/bos log -1 --pretty=format:\"%h - %s%n%b\" 8a6bf8d7762732206a9a351de121eca80e16c52c)",
+      "Bash(python3)",
+      "Bash(cargo check:*)"
     ]
   }
 }

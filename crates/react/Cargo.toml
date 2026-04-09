@@ -19,3 +19,4 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 tokio-stream = "0.1"
 dashmap = {workspace = true}
 uuid = {workspace = true}
+qserde = { path = "../qserde" }
