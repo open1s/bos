@@ -34,9 +34,11 @@ pub use rkyv;
 type SerializeStrategy<'a> = Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, RkyvError>;
 type DeserializeStrategy = HighDeserializer<RkyvError>;
 
-pub mod ergonomic;
+// pub mod ergonomic; // Temporarily disabled - needs refactoring for new backend design
+pub mod backends;
+pub mod error;
 pub mod prelude {
-    pub use crate::ergonomic::{DeserializeExt2, SerializeExt};
+    // pub use crate::ergonomic::{DeserializeExt2, SerializeExt};
     pub use crate::{
         archive, decode, dump, encode, load, snapshot, Archive, Archived, Deserialize,
         DeserializeExt, Result, Serialize, SkipNone, Snapshot,

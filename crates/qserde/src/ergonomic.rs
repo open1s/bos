@@ -1,4 +1,6 @@
-use crate::{from_bytes, to_bytes, Deserialize, Error, Result, RkyvArchive, SerializeStrategy};
+#![cfg(feature = "rkyv-backend")]
+
+use crate::{from_bytes, to_bytes, Error as QserdeError, Result, RkyvArchive, SerializeStrategy};
 use std::io::{Read, Write};
 use std::path::Path;
 

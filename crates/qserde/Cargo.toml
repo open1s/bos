@@ -28,9 +28,9 @@ alloc = []
 # Backend features
 rkyv-backend = ["rkyv"]
 serde-backend = ["serde", "serde_json"]
-bincode-backend = ["bincode"]
+bincode-backend = ["bincode", "serde"]
 cbor-backend = ["serde", "ciborium"]
-postcard-backend = ["postcard"]
+postcard-backend = ["postcard/use-std"]
 # Convenience features
 all-backends = [
     "rkyv-backend",

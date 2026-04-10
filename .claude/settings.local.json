@@ -20,7 +20,15 @@
       "Bash(git -C /Users/gaosg/Projects/bos log -20 --pretty=format:\"%h - %s\" -- 'crates/qserde/' 'crates/serde_derive/')",
       "Bash(git -C /Users/gaosg/Projects/bos log -1 --pretty=format:\"%h - %s%n%b\" 8a6bf8d7762732206a9a351de121eca80e16c52c)",
       "Bash(python3)",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(git -C /Users/gaosg/Projects/bos diff HEAD --stat crates/qserde/src/backends/rkyv.rs)",
+      "Bash(cargo doc:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.rs)"
     ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true
   }
 }
