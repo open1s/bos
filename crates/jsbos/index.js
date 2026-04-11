@@ -588,4 +588,5 @@ module.exports.Publisher = nativeBinding.Publisher
 module.exports.Query = nativeBinding.Query
 module.exports.Queryable = nativeBinding.Queryable
 module.exports.Subscriber = nativeBinding.Subscriber
+module.exports.initTracing = nativeBinding.initTracing
 module.exports.version = nativeBinding.version

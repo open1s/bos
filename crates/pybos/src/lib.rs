@@ -17,7 +17,7 @@ mod utils;
 //AI NOT ALLOW TO REMOVE
 #[allow(unused)]
 pub use agent::{
-    PyAgent, PyAgentCallableServer, PyAgentConfig, PyAgentRpcClient, PyPythonTool, PyStreamIterator, PyLlmMessage,
+PyAgent, PyAgentCallableServer, PyAgentConfig, PyAgentRpcClient, PyPythonTool, PyStreamIterator, PyLlmMessage,
 };
 pub use bus::{PyBus, PyBusConfig};
 pub use caller::{PyCallable, PyCaller};
@@ -47,5 +47,11 @@ fn pybos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPythonTool>()?;
     m.add_class::<PyMcpClient>()?;
     m.add_class::<PyLlmMessage>()?;
+    m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     Ok(())
+}
+
+#[pyfunction]
+pub fn init_tracing() {
+    logging::auto_init_tracing();
 }

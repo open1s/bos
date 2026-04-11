@@ -67,7 +67,6 @@ fn pretty_msg(msg: &str) -> String {
     msg.to_string()
 }
 
-#[ctor::ctor]
 pub fn auto_init_tracing() {
     let logdir = dirs::home_dir().unwrap().join(".bos/log");
     let file_spec = FileSpec::default().directory(logdir).basename("bos");

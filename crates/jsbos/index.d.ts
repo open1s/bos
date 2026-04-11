@@ -152,4 +152,6 @@ export interface BusConfig {
   peer?: string
 }
 
+export declare function initTracing(): void
+
 export declare function version(): string

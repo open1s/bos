@@ -26,3 +26,8 @@ pub use subscriber::Subscriber;
 pub fn version() -> String {
   env!("CARGO_PKG_VERSION").to_string()
 }
+
+#[napi]
+pub fn init_tracing() {
+  logging::auto_init_tracing();
+}

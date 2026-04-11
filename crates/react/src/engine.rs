@@ -137,17 +137,200 @@ pub fn parse_llm_intent(
 /// Priority 5: LaTeX boxed: $\boxed{...}
 ///
 /// Each parser validates its output and returns None if type checking fails.
+fn extract_json_block(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let mut depth = 0;
+    let mut end = None;
+    for (i, c) in s[start..].chars().enumerate() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    end.and_then(|e| {
+        let inner = &s[start..e];
+        if inner.starts_with("{{") && inner.ends_with("}}") {
+            Some(&inner[1..inner.len() - 1])
+        } else {
+            Some(inner)
+        }
+    })
+}
+
+fn is_tool_call_json(val: &Value) -> Option<(String, Value)> {
+    if let (Some(name), Some(params)) = (
+        val.get("name").and_then(|v| v.as_str()),
+        val.get("parameters").or_else(|| val.get("args")).or_else(|| val.get("arguments")),
+    ) {
+        if name.is_empty() {
+            return None;
+        }
+        return Some((name.to_string(), params.clone()));
+    }
+
+    if let Some(tool_calls) = val.get("tool_calls").and_then(|v| v.as_array()) {
+        if let Some(first_call) = tool_calls.first() {
+            let function = first_call.get("function")?;
+            let name = function.get("name").and_then(|v| v.as_str())?;
+            let args = function.get("arguments").and_then(|v| v.as_str())?;
+            let args_val: Value = serde_json::from_str(args).unwrap_or_else(|_| Value::String(args.to_string()));
+            return Some((name.to_string(), args_val));
+        }
+    }
+
+    if let Some(fc) = val.get("functionCall").or_else(|| val.get("function_call")) {
+        let name = fc.get("name").and_then(|v| v.as_str())?;
+        let args = fc.get("args").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+        return Some((name.to_string(), args));
+    }
+
+    if let Some(content) = val.get("content").and_then(|v| v.as_array()) {
+        for block in content {
+            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                let name = block.get("name").and_then(|v| v.as_str())?;
+                let input = block.get("input").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+                return Some((name.to_string(), input));
+            }
+        }
+    }
+
+    if let Some(outputs) = val.get("outputs").and_then(|v| v.as_array()) {
+        for output in outputs {
+            if let Some(tool_calls) = output.get("tool_calls").and_then(|v| v.as_array()) {
+                if let Some(call) = tool_calls.first() {
+                    let name = call.get("name").or_else(|| call.get("function").and_then(|f| f.get("name"))).and_then(|v| v.as_str())?;
+                    let args = call.get("arguments").or_else(|| call.get("input")).cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+                    return Some((name.to_string(), args));
+                }
+            }
+        }
+    }
+
+    if let Some(obj) = val.as_object() {
+        if obj.len() == 1 {
+            if let Some((name, params)) = obj.iter().next() {
+                return Some((name.clone(), params.clone()));
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_xml_block(s: &str) -> Option<(&str, &str, bool)> {
+    let start = s.find('<')?;
+    let end = s.rfind('>')?;
+    if end <= start + 1 {
+        return None;
+    }
+    let content = &s[start + 1..end];
+    if content.starts_with('/') || content.starts_with('!') {
+        return None;
+    }
+    let self_closing = content.ends_with('/');
+    let tag = if self_closing {
+        content[..content.len() - 1].trim()
+    } else {
+        content.trim()
+    };
+    let tag_name = tag.split_whitespace().next()?;
+    Some((tag_name, &s[start..=end], self_closing))
+}
+
+fn is_tool_call_xml(s: &str) -> Option<(String, Value)> {
+    let (tag_name, full_tag, self_closing) = extract_xml_block(s)?;
+
+    let mut args = serde_json::Map::new();
+    let raw_tag = full_tag[1..full_tag.len() - 1].trim().trim_end_matches('/');
+
+    for part in raw_tag.splitn(2, ' ') {
+        if let Some((key, val)) = part.splitn(2, '=').collect::<Vec<_>>().split_first() {
+            if let Some(v) = val.first() {
+                let clean = v.trim_matches('"').trim_matches('\'');
+                args.insert(key.to_string(), Value::String(clean.to_string()));
+            }
+        }
+    }
+
+    if !self_closing {
+        let close_tag = format!("</{}>", tag_name);
+        if let Some(close_pos) = s.find(&close_tag) {
+            let inner = &full_tag[full_tag.len() - 1..close_pos];
+            let name_tag = format!("<{}>", tag_name);
+            let args_tag = "<arguments>";
+
+            let mut inner_args = serde_json::Map::new();
+
+            if let Some(n_start) = inner.find(&name_tag) {
+                let n_end = inner.find(&format!("</{}>", tag_name)).unwrap_or(inner.len());
+                let name_content = inner[n_start + name_tag.len()..n_end].trim();
+                if !name_content.is_empty() {
+                    inner_args.insert("name".to_string(), Value::String(name_content.to_string()));
+                }
+            }
+
+            if let Some(a_start) = inner.find(args_tag) {
+                let a_end = inner.find("</arguments>").unwrap_or(inner.len());
+                let args_content = inner[a_start + args_tag.len()..a_end].trim();
+                if let Ok(v) = serde_json::from_str(args_content) {
+                    inner_args.insert("arguments".to_string(), v);
+                } else {
+                    for line in args_content.lines() {
+                        let line = line.trim();
+                        if line.starts_with('<') && line.ends_with('>') {
+                            let inner_t = &line[1..line.len() - 1];
+                            if let Some(t_end) = inner_t.find('>') {
+                                let k = inner_t[..t_end].trim().to_string();
+                                let v = inner_t[t_end + 1..].trim().to_string();
+                                if !k.is_empty() {
+                                    inner_args.insert(k, Value::String(v));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !inner_args.is_empty() {
+                args = inner_args;
+            }
+        }
+    }
+
+    if args.is_empty() {
+        args.insert("_".to_string(), Value::String(full_tag.to_string()));
+    }
+
+    Some((tag_name.to_string(), Value::Object(args)))
+}
+
 fn parse_unified_tool_call(thought: &str) -> Option<(String, Value)> {
     let thought = thought.trim();
     if thought.is_empty() {
         return None;
     }
 
-    // Priority order: JSON > ReAct > Function > XML > LaTeX
-    parse_json_object(thought)
-        .or_else(|| parse_react_format(thought))
+    if let Some(json_str) = extract_json_block(thought) {
+        if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+            if let Some(call) = is_tool_call_json(&val) {
+                return Some(call);
+            }
+        }
+    }
+
+    if let Some(call) = is_tool_call_xml(thought) {
+        return Some(call);
+    }
+
+    parse_react_format(thought)
         .or_else(|| parse_function_call(thought))
-        .or_else(|| parse_xml_tags(thought))
         .or_else(|| parse_latex_boxed(thought))
 }
 
@@ -230,64 +413,11 @@ fn parse_function_call(thought: &str) -> Option<(String, Value)> {
 /// Parse JSON object format: {"name": "tool", "parameters": {...}}
 /// Type check: returns (name: String, args: Value) where name must be non-empty string
 fn parse_json_object(thought: &str) -> Option<(String, Value)> {
-    let start = thought.find('{')?;
-
-    let mut depth = 0;
-    let mut end = None;
-    for (i, c) in thought.chars().enumerate() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i + 1);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let end = end?;
-    if end <= start {
-        return None;
-    }
-
-    let mut json_str = &thought[start..end];
-
-    // Handle double-brace wrapping: {{...}} → {...}
-    if json_str.starts_with("{{") && json_str.ends_with("}}") {
-        json_str = &json_str[1..json_str.len() - 1];
-    }
-
-    let val: Value = serde_json::from_str(json_str).ok()?;
-
-    if let (Some(name), Some(params)) = (
-        val.get("name").and_then(|v| v.as_str()),
-        val.get("parameters")
-            .or_else(|| val.get("args"))
-            .or_else(|| val.get("arguments")),
-    ) {
-        // Type check: name must be non-empty
-        if name.is_empty() {
-            return None;
-        }
-        return Some((name.to_string(), params.clone()));
-    }
-
-    if let Some(obj) = val.as_object() {
-        if obj.len() == 1 {
-            if let Some((name, params)) = obj.iter().next() {
-                return Some((name.clone(), params.clone()));
-            }
-        }
-    }
-
-    None
+    extract_json_block(thought).and_then(|json_str| {
+        serde_json::from_str::<Value>(json_str).ok()
+    }).and_then(|val| is_tool_call_json(&val))
 }
 
-/// Parse ReAct format: Action: tool\nAction Input: {...}
-/// Type check: returns (name: String, args: Value) where name must be non-empty
 fn parse_react_format(thought: &str) -> Option<(String, Value)> {
     let mut tool_name: Option<String> = None;
     let mut input = Value::Null;
@@ -338,62 +468,8 @@ fn parse_latex_boxed(thought: &str) -> Option<(String, Value)> {
     parse_json_object(cleaned).or_else(|| parse_function_call(cleaned))
 }
 
-/// Parse XML tag format: <tool_name>args</tool_name> or <tool_name/>
-/// Type check: tag name must be non-empty and have valid characters
 fn parse_xml_tags(thought: &str) -> Option<(String, Value)> {
-    let start_tag = thought.find('<')?;
-    let end_tag = thought.find('>')?;
-    if end_tag <= start_tag + 1 {
-        return None;
-    }
-
-    let tag_content = &thought[start_tag + 1..end_tag];
-    if tag_content.starts_with('/') || tag_content.starts_with('!') {
-        return None;
-    }
-
-    // Self-closing or with content
-    let is_self_closing = tag_content.ends_with('/');
-    let tag_name = if is_self_closing {
-        tag_content[..tag_content.len() - 1].trim().to_string()
-    } else {
-        tag_content
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string()
-    };
-
-    if tag_name.is_empty() {
-        return None;
-    }
-
-    // Valid tool name characters
-    if !tag_name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '/' || c == '-' || c == '.')
-    {
-        return None;
-    }
-
-    // Find closing tag if not self-closing
-    let args = if is_self_closing {
-        Value::Object(serde_json::Map::new())
-    } else {
-        let close_pattern = format!("</{}>", tag_name);
-        if let Some(close_pos) = thought.find(&close_pattern) {
-            let args_content = &thought[end_tag + 1..close_pos];
-            if let Ok(v) = serde_json::from_str(args_content) {
-                v
-            } else {
-                Value::String(args_content.to_string())
-            }
-        } else {
-            Value::Object(serde_json::Map::new())
-        }
-    };
-
-    Some((tag_name, args))
+    is_tool_call_xml(thought)
 }
 
 #[allow(dead_code)]
