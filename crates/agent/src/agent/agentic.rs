@@ -404,9 +404,8 @@ impl AgentBuilder {
     }
 
     /// Build with custom LLM client and start a session immediately.
-    pub fn build_session(self, llm: Arc<dyn LlmClient>) -> Result<AgentSession, AgentError> {
-        let agent = self.build_with_llm(llm)?;
-        Ok(AgentSession::new(agent))
+    pub fn build_session(self, llm: Arc<dyn LlmClient>) -> Result<Agent, AgentError> {
+        self.build_with_llm(llm)
     }
 }
 
@@ -442,6 +441,9 @@ pub struct Agent {
     skills: Vec<crate::skills::SkillContent>,
     /// Resilience configuration for ReAct loop
     resilience: ReActResilience,
+    /// Message log for conversation history - not serializable
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    message_log: Arc<std::sync::Mutex<Vec<react::llm::LlmMessage>>>,
 }
 
 impl Agent {
@@ -458,6 +460,7 @@ impl Agent {
             skills_dir: None,
             skills: Vec::new(),
             resilience,
+            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -479,6 +482,7 @@ impl Agent {
             skills_dir: None,
             skills: Vec::new(),
             resilience: ReActResilience::new(Default::default()),
+            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -490,6 +494,29 @@ impl Agent {
     /// Get tool registry.
     pub fn registry(&self) -> Option<&Arc<ToolRegistry>> {
         self.registry.as_ref()
+    }
+
+    pub fn add_message(&mut self, message: react::llm::LlmMessage) {
+        self.message_log.lock().unwrap().push(message);
+    }
+
+    pub fn get_messages(&self) -> Vec<react::llm::LlmMessage> {
+        self.message_log.lock().unwrap().clone()
+    }
+
+    pub fn save_message_log(&self, path: &str) -> Result<(), AgentError> {
+        let json = serde_json::to_string_pretty(&*self.message_log.lock().unwrap())
+            .map_err(|e| AgentError::Session(format!("Serialize error: {}", e)))?;
+        std::fs::write(path, json).map_err(|e| AgentError::Session(format!("Write error: {}", e)))
+    }
+
+    pub fn restore_message_log(&mut self, path: &str) -> Result<(), AgentError> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| AgentError::Session(format!("Read error: {}", e)))?;
+        let messages: Vec<react::llm::LlmMessage> = serde_json::from_str(&json)
+            .map_err(|e| AgentError::Session(format!("Parse error: {}", e)))?;
+        *self.message_log.lock().unwrap() = messages;
+        Ok(())
     }
 
     /// Add a tool that calls another agent via bus Caller.
@@ -614,7 +641,7 @@ impl Agent {
             if !system_prompt.is_empty() {
                 system_prompt.push_str("\n\n");
             }
-            let skills_catalog = AgentSession::render_skills_catalog(&skills_schemas);
+            let skills_catalog = render_skills_catalog(&skills_schemas);
             system_prompt.push_str(&format!(
                 "Available skills (call load_skill tool to get instructions):\n{}",
                 skills_catalog
@@ -654,6 +681,8 @@ impl Agent {
         let mut engine = builder
             .build()
             .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))?;
+
+        engine.set_input_messages(self.message_log.lock().unwrap().clone());
         let result = engine
             .react(task)
             .await
@@ -663,24 +692,135 @@ impl Agent {
 
     /// Run the agent using simple loop (no ReAct).
     /// Useful for testing or when ReAct format is not needed.
+    /// Supports tools and skills like react() does, but makes a single LLM call.
     pub async fn run_simple(&self, task: &str) -> Result<String, AgentError> {
         use react::llm::{LlmContext, LlmMessage, LlmRequest};
 
-        let system_prompt = self.config.system_prompt.clone();
-        let conversations = if system_prompt.is_empty() {
-            vec![LlmMessage::User {
-                content: task.to_string(),
-            }]
-        } else {
-            vec![
-                LlmMessage::System {
-                    content: system_prompt,
+        let react_llm = Box::new(AgentLlmAdapter::new(self.llm.clone()));
+        let mut builder = ReActEngineBuilder::new().llm(react_llm);
+
+        if let Some(ref registry) = self.registry {
+            for (_name, tool) in registry.iter() {
+                let tool_adapter = Box::new(ReactToolAdapter::new(tool.clone()));
+                builder = builder.with_tool(tool_adapter);
+            }
+        }
+
+        let has_skills = !self.skills.is_empty();
+        let skills_schemas = self.get_skills_schemas();
+        if has_skills {
+            let skill_names: Vec<String> = self
+                .skills
+                .iter()
+                .map(|s| s.metadata.name.clone())
+                .collect();
+
+            for skill in &self.skills {
+                let skill_name = skill.metadata.name.clone();
+                let skill_desc = format!("Get instructions for the {} skill", skill_name);
+                let skill_instructions = skill.instructions.clone();
+                let skill_name_for_closure = skill_name.clone();
+                let skill_tool = Arc::new(FunctionTool::skill(
+                    &skill_name,
+                    &skill_desc,
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }),
+                    move |_args: &serde_json::Value| {
+                        Ok(serde_json::json!({
+                            "skill": skill_name_for_closure,
+                            "instructions": skill_instructions
+                        }))
+                    },
+                ));
+                builder = builder.with_tool(Box::new(ReactToolAdapter::new(skill_tool)));
+            }
+
+            let load_skill_tool = Arc::new(FunctionTool::new(
+                "load_skill",
+                "Load a skill by name to get its instructions",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the skill to load"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+                {
+                    let skills = self.skills.clone();
+                    move |args: &serde_json::Value| {
+                        let name = args
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let found = skills.iter().find(|s| s.metadata.name == name);
+                        if let Some(skill) = found {
+                            Ok(serde_json::json!({
+                                "name": skill.metadata.name,
+                                "description": skill.metadata.description,
+                                "instructions": skill.instructions
+                            }))
+                        } else {
+                            Ok(serde_json::json!({
+                                "error": format!("Skill '{}' not found. Available: {}", name, skill_names.join(", "))
+                            }))
+                        }
+                    }
                 },
-                LlmMessage::User {
-                    content: task.to_string(),
-                },
-            ]
-        };
+            ));
+            builder = builder.with_tool(Box::new(ReactToolAdapter::new(load_skill_tool)));
+        }
+
+        let mut system_prompt = self.config.system_prompt.clone();
+        if has_skills {
+            if !system_prompt.is_empty() {
+                system_prompt.push_str("\n\n");
+            }
+            let skills_catalog = render_skills_catalog(&skills_schemas);
+            system_prompt.push_str(&format!(
+                "Available skills (call load_skill tool to get instructions):\n{}",
+                skills_catalog
+            ));
+        }
+
+        if !system_prompt.is_empty() {
+            system_prompt.push_str("\n\n");
+        }
+
+        let mut tool_schemas = String::new();
+        if let Some(ref registry) = self.registry {
+            for (name, tool) in registry.iter() {
+                let schema = tool.json_schema();
+                tool_schemas.push_str(&format!("- {}: {:?}\n", name, schema));
+            }
+        }
+
+        if !tool_schemas.is_empty() {
+            system_prompt.push_str(&format!(
+                "Available tools (MUST follow each tool's schema exactly):\n{}",
+                tool_schemas
+            ));
+        }
+
+        builder = builder.resilience(self.resilience.clone());
+        builder = builder.llm_timeout(self.config.timeout_secs);
+        builder = builder.max_steps(self.config.max_steps);
+        builder = builder.model(self.config.model.clone());
+        builder = builder.system_prompt(system_prompt);
+
+        let mut engine = builder
+            .build()
+            .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))?;
+
+        engine.set_input_messages(self.message_log.lock().unwrap().clone());
+
+        let mut conversations = self.message_log.lock().unwrap().clone();
+        conversations.push(LlmMessage::user(task.to_string()));
 
         let context = LlmContext {
             conversations,
@@ -694,30 +834,278 @@ impl Agent {
             ..Default::default()
         };
 
-        let response = self
-            .llm
-            .complete(req)
+        let response = engine
+            .call_llm(req)
             .await
             .map_err(|e| AgentError::Session(format!("LLM call failed: {}", e)))?;
 
+        let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
         match response {
-            react::llm::LlmResponse::Text(content) => Ok(content),
-            react::llm::LlmResponse::Partial(content) => Ok(content),
+            react::llm::LlmResponse::Text(content) => {
+                self.message_log.lock().unwrap().push(LlmMessage::assistant(content.clone()));
+                Ok(content)
+            }
+            react::llm::LlmResponse::Partial(content) => {
+                self.message_log.lock().unwrap().push(LlmMessage::assistant(content.clone()));
+                Ok(content)
+            }
             react::llm::LlmResponse::Done => Ok(String::new()),
-            react::llm::LlmResponse::ToolCall { name, args, id } => Ok(format!(
-                "Tool call: {} with args {:?} (id: {:?})",
-                name, args, id
-            )),
+            react::llm::LlmResponse::ToolCall { name, args, id: _ } => {
+                let result = if name == "load_skill" {
+                    let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(cached) = loaded_skills.get(skill_name) {
+                        Ok(serde_json::json!({
+                            "name": skill_name,
+                            "instructions": cached,
+                            "cached": true
+                        }))
+                    } else {
+                        engine.call_tool(&name, &args).await
+                    }
+                } else {
+                    engine.call_tool(&name, &args).await
+                };
+
+                let result_text = match &result {
+                    Ok(ret) => {
+                        if name == "load_skill" {
+                            let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
+                            if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                loaded_skills.insert(skill_name.to_string(), instructions.to_string());
+                            }
+                        }
+                        ret.to_string()
+                    },
+                    Err(e) => format!("Error: {:?}", e),
+                };
+
+                Ok(result_text)
+            }
         }
     }
 
     /// Stream the agent response using simple approach.
+    /// Supports tools and skills like react() does, but makes a single LLM call.
     pub fn stream(
         &self,
         task: &str,
-    ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send>> {
-        let session = AgentSession::new(self.clone());
-        session.into_stream(task)
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send + '_>> {
+        use futures::stream::StreamExt;
+        use react::llm::{LlmContext, LlmMessage, LlmRequest};
+
+        let react_llm = Box::new(AgentLlmAdapter::new(self.llm.clone()));
+        let mut builder = ReActEngineBuilder::new().llm(react_llm);
+
+        if let Some(ref registry) = self.registry {
+            for (_name, tool) in registry.iter() {
+                let tool_adapter = Box::new(ReactToolAdapter::new(tool.clone()));
+                builder = builder.with_tool(tool_adapter);
+            }
+        }
+
+        let has_skills = !self.skills.is_empty();
+        let skills_schemas = self.get_skills_schemas();
+        if has_skills {
+            let skill_names: Vec<String> = self
+                .skills
+                .iter()
+                .map(|s| s.metadata.name.clone())
+                .collect();
+
+            for skill in &self.skills {
+                let skill_name = skill.metadata.name.clone();
+                let skill_desc = format!("Get instructions for the {} skill", skill_name);
+                let skill_instructions = skill.instructions.clone();
+                let skill_name_for_closure = skill_name.clone();
+                let skill_tool = Arc::new(FunctionTool::skill(
+                    &skill_name,
+                    &skill_desc,
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }),
+                    move |_args: &serde_json::Value| {
+                        Ok(serde_json::json!({
+                            "skill": skill_name_for_closure,
+                            "instructions": skill_instructions
+                        }))
+                    },
+                ));
+                builder = builder.with_tool(Box::new(ReactToolAdapter::new(skill_tool)));
+            }
+
+            let load_skill_tool = Arc::new(FunctionTool::new(
+                "load_skill",
+                "Load a skill by name to get its instructions",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the skill to load"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+                {
+                    let skills = self.skills.clone();
+                    move |args: &serde_json::Value| {
+                        let name = args
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let found = skills.iter().find(|s| s.metadata.name == name);
+                        if let Some(skill) = found {
+                            Ok(serde_json::json!({
+                                "name": skill.metadata.name,
+                                "description": skill.metadata.description,
+                                "instructions": skill.instructions
+                            }))
+                        } else {
+                            Ok(serde_json::json!({
+                                "error": format!("Skill '{}' not found. Available: {}", name, skill_names.join(", "))
+                            }))
+                        }
+                    }
+                },
+            ));
+            builder = builder.with_tool(Box::new(ReactToolAdapter::new(load_skill_tool)));
+        }
+
+        let mut system_prompt = self.config.system_prompt.clone();
+        if has_skills {
+            if !system_prompt.is_empty() {
+                system_prompt.push_str("\n\n");
+            }
+            let skills_catalog = render_skills_catalog(&skills_schemas);
+            system_prompt.push_str(&format!(
+                "Available skills (call load_skill tool to get instructions):\n{}",
+                skills_catalog
+            ));
+        }
+
+        if !system_prompt.is_empty() {
+            system_prompt.push_str("\n\n");
+        }
+
+        let mut tool_schemas = String::new();
+        if let Some(ref registry) = self.registry {
+            for (name, tool) in registry.iter() {
+                let schema = tool.json_schema();
+                tool_schemas.push_str(&format!("- {}: {:?}\n", name, schema));
+            }
+        }
+
+        if !tool_schemas.is_empty() {
+            system_prompt.push_str(&format!(
+                "Available tools (MUST follow each tool's schema exactly):\n{}",
+                tool_schemas
+            ));
+        }
+
+        builder = builder.resilience(self.resilience.clone());
+        builder = builder.llm_timeout(self.config.timeout_secs);
+        builder = builder.max_steps(self.config.max_steps);
+        builder = builder.model(self.config.model.clone());
+        builder = builder.system_prompt(system_prompt);
+
+        let engine_result = builder.build();
+        let task_str = task.to_string();
+        let message_log_ptr = self.message_log.clone();
+
+        let stream = async_stream::stream! {
+            let engine = match engine_result {
+                Ok(e) => e,
+                Err(e) => {
+                    yield Err(AgentError::Session(format!("ReAct build error: {}", e)));
+                    return;
+                }
+            };
+
+            let mut all_conversations = message_log_ptr.lock().unwrap().clone();
+            all_conversations.push(LlmMessage::user(task_str.clone()));
+
+            let context = LlmContext {
+                conversations: all_conversations,
+                ..Default::default()
+            };
+
+            let req = LlmRequest {
+                model: self.config.model.clone(),
+                context,
+                temperature: Some(0.7),
+                ..Default::default()
+            };
+
+            let llm_stream = match engine.call_llm_stream(req).await {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Err(AgentError::Session(format!("LLM stream error: {}", e)));
+                    return;
+                }
+            };
+            futures::pin_mut!(llm_stream);
+            let mut full_response = String::new();
+            let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            
+            while let Some(item) = llm_stream.next().await {
+                match item {
+                    Ok(StreamToken::Text(text)) => {
+                        full_response.push_str(&text);
+                        yield Ok(StreamToken::Text(text));
+                    }
+                    Ok(StreamToken::Done) => {
+                        yield Ok(StreamToken::Done);
+                    }
+                    Ok(StreamToken::ToolCall { name, args, id }) => {
+                        yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
+
+                        let result = if name == "load_skill" {
+                            let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            if let Some(cached) = loaded_skills.get(skill_name) {
+                                Ok(serde_json::json!({
+                                    "name": skill_name,
+                                    "instructions": cached,
+                                    "cached": true
+                                }))
+                            } else {
+                                engine.call_tool(&name, &args).await
+                            }
+                        } else {
+                            engine.call_tool(&name, &args).await
+                        };
+
+                        let result_text = match &result {
+                            Ok(ret) => {
+                                if name == "load_skill" {
+                                    let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
+                                    if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                        loaded_skills.insert(skill_name.to_string(), instructions.to_string());
+                                    }
+                                }
+                                ret.to_string()
+                            },
+                            Err(e) => format!("Error: {:?}", e),
+                        };
+
+                        full_response.push_str(&result_text);
+                        yield Ok(StreamToken::Text(result_text));
+                    }
+                    Err(e) => yield Err(AgentError::Session(format!("LLM stream error: {}", e))),
+                }
+            }
+            let mut log = message_log_ptr.lock().unwrap();
+            log.push(LlmMessage::user(task_str));
+            if !full_response.is_empty() {
+                log.push(LlmMessage::assistant(full_response));
+            }
+        };
+
+        Box::pin(stream)
     }
 
     /// Register a tool.
@@ -879,52 +1267,27 @@ impl Clone for Agent {
             skills_dir: self.skills_dir.clone(),
             skills: self.skills.clone(),
             resilience: self.resilience.clone(),
+            message_log: self.message_log.clone(),
         }
     }
 }
 
 /// Session wrapper for Agent that provides simplified execution.
-/// This is a convenience wrapper for running agents without the ReAct engine.
-#[derive(Clone)]
-pub struct AgentSession {
-    agent: Agent,
-}
-
-impl AgentSession {
-    /// Create a new session from an Agent.
-    pub fn new(agent: Agent) -> Self {
-        Self { agent }
-    }
-
-    /// Run a task using the simple loop (non-ReAct).
-    pub async fn run(&mut self, task: &str) -> Result<String, AgentError> {
-        self.agent.run_simple(task).await
-    }
-
-    /// Stream the agent response.
-    pub fn into_stream(
-        self,
-        task: &str,
-    ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send>> {
-        self.agent.stream(task)
-    }
-
-    /// Render the skills catalog for the system prompt.
-    /// Takes skill schemas and formats them for display.
-    pub fn render_skills_catalog(skills_schemas: &[serde_json::Value]) -> String {
-        let mut catalog = String::new();
-        catalog.push_str("Available skills:\n\n");
-        for schema in skills_schemas {
-            if let Some(name) = schema.get("name").and_then(|v| v.as_str()) {
-                catalog.push_str(&format!("- {}: ", name));
-                if let Some(desc) = schema.get("description").and_then(|v| v.as_str()) {
-                    catalog.push_str(desc);
-                }
-                catalog.push('\n');
+/// Render the skills catalog for the system prompt.
+/// Takes skill schemas and formats them for display.
+fn render_skills_catalog(skills_schemas: &[serde_json::Value]) -> String {
+    let mut catalog = String::new();
+    catalog.push_str("Available skills:\n\n");
+    for schema in skills_schemas {
+        if let Some(name) = schema.get("name").and_then(|v| v.as_str()) {
+            catalog.push_str(&format!("- {}: ", name));
+            if let Some(desc) = schema.get("description").and_then(|v| v.as_str()) {
+                catalog.push_str(desc);
             }
+            catalog.push('\n');
         }
-        catalog
     }
+    catalog
 }
 
 /// Manual Debug implementation that skips the non-Debug llm field.
@@ -936,7 +1299,7 @@ impl std::fmt::Debug for Agent {
             .field("skills_dir", &self.skills_dir)
             .field("skills", &self.skills)
             .field("resilience", &self.resilience)
-.finish_non_exhaustive()
+            .finish_non_exhaustive()
     }
 }
 
@@ -950,7 +1313,9 @@ mod agent_serialization_tests {
     fn test_agent_config_serialize() {
         let config = AgentConfig::default();
         let bytes = config.dump().expect("AgentConfig should be serializable");
-        let loaded = bytes.load::<AgentConfig>().expect("AgentConfig should be deserializable");
+        let loaded = bytes
+            .load::<AgentConfig>()
+            .expect("AgentConfig should be deserializable");
         assert_eq!(loaded.name, config.name);
         assert_eq!(loaded.model, config.model);
     }
@@ -965,7 +1330,10 @@ mod agent_serialization_tests {
         struct MockLlmClient;
         #[async_trait]
         impl LlmClient for MockLlmClient {
-            async fn complete(&self, _req: react::llm::LlmRequest) -> react::llm::LlmResponseResult {
+            async fn complete(
+                &self,
+                _req: react::llm::LlmRequest,
+            ) -> react::llm::LlmResponseResult {
                 todo!()
             }
             async fn stream_complete(
@@ -989,13 +1357,14 @@ mod agent_serialization_tests {
             skills_dir: None,
             skills: Vec::new(),
             resilience: ReActResilience::new(react::ResilienceConfig::default()),
+            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
 
         let bytes = agent.dump().expect("Agent should be serializable");
         assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
     }
 
-/// Test that Agent can be serialized (serialize-only, cannot deserialize due to dyn LlmClient)
+    /// Test that Agent can be serialized (serialize-only, cannot deserialize due to dyn LlmClient)
     #[test]
     fn test_agent_serialize_only() {
         use react::llm::LlmClient;
@@ -1005,7 +1374,10 @@ mod agent_serialization_tests {
         struct MockLlmClient;
         #[async_trait]
         impl LlmClient for MockLlmClient {
-            async fn complete(&self, _req: react::llm::LlmRequest) -> react::llm::LlmResponseResult {
+            async fn complete(
+                &self,
+                _req: react::llm::LlmRequest,
+            ) -> react::llm::LlmResponseResult {
                 todo!()
             }
             async fn stream_complete(
@@ -1029,9 +1401,75 @@ mod agent_serialization_tests {
             skills_dir: None,
             skills: Vec::new(),
             resilience: ReActResilience::new(react::ResilienceConfig::default()),
+            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
 
         let bytes = agent.dump().expect("Agent should be serializable");
         assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
     }
+}
+
+/// Test message log save/restore functionality
+#[test]
+fn test_message_log_save_restore() {
+    use react::llm::LlmMessage;
+    use std::env::temp_dir;
+    use std::fs;
+
+    // Create a temp file path
+    let mut path = temp_dir();
+    path.push("test_message_log.json");
+
+    // Create session and add some messages
+    let config = AgentConfig::default();
+    struct MockLlmClient;
+    #[async_trait]
+    impl LlmClient for MockLlmClient {
+        async fn complete(&self, _req: react::llm::LlmRequest) -> react::llm::LlmResponseResult {
+            todo!()
+        }
+        async fn stream_complete(
+            &self,
+            _req: react::llm::LlmRequest,
+        ) -> std::result::Result<react::llm::TokenStream, react::llm::LlmError> {
+            todo!()
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    let mut agent = Agent::new(config, Arc::new(MockLlmClient) as Arc<dyn LlmClient>);
+
+    // Add test messages
+    agent.add_message(LlmMessage::user("Hello"));
+    agent.add_message(LlmMessage::assistant("Hi there!"));
+    agent.add_message(LlmMessage::user("How are you?"));
+
+    // Save to file
+    agent
+        .save_message_log(path.to_str().unwrap())
+        .expect("save should work");
+
+    // Create new agent and restore
+    let mut agent2 = Agent::new(
+        AgentConfig::default(),
+        Arc::new(MockLlmClient) as Arc<dyn LlmClient>,
+    );
+    agent2
+        .restore_message_log(path.to_str().unwrap())
+        .expect("restore should work");
+
+    // Verify messages match
+    let messages = agent2.get_messages();
+    assert_eq!(messages.len(), 3);
+    assert!(matches!(messages[0], LlmMessage::User { content: ref c } if c == "Hello"));
+    assert!(matches!(messages[1], LlmMessage::Assistant { content: ref c } if c == "Hi there!"));
+    assert!(matches!(messages[2], LlmMessage::User { content: ref c } if c == "How are you?"));
+
+    // Cleanup
+    fs::remove_file(&path).ok();
 }

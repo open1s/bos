@@ -1,16 +1,147 @@
 use crate::bus::PyBus;
 use crate::utils::{invoke_python_handler_to_pyany, json_to_py, to_py_runtime_error};
 use agent::{
-    Agent, AgentCallableServer, AgentConfig, AgentRpcClient, StreamToken, Tool, ToolDescription,
+    Agent, AgentCallableServer, AgentConfig, AgentRpcClient, LlmMessage, StreamToken, Tool,
+    ToolDescription,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyDict, PyType};
 use pyo3::IntoPyObjectExt;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+
+/// Python wrapper for LlmMessage
+#[pyclass(name = "LlmMessage", skip_from_py_object)]
+pub struct PyLlmMessage {
+    inner: LlmMessage,
+}
+
+#[pymethods]
+impl PyLlmMessage {
+    #[staticmethod]
+    fn system(content: String) -> Self {
+        Self {
+            inner: LlmMessage::system(content),
+        }
+    }
+
+    #[staticmethod]
+    fn user(content: String) -> Self {
+        Self {
+            inner: LlmMessage::user(content),
+        }
+    }
+
+    #[staticmethod]
+    fn assistant(content: String) -> Self {
+        Self {
+            inner: LlmMessage::assistant(content),
+        }
+    }
+
+    fn to_py<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            LlmMessage::System { content } => {
+                let dict = PyDict::new(py);
+                dict.set_item("role", "system")?;
+                dict.set_item("content", content)?;
+                Ok(dict.into_any())
+            }
+            LlmMessage::User { content } => {
+                let dict = PyDict::new(py);
+                dict.set_item("role", "user")?;
+                dict.set_item("content", content)?;
+                Ok(dict.into_any())
+            }
+            LlmMessage::Assistant { content } => {
+                let dict = PyDict::new(py);
+                dict.set_item("role", "assistant")?;
+                dict.set_item("content", content)?;
+                Ok(dict.into_any())
+            }
+            LlmMessage::AssistantToolCall { tool_call_id, name, args } => {
+                let dict = PyDict::new(py);
+                dict.set_item("role", "assistant_tool_call")?;
+                dict.set_item("tool_call_id", tool_call_id)?;
+                dict.set_item("name", name)?;
+                let args_py = json_to_py(py, args)?;
+                dict.set_item("args", args_py)?;
+                Ok(dict.into_any())
+            }
+            LlmMessage::ToolResult { tool_call_id, content } => {
+                let dict = PyDict::new(py);
+                dict.set_item("role", "tool_result")?;
+                dict.set_item("tool_call_id", tool_call_id)?;
+                dict.set_item("content", content)?;
+                Ok(dict.into_any())
+            }
+        }
+    }
+
+    #[staticmethod]
+    fn from_py<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let dict = obj.cast::<PyDict>()?;
+        let role = dict
+            .get_item("role")?
+            .map(|v| v.extract::<String>())
+            .transpose()?
+            .unwrap_or_default();
+        let content = dict
+            .get_item("content")?
+            .map(|v| v.extract::<String>())
+            .transpose()?
+            .unwrap_or_default();
+
+        let inner = match role.as_str() {
+            "system" => LlmMessage::system(content),
+            "user" => LlmMessage::user(content),
+            "assistant" => LlmMessage::assistant(content),
+            "assistant_tool_call" => {
+                let tool_call_id = dict
+                    .get_item("tool_call_id")?
+                    .map(|v| v.extract::<String>())
+                    .transpose()?
+                    .unwrap_or_default();
+                let name = dict
+                    .get_item("name")?
+                    .map(|v| v.extract::<String>())
+                    .transpose()?
+                    .unwrap_or_default();
+                let args = dict
+                    .get_item("args")?
+                    .map(|v| crate::utils::py_to_json(&v))
+                    .transpose()?
+                    .unwrap_or(serde_json::Value::Null);
+                LlmMessage::AssistantToolCall {
+                    tool_call_id,
+                    name,
+                    args,
+                }
+            }
+            "tool_result" => {
+                let tool_call_id = dict
+                    .get_item("tool_call_id")?
+                    .map(|v| v.extract::<String>())
+                    .transpose()?
+                    .unwrap_or_default();
+                LlmMessage::ToolResult {
+                    tool_call_id,
+                    content,
+                }
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid role: {}. Expected one of: system, user, assistant, assistant_tool_call, tool_result",
+                    role
+                )));
+            }
+        };
+        Ok(Self { inner })
+    }
+}
 
 /// Async iterator that yields tokens from the agent stream.
 /// Implements Python's async iteration protocol (__anext__).
@@ -999,5 +1130,49 @@ impl PyAgent {
             })
             .unwrap_or_default();
         Ok(prompts)
+    }
+
+    fn add_message<'py>(&self, _py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<()> {
+        let py_message = PyLlmMessage::from_py(message)?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.add_message(py_message.inner);
+        Ok(())
+    }
+
+    fn get_messages<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let messages = guard.get_messages();
+        let py_list = pyo3::types::PyList::empty(py);
+        for msg in messages {
+            let wrapper = PyLlmMessage { inner: msg.clone() };
+            py_list.append(wrapper.to_py(py)?)?;
+        }
+        Ok(py_list.into_any())
+    }
+
+    fn save_message_log<'py>(&self, _py: Python<'py>, path: String) -> PyResult<()> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard
+            .save_message_log(&path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn restore_message_log<'py>(&self, _py: Python<'py>, path: String) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard
+            .restore_message_log(&path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 }

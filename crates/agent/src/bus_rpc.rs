@@ -1134,10 +1134,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_agent_to_agent_tool_call_via_bus() {
-        let mut config = zenoh::Config::default();
-        config.listen.endpoints.set(vec![]).unwrap();
-        config.scouting.multicast.set_enabled(Some(false)).unwrap();
-        config.scouting.gossip.set_enabled(Some(false)).unwrap();
+        let config = zenoh::Config::default();
         let session = Arc::new(zenoh::open(config).await.unwrap());
 
         let llm = Arc::new(react::llm::vendor::OpenAiClient::new(

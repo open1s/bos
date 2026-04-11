@@ -422,6 +422,121 @@ impl Agent {
       inner: std::sync::Arc::new(server),
     })
   }
+
+  #[napi]
+  pub async fn add_message(&self, message: serde_json::Value) -> Result<()> {
+    let llm_message = if let Some(role) = message.get("role").and_then(|v| v.as_str()) {
+      match role {
+        "system" => {
+          let content = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
+          agent::LlmMessage::System { content: content.to_string() }
+        }
+        "user" => {
+          let content = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
+          agent::LlmMessage::User { content: content.to_string() }
+        }
+        "assistant" => {
+          let content = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
+          agent::LlmMessage::Assistant { content: content.to_string() }
+        }
+        "assistant_tool_call" => {
+          let tool_call_id = message.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+          let name = message.get("name").and_then(|v| v.as_str()).unwrap_or("");
+          let args = message.get("args").cloned().unwrap_or(serde_json::Value::Null);
+          agent::LlmMessage::AssistantToolCall {
+            tool_call_id: tool_call_id.to_string(),
+            name: name.to_string(),
+            args,
+          }
+        }
+        "tool_result" => {
+          let tool_call_id = message.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+          let content = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
+          agent::LlmMessage::ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            content: content.to_string(),
+          }
+        }
+        _ => {
+          return Err(Error::new(
+            napi::Status::GenericFailure,
+            format!("Invalid role: {}", role),
+          ))
+        }
+      }
+    } else {
+      return Err(Error::new(
+        napi::Status::GenericFailure,
+        "Message must have a 'role' field",
+      ))
+    };
+    let mut guard = self.inner.lock().await;
+    guard.add_message(llm_message);
+    Ok(())
+  }
+
+  #[napi]
+  pub fn get_messages(&self) -> Result<Vec<serde_json::Value>> {
+    let guard = self.inner.blocking_lock();
+    let messages = guard.get_messages();
+    let json_messages: Vec<serde_json::Value> = messages
+      .iter()
+      .map(|msg| {
+        match msg {
+          agent::LlmMessage::System { content } => {
+            serde_json::json!({
+              "role": "system",
+              "content": content
+            })
+          }
+          agent::LlmMessage::User { content } => {
+            serde_json::json!({
+              "role": "user",
+              "content": content
+            })
+          }
+          agent::LlmMessage::Assistant { content } => {
+            serde_json::json!({
+              "role": "assistant",
+              "content": content
+            })
+          }
+          agent::LlmMessage::AssistantToolCall { tool_call_id, name, args } => {
+            serde_json::json!({
+              "role": "assistant_tool_call",
+              "tool_call_id": tool_call_id,
+              "name": name,
+              "args": args
+            })
+          }
+          agent::LlmMessage::ToolResult { tool_call_id, content } => {
+            serde_json::json!({
+              "role": "tool_result",
+              "tool_call_id": tool_call_id,
+              "content": content
+            })
+          }
+        }
+      })
+      .collect();
+    Ok(json_messages)
+  }
+
+  #[napi]
+  pub fn save_message_log(&self, path: String) -> Result<()> {
+    let guard = self.inner.blocking_lock();
+    guard
+      .save_message_log(&path)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  #[napi]
+  pub fn restore_message_log(&self, path: String) -> Result<()> {
+    let mut guard = self.inner.blocking_lock();
+    guard
+      .restore_message_log(&path)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
 }
 
 #[napi]

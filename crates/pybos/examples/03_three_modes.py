@@ -3,7 +3,7 @@
 Example 3: Three Ways to Talk to an Agent
 
 Demonstrates:
-- agent.run_simple() — Direct conversation, no tools
+- agent.run_simple() — Single LLM call with tools and skills
 - agent.stream()   — Streaming token-by-token response
 """
 

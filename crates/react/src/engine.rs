@@ -78,7 +78,7 @@ pub struct PlanStep {
 
 /// Parse result indicating whether the LLM output is a tool call or text
 #[derive(Debug)]
-enum ParsedIntent {
+pub enum ParsedIntent {
     /// LLM explicitly requested a tool call (structured, from LLM API)
     ToolCall {
         name: String,
@@ -95,7 +95,7 @@ enum ParsedIntent {
 /// 1. "Final Answer:" prefix → absolute boundary, everything after is text
 /// 2. Tool call format → only valid if tool exists in registry
 /// 3. Plain text → always final answer
-fn parse_llm_intent(
+pub fn parse_llm_intent(
     thought: &str,
     available_tools: &HashMap<String, Box<dyn Tool>>,
 ) -> ParsedIntent {
@@ -411,6 +411,7 @@ pub struct ReActEngine {
     auto_continue: bool,
     checkpoint_interval: usize,
     token_counter: TokenCounter,
+    input_messages: Vec<LlmMessage>,
 }
 
 pub struct ReActEngineBuilder {
@@ -525,6 +526,7 @@ impl ReActEngineBuilder {
             auto_continue: self.auto_continue,
             checkpoint_interval: self.checkpoint_interval,
             token_counter: self.token_counter,
+            input_messages: Vec::new(),
         })
     }
 }
@@ -545,6 +547,7 @@ impl ReActEngine {
             auto_continue: false,
             checkpoint_interval: 5,
             token_counter: TokenCounter::with_default(),
+            input_messages: Vec::new(),
         }
     }
 
@@ -558,6 +561,14 @@ impl ReActEngine {
 
     pub fn set_plan_mode(&mut self, mode: PlanMode) {
         self.plan_mode = mode;
+    }
+
+    pub fn set_input_messages(&mut self, messages: Vec<LlmMessage>) {
+        self.input_messages = messages;
+    }
+
+    pub fn get_input_messages(&self) -> &[LlmMessage] {
+        &self.input_messages
     }
 
     /// Generate an execution plan for the given user input without executing it.
@@ -698,7 +709,7 @@ impl ReActEngine {
     }
 
     /// Call LLM with optional resilience wrapper.
-    async fn call_llm(&self, request: LlmRequest) -> Result<LlmResponse, ReactError> {
+    pub async fn call_llm(&self, request: LlmRequest) -> Result<LlmResponse, ReactError> {
         let result = if let Some(ref resilience) = self.resilience {
             let llm = &self.llm;
             let request = request.clone();
@@ -725,7 +736,7 @@ impl ReActEngine {
     /// Call LLM for streaming with optional resilience wrapper.
     /// Applies resilience to the future that creates the stream, then returns the stream.
     #[allow(dead_code)]
-    async fn call_llm_stream(
+    pub async fn call_llm_stream(
         &self,
         request: LlmRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send + '_>>, ReactError>
@@ -746,7 +757,7 @@ impl ReActEngine {
     }
 
     /// Call tool - no resilience wrapper (only LLM calls need rate limiting)
-    async fn call_tool(&self, name: &str, input: &Value) -> Result<Value, ReactError> {
+    pub async fn call_tool(&self, name: &str, input: &Value) -> Result<Value, ReactError> {
         self.tools
             .call(name, input)
             .map_err(|e| ReactError::ToolError(format!("{:?}", e)))
@@ -787,6 +798,7 @@ impl ReActEngine {
         context
             .conversations
             .push(LlmMessage::system(self.system_prompt.clone()));
+        context.conversations.extend(self.input_messages.clone());
         context
             .conversations
             .push(LlmMessage::user(user_input.to_string()));
@@ -997,9 +1009,268 @@ impl ReActEngine {
         Ok(thought)
     }
 
-    // Expose a simple memory checkpoint API for testing/observability
-    pub fn save_memory_checkpoint(&self, path: &str) -> Result<(), std::io::Error> {
-        self.memory.save_to_file(path)
+    pub async fn react_with_request(
+        &mut self,
+        mut request: LlmRequest,
+    ) -> Result<String, ReactError> {
+        let openai_tools: Vec<LlmTool> = self
+            .tools
+            .tools
+            .iter()
+            .filter(|(_, tool)| !tool.is_skill())
+            .map(|(name, tool)| LlmTool {
+                name: name.to_string(),
+                description: tool.description(),
+                parameters: tool.json_schema(),
+            })
+            .collect();
+        let openai_skills: Vec<Skill> = self
+            .tools
+            .tools
+            .iter()
+            .filter(|(_, tool)| tool.is_skill())
+            .map(|(name, tool)| Skill {
+                category: tool.category(),
+                name: name.to_string(),
+                description: tool.description(),
+            })
+            .collect();
+
+        request.context.tools = openai_tools;
+        request.context.skills = openai_skills;
+
+        if request.context.conversations.is_empty()
+            || !matches!(request.context.conversations[0], LlmMessage::System { .. })
+        {
+            request
+                .context
+                .conversations
+                .insert(0, LlmMessage::system(self.system_prompt.clone()));
+        }
+
+        request
+            .context
+            .conversations
+            .extend(self.input_messages.clone());
+
+        let mut thought = String::new();
+        let mut loaded_skills: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut step_count = 0;
+
+        for _ in 0..self.max_steps {
+            step_count += 1;
+
+            if self.checkpoint_interval > 0 && step_count % self.checkpoint_interval == 0 {
+                let checkpoint = serde_json::json!({
+                    "step": step_count,
+                    "thought": thought,
+                    "context_size": request.context.conversations.len(),
+                });
+                self.telemetry.emit(&TelemetryEvent::Checkpoint(checkpoint));
+            }
+
+            if request.model.is_empty() {
+                request.model = self.model.clone();
+            }
+
+            info!("[ReACT] SEND: {:?}", request);
+            let llm_response = match timeout(
+                Duration::from_secs(self.llm_timeout_secs),
+                self.call_llm(request.clone()),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(ReactError::Timeout("LLM prediction timed out".to_string())),
+            };
+
+            match llm_response {
+                LlmResponse::ToolCall { name, args, id } => {
+                    let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+
+                    if name == "load_skill" {
+                        let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        if loaded_skills.contains_key(skill_name) {
+                            let cached = loaded_skills.get(skill_name).unwrap();
+                            request
+                                .context
+                                .conversations
+                                .push(LlmMessage::AssistantToolCall {
+                                    tool_call_id: call_id.clone(),
+                                    name: name.clone(),
+                                    args: args.clone(),
+                                });
+                            request.context.conversations.push(LlmMessage::ToolResult {
+                            tool_call_id: call_id,
+                            content: format!(
+                                "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.\n\n{}",
+                                skill_name, cached
+                            ),
+                        });
+                            continue;
+                        }
+                    }
+
+                    let result = self.call_tool(&name, &args).await;
+
+                    if let Ok(ret) = &result {
+                        if name == "load_skill" {
+                            let skill_name =
+                                args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let instructions = ret
+                                .get("instructions")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !instructions.is_empty() {
+                                loaded_skills
+                                    .insert(skill_name.to_string(), instructions.to_string());
+                            }
+                        }
+
+                        self.telemetry.emit(&TelemetryEvent::ToolInvocation {
+                            tool: name.clone(),
+                            input: args.clone(),
+                            output: ret.clone(),
+                        });
+                        request
+                            .context
+                            .conversations
+                            .push(LlmMessage::AssistantToolCall {
+                                tool_call_id: call_id.clone(),
+                                name: name.clone(),
+                                args: args.clone(),
+                            });
+                        request.context.conversations.push(LlmMessage::ToolResult {
+                            tool_call_id: call_id,
+                            content: ret.to_string(),
+                        });
+                    } else {
+                        request
+                            .context
+                            .conversations
+                            .push(LlmMessage::AssistantToolCall {
+                                tool_call_id: call_id.clone(),
+                                name: name.clone(),
+                                args: args.clone(),
+                            });
+                        request.context.conversations.push(LlmMessage::ToolResult {
+                            tool_call_id: call_id,
+                            content: format!("Error: {:?}", result),
+                        });
+                    }
+                }
+                LlmResponse::Text(text) | LlmResponse::Partial(text) => {
+                    thought = text.clone();
+                    info!("[ReAct] RECV: {}", thought);
+
+                    self.telemetry.emit(&TelemetryEvent::ThoughtGenerated {
+                        thought: thought.clone(),
+                    });
+
+                    match parse_llm_intent(&thought, &self.tools.tools) {
+                        ParsedIntent::ToolCall {
+                            name,
+                            input,
+                            call_id,
+                        } => {
+                            let call_id = call_id
+                                .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+
+                            if name == "load_skill" {
+                                let skill_name =
+                                    input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                if loaded_skills.contains_key(skill_name) {
+                                    let cached = loaded_skills.get(skill_name).unwrap();
+                                    request.context.conversations.push(
+                                        LlmMessage::AssistantToolCall {
+                                            tool_call_id: call_id.clone(),
+                                            name: name.clone(),
+                                            args: input.clone(),
+                                        },
+                                    );
+                                    request.context.conversations.push(LlmMessage::ToolResult {
+                                    tool_call_id: call_id,
+                                    content: format!(
+                                        "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.\n\n{}",
+                                        skill_name, cached
+                                    ),
+                                });
+                                    continue;
+                                }
+                            }
+
+                            let result = self.call_tool(&name, &input).await;
+
+                            if let Ok(ret) = &result {
+                                if name == "load_skill" {
+                                    let skill_name =
+                                        input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let instructions = ret
+                                        .get("instructions")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if !instructions.is_empty() {
+                                        loaded_skills.insert(
+                                            skill_name.to_string(),
+                                            instructions.to_string(),
+                                        );
+                                    }
+                                }
+
+                                self.telemetry.emit(&TelemetryEvent::ToolInvocation {
+                                    tool: name.clone(),
+                                    input: input.clone(),
+                                    output: ret.clone(),
+                                });
+                                request
+                                    .context
+                                    .conversations
+                                    .push(LlmMessage::AssistantToolCall {
+                                        tool_call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        args: input.clone(),
+                                    });
+                                request.context.conversations.push(LlmMessage::ToolResult {
+                                    tool_call_id: call_id,
+                                    content: ret.to_string(),
+                                });
+                            } else {
+                                request
+                                    .context
+                                    .conversations
+                                    .push(LlmMessage::AssistantToolCall {
+                                        tool_call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        args: input.clone(),
+                                    });
+                                request.context.conversations.push(LlmMessage::ToolResult {
+                                    tool_call_id: call_id,
+                                    content: format!("Error: {:?}", result),
+                                });
+                            }
+                        }
+                        ParsedIntent::FinalAnswer { text } => {
+                            self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                                answer: text.clone(),
+                            });
+                            return Ok(text);
+                        }
+                    }
+                }
+                LlmResponse::Done => {
+                    self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                        answer: thought.clone(),
+                    });
+                    return Ok(thought);
+                }
+            }
+        }
+        self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+            answer: thought.clone(),
+        });
+        Ok(thought)
     }
 
     /// Get current token usage for this session

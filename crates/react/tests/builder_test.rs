@@ -96,3 +96,132 @@ fn test_builder_missing_llm() {
         _ => panic!("Expected MissingLlm error"),
     }
 }
+
+#[test]
+fn test_message_log_input() {
+    use react::llm::LlmMessage;
+    use std::sync::{Arc, Mutex};
+
+    struct MockLlmWithHistory {
+        received_conversations: Arc<Mutex<Vec<Vec<LlmMessage>>>>,
+    }
+    impl MockLlmWithHistory {
+        fn new() -> Self {
+            Self {
+                received_conversations: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for MockLlmWithHistory {
+        async fn complete(&self, request: LlmRequest) -> LlmResponseResult {
+            self.received_conversations
+                .lock()
+                .unwrap()
+                .push(request.context.conversations.clone());
+            Ok(LlmResponse::Text("Hello back!".to_string()))
+        }
+
+        async fn stream_complete(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<TokenStream, LlmError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    let mock = MockLlmWithHistory::new();
+    let received = mock.received_conversations.clone();
+
+    let mut engine = ReActEngineBuilder::new()
+        .llm(Box::new(mock))
+        .max_steps(1)
+        .build()
+        .expect("Failed to build engine");
+
+    engine.set_input_messages(vec![
+        LlmMessage::user("Previous conversation"),
+        LlmMessage::assistant("I remember that"),
+    ]);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async { engine.react("New message").await }).unwrap();
+
+    let convos = received.lock().unwrap();
+    assert!(!convos.is_empty());
+    let first_convo = &convos[0];
+    assert!(first_convo.len() >= 3, "Should have system + history + new user");
+    assert!(matches!(first_convo[1], LlmMessage::User { content: ref c } if c == "Previous conversation"));
+}
+
+#[test]
+fn test_react_with_request() {
+    use react::llm::{LlmContext, LlmMessage};
+
+    struct MockLlmFullRequest {
+        received_model: Arc<Mutex<Option<String>>>,
+    }
+    impl MockLlmFullRequest {
+        fn new() -> Self {
+            Self {
+                received_model: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for MockLlmFullRequest {
+        async fn complete(&self, request: LlmRequest) -> LlmResponseResult {
+            *self.received_model.lock().unwrap() = Some(request.model.clone());
+            Ok(LlmResponse::Text("Answer from custom request".to_string()))
+        }
+
+        async fn stream_complete(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<TokenStream, LlmError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    let mock = MockLlmFullRequest::new();
+    let received_model = mock.received_model.clone();
+
+    let mut engine = ReActEngineBuilder::new()
+        .llm(Box::new(mock))
+        .max_steps(1)
+        .build()
+        .expect("Failed to build engine");
+
+    let mut context = LlmContext::default();
+    context.conversations.push(LlmMessage::user("Hello"));
+    let request = LlmRequest {
+        model: "custom-model".to_string(),
+        context,
+        temperature: Some(0.9),
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async { engine.react_with_request(request).await }).unwrap();
+
+    let model = received_model.lock().unwrap();
+    assert_eq!(model.as_ref().unwrap(), "custom-model");
+}

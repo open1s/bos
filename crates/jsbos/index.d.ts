@@ -23,6 +23,10 @@ export declare class Agent {
   listMcpPrompts(): Promise<Array<any>>
   rpcClient(endpoint: string, bus: ExternalObject<Session>): Promise<AgentRpcClient>
   asCallableServer(endpoint: string, bus: ExternalObject<Session>): Promise<AgentCallableServer>
+  addMessage(message: any): Promise<void>
+  getMessages(): Array<any>
+  saveMessageLog(path: string): void
+  restoreMessageLog(path: string): void
 }
 
 export declare class AgentCallableServer {

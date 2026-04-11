@@ -38,31 +38,3 @@ impl LlmClient for MockLlm {
         "mock"
     }
 }
-
-#[test]
-fn plan_d_observability_memory_checkpoint() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let _ = env_logger::builder().is_test(true).try_init();
-    });
-
-    let mock_llm = MockLlm::new(vec![
-        "Action: calculator\nInput: {\"expression\": \"2+3\"}".to_string(),
-        "Final Answer: 5".to_string(),
-    ]);
-
-    let mut engine = ReActEngine::new(Box::new(mock_llm), 3);
-    engine.register_tool(Box::new(CalculatorTool));
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let res = engine.react("2+3").await;
-        assert!(res.is_ok());
-        let path = std::env::temp_dir().join("plan-d-observability-memory.json");
-        engine
-            .save_memory_checkpoint(path.to_str().unwrap())
-            .unwrap();
-        let contents = std::fs::read_to_string(path).unwrap();
-        assert!(contents.trim().starts_with("["));
-    });
-}

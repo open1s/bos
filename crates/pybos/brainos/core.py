@@ -112,19 +112,19 @@ class Agent:
     # ── Interaction ────────────────────────────────────────────────
 
     async def ask(self, question: str) -> str:
-        """Ask the agent a question. Uses the full agent run_loop with tools."""
+        """Ask the agent a question. Uses run_simple with tools and skills."""
         if self._agent is None:
             await self.start()
         return await self._agent.run_simple(question)
 
     async def chat(self, message: str) -> str:
-        """Send a message using simple conversation (no tool reasoning)."""
+        """Send a message using simple conversation (no ReAct loop)."""
         if self._agent is None:
             await self.start()
         return await self._agent.run_simple(message)
 
     async def run_simple(self, message: str) -> str:
-        """Run a simple conversation (no tool reasoning)."""
+        """Run a simple conversation (single LLM call with tools and skills)."""
         if self._agent is None:
             await self.start()
         return await self._agent.run_simple(message)

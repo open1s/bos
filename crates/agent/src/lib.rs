@@ -25,7 +25,7 @@ pub use mcp::{
     ReadResourceResult, ResourceContents, ServerCapabilities, StdioTransport, ToolDefinition,
 };
 pub use react::llm::vendor::OpenAiVendor;
-pub use react::llm::{LlmClient, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
+pub use react::llm::{LlmClient, LlmMessage, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
 pub use security::{SecurityError, WorkspaceValidator};
 pub use session::manager::SessionManager;
 pub use session::serializer::SessionSerializer;
