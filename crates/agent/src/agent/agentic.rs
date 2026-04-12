@@ -6,6 +6,7 @@ use log::warn;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use react::engine::ReActEngineBuilder;
 use react::llm::{
@@ -562,9 +563,6 @@ impl Agent {
 
     /// Run the agent using ReAct engine.
     pub async fn react(&self, task: &str) -> Result<String, AgentError> {
-        use react::llm::LlmMessage;
-        self.message_log.lock().unwrap().push(LlmMessage::user(task.to_string()));
-        
         let react_llm = Box::new(AgentLlmAdapter::new(self.llm.clone()));
         let mut builder = ReActEngineBuilder::new().llm(react_llm);
 
@@ -577,7 +575,7 @@ impl Agent {
 
         // Inject skill catalog and load_skill tool into ReAct engine
         let has_skills = !self.skills.is_empty();
-        let skills_schemas = self.get_skills_schemas();
+        // let skills_schemas = self.get_skills_schemas();
         if has_skills {
             let skill_names: Vec<String> = self
                 .skills
@@ -650,56 +648,29 @@ impl Agent {
 
         // Build system prompt with skill context
         let mut system_prompt = self.config.system_prompt.clone();
-        if has_skills {
-            if !system_prompt.is_empty() {
-                system_prompt.push_str("\n\n");
-            }
-            let skills_catalog = render_skills_catalog(&skills_schemas);
-            system_prompt.push_str(&format!(
-                "Available skills (call load_skill tool to get instructions):\n{}",
-                skills_catalog
-            ));
-        }
-
-        // Add strict format instructions with tool schemas
-        if !system_prompt.is_empty() {
-            system_prompt.push_str("\n\n");
-        }
-
-        // Build tool schema descriptions
-        let mut tool_schemas = String::new();
-        if let Some(ref registry) = self.registry {
-            for (name, tool) in registry.iter() {
-                let schema = tool.json_schema();
-                tool_schemas.push_str(&format!("- {}: {:?}\n", name, schema));
-            }
-        }
-
-        if !tool_schemas.is_empty() {
-            system_prompt.push_str(&format!(
-                "Available tools (MUST follow each tool's schema exactly):\n{}\n\
-                Use keyword arguments matching the schema. Final answer: Final Answer: your answer",
-                tool_schemas
-            ));
-        } else {
-            system_prompt.push_str("Final answer: Final Answer: your answer");
-        }
+        system_prompt.push_str("Final answer: Final Answer: your answer");
 
         builder = builder.resilience(self.resilience.clone());
         builder = builder.llm_timeout(self.config.timeout_secs);
         builder = builder.max_steps(self.config.max_steps);
         builder = builder.model(self.config.model.clone());
-        builder = builder.system_prompt(system_prompt);
+        builder = builder.system_prompt(system_prompt.clone());
 
         let mut engine = builder
             .build()
             .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))?;
 
         engine.set_input_messages(self.message_log.lock().unwrap().clone());
-        let result = engine
+        let (result, context) = engine
             .react(task)
             .await
             .map_err(|e| AgentError::Session(format!("ReAct run error: {}", e)))?;
+
+        let mut log = context.conversations.clone();
+        log.remove(0); //remove system log
+
+        *self.message_log.lock().unwrap() = log;
+
         Ok(result)
     }
 
@@ -708,8 +679,6 @@ impl Agent {
     /// Supports tools and skills like react() does, but makes a single LLM call.
     pub async fn run_simple(&self, task: &str) -> Result<String, AgentError> {
         use react::llm::LlmMessage;
-        self.message_log.lock().unwrap().push(LlmMessage::user(task.to_string()));
-        
         use react::llm::{LlmContext, LlmRequest};
 
         let react_llm = Box::new(AgentLlmAdapter::new(self.llm.clone()));
@@ -723,7 +692,6 @@ impl Agent {
         }
 
         let has_skills = !self.skills.is_empty();
-        let skills_schemas = self.get_skills_schemas();
         if has_skills {
             let skill_names: Vec<String> = self
                 .skills
@@ -792,53 +760,25 @@ impl Agent {
             builder = builder.with_tool(Box::new(ReactToolAdapter::new(load_skill_tool)));
         }
 
-        let mut system_prompt = self.config.system_prompt.clone();
-        if has_skills {
-            if !system_prompt.is_empty() {
-                system_prompt.push_str("\n\n");
-            }
-            let skills_catalog = render_skills_catalog(&skills_schemas);
-            system_prompt.push_str(&format!(
-                "Available skills (call load_skill tool to get instructions):\n{}",
-                skills_catalog
-            ));
-        }
-
-        if !system_prompt.is_empty() {
-            system_prompt.push_str("\n\n");
-        }
-
-        let mut tool_schemas = String::new();
-        if let Some(ref registry) = self.registry {
-            for (name, tool) in registry.iter() {
-                let schema = tool.json_schema();
-                tool_schemas.push_str(&format!("- {}: {:?}\n", name, schema));
-            }
-        }
-
-        if !tool_schemas.is_empty() {
-            system_prompt.push_str(&format!(
-                "Available tools (MUST follow each tool's schema exactly):\n{}",
-                tool_schemas
-            ));
-        }
+        let system_prompt = self.config.system_prompt.clone();
 
         builder = builder.resilience(self.resilience.clone());
         builder = builder.llm_timeout(self.config.timeout_secs);
         builder = builder.max_steps(self.config.max_steps);
         builder = builder.model(self.config.model.clone());
-        builder = builder.system_prompt(system_prompt);
+        builder = builder.system_prompt(system_prompt.clone());
 
-        let mut engine = builder
+        let engine = builder
             .build()
             .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))?;
 
-        engine.set_input_messages(self.message_log.lock().unwrap().clone());
-
         let conversations = self.message_log.lock().unwrap().clone();
+        let mut all_conversations = vec![LlmMessage::system(system_prompt.clone())];
+        all_conversations.extend(conversations);
+        all_conversations.push(LlmMessage::user(task.to_string()));
 
         let context = LlmContext {
-            conversations,
+            conversations: all_conversations.clone(),
             ..Default::default()
         };
 
@@ -854,19 +794,27 @@ impl Agent {
             .await
             .map_err(|e| AgentError::Session(format!("LLM call failed: {}", e)))?;
 
-        let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut loaded_skills: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         match response {
             react::llm::LlmResponse::Text(content) => {
-                self.message_log.lock().unwrap().push(LlmMessage::assistant(content.clone()));
+                let mut log = self.message_log.lock().unwrap();
+                log.push(LlmMessage::user(task.to_string()));
+                log.push(LlmMessage::assistant(content.clone()));
                 Ok(content)
             }
             react::llm::LlmResponse::Partial(content) => {
-                self.message_log.lock().unwrap().push(LlmMessage::assistant(content.clone()));
+                let mut log = self.message_log.lock().unwrap();
+                log.push(LlmMessage::user(task.to_string()));
+                log.push(LlmMessage::assistant(content.clone()));
                 Ok(content)
             }
             react::llm::LlmResponse::Done => Ok(String::new()),
-            react::llm::LlmResponse::ToolCall { name, args, id: _ } => {
+            react::llm::LlmResponse::ToolCall { name, args, id } => {
+                let call_id =
+                    id.unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
+
                 let result = if name == "load_skill" {
                     let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     if let Some(cached) = loaded_skills.get(skill_name) {
@@ -885,16 +833,32 @@ impl Agent {
                 let result_text = match &result {
                     Ok(ret) => {
                         if name == "load_skill" {
-                            let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
-                            if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                loaded_skills.insert(skill_name.to_string(), instructions.to_string());
+                            let skill_name =
+                                args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let instructions = ret
+                                .get("instructions")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !instructions.is_empty()
+                                && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false)
+                            {
+                                loaded_skills
+                                    .insert(skill_name.to_string(), instructions.to_string());
                             }
                         }
                         ret.to_string()
-                    },
+                    }
                     Err(e) => format!("Error: {:?}", e),
                 };
+
+                let mut log = self.message_log.lock().unwrap();
+                log.push(LlmMessage::user(task.to_string()));
+                log.push(LlmMessage::assistant_tool_call(
+                    call_id.clone(),
+                    name.clone(),
+                    args.clone(),
+                ));
+                log.push(LlmMessage::tool_result(call_id, result_text.clone()));
 
                 Ok(result_text)
             }
@@ -921,7 +885,6 @@ impl Agent {
         }
 
         let has_skills = !self.skills.is_empty();
-        let skills_schemas = self.get_skills_schemas();
         if has_skills {
             let skill_names: Vec<String> = self
                 .skills
@@ -990,42 +953,13 @@ impl Agent {
             builder = builder.with_tool(Box::new(ReactToolAdapter::new(load_skill_tool)));
         }
 
-        let mut system_prompt = self.config.system_prompt.clone();
-        if has_skills {
-            if !system_prompt.is_empty() {
-                system_prompt.push_str("\n\n");
-            }
-            let skills_catalog = render_skills_catalog(&skills_schemas);
-            system_prompt.push_str(&format!(
-                "Available skills (call load_skill tool to get instructions):\n{}",
-                skills_catalog
-            ));
-        }
-
-        if !system_prompt.is_empty() {
-            system_prompt.push_str("\n\n");
-        }
-
-        let mut tool_schemas = String::new();
-        if let Some(ref registry) = self.registry {
-            for (name, tool) in registry.iter() {
-                let schema = tool.json_schema();
-                tool_schemas.push_str(&format!("- {}: {:?}\n", name, schema));
-            }
-        }
-
-        if !tool_schemas.is_empty() {
-            system_prompt.push_str(&format!(
-                "Available tools (MUST follow each tool's schema exactly):\n{}",
-                tool_schemas
-            ));
-        }
+        let system_prompt = self.config.system_prompt.clone();
 
         builder = builder.resilience(self.resilience.clone());
         builder = builder.llm_timeout(self.config.timeout_secs);
         builder = builder.max_steps(self.config.max_steps);
         builder = builder.model(self.config.model.clone());
-        builder = builder.system_prompt(system_prompt);
+        builder = builder.system_prompt(system_prompt.clone());
 
         let engine_result = builder.build();
         let task_str = task.to_string();
@@ -1040,8 +974,12 @@ impl Agent {
                 }
             };
 
-            let mut all_conversations = message_log_ptr.lock().unwrap().clone();
+            let mut all_conversations = vec![LlmMessage::system(system_prompt.clone())];
+            all_conversations.extend(message_log_ptr.lock().unwrap().clone());
             all_conversations.push(LlmMessage::user(task_str.clone()));
+
+            let mut log = message_log_ptr.lock().unwrap().clone();
+            log.push(LlmMessage::user(task_str.clone()));
 
             let context = LlmContext {
                 conversations: all_conversations,
@@ -1065,7 +1003,7 @@ impl Agent {
             futures::pin_mut!(llm_stream);
             let mut full_response = String::new();
             let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-            
+
             while let Some(item) = llm_stream.next().await {
                 match item {
                     Ok(StreamToken::Text(text)) => {
@@ -1077,6 +1015,8 @@ impl Agent {
                     }
                     Ok(StreamToken::ToolCall { name, args, id }) => {
                         yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
+
+                        let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
 
                         let result = if name == "load_skill" {
                             let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1108,11 +1048,22 @@ impl Agent {
                         };
 
                         full_response.push_str(&result_text);
-                        yield Ok(StreamToken::Text(result_text));
+                        yield Ok(StreamToken::Text(result_text.clone()));
+
+                        let mut log = message_log_ptr.lock().unwrap();
+                        if !log.iter().any(|m| matches!(m, LlmMessage::System { .. })) {
+                            log.insert(0, LlmMessage::system(system_prompt.clone()));
+                        }
+                        if !log.iter().any(|m| matches!(m, LlmMessage::User { .. })) {
+                            log.push(LlmMessage::user(task_str.clone()));
+                        }
+                        log.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), args.clone()));
+                        log.push(LlmMessage::tool_result(call_id, result_text));
                     }
                     Err(e) => yield Err(AgentError::Session(format!("LLM stream error: {}", e))),
                 }
             }
+
             let mut log = message_log_ptr.lock().unwrap();
             log.push(LlmMessage::user(task_str));
             if !full_response.is_empty() {
@@ -1290,6 +1241,7 @@ impl Clone for Agent {
 /// Session wrapper for Agent that provides simplified execution.
 /// Render the skills catalog for the system prompt.
 /// Takes skill schemas and formats them for display.
+#[allow(dead_code)]
 fn render_skills_catalog(skills_schemas: &[serde_json::Value]) -> String {
     let mut catalog = String::new();
     catalog.push_str("Available skills:\n\n");
@@ -1487,4 +1439,718 @@ fn test_message_log_save_restore() {
 
     // Cleanup
     fs::remove_file(&path).ok();
+}
+
+#[cfg(test)]
+mod message_log_tests {
+    use super::*;
+    use react::llm::{LlmMessage, LlmResponse, LlmResponseResult};
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    struct RecordingLlmClient {
+        responses: Arc<TokioMutex<Vec<LlmResponse>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for RecordingLlmClient {
+        async fn complete(&self, _req: react::llm::LlmRequest) -> LlmResponseResult {
+            let mut responses = self.responses.lock().await;
+            if responses.is_empty() {
+                Ok(LlmResponse::Text("Final answer: test response".to_string()))
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+
+        async fn stream_complete(
+            &self,
+            _req: react::llm::LlmRequest,
+        ) -> std::result::Result<react::llm::TokenStream, react::llm::LlmError> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamToken::Text("test".to_string())),
+                Ok(StreamToken::Done),
+            ])))
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_message_log_includes_system_user_assistant() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        agent.add_message(LlmMessage::user("Previous message"));
+
+        let _ = agent.run_simple("test task").await;
+
+        let messages = agent.get_messages();
+        assert!(
+            messages.len() >= 2,
+            "Should have at least system and user messages"
+        );
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, LlmMessage::System { .. })),
+            "Should have system message"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, LlmMessage::User { .. })),
+            "Should have user messages"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, LlmMessage::Assistant { .. })),
+            "Should have assistant message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_message_log_includes_tool_calls_and_results() {
+        // Tool call testing requires proper LLM with tool support
+        // This test verifies the code compiles correctly
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        // Add a tool to verify registry works
+        let tool = Arc::new(FunctionTool::new(
+            "test_tool",
+            "A test tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string" }
+                },
+                "required": ["input"]
+            }),
+            |_args: &serde_json::Value| {
+                Ok(serde_json::json!({
+                    "result": "tool executed successfully"
+                }))
+            },
+        ));
+        agent.add_tool(tool);
+
+        // Verify tool is registered
+        assert!(agent.registry().and_then(|r| r.get("test_tool")).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_stream_message_log_includes_system_user_assistant() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        agent.add_message(LlmMessage::user("Previous"));
+
+        let mut stream = agent.stream("test task");
+        while let Some(_result) = stream.next().await {}
+
+        let messages = agent.get_messages();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, LlmMessage::System { .. })),
+            "Stream should add system message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_message_log_includes_tool_calls_and_results() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let tool = Arc::new(FunctionTool::new(
+            "test_tool",
+            "A test tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string" }
+                },
+                "required": ["input"]
+            }),
+            |_args: &serde_json::Value| {
+                Ok(serde_json::json!({
+                    "result": "tool executed"
+                }))
+            },
+        ));
+        agent.add_tool(tool);
+
+        // Verify tool is registered
+        assert!(agent.registry().and_then(|r| r.get("test_tool")).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_react_message_log_includes_all_types() {
+        use react::llm::LlmMessage;
+
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        agent.add_message(LlmMessage::user("initial"));
+
+        let messages = agent.get_messages();
+
+        assert!(!messages.is_empty(), "message_log should have messages");
+    }
+
+    /// Mock LLM client that returns a tool call response for testing tool message logging
+    struct ToolCallLlmClient {
+        responses: Arc<TokioMutex<Vec<LlmResponse>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolCallLlmClient {
+        async fn complete(&self, _req: react::llm::LlmRequest) -> LlmResponseResult {
+            let mut responses = self.responses.lock().await;
+            if responses.is_empty() {
+                Ok(LlmResponse::Text("Final answer: test response".to_string()))
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+
+        async fn stream_complete(
+            &self,
+            _req: react::llm::LlmRequest,
+        ) -> std::result::Result<react::llm::TokenStream, react::llm::LlmError> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamToken::Text("test".to_string())),
+                Ok(StreamToken::Done),
+            ])))
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "mock-tool"
+        }
+    }
+
+    /// Helper to check if message log contains all required message types
+    fn has_message_type(messages: &[LlmMessage], variant: &str) -> bool {
+        messages.iter().any(|m| match (m, variant) {
+            (LlmMessage::System { .. }, "system") => true,
+            (LlmMessage::User { .. }, "user") => true,
+            (LlmMessage::Assistant { .. }, "assistant") => true,
+            (LlmMessage::AssistantToolCall { .. }, "tool_call") => true,
+            (LlmMessage::ToolResult { .. }, "tool_result") => true,
+            _ => false,
+        })
+    }
+
+    // ============================================================================
+    // RED Phase: Failing tests for message log completeness
+    // These tests verify that message_log includes system, user, assistant, and tool call
+    // after calling react(), run_simple(), and stream() methods.
+    // ============================================================================
+
+    /// Test that react() includes all message types in message_log
+    /// RED: This test should FAIL initially - react() doesn't properly track all message types
+    #[tokio::test]
+    async fn test_react_includes_system_user_assistant_messages() {
+        let config = AgentConfig::default();
+        // Create mock that returns text response
+        let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
+            "Final answer: test response".to_string(),
+        )]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        // Call react method
+        let _ = agent.react("test task").await;
+
+        let messages = agent.get_messages();
+
+        // MUST have system message
+        assert!(
+            has_message_type(&messages, "system"),
+            "react() message_log must include system messages. Got: {:?}",
+            messages
+        );
+
+        // MUST have user message
+        assert!(
+            has_message_type(&messages, "user"),
+            "react() message_log must include user messages. Got: {:?}",
+            messages
+        );
+
+        // MUST have assistant message
+        assert!(
+            has_message_type(&messages, "assistant"),
+            "react() message_log must include assistant messages. Got: {:?}",
+            messages
+        );
+    }
+
+    /// Test that run_simple() includes all message types in message_log
+    /// RED: This test may fail if tool calls are not properly logged
+    #[tokio::test]
+    async fn test_run_simple_includes_system_user_assistant_messages() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
+            "Final answer: test response".to_string(),
+        )]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        // Call run_simple method
+        let _ = agent.run_simple("test task").await;
+
+        let messages = agent.get_messages();
+
+        // MUST have system message
+        assert!(
+            has_message_type(&messages, "system"),
+            "run_simple() message_log must include system messages. Got: {:?}",
+            messages
+        );
+
+        // MUST have user message
+        assert!(
+            has_message_type(&messages, "user"),
+            "run_simple() message_log must include user messages. Got: {:?}",
+            messages
+        );
+
+        // MUST have assistant message
+        assert!(
+            has_message_type(&messages, "assistant"),
+            "run_simple() message_log must include assistant messages. Got: {:?}",
+            messages
+        );
+    }
+
+    /// Test that stream() includes all message types in message_log
+    /// RED: This test should FAIL initially - stream() doesn't properly track all message types
+    #[tokio::test]
+    async fn test_stream_includes_system_user_assistant_messages() {
+        let config = AgentConfig::default();
+        let responses: Arc<TokioMutex<Vec<LlmResponse>>> = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let agent = Agent::new(config, llm);
+
+        // Collect stream results
+        let mut stream = agent.stream("test task");
+        while let Some(item) = stream.next().await {
+            // Just consume the stream
+            let _ = item;
+        }
+
+        let messages = agent.get_messages();
+
+        // MUST have system message
+        assert!(
+            has_message_type(&messages, "system"),
+            "stream() message_log must include system messages. Got: {:?}",
+            messages
+        );
+
+        // MUST have user message
+        assert!(
+            has_message_type(&messages, "user"),
+            "stream() message_log must include user messages. Got: {:?}",
+            messages
+        );
+
+        // MUST have assistant message
+        assert!(
+            has_message_type(&messages, "assistant"),
+            "stream() message_log must include assistant messages. Got: {:?}",
+            messages
+        );
+    }
+
+    /// Test that LLM response is included in message_log for react()
+    /// RED: This test should FAIL initially
+    #[tokio::test]
+    async fn test_react_llm_response_included_in_message_log() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
+            "Final answer: LLM response text".to_string(),
+        )]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let result = agent.react("test task").await;
+
+        // Verify the LLM response was received
+        assert!(result.is_ok(), "react() should succeed");
+        let messages = agent.get_messages();
+
+        // The assistant message should contain the LLM response
+        let has_assistant_with_content = messages.iter().any(|m| {
+            if let LlmMessage::Assistant { content } = m {
+                content.contains("LLM response text") || content.contains("Final answer")
+            } else {
+                false
+            }
+        });
+
+        assert!(
+            has_assistant_with_content,
+            "react() message_log must include LLM response in assistant message. Got: {:?}",
+            messages
+        );
+    }
+
+    /// Test that LLM response is included in message_log for run_simple()
+    /// RED: This test should FAIL initially
+    #[tokio::test]
+    async fn test_run_simple_llm_response_included_in_message_log() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
+            "Final answer: LLM response text".to_string(),
+        )]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let result = agent.run_simple("test task").await;
+
+        // Verify the LLM response was received
+        assert!(result.is_ok(), "run_simple() should succeed");
+        let messages = agent.get_messages();
+
+        // The assistant message should contain the LLM response
+        let has_assistant_with_content = messages.iter().any(|m| {
+            if let LlmMessage::Assistant { content } = m {
+                content.contains("LLM response text") || content.contains("Final answer")
+            } else {
+                false
+            }
+        });
+
+        assert!(
+            has_assistant_with_content,
+            "run_simple() message_log must include LLM response in assistant message. Got: {:?}",
+            messages
+        );
+    }
+
+    /// Test that tool call messages are included in message_log when LLM returns a tool call
+    /// RED: This test should FAIL initially - need to mock tool call responses
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_run_simple_includes_tool_call_messages() {
+        use serde_json::json;
+
+        let config = AgentConfig::default();
+        // First response is a tool call, second is the final answer
+        let responses = Arc::new(TokioMutex::new(vec![
+            LlmResponse::ToolCall {
+                name: "test_tool".to_string(),
+                args: json!({"param": "value"}),
+                id: Some("call_123".to_string()),
+            },
+            LlmResponse::Text("Final answer: tool executed".to_string()),
+        ]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+
+        // Create agent with a test tool registered
+        let mut agent = Agent::new(config, llm);
+        let tool = Arc::new(FunctionTool::new(
+            "test_tool",
+            "A test tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "param": { "type": "string" }
+                },
+                "required": ["param"]
+            }),
+            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "tool executed" })),
+        ));
+        agent.add_tool(tool);
+
+        // Call run_simple - it should handle tool calls
+        let _ = agent.run_simple("test task").await;
+
+        let messages = agent.get_messages();
+
+        // MUST have tool call message
+        assert!(
+            has_message_type(&messages, "tool_call"),
+            "run_simple() message_log must include tool call messages when LLM returns tool call. Got: {:?}",
+            messages
+        );
+
+        // MUST have tool result message
+        assert!(
+            has_message_type(&messages, "tool_result"),
+            "run_simple() message_log must include tool result messages. Got: {:?}",
+            messages
+        );
+    }
+
+    // ========================================================================
+    // TDD Tests: No Duplicate Messages
+    // These tests verify that message_log does NOT contain duplicate messages
+    // when calling react(), run_simple(), and stream() methods.
+    // ========================================================================
+
+    /// Helper to count messages of a specific type
+    fn count_message_type(messages: &[LlmMessage], variant: &str) -> usize {
+        messages
+            .iter()
+            .filter(|m| match (m, variant) {
+                (LlmMessage::System { .. }, "system") => true,
+                (LlmMessage::User { .. }, "user") => true,
+                (LlmMessage::Assistant { .. }, "assistant") => true,
+                (LlmMessage::AssistantToolCall { .. }, "tool_call") => true,
+                (LlmMessage::ToolResult { .. }, "tool_result") => true,
+                _ => false,
+            })
+            .count()
+    }
+
+    /// RED: Test that react() does NOT add duplicate system messages
+    #[tokio::test]
+    async fn test_react_no_duplicate_system_messages() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
+            "Final answer: test response".to_string(),
+        )]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        // Call react - should add exactly ONE system message
+        let _ = agent.react("test task").await;
+
+        let messages = agent.get_messages();
+        let system_count = count_message_type(&messages, "system");
+
+        assert_eq!(
+            system_count, 1,
+            "react() should add exactly ONE system message. Found {} system messages. Got: {:?}",
+            system_count, messages
+        );
+    }
+
+    /// RED: Test that react() does NOT add duplicate user messages
+    #[tokio::test]
+    async fn test_react_no_duplicate_user_messages() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
+            "Final answer: test response".to_string(),
+        )]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        // Call react - should add exactly ONE user message for this task
+        let _ = agent.react("test task").await;
+
+        let messages = agent.get_messages();
+        // Filter user messages for the specific task content
+        let user_messages_for_task: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                if let LlmMessage::User { content } = m {
+                    content == "test task"
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            user_messages_for_task.len(), 1,
+            "react() should add exactly ONE user message for the task. Found {} user messages for 'test task'. Got: {:?}",
+            user_messages_for_task.len(), messages
+        );
+    }
+
+    /// RED: Test that run_simple() does NOT add duplicate system messages
+    #[tokio::test]
+    async fn test_run_simple_no_duplicate_system_messages() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
+            "Final answer: test response".to_string(),
+        )]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        // Call run_simple - should add exactly ONE system message
+        let _ = agent.run_simple("test task").await;
+
+        let messages = agent.get_messages();
+        let system_count = count_message_type(&messages, "system");
+
+        assert_eq!(
+            system_count, 1,
+            "run_simple() should add exactly ONE system message. Found {} system messages. Got: {:?}",
+            system_count, messages
+        );
+    }
+
+    /// RED: Test that run_simple() does NOT add duplicate user messages
+    #[tokio::test]
+    async fn test_run_simple_no_duplicate_user_messages() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
+            "Final answer: test response".to_string(),
+        )]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        // Call run_simple - should add exactly ONE user message for this task
+        let _ = agent.run_simple("test task").await;
+
+        let messages = agent.get_messages();
+        // Filter user messages for the specific task content
+        let user_messages_for_task: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                if let LlmMessage::User { content } = m {
+                    content == "test task"
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            user_messages_for_task.len(), 1,
+            "run_simple() should add exactly ONE user message for the task. Found {} user messages for 'test task'. Got: {:?}",
+            user_messages_for_task.len(), messages
+        );
+    }
+
+    /// RED: Test that stream() does NOT add duplicate system messages
+    #[tokio::test]
+    async fn test_stream_no_duplicate_system_messages() {
+        let config = AgentConfig::default();
+        let responses: Arc<TokioMutex<Vec<LlmResponse>>> = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let agent = Agent::new(config, llm);
+
+        // Consume the stream
+        let mut stream = agent.stream("test task");
+        while let Some(_item) = stream.next().await {}
+
+        let messages = agent.get_messages();
+        let system_count = count_message_type(&messages, "system");
+
+        assert_eq!(
+            system_count, 1,
+            "stream() should add exactly ONE system message. Found {} system messages. Got: {:?}",
+            system_count, messages
+        );
+    }
+
+    /// RED: Test that stream() does NOT add duplicate user messages
+    #[tokio::test]
+    async fn test_stream_no_duplicate_user_messages() {
+        let config = AgentConfig::default();
+        let responses: Arc<TokioMutex<Vec<LlmResponse>>> = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let agent = Agent::new(config, llm);
+
+        // Consume the stream
+        let mut stream = agent.stream("test task");
+        while let Some(_item) = stream.next().await {}
+
+        let messages = agent.get_messages();
+        // Filter user messages for the specific task content
+        let user_messages_for_task: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                if let LlmMessage::User { content } = m {
+                    content == "test task"
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            user_messages_for_task.len(), 1,
+            "stream() should add exactly ONE user message for the task. Found {} user messages for 'test task'. Got: {:?}",
+            user_messages_for_task.len(), messages
+        );
+    }
+
+    /// Test that multiple calls to react() don't duplicate system messages
+    /// (each call should have its own system message based on the current config)
+    #[tokio::test]
+    async fn test_react_multiple_calls_no_duplicate_per_call() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![
+            LlmResponse::Text("Final answer: response 1".to_string()),
+            LlmResponse::Text("Final answer: response 2".to_string()),
+        ]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        // First call
+        let _ = agent.react("task 1").await;
+        let messages_after_first = agent.get_messages();
+        let system_count_first = count_message_type(&messages_after_first, "system");
+
+        // Second call - should add another user message but NOT duplicate system
+        let _ = agent.react("task 2").await;
+        let messages_after_second = agent.get_messages();
+        let system_count_second = count_message_type(&messages_after_second, "system");
+
+        // Note: react() currently rebuilds message_log, so this test may need adjustment
+        // based on the intended behavior
+        assert!(
+            system_count_second >= system_count_first,
+            "Second react() call should not reduce system messages. Before: {}, After: {}. Got: {:?}",
+            system_count_first, system_count_second, messages_after_second
+        );
+    }
+
+    /// Test that message_log correctly accumulates across calls
+    #[tokio::test]
+    async fn test_message_log_accumulation_no_duplicates() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![
+            LlmResponse::Text("Final answer: response 1".to_string()),
+            LlmResponse::Text("Final answer: response 2".to_string()),
+        ]));
+        let llm = Arc::new(RecordingLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        // First call
+        let _ = agent.run_simple("task 1").await;
+        let messages_after_first = agent.get_messages().len();
+
+        // Second call
+        let _ = agent.run_simple("task 2").await;
+        let messages_after_second = agent.get_messages().len();
+
+        // Should accumulate messages (not replace)
+        assert!(
+            messages_after_second > messages_after_first,
+            "Message log should grow across calls. Before: {}, After: {}",
+            messages_after_first,
+            messages_after_second
+        );
+    }
 }

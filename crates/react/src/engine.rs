@@ -166,11 +166,15 @@ fn extract_react_block(s: &str) -> Option<(String, Value)> {
             if let Some(pos) = line.find(':') {
                 tool_name = Some(line[pos + 1..].trim().to_string());
             }
-        } else if l.starts_with("input:") || l.starts_with("action input:") || l.starts_with("args:") {
+        } else if l.starts_with("input:")
+            || l.starts_with("action input:")
+            || l.starts_with("args:")
+        {
             if let Some(pos) = line.find(':') {
                 let raw = line[pos + 1..].trim();
                 if !raw.is_empty() {
-                    input = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+                    input = serde_json::from_str(raw)
+                        .unwrap_or_else(|_| Value::String(raw.to_string()));
                 }
             }
         }
@@ -188,11 +192,19 @@ fn parse_function_call(thought: &str) -> Option<(String, Value)> {
 }
 
 fn extract_function_block(s: &str) -> Option<(String, Value)> {
-    let cleaned = s.strip_prefix("<|python_tag|>").unwrap_or(s).trim().to_string();
+    let cleaned = s
+        .strip_prefix("<|python_tag|>")
+        .unwrap_or(s)
+        .trim()
+        .to_string();
     let paren_pos = cleaned.find('(')?;
     let func_name = cleaned[..paren_pos].trim().to_string();
 
-    if func_name.is_empty() || !func_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '/' || c == '-' || c == '.') {
+    if func_name.is_empty()
+        || !func_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '/' || c == '-' || c == '.')
+    {
         return None;
     }
 
@@ -211,7 +223,15 @@ fn extract_function_block(s: &str) -> Option<(String, Value)> {
         return Some((func_name, serde_json::json!({ "value": obj })));
     }
 
-    if let Some(s) = args_str.strip_prefix('"').and_then(|s| s.strip_suffix('"')).or_else(|| args_str.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))) {
+    if let Some(s) = args_str
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            args_str
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
+    {
         return Some((func_name, serde_json::json!({ "value": s })));
     }
 
@@ -225,9 +245,9 @@ fn is_tool_call_function(call: (String, Value)) -> Option<(String, Value)> {
 fn parse_latex_boxed(thought: &str) -> Option<(String, Value)> {
     extract_latex_block(thought).and_then(|content| {
         parse_function_call(content).or_else(|| {
-            extract_json_block(content).and_then(|json_str| {
-                serde_json::from_str::<Value>(json_str).ok()
-            }).and_then(|val| is_tool_call_json(&val))
+            extract_json_block(content)
+                .and_then(|json_str| serde_json::from_str::<Value>(json_str).ok())
+                .and_then(|val| is_tool_call_json(&val))
         })
     })
 }
@@ -279,7 +299,9 @@ fn extract_json_block(s: &str) -> Option<&str> {
 fn is_tool_call_json(val: &Value) -> Option<(String, Value)> {
     if let (Some(name), Some(params)) = (
         val.get("name").and_then(|v| v.as_str()),
-        val.get("parameters").or_else(|| val.get("args")).or_else(|| val.get("arguments")),
+        val.get("parameters")
+            .or_else(|| val.get("args"))
+            .or_else(|| val.get("arguments")),
     ) {
         if name.is_empty() {
             return None;
@@ -292,14 +314,18 @@ fn is_tool_call_json(val: &Value) -> Option<(String, Value)> {
             let function = first_call.get("function")?;
             let name = function.get("name").and_then(|v| v.as_str())?;
             let args = function.get("arguments").and_then(|v| v.as_str())?;
-            let args_val: Value = serde_json::from_str(args).unwrap_or_else(|_| Value::String(args.to_string()));
+            let args_val: Value =
+                serde_json::from_str(args).unwrap_or_else(|_| Value::String(args.to_string()));
             return Some((name.to_string(), args_val));
         }
     }
 
     if let Some(fc) = val.get("functionCall").or_else(|| val.get("function_call")) {
         let name = fc.get("name").and_then(|v| v.as_str())?;
-        let args = fc.get("args").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+        let args = fc
+            .get("args")
+            .cloned()
+            .unwrap_or(Value::Object(serde_json::Map::new()));
         return Some((name.to_string(), args));
     }
 
@@ -307,7 +333,10 @@ fn is_tool_call_json(val: &Value) -> Option<(String, Value)> {
         for block in content {
             if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
                 let name = block.get("name").and_then(|v| v.as_str())?;
-                let input = block.get("input").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+                let input = block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(Value::Object(serde_json::Map::new()));
                 return Some((name.to_string(), input));
             }
         }
@@ -317,8 +346,15 @@ fn is_tool_call_json(val: &Value) -> Option<(String, Value)> {
         for output in outputs {
             if let Some(tool_calls) = output.get("tool_calls").and_then(|v| v.as_array()) {
                 if let Some(call) = tool_calls.first() {
-                    let name = call.get("name").or_else(|| call.get("function").and_then(|f| f.get("name"))).and_then(|v| v.as_str())?;
-                    let args = call.get("arguments").or_else(|| call.get("input")).cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+                    let name = call
+                        .get("name")
+                        .or_else(|| call.get("function").and_then(|f| f.get("name")))
+                        .and_then(|v| v.as_str())?;
+                    let args = call
+                        .get("arguments")
+                        .or_else(|| call.get("input"))
+                        .cloned()
+                        .unwrap_or(Value::Object(serde_json::Map::new()));
                     return Some((name.to_string(), args));
                 }
             }
@@ -369,7 +405,7 @@ fn is_tool_call_xml(s: &str) -> Option<(String, Value)> {
                     args.insert(key.to_string(), Value::String(clean.to_string()));
                 }
             }
-        };
+        }
 
         if !self_closing {
             let close_tag = format!("</{}>", tag_name);
@@ -383,7 +419,11 @@ fn is_tool_call_xml(s: &str) -> Option<(String, Value)> {
                 let mut inner_args = serde_json::Map::new();
                 for line in inner.lines() {
                     let line = line.trim();
-                    if line.starts_with('<') && line.ends_with('>') && !line.contains("<arguments>") && !line.contains("</arguments>") {
+                    if line.starts_with('<')
+                        && line.ends_with('>')
+                        && !line.contains("<arguments>")
+                        && !line.contains("</arguments>")
+                    {
                         let inner_t = &line[1..line.len() - 1];
                         if let Some(t_end) = inner_t.find('>') {
                             let k = inner_t[..t_end].trim().to_string();
@@ -682,7 +722,10 @@ impl ReActEngine {
     }
 
     /// Execute with plan mode - shows plan first, then executes if approved
-    pub async fn react_with_plan(&mut self, user_input: &str) -> Result<String, ReactError> {
+    pub async fn react_with_plan(
+        &mut self,
+        user_input: &str,
+    ) -> Result<(String, LlmContext), ReactError> {
         match self.plan_mode {
             PlanMode::None => self.react(user_input).await,
             PlanMode::Silent => {
@@ -776,7 +819,7 @@ impl ReActEngine {
             .map_err(|e| ReactError::ToolError(format!("{:?}", e)))
     }
 
-    pub async fn react(&mut self, user_input: &str) -> Result<String, ReactError> {
+    pub async fn react(&mut self, user_input: &str) -> Result<(String, LlmContext), ReactError> {
         let openai_tools: Vec<LlmTool> = self
             .tools
             .tools
@@ -1001,25 +1044,43 @@ impl ReActEngine {
                             }
                         }
                         ParsedIntent::FinalAnswer { text } => {
+                            context
+                                .conversations
+                                .push(LlmMessage::assistant(text.clone()));
                             self.telemetry.emit(&TelemetryEvent::FinalAnswer {
                                 answer: text.clone(),
                             });
-                            return Ok(text);
+                            let mut histroy = context.conversations.clone();
+                            histroy.remove(0);
+                            self.set_input_messages(histroy);
+                            return Ok((text, context));
                         }
                     }
                 }
                 LlmResponse::Done => {
+                    context
+                        .conversations
+                        .push(LlmMessage::assistant(thought.clone()));
                     self.telemetry.emit(&TelemetryEvent::FinalAnswer {
                         answer: thought.clone(),
                     });
-                    return Ok(thought);
+                    let mut histroy = context.conversations.clone();
+                    histroy.remove(0);
+                    self.set_input_messages(histroy);
+                    return Ok((thought, context));
                 }
             }
         }
+        context
+            .conversations
+            .push(LlmMessage::assistant(thought.clone()));
         self.telemetry.emit(&TelemetryEvent::FinalAnswer {
             answer: thought.clone(),
         });
-        Ok(thought)
+        let mut histroy = context.conversations.clone();
+        histroy.remove(0);
+        self.set_input_messages(histroy);
+        Ok((thought, context))
     }
 
     pub async fn react_with_request(
@@ -1052,9 +1113,9 @@ impl ReActEngine {
         request.context.tools = openai_tools;
         request.context.skills = openai_skills;
 
-        if request.context.conversations.is_empty()
-            || !matches!(request.context.conversations[0], LlmMessage::System { .. })
-        {
+        // Only add System message if there's no conversation history at all
+        // Don't add if first message exists (even if not System - it means history was loaded)
+        if request.context.conversations.is_empty() {
             request
                 .context
                 .conversations
@@ -1268,6 +1329,7 @@ impl ReActEngine {
                             self.telemetry.emit(&TelemetryEvent::FinalAnswer {
                                 answer: text.clone(),
                             });
+                            self.input_messages = request.context.conversations.clone();
                             return Ok(text);
                         }
                     }
@@ -1276,6 +1338,7 @@ impl ReActEngine {
                     self.telemetry.emit(&TelemetryEvent::FinalAnswer {
                         answer: thought.clone(),
                     });
+                    self.input_messages = request.context.conversations.clone();
                     return Ok(thought);
                 }
             }
@@ -1283,6 +1346,7 @@ impl ReActEngine {
         self.telemetry.emit(&TelemetryEvent::FinalAnswer {
             answer: thought.clone(),
         });
+        self.input_messages = request.context.conversations.clone();
         Ok(thought)
     }
 

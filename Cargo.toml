@@ -9,7 +9,7 @@ members = [
     "crates/jsbos",
     "crates/qserde",
     "crates/qserde_derive"
-]
+, "examples/aicoder/quick_sort"]
 resolver = "2"
 
 [workspace.dependencies]

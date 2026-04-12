@@ -77,9 +77,9 @@ fn test_builder_pattern() {
         .build()
         .expect("Failed to build engine");
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async { engine.react("2+3").await });
-    assert_eq!(result.unwrap(), "5");
+let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async { engine.react("2+3").await });
+        assert_eq!(result.unwrap().0, "5");
 }
 
 #[test]
@@ -151,12 +151,12 @@ fn test_message_log_input() {
     engine.set_input_messages(vec![
         LlmMessage::user("Previous conversation"),
         LlmMessage::assistant("I remember that"),
-    ]);
+]);
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async { engine.react("New message").await }).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (result, _context) = rt.block_on(async { engine.react("New message").await }).unwrap();
 
-    let convos = received.lock().unwrap();
+        let convos = received.lock().unwrap();
     assert!(!convos.is_empty());
     let first_convo = &convos[0];
     assert!(first_convo.len() >= 3, "Should have system + history + new user");
