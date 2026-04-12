@@ -249,6 +249,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Set circuit breaker configuration to prevent cascading failures.
+    pub fn circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
+        self.config.circuit_breaker = Some(config);
+        self
+    }
+
     /// Set context compaction threshold (approximate tokens).
     pub fn context_compaction_threshold_tokens(mut self, tokens: usize) -> Self {
         self.config.context_compaction_threshold_tokens = tokens;
@@ -308,7 +314,7 @@ impl AgentBuilder {
         }
 
         let resilience = ReActResilience::new(react::ResilienceConfig {
-            circuit_breaker: Default::default(),
+            circuit_breaker: self.config.circuit_breaker.clone().unwrap_or_default(),
             rate_limiter: self.config.rate_limit.clone().unwrap_or_default(),
         });
 
@@ -454,7 +460,7 @@ impl Agent {
     /// Create a new Agent with the given config and LLM client.
     pub fn new(config: AgentConfig, llm: Arc<dyn LlmClient>) -> Self {
         let resilience = ReActResilience::new(react::ResilienceConfig {
-            circuit_breaker: Default::default(),
+            circuit_breaker: config.circuit_breaker.clone().unwrap_or_default(),
             rate_limiter: config.rate_limit.clone().unwrap_or_default(),
         });
         Self {
@@ -556,6 +562,9 @@ impl Agent {
 
     /// Run the agent using ReAct engine.
     pub async fn react(&self, task: &str) -> Result<String, AgentError> {
+        use react::llm::LlmMessage;
+        self.message_log.lock().unwrap().push(LlmMessage::user(task.to_string()));
+        
         let react_llm = Box::new(AgentLlmAdapter::new(self.llm.clone()));
         let mut builder = ReActEngineBuilder::new().llm(react_llm);
 
@@ -698,7 +707,10 @@ impl Agent {
     /// Useful for testing or when ReAct format is not needed.
     /// Supports tools and skills like react() does, but makes a single LLM call.
     pub async fn run_simple(&self, task: &str) -> Result<String, AgentError> {
-        use react::llm::{LlmContext, LlmMessage, LlmRequest};
+        use react::llm::LlmMessage;
+        self.message_log.lock().unwrap().push(LlmMessage::user(task.to_string()));
+        
+        use react::llm::{LlmContext, LlmRequest};
 
         let react_llm = Box::new(AgentLlmAdapter::new(self.llm.clone()));
         let mut builder = ReActEngineBuilder::new().llm(react_llm);
@@ -823,8 +835,7 @@ impl Agent {
 
         engine.set_input_messages(self.message_log.lock().unwrap().clone());
 
-        let mut conversations = self.message_log.lock().unwrap().clone();
-        conversations.push(LlmMessage::user(task.to_string()));
+        let conversations = self.message_log.lock().unwrap().clone();
 
         let context = LlmContext {
             conversations,

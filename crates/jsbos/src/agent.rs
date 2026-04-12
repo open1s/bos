@@ -85,6 +85,13 @@ pub struct AgentConfig {
   pub max_tokens: Option<i32>,
   pub timeout_secs: i64,
   pub max_steps: Option<i64>,
+  pub circuit_breaker_max_failures: Option<i32>,
+  pub circuit_breaker_cooldown_secs: Option<i64>,
+  pub rate_limit_capacity: Option<i32>,
+  pub rate_limit_window_secs: Option<i64>,
+  pub rate_limit_max_retries: Option<i32>,
+  pub rate_limit_retry_backoff_secs: Option<i64>,
+  pub rate_limit_auto_wait: Option<bool>,
   pub context_compaction_threshold_tokens: Option<i32>,
   pub context_compaction_trigger_ratio: Option<f64>,
   pub context_compaction_keep_recent_messages: Option<i32>,
@@ -105,6 +112,13 @@ impl Default for AgentConfig {
       max_tokens: c.max_tokens.map(|v| v as i32),
       timeout_secs: c.timeout_secs as i64,
       max_steps: None,
+      circuit_breaker_max_failures: None,
+      circuit_breaker_cooldown_secs: None,
+      rate_limit_capacity: None,
+      rate_limit_window_secs: None,
+      rate_limit_max_retries: None,
+      rate_limit_retry_backoff_secs: None,
+      rate_limit_auto_wait: None,
       context_compaction_threshold_tokens: None,
       context_compaction_trigger_ratio: None,
       context_compaction_keep_recent_messages: None,
@@ -116,6 +130,36 @@ impl Default for AgentConfig {
 
 impl From<AgentConfig> for agent::AgentConfig {
   fn from(value: AgentConfig) -> Self {
+    let circuit_breaker = if value.circuit_breaker_max_failures.is_some()
+      || value.circuit_breaker_cooldown_secs.is_some()
+    {
+      Some(agent::CircuitBreakerConfig {
+        max_failures: value.circuit_breaker_max_failures.unwrap_or(5) as usize,
+        cooldown: std::time::Duration::from_secs(
+          value.circuit_breaker_cooldown_secs.unwrap_or(30) as u64,
+        ),
+      })
+    } else {
+      None
+    };
+
+    let rate_limit = if value.rate_limit_capacity.is_some()
+      || value.rate_limit_window_secs.is_some()
+      || value.rate_limit_max_retries.is_some()
+    {
+      Some(agent::RateLimiterConfig {
+        capacity: value.rate_limit_capacity.unwrap_or(40) as u32,
+        window: std::time::Duration::from_secs(value.rate_limit_window_secs.unwrap_or(60) as u64),
+        max_retries: value.rate_limit_max_retries.unwrap_or(3) as u32,
+        retry_backoff: std::time::Duration::from_secs(
+          value.rate_limit_retry_backoff_secs.unwrap_or(1) as u64,
+        ),
+        auto_wait: value.rate_limit_auto_wait.unwrap_or(true),
+      })
+    } else {
+      None
+    };
+
     Self {
       name: value.name,
       model: value.model,
@@ -126,8 +170,8 @@ impl From<AgentConfig> for agent::AgentConfig {
       max_tokens: value.max_tokens.map(|v| v as u32),
       timeout_secs: value.timeout_secs as u64,
       max_steps: value.max_steps.unwrap_or(10) as usize,
-      circuit_breaker: None,
-      rate_limit: None,
+      circuit_breaker,
+      rate_limit,
       context_compaction_threshold_tokens: value.context_compaction_threshold_tokens.unwrap_or(0)
         as usize,
       context_compaction_trigger_ratio: value.context_compaction_trigger_ratio.unwrap_or(0.0)

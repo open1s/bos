@@ -424,6 +424,47 @@ Agent(bus, name="assistant", model=..., base_url=..., api_key=..., system_prompt
 | `react(task)` | Run with ReAct | `str` | 
 | `stream(task)` | Stream response | `AsyncIterator` |
 
+### Resilience Configuration
+
+The Agent supports configuring circuit breaker and rate limiter for resilience:
+
+```python
+# Using pybos directly for full config options
+from pybos import Agent, AgentConfig
+
+cfg = AgentConfig(
+    name="assistant",
+    model="gpt-4",
+    api_key="sk-...",
+    # Circuit Breaker - prevents cascading failures
+    circuit_breaker_max_failures=5,      # failures before opening circuit
+    circuit_breaker_cooldown_secs=30,    # seconds before attempting recovery
+    
+    # Rate Limiter - prevents 429 errors
+    rate_limit_capacity=40,              # max requests per window
+    rate_limit_window_secs=60,            # window duration in seconds
+    rate_limit_max_retries=3,             # retry attempts on rate limit
+    rate_limit_retry_backoff_secs=1,      # backoff between retries
+    rate_limit_auto_wait=True,            # auto-wait when rate limited
+)
+agent = Agent.from_config(cfg)
+```
+
+**Circuit Breaker Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `circuit_breaker_max_failures` | 5 | Failures before opening circuit |
+| `circuit_breaker_cooldown_secs` | 30 | Seconds before half-open state |
+
+**Rate Limiter Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `rate_limit_capacity` | 40 | Max requests per window |
+| `rate_limit_window_secs` | 60 | Window duration in seconds |
+| `rate_limit_max_retries` | 3 | Retry attempts on 429 errors |
+| `rate_limit_retry_backoff_secs` | 1 | Initial backoff duration |
+| `rate_limit_auto_wait` | true | Auto-wait when rate limited |
+
 **Properties:**
 | Property | Type | Description |
 |-----------|------|-------------|

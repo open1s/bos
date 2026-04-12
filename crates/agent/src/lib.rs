@@ -26,6 +26,7 @@ pub use mcp::{
 };
 pub use react::llm::vendor::OpenAiVendor;
 pub use react::llm::{LlmClient, LlmMessage, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
+pub use react::{CircuitBreakerConfig, RateLimiterConfig};
 pub use security::{SecurityError, WorkspaceValidator};
 pub use session::manager::SessionManager;
 pub use session::serializer::SessionSerializer;

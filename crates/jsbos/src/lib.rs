@@ -31,3 +31,8 @@ pub fn version() -> String {
 pub fn init_tracing() {
   logging::auto_init_tracing();
 }
+
+#[napi]
+pub fn log_test_message(message: String) {
+  logging::log_test_message(&message);
+}

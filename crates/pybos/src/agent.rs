@@ -1,8 +1,8 @@
 use crate::bus::PyBus;
 use crate::utils::{invoke_python_handler_to_pyany, json_to_py, to_py_runtime_error};
 use agent::{
-    Agent, AgentCallableServer, AgentConfig, AgentRpcClient, LlmMessage, StreamToken, Tool,
-    ToolDescription,
+    Agent, AgentCallableServer, AgentConfig, AgentRpcClient, CircuitBreakerConfig, LlmMessage,
+    RateLimiterConfig, StreamToken, Tool, ToolDescription,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -348,6 +348,20 @@ pub struct PyAgentConfig {
     #[pyo3(get, set)]
     pub max_steps: usize,
     #[pyo3(get, set)]
+    pub circuit_breaker_max_failures: Option<usize>,
+    #[pyo3(get, set)]
+    pub circuit_breaker_cooldown_secs: Option<u64>,
+    #[pyo3(get, set)]
+    pub rate_limit_capacity: Option<u32>,
+    #[pyo3(get, set)]
+    pub rate_limit_window_secs: Option<u64>,
+    #[pyo3(get, set)]
+    pub rate_limit_max_retries: Option<u32>,
+    #[pyo3(get, set)]
+    pub rate_limit_retry_backoff_secs: Option<u64>,
+    #[pyo3(get, set)]
+    pub rate_limit_auto_wait: Option<bool>,
+    #[pyo3(get, set)]
     pub context_compaction_threshold_tokens: usize,
     #[pyo3(get, set)]
     pub context_compaction_trigger_ratio: f32,
@@ -372,6 +386,13 @@ impl Default for PyAgentConfig {
             max_tokens: c.max_tokens,
             timeout_secs: c.timeout_secs,
             max_steps: 10,
+            circuit_breaker_max_failures: None,
+            circuit_breaker_cooldown_secs: None,
+            rate_limit_capacity: None,
+            rate_limit_window_secs: None,
+            rate_limit_max_retries: None,
+            rate_limit_retry_backoff_secs: None,
+            rate_limit_auto_wait: None,
             context_compaction_threshold_tokens: c.context_compaction_threshold_tokens,
             context_compaction_trigger_ratio: c.context_compaction_trigger_ratio,
             context_compaction_keep_recent_messages: c.context_compaction_keep_recent_messages,
@@ -383,6 +404,36 @@ impl Default for PyAgentConfig {
 
 impl From<PyAgentConfig> for AgentConfig {
     fn from(value: PyAgentConfig) -> Self {
+        let circuit_breaker = if value.circuit_breaker_max_failures.is_some()
+            || value.circuit_breaker_cooldown_secs.is_some()
+        {
+            Some(CircuitBreakerConfig {
+                max_failures: value.circuit_breaker_max_failures.unwrap_or(5),
+                cooldown: std::time::Duration::from_secs(
+                    value.circuit_breaker_cooldown_secs.unwrap_or(30),
+                ),
+            })
+        } else {
+            None
+        };
+
+        let rate_limit = if value.rate_limit_capacity.is_some()
+            || value.rate_limit_window_secs.is_some()
+            || value.rate_limit_max_retries.is_some()
+        {
+            Some(RateLimiterConfig {
+                capacity: value.rate_limit_capacity.unwrap_or(40),
+                window: std::time::Duration::from_secs(value.rate_limit_window_secs.unwrap_or(60)),
+                max_retries: value.rate_limit_max_retries.unwrap_or(3),
+                retry_backoff: std::time::Duration::from_secs(
+                    value.rate_limit_retry_backoff_secs.unwrap_or(1),
+                ),
+                auto_wait: value.rate_limit_auto_wait.unwrap_or(true),
+            })
+        } else {
+            None
+        };
+
         Self {
             name: value.name,
             model: value.model,
@@ -393,8 +444,8 @@ impl From<PyAgentConfig> for AgentConfig {
             max_tokens: value.max_tokens,
             timeout_secs: value.timeout_secs,
             max_steps: value.max_steps,
-            circuit_breaker: None,
-            rate_limit: None,
+            circuit_breaker,
+            rate_limit,
             context_compaction_threshold_tokens: value.context_compaction_threshold_tokens,
             context_compaction_trigger_ratio: value.context_compaction_trigger_ratio,
             context_compaction_keep_recent_messages: value.context_compaction_keep_recent_messages,
@@ -579,7 +630,7 @@ impl PyAgentCallableServer {
     // The server starts listening for requests immediately
 }
 
-#[pyclass(name = "Agent", frozen, unsendable, subclass, skip_from_py_object)]
+#[pyclass(name = "Agent", frozen, subclass, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyAgent {
     pub inner: std::sync::Arc<Mutex<Agent>>,

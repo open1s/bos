@@ -27,6 +27,8 @@ const {
   Subscriber,
   McpClient,
   version: getVersion,
+  initTracing,
+  logTestMessage,
 } = require('./index.js');
 
 class ToolDef {
@@ -443,4 +445,6 @@ module.exports = {
   Callable: CallableServer,
   McpClient,
   version: getVersion,
+  initTracing,
+  logTestMessage,
 };

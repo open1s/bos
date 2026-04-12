@@ -138,6 +138,13 @@ export interface AgentConfig {
   maxTokens?: number
   timeoutSecs: number
   maxSteps?: number
+  circuitBreakerMaxFailures?: number
+  circuitBreakerCooldownSecs?: number
+  rateLimitCapacity?: number
+  rateLimitWindowSecs?: number
+  rateLimitMaxRetries?: number
+  rateLimitRetryBackoffSecs?: number
+  rateLimitAutoWait?: boolean
   contextCompactionThresholdTokens?: number
   contextCompactionTriggerRatio?: number
   contextCompactionKeepRecentMessages?: number
@@ -153,5 +160,7 @@ export interface BusConfig {
 }
 
 export declare function initTracing(): void
+
+export declare function logTestMessage(message: string): void
 
 export declare function version(): string

@@ -541,6 +541,45 @@ new Agent(bus, options = {})
 | `runSimple(message)` | Simple run | `Promise<string>` |
 | `react(task)` | Run with ReAct | `Promise<string>` |
 
+### Resilience Configuration
+
+The Agent supports configuring circuit breaker and rate limiter for resilience:
+
+```javascript
+const { Agent } = require('brainos');
+
+const agent = await Agent.create({
+  name: "assistant",
+  model: "gpt-4",
+  apiKey: "sk-...",
+  // Circuit Breaker - prevents cascading failures
+  circuitBreakerMaxFailures: 5,      // failures before opening circuit
+  circuitBreakerCooldownSecs: 30,    // seconds before attempting recovery
+  
+  // Rate Limiter - prevents 429 errors
+  rateLimitCapacity: 40,              // max requests per window
+  rateLimitWindowSecs: 60,            // window duration in seconds
+  rateLimitMaxRetries: 3,             // retry attempts on rate limit
+  rateLimitRetryBackoffSecs: 1,       // backoff between retries
+  rateLimitAutoWait: true,            // auto-wait when rate limited
+});
+```
+
+**Circuit Breaker Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `circuitBreakerMaxFailures` | 5 | Failures before opening circuit |
+| `circuitBreakerCooldownSecs` | 30 | Seconds before half-open state |
+
+**Rate Limiter Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `rateLimitCapacity` | 40 | Max requests per window |
+| `rateLimitWindowSecs` | 60 | Window duration in seconds |
+| `rateLimitMaxRetries` | 3 | Retry attempts on 429 errors |
+| `rateLimitRetryBackoffSecs` | 1 | Initial backoff duration |
+| `rateLimitAutoWait` | true | Auto-wait when rate limited |
+
 **Properties:**
 | Property | Type | Description |
 |-----------|------|-------------|

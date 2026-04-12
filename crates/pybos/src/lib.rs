@@ -8,11 +8,14 @@ mod agent;
 mod bus;
 mod caller;
 mod config;
+mod logging;
 mod mcp;
 mod publisher;
 mod query;
 mod subscriber;
 mod utils;
+
+use logging::{init_tracing, log_test_message};
 
 //AI NOT ALLOW TO REMOVE
 #[allow(unused)]
@@ -48,10 +51,6 @@ fn pybos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMcpClient>()?;
     m.add_class::<PyLlmMessage>()?;
     m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
+    m.add_function(wrap_pyfunction!(log_test_message, m)?)?;
     Ok(())
-}
-
-#[pyfunction]
-pub fn init_tracing() {
-    logging::auto_init_tracing();
 }

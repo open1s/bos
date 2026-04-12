@@ -1,6 +1,8 @@
 use flexi_logger::{Cleanup, Criterion, DeferredNow, FileSpec, Logger, Naming};
 use log::Record;
-use std::{io::Write, path::Path};
+use std::{io::Write, path::Path, sync::Mutex};
+
+static LOGGER_HANDLE: Mutex<Option<flexi_logger::LoggerHandle>> = Mutex::new(None);
 
 pub fn short_format(
     w: &mut dyn Write,
@@ -9,7 +11,6 @@ pub fn short_format(
 ) -> std::io::Result<()> {
     let file = record.file().unwrap_or("unknown");
 
-    // 👇 核心：只取文件名
     let short_file = Path::new(file)
         .file_name()
         .and_then(|f| f.to_str())
@@ -45,7 +46,6 @@ fn pretty_stdout(w: &mut dyn Write, now: &mut DeferredNow, record: &Record) -> s
 }
 
 fn pretty_msg(msg: &str) -> String {
-    // 👉 如果是 JSON，直接美化
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(msg) {
         return format!(
             "{}\n{}",
@@ -53,25 +53,22 @@ fn pretty_msg(msg: &str) -> String {
             serde_json::to_string_pretty(&json).unwrap()
         );
     }
-
-    // 👉 Agent log 特化（你的场景）
-    // if msg.contains("LlmRequest") {
-    //     return msg
-    //         .replace("messages:", "\n📨 messages:\n")
-    //         .replace("System", "\n  🧠 System")
-    //         .replace("User", "\n  👤 User")
-    //         .replace("AssistantToolCall", "\n  🔧 ToolCall")
-    //         .replace("ToolResult", "\n  ✅ ToolResult");
-    // }
-
     msg.to_string()
 }
 
 pub fn auto_init_tracing() {
-    let logdir = dirs::home_dir().unwrap().join(".bos/log");
-    let file_spec = FileSpec::default().directory(logdir).basename("bos");
-    let level = std::env::var("BOS_LOG");
+   let logdir = match dirs::home_dir() {
+        Some(d) => d.join(".bos/log"),
+        None => {
+            return;
+        }
+    };
 
+    if let Err(_) = std::fs::create_dir_all(&logdir) {
+        return;
+    }
+
+    let level = std::env::var("BOS_LOG");
     let level = level.unwrap_or_else(|_| {
         let mut loader = config::loader::ConfigLoader::new().discover();
         match loader.load_sync() {
@@ -85,19 +82,14 @@ pub fn auto_init_tracing() {
         }
     });
 
-    let level = level.to_lowercase();
-
     let valid_levels = ["error", "warn", "info", "debug", "trace"];
     let level = if valid_levels.contains(&level.as_str()) {
         level
     } else {
-        "error".to_string()
+        "info".to_string()
     };
 
-    let level = format!(
-        "bus={level},agent={level},react={level},pybos={level},zenoh=off,h2=off,rustls=off"
-    );
-
+    let file_spec = FileSpec::default().directory(logdir).basename("bos");
     let logger = Logger::try_with_str(level)
         .unwrap()
         .log_to_file(file_spec)
@@ -111,10 +103,23 @@ pub fn auto_init_tracing() {
         )
         .duplicate_to_stdout(flexi_logger::Duplicate::All) // 同步输出到控制台
         .format_for_files(short_format) // 文件日志详细
-        // .format_for_stdout(flexi_logger::colored_detailed_format)
-        .format_for_stdout(pretty_stdout)
-        .start()
-        .unwrap();
+        .format_for_stdout(pretty_stdout);
+
+
+    match logger.start() {
+        Ok(handle) => {
+            if let Ok(mut guard) = LOGGER_HANDLE.lock() {
+                *guard = Some(handle);
+            }
+        }
+        Err(e) => {
+            eprintln!("logging: failed to init logger: {}", e);
+        }
+    }
+}
+
+pub fn log_test_message(message: &str) {
+    log::info!("[TEST] {}", message);
 }
 
 #[cfg(test)]
@@ -141,5 +146,34 @@ mod tests {
             "unexpected log level: {}",
             level
         );
+    }
+
+    #[test]
+    fn test_auto_init_tracing_creates_log_file() {
+        use crate::{auto_init_tracing, log_test_message};
+
+        auto_init_tracing();
+
+        log::info!("DIRECT LOG TEST");
+        log_test_message("test message from rust test");
+
+        let logdir = dirs::home_dir().unwrap().join(".bos/log");
+        println!("Log directory: {:?}", logdir);
+
+        if let Ok(entries) = std::fs::read_dir(&logdir) {
+            let files: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            println!("Found {} files in log dir", files.len());
+            for entry in &files {
+                println!("  - {:?}", entry.path());
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    println!(
+                        "    Content: {}",
+                        content.lines().take(3).collect::<Vec<_>>().join("\n    ")
+                    );
+                }
+            }
+        } else {
+            println!("Could not read log directory");
+        }
     }
 }

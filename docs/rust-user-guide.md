@@ -415,6 +415,46 @@ Agent configuration.
 | `timeout(duration)` | Set timeout |
 | `base_url(url)` | Set base URL |
 | `api_key(key)` | Set API key |
+| `rate_limit(config)` | Set rate limiter config |
+| `circuit_breaker(config)` | Set circuit breaker config |
+
+**Resilience Configuration:**
+
+```rust
+use agent::{Agent, AgentConfig};
+use react::{CircuitBreakerConfig, RateLimiterConfig};
+use std::time::Duration;
+
+let config = AgentConfig::default()
+    .name("assistant")
+    .model("gpt-4")
+    .circuit_breaker(CircuitBreakerConfig {
+        max_failures: 5,
+        cooldown: Duration::from_secs(30),
+    })
+    .rate_limit(RateLimiterConfig {
+        capacity: 40,
+        window: Duration::from_secs(60),
+        max_retries: 3,
+        retry_backoff: Duration::from_secs(1),
+        auto_wait: true,
+    });
+```
+
+**Circuit Breaker Options:**
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_failures` | 5 | Failures before opening circuit |
+| `cooldown` | 30s | Seconds before half-open state |
+
+**Rate Limiter Options:**
+| Field | Default | Description |
+|-------|---------|-------------|
+| `capacity` | 40 | Max requests per window |
+| `window` | 60s | Window duration |
+| `max_retries` | 3 | Retry attempts on 429 errors |
+| `retry_backoff` | 1s | Initial backoff duration |
+| `auto_wait` | true | Auto-wait when rate limited |
 
 ### `ToolRegistry`
 
