@@ -126,6 +126,7 @@ impl From<AgentConfig> for agent::AgentConfig {
       max_tokens: value.max_tokens.map(|v| v as u32),
       timeout_secs: value.timeout_secs as u64,
       max_steps: value.max_steps.unwrap_or(10) as usize,
+      circuit_breaker: None,
       rate_limit: None,
       context_compaction_threshold_tokens: value.context_compaction_threshold_tokens.unwrap_or(0)
         as usize,

@@ -393,6 +393,7 @@ impl From<PyAgentConfig> for AgentConfig {
             max_tokens: value.max_tokens,
             timeout_secs: value.timeout_secs,
             max_steps: value.max_steps,
+            circuit_breaker: None,
             rate_limit: None,
             context_compaction_threshold_tokens: value.context_compaction_threshold_tokens,
             context_compaction_trigger_ratio: value.context_compaction_trigger_ratio,

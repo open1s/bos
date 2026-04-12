@@ -101,6 +101,7 @@ impl From<TomlAgentConfig> for AgentConfig {
             max_tokens: t.max_tokens,
             timeout_secs: t.timeout_secs,
             max_steps: t.max_steps.unwrap_or(10),
+            circuit_breaker: None,
             rate_limit: None,
             context_compaction_threshold_tokens: t.context_compaction_threshold_tokens,
             context_compaction_trigger_ratio: t.context_compaction_trigger_ratio,

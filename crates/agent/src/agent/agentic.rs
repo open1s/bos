@@ -14,7 +14,7 @@ use react::llm::{
     TokenStream as ReactTokenStream,
 };
 use react::tool::{Tool as ReactToolTrait, ToolError as ReactToolError};
-use react::{RateLimiterConfig, ReActResilience};
+use react::{CircuitBreakerConfig, RateLimiterConfig, ReActResilience};
 
 // ============================================================================
 // ReAct Adapters - Bridge between Agent and React crate
@@ -140,6 +140,9 @@ pub struct AgentConfig {
     pub max_tokens: Option<u32>,
     pub timeout_secs: u64,
     pub max_steps: usize,
+    /// Circuit breaker configuration for resilience
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+    /// Rate limiter configuration for resilience
     pub rate_limit: Option<RateLimiterConfig>,
     pub context_compaction_threshold_tokens: usize,
     pub context_compaction_trigger_ratio: f32,
@@ -160,6 +163,7 @@ impl Default for AgentConfig {
             max_tokens: None,
             timeout_secs: 60,
             max_steps: 10,
+            circuit_breaker: None,
             rate_limit: None,
             context_compaction_threshold_tokens: 24_000,
             context_compaction_trigger_ratio: 0.85,
