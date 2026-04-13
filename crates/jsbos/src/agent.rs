@@ -42,7 +42,7 @@ impl agent::Tool for JSTool {
 
     callback.call_with_return_value(
       Ok(JSAny(args_json)),
-      ThreadsafeFunctionCallMode::Blocking,
+      ThreadsafeFunctionCallMode::NonBlocking,
       move |result: std::result::Result<napi::Unknown<'_>, napi::Error>,
             _env|
             -> napi::Result<()> {
