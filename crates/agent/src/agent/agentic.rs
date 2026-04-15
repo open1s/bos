@@ -1,3 +1,4 @@
+use crate::agent::hooks::{HookContext, HookDecision, HookEvent, HookRegistry};
 use crate::tools::FunctionTool;
 use crate::{AgentError, LlmClient, LlmResponse, StreamToken, Tool, ToolRegistry};
 use async_trait::async_trait;
@@ -47,6 +48,93 @@ impl ReactToolTrait for ReactToolAdapter {
     fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ReactToolError> {
         let result =
             tokio::task::block_in_place(|| futures::executor::block_on(self.inner.execute(input)));
+        result.map_err(|e| ReactToolError::Failed(e.to_string()))
+    }
+
+    fn is_skill(&self) -> bool {
+        self.inner.is_skill()
+    }
+}
+
+// ============================================================================
+// HookedToolAdapter - Wraps a tool with hook support for ReAct engine
+// ============================================================================
+
+struct HookedToolAdapter {
+    inner: Arc<dyn Tool + Send + Sync>,
+    hooks: HookRegistry,
+    agent_id: String,
+}
+
+impl HookedToolAdapter {
+    fn new(inner: Arc<dyn Tool + Send + Sync>, hooks: HookRegistry, agent_id: String) -> Self {
+        Self { inner, hooks, agent_id }
+    }
+}
+
+impl ReactToolTrait for HookedToolAdapter {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> String {
+        self.inner.description().short
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        self.inner.json_schema()
+    }
+
+    fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ReactToolError> {
+        // Use block_in_place + block_on for sync compatibility with react's sync Tool trait
+        let hooks = self.hooks.clone();
+        let agent_id = self.agent_id.clone();
+        let tool_name = self.inner.name().to_string();
+        let tool_args = input.to_string();
+
+        // Trigger BeforeToolCall hook (sync block)
+        let before_ctx = async {
+            let mut ctx = HookContext::new(&agent_id);
+            ctx.set("tool_name", &tool_name);
+            ctx.set("tool_args", &tool_args);
+            hooks.trigger(HookEvent::BeforeToolCall, ctx).await
+        };
+        let decision = tokio::task::block_in_place(|| futures::executor::block_on(before_ctx));
+
+        match decision {
+            HookDecision::Error(msg) => {
+                return Err(ReactToolError::Failed(format!("BeforeToolCall hook error: {}", msg)));
+            }
+            HookDecision::Abort => {
+                return Err(ReactToolError::Failed("Tool call aborted by hook".to_string()));
+            }
+            HookDecision::Continue => {}
+        }
+
+        // Execute the tool
+        let result = tokio::task::block_in_place(|| futures::executor::block_on(self.inner.execute(input)));
+
+        // Trigger AfterToolCall hook (sync block)
+        let after_ctx = async {
+            let mut ctx = HookContext::new(&agent_id);
+            ctx.set("tool_name", &tool_name);
+            ctx.set("tool_args", &tool_args);
+            match &result {
+                Ok(v) => ctx.set("tool_result", &v.to_string()),
+                Err(e) => ctx.set("error", &e.to_string()),
+            }
+            hooks.trigger(HookEvent::AfterToolCall, ctx).await
+        };
+        let decision = tokio::task::block_in_place(|| futures::executor::block_on(after_ctx));
+
+        match decision {
+            HookDecision::Error(msg) => log::warn!("AfterToolCall hook error: {}", msg),
+            HookDecision::Abort => {
+                return Err(ReactToolError::Failed("Tool call aborted by after hook".to_string()));
+            }
+            HookDecision::Continue => {}
+        }
+
         result.map_err(|e| ReactToolError::Failed(e.to_string()))
     }
 
@@ -185,6 +273,7 @@ pub struct AgentBuilder {
     config: AgentConfig,
     tools: Vec<Arc<dyn Tool>>,
     skills_dir: Option<std::path::PathBuf>,
+    hooks: Option<HookRegistry>,
 }
 
 impl AgentBuilder {
@@ -193,6 +282,7 @@ impl AgentBuilder {
             config: AgentConfig::default(),
             tools: Vec::new(),
             skills_dir: None,
+            hooks: None,
         }
     }
 
@@ -295,7 +385,7 @@ impl AgentBuilder {
     /// Add multiple tools from an iterable.
     pub fn tools<T>(mut self, tools: T) -> Self
     where
-        T: IntoIterator<Item = Arc<dyn Tool>>,
+        T: IntoIterator<Item=Arc<dyn Tool>>,
     {
         self.tools.extend(tools);
         self
@@ -304,6 +394,12 @@ impl AgentBuilder {
     /// Set skills directory.
     pub fn skills_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.skills_dir = Some(dir);
+        self
+    }
+
+    /// Set hooks registry.
+    pub fn with_hooks(mut self, hooks: HookRegistry) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 
@@ -327,6 +423,10 @@ impl AgentBuilder {
             resilience,
             ..Agent::default_internal()
         };
+
+        if let Some(hooks) = self.hooks {
+            agent.hooks = hooks;
+        }
 
         if let Some(ref dir) = agent.skills_dir {
             agent.register_skills_from_dir(dir.clone())?;
@@ -455,6 +555,9 @@ pub struct Agent {
     /// Message log for conversation history - not serializable
     #[rkyv(with = qserde::rkyv::with::Skip)]
     message_log: Arc<std::sync::Mutex<Vec<react::llm::LlmMessage>>>,
+    /// Hook registry for extensibility
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    hooks: HookRegistry,
 }
 
 impl Agent {
@@ -472,6 +575,7 @@ impl Agent {
             skills: Vec::new(),
             resilience,
             message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            hooks: HookRegistry::new(),
         }
     }
 
@@ -494,6 +598,7 @@ impl Agent {
             skills: Vec::new(),
             resilience: ReActResilience::new(Default::default()),
             message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            hooks: HookRegistry::new(),
         }
     }
 
@@ -505,6 +610,11 @@ impl Agent {
     /// Get tool registry.
     pub fn registry(&self) -> Option<&Arc<ToolRegistry>> {
         self.registry.as_ref()
+    }
+
+    /// Get hooks registry for external registration.
+    pub fn hooks(&self) -> &HookRegistry {
+        &self.hooks
     }
 
     pub fn add_message(&mut self, message: react::llm::LlmMessage) {
@@ -568,7 +678,11 @@ impl Agent {
 
         if let Some(ref registry) = self.registry {
             for (_name, tool) in registry.iter() {
-                let tool_adapter = Box::new(ReactToolAdapter::new(tool.clone()));
+                let tool_adapter = Box::new(HookedToolAdapter::new(
+                    tool.clone(),
+                    self.hooks.clone(),
+                    self.config.name.clone(),
+                ));
                 builder = builder.with_tool(tool_adapter);
             }
         }
@@ -604,7 +718,11 @@ impl Agent {
                         }))
                     },
                 ));
-                builder = builder.with_tool(Box::new(ReactToolAdapter::new(skill_tool)));
+                builder = builder.with_tool(Box::new(HookedToolAdapter::new(
+                    skill_tool,
+                    self.hooks.clone(),
+                    self.config.name.clone(),
+                )));
             }
 
             // Also register load_skill for compatibility
@@ -643,7 +761,11 @@ impl Agent {
                     }
                 },
             ));
-            builder = builder.with_tool(Box::new(ReactToolAdapter::new(load_skill_tool)));
+            builder = builder.with_tool(Box::new(HookedToolAdapter::new(
+                load_skill_tool,
+                self.hooks.clone(),
+                self.config.name.clone(),
+            )));
         }
 
         // Build system prompt with skill context
@@ -660,18 +782,46 @@ impl Agent {
             .build()
             .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))?;
 
+        let mut ctx = HookContext::new(&self.config.name);
+        ctx.set("task", task);
+        let decision = self.hooks.trigger(HookEvent::BeforeLlmCall, ctx).await;
+        match decision {
+            HookDecision::Error(msg) => return Err(AgentError::Session(format!("BeforeLlmCall hook error: {}", msg))),
+            HookDecision::Abort => return Ok(String::new()),
+            HookDecision::Continue => {}
+        }
+
         engine.set_input_messages(self.message_log.lock().unwrap().clone());
-        let (result, context) = engine
-            .react(task)
-            .await
-            .map_err(|e| AgentError::Session(format!("ReAct run error: {}", e)))?;
+        let result = engine.react(task).await;
 
-        let mut log = context.conversations.clone();
-        log.remove(0); //remove system log
+        match result {
+            Ok((result, context)) => {
+                let mut ctx = HookContext::new(&self.config.name);
+                ctx.set("result", &result);
+                let decision = self.hooks.trigger(HookEvent::AfterLlmCall, ctx).await;
+                match decision {
+                    HookDecision::Error(msg) => log::warn!("AfterLlmCall hook error: {}", msg),
+                    HookDecision::Abort => return Ok(String::new()),
+                    HookDecision::Continue => {}
+                }
 
-        *self.message_log.lock().unwrap() = log;
-
-        Ok(result)
+                let mut log = context.conversations.clone();
+                log.remove(0);
+                *self.message_log.lock().unwrap() = log;
+                Ok(result)
+            }
+            Err(e) => {
+                let mut ctx = HookContext::new(&self.config.name);
+                ctx.set("error", &e.to_string());
+                let decision = self.hooks.trigger(HookEvent::OnError, ctx).await;
+                match decision {
+                    HookDecision::Error(msg) => log::warn!("OnError hook error: {}", msg),
+                    HookDecision::Abort => return Ok(String::new()),
+                    HookDecision::Continue => {}
+                }
+                Err(AgentError::Session(format!("ReAct run error: {}", e)))
+            }
+        }
     }
 
     /// Run the agent using simple loop (no ReAct).
@@ -686,7 +836,11 @@ impl Agent {
 
         if let Some(ref registry) = self.registry {
             for (_name, tool) in registry.iter() {
-                let tool_adapter = Box::new(ReactToolAdapter::new(tool.clone()));
+                let tool_adapter = Box::new(HookedToolAdapter::new(
+                    tool.clone(),
+                    self.hooks.clone(),
+                    self.config.name.clone(),
+                ));
                 builder = builder.with_tool(tool_adapter);
             }
         }
@@ -789,10 +943,49 @@ impl Agent {
             ..Default::default()
         };
 
-        let response = engine
-            .call_llm(req)
-            .await
-            .map_err(|e| AgentError::Session(format!("LLM call failed: {}", e)))?;
+        // Emit BeforeLlmCall hook
+        let mut hook_ctx = HookContext::new(&self.config.name);
+        hook_ctx.set("model", &self.config.model);
+        hook_ctx.set("task", task);
+        let decision = self.hooks.trigger(HookEvent::BeforeLlmCall, hook_ctx).await;
+        match decision {
+            HookDecision::Error(msg) => return Err(AgentError::Session(format!("BeforeLlmCall hook error: {}", msg))),
+            HookDecision::Abort => return Ok(String::new()),
+            HookDecision::Continue => {}
+        }
+
+        let response = engine.call_llm(req).await;
+
+        if let Err(e) = &response {
+            let mut ctx = HookContext::new(&self.config.name);
+            ctx.set("error", "LLM call failed");
+            let decision = self.hooks.trigger(HookEvent::OnError, ctx).await;
+            match decision {
+                HookDecision::Error(msg) => log::warn!("OnError hook error: {}", msg),
+                HookDecision::Abort => return Ok(String::new()),
+                HookDecision::Continue => {}
+            }
+            return Err(AgentError::Session(format!("LLM call failed: {}", e)));
+        }
+
+        let response = response.unwrap();
+
+        // Emit AfterLlmCall hook
+        let mut hook_ctx = HookContext::new(&self.config.name);
+        hook_ctx.set("model", &self.config.model);
+        let response_type = match response {
+            react::llm::LlmResponse::Text(_) => "text",
+            react::llm::LlmResponse::Partial(_) => "partial",
+            react::llm::LlmResponse::Done => "done",
+            react::llm::LlmResponse::ToolCall { .. } => "tool_call",
+        };
+        hook_ctx.set("response_type", response_type);
+        let decision = self.hooks.trigger(HookEvent::AfterLlmCall, hook_ctx).await;
+        match decision {
+            HookDecision::Error(msg) => log::warn!("AfterLlmCall hook error: {}", msg),
+            HookDecision::Abort => return Ok(String::new()),
+            HookDecision::Continue => {}
+        }
 
         let mut loaded_skills: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -815,6 +1008,19 @@ impl Agent {
                 let call_id =
                     id.unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
 
+                let mut ctx = HookContext::new(&self.config.name);
+                ctx.set("tool_name", &name);
+                ctx.set("tool_args", &args.to_string());
+                match self.hooks.trigger(HookEvent::BeforeToolCall, ctx).await {
+                    HookDecision::Error(msg) => {
+                        return Ok(format!("Tool blocked by hook: {}", msg));
+                    }
+                    HookDecision::Abort => {
+                        return Ok("Tool aborted by hook".to_string());
+                    }
+                    HookDecision::Continue => {}
+                }
+
                 let result = if name == "load_skill" {
                     let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     if let Some(cached) = loaded_skills.get(skill_name) {
@@ -832,6 +1038,15 @@ impl Agent {
 
                 let result_text = match &result {
                     Ok(ret) => {
+                        let mut ctx = HookContext::new(&self.config.name);
+                        ctx.set("tool_name", &name);
+                        ctx.set("tool_result", "success");
+                        let decision = self.hooks.trigger(HookEvent::AfterToolCall, ctx).await;
+                        match decision {
+                            HookDecision::Error(msg) => log::warn!("AfterToolCall hook error: {}", msg),
+                            HookDecision::Abort => return Ok(String::new()),
+                            HookDecision::Continue => {}
+                        }
                         if name == "load_skill" {
                             let skill_name =
                                 args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -870,7 +1085,7 @@ impl Agent {
     pub fn stream(
         &self,
         task: &str,
-    ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item=Result<StreamToken, AgentError>> + Send + '_>> {
         use futures::stream::StreamExt;
         use react::llm::{LlmContext, LlmMessage, LlmRequest};
 
@@ -879,7 +1094,11 @@ impl Agent {
 
         if let Some(ref registry) = self.registry {
             for (_name, tool) in registry.iter() {
-                let tool_adapter = Box::new(ReactToolAdapter::new(tool.clone()));
+                let tool_adapter = Box::new(HookedToolAdapter::new(
+                    tool.clone(),
+                    self.hooks.clone(),
+                    self.config.name.clone(),
+                ));
                 builder = builder.with_tool(tool_adapter);
             }
         }
@@ -912,7 +1131,11 @@ impl Agent {
                         }))
                     },
                 ));
-                builder = builder.with_tool(Box::new(ReactToolAdapter::new(skill_tool)));
+                builder = builder.with_tool(Box::new(HookedToolAdapter::new(
+                    skill_tool,
+                    self.hooks.clone(),
+                    self.config.name.clone(),
+                )));
             }
 
             let load_skill_tool = Arc::new(FunctionTool::new(
@@ -993,6 +1216,20 @@ impl Agent {
                 ..Default::default()
             };
 
+            let mut ctx = HookContext::new(&self.config.name);
+            ctx.set("model", &self.config.model);
+            let decision = self.hooks.trigger(HookEvent::BeforeLlmCall, ctx).await;
+            match decision {
+                HookDecision::Error(msg) => {
+                    yield Err(AgentError::Session(format!("BeforeLlmCall hook error: {}", msg)));
+                    return;
+                }
+                HookDecision::Abort => {
+                    return;
+                }
+                HookDecision::Continue => {}
+            }
+
             let llm_stream = match engine.call_llm_stream(req).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -1018,6 +1255,23 @@ impl Agent {
 
                         let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
 
+                        let mut ctx = HookContext::new(&self.config.name);
+                        ctx.set("tool_name", &name);
+                        ctx.set("tool_args", &args.to_string());
+                        match self.hooks.trigger(HookEvent::BeforeToolCall, ctx).await {
+                            HookDecision::Error(msg) => {
+                                full_response.push_str(&format!("Tool blocked by hook: {}", msg));
+                                yield Ok(StreamToken::Text(format!("Tool blocked by hook: {}", msg)));
+                                continue;
+                            }
+                            HookDecision::Abort => {
+                                full_response.push_str("Tool aborted by hook");
+                                yield Ok(StreamToken::Text("Tool aborted by hook".to_string()));
+                                continue;
+                            }
+                            HookDecision::Continue => {}
+                        }
+
                         let result = if name == "load_skill" {
                             let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                             if let Some(cached) = loaded_skills.get(skill_name) {
@@ -1035,6 +1289,17 @@ impl Agent {
 
                         let result_text = match &result {
                             Ok(ret) => {
+                                let mut ctx = HookContext::new(&self.config.name);
+                                ctx.set("tool_name", &name);
+                                ctx.set("tool_result", "success");
+                                let decision = self.hooks.trigger(HookEvent::AfterToolCall, ctx).await;
+                                match decision {
+                                    HookDecision::Error(msg) => log::warn!("AfterToolCall hook error: {}", msg),
+                                    HookDecision::Abort => {
+                                        return;
+                                    }
+                                    HookDecision::Continue => {}
+                                }
                                 if name == "load_skill" {
                                     let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                     let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
@@ -1064,10 +1329,19 @@ impl Agent {
                 }
             }
 
+            let mut ctx = HookContext::new(&self.config.name);
+            ctx.set("model", &self.config.model);
+            let decision = self.hooks.trigger(HookEvent::AfterLlmCall, ctx).await;
+            match decision {
+                HookDecision::Error(msg) => log::warn!("AfterLlmCall hook error: {}", msg),
+                HookDecision::Abort => return,
+                HookDecision::Continue => {}
+            }
+
             let mut log = message_log_ptr.lock().unwrap();
             log.push(LlmMessage::user(task_str));
             if !full_response.is_empty() {
-                log.push(LlmMessage::assistant(full_response));
+                log.push(LlmMessage::assistant(full_response.clone()));
             }
         };
 
@@ -1234,6 +1508,7 @@ impl Clone for Agent {
             skills: self.skills.clone(),
             resilience: self.resilience.clone(),
             message_log: self.message_log.clone(),
+            hooks: self.hooks.clone(),
         }
     }
 }
@@ -1317,21 +1592,22 @@ mod agent_serialization_tests {
             }
         }
 
-        let agent = Agent {
-            config,
-            llm: Arc::new(MockLlmClient) as Arc<dyn LlmClient>,
-            registry: None,
-            skills_dir: None,
-            skills: Vec::new(),
-            resilience: ReActResilience::new(react::ResilienceConfig::default()),
-            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
+let agent = Agent {
+    config,
+    llm: Arc::new(MockLlmClient) as Arc<dyn LlmClient>,
+    registry: None,
+    skills_dir: None,
+    skills: Vec::new(),
+    resilience: ReActResilience::new(react::ResilienceConfig::default()),
+    message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+    hooks: HookRegistry::new(),
+  };
 
-        let bytes = agent.dump().expect("Agent should be serializable");
-        assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
-    }
+  let bytes = agent.dump().expect("Agent should be serializable");
+  assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
+}
 
-    /// Test that Agent can be serialized (serialize-only, cannot deserialize due to dyn LlmClient)
+/// Test that Agent can be serialized (serialize-only, cannot deserialize due to dyn LlmClient)
     #[test]
     fn test_agent_serialize_only() {
         use react::llm::LlmClient;
@@ -1361,19 +1637,20 @@ mod agent_serialization_tests {
             }
         }
 
-        let agent = Agent {
-            config,
-            llm: Arc::new(MockLlmClient) as Arc<dyn LlmClient>,
-            registry: None,
-            skills_dir: None,
-            skills: Vec::new(),
-            resilience: ReActResilience::new(react::ResilienceConfig::default()),
-            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
+let agent = Agent {
+    config,
+    llm: Arc::new(MockLlmClient) as Arc<dyn LlmClient>,
+    registry: None,
+    skills_dir: None,
+    skills: Vec::new(),
+    resilience: ReActResilience::new(react::ResilienceConfig::default()),
+    message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+    hooks: HookRegistry::new(),
+  };
 
-        let bytes = agent.dump().expect("Agent should be serializable");
-        assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
-    }
+  let bytes = agent.dump().expect("Agent should be serializable");
+  assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
+}
 }
 
 /// Test message log save/restore functionality
@@ -1448,12 +1725,12 @@ mod message_log_tests {
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
-    struct RecordingLlmClient {
+    struct MockLlmClient {
         responses: Arc<TokioMutex<Vec<LlmResponse>>>,
     }
 
     #[async_trait]
-    impl LlmClient for RecordingLlmClient {
+    impl LlmClient for MockLlmClient {
         async fn complete(&self, _req: react::llm::LlmRequest) -> LlmResponseResult {
             let mut responses = self.responses.lock().await;
             if responses.is_empty() {
@@ -1488,7 +1765,7 @@ mod message_log_tests {
         // This test verifies the code compiles correctly
         let config = AgentConfig::default();
         let responses = Arc::new(TokioMutex::new(vec![]));
-        let llm = Arc::new(RecordingLlmClient { responses });
+        let llm = Arc::new(MockLlmClient { responses });
         let mut agent = Agent::new(config, llm);
 
         // Add a tool to verify registry works
@@ -1518,7 +1795,7 @@ mod message_log_tests {
     async fn test_stream_message_log_includes_tool_calls_and_results() {
         let config = AgentConfig::default();
         let responses = Arc::new(TokioMutex::new(vec![]));
-        let llm = Arc::new(RecordingLlmClient { responses });
+        let llm = Arc::new(MockLlmClient { responses });
         let mut agent = Agent::new(config, llm);
 
         let tool = Arc::new(FunctionTool::new(
@@ -1549,7 +1826,7 @@ mod message_log_tests {
 
         let config = AgentConfig::default();
         let responses = Arc::new(TokioMutex::new(vec![]));
-        let llm = Arc::new(RecordingLlmClient { responses });
+        let llm = Arc::new(MockLlmClient { responses });
         let mut agent = Agent::new(config, llm);
 
         agent.add_message(LlmMessage::user("initial"));
@@ -1613,7 +1890,7 @@ mod message_log_tests {
         let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
             "Final answer: LLM response text".to_string(),
         )]));
-        let llm = Arc::new(RecordingLlmClient { responses });
+        let llm = Arc::new(MockLlmClient { responses });
         let mut agent = Agent::new(config, llm);
 
         let result = agent.run_simple("test task").await;
@@ -1654,7 +1931,7 @@ mod message_log_tests {
             },
             LlmResponse::Text("Final answer: tool executed".to_string()),
         ]));
-        let llm = Arc::new(RecordingLlmClient { responses });
+        let llm = Arc::new(MockLlmClient { responses });
 
         // Create agent with a test tool registered
         let mut agent = Agent::new(config, llm);
@@ -1711,5 +1988,374 @@ mod message_log_tests {
                 _ => false,
             })
             .count()
+    }
+}
+
+mod hook_tests {
+    use super::*;
+    use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent};
+    use async_trait::async_trait;
+    use react::llm::{LlmMessage, LlmResponse, LlmResponseResult, StreamToken};
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    #[derive(Clone)]
+    struct RecordingHook {
+        events: Arc<TokioMutex<Vec<(HookEvent, HookContext)>>>,
+        decision: HookDecision,
+    }
+
+    impl RecordingHook {
+        fn new(decision: HookDecision) -> Self {
+            Self {
+                events: Arc::new(TokioMutex::new(Vec::new())),
+                decision,
+            }
+        }
+
+        async fn get_events(&self) -> Vec<(HookEvent, HookContext)> {
+            self.events.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentHook for RecordingHook {
+        async fn on_event(&self, event: HookEvent, context: &HookContext) -> HookDecision {
+            self.events.lock().await.push((event, context.clone()));
+            self.decision.clone()
+        }
+    }
+
+    struct MockLlmClient {
+        responses: Arc<TokioMutex<Vec<LlmResponse>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for MockLlmClient {
+        async fn complete(&self, _req: react::llm::LlmRequest) -> LlmResponseResult {
+            let mut responses = self.responses.lock().await;
+            if responses.is_empty() {
+                Ok(LlmResponse::Text("Final answer: test response".to_string()))
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+
+        async fn stream_complete(
+            &self,
+            _req: react::llm::LlmRequest,
+        ) -> std::result::Result<react::llm::TokenStream, react::llm::LlmError> {
+            let mut responses = self.responses.lock().await;
+            let tokens: Vec<Result<StreamToken, react::llm::LlmError>> = if responses.is_empty() {
+                vec![
+                    Ok(StreamToken::Text("Final answer: test response".to_string())),
+                    Ok(StreamToken::Done),
+                ]
+            } else {
+                let resp = responses.remove(0);
+                match resp {
+                    LlmResponse::ToolCall { name, args, id } => vec![
+                        Ok(StreamToken::ToolCall { name, args, id }),
+                    ],
+                    LlmResponse::Text(s) => vec![
+                        Ok(StreamToken::Text(s)),
+                        Ok(StreamToken::Done),
+                    ],
+                    LlmResponse::Partial(s) => vec![
+                        Ok(StreamToken::Text(s)),
+                        Ok(StreamToken::Done),
+                    ],
+                    LlmResponse::Done => vec![Ok(StreamToken::Done)],
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(tokens)))
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_react_llm_hooks() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(MockLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let before_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
+        let after_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
+
+        agent.hooks.register(HookEvent::BeforeLlmCall, before_llm.clone()).await;
+        agent.hooks.register(HookEvent::AfterLlmCall, after_llm.clone()).await;
+
+        let _ = agent.react("test").await;
+
+        let before_events = before_llm.get_events().await;
+        let after_events = after_llm.get_events().await;
+
+        assert!(!before_events.is_empty(), "BeforeLlmCall should be triggered");
+        assert!(!after_events.is_empty(), "AfterLlmCall should be triggered");
+    }
+
+    #[tokio::test]
+    async fn test_run_simple_llm_hooks() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(MockLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let before_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
+        let after_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
+
+        agent.hooks.register(HookEvent::BeforeLlmCall, before_llm.clone()).await;
+        agent.hooks.register(HookEvent::AfterLlmCall, after_llm.clone()).await;
+
+        let _ = agent.run_simple("test").await;
+
+        let before_events = before_llm.get_events().await;
+        let after_events = after_llm.get_events().await;
+
+        assert!(!before_events.is_empty(), "BeforeLlmCall should be triggered in run_simple");
+        assert!(!after_events.is_empty(), "AfterLlmCall should be triggered in run_simple");
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_hooks() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(MockLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let before_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
+        let after_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
+
+        agent.hooks.register(HookEvent::BeforeLlmCall, before_llm.clone()).await;
+        agent.hooks.register(HookEvent::AfterLlmCall, after_llm.clone()).await;
+
+        let mut stream = agent.stream("test");
+        while let Some(_) = stream.next().await {}
+
+        let before_events = before_llm.get_events().await;
+        let after_events = after_llm.get_events().await;
+
+        assert!(!before_events.is_empty(), "BeforeLlmCall should be triggered in stream");
+        assert!(!after_events.is_empty(), "AfterLlmCall should be triggered in stream");
+    }
+
+    #[tokio::test]
+    async fn test_react_error_hook() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(MockLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let on_error = Arc::new(RecordingHook::new(HookDecision::Continue));
+        agent.hooks.register(HookEvent::OnError, on_error.clone()).await;
+
+        let _ = agent.react("test").await;
+
+        let events = on_error.get_events().await;
+        assert!(events.is_empty(), "OnError should not trigger on success");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tool_call_hooks_in_react() {
+        let config = AgentConfig::default();
+        let mut responses = vec![
+            LlmResponse::ToolCall {
+                name: "test_tool".to_string(),
+                args: serde_json::json!({ "param": "value" }),
+                id: Some("call_123".to_string()),
+            },
+            LlmResponse::Text("Final answer: done".to_string()),
+        ];
+        let responses = Arc::new(TokioMutex::new(responses));
+        let llm = Arc::new(MockLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let tool = Arc::new(FunctionTool::new(
+            "test_tool",
+            "A test tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "param": { "type": "string" }
+                },
+                "required": ["param"]
+            }),
+            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
+        ));
+        agent.add_tool(tool);
+
+        let before_tool = Arc::new(RecordingHook::new(HookDecision::Continue));
+        let after_tool = Arc::new(RecordingHook::new(HookDecision::Continue));
+
+        agent.hooks.register(HookEvent::BeforeToolCall, before_tool.clone()).await;
+        agent.hooks.register(HookEvent::AfterToolCall, after_tool.clone()).await;
+
+        let _ = agent.react("test").await;
+
+        let before_events = before_tool.get_events().await;
+        let after_events = after_tool.get_events().await;
+
+        assert!(!before_events.is_empty(), "BeforeToolCall should be triggered in react");
+        assert!(!after_events.is_empty(), "AfterToolCall should be triggered in react");
+
+        if let Some((_, ctx)) = before_events.first() {
+            assert_eq!(ctx.get("tool_name"), Some(&"test_tool".to_string()));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tool_call_hooks_in_run_simple() {
+        let config = AgentConfig::default();
+        let responses = vec![
+            LlmResponse::ToolCall {
+                name: "test_tool".to_string(),
+                args: serde_json::json!({ "param": "value" }),
+                id: Some("call_123".to_string()),
+            },
+        ];
+        let responses = Arc::new(TokioMutex::new(responses));
+        let llm = Arc::new(MockLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let tool = Arc::new(FunctionTool::new(
+            "test_tool",
+            "A test tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "param": { "type": "string" }
+                },
+                "required": ["param"]
+            }),
+            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
+        ));
+        agent.add_tool(tool);
+
+        let before_tool = Arc::new(RecordingHook::new(HookDecision::Continue));
+        let after_tool = Arc::new(RecordingHook::new(HookDecision::Continue));
+
+        agent.hooks.register(HookEvent::BeforeToolCall, before_tool.clone()).await;
+        agent.hooks.register(HookEvent::AfterToolCall, after_tool.clone()).await;
+
+        let _ = agent.run_simple("test").await;
+
+        let before_events = before_tool.get_events().await;
+        let after_events = after_tool.get_events().await;
+
+        assert!(!before_events.is_empty(), "BeforeToolCall should be triggered in run_simple");
+        assert!(!after_events.is_empty(), "AfterToolCall should be triggered in run_simple");
+    }
+
+    #[tokio::test]
+    async fn test_before_tool_call_abort() {
+        let config = AgentConfig::default();
+        let responses = vec![
+            LlmResponse::ToolCall {
+                name: "test_tool".to_string(),
+                args: serde_json::json!({ "param": "value" }),
+                id: Some("call_123".to_string()),
+            },
+        ];
+        let responses = Arc::new(TokioMutex::new(responses));
+        let llm = Arc::new(MockLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let tool = Arc::new(FunctionTool::new(
+            "test_tool",
+            "A test tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "param": { "type": "string" }
+                },
+                "required": ["param"]
+            }),
+            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
+        ));
+        agent.add_tool(tool);
+
+        let abort_hook = Arc::new(RecordingHook::new(HookDecision::Abort));
+        agent.hooks.register(HookEvent::BeforeToolCall, abort_hook.clone()).await;
+
+        let result = agent.run_simple("test").await;
+
+        let events = abort_hook.get_events().await;
+        assert!(!events.is_empty(), "Hook should be triggered");
+
+        let tool_result = result.unwrap_or_default();
+        assert!(
+            tool_result.contains("aborted") || tool_result.contains("blocked"),
+            "Tool should be blocked when hook returns Abort"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tool_call_hooks_in_stream() {
+        let config = AgentConfig::default();
+        let responses = vec![
+            LlmResponse::ToolCall {
+                name: "test_tool".to_string(),
+                args: serde_json::json!({ "param": "value" }),
+                id: Some("call_123".to_string()),
+            },
+            LlmResponse::Text("Final answer: done".to_string()),
+        ];
+        let responses = Arc::new(TokioMutex::new(responses));
+        let llm = Arc::new(MockLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let tool = Arc::new(FunctionTool::new(
+            "test_tool",
+            "A test tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "param": { "type": "string" }
+                },
+                "required": ["param"]
+            }),
+            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
+        ));
+        agent.add_tool(tool);
+
+        let before_tool = Arc::new(RecordingHook::new(HookDecision::Continue));
+        let after_tool = Arc::new(RecordingHook::new(HookDecision::Continue));
+
+        agent.hooks.register(HookEvent::BeforeToolCall, before_tool.clone()).await;
+        agent.hooks.register(HookEvent::AfterToolCall, after_tool.clone()).await;
+
+        let mut stream = agent.stream("test");
+        while let Some(_) = stream.next().await {}
+
+        let before_events = before_tool.get_events().await;
+        let after_events = after_tool.get_events().await;
+
+        assert!(!before_events.is_empty(), "BeforeToolCall should be triggered in stream");
+        assert!(!after_events.is_empty(), "AfterToolCall should be triggered in stream");
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_hook() {
+        let config = AgentConfig::default();
+        let responses = Arc::new(TokioMutex::new(vec![]));
+        let llm = Arc::new(MockLlmClient { responses });
+        let mut agent = Agent::new(config, llm);
+
+        let on_error = Arc::new(RecordingHook::new(HookDecision::Continue));
+        agent.hooks.register(HookEvent::OnError, on_error.clone()).await;
+
+        let mut stream = agent.stream("test");
+        while let Some(_) = stream.next().await {}
+
+        let events = on_error.get_events().await;
+        assert!(events.is_empty(), "OnError should not trigger on success in stream");
     }
 }

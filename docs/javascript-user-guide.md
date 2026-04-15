@@ -9,12 +9,13 @@ This guide provides a unified, consistent API for using BrainOS in JavaScript/No
 3. [Core Concepts](#core-concepts)
 4. [Agent API](#agent-api)
 5. [Tool Registration](#tool-registration)
-6. [Bus Communication](#bus-communication)
-7. [Query/Queryable](#queryqueryable)
-8. [Caller/Callable](#callercallable)
-9. [Configuration](#configuration)
-10. [MCP Client](#mcp-client-model-context-protocol)
-11. [API Reference](#api-reference)
+6. [Hooks](#hooks)
+7. [Bus Communication](#bus-communication)
+8. [Query/Queryable](#queryqueryable)
+9. [Caller/Callable](#callercallable)
+10. [Configuration](#configuration)
+11. [MCP Client](#mcp-client-model-context-protocol)
+12. [API Reference](#api-reference)
 
 ---
 
@@ -152,6 +153,109 @@ agent.registerMany(tool1, tool2);
 ```
 
 ---
+
+## Hooks
+
+Hooks allow you to intercept and react to events during agent execution. Use `onHook()` to register callback functions.
+
+### Using Hooks with BrainOS Agent
+
+```javascript
+const { BrainOS, HookEvent } = require('brainos');
+
+const brain = new BrainOS({ apiKey: 'sk-...' });
+await brain.start();
+
+// Register hooks
+brain.agent('assistant')
+  .onHook(HookEvent.BeforeToolCall, (ctx) => {
+    console.log('[BeforeToolCall]', ctx.data.tool_name);
+    return 'continue';  // proceed normally
+  })
+  .onHook(HookEvent.AfterToolCall, (ctx) => {
+    console.log('[AfterToolCall]', ctx.data.tool_name);
+    return 'continue';
+  })
+  .onHook(HookEvent.BeforeLlmCall, (ctx) => {
+    console.log('[BeforeLlmCall] Starting LLM call');
+    return 'continue';
+  })
+  .onHook(HookEvent.AfterLlmCall, (ctx) => {
+    console.log('[AfterLlmCall] LLM call completed');
+    return 'continue';
+  })
+  .onHook(HookEvent.OnError, (ctx) => {
+    console.log('[OnError]', ctx.data.error);
+    return 'continue';
+  });
+```
+
+### Using Hooks with Raw Agent
+
+```javascript
+const { Agent, HookEvent } = require('./index.js');
+
+const agent = await Agent.create({
+  name: 'assistant',
+  model: 'gpt-4',
+  apiKey: 'sk-...',
+  baseUrl: 'https://api.openai.com/v1',
+  systemPrompt: 'You are helpful.',
+  temperature: 0.7,
+  timeoutSecs: 120,
+});
+
+agent.registerHook(HookEvent.BeforeToolCall, (ctx) => {
+  console.log('[BeforeToolCall]', ctx.data.tool_name);
+  return 'continue';
+});
+
+agent.registerHook(HookEvent.AfterToolCall, (ctx) => {
+  console.log('[AfterToolCall]', ctx.data.tool_name);
+  return 'continue';
+});
+```
+
+### Hook Events
+
+| Event | Description |
+|-------|-------------|
+| `BeforeToolCall` | Fired before a tool is called |
+| `AfterToolCall` | Fired after a tool completes |
+| `BeforeLlmCall` | Fired before LLM API call |
+| `AfterLlmCall` | Fired after LLM API call |
+| `OnMessage` | Fired for each message |
+| `OnComplete` | Fired when agent completes |
+| `OnError` | Fired when an error occurs |
+
+### Hook Decisions
+
+Return a string to control execution:
+
+| Decision | Description |
+|---------|-------------|
+| `'continue'` | Proceed normally (default) |
+| `'abort'` | Abort current operation |
+| `'error:message'` | Return an error |
+
+### Hook Context
+
+The callback receives a `HookContextData` object:
+
+```javascript
+{
+  agent_id: 'assistant',     // agent name
+  data: {                   // event-specific data
+    tool_name: 'add',      // for BeforeToolCall/AfterToolCall
+    error: 'failed',        // for OnError
+    // ...
+  }
+}
+```
+
+---
+
+## Tool Registration
 
 ## Tool Registration
 

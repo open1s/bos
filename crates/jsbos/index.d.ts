@@ -14,6 +14,7 @@ export declare class Agent {
   react(task: string): Promise<string>
   config(): any
   listTools(): Array<string>
+  registerHook(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => any)): void
   addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => any)): Promise<string>
   registerSkillsFromDir(dirPath: string): Promise<void>
   addMcpServer(namespace: string, command: string, args: Array<string>): Promise<void>
@@ -78,6 +79,11 @@ export declare class ConfigLoader {
   reset(): void
   loadSync(): string
   reloadSync(): string
+}
+
+export declare class HookRegistry {
+  constructor()
+  register(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => any)): Promise<void>
 }
 
 export declare class McpClient {
@@ -157,6 +163,27 @@ export interface BusConfig {
   connect?: Array<string>
   listen?: Array<string>
   peer?: string
+}
+
+export interface HookContextData {
+  agentId: string
+  data: Record<string, string>
+}
+
+export declare const enum HookDecision {
+  Continue = 0,
+  Abort = 1,
+  Error = 2
+}
+
+export declare const enum HookEvent {
+  BeforeToolCall = 0,
+  AfterToolCall = 1,
+  BeforeLlmCall = 2,
+  AfterLlmCall = 3,
+  OnMessage = 4,
+  OnComplete = 5,
+  OnError = 6
 }
 
 export declare function initTracing(): void

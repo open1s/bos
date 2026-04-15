@@ -29,6 +29,10 @@ const {
   version: getVersion,
   initTracing,
   logTestMessage,
+  HookEvent,
+  HookDecision,
+  HookContextData,
+  HookRegistry,
 } = require('./index.js');
 
 class ToolDef {
@@ -77,6 +81,7 @@ class Agent {
     this._bus = bus;
     this._inner = null;
     this._tools = [];
+    this._hooks = [];
     this._config = {
       name: options.name || 'assistant',
       model: options.model || 'nvidia/meta/llama-3.1-8b-instruct',
@@ -120,6 +125,11 @@ class Agent {
     return this;
   }
 
+  onHook(event, callback) {
+    this._hooks.push({ event, callback });
+    return this;
+  }
+
   async start() {
     const { Agent: RawAgent } = require('./jsbos.js');
     this._inner = await RawAgent.create(this._config);
@@ -133,6 +143,9 @@ class Agent {
         schema,
         (err, args) => t.callback(args)
       );
+    }
+    for (const h of this._hooks) {
+      this._inner.registerHook(h.event, h.callback);
     }
     return this;
   }
@@ -447,4 +460,8 @@ module.exports = {
   version: getVersion,
   initTracing,
   logTestMessage,
+  HookEvent,
+  HookDecision,
+  HookContextData,
+  HookRegistry,
 };

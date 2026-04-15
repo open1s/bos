@@ -636,6 +636,8 @@ pub struct PyAgent {
     pub inner: std::sync::Arc<Mutex<Agent>>,
     /// Stored MCP clients for restart/health_status operations
     pub mcp_clients: std::sync::Arc<Mutex<Vec<std::sync::Arc<agent::mcp::McpClient>>>>,
+    /// Hook registry for extensibility
+    pub hooks: std::sync::Arc<Mutex<crate::hooks::PyHookRegistry>>,
 }
 
 #[pymethods]
@@ -664,9 +666,12 @@ impl PyAgent {
             .build()
             .map_err(to_py_runtime_error)?;
 
+        let py_hooks = crate::hooks::PyHookRegistry::create();
+
         Ok(Self {
             inner: std::sync::Arc::new(Mutex::new(agent)),
             mcp_clients: Default::default(),
+            hooks: std::sync::Arc::new(Mutex::new(py_hooks)),
         })
     }
 
@@ -700,12 +705,15 @@ impl PyAgent {
                 .build()
                 .map_err(to_py_runtime_error)?;
 
+            let py_hooks = crate::hooks::PyHookRegistry::create();
+
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let py_agent = Py::new(
                     py,
                     PyAgent {
                         inner: std::sync::Arc::new(Mutex::new(agent)),
                         mcp_clients: Default::default(),
+                        hooks: std::sync::Arc::new(Mutex::new(py_hooks)),
                     },
                 )?;
                 Ok(py_agent.into_any())
@@ -1226,5 +1234,14 @@ impl PyAgent {
         guard
             .restore_message_log(&path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn register_hook(&self, event: crate::hooks::PyHookEvent, callback: Py<PyAny>) -> PyResult<()> {
+        let guard = self
+            .hooks
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Hooks lock poisoned"))?;
+        guard.register(event, callback);
+        Ok(())
     }
 }

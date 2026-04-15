@@ -8,6 +8,7 @@ mod agent;
 mod bus;
 mod caller;
 mod config;
+mod hooks;
 mod logging;
 mod mcp;
 mod publisher;
@@ -25,6 +26,7 @@ PyAgent, PyAgentCallableServer, PyAgentConfig, PyAgentRpcClient, PyPythonTool, P
 pub use bus::{PyBus, PyBusConfig};
 pub use caller::{PyCallable, PyCaller};
 pub use config::PyConfigLoader;
+pub use hooks::{PyHookContext, PyHookDecision, PyHookEvent, PyHookRegistry};
 pub use mcp::PyMcpClient;
 pub use publisher::PyPublisher;
 pub use query::{PyQuery, PyQueryStreamIterator, PyQueryable, PyStreamSender};
@@ -50,6 +52,10 @@ fn pybos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPythonTool>()?;
     m.add_class::<PyMcpClient>()?;
     m.add_class::<PyLlmMessage>()?;
+    m.add_class::<PyHookEvent>()?;
+    m.add_class::<PyHookDecision>()?;
+    m.add_class::<PyHookContext>()?;
+    m.add_class::<PyHookRegistry>()?;
     m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(log_test_message, m)?)?;
     Ok(())

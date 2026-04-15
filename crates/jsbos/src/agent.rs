@@ -7,6 +7,7 @@ use napi_derive::napi;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
 
 struct JSTool {
@@ -192,13 +193,21 @@ impl From<AgentConfig> for agent::AgentConfig {
 pub struct Agent {
   inner: Arc<Mutex<agent::Agent>>,
   bus_session: Option<Arc<crate::Session>>,
+  hooks: std::sync::Arc<std::sync::Mutex<HookRegistry>>,
+  #[allow(dead_code)]
+  runtime: tokio::runtime::Runtime,
 }
 
 #[napi]
 impl Agent {
   #[napi(factory)]
   pub async fn create(config: AgentConfig) -> Result<Self> {
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    
     let cfg: agent::AgentConfig = config.into();
+    let js_hooks = HookRegistry::new();
+    let js_hooks_clone = js_hooks.clone_inner();
+    
     let agent = agent::Agent::builder()
       .name(cfg.name)
       .model(cfg.model)
@@ -208,12 +217,15 @@ impl Agent {
       .temperature(cfg.temperature)
       .max_tokens(cfg.max_tokens.unwrap_or(4096) as u32)
       .timeout(cfg.timeout_secs as u64)
+      .with_hooks(js_hooks_clone)
       .build()
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
 
     Ok(Agent {
       inner: Arc::new(Mutex::new(agent)),
       bus_session: None,
+      hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
+      runtime,
     })
   }
 
@@ -222,7 +234,12 @@ impl Agent {
     config: AgentConfig,
     _bus: &External<Arc<crate::Session>>,
   ) -> Result<Self> {
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    
     let cfg: agent::AgentConfig = config.into();
+    let js_hooks = HookRegistry::new();
+    let js_hooks_clone = js_hooks.clone_inner();
+    
     let agent = agent::Agent::builder()
       .name(cfg.name)
       .model(cfg.model)
@@ -232,12 +249,15 @@ impl Agent {
       .temperature(cfg.temperature)
       .max_tokens(cfg.max_tokens.unwrap_or(4096) as u32)
       .timeout(cfg.timeout_secs as u64)
+      .with_hooks(js_hooks_clone)
       .build()
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
 
     Ok(Agent {
       inner: Arc::new(Mutex::new(agent)),
       bus_session: None,
+      hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
+      runtime,
     })
   }
 
@@ -288,6 +308,37 @@ impl Agent {
     } else {
       Ok(Vec::new())
     }
+  }
+
+  #[napi]
+  pub fn register_hook(
+    &self,
+    event: HookEvent,
+    callback: ThreadsafeFunction<HookContextData>,
+  ) -> Result<()> {
+    let hooks = self.hooks.clone();
+    let hook = crate::hooks::JSHook {
+      callback: callback.into(),
+    };
+    
+    self.runtime.spawn(async move {
+      let event = match event {
+        HookEvent::BeforeToolCall => agent::agent::hooks::HookEvent::BeforeToolCall,
+        HookEvent::AfterToolCall => agent::agent::hooks::HookEvent::AfterToolCall,
+        HookEvent::BeforeLlmCall => agent::agent::hooks::HookEvent::BeforeLlmCall,
+        HookEvent::AfterLlmCall => agent::agent::hooks::HookEvent::AfterLlmCall,
+        HookEvent::OnMessage => agent::agent::hooks::HookEvent::OnMessage,
+        HookEvent::OnComplete => agent::agent::hooks::HookEvent::OnComplete,
+        HookEvent::OnError => agent::agent::hooks::HookEvent::OnError,
+      };
+      
+      let registry = {
+        let mut guard = hooks.lock().unwrap();
+        guard.inner_mut().clone()
+      };
+      registry.register(event, std::sync::Arc::new(hook)).await;
+    });
+    Ok(())
   }
 
   #[napi]
