@@ -57,7 +57,7 @@ fn pretty_msg(msg: &str) -> String {
 }
 
 pub fn auto_init_tracing() {
-   let logdir = match dirs::home_dir() {
+    let logdir = match dirs::home_dir() {
         Some(d) => d.join(".bos/log"),
         None => {
             return;
@@ -104,7 +104,6 @@ pub fn auto_init_tracing() {
         .duplicate_to_stdout(flexi_logger::Duplicate::All) // 同步输出到控制台
         .format_for_files(short_format) // 文件日志详细
         .format_for_stdout(pretty_stdout);
-
 
     match logger.start() {
         Ok(handle) => {

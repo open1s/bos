@@ -1,4 +1,7 @@
-use agent::agent::hooks::{AgentHook, HookContext, HookDecision as InnerDecision, HookEvent as InnerEvent, HookRegistry as InnerRegistry};
+use agent::agent::hooks::{
+    AgentHook, HookContext, HookDecision as InnerDecision, HookEvent as InnerEvent,
+    HookRegistry as InnerRegistry,
+};
 use async_trait::async_trait;
 use pyo3::prelude::*;
 use std::collections::HashMap;
@@ -125,11 +128,7 @@ struct PythonHook {
 
 #[async_trait]
 impl AgentHook for PythonHook {
-    async fn on_event(
-        &self,
-        event: InnerEvent,
-        context: &HookContext,
-    ) -> InnerDecision {
+    async fn on_event(&self, event: InnerEvent, context: &HookContext) -> InnerDecision {
         let py_hook_context = PyHookContext {
             agent_id: context.agent_id.clone(),
             data: context.data.clone(),
@@ -154,7 +153,9 @@ impl AgentHook for PythonHook {
                             "Continue" => InnerDecision::Continue,
                             "Abort" => InnerDecision::Abort,
                             _ if decision_str.starts_with("Error(") => {
-                                let msg = decision_str.trim_start_matches("Error(").trim_end_matches(')');
+                                let msg = decision_str
+                                    .trim_start_matches("Error(")
+                                    .trim_end_matches(')');
                                 InnerDecision::Error(msg.to_string())
                             }
                             _ => InnerDecision::Continue,
@@ -184,6 +185,10 @@ impl PyHookRegistry {
     pub fn inner(&self) -> Arc<InnerRegistry> {
         self.inner.clone()
     }
+
+    pub fn to_hook_registry(&self) -> InnerRegistry {
+        self.inner.as_ref().clone()
+    }
 }
 
 #[pymethods]
@@ -195,14 +200,9 @@ impl PyHookRegistry {
 
     pub fn register(&self, event: PyHookEvent, callback: Py<PyAny>) {
         let event: InnerEvent = event.into();
-        let hook = PythonHook { callback: callback.into() };
-        let inner = self.inner.clone();
-        
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                inner.register(event, Arc::new(hook)).await;
-            });
-        });
+        let hook = PythonHook {
+            callback: callback.into(),
+        };
+        self.inner.register_blocking(event, Arc::new(hook));
     }
 }

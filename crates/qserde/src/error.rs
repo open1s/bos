@@ -1,7 +1,7 @@
 //! Error types for qserde operations
 
-use thiserror::Error;
 use crate::Error as QserdeLibError;
+use thiserror::Error;
 
 /// Unified error enum for qserde operations
 #[derive(Debug, Error)]

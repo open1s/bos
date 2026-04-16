@@ -77,9 +77,9 @@ fn test_builder_pattern() {
         .build()
         .expect("Failed to build engine");
 
-let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async { engine.react("2+3").await });
-        assert_eq!(result.unwrap().0, "5");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(async { engine.react("2+3").await });
+    assert_eq!(result.unwrap().0, "5");
 }
 
 #[test]
@@ -123,10 +123,7 @@ fn test_message_log_input() {
             Ok(LlmResponse::Text("Hello back!".to_string()))
         }
 
-        async fn stream_complete(
-            &self,
-            _request: LlmRequest,
-        ) -> Result<TokenStream, LlmError> {
+        async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -151,16 +148,23 @@ fn test_message_log_input() {
     engine.set_input_messages(vec![
         LlmMessage::user("Previous conversation"),
         LlmMessage::assistant("I remember that"),
-]);
+    ]);
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let (result, _context) = rt.block_on(async { engine.react("New message").await }).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (result, _context) = rt
+        .block_on(async { engine.react("New message").await })
+        .unwrap();
 
-        let convos = received.lock().unwrap();
+    let convos = received.lock().unwrap();
     assert!(!convos.is_empty());
     let first_convo = &convos[0];
-    assert!(first_convo.len() >= 3, "Should have system + history + new user");
-    assert!(matches!(first_convo[1], LlmMessage::User { content: ref c } if c == "Previous conversation"));
+    assert!(
+        first_convo.len() >= 3,
+        "Should have system + history + new user"
+    );
+    assert!(
+        matches!(first_convo[1], LlmMessage::User { content: ref c } if c == "Previous conversation")
+    );
 }
 
 #[test]
@@ -185,10 +189,7 @@ fn test_react_with_request() {
             Ok(LlmResponse::Text("Answer from custom request".to_string()))
         }
 
-        async fn stream_complete(
-            &self,
-            _request: LlmRequest,
-        ) -> Result<TokenStream, LlmError> {
+        async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -220,7 +221,8 @@ fn test_react_with_request() {
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async { engine.react_with_request(request).await }).unwrap();
+    rt.block_on(async { engine.react_with_request(request).await })
+        .unwrap();
 
     let model = received_model.lock().unwrap();
     assert_eq!(model.as_ref().unwrap(), "custom-model");

@@ -36,7 +36,9 @@ async fn test_hook_registry_register() {
     let registry = HookRegistry::new();
     let hook = Arc::new(TestHook::new());
 
-    registry.register(HookEvent::AfterToolCall, hook.clone()).await;
+    registry
+        .register(HookEvent::AfterToolCall, hook.clone())
+        .await;
 
     let hooks = registry.get_hooks(&HookEvent::AfterToolCall).await;
     assert_eq!(hooks.len(), 1);
@@ -47,7 +49,9 @@ async fn test_hook_registry_multiple_events() {
     let registry = HookRegistry::new();
     let hook = Arc::new(TestHook::new());
 
-    registry.register(HookEvent::AfterToolCall, hook.clone()).await;
+    registry
+        .register(HookEvent::AfterToolCall, hook.clone())
+        .await;
     registry.register(HookEvent::OnComplete, hook.clone()).await;
 
     let tool_hooks = registry.get_hooks(&HookEvent::AfterToolCall).await;
@@ -63,8 +67,12 @@ async fn test_hook_registry_different_hooks() {
     let hook1 = Arc::new(TestHook::new());
     let hook2 = Arc::new(TestHook::new());
 
-    registry.register(HookEvent::AfterToolCall, hook1.clone()).await;
-    registry.register(HookEvent::OnComplete, hook2.clone()).await;
+    registry
+        .register(HookEvent::AfterToolCall, hook1.clone())
+        .await;
+    registry
+        .register(HookEvent::OnComplete, hook2.clone())
+        .await;
 
     let tool_hooks = registry.get_hooks(&HookEvent::AfterToolCall).await;
     let complete_hooks = registry.get_hooks(&HookEvent::OnComplete).await;

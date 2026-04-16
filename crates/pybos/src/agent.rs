@@ -62,7 +62,11 @@ impl PyLlmMessage {
                 dict.set_item("content", content)?;
                 Ok(dict.into_any())
             }
-            LlmMessage::AssistantToolCall { tool_call_id, name, args } => {
+            LlmMessage::AssistantToolCall {
+                tool_call_id,
+                name,
+                args,
+            } => {
                 let dict = PyDict::new(py);
                 dict.set_item("role", "assistant_tool_call")?;
                 dict.set_item("tool_call_id", tool_call_id)?;
@@ -71,7 +75,10 @@ impl PyLlmMessage {
                 dict.set_item("args", args_py)?;
                 Ok(dict.into_any())
             }
-            LlmMessage::ToolResult { tool_call_id, content } => {
+            LlmMessage::ToolResult {
+                tool_call_id,
+                content,
+            } => {
                 let dict = PyDict::new(py);
                 dict.set_item("role", "tool_result")?;
                 dict.set_item("tool_call_id", tool_call_id)?;
@@ -649,6 +656,9 @@ impl PyAgent {
         config: PyRef<'py, PyAgentConfig>,
     ) -> PyResult<Self> {
         let cfg: AgentConfig = config.clone().into();
+        let py_hooks = crate::hooks::PyHookRegistry::create();
+        let hooks = py_hooks.to_hook_registry();
+
         let agent = Agent::builder()
             .name(cfg.name)
             .model(cfg.model)
@@ -663,10 +673,9 @@ impl PyAgent {
             .context_compaction_keep_recent_messages(cfg.context_compaction_keep_recent_messages)
             .context_compaction_max_summary_chars(cfg.context_compaction_max_summary_chars)
             .context_compaction_summary_max_tokens(cfg.context_compaction_summary_max_tokens)
+            .with_hooks(hooks)
             .build()
             .map_err(to_py_runtime_error)?;
-
-        let py_hooks = crate::hooks::PyHookRegistry::create();
 
         Ok(Self {
             inner: std::sync::Arc::new(Mutex::new(agent)),
@@ -682,10 +691,12 @@ impl PyAgent {
         config: PyRef<'py, PyAgentConfig>,
         _bus: PyRef<'py, PyBus>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Create agent from config (bus parameter is currently unused but kept for API compatibility)
         let cfg: AgentConfig = config.clone().into();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let py_hooks = crate::hooks::PyHookRegistry::create();
+            let hooks = py_hooks.to_hook_registry();
+
             let agent = Agent::builder()
                 .name(cfg.name)
                 .model(cfg.model)
@@ -702,10 +713,9 @@ impl PyAgent {
                 )
                 .context_compaction_max_summary_chars(cfg.context_compaction_max_summary_chars)
                 .context_compaction_summary_max_tokens(cfg.context_compaction_summary_max_tokens)
+                .with_hooks(hooks)
                 .build()
                 .map_err(to_py_runtime_error)?;
-
-            let py_hooks = crate::hooks::PyHookRegistry::create();
 
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let py_agent = Py::new(
@@ -1237,11 +1247,19 @@ impl PyAgent {
     }
 
     fn register_hook(&self, event: crate::hooks::PyHookEvent, callback: Py<PyAny>) -> PyResult<()> {
-        let guard = self
-            .hooks
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Hooks lock poisoned"))?;
-        guard.register(event, callback);
+        self.hooks.lock().unwrap().register(event, callback);
+        Ok(())
+    }
+
+    fn register_plugin(&self, plugin: pyo3::Py<crate::plugin::PyAgentPlugin>) -> PyResult<()> {
+        let plugin_arc = pyo3::Python::attach(
+            |py| -> PyResult<std::sync::Arc<dyn agent::agent::plugin::AgentPlugin>> {
+                let plugin_ref = plugin.bind(py).borrow();
+                Ok(plugin_ref.inner.clone())
+            },
+        )?;
+
+        self.inner.lock().unwrap().add_plugin(plugin_arc);
         Ok(())
     }
 }

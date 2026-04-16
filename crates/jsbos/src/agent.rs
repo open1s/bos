@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
+use crate::plugin::PluginRegistry;
 
 struct JSTool {
   name: String,
@@ -137,7 +138,7 @@ impl From<AgentConfig> for agent::AgentConfig {
       Some(agent::CircuitBreakerConfig {
         max_failures: value.circuit_breaker_max_failures.unwrap_or(5) as usize,
         cooldown: std::time::Duration::from_secs(
-          value.circuit_breaker_cooldown_secs.unwrap_or(30) as u64,
+          value.circuit_breaker_cooldown_secs.unwrap_or(30) as u64
         ),
       })
     } else {
@@ -194,20 +195,19 @@ pub struct Agent {
   inner: Arc<Mutex<agent::Agent>>,
   bus_session: Option<Arc<crate::Session>>,
   hooks: std::sync::Arc<std::sync::Mutex<HookRegistry>>,
-  #[allow(dead_code)]
-  runtime: tokio::runtime::Runtime,
+  plugins: std::sync::Arc<std::sync::Mutex<PluginRegistry>>,
 }
 
 #[napi]
 impl Agent {
   #[napi(factory)]
   pub async fn create(config: AgentConfig) -> Result<Self> {
-    let runtime = tokio::runtime::Runtime::new().map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
-    
     let cfg: agent::AgentConfig = config.into();
     let js_hooks = HookRegistry::new();
     let js_hooks_clone = js_hooks.clone_inner();
-    
+    let js_plugins = PluginRegistry::new();
+    let js_plugins_clone = js_plugins.clone_inner();
+
     let agent = agent::Agent::builder()
       .name(cfg.name)
       .model(cfg.model)
@@ -218,6 +218,7 @@ impl Agent {
       .max_tokens(cfg.max_tokens.unwrap_or(4096) as u32)
       .timeout(cfg.timeout_secs as u64)
       .with_hooks(js_hooks_clone)
+      .with_plugins(js_plugins_clone)
       .build()
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
 
@@ -225,7 +226,7 @@ impl Agent {
       inner: Arc::new(Mutex::new(agent)),
       bus_session: None,
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
-      runtime,
+      plugins: std::sync::Arc::new(std::sync::Mutex::new(js_plugins)),
     })
   }
 
@@ -234,12 +235,12 @@ impl Agent {
     config: AgentConfig,
     _bus: &External<Arc<crate::Session>>,
   ) -> Result<Self> {
-    let runtime = tokio::runtime::Runtime::new().map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
-    
     let cfg: agent::AgentConfig = config.into();
     let js_hooks = HookRegistry::new();
     let js_hooks_clone = js_hooks.clone_inner();
-    
+    let js_plugins = PluginRegistry::new();
+    let js_plugins_clone = js_plugins.clone_inner();
+
     let agent = agent::Agent::builder()
       .name(cfg.name)
       .model(cfg.model)
@@ -250,6 +251,7 @@ impl Agent {
       .max_tokens(cfg.max_tokens.unwrap_or(4096) as u32)
       .timeout(cfg.timeout_secs as u64)
       .with_hooks(js_hooks_clone)
+      .with_plugins(js_plugins_clone)
       .build()
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
 
@@ -257,7 +259,7 @@ impl Agent {
       inner: Arc::new(Mutex::new(agent)),
       bus_session: None,
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
-      runtime,
+      plugins: std::sync::Arc::new(std::sync::Mutex::new(js_plugins)),
     })
   }
 
@@ -316,28 +318,58 @@ impl Agent {
     event: HookEvent,
     callback: ThreadsafeFunction<HookContextData>,
   ) -> Result<()> {
-    let hooks = self.hooks.clone();
     let hook = crate::hooks::JSHook {
       callback: callback.into(),
     };
-    
-    self.runtime.spawn(async move {
-      let event = match event {
-        HookEvent::BeforeToolCall => agent::agent::hooks::HookEvent::BeforeToolCall,
-        HookEvent::AfterToolCall => agent::agent::hooks::HookEvent::AfterToolCall,
-        HookEvent::BeforeLlmCall => agent::agent::hooks::HookEvent::BeforeLlmCall,
-        HookEvent::AfterLlmCall => agent::agent::hooks::HookEvent::AfterLlmCall,
-        HookEvent::OnMessage => agent::agent::hooks::HookEvent::OnMessage,
-        HookEvent::OnComplete => agent::agent::hooks::HookEvent::OnComplete,
-        HookEvent::OnError => agent::agent::hooks::HookEvent::OnError,
-      };
-      
-      let registry = {
-        let mut guard = hooks.lock().unwrap();
-        guard.inner_mut().clone()
-      };
-      registry.register(event, std::sync::Arc::new(hook)).await;
-    });
+    let event = match event {
+      HookEvent::BeforeToolCall => agent::agent::hooks::HookEvent::BeforeToolCall,
+      HookEvent::AfterToolCall => agent::agent::hooks::HookEvent::AfterToolCall,
+      HookEvent::BeforeLlmCall => agent::agent::hooks::HookEvent::BeforeLlmCall,
+      HookEvent::AfterLlmCall => agent::agent::hooks::HookEvent::AfterLlmCall,
+      HookEvent::OnMessage => agent::agent::hooks::HookEvent::OnMessage,
+      HookEvent::OnComplete => agent::agent::hooks::HookEvent::OnComplete,
+      HookEvent::OnError => agent::agent::hooks::HookEvent::OnError,
+    };
+
+    let registry = {
+      let mut guard = self.hooks.lock().unwrap();
+      guard.inner_mut().clone()
+    };
+    registry.register_blocking(event, std::sync::Arc::new(hook));
+    Ok(())
+  }
+
+  #[napi]
+  pub fn register_plugin(
+    &self,
+    name: String,
+    on_llm_request: Option<ThreadsafeFunction<JSAny>>,
+    on_llm_response: Option<ThreadsafeFunction<JSAny>>,
+    on_tool_call: Option<ThreadsafeFunction<JSAny>>,
+    on_tool_result: Option<ThreadsafeFunction<JSAny>>,
+  ) -> Result<()> {
+    let js_plugin = crate::plugin::JSPlugin::new(
+      name,
+      on_llm_request,
+      on_llm_response,
+      on_tool_call,
+      on_tool_result,
+    );
+    let plugin_arc: std::sync::Arc<dyn agent::agent::plugin::AgentPlugin> =
+      std::sync::Arc::new(js_plugin);
+
+    let plugins_guard = self.plugins.lock().unwrap();
+    let inner = plugins_guard.inner().clone();
+    drop(plugins_guard);
+    inner.register_blocking(plugin_arc);
+    Ok(())
+  }
+
+  #[napi]
+  pub fn close(&self) -> Result<()> {
+    let mut guard = self.inner.blocking_lock();
+    guard.clear_runtime_extensions();
+
     Ok(())
   }
 
@@ -524,21 +556,42 @@ impl Agent {
     let llm_message = if let Some(role) = message.get("role").and_then(|v| v.as_str()) {
       match role {
         "system" => {
-          let content = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
-          agent::LlmMessage::System { content: content.to_string() }
+          let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+          agent::LlmMessage::System {
+            content: content.to_string(),
+          }
         }
         "user" => {
-          let content = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
-          agent::LlmMessage::User { content: content.to_string() }
+          let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+          agent::LlmMessage::User {
+            content: content.to_string(),
+          }
         }
         "assistant" => {
-          let content = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
-          agent::LlmMessage::Assistant { content: content.to_string() }
+          let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+          agent::LlmMessage::Assistant {
+            content: content.to_string(),
+          }
         }
         "assistant_tool_call" => {
-          let tool_call_id = message.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+          let tool_call_id = message
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
           let name = message.get("name").and_then(|v| v.as_str()).unwrap_or("");
-          let args = message.get("args").cloned().unwrap_or(serde_json::Value::Null);
+          let args = message
+            .get("args")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
           agent::LlmMessage::AssistantToolCall {
             tool_call_id: tool_call_id.to_string(),
             name: name.to_string(),
@@ -546,8 +599,14 @@ impl Agent {
           }
         }
         "tool_result" => {
-          let tool_call_id = message.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
-          let content = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
+          let tool_call_id = message
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+          let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
           agent::LlmMessage::ToolResult {
             tool_call_id: tool_call_id.to_string(),
             content: content.to_string(),
@@ -564,7 +623,7 @@ impl Agent {
       return Err(Error::new(
         napi::Status::GenericFailure,
         "Message must have a 'role' field",
-      ))
+      ));
     };
     let mut guard = self.inner.lock().await;
     guard.add_message(llm_message);
@@ -577,41 +636,46 @@ impl Agent {
     let messages = guard.get_messages();
     let json_messages: Vec<serde_json::Value> = messages
       .iter()
-      .map(|msg| {
-        match msg {
-          agent::LlmMessage::System { content } => {
-            serde_json::json!({
-              "role": "system",
-              "content": content
-            })
-          }
-          agent::LlmMessage::User { content } => {
-            serde_json::json!({
-              "role": "user",
-              "content": content
-            })
-          }
-          agent::LlmMessage::Assistant { content } => {
-            serde_json::json!({
-              "role": "assistant",
-              "content": content
-            })
-          }
-          agent::LlmMessage::AssistantToolCall { tool_call_id, name, args } => {
-            serde_json::json!({
-              "role": "assistant_tool_call",
-              "tool_call_id": tool_call_id,
-              "name": name,
-              "args": args
-            })
-          }
-          agent::LlmMessage::ToolResult { tool_call_id, content } => {
-            serde_json::json!({
-              "role": "tool_result",
-              "tool_call_id": tool_call_id,
-              "content": content
-            })
-          }
+      .map(|msg| match msg {
+        agent::LlmMessage::System { content } => {
+          serde_json::json!({
+            "role": "system",
+            "content": content
+          })
+        }
+        agent::LlmMessage::User { content } => {
+          serde_json::json!({
+            "role": "user",
+            "content": content
+          })
+        }
+        agent::LlmMessage::Assistant { content } => {
+          serde_json::json!({
+            "role": "assistant",
+            "content": content
+          })
+        }
+        agent::LlmMessage::AssistantToolCall {
+          tool_call_id,
+          name,
+          args,
+        } => {
+          serde_json::json!({
+            "role": "assistant_tool_call",
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "args": args
+          })
+        }
+        agent::LlmMessage::ToolResult {
+          tool_call_id,
+          content,
+        } => {
+          serde_json::json!({
+            "role": "tool_result",
+            "tool_call_id": tool_call_id,
+            "content": content
+          })
         }
       })
       .collect();

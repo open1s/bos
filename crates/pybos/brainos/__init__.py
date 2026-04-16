@@ -26,6 +26,7 @@ from brainos.bus import BusManager, Publisher, Subscriber
 from brainos.query import Query, Queryable
 from brainos.caller import Caller, Callable
 from brainos.config import Config
+from pybos import AgentConfig, AgentPlugin, PluginRegistry, ConfigLoader
 
 __all__ = [
     "BrainOS", "Agent",
@@ -34,5 +35,9 @@ __all__ = [
     "Query", "Queryable",
     "Caller", "Callable",
     "Config",
+    "AgentConfig",
+    "AgentPlugin",
+    "PluginRegistry",
+    "ConfigLoader",
 ]
 __version__ = "0.1.0"

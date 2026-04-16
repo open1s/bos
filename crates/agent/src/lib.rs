@@ -17,8 +17,8 @@ pub mod tools;
 pub use agent::config::TomlAgentBuilder as AgentBuilder;
 pub use agent::config::TomlAgentConfig;
 pub use agent::config::TomlToolRef;
-pub use agent::{Agent, AgentBuilder as SimpleAgentBuilder, AgentConfig, AgentOutput};
 pub use agent::hooks::{AgentHook, HookContext, HookEvent, HookRegistry};
+pub use agent::{Agent, AgentBuilder as SimpleAgentBuilder, AgentConfig, AgentOutput};
 pub use bus_rpc::{AgentCallableServer, AgentCallerTool, AgentRpcClient};
 pub use error::{AgentError, LlmError, ToolError};
 pub use mcp::{

@@ -3431,6 +3431,7 @@ dependencies = [
  "maturin",
  "pyo3",
  "pyo3-async-runtimes",
+ "react",
  "serde_json",
  "tokio",
 ]

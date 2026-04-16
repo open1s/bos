@@ -60,7 +60,14 @@ async function demo() {
   console.log('5. When agent.run_simple() or agent.react() is called,');
   console.log('   hooks will fire at the appropriate times.\n');
 
+  agent.close();
+
   console.log('=== Done ===');
 }
 
-demo().catch(console.error);
+demo()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });

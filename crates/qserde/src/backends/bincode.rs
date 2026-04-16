@@ -3,8 +3,8 @@
 //! This module is only available with the `bincode-backend` feature.
 
 use crate::error::QserdeError;
-use bincode::enc::Encode;
 use bincode::de::Decode;
+use bincode::enc::Encode;
 
 /// Bincode backend - compact binary format
 ///

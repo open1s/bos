@@ -3,7 +3,7 @@
 //! This module is only available with the `postcard-backend` feature.
 
 use crate::error::QserdeError;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 
 /// Postcard backend for no_std/embedded
 ///
@@ -18,8 +18,7 @@ impl PostcardBackend {
     where
         T: Serialize,
     {
-        postcard::to_stdvec(value)
-            .map_err(|e| QserdeError::serialize(e.to_string()))
+        postcard::to_stdvec(value).map_err(|e| QserdeError::serialize(e.to_string()))
     }
 
     /// Deserialize bytes from postcard

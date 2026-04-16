@@ -3,8 +3,8 @@
 //! This module is only available with the `rkyv-backend` feature.
 
 use crate::error::QserdeError;
-use rkyv::rancor::Error as RkyvError;
 use rkyv::api::high::HighSerializer;
+use rkyv::rancor::Error as RkyvError;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
 

@@ -7,6 +7,7 @@ mod config;
 mod hooks;
 mod jsany;
 mod mcp;
+mod plugin;
 mod publisher;
 mod query;
 mod subscriber;
@@ -18,6 +19,10 @@ pub use caller::{Callable, Caller};
 pub use config::ConfigLoader;
 pub use hooks::{HookContextData, HookDecision, HookEvent, HookRegistry};
 pub use mcp::McpClient;
+pub use plugin::{
+  PluginLlmRequest, PluginLlmResponse, PluginRegistry, PluginStage, PluginToolCall,
+  PluginToolResult,
+};
 pub use publisher::Publisher;
 pub use query::{Query, Queryable};
 pub use subscriber::Subscriber;

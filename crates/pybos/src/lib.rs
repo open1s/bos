@@ -11,6 +11,7 @@ mod config;
 mod hooks;
 mod logging;
 mod mcp;
+mod plugin;
 mod publisher;
 mod query;
 mod subscriber;
@@ -21,13 +22,18 @@ use logging::{init_tracing, log_test_message};
 //AI NOT ALLOW TO REMOVE
 #[allow(unused)]
 pub use agent::{
-PyAgent, PyAgentCallableServer, PyAgentConfig, PyAgentRpcClient, PyPythonTool, PyStreamIterator, PyLlmMessage,
+    PyAgent, PyAgentCallableServer, PyAgentConfig, PyAgentRpcClient, PyLlmMessage, PyPythonTool,
+    PyStreamIterator,
 };
 pub use bus::{PyBus, PyBusConfig};
 pub use caller::{PyCallable, PyCaller};
 pub use config::PyConfigLoader;
 pub use hooks::{PyHookContext, PyHookDecision, PyHookEvent, PyHookRegistry};
 pub use mcp::PyMcpClient;
+pub use plugin::{
+    PyAgentPlugin, PyLlmRequestWrapper, PyLlmResponseWrapper, PyPluginRegistry, PyToolCallWrapper,
+    PyToolResultWrapper,
+};
 pub use publisher::PyPublisher;
 pub use query::{PyQuery, PyQueryStreamIterator, PyQueryable, PyStreamSender};
 pub use subscriber::PySubscriber;
@@ -56,6 +62,12 @@ fn pybos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHookDecision>()?;
     m.add_class::<PyHookContext>()?;
     m.add_class::<PyHookRegistry>()?;
+    m.add_class::<PyAgentPlugin>()?;
+    m.add_class::<PyPluginRegistry>()?;
+    m.add_class::<PyLlmRequestWrapper>()?;
+    m.add_class::<PyLlmResponseWrapper>()?;
+    m.add_class::<PyToolCallWrapper>()?;
+    m.add_class::<PyToolResultWrapper>()?;
     m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(log_test_message, m)?)?;
     Ok(())

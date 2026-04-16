@@ -15,6 +15,8 @@ export declare class Agent {
   config(): any
   listTools(): Array<string>
   registerHook(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => any)): void
+  registerPlugin(name: string, onLlmRequest?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onLlmResponse?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolCall?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolResult?: (((err: Error | null, arg: JSAny) => any)) | undefined | null): void
+  close(): void
   addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => any)): Promise<string>
   registerSkillsFromDir(dirPath: string): Promise<void>
   addMcpServer(namespace: string, command: string, args: Array<string>): Promise<void>
@@ -95,6 +97,11 @@ export declare class McpClient {
   listPrompts(): Promise<Array<any>>
   listResources(): Promise<Array<any>>
   readResource(uri: string): Promise<any>
+}
+
+export declare class PluginRegistry {
+  constructor()
+  clear(): Promise<void>
 }
 
 export declare class Publisher {
@@ -189,5 +196,41 @@ export declare const enum HookEvent {
 export declare function initTracing(): void
 
 export declare function logTestMessage(message: string): void
+
+export interface PluginLlmRequest {
+  model: string
+  temperature?: number
+  maxTokens?: number
+  topP?: number
+  topK?: number
+  metadata: Record<string, string>
+}
+
+export type PluginLlmResponse =
+  | { type: 'Text', field0: string }
+  | { type: 'Partial', field0: string }
+  | { type: 'ToolCall', name: string, args: string, id?: string }
+  | { type: 'Done' }
+
+export declare const enum PluginStage {
+  PreRequest = 0,
+  PostResponse = 1,
+  PreExecute = 2,
+  PostExecute = 3
+}
+
+export interface PluginToolCall {
+  name: string
+  args: string
+  id?: string
+  metadata: Record<string, string>
+}
+
+export interface PluginToolResult {
+  result: string
+  success: boolean
+  error?: string
+  metadata: Record<string, string>
+}
 
 export declare function version(): string

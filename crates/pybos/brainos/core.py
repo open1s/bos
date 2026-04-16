@@ -28,7 +28,7 @@ class Agent:
 
     def __init__(
         self,
-        bus: PyBus,
+        bus: PyBus = None,
         *,
         name: str = "assistant",
         model: str = "nvidia/meta/llama-3.1-8b-instruct",
@@ -43,16 +43,32 @@ class Agent:
         self._tools: list[ToolDef] = []
         self._agent: PyAgent | None = None
 
-        self._config = PyAgentConfig()
-        self._config.name = name
-        self._config.model = model
-        self._config.base_url = base_url
-        self._config.api_key = api_key
-        self._config.system_prompt = system_prompt
-        self._config.temperature = temperature
-        if max_tokens is not None:
-            self._config.max_tokens = max_tokens
-        self._config.timeout_secs = timeout_secs
+        if isinstance(bus, PyAgentConfig):
+            # Backwards compatibility / direct config support
+            self._config = bus
+            if name != "assistant": self._config.name = name
+            if model != "nvidia/meta/llama-3.1-8b-instruct": self._config.model = model
+            if base_url != "https://integrate.api.nvidia.com/v1": self._config.base_url = base_url
+            if api_key is not None: self._config.api_key = api_key
+            if system_prompt != "You are a helpful assistant.": self._config.system_prompt = system_prompt
+            if temperature != 0.7: self._config.temperature = temperature
+            if max_tokens is not None: self._config.max_tokens = max_tokens
+            if timeout_secs != 120: self._config.timeout_secs = timeout_secs
+            
+            # Since we got config directly, we can create the agent immediately
+            self._agent = PyAgent.from_config(self._config)
+            self._bus = None
+        else:
+            self._config = PyAgentConfig()
+            self._config.name = name
+            self._config.model = model
+            self._config.base_url = base_url
+            self._config.api_key = api_key or ""
+            self._config.system_prompt = system_prompt
+            self._config.temperature = temperature
+            if max_tokens is not None:
+                self._config.max_tokens = max_tokens
+            self._config.timeout_secs = timeout_secs
 
     # ── Fluent config ──────────────────────────────────────────────
 

@@ -4,7 +4,15 @@
 mod rkyv_tests {
     use qserde::backends::RkyvBackend;
 
-    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(
+        Debug,
+        PartialEq,
+        serde::Serialize,
+        serde::Deserialize,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize,
+    )]
     struct TestStruct {
         id: u64,
         name: String,
@@ -155,8 +163,16 @@ mod serde_json_tests {
     fn test_json_roundtrip_mixed() {
         let backend = SerdeJsonBackend;
         let value = vec![
-            TestStruct { id: 1, name: "one".to_string(), tags: vec![] },
-            TestStruct { id: 2, name: "two".to_string(), tags: vec!["x".to_string()] },
+            TestStruct {
+                id: 1,
+                name: "one".to_string(),
+                tags: vec![],
+            },
+            TestStruct {
+                id: 2,
+                name: "two".to_string(),
+                tags: vec!["x".to_string()],
+            },
         ];
 
         let bytes = backend.serialize(&value).expect("serialize vec");
@@ -230,7 +246,9 @@ mod cbor_tests {
 mod bincode_tests {
     use qserde::backends::BincodeBackend;
 
-    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+    #[derive(
+        Debug, PartialEq, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode,
+    )]
     struct TestStruct {
         id: u64,
         name: String,
@@ -341,7 +359,9 @@ mod postcard_tests {
         // Empty string
         let value = "".to_string();
         let bytes = backend.serialize(&value).expect("serialize empty string");
-        let restored: String = backend.deserialize(&bytes).expect("deserialize empty string");
+        let restored: String = backend
+            .deserialize(&bytes)
+            .expect("deserialize empty string");
         assert_eq!(value, restored);
 
         // Empty vec
