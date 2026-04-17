@@ -113,20 +113,15 @@ class Agent {
     return this;
   }
 
-  register(toolDef) {
-    this._tools.push(toolDef);
-    return this;
-  }
-
-  registerMany(...tools) {
+withTools(...tools) {
     for (const t of tools) {
       this._tools.push(t);
     }
     return this;
   }
 
-  onHook(event, callback) {
-    this._hooks.push({ event, callback });
+  withBashTool(name = 'bash', workspaceRoot = null) {
+    this._config._bashTool = { name, workspaceRoot };
     return this;
   }
 
@@ -142,6 +137,12 @@ class Agent {
         params,
         schema,
         (err, args) => t.callback(args)
+      );
+    }
+    if (this._config._bashTool) {
+      await this._inner.addBashTool(
+        this._config._bashTool.name,
+        this._config._bashTool.workspaceRoot
       );
     }
     for (const h of this._hooks) {
@@ -167,6 +168,31 @@ class Agent {
   async react(task) {
     if (!this._inner) await this.start();
     return this._inner.react(task);
+  }
+
+  stream(task, onToken) {
+    if (!this._inner) throw new Error('Agent not started. Call start() first.');
+    return this._inner.stream(task, (err, token) => {
+      if (err) {
+        onToken({ type: 'Error', error: err.message || String(err) });
+      } else {
+        onToken(token);
+      }
+    });
+  }
+
+  async streamCollect(task) {
+    const tokens = [];
+    await new Promise((resolve, reject) => {
+      this.stream(task, (token) => {
+        tokens.push(token);
+        if (token.type === 'Done' || token.type === 'Error') {
+          if (token.type === 'Error') reject(new Error(token.error));
+          else resolve();
+        }
+      });
+    });
+    return tokens;
   }
 
   get tools() {
@@ -458,6 +484,28 @@ module.exports = {
   Callable: CallableServer,
   McpClient,
   version: getVersion,
+  initTracing,
+  logTestMessage,
+  HookEvent,
+  HookDecision,
+  HookContextData,
+  HookRegistry,
+};
+
+export {
+  BrainOS,
+  Agent,
+  tool,
+  ToolDef,
+  BusManager,
+  PublisherWrapper as Publisher,
+  SubscriberWrapper as Subscriber,
+  QueryClient as Query,
+  QueryableServer as Queryable,
+  CallerClient as Caller,
+  CallableServer as Callable,
+  McpClient,
+  getVersion as version,
   initTracing,
   logTestMessage,
   HookEvent,

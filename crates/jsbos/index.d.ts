@@ -18,6 +18,7 @@ export declare class Agent {
   registerPlugin(name: string, onLlmRequest?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onLlmResponse?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolCall?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolResult?: (((err: Error | null, arg: JSAny) => any)) | undefined | null): void
   close(): void
   addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => any)): Promise<string>
+  addBashTool(name: string, workspaceRoot?: string | undefined | null): Promise<void>
   registerSkillsFromDir(dirPath: string): Promise<void>
   addMcpServer(namespace: string, command: string, args: Array<string>): Promise<void>
   addMcpServerHttp(namespace: string, url: string): Promise<void>
@@ -30,6 +31,7 @@ export declare class Agent {
   getMessages(): Array<any>
   saveMessageLog(path: string): void
   restoreMessageLog(path: string): void
+  stream(task: string, callback: ((err: Error | null, arg: any) => any)): Promise<void>
 }
 
 export declare class AgentCallableServer {

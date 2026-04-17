@@ -1,0 +1,98 @@
+/**
+ * Type declarations for brainos.js high-level API
+ */
+
+export class BrainOS {
+  constructor(options?: { apiKey?: string; baseUrl?: string; model?: string });
+  start(): Promise<this>;
+  stop(): Promise<void>;
+  agent(name?: string, options?: object): Agent;
+  get bus(): unknown;
+}
+
+export class Agent {
+  constructor(bus: unknown, options?: object);
+  withModel(model: string): Agent;
+  withPrompt(prompt: string): Agent;
+  withPrompt(prompt: string): Agent;
+  withTemperature(temp: number): Agent;
+  withTimeout(secs: number): Agent;
+  withTools(...tools: ToolDef[]): Agent;
+  withBashTool(name?: string, workspaceRoot?: string | null): Agent;
+  register(toolDef: ToolDef): Agent;
+  registerMany(...tools: ToolDef[]): Agent;
+  onHook(event: number, callback: Function): Agent;
+  start(): Promise<this>;
+  ask(question: string): Promise<string>;
+  chat(message: string): Promise<string>;
+  runSimple(message: string): Promise<string>;
+  react(task: string): Promise<string>;
+  stream(task: string, onToken: (token: unknown) => void): void;
+  streamCollect(task: string): Promise<unknown[]>;
+  get tools(): string[];
+  get config(): object;
+  get _inner(): unknown;
+}
+
+export class ToolDef {
+  constructor(
+    name: string,
+    description: string,
+    callback: (args: unknown) => unknown,
+    parameters?: object,
+    schema?: object
+  );
+  name: string;
+  description: string;
+  parameters: object;
+  schema: object;
+  callback: (args: unknown) => unknown;
+}
+
+export function tool(description: string, options?: { schema?: object; parameters?: object }): MethodDecorator;
+
+export class BusManager {
+  constructor(options?: object);
+  static create(options?: object): Promise<BusManager>;
+  start(): Promise<this>;
+  stop(): Promise<void>;
+  async publishText(topic: string, payload: string): Promise<void>;
+  async publishJson(topic: string, data: object): Promise<void>;
+  async createPublisher(topic: string): Promise<unknown>;
+  async createSubscriber(topic: string): Promise<unknown>;
+  async createQuery(topic: string): Promise<unknown>;
+  async createQueryable(topic: string, handler?: Function): Promise<unknown>;
+  async createCaller(name: string): Promise<unknown>;
+  async createCallable(uri: string, handler?: Function): Promise<unknown>;
+}
+
+export class McpClient {
+  static spawn(command: string, args: string[]): Promise<McpClient>;
+  static connectHttp(url: string): McpClient;
+  initialize(): Promise<any>;
+  listTools(): Promise<any[]>;
+  callTool(name: string, argsJson: string): Promise<any>;
+  listPrompts(): Promise<any[]>;
+  listResources(): Promise<any[]>;
+  readResource(uri: string): Promise<any>;
+}
+
+export const HookEvent: {
+  BeforeToolCall: number;
+  AfterToolCall: number;
+  BeforeLlmCall: number;
+  AfterLlmCall: number;
+  OnMessage: number;
+  OnComplete: number;
+  OnError: number;
+};
+
+export const HookDecision: {
+  Continue: number;
+  Abort: number;
+  Error: number;
+};
+
+export function version(): string;
+export function initTracing(): void;
+export function logTestMessage(message: string): void;

@@ -26,6 +26,16 @@ pub enum HookDecision {
   Error,
 }
 
+impl From<HookDecision> for agent::agent::hooks::HookDecision {
+  fn from(src: HookDecision) -> Self {
+    match src {
+      HookDecision::Continue => agent::agent::hooks::HookDecision::Continue,
+      HookDecision::Abort => agent::agent::hooks::HookDecision::Abort,
+      HookDecision::Error => agent::agent::hooks::HookDecision::Error(String::new()),
+    }
+  }
+}
+
 #[napi(object)]
 pub struct HookContextData {
   pub agent_id: String,

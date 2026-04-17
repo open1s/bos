@@ -344,6 +344,7 @@ impl ReactLlmTrait for AgentLlmAdapter {
 struct PluginLlmAdapter {
     inner: AgentLlmAdapter,
     plugins: PluginRegistry,
+    #[allow(dead_code)]
     agent_id: String,
 }
 
@@ -2357,11 +2358,12 @@ mod message_log_tests {
     }
 }
 
+#[cfg(test)]
 mod hook_tests {
     use super::*;
     use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent};
     use async_trait::async_trait;
-    use react::llm::{LlmMessage, LlmResponse, LlmResponseResult, StreamToken};
+    use react::llm::{LlmResponse, LlmResponseResult, StreamToken};
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 

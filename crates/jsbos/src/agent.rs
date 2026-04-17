@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
 use crate::plugin::PluginRegistry;
+use agent::BashTool;
 
 struct JSTool {
   name: String,
@@ -391,11 +392,25 @@ impl Agent {
       schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
       callback: callback.into(),
     };
+let mut guard = self.inner.lock().await;
+    guard
+        .try_add_tool(std::sync::Arc::new(tool))
+        .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    Ok(name)
+  }
+
+  #[napi]
+  pub async fn add_bash_tool(&self, name: String, workspace_root: Option<String>) -> Result<()> {
+    let tool = if let Some(root) = workspace_root {
+      BashTool::new(&name).with_workspace(&root)
+    } else {
+      BashTool::new(&name)
+    };
     let mut guard = self.inner.lock().await;
     guard
-      .try_add_tool(std::sync::Arc::new(tool))
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
-    Ok(name)
+        .try_add_tool(std::sync::Arc::new(tool))
+        .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    Ok(())
   }
 
   #[napi]
@@ -690,13 +705,61 @@ impl Agent {
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
-  #[napi]
-  pub fn restore_message_log(&self, path: String) -> Result<()> {
+#[napi]
+pub fn restore_message_log(&self, path: String) -> Result<()> {
     let mut guard = self.inner.blocking_lock();
     guard
-      .restore_message_log(&path)
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
-  }
+        .restore_message_log(&path)
+        .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+}
+
+#[napi]
+pub async fn stream(
+    &self,
+    task: String,
+    callback: ThreadsafeFunction<serde_json::Value>,
+) -> Result<()> {
+    let agent = {
+        let guard = self.inner.lock().await;
+        guard.clone()
+    };
+
+    let stream = agent.stream(&task);
+    use futures::stream::StreamExt;
+
+    futures::pin_mut!(stream);
+    while let Some(token_result) = stream.next().await {
+        match token_result {
+            Ok(token) => {
+                let json = match token {
+                    agent::StreamToken::Text(text) => {
+                        serde_json::json!({ "type": "Text", "text": text })
+                    }
+                    agent::StreamToken::ToolCall { name, args, id } => {
+                        serde_json::json!({
+                            "type": "ToolCall",
+                            "name": name,
+                            "args": args,
+                            "id": id
+                        })
+                    }
+                    agent::StreamToken::Done => {
+                        serde_json::json!({ "type": "Done" })
+                    }
+                };
+                callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+            Err(e) => {
+                let json = serde_json::json!({
+                    "type": "Error",
+                    "error": e.to_string()
+                });
+                callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }
+    }
+    Ok(())
+}
 }
 
 #[napi]

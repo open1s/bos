@@ -1,8 +1,9 @@
 {
   "name": "@open1s/jsbos",
   "version": "1.0.0",
-  "description": "Template project for writing node package with napi-rs",
-  "main": "index.js",
+  "description": "BrainOS JavaScript bindings - AI agent framework with ReAct engine",
+  "main": "brainos.js",
+  "types": "index.d.ts",
   "repository": {
     "type": "git",
     "url": "git+ssh://git@github.com/napi-rs/package-template.git"
@@ -14,11 +15,16 @@
     "N-API",
     "Rust",
     "node-addon",
-    "node-addon-api"
+    "node-addon-api",
+    "ai",
+    "agent",
+    "react"
   ],
   "files": [
     "index.d.ts",
-    "index.js"
+    "index.js",
+    "brainos.js",
+    "jsbos.darwin-arm64.node"
   ],
   "napi": {
     "binaryName": "jsbos",

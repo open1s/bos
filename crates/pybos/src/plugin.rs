@@ -251,6 +251,7 @@ pub struct PyAgentPlugin {
 }
 
 impl PyAgentPlugin {
+    #[allow(dead_code)]
     fn to_inner(self: Arc<Self>) -> Arc<dyn InnerPlugin> {
         self.inner.clone()
     }

@@ -4,7 +4,7 @@ use agent::{
     Agent, AgentCallableServer, AgentConfig, AgentRpcClient, CircuitBreakerConfig, LlmMessage,
     RateLimiterConfig, StreamToken, Tool, ToolDescription,
 };
-use agent::agent::hooks::{AgentHook, HookEvent};
+use agent::agent::hooks::HookEvent;
 use async_trait::async_trait;
 use futures::StreamExt;
 use pyo3::prelude::*;
