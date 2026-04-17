@@ -491,25 +491,3 @@ module.exports = {
   HookContextData,
   HookRegistry,
 };
-
-export {
-  BrainOS,
-  Agent,
-  tool,
-  ToolDef,
-  BusManager,
-  PublisherWrapper as Publisher,
-  SubscriberWrapper as Subscriber,
-  QueryClient as Query,
-  QueryableServer as Queryable,
-  CallerClient as Caller,
-  CallableServer as Callable,
-  McpClient,
-  getVersion as version,
-  initTracing,
-  logTestMessage,
-  HookEvent,
-  HookDecision,
-  HookContextData,
-  HookRegistry,
-};

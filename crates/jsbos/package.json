@@ -1,9 +1,17 @@
 {
   "name": "@open1s/jsbos",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "BrainOS JavaScript bindings - AI agent framework with ReAct engine",
-  "main": "brainos.js",
+  "main": "./brainos.js",
+  "module": "./index.mjs",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./index.mjs",
+      "require": "./brainos.js",
+      "types": "./index.d.ts"
+    }
+  },
   "repository": {
     "type": "git",
     "url": "git+ssh://git@github.com/napi-rs/package-template.git"
@@ -23,6 +31,7 @@
   "files": [
     "index.d.ts",
     "index.js",
+    "index.mjs",
     "brainos.js",
     "jsbos.darwin-arm64.node"
   ],
@@ -108,5 +117,12 @@
     "singleQuote": true,
     "arrowParens": "always"
   },
-  "packageManager": "yarn@4.13.0"
+  "packageManager": "yarn@4.13.0",
+  "optionalDependencies": {
+    "@open1s/jsbos-darwin-x64": "1.0.3",
+    "@open1s/jsbos-linux-x64-gnu": "1.0.3",
+    "@open1s/jsbos-linux-x64-musl": "1.0.3",
+    "@open1s/jsbos-darwin-arm64": "1.0.3",
+    "@open1s/jsbos-linux-arm64-musl": "1.0.3"
+  }
 }
