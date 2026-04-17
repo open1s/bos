@@ -1,4 +1,4 @@
-const { Agent, HookEvent } = require('./index.js');
+const { Agent, HookEvent } = require('../index.js');
 
 async function demo() {
   console.log('=== JSBOS Agent Hook Demo ===\n');

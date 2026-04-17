@@ -1,4 +1,4 @@
-const { BrainOS, HookEvent } = require('./brainos.js');
+const { BrainOS, HookEvent } = require('../brainos.js');
 
 async function demo() {
   console.log('=== JSBOS BrainOS Hook Demo ===\n');

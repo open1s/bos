@@ -4,6 +4,7 @@ use agent::{
     Agent, AgentCallableServer, AgentConfig, AgentRpcClient, CircuitBreakerConfig, LlmMessage,
     RateLimiterConfig, StreamToken, Tool, ToolDescription,
 };
+use agent::agent::hooks::{AgentHook, HookEvent};
 use async_trait::async_trait;
 use futures::StreamExt;
 use pyo3::prelude::*;
@@ -1246,10 +1247,34 @@ impl PyAgent {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
-    fn register_hook(&self, event: crate::hooks::PyHookEvent, callback: Py<PyAny>) -> PyResult<()> {
-        self.hooks.lock().unwrap().register(event, callback);
-        Ok(())
+fn register_hook(&self, event: &Bound<'_, PyAny>, callback: Py<PyAny>) -> PyResult<()> {
+    let hook = crate::hooks::PythonHook {
+        callback: callback.into(),
+    };
+    
+    let event_str = event.getattr("value")
+        .and_then(|v| v.extract::<String>())
+        .or_else(|_| event.extract::<String>())
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("event must be a HookEvent or string"))?;
+    
+    let hook_event = match event_str.as_str() {
+        "BeforeToolCall" => HookEvent::BeforeToolCall,
+        "AfterToolCall" => HookEvent::AfterToolCall,
+        "BeforeLlmCall" => HookEvent::BeforeLlmCall,
+        "AfterLlmCall" => HookEvent::AfterLlmCall,
+        "OnMessage" => HookEvent::OnMessage,
+        "OnComplete" => HookEvent::OnComplete,
+        "OnError" => HookEvent::OnError,
+        _ => HookEvent::OnMessage,
+    };
+    
+    {
+        let mut agent = self.inner.lock().unwrap();
+        agent.add_hook(hook_event, std::sync::Arc::new(hook));
     }
+    
+    Ok(())
+}
 
     fn register_plugin(&self, plugin: pyo3::Py<crate::plugin::PyAgentPlugin>) -> PyResult<()> {
         let plugin_arc = pyo3::Python::attach(

@@ -597,6 +597,8 @@ const tools = await client.listTools();
 
 ## API Reference
 
+For the complete API reference, see [JavaScript API Reference](./api-reference/jsbos-api.md).
+
 ### `BrainOS`
 
 Main entry point for BrainOS.
@@ -945,27 +947,177 @@ main().catch(console.error);
 
 ---
 
-## Error Handling
+## Hooks, Plugins, and Sessions
+
+### Hooks
+
+Hooks allow you to intercept and react to events during agent execution.
+
+#### Using Hooks
+
+```javascript
+const { BrainOS, HookEvent } = require('brainos');
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+  
+  const agent = brain.agent('assistant');
+  
+  // Register hooks
+  agent.hooks().register(HookEvent.BeforeToolCall, (ctx) => {
+    return {
+      toolName: ctx.data.tool_name,
+      decision: 'continue'  // or 'abort' or { decision: 'error', message: 'error message' }
+    };
+  });
+  
+  agent.hooks().register(HookEvent.AfterToolCall, (ctx) => {
+    return {
+      toolName: ctx.data.tool_name,
+      toolResult: ctx.data.tool_result,
+      decision: 'continue'
+    };
+  });
+  
+  agent.hooks().register(HookEvent.BeforeLlmCall, (ctx) => {
+    return {
+      prompt: ctx.data.prompt,
+      decision: 'continue'
+    };
+  });
+  
+  agent.hooks().register(HookEvent.AfterLlmCall, (ctx) => {
+    return {
+      response: ctx.data.response,
+      decision: 'continue'
+    };
+  });
+  
+  agent.hooks().register(HookEvent.OnError, (ctx) => {
+    return {
+      error: ctx.data.error,
+      decision: 'continue'
+    };
+  });
+  
+  const result = await agent.ask('Hello');
+  console.log(result);
+  
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+#### Hook Events
+
+| Event | Description |
+|-------|-------------|
+| `BeforeToolCall` | Fired before a tool is called |
+| `AfterToolCall` | Fired after a tool completes |
+| `BeforeLlmCall` | Fired before LLM API call |
+| `AfterLlmCall` | Fired after LLM API call |
+| `OnMessage` | Fired for each message |
+| `OnComplete` | Fired when agent completes |
+| `OnError` | Fired when an error occurs |
+
+#### Hook Decisions
+
+Return an object to control execution:
+
+| Decision | Description |
+|----------|-------------|
+| `{ decision: 'continue' }` | Proceed normally (default) |
+| `{ decision: 'abort' }` | Abort current operation |
+| `{ decision: 'error', message: 'error message' }` | Return an error |
+
+### Plugins
+
+Plugins allow you to preprocess and postprocess LLM requests and responses.
+
+#### Using Plugins
+
+```javascript
+const { BrainOS } = require('brainos');
+
+class MyPlugin {
+  async processLlmRequest(wrapper) {
+    // Modify request before sending to LLM
+    // Example: add system prompt prefix
+    const request = wrapper.intoRequest();
+    // Modify request here
+    return wrapper.constructor(request);
+  }
+  
+  async processLlmResponse(wrapper) {
+    // Modify response after receiving from LLM
+    const response = wrapper.intoResponse();
+    // Modify response here
+    return wrapper.constructor(response);
+  }
+}
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+  
+  const agent = brain.agent('assistant');
+  
+  // Register plugin
+  agent.plugins().registerBlocking(new MyPlugin());
+  
+  const result = await agent.ask('Hello');
+  console.log(result);
+  
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+### Session Management
+
+BrainOS provides session management for persisting agent state across restarts.
+
+#### Session Operations
 
 ```javascript
 const { BrainOS } = require('brainos');
 
 async function main() {
-  try {
-    const brain = new BrainOS();
-    await brain.start();
-    
-    const agent = brain.agent('assistant');
-    const result = await agent.ask('Hello');
-    
-    await brain.stop();
-  } catch (e) {
-    console.error('Runtime error:', e.message);
-  }
+  const brain = new BrainOS();
+  await brain.start();
+  
+  const agent = brain.agent('assistant');
+  
+  // Save session
+  agent.saveMessageLog('/tmp/session.json');
+  
+  // Later, restore session
+  // agent.restoreMessageLog('/tmp/session.json');
+  
+  const result = await agent.ask('Hello');
+  console.log(result);
+  
+  await brain.stop();
 }
 
 main().catch(console.error);
 ```
+
+#### Session Info Methods
+
+| Method | Description |
+|--------|-------------|
+| `addMessage(message)` | Add message to conversation log |
+| `getMessages()` | Get conversation messages |
+| `saveMessageLog(path)` | Save message log to file |
+| `restoreMessageLog(path)` | Restore message log from file |
+
+---
+
+## Error Handling
 
 ---
 

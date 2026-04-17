@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use react::llm::LlmContext;
 use std::sync::Arc;
 
-#[pyclass(name = "LlmRequestWrapper")]
+#[pyclass(name = "LlmRequestWrapper", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyLlmRequestWrapper {
     #[pyo3(get, set)]
@@ -51,7 +51,7 @@ impl From<PyLlmRequestWrapper> for InnerLlmRequest {
     }
 }
 
-#[pyclass(name = "LlmResponseWrapper")]
+#[pyclass(name = "LlmResponseWrapper", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyLlmResponseWrapper {
     #[pyo3(get, set)]
@@ -118,7 +118,7 @@ impl From<PyLlmResponseWrapper> for InnerLlmResponse {
     }
 }
 
-#[pyclass(name = "ToolCallWrapper")]
+#[pyclass(name = "ToolCallWrapper", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyToolCallWrapper {
     #[pyo3(get, set)]
@@ -150,7 +150,7 @@ impl From<PyToolCallWrapper> for InnerToolCall {
     }
 }
 
-#[pyclass(name = "ToolResultWrapper")]
+#[pyclass(name = "ToolResultWrapper", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyToolResultWrapper {
     #[pyo3(get, set)]

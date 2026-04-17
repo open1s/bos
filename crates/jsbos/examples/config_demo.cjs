@@ -59,17 +59,18 @@ function demoInlineOverride() {
 
 function demoReload() {
   console.log('═'.repeat(60));
-  console.log('  Demo 3 — Config reload');
+  console.log(' Demo 3 — Config reload');
   console.log('═'.repeat(60));
 
   const cfg = new ConfigLoader();
   cfg.addInline({ version: 1 });
-  console.log(`  📄 Initial: ${cfg.loadSync()}`);
+  const initial = JSON.parse(cfg.loadSync());
+  console.log(` 📄 Initial: ${JSON.stringify(initial)}`);
 
   cfg.reset();
   cfg.addInline({ version: 2, new_key: 'added' });
-  const reloaded = JSON.parse(cfg.reloadSync());
-  console.log(`  📄 After reload: ${JSON.stringify(reloaded)}`);
+  const reloaded = JSON.parse(cfg.loadSync());
+  console.log(` 📄 After reload: ${JSON.stringify(reloaded)}`);
   console.log();
 }
 

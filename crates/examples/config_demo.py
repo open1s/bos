@@ -54,17 +54,18 @@ def demo_inline_override():
 
 def demo_reload():
     print("═" * 60)
-    print("  Demo 3 — Config reload")
+    print(" Demo 3 — Config reload")
     print("═" * 60)
 
     cfg = Config()
     cfg.add_inline({"version": 1})
-    print(f"  📄 Initial: {cfg.load_sync()}")
+    initial = cfg.load_sync()
+    print(f" 📄 Initial: {initial}")
 
     cfg.reset()
     cfg.add_inline({"version": 2, "new_key": "added"})
-    reloaded = cfg.reload_sync()
-    print(f"  📄 After reload: {reloaded}")
+    reloaded = cfg.load_sync()
+    print(f" 📄 After reload: {reloaded}")
     print()
 
 

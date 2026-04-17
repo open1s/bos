@@ -2,7 +2,7 @@ const {
   Agent, 
   HookEvent, 
   ConfigLoader,
-} = require('./index.js');
+} = require('../index.js');
 
 
 async function loadConfig() {

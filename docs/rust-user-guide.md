@@ -382,6 +382,8 @@ let config = loader.load_sync()?;
 
 ## API Reference
 
+For the complete API reference, see [Rust API Reference](./api-reference/rust-api.md).
+
 ### `Agent`
 
 LLM-powered agent with tool support.
@@ -703,18 +705,206 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Error Handling
+## Hooks, Plugins, and Sessions
+
+### Hooks
+
+Hooks allow you to intercept and react to events during agent execution.
+
+#### Using Hooks
 
 ```rust
-use agent::AgentError;
+use agent::{Agent, AgentConfig, HookEvent};
+use agent::hooks::{HookContext, HookDecision, HookRegistry};
+use std::sync::Arc;
 
-match agent.run_simple("Hello").await {
-    Ok(result) => println!("{}", result),
-    Err(AgentError::Llm(e)) => println!("LLM error: {}", e),
-    Err(AgentError::Tool(e)) => println!("Tool error: {}", e),
-    Err(e) => println!("Error: {}", e),
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::default()
+        .name("assistant")
+        .model("gpt-4");
+    
+    let mut registry = agent::tools::ToolRegistry::new();
+    // Add your tools here
+    
+    let mut agent = Agent::builder()
+        .config(config)
+        .registry(registry)
+        .build()?;
+    
+    // Register hooks
+    agent.hooks().register(HookEvent::BeforeToolCall, |ctx| {
+        let tool_name = ctx.get::<String>("tool_name").unwrap_or_default();
+        println!("Before tool call: {}", tool_name);
+        HookDecision::Continue
+    });
+    
+    agent.hooks().register(HookEvent::AfterToolCall, |ctx| {
+        let tool_name = ctx.get::<String>("tool_name").unwrap_or_default();
+        let tool_result = ctx.get::<String>("tool_result").unwrap_or_default();
+        println!("After tool call: {} = {}", tool_name, tool_result);
+        HookDecision::Continue
+    });
+    
+    agent.hooks().register(HookEvent::BeforeLlmCall, |ctx| {
+        let prompt = ctx.get::<String>("prompt").unwrap_or_default();
+        println!("Before LLM call: {}", prompt);
+        HookDecision::Continue
+    });
+    
+    agent.hooks().register(HookEvent::AfterLlmCall, |ctx| {
+        let response = ctx.get::<String>("response").unwrap_or_default();
+        println!("After LLM call: {}", response);
+        HookDecision::Continue
+    });
+    
+    agent.hooks().register(HookEvent::OnError, |ctx| {
+        let error = ctx.get::<String>("error").unwrap_or_default();
+        println!("Error: {}", error);
+        HookDecision::Continue
+    });
+    
+    let result = agent.run_simple("Hello").await?;
+    println!("{}", result);
+    
+    Ok(())
 }
 ```
+
+#### Hook Events
+
+| Event | Description |
+|-------|-------------|
+| `BeforeToolCall` | Fired before a tool is called |
+| `AfterToolCall` | Fired after a tool completes |
+| `BeforeLlmCall` | Fired before LLM API call |
+| `AfterLlmCall` | Fired after LLM API call |
+| `OnMessage` | Fired for each message |
+| `OnComplete` | Fired when agent completes |
+| `OnError` | Fired when an error occurs |
+
+#### Hook Context
+
+Store and retrieve data for hook callbacks:
+
+| Method | Description |
+|--------|-------------|
+| `HookContext::new(agent_id: &str) -> HookContext` | Create new context |
+| `set<T: ToString>(&mut self, key: &str, value: &T) -> &mut Self` | Set a value |
+| `get<T: FromStr>(&self, key: &str) -> Option<T>` | Get a value |
+| `remove(&mut self, key: &str) -> Option<String>` | Remove a value |
+
+#### Hook Decisions
+
+Control execution flow:
+
+| Decision | Description |
+|----------|-------------|
+| `HookDecision::Continue` | Proceed normally |
+| `HookDecision::Abort` | Abort current operation |
+| `HookDecision::Error(msg: String)` | Return an error |
+
+### Plugins
+
+Plugins allow you to preprocess and postprocess LLM requests and responses.
+
+#### Using Plugins
+
+```rust
+use agent::{Agent, AgentConfig};
+use agent::plugin::{AgentPlugin, LlmRequestWrapper, LlmResponseWrapper};
+use async_trait::async_trait;
+use std::sync::Arc;
+
+struct MyPlugin;
+
+#[async_trait]
+impl AgentPlugin for MyPlugin {
+    async fn process_llm_request(&self, wrapper: LlmRequestWrapper) -> LlmRequestWrapper {
+        // Modify request before sending to LLM
+        // Example: add system prompt prefix
+        wrapper
+    }
+    
+    async fn process_llm_response(&self, wrapper: LlmResponseWrapper) -> LlmResponseWrapper {
+        // Modify response after receiving from LLM
+        wrapper
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::default()
+        .name("assistant")
+        .model("gpt-4");
+    
+    let mut registry = agent::tools::ToolRegistry::new();
+    // Add your tools here
+    
+    let mut agent = Agent::builder()
+        .config(config)
+        .registry(registry)
+        .build()?;
+    
+    // Register plugin
+    agent.plugins().register_blocking(Arc::new(MyPlugin()));
+    
+    let result = agent.run_simple("Hello").await?;
+    println!("{}", result);
+    
+    Ok(())
+}
+```
+
+### Session Management
+
+BrainOS provides session management for persisting agent state across restarts.
+
+#### Session Operations
+
+```rust
+use agent::{Agent, AgentConfig};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::default()
+        .name("assistant")
+        .model("gpt-4");
+    
+    let mut registry = agent::tools::ToolRegistry::new();
+    // Add your tools here
+    
+    let mut agent = Agent::builder()
+        .config(config)
+        .registry(registry)
+        .build()?;
+    
+    // Save session
+    agent.save_message_log("/tmp/session.json")?;
+    
+    // Later, restore session
+    // agent.restore_message_log("/tmp/session.json")?;
+    
+    let result = agent.run_simple("Hello").await?;
+    println!("{}", result);
+    
+    Ok(())
+}
+```
+
+#### Session Info Methods
+
+| Method | Description |
+|--------|-------------|
+| `add_message(&mut self, message: LlmMessage)` | Add message to conversation log |
+| `get_messages(&self) -> Vec<LlmMessage>` | Get conversation messages |
+| `save_message_log(&self, path: &str) -> Result<(), AgentError>` | Save message log to file |
+| `restore_message_log(&mut self, path: &str) -> Result<(), AgentError>` | Restore message log from file |
+
+---
+
+## Error Handling
 
 ---
 

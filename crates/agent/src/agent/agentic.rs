@@ -1,4 +1,4 @@
-use crate::agent::hooks::{HookContext, HookDecision, HookEvent, HookRegistry};
+use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
 use crate::agent::plugin::{
     AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, PluginRegistry, StreamTokenWrapper,
     ToolCallWrapper, ToolResultWrapper,
@@ -1705,6 +1705,10 @@ impl Agent {
 
     pub fn add_plugin(&mut self, plugin: Arc<dyn AgentPlugin>) {
         self.plugins.register_blocking(plugin);
+    }
+
+    pub fn add_hook(&mut self, event: HookEvent, hook: Arc<dyn AgentHook>) {
+        self.hooks.register_blocking(event, hook);
     }
 
     /// Clear runtime extensions (tools, hooks, plugins).

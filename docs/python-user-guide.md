@@ -382,7 +382,155 @@ data = config.load_sync()
 
 ---
 
+## Hooks, Plugins, and Sessions
+
+### Hooks
+
+Hooks allow you to intercept and react to events during agent execution.
+
+#### Using Hooks
+
+```python
+from brainos import BrainOS, HookEvent
+import asyncio
+
+async def main():
+    async with BrainOS() as brain:
+        agent = brain.agent("assistant")
+        
+        # Register hooks
+        agent.hooks().register(HookEvent.BeforeToolCall, lambda ctx: {
+            "tool_name": ctx.get("tool_name"),
+            "decision": "continue"  # or "abort" or {"error": "message"}
+        })
+        
+        agent.hooks().register(HookEvent.AfterToolCall, lambda ctx: {
+            "tool_name": ctx.get("tool_name"),
+            "tool_result": ctx.get("tool_result"),
+            "decision": "continue"
+        })
+        
+        agent.hooks().register(HookEvent.BeforeLlmCall, lambda ctx: {
+            "prompt": ctx.get("prompt"),
+            "decision": "continue"
+        })
+        
+        agent.hooks().register(HookEvent.AfterLlmCall, lambda ctx: {
+            "response": ctx.get("response"),
+            "decision": "continue"
+        })
+        
+        agent.hooks().register(HookEvent.OnError, lambda ctx: {
+            "error": ctx.get("error"),
+            "decision": "continue"
+        })
+        
+        result = await agent.react("Say hello!")
+        print(result)
+
+asyncio.run(main())
+```
+
+#### Hook Events
+
+| Event | Description |
+|-------|-------------|
+| `BeforeToolCall` | Fired before a tool is called |
+| `AfterToolCall` | Fired after a tool completes |
+| `BeforeLlmCall` | Fired before LLM API call |
+| `AfterLlmCall` | Fired after LLM API call |
+| `OnMessage` | Fired for each message |
+| `OnComplete` | Fired when agent completes |
+| `OnError` | Fired when an error occurs |
+
+#### Hook Decisions
+
+Return a dict to control execution:
+
+| Decision | Description |
+|----------|-------------|
+| `{"decision": "continue"}` | Proceed normally (default) |
+| `{"decision": "abort"}` | Abort current operation |
+| `{"decision": "error", "message": "error message"}` | Return an error |
+
+### Plugins
+
+Plugins allow you to preprocess and postprocess LLM requests and responses.
+
+#### Using Plugins
+
+```python
+from brainos import BrainOS
+from brainos.plugin import AgentPlugin
+import asyncio
+
+class MyPlugin(AgentPlugin):
+    async def process_llm_request(self, wrapper):
+        # Modify request before sending to LLM
+        # Example: add system prompt prefix
+        request = wrapper.into_request()
+        # Modify request here
+        return wrapper.__class__(request)
+    
+    async def process_llm_response(self, wrapper):
+        # Modify response after receiving from LLM
+        response = wrapper.into_response()
+        # Modify response here
+        return wrapper.__class__(response)
+
+async def main():
+    async with BrainOS() as brain:
+        agent = brain.agent("assistant")
+        
+        # Register plugin
+        agent.plugins().register_blocking(MyPlugin())
+        
+        result = await agent.react("Say hello!")
+        print(result)
+
+asyncio.run(main())
+```
+
+### Session Management
+
+BrainOS provides session management for persisting agent state across restarts.
+
+#### Session Operations
+
+```python
+from brainos import BrainOS
+import asyncio
+
+async def main():
+    async with BrainOS() as brain:
+        agent = brain.agent("assistant")
+        
+        # Save session
+        agent.save_message_log("/tmp/session.json")
+        
+        # Later, restore session
+        # agent.restore_message_log("/tmp/session.json")
+        
+        result = await agent.react("Say hello!")
+        print(result)
+
+asyncio.run(main())
+```
+
+#### Session Info Methods
+
+| Method | Description |
+|--------|-------------|
+| `add_message(message)` | Add message to conversation log |
+| `get_messages()` | Get conversation messages |
+| `save_message_log(path)` | Save message log to file |
+| `restore_message_log(path)` | Restore message log from file |
+
+---
+
 ## API Reference
+
+For the complete API reference, see [Python API Reference](./api-reference/pybos-api.md).
 
 ### `BrainOS`
 

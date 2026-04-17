@@ -7,37 +7,44 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[pyclass(name = "HookEvent")]
+#[pyclass(name = "HookEvent", from_py_object)]
 #[derive(Clone)]
-pub struct PyHookEvent(String);
+pub struct PyHookEvent {
+    pub value: String,
+}
 
 #[pymethods]
 impl PyHookEvent {
     #[new]
     fn new(value: String) -> Self {
-        Self(value)
+        Self { value }
     }
 
     fn __str__(&self) -> String {
-        self.0.clone()
+        self.value.clone()
     }
 
     fn __eq__(&self, other: &PyHookEvent) -> bool {
-        self.0 == other.0
+        self.value == other.value
     }
 
     fn __hash__(&self) -> isize {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
-        self.0.hash(&mut hasher);
+        self.value.hash(&mut hasher);
         hasher.finish() as isize
+    }
+
+    #[getter]
+    fn value(&self) -> String {
+        self.value.clone()
     }
 }
 
 impl From<PyHookEvent> for InnerEvent {
     fn from(e: PyHookEvent) -> Self {
-        match e.0.as_str() {
+        match e.value.as_str() {
             "BeforeToolCall" => InnerEvent::BeforeToolCall,
             "AfterToolCall" => InnerEvent::AfterToolCall,
             "BeforeLlmCall" => InnerEvent::BeforeLlmCall,
@@ -61,11 +68,11 @@ impl From<InnerEvent> for PyHookEvent {
             InnerEvent::OnComplete => "OnComplete",
             InnerEvent::OnError => "OnError",
         };
-        PyHookEvent(s.to_string())
+        Self { value: s.to_string() }
     }
 }
 
-#[pyclass(name = "HookDecision")]
+#[pyclass(name = "HookDecision", from_py_object)]
 #[derive(Clone)]
 pub struct PyHookDecision(String, Option<String>);
 
@@ -94,7 +101,7 @@ impl From<InnerDecision> for PyHookDecision {
     }
 }
 
-#[pyclass(name = "HookContext")]
+#[pyclass(name = "HookContext", from_py_object)]
 #[derive(Clone)]
 pub struct PyHookContext {
     #[pyo3(get, set)]
@@ -122,8 +129,8 @@ impl PyHookContext {
     }
 }
 
-struct PythonHook {
-    callback: Arc<Py<PyAny>>,
+pub(crate) struct PythonHook {
+    pub(crate) callback: Arc<Py<PyAny>>,
 }
 
 #[async_trait]
