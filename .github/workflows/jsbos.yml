@@ -35,10 +35,10 @@ jobs:
             build: yarn build
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-            build: yarn build --target x86_64-unknown-linux-musl --use-napi-cross
+            build: yarn build --target x86_64-unknown-linux-musl -x
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest-arm
-            build: yarn build --target aarch64-unknown-linux-musl --use-napi-cross
+            build: yarn build --target aarch64-unknown-linux-musl -x
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -60,6 +60,10 @@ jobs:
 
       - name: Install dependencies
         run: yarn install
+
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        run: cargo install cargo-zigbuild
 
       - name: Build
         run: ${{ matrix.build }}
