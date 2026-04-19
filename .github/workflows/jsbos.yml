@@ -86,7 +86,7 @@ jobs:
       - name: Setup node
         uses: actions/setup-node@v6
         with:
-          node-version: 24
+          node-version: 20
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
       - name: Install dependencies
@@ -96,8 +96,8 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v6
         with:
-          path: artifacts
-      - name: Move artifacts
+          path: crates/jsbos/artifacts
+      - name: Create npm artifacts
         run: yarn artifacts
       - name: List packages
         run: ls -R ./npm
