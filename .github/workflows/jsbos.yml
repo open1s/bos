@@ -70,7 +70,7 @@ jobs:
           path: crates/jsbos/*.node
           retention-days: 7
 
-publish:
+  publish:
     name: Publish
     runs-on: ubuntu-latest
     permissions:
