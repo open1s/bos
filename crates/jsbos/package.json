@@ -116,12 +116,4 @@
     "trailingComma": "all",
     "singleQuote": true,
     "arrowParens": "always"
-  },
-  "optionalDependencies": {
-    "@open1s/jsbos-darwin-x64": "1.0.3",
-    "@open1s/jsbos-linux-x64-gnu": "1.0.3",
-    "@open1s/jsbos-linux-x64-musl": "1.0.3",
-    "@open1s/jsbos-darwin-arm64": "1.0.3",
-    "@open1s/jsbos-linux-arm64-musl": "1.0.3"
   }
-}

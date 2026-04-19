@@ -53,7 +53,7 @@ jobs:
           cache-dependency-path: crates/jsbos/yarn.lock
 
       - name: Install dependencies
-        run: yarn install --ignore-optional
+        run: yarn install
 
       - name: Build
         run: |
@@ -97,7 +97,7 @@ jobs:
           cache-dependency-path: crates/jsbos/yarn.lock
           architecture: ${{ matrix.settings.architecture }}
       - name: Install dependencies
-        run: yarn install --ignore-optional
+        run: yarn install
       - name: Download artifacts
         uses: actions/download-artifact@v6
         with:
@@ -138,7 +138,7 @@ jobs:
           cache-dependency-path: crates/jsbos/yarn.lock
           architecture: ${{ matrix.settings.architecture }}
       - name: Install dependencies
-        run: yarn install --ignore-optional
+        run: yarn install
       - name: Download artifacts
         uses: actions/download-artifact@v6
         with:
@@ -197,7 +197,7 @@ jobs:
         run: |
           yarn config set --json supportedArchitectures.cpu '["current", "arm64", "x64", "arm"]'
           yarn config set --json supportedArchitectures.libc '["current", "musl", "gnu"]'
-          yarn install --ignore-optional
+          yarn install
       - name: Download artifacts
         uses: actions/download-artifact@v6
         with:
@@ -239,7 +239,7 @@ jobs:
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
       - name: Install dependencies
-        run: yarn install --ignore-optional
+        run: yarn install
       - name: create npm dirs
         run: yarn napi create-npm-dirs
       - name: Download all artifacts
