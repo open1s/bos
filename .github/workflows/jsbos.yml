@@ -57,6 +57,9 @@ jobs:
           corepack enable
           yarn install
 
+      - name: Activate Yarn 4
+        run: corepack prepare yarn@4.13.0 --activate
+
       - name: Build
         run: |
           cd crates/jsbos
@@ -101,6 +104,8 @@ jobs:
           architecture: ${{ matrix.settings.architecture }}
       - name: Enable Corepack
         run: corepack enable
+      - name: Activate Yarn 4
+        run: corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
         run: yarn install
       - name: Download artifacts
@@ -144,6 +149,8 @@ jobs:
           architecture: ${{ matrix.settings.architecture }}
       - name: Enable Corepack
         run: corepack enable
+      - name: Activate Yarn 4
+        run: corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
         run: yarn install
       - name: Download artifacts
@@ -183,7 +190,8 @@ jobs:
           cache-dependency-path: crates/jsbos/yarn.lock
       - name: Enable Corepack
         run: corepack enable
-
+      - name: Activate Yarn 4
+        run: corepack prepare yarn@4.13.0 --activate
       - name: Output docker params
         id: docker
         run: |
@@ -250,6 +258,8 @@ jobs:
           cache-dependency-path: crates/jsbos/yarn.lock
       - name: Enable Corepack
         run: corepack enable
+      - name: Activate Yarn 4
+        run: corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
         run: yarn install
       - name: create npm dirs
