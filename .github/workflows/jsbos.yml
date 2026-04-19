@@ -13,7 +13,60 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
+  build:
+    name: Build bindings for ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest-arm
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: ./crates/jsbos
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: yarn
+          cache-dependency-path: crates/jsbos/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build
+        run: |
+          cd crates/jsbos
+          npm_config_target_mtriple=${{ matrix.target }} yarn build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v8
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/jsbos/*.node
+          retention-days: 7
+
   build-windows_binding:
     name: Test bindings on ${{ matrix.settings.target }} - node@${{ matrix.node }}
     needs:
@@ -175,8 +228,8 @@ jobs:
       id-token: write
     needs:
       - build-windows_binding
-      - build-macOS-binding
-      - build-linux-binding
+      - build-macOS_binding
+      - test-linux-binding
     steps:
       - uses: actions/checkout@v6
       - name: Setup node
