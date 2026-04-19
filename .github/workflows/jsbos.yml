@@ -40,6 +40,9 @@ jobs:
       - name: Clippy
         run: cargo clippy
   build:
+    defaults:
+      run:
+        working-directory: ./crates/jsbos
     strategy:
       fail-fast: false
       matrix:
@@ -76,9 +79,6 @@ jobs:
             build: yarn build --target aarch64-pc-windows-msvc
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
-    defaults:
-      run:
-        working-directory: ./crates/jsbos
     steps:
       - uses: actions/checkout@v6
       - name: Setup node
