@@ -57,11 +57,9 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 20
-          cache: yarn
-          cache-dependency-path: crates/jsbos/yarn.lock
 
       - name: Install dependencies
-        run: yarn install
+        run: yarn install --no-cache
 
       - name: Build
         run: ${{ matrix.build }}
@@ -103,8 +101,6 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-          cache: yarn
-          cache-dependency-path: crates/jsbos/yarn.lock
           architecture: ${{ matrix.architecture }}
       - name: Install dependencies
         run: yarn install
@@ -144,8 +140,6 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-          cache: yarn
-          cache-dependency-path: crates/jsbos/yarn.lock
       - name: Install dependencies
         run: yarn install
       - name: Download artifacts
@@ -181,8 +175,6 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 20
-          cache: yarn
-          cache-dependency-path: crates/jsbos/yarn.lock
       - name: Install dependencies
         run: yarn install
       - name: create npm dirs
