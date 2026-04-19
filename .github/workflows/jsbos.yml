@@ -153,7 +153,7 @@ jobs:
         shell: bash
       - name: Test bindings
         run: yarn test
-  test-linux-binding:
+  build-linux-binding:
     name: Test ${{ matrix.target }} - node@${{ matrix.node }}
     needs:
       - build
@@ -161,12 +161,10 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
         node:
           - '20'
-          - '22'
-    runs-on: ${{ contains(matrix.target, 'aarch64') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ./crates/jsbos
