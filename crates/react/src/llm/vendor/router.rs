@@ -79,7 +79,7 @@ impl LlmClient for LlmRouter {
     }
 
     fn supports_tools(&self) -> bool {
-        false
+        true
     }
     fn provider_name(&self) -> &'static str {
         "llm-router"

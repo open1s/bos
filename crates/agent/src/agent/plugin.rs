@@ -219,6 +219,11 @@ pub trait AgentPlugin: Send + Sync + 'static {
         let _ = tool_result;
         None
     }
+
+    async fn on_stream_token(&self, token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
+        let _ = token;
+        None
+    }
 }
 
 #[derive(Default, Clone)]
@@ -329,33 +334,17 @@ impl PluginRegistry {
         let plugins = self.plugins().await;
         for plugin in plugins {
             let plugin_name = plugin.name().to_string();
-            let response = match &token {
-                StreamTokenWrapper::Text(s) => LlmResponseWrapper::Text(s.clone()),
-                StreamTokenWrapper::ToolCall { name, args, id } => LlmResponseWrapper::ToolCall {
-                    name: name.clone(),
-                    args: args.clone(),
-                    id: id.clone(),
-                },
-                StreamTokenWrapper::Done => LlmResponseWrapper::Done,
-            };
-            let result = AssertUnwindSafe(plugin.on_llm_response(response))
+            let result = AssertUnwindSafe(plugin.on_stream_token(token.clone()))
                 .catch_unwind()
                 .await;
             match result {
                 Ok(Some(modified)) => {
-                    token = match modified {
-                        LlmResponseWrapper::Text(s) => StreamTokenWrapper::Text(s),
-                        LlmResponseWrapper::Partial(s) => StreamTokenWrapper::Text(s),
-                        LlmResponseWrapper::ToolCall { name, args, id } => {
-                            StreamTokenWrapper::ToolCall { name, args, id }
-                        }
-                        LlmResponseWrapper::Done => StreamTokenWrapper::Done,
-                    };
+                    token = modified;
                 }
                 Ok(None) => {}
                 Err(_) => {
                     log::warn!(
-                        "Plugin '{}' panicked during stream token processing; skipping",
+                        "Plugin '{}' panicked during on_stream_token; skipping",
                         plugin_name
                     );
                 }
@@ -1000,15 +989,15 @@ mod tests {
             fn name(&self) -> &str {
                 "stream-modifier"
             }
-            async fn on_llm_response(
-                &self,
-                response: LlmResponseWrapper,
-            ) -> Option<LlmResponseWrapper> {
-                if let LlmResponseWrapper::Text(s) = response {
-                    return Some(LlmResponseWrapper::Text(s.replace("hello", "goodbye")));
-                }
-                None
-            }
+    async fn on_stream_token(
+        &self,
+        token: StreamTokenWrapper,
+    ) -> Option<StreamTokenWrapper> {
+        if let StreamTokenWrapper::Text(s) = token {
+            return Some(StreamTokenWrapper::Text(s.replace("hello", "goodbye")));
+        }
+        None
+    }
         }
 
         let registry = PluginRegistry::new();
@@ -1017,9 +1006,81 @@ mod tests {
         let wrapper = StreamTokenWrapper::Text("hello world".to_string());
         let result = registry.process_stream_token(wrapper).await;
 
+    match result {
+        StreamTokenWrapper::Text(s) => assert_eq!(s, "goodbye world"),
+        _ => panic!("expected modified Text"),
+    }
+    }
+
+    #[tokio::test]
+    async fn test_on_stream_token_tool_call() {
+        #[derive(Debug)]
+        struct ToolCallModifier;
+        #[async_trait]
+        impl AgentPlugin for ToolCallModifier {
+            fn name(&self) -> &str {
+                "tool-call-modifier"
+            }
+            async fn on_stream_token(
+                &self,
+                token: StreamTokenWrapper,
+            ) -> Option<StreamTokenWrapper> {
+                if let StreamTokenWrapper::ToolCall { name, args, id } = token {
+                    return Some(StreamTokenWrapper::ToolCall {
+                        name: format!("modified_{}", name),
+                        args,
+                        id,
+                    });
+                }
+                None
+            }
+        }
+
+        let registry = PluginRegistry::new();
+        registry.register(Arc::new(ToolCallModifier)).await;
+
+        let wrapper = StreamTokenWrapper::ToolCall {
+            name: "add".to_string(),
+            args: serde_json::json!({"a": 1}),
+            id: Some("call_123".to_string()),
+        };
+        let result = registry.process_stream_token(wrapper).await;
+
         match result {
-            StreamTokenWrapper::Text(s) => assert_eq!(s, "goodbye world"),
-            _ => panic!("expected modified Text"),
+            StreamTokenWrapper::ToolCall { name, args: _, id } => {
+                assert_eq!(name, "modified_add");
+                assert_eq!(id, Some("call_123".to_string()));
+            }
+            _ => panic!("expected modified ToolCall"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_stream_token_none_passes_through() {
+        #[derive(Debug)]
+        struct NoopStreamPlugin;
+        #[async_trait]
+        impl AgentPlugin for NoopStreamPlugin {
+            fn name(&self) -> &str {
+                "noop-stream"
+            }
+            async fn on_stream_token(
+                &self,
+                _token: StreamTokenWrapper,
+            ) -> Option<StreamTokenWrapper> {
+                None
+            }
+        }
+
+        let registry = PluginRegistry::new();
+        registry.register(Arc::new(NoopStreamPlugin)).await;
+
+        let wrapper = StreamTokenWrapper::Text("unchanged".to_string());
+        let result = registry.process_stream_token(wrapper).await;
+
+        match result {
+            StreamTokenWrapper::Text(s) => assert_eq!(s, "unchanged"),
+            _ => panic!("expected unchanged Text"),
         }
     }
 

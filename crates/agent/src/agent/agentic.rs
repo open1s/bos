@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use react::engine::ReActEngineBuilder;
+use react::engine::{ReActEngine, ReActEngineBuilder};
 use react::llm::{
     LlmClient as ReactLlmTrait, LlmError as ReactLlmError, LlmRequest as ReactLlmRequest,
     LlmResponse as ReactLlmResponse, StreamToken as ReactStreamToken,
@@ -25,40 +25,6 @@ use react::{CircuitBreakerConfig, RateLimiterConfig, ReActResilience};
 // ============================================================================
 // ReAct Adapters - Bridge between Agent and React crate
 // ============================================================================
-
-struct ReactToolAdapter {
-    inner: Arc<dyn Tool + Send + Sync>,
-}
-
-impl ReactToolAdapter {
-    fn new(inner: Arc<dyn Tool + Send + Sync>) -> Self {
-        Self { inner }
-    }
-}
-
-impl ReactToolTrait for ReactToolAdapter {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn description(&self) -> String {
-        self.inner.description().short
-    }
-
-    fn json_schema(&self) -> serde_json::Value {
-        self.inner.json_schema()
-    }
-
-    fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ReactToolError> {
-        let result =
-            tokio::task::block_in_place(|| futures::executor::block_on(self.inner.execute(input)));
-        result.map_err(|e| ReactToolError::Failed(e.to_string()))
-    }
-
-    fn is_skill(&self) -> bool {
-        self.inner.is_skill()
-    }
-}
 
 // ============================================================================
 // HookedToolAdapter - Wraps a tool with hook support for ReAct engine
@@ -915,8 +881,9 @@ impl Agent {
         crate::bus_rpc::AgentCallableServer::new(endpoint, session, Arc::new(self.clone()))
     }
 
-    /// Run the agent using ReAct engine.
-    pub async fn react(&self, task: &str) -> Result<String, AgentError> {
+    /// Build a ReActEngine with the standard adapter stack (LLM, tools, skills).
+    /// Shared by react(), run_simple(), and stream() to avoid duplicating adapter construction.
+    fn build_react_engine(&self, system_prompt: String) -> Result<ReActEngine, AgentError> {
         let has_plugins = self.plugins.has_plugins();
 
         let react_llm = if has_plugins {
@@ -952,7 +919,6 @@ impl Agent {
         }
 
         let has_skills = !self.skills.is_empty();
-        // let skills_schemas = self.get_skills_schemas();
         if has_skills {
             let skill_names: Vec<String> = self
                 .skills
@@ -960,7 +926,6 @@ impl Agent {
                 .map(|s| s.metadata.name.clone())
                 .collect();
 
-            // Register each skill as a callable tool that returns its instructions
             for skill in &self.skills {
                 let skill_name = skill.metadata.name.clone();
                 let skill_desc = format!("Get instructions for the {} skill", skill_name);
@@ -988,7 +953,6 @@ impl Agent {
                 )));
             }
 
-            // Also register load_skill for compatibility
             let load_skill_tool = Arc::new(FunctionTool::new(
                 "load_skill",
                 "Load a skill by name to get its instructions",
@@ -1031,19 +995,35 @@ impl Agent {
             )));
         }
 
-        // Build system prompt with skill context
-        let mut system_prompt = self.config.system_prompt.clone();
-        system_prompt.push_str("Final answer: Final Answer: your answer");
-
         builder = builder.resilience(self.resilience.clone());
         builder = builder.llm_timeout(self.config.timeout_secs);
         builder = builder.max_steps(self.config.max_steps);
         builder = builder.model(self.config.model.clone());
-        builder = builder.system_prompt(system_prompt.clone());
+        builder = builder.system_prompt(system_prompt);
 
-        let mut engine = builder
+        builder
             .build()
-            .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))?;
+            .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))
+    }
+
+    /// Run the agent using ReAct engine.
+    pub async fn react(&self, task: &str) -> Result<String, AgentError> {
+        // Build system prompt with skill context
+        let mut system_prompt = self.config.system_prompt.clone();
+        if !self.skills.is_empty() {
+            let injector = crate::skills::SkillInjector::with_options(
+                crate::skills::InjectionOptions::compact(),
+            );
+            let metadata: Vec<_> = self.skills.iter().map(|s| s.metadata.clone()).collect();
+            let injection = injector.inject_available(&metadata);
+            if !injection.is_empty() {
+                system_prompt.push('\n');
+                system_prompt.push_str(&injection);
+            }
+        }
+        system_prompt.push_str("Final answer: Final Answer: your answer");
+
+        let mut engine = self.build_react_engine(system_prompt)?;
 
         let mut ctx = HookContext::new(&self.config.name);
         ctx.set("task", task);
@@ -1106,120 +1086,8 @@ impl Agent {
         use react::llm::LlmMessage;
         use react::llm::{LlmContext, LlmRequest};
 
-        let has_plugins = self.plugins.has_plugins();
-
-        let react_llm = if has_plugins {
-            Box::new(PluginLlmAdapter::new(
-                AgentLlmAdapter::new(self.llm.clone()),
-                self.plugins.clone(),
-                self.config.name.clone(),
-            )) as Box<dyn ReactLlmTrait>
-        } else {
-            Box::new(AgentLlmAdapter::new(self.llm.clone()))
-        };
-
-        let mut builder = ReActEngineBuilder::new().llm(react_llm);
-
-        if let Some(ref registry) = self.registry {
-            for (_name, tool) in registry.iter() {
-                let tool_adapter = if has_plugins {
-                    Box::new(PluginToolAdapter::new(
-                        tool.clone(),
-                        self.plugins.clone(),
-                        self.hooks.clone(),
-                        self.config.name.clone(),
-                    )) as Box<dyn ReactToolTrait>
-                } else {
-                    Box::new(HookedToolAdapter::new(
-                        tool.clone(),
-                        self.hooks.clone(),
-                        self.config.name.clone(),
-                    ))
-                };
-                builder = builder.with_tool(tool_adapter);
-            }
-        }
-
-        let has_skills = !self.skills.is_empty();
-        if has_skills {
-            let skill_names: Vec<String> = self
-                .skills
-                .iter()
-                .map(|s| s.metadata.name.clone())
-                .collect();
-
-            for skill in &self.skills {
-                let skill_name = skill.metadata.name.clone();
-                let skill_desc = format!("Get instructions for the {} skill", skill_name);
-                let skill_instructions = skill.instructions.clone();
-                let skill_name_for_closure = skill_name.clone();
-                let skill_tool = Arc::new(FunctionTool::skill(
-                    &skill_name,
-                    &skill_desc,
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }),
-                    move |_args: &serde_json::Value| {
-                        Ok(serde_json::json!({
-                            "skill": skill_name_for_closure,
-                            "instructions": skill_instructions
-                        }))
-                    },
-                ));
-                builder = builder.with_tool(Box::new(ReactToolAdapter::new(skill_tool)));
-            }
-
-            let load_skill_tool = Arc::new(FunctionTool::new(
-                "load_skill",
-                "Load a skill by name to get its instructions",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name of the skill to load"
-                        }
-                    },
-                    "required": ["name"]
-                }),
-                {
-                    let skills = self.skills.clone();
-                    move |args: &serde_json::Value| {
-                        let name = args
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let found = skills.iter().find(|s| s.metadata.name == name);
-                        if let Some(skill) = found {
-                            Ok(serde_json::json!({
-                                "name": skill.metadata.name,
-                                "description": skill.metadata.description,
-                                "instructions": skill.instructions
-                            }))
-                        } else {
-                            Ok(serde_json::json!({
-                                "error": format!("Skill '{}' not found. Available: {}", name, skill_names.join(", "))
-                            }))
-                        }
-                    }
-                },
-            ));
-            builder = builder.with_tool(Box::new(ReactToolAdapter::new(load_skill_tool)));
-        }
-
         let system_prompt = self.config.system_prompt.clone();
-
-        builder = builder.resilience(self.resilience.clone());
-        builder = builder.llm_timeout(self.config.timeout_secs);
-        builder = builder.max_steps(self.config.max_steps);
-        builder = builder.model(self.config.model.clone());
-        builder = builder.system_prompt(system_prompt.clone());
-
-        let engine = builder
-            .build()
-            .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))?;
+        let engine = self.build_react_engine(system_prompt.clone())?;
 
         let conversations = self.message_log.lock().unwrap().clone();
         let mut all_conversations = vec![LlmMessage::system(system_prompt.clone())];
@@ -1412,133 +1280,19 @@ impl Agent {
         use futures::stream::StreamExt;
         use react::llm::{LlmContext, LlmMessage, LlmRequest};
 
-        let has_plugins = { self.plugins.has_plugins() };
-
-        let react_llm = if has_plugins {
-            Box::new(PluginLlmAdapter::new(
-                AgentLlmAdapter::new(self.llm.clone()),
-                self.plugins.clone(),
-                self.config.name.clone(),
-            )) as Box<dyn ReactLlmTrait>
-        } else {
-            Box::new(AgentLlmAdapter::new(self.llm.clone()))
-        };
-
-        let mut builder = ReActEngineBuilder::new().llm(react_llm);
-
-        if let Some(ref registry) = self.registry {
-            for (_name, tool) in registry.iter() {
-                let tool_adapter = if has_plugins {
-                    Box::new(PluginToolAdapter::new(
-                        tool.clone(),
-                        self.plugins.clone(),
-                        self.hooks.clone(),
-                        self.config.name.clone(),
-                    )) as Box<dyn ReactToolTrait>
-                } else {
-                    Box::new(HookedToolAdapter::new(
-                        tool.clone(),
-                        self.hooks.clone(),
-                        self.config.name.clone(),
-                    ))
-                };
-                builder = builder.with_tool(tool_adapter);
-            }
-        }
-
-        let has_skills = !self.skills.is_empty();
-        if has_skills {
-            let skill_names: Vec<String> = self
-                .skills
-                .iter()
-                .map(|s| s.metadata.name.clone())
-                .collect();
-
-            for skill in &self.skills {
-                let skill_name = skill.metadata.name.clone();
-                let skill_desc = format!("Get instructions for the {} skill", skill_name);
-                let skill_instructions = skill.instructions.clone();
-                let skill_name_for_closure = skill_name.clone();
-                let skill_tool = Arc::new(FunctionTool::skill(
-                    &skill_name,
-                    &skill_desc,
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }),
-                    move |_args: &serde_json::Value| {
-                        Ok(serde_json::json!({
-                            "skill": skill_name_for_closure,
-                            "instructions": skill_instructions
-                        }))
-                    },
-                ));
-                builder = builder.with_tool(Box::new(HookedToolAdapter::new(
-                    skill_tool,
-                    self.hooks.clone(),
-                    self.config.name.clone(),
-                )));
-            }
-
-            let load_skill_tool = Arc::new(FunctionTool::new(
-                "load_skill",
-                "Load a skill by name to get its instructions",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name of the skill to load"
-                        }
-                    },
-                    "required": ["name"]
-                }),
-                {
-                    let skills = self.skills.clone();
-                    move |args: &serde_json::Value| {
-                        let name = args
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let found = skills.iter().find(|s| s.metadata.name == name);
-                        if let Some(skill) = found {
-                            Ok(serde_json::json!({
-                                "name": skill.metadata.name,
-                                "description": skill.metadata.description,
-                                "instructions": skill.instructions
-                            }))
-                        } else {
-                            Ok(serde_json::json!({
-                                "error": format!("Skill '{}' not found. Available: {}", name, skill_names.join(", "))
-                            }))
-                        }
-                    }
-                },
-            ));
-            builder = builder.with_tool(Box::new(ReactToolAdapter::new(load_skill_tool)));
-        }
-
         let system_prompt = self.config.system_prompt.clone();
-
-        builder = builder.resilience(self.resilience.clone());
-        builder = builder.llm_timeout(self.config.timeout_secs);
-        builder = builder.max_steps(self.config.max_steps);
-        builder = builder.model(self.config.model.clone());
-        builder = builder.system_prompt(system_prompt.clone());
-
-        let engine_result = builder.build();
+        let engine_result = self.build_react_engine(system_prompt.clone());
         let task_str = task.to_string();
         let message_log_ptr = self.message_log.clone();
 
         let stream = async_stream::stream! {
-                    let engine = match engine_result {
-                        Ok(e) => e,
-                        Err(e) => {
-                            yield Err(AgentError::Session(format!("ReAct build error: {}", e)));
-                            return;
-                        }
-                    };
+        let engine = match engine_result {
+            Ok(e) => e,
+            Err(e) => {
+                yield Err(e);
+                return;
+            }
+        };
 
                     let mut all_conversations = vec![LlmMessage::system(system_prompt.clone())];
                     all_conversations.extend(message_log_ptr.lock().unwrap().clone());
