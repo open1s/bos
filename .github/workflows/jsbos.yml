@@ -23,16 +23,22 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
+            build: yarn build
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
+            build: yarn build
           - target: aarch64-apple-darwin
             runner: macos-latest
+            build: yarn build
           - target: x86_64-apple-darwin
             runner: macos-latest
+            build: yarn build
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
+            build: yarn build --target x86_64-unknown-linux-musl -x
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest-arm
+            build: yarn build --target aarch64-unknown-linux-musl -x
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -56,7 +62,7 @@ jobs:
         run: yarn install
 
       - name: Build
-        run: yarn build --target ${{ matrix.target }}
+        run: ${{ matrix.build }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
