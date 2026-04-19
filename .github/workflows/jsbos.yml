@@ -53,17 +53,11 @@ jobs:
           cache-dependency-path: crates/jsbos/yarn.lock
 
       - name: Install dependencies
-        run: |
-          corepack enable
-          yarn install
-
-      - name: Activate Yarn 4
-        run: corepack prepare yarn@4.13.0 --activate
+        run: yarn install
 
       - name: Build
         run: |
           cd crates/jsbos
-          corepack enable
           npm_config_target_mtriple=${{ matrix.target }} yarn build
 
       - name: Upload artifacts
@@ -102,8 +96,6 @@ jobs:
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
           architecture: ${{ matrix.settings.architecture }}
-      - name: Enable Corepack
-        run: corepack enable
       - name: Activate Yarn 4
         run: corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
@@ -147,8 +139,6 @@ jobs:
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
           architecture: ${{ matrix.settings.architecture }}
-      - name: Enable Corepack
-        run: corepack enable
       - name: Activate Yarn 4
         run: corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
@@ -188,8 +178,6 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
-      - name: Enable Corepack
-        run: corepack enable
       - name: Activate Yarn 4
         run: corepack prepare yarn@4.13.0 --activate
       - name: Output docker params
@@ -256,8 +244,6 @@ jobs:
           node-version: 24
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
-      - name: Enable Corepack
-        run: corepack enable
       - name: Activate Yarn 4
         run: corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
