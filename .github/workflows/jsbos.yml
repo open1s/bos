@@ -149,7 +149,7 @@ jobs:
           name: bindings-${{ matrix.target }}
           path: crates/jsbos
       - name: List artifacts
-        run: ls -la crates/jsbos/*.node
+        run: ls -la *.node
         shell: bash
       - name: Run smoke test
         run: node test.js
