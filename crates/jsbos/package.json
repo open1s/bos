@@ -91,7 +91,6 @@
     "@open1s/jsbos-linux-x64-gnu": "1.0.3",
     "@open1s/jsbos-win32-x64-msvc": "1.0.3",
     "@open1s/jsbos-darwin-arm64": "1.0.3",
-    "@open1s/jsbos-linux-arm64-musl": "1.0.3",
     "@open1s/jsbos-linux-arm64-gnu": "1.0.3",
     "@open1s/jsbos-win32-arm64-msvc": "1.0.3"
   },
