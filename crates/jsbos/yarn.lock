@@ -119,7 +119,6 @@ __metadata:
   checksum: 10c0/07fcedebf5f45fc7707f5e0902bcfea6dd46390783728ee8f7338db365c040b3a4ff8dc29ec645b434cdf7da5b740a9541e44fc3d87b8ac79443645f8efa2a9c
   languageName: node
   linkType: hard
-
 "@inquirer/editor@npm:^5.1.0":
   version: 5.1.0
   resolution: "@inquirer/editor@npm:5.1.0"
