@@ -63,7 +63,10 @@ jobs:
 
       - name: Install cross-toolchain
         if: runner.os == 'Linux'
-        run: yarn add -D @napi-rs/cross-toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          yarn add -D @napi-rs/cross-toolchain
 
       - name: Build
         run: ${{ matrix.build }}
