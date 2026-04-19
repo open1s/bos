@@ -70,14 +70,17 @@ jobs:
           path: crates/jsbos/*.node
           retention-days: 7
 
-  publish:
+publish:
     name: Publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
     needs:
-    - build
+      - build
+    defaults:
+      run:
+        working-directory: ./crates/jsbos
     steps:
       - uses: actions/checkout@v6
       - name: Setup node
