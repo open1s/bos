@@ -76,8 +76,8 @@ jobs:
     permissions:
       contents: write
       id-token: write
-  needs:
-  - build
+    needs:
+    - build
     steps:
       - uses: actions/checkout@v6
       - name: Setup node
