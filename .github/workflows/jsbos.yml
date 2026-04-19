@@ -52,15 +52,15 @@ jobs:
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
 
-      - name: Enable Corepack
-        run: corepack enable
-
       - name: Install dependencies
-        run: yarn install
+        run: |
+          corepack enable
+          yarn install
 
       - name: Build
         run: |
           cd crates/jsbos
+          corepack enable
           npm_config_target_mtriple=${{ matrix.target }} yarn build
 
       - name: Upload artifacts
