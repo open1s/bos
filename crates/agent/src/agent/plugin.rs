@@ -989,15 +989,15 @@ mod tests {
             fn name(&self) -> &str {
                 "stream-modifier"
             }
-    async fn on_stream_token(
-        &self,
-        token: StreamTokenWrapper,
-    ) -> Option<StreamTokenWrapper> {
-        if let StreamTokenWrapper::Text(s) = token {
-            return Some(StreamTokenWrapper::Text(s.replace("hello", "goodbye")));
-        }
-        None
-    }
+            async fn on_stream_token(
+                &self,
+                token: StreamTokenWrapper,
+            ) -> Option<StreamTokenWrapper> {
+                if let StreamTokenWrapper::Text(s) = token {
+                    return Some(StreamTokenWrapper::Text(s.replace("hello", "goodbye")));
+                }
+                None
+            }
         }
 
         let registry = PluginRegistry::new();
@@ -1006,10 +1006,10 @@ mod tests {
         let wrapper = StreamTokenWrapper::Text("hello world".to_string());
         let result = registry.process_stream_token(wrapper).await;
 
-    match result {
-        StreamTokenWrapper::Text(s) => assert_eq!(s, "goodbye world"),
-        _ => panic!("expected modified Text"),
-    }
+        match result {
+            StreamTokenWrapper::Text(s) => assert_eq!(s, "goodbye world"),
+            _ => panic!("expected modified Text"),
+        }
     }
 
     #[tokio::test]

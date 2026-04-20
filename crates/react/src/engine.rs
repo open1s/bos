@@ -822,10 +822,7 @@ impl ReActEngine {
     /// Core ReAct step loop. Runs up to max_steps iterations of:
     /// LLM call → match response (ToolCall / Text+ParsedIntent / Done) → tool execution → continue
     /// Returns the final thought text.
-    async fn react_loop(
-        &mut self,
-        context: &mut LlmContext,
-    ) -> Result<String, ReactError> {
+    async fn react_loop(&mut self, context: &mut LlmContext) -> Result<String, ReactError> {
         let mut thought = String::new();
         let mut loaded_skills: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();

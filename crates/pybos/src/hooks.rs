@@ -68,7 +68,9 @@ impl From<InnerEvent> for PyHookEvent {
             InnerEvent::OnComplete => "OnComplete",
             InnerEvent::OnError => "OnError",
         };
-        Self { value: s.to_string() }
+        Self {
+            value: s.to_string(),
+        }
     }
 }
 

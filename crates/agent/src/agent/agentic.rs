@@ -1286,161 +1286,153 @@ impl Agent {
         let message_log_ptr = self.message_log.clone();
 
         let stream = async_stream::stream! {
-        let engine = match engine_result {
-            Ok(e) => e,
-            Err(e) => {
-                yield Err(e);
-                return;
+            let engine = match engine_result {
+                Ok(e) => e,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            let mut all_conversations = vec![LlmMessage::system(system_prompt.clone())];
+            all_conversations.extend(message_log_ptr.lock().unwrap().clone());
+            all_conversations.push(LlmMessage::user(task_str.clone()));
+
+            let mut log = message_log_ptr.lock().unwrap().clone();
+            log.push(LlmMessage::user(task_str.clone()));
+
+            let context = LlmContext {
+                conversations: all_conversations,
+                ..Default::default()
+            };
+
+            let req = LlmRequest {
+                model: self.config.model.clone(),
+                context,
+                temperature: Some(0.7),
+                ..Default::default()
+            };
+
+            let mut ctx = HookContext::new(&self.config.name);
+            ctx.set("model", &self.config.model);
+            let decision = self.hooks.trigger(HookEvent::BeforeLlmCall, ctx).await;
+            match decision {
+                HookDecision::Error(msg) => {
+                    yield Err(AgentError::Session(format!("BeforeLlmCall hook error: {}", msg)));
+                    return;
+                }
+                HookDecision::Abort => {
+                    return;
+                }
+                HookDecision::Continue => {}
             }
-        };
 
-                    let mut all_conversations = vec![LlmMessage::system(system_prompt.clone())];
-                    all_conversations.extend(message_log_ptr.lock().unwrap().clone());
-                    all_conversations.push(LlmMessage::user(task_str.clone()));
+            let llm_stream = match engine.call_llm_stream(req).await {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Err(AgentError::Session(format!("LLM stream error: {}", e)));
+                    return;
+                }
+            };
+            futures::pin_mut!(llm_stream);
+            let mut full_response = String::new();
+            let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-                    let mut log = message_log_ptr.lock().unwrap().clone();
-                    log.push(LlmMessage::user(task_str.clone()));
-
-                    let context = LlmContext {
-                        conversations: all_conversations,
-                        ..Default::default()
-                    };
-
-                    let req = LlmRequest {
-                        model: self.config.model.clone(),
-                        context,
-                        temperature: Some(0.7),
-                        ..Default::default()
-                    };
-
-                    let mut ctx = HookContext::new(&self.config.name);
-                    ctx.set("model", &self.config.model);
-                    let decision = self.hooks.trigger(HookEvent::BeforeLlmCall, ctx).await;
-                    match decision {
-                        HookDecision::Error(msg) => {
-                            yield Err(AgentError::Session(format!("BeforeLlmCall hook error: {}", msg)));
-                            return;
-                        }
-                        HookDecision::Abort => {
-                            return;
-                        }
-                        HookDecision::Continue => {}
+            while let Some(item) = llm_stream.next().await {
+                match item {
+                    Ok(StreamToken::Text(text)) => {
+                        full_response.push_str(&text);
+                        yield Ok(StreamToken::Text(text));
                     }
+                    Ok(StreamToken::Done) => {
+                        yield Ok(StreamToken::Done);
+                    }
+                    Ok(StreamToken::ToolCall { name, args, id }) => {
+                        yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
 
-                    let llm_stream = match engine.call_llm_stream(req).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            yield Err(AgentError::Session(format!("LLM stream error: {}", e)));
-                            return;
+                        let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+
+                        let mut ctx = HookContext::new(&self.config.name);
+                        ctx.set("tool_name", &name);
+                        ctx.set("tool_args", &args.to_string());
+                        match self.hooks.trigger(HookEvent::BeforeToolCall, ctx).await {
+                            HookDecision::Error(msg) => {
+                                full_response.push_str(&format!("Tool blocked by hook: {}", msg));
+                                yield Ok(StreamToken::Text(format!("Tool blocked by hook: {}", msg)));
+                                continue;
+                            }
+                            HookDecision::Abort => {
+                                full_response.push_str("Tool aborted by hook");
+                                yield Ok(StreamToken::Text("Tool aborted by hook".to_string()));
+                                continue;
+                            }
+                            HookDecision::Continue => {}
                         }
-                    };
-                    futures::pin_mut!(llm_stream);
-                    let mut full_response = String::new();
-                    let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-                    while let Some(item) = llm_stream.next().await {
-                        match item {
-                            Ok(StreamToken::Text(text)) => {
-                                full_response.push_str(&text);
-                                yield Ok(StreamToken::Text(text));
+                        let result = if name == "load_skill" {
+                            let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            if let Some(cached) = loaded_skills.get(skill_name) {
+                                Ok(serde_json::json!({
+                                    "name": skill_name,
+                                    "instructions": cached,
+                                    "cached": true
+                                }))
+                            } else {
+                                engine.call_tool(&name, &args).await
                             }
-                            Ok(StreamToken::Done) => {
-                                yield Ok(StreamToken::Done);
-                            }
-                            Ok(StreamToken::ToolCall { name, args, id }) => {
-                                yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
+                        } else {
+                            engine.call_tool(&name, &args).await
+                        };
 
-                                let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
-
+                        let result_text = match &result {
+                            Ok(ret) => {
                                 let mut ctx = HookContext::new(&self.config.name);
                                 ctx.set("tool_name", &name);
-                                ctx.set("tool_args", &args.to_string());
-                                match self.hooks.trigger(HookEvent::BeforeToolCall, ctx).await {
-                                    HookDecision::Error(msg) => {
-                                        full_response.push_str(&format!("Tool blocked by hook: {}", msg));
-                                        yield Ok(StreamToken::Text(format!("Tool blocked by hook: {}", msg)));
-                                        continue;
-                                    }
+                                ctx.set("tool_result", "success");
+                                let decision = self.hooks.trigger(HookEvent::AfterToolCall, ctx).await;
+                                match decision {
+                                    HookDecision::Error(msg) => log::warn!("AfterToolCall hook error: {}", msg),
                                     HookDecision::Abort => {
-                                        full_response.push_str("Tool aborted by hook");
-                                        yield Ok(StreamToken::Text("Tool aborted by hook".to_string()));
-                                        continue;
+                                        return;
                                     }
                                     HookDecision::Continue => {}
                                 }
-
-                                let result = if name == "load_skill" {
+                                if name == "load_skill" {
                                     let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                    if let Some(cached) = loaded_skills.get(skill_name) {
-                                        Ok(serde_json::json!({
-                                            "name": skill_name,
-                                            "instructions": cached,
-                                            "cached": true
-                                        }))
-                                    } else {
-                                        engine.call_tool(&name, &args).await
+                                    let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
+                                    if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                        loaded_skills.insert(skill_name.to_string(), instructions.to_string());
                                     }
-                                } else {
-                                    engine.call_tool(&name, &args).await
-                                };
+                                }
+                                ret.to_string()
+                            },
+                            Err(e) => format!("Error: {:?}", e),
+                        };
 
-                                let result_text = match &result {
-                                    Ok(ret) => {
-                                        let mut ctx = HookContext::new(&self.config.name);
-                                        ctx.set("tool_name", &name);
-                                        ctx.set("tool_result", "success");
-                                        let decision = self.hooks.trigger(HookEvent::AfterToolCall, ctx).await;
-                                        match decision {
-                                            HookDecision::Error(msg) => log::warn!("AfterToolCall hook error: {}", msg),
-                                            HookDecision::Abort => {
-                                                return;
-                                            }
-                                            HookDecision::Continue => {}
-                                        }
-                                        if name == "load_skill" {
-                                            let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                            let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
-                                            if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                                loaded_skills.insert(skill_name.to_string(), instructions.to_string());
-                                            }
-                                        }
-                                        ret.to_string()
-                                    },
-                                    Err(e) => format!("Error: {:?}", e),
-                                };
-
-                                full_response.push_str(&result_text);
-                                yield Ok(StreamToken::Text(result_text.clone()));
-
-        {
-                let mut log = message_log_ptr.lock().unwrap();
-                if !log.iter().any(|m| matches!(m, LlmMessage::System { .. })) {
-                    log.insert(0, LlmMessage::system(system_prompt.clone()));
-                }
-                if !log.iter().any(|m| matches!(m, LlmMessage::User { .. })) {
-                    log.push(LlmMessage::user(task_str.clone()));
-                }
-                log.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), args.clone()));
-                log.push(LlmMessage::tool_result(call_id, result_text));
-            }
-            self.hooks.trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name)).await;
-        }
-                            Err(e) => yield Err(AgentError::Session(format!("LLM stream error: {}", e))),
+                        full_response.push_str(&result_text);
+                        yield Ok(StreamToken::Text(result_text.clone()));
+                        {
+                            let mut log = message_log_ptr.lock().unwrap();
+                            log.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), args.clone()));
+                            log.push(LlmMessage::tool_result(call_id, result_text));
                         }
+                        self.hooks.trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name)).await;
                     }
+                    Err(e) => yield Err(AgentError::Session(format!("LLM stream error: {}", e))),
+                }
+            }
 
-                    let mut ctx = HookContext::new(&self.config.name);
-                    ctx.set("model", &self.config.model);
-                    let decision = self.hooks.trigger(HookEvent::AfterLlmCall, ctx).await;
-                    match decision {
-                        HookDecision::Error(msg) => log::warn!("AfterLlmCall hook error: {}", msg),
-                        HookDecision::Abort => return,
-                        HookDecision::Continue => {}
-                    }
+            let mut ctx = HookContext::new(&self.config.name);
+            ctx.set("model", &self.config.model);
+            let decision = self.hooks.trigger(HookEvent::AfterLlmCall, ctx).await;
+            match decision {
+                HookDecision::Error(msg) => log::warn!("AfterLlmCall hook error: {}", msg),
+                HookDecision::Abort => return,
+                HookDecision::Continue => {}
+            }
 
-        {
+            {
                 let mut log = message_log_ptr.lock().unwrap();
-                log.push(LlmMessage::user(task_str));
                 if !full_response.is_empty() {
                     log.push(LlmMessage::assistant(full_response.clone()));
                 }

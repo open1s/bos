@@ -392,10 +392,10 @@ impl Agent {
       schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
       callback: callback.into(),
     };
-let mut guard = self.inner.lock().await;
+    let mut guard = self.inner.lock().await;
     guard
-        .try_add_tool(std::sync::Arc::new(tool))
-        .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+      .try_add_tool(std::sync::Arc::new(tool))
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
     Ok(name)
   }
 
@@ -408,8 +408,8 @@ let mut guard = self.inner.lock().await;
     };
     let mut guard = self.inner.lock().await;
     guard
-        .try_add_tool(std::sync::Arc::new(tool))
-        .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+      .try_add_tool(std::sync::Arc::new(tool))
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
     Ok(())
   }
 
@@ -705,23 +705,23 @@ let mut guard = self.inner.lock().await;
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
-#[napi]
-pub fn restore_message_log(&self, path: String) -> Result<()> {
+  #[napi]
+  pub fn restore_message_log(&self, path: String) -> Result<()> {
     let mut guard = self.inner.blocking_lock();
     guard
-        .restore_message_log(&path)
-        .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
-}
+      .restore_message_log(&path)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
 
-#[napi]
-pub async fn stream(
+  #[napi]
+  pub async fn stream(
     &self,
     task: String,
     callback: ThreadsafeFunction<serde_json::Value>,
-) -> Result<()> {
+  ) -> Result<()> {
     let agent = {
-        let guard = self.inner.lock().await;
-        guard.clone()
+      let guard = self.inner.lock().await;
+      guard.clone()
     };
 
     let stream = agent.stream(&task);
@@ -729,37 +729,37 @@ pub async fn stream(
 
     futures::pin_mut!(stream);
     while let Some(token_result) = stream.next().await {
-        match token_result {
-            Ok(token) => {
-                let json = match token {
-                    agent::StreamToken::Text(text) => {
-                        serde_json::json!({ "type": "Text", "text": text })
-                    }
-                    agent::StreamToken::ToolCall { name, args, id } => {
-                        serde_json::json!({
-                            "type": "ToolCall",
-                            "name": name,
-                            "args": args,
-                            "id": id
-                        })
-                    }
-                    agent::StreamToken::Done => {
-                        serde_json::json!({ "type": "Done" })
-                    }
-                };
-                callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+      match token_result {
+        Ok(token) => {
+          let json = match token {
+            agent::StreamToken::Text(text) => {
+              serde_json::json!({ "type": "Text", "text": text })
             }
-            Err(e) => {
-                let json = serde_json::json!({
-                    "type": "Error",
-                    "error": e.to_string()
-                });
-                callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+            agent::StreamToken::ToolCall { name, args, id } => {
+              serde_json::json!({
+                  "type": "ToolCall",
+                  "name": name,
+                  "args": args,
+                  "id": id
+              })
             }
+            agent::StreamToken::Done => {
+              serde_json::json!({ "type": "Done" })
+            }
+          };
+          callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
         }
+        Err(e) => {
+          let json = serde_json::json!({
+              "type": "Error",
+              "error": e.to_string()
+          });
+          callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+        }
+      }
     }
     Ok(())
-}
+  }
 }
 
 #[napi]

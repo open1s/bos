@@ -13,7 +13,7 @@ def on_response(res):
     return res
 
 def on_tool_call(tc):
-    print(f"🔌 PLUGIN [ToolCall]: Intercepting tool call: {tc.name}")
+    print(f"🔌 PLUGIN [ToolCall]: @@Intercepting tool call: {tc.name}")
     return tc
 
 def on_tool_result(tr):

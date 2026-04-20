@@ -1,87 +1,100 @@
-# `@napi-rs/package-template`
+# @open1s/jsbos
 
-![https://github.com/napi-rs/package-template/actions](https://github.com/napi-rs/package-template/workflows/CI/badge.svg)
+BrainOS JavaScript bindings - AI agent framework with ReAct engine.
 
-> Template project for writing node packages with napi-rs.
-
-# Usage
-
-1. Click **Use this template**.
-2. **Clone** your project.
-3. Run `yarn install` to install dependencies.
-4. Run `yarn napi rename -n [@your-scope/package-name] -b [binary-name]` command under the project folder to rename your package.
-
-## Install this test package
+## Installation
 
 ```bash
-yarn add @napi-rs/package-template
+npm install @open1s/jsbos
+# or
+yarn add @open1s/jsbos
 ```
 
-## Ability
+## What is BrainOS?
 
-### Build
+BrainOS is a Rust-based AI agent framework implementing the ReAct (Reason + Act) paradigm. It provides:
 
-After `yarn build/npm run build` command, you can see `package-template.[darwin|win32|linux].node` file in project root. This is the native addon built from [lib.rs](./src/lib.rs).
+- **Agent** - Async agent with tool-calling capabilities
+- **Bus** - Message bus for inter-agent communication
+- **Hooks** - Lifecycle hooks for extensibility
+- **Plugin** - LLM plugin system for tool discovery
+- **MCP Client** - Model Context Protocol client
 
-### Test
+## API Overview
 
-With [ava](https://github.com/avajs/ava), run `yarn test/npm run test` to testing native addon. You can also switch to another testing framework if you want.
+### Agent
 
-### CI
+```typescript
+import { Agent, AgentConfig } from '@open1s/jsbos';
 
-With GitHub Actions, each commit and pull request will be built and tested automatically in [`node@20`, `@node22`] x [`macOS`, `Linux`, `Windows`] matrix. You will never be afraid of the native addon broken in these platforms.
+const config: AgentConfig = {
+  name: 'my-agent',
+  tools: [...],
+  llm: { provider: 'openai', model: 'gpt-4' }
+};
 
-### Release
+const agent = new Agent(config);
+await agent.run('你的任务');
+```
 
-Release native package is very difficult in old days. Native packages may ask developers who use it to install `build toolchain` like `gcc/llvm`, `node-gyp` or something more.
+### Bus (Message Bus)
 
-With `GitHub actions`, we can easily prebuild a `binary` for major platforms. And with `N-API`, we should never be afraid of **ABI Compatible**.
+```typescript
+import { Bus, Session } from '@open1s/jsbos';
 
-The other problem is how to deliver prebuild `binary` to users. Downloading it in `postinstall` script is a common way that most packages do it right now. The problem with this solution is it introduced many other packages to download binary that has not been used by `runtime codes`. The other problem is some users may not easily download the binary from `GitHub/CDN` if they are behind a private network (But in most cases, they have a private NPM mirror).
+const bus = new Bus({ name: 'my-bus' });
+const session = await bus.createSession();
+session.send({ type: 'message', payload: '...' });
+```
 
-In this package, we choose a better way to solve this problem. We release different `npm packages` for different platforms. And add it to `optionalDependencies` before releasing the `Major` package to npm.
+### Hooks
 
-`NPM` will choose which native package should download from `registry` automatically. You can see [npm](./npm) dir for details. And you can also run `yarn add @napi-rs/package-template` to see how it works.
+```typescript
+import { HookRegistry, HookEvent, HookDecision } from '@open1s/jsbos';
 
-## Develop requirements
+const registry = new HookRegistry();
+registry.on(HookEvent.BeforeToolCall, async (ctx) => {
+  return HookDecision::Allow; // or HookDecision::Block
+});
+```
 
-- Install the latest `Rust`
-- Install `Node.js@10+` which fully supported `Node-API`
-- Install `yarn@1.x`
+### Plugin
 
-## Test in local
+```typescript
+import { PluginRegistry, PluginToolCall } from '@open1s/jsbos';
 
-- yarn
-- yarn build
-- yarn test
+const registry = new PluginRegistry();
+registry.register('my-plugin', {
+  name: 'my-plugin',
+  tools: [...]
+});
+```
 
-And you will see:
+### MCP Client
+
+```typescript
+import { McpClient } from '@open1s/jsbos';
+
+const client = new McpClient();
+await client.connect('mcp-server-name');
+```
+
+## Development
 
 ```bash
-$ ava --verbose
+# Install dependencies
+yarn
 
-  ✔ sync function from native code
-  ✔ sleep function from native code (201ms)
-  ─
+# Build native addon
+yarn build
 
-  2 tests passed
-✨  Done in 1.12s.
+# Run tests
+yarn test
+
+# Format code
+yarn format
 ```
 
-## Release package
+## License
 
-Ensure you have set your **NPM_TOKEN** in the `GitHub` project setting.
-
-In `Settings -> Secrets`, add **NPM_TOKEN** into it.
-
-When you want to release the package:
-
-```bash
-npm version [<newversion> | major | minor | patch | premajor | preminor | prepatch | prerelease [--preid=<prerelease-id>] | from-git]
-
-git push
-```
-
-GitHub actions will do the rest job for you.
-
-> WARN: Don't run `npm publish` manually.
+MIT
