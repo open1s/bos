@@ -54,6 +54,8 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 20
+          cache: yarn
+      - run: corepack enable  
 
       - name: Install dependencies
         run: yarn install --no-cache
@@ -102,6 +104,8 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           architecture: ${{ matrix.architecture }}
+          cache: yarn
+      - run: corepack enable     
       - name: Install dependencies
         run: yarn install
       - name: Download artifacts
@@ -138,6 +142,8 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
+          cache: yarn
+      - run: corepack enable       
       - name: Install dependencies
         run: yarn install
       - name: Download artifacts
@@ -173,6 +179,8 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 20
+          cache: yarn
+      - run: corepack enable      
       - name: Install dependencies
         run: yarn install
       - name: create npm dirs
