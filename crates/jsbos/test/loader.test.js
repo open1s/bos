@@ -1,4 +1,11 @@
-const { version, ConfigLoader, Bus, Agent } = require('./index.js');
+const test = require('ava')
+const { version, ConfigLoader, Bus, Agent } = require('../index.js');
+
+test('can create config loader', t => {
+  const loader = new ConfigLoader()
+  t.truthy(loader)
+})
+
 
 const loader = new ConfigLoader();
 loader.discover();
