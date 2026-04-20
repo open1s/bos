@@ -62,7 +62,7 @@ jobs:
       - run: corepack enable && corepack prepare yarn@4.13.0 --activate
 
       - name: Install dependencies
-        run: yarn install --no-cache
+        run: yarn install
 
       - name: Build
         run: ${{ matrix.build }}
