@@ -108,7 +108,7 @@ jobs:
         uses: actions/download-artifact@v6
         with:
           name: bindings-${{ matrix.target }}
-          path: .
+          path: crates/jsbos
       - name: List artifacts
         run: ls -la *.node
         shell: bash
@@ -117,7 +117,6 @@ jobs:
         env:
           OPENAI_API_KEY: test-key
           LLM_MODEL: test-model
-        working-directory: crates/jsbos
 
   test-linux:
     name: Test ${{ matrix.target }} - node@${{ matrix.node }}
@@ -156,7 +155,6 @@ jobs:
         env:
           OPENAI_API_KEY: test-key
           LLM_MODEL: test-model
-        working-directory: crates/jsbos
 
   publish:
     name: Publish
