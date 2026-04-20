@@ -1,0 +1,20 @@
+name: Verify NPM Token
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment:
+      name: Actions
+    steps:
+      - name: Check NPM_TOKEN
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "FAIL: NPM_TOKEN is EMPTY"
+            exit 1
+          else
+            echo "SUCCESS: NPM_TOKEN is set"
+          fi
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
