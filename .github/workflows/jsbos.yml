@@ -38,9 +38,6 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             build: yarn build --target x86_64-unknown-linux-gnu
-          # - target: aarch64-unknown-linux-gnu
-          #   runner: ubuntu-24.04-arm
-          #   build: yarn build --target aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -81,16 +78,19 @@ jobs:
           - target: x86_64-pc-windows-msvc
             host: windows-latest
             architecture: x64
+            node: '20'
           - target: aarch64-pc-windows-msvc
             host: windows-11-arm
             architecture: arm64
+            node: '20'
           - target: x86_64-apple-darwin
             host: macos-latest
             architecture: x64
+            node: '20'
           - target: aarch64-apple-darwin
             host: macos-latest
             architecture: arm64
-        node: ['20']
+            node: '20'
     runs-on: ${{ matrix.host }}
     defaults:
       run:
@@ -127,9 +127,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-          # - target: aarch64-unknown-linux-gnu
-          #   runner: ubuntu-24.04-arm
-        node: ['20']
+            node: '20'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -191,12 +189,10 @@ jobs:
       - name: Publish
         run: |
           npm config set provenance true
-          if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$";
-          then
+          if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$"; then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --access public
-          elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+";
-          then
+          elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+"; then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --tag next --access public
           else
