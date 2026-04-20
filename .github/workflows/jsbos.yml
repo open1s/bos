@@ -185,6 +185,8 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    environment:
+      name: Actions
     needs:
       - build
       - test-macos-windows
