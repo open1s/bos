@@ -185,9 +185,6 @@ jobs:
     permissions:
       contents: write
       id-token: write
-    environment:
-      name: Actions
-      url: https://github.com/open1s/bos
     needs:
       - build
       - test-macos-windows
@@ -238,4 +235,4 @@ jobs:
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.environments.Actions.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
