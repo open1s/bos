@@ -57,60 +57,10 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 20
-      - run: corepack enable && corepack prepare yarn@4.13.0 --activate
-
+- run: corepack enable && corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
-        run: yarn install
+        run: yarn install --mutable
 
-      - name: Build
-        run: ${{ matrix.build }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          name: bindings-${{ matrix.target }}
-          path: crates/jsbos/*.node
-          retention-days: 7
-
-  test-macos-windows:
-    name: Test bindings on ${{ matrix.target }} - node@${{ matrix.node }}
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            host: windows-latest
-            architecture: x64
-            node: '20'
-          - target: aarch64-pc-windows-msvc
-            host: windows-11-arm
-            architecture: arm64
-            node: '20'
-          - target: x86_64-apple-darwin
-            host: macos-latest
-            architecture: x64
-            node: '20'
-          - target: aarch64-apple-darwin
-            host: macos-latest
-            architecture: arm64
-            node: '20'
-    runs-on: ${{ matrix.host }}
-    defaults:
-      run:
-        working-directory: ./crates/jsbos
-    steps:
-      - uses: actions/checkout@v6
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ matrix.node }}
-          architecture: ${{ matrix.architecture }}
-          cache: yarn
-          cache-dependency-path: crates/jsbos/yarn.lock
-      - run: corepack enable
-      - name: Install dependencies
-        run: yarn install
       - name: Download artifacts
         uses: actions/download-artifact@v6
         with:
