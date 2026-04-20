@@ -59,7 +59,7 @@ jobs:
           node-version: 20
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
-      - run: corepack enable
+      - run: corepack enable && corepack prepare yarn@4.13.0 --activate
 
       - name: Install dependencies
         run: yarn install --no-cache
@@ -110,7 +110,7 @@ jobs:
           architecture: ${{ matrix.architecture }}
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
-      - run: corepack enable     
+      - run: corepack enable && corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
         run: yarn install
       - name: Download artifacts
@@ -152,7 +152,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
-      - run: corepack enable
+      - run: corepack enable && corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
         run: yarn install
       - name: Download artifacts
@@ -190,7 +190,7 @@ jobs:
           node-version: 20
           cache: yarn
           cache-dependency-path: crates/jsbos/yarn.lock
-      - run: corepack enable      
+      - run: corepack enable && corepack prepare yarn@4.13.0 --activate
       - name: Install dependencies
         run: yarn install
       - name: create npm dirs
