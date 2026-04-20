@@ -57,7 +57,9 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 20
-- run: corepack enable && corepack prepare yarn@4.13.0 --activate
+      - name: Setup yarn
+        run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
       - name: Install dependencies
         run: yarn install --mutable
 
