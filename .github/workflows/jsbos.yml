@@ -57,6 +57,59 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 20
+
+      - name: Setup yarn
+        run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
+      - name: Install dependencies
+        run: yarn install --mutable
+
+      - name: Build
+        run: ${{ matrix.build }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/jsbos/*.node
+          retention-days: 7
+
+  test-macos-windows:
+    name: Test bindings on ${{ matrix.target }} - node@${{ matrix.node }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            host: windows-latest
+            architecture: x64
+            node: '20'
+          - target: aarch64-pc-windows-msvc
+            host: windows-11-arm
+            architecture: arm64
+            node: '20'
+          - target: x86_64-apple-darwin
+            host: macos-latest
+            architecture: x64
+            node: '20'
+          - target: aarch64-apple-darwin
+            host: macos-latest
+            architecture: arm64
+            node: '20'
+    runs-on: ${{ matrix.host }}
+    defaults:
+      run:
+        working-directory: ./crates/jsbos
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.architecture }}
+
       - name: Setup yarn
         run: corepack enable && corepack prepare yarn@4.13.0 --activate
 
@@ -68,9 +121,11 @@ jobs:
         with:
           name: bindings-${{ matrix.target }}
           path: crates/jsbos
+
       - name: List artifacts
         run: ls -la *.node
         shell: bash
+
       - name: Run smoke test
         run: yarn test
         env:
@@ -96,23 +151,28 @@ jobs:
         working-directory: ./crates/jsbos
     steps:
       - uses: actions/checkout@v6
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-          cache: yarn
-          cache-dependency-path: crates/jsbos/yarn.lock
-      - run: corepack enable
+
+      - name: Setup yarn
+        run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
       - name: Install dependencies
-        run: yarn install
+        run: yarn install --mutable
+
       - name: Download artifacts
         uses: actions/download-artifact@v6
         with:
           name: bindings-${{ matrix.target }}
           path: crates/jsbos
+
       - name: List artifacts
         run: ls -la *.node
         shell: bash
+
       - name: Run smoke test
         run: yarn test
         env:
@@ -134,31 +194,40 @@ jobs:
         working-directory: ./crates/jsbos
     steps:
       - uses: actions/checkout@v6
+
       - name: Setup node
         uses: actions/setup-node@v6
         with:
           node-version: 20
-      - run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
+      - name: Setup yarn
+        run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
       - name: Install dependencies
-        run: yarn install
+        run: yarn install --mutable
+
       - name: create npm dirs
         run: yarn napi create-npm-dirs
+
       - name: Download all artifacts
         uses: actions/download-artifact@v6
         with:
           path: crates/jsbos/artifacts
+
       - name: Create npm artifacts
         run: yarn artifacts
+
       - name: List packages
         run: ls -R ./npm
         shell: bash
+
       - name: Publish
         run: |
           npm config set provenance true
           if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$"; then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --access public
-          elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+"; then
+          elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+"; then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --tag next --access public
           else
