@@ -62,7 +62,7 @@ jobs:
         run: corepack enable && corepack prepare yarn@4.13.0 --activate
 
       - name: Install dependencies
-        run: yarn install
+        run: yarn install --no-immutable
 
       - name: Build
         run: ${{ matrix.build }}
@@ -114,7 +114,7 @@ jobs:
         run: corepack enable && corepack prepare yarn@4.13.0 --activate
 
       - name: Install dependencies
-        run: yarn install
+        run: yarn install --no-immutable
 
       - name: Download artifacts
         uses: actions/download-artifact@v6
@@ -161,7 +161,7 @@ jobs:
         run: corepack enable && corepack prepare yarn@4.13.0 --activate
 
       - name: Install dependencies
-        run: yarn install
+        run: yarn install --no-immutable
 
       - name: Download artifacts
         uses: actions/download-artifact@v6
@@ -204,7 +204,7 @@ jobs:
         run: corepack enable && corepack prepare yarn@4.13.0 --activate
 
       - name: Install dependencies
-        run: yarn install
+        run: yarn install --no-immutable
 
       - name: create npm dirs
         run: yarn napi create-npm-dirs
