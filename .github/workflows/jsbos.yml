@@ -122,7 +122,7 @@ jobs:
         run: ls -la *.node
         shell: bash
       - name: Run smoke test
-        run: node test/loader.test.js
+        run: yarn test
         env:
           OPENAI_API_KEY: test-key
           LLM_MODEL: test-model
@@ -164,7 +164,7 @@ jobs:
         run: ls -la *.node
         shell: bash
       - name: Run smoke test
-        run: node test/loader.test.js
+        run: yarn test
         env:
           OPENAI_API_KEY: test-key
           LLM_MODEL: test-model
