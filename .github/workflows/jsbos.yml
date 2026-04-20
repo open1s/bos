@@ -38,6 +38,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             build: yarn build --target x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            build: yarn build --target aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -131,6 +134,9 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            node: '20'
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
             node: '20'
     runs-on: ${{ matrix.runner }}
     defaults:
