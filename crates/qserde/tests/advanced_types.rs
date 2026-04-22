@@ -1,4 +1,4 @@
-use qserde::{Deserialize, DeserializeExt, Serialize};
+use qserde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[test]

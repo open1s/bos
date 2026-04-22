@@ -20,3 +20,5 @@ tokio-stream = "0.1"
 dashmap = {workspace = true}
 uuid = {workspace = true}
 qserde = { path = "../qserde" }
+surfing = "0.1"
+quick-xml = "0.39"

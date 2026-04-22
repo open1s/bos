@@ -369,6 +369,48 @@ pub enum StreamToken {
     Done,
 }
 
+/// Accumulates tool call data and invokes handler with raw accumulated data.
+/// Handler is responsible for parsing and returning StreamToken.
+pub struct StreamResponseAccumulator<F> {
+    response: String,
+    index: usize,
+    handler: F,
+}
+
+impl<F> StreamResponseAccumulator<F>
+where
+    F: FnMut(&str,usize) -> (usize,Option<Vec<StreamToken>>), //index is the parsed index
+{
+    /// Create new accumulator with handler: fn(name, id, accumulated_args) -> Option<StreamToken>
+    pub fn new(handler: F) -> Self {
+        Self {
+            response: String::new(),
+            index: 0,
+            handler,
+        }
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Push a chunk of tool call data. Handler is called to try parse accumulated arguments.
+    pub fn push(
+        &mut self,
+        chunk: &str,
+    ) -> Option<Vec<StreamToken>> {
+        self.response.push_str(chunk);
+        let (index, token) = (self.handler)(&self.response,self.index);
+        self.index = index;
+        token
+    }
+
+    pub fn reset(&mut self) {
+        self.response.clear();
+        self.index = 0;
+    }   
+}
+
 pub type LlmResponseResult = Result<LlmResponse, LlmError>;
 pub type TokenStream = Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>;
 

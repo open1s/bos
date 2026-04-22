@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use surfing::JSONParser;
 
 use crate::llm::{
-    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken, Stringfy,
-    TokenStream,
+    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken,
+    Stringfy, TokenStream, StreamResponseAccumulator,
 };
 
 pub struct NvidiaVendor {
@@ -101,6 +102,7 @@ struct StreamChoice {
 
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
+    #[allow(dead_code)]
     content: Option<String>,
     tool_calls: Option<Vec<StreamToolCall>>,
 }
@@ -108,6 +110,8 @@ struct StreamDelta {
 #[derive(Debug, Deserialize)]
 struct StreamToolCall {
     id: Option<String>,
+    #[allow(dead_code)]
+    index: Option<usize>,
     #[serde(rename = "type")]
     _call_type: Option<String>,
     function: StreamFunctionCall,
@@ -198,7 +202,7 @@ impl NvidiaVendor {
             messages.push(json_msg);
         }
 
-        //Availale Skill as system
+        // Availale Skill as system
         let available_skills = if !req.context.skills.is_empty() {
             let available_skills = req
                 .context
@@ -402,47 +406,72 @@ impl LlmClient for NvidiaVendor {
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
+            // Use surfing for JSON extraction
+            let mut parser = JSONParser::new();
+            let mut accumulator = StreamResponseAccumulator::new(move |response, start_idx| {
+                let remaining = if start_idx < response.len() {
+                    &response[start_idx..]
+                } else {
+                    return (start_idx, None);
+                };
+
+                let mut all_tokens = Vec::new();
+                let mut bytes_written = Vec::new();
+                
+                let write_result = {
+                    let mut writer = std::io::BufWriter::new(&mut bytes_written);
+                    parser.extract_json_from_stream(&mut writer, remaining)
+                };
+                
+                if write_result.is_ok() {
+                    let json_str = String::from_utf8_lossy(&bytes_written);
+                    if let Ok(resp) = serde_json::from_str::<NvidiaStreamResponse>(&json_str) {
+                        for choice in &resp.choices {
+                            if let Some(content) = &choice.delta.content {
+                                if !content.is_empty() {
+                                    all_tokens.push(StreamToken::Text(content.clone()));
+                                }
+                            }
+                            if let Some(calls) = &choice.delta.tool_calls {
+                                for call in calls {
+                                    let name = call.function.name.as_ref();
+                                    let args = call.function.arguments.as_ref();
+                                    if let (Some(n), Some(a)) = (name, args) {
+                                        let args_val: serde_json::Value =
+                                            match serde_json::from_str(a) {
+                                                Ok(v) => v,
+                                                Err(_) => serde_json::Value::Null,
+                                            };
+                                        all_tokens.push(StreamToken::ToolCall {
+                                            name: n.clone(),
+                                            args: args_val,
+                                            id: call.id.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        let new_idx = start_idx + bytes_written.len();
+                        return (new_idx, Some(all_tokens));
+                    }
+                }
+                
+                (start_idx, None)
+            });
 
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes).to_string();
-                        for line in text.lines() {
-                            if line.starts_with("data: ") {
-                                let data = line.strip_prefix("data: ").unwrap_or("");
-                                if data == "[DONE]" {
-                                    let _ = tx.send(Ok(StreamToken::Done)).await;
-                                    return;
-                                }
-                                if let Ok(response) =
-                                    serde_json::from_str::<NvidiaStreamResponse>(data)
-                                {
-                                    for choice in response.choices {
-                                        if let Some(content) = choice.delta.content {
-                                            if !content.is_empty() {
-                                                let _ =
-                                                    tx.send(Ok(StreamToken::Text(content))).await;
-                                            }
-                                        }
-                                        if let Some(calls) = choice.delta.tool_calls {
-                                            for call in calls {
-                                                if let (Some(name), Some(args)) =
-                                                    (call.function.name, call.function.arguments)
-                                                {
-                                                    let args_val: serde_json::Value =
-                                                        serde_json::from_str(&args)
-                                                            .ok()
-                                                            .unwrap_or(serde_json::json!({}));
-                                                    let _ = tx
-                                                        .send(Ok(StreamToken::ToolCall {
-                                                            name,
-                                                            args: args_val,
-                                                            id: call.id,
-                                                        }))
-                                                        .await;
-                                                }
-                                            }
-                                        }
+                        if let Some(tokens) = accumulator.push(&text) {
+                            for tk in tokens {
+                                match &tk {
+                                    StreamToken::Done => {
+                                        let _ = tx.send(Ok(StreamToken::Done)).await;
+                                        return;
+                                    }
+                                    _ => {
+                                        let _ = tx.send(Ok(tk)).await;
                                     }
                                 }
                             }

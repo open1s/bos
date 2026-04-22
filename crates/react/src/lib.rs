@@ -8,6 +8,7 @@ pub mod search_tool;
 pub mod telemetry;
 pub mod token_counter;
 pub mod tool;
+pub mod json_xml_extractor;
 use serde_json::Value;
 use std::collections::HashMap;
 #[derive(Debug, Clone)]
