@@ -44,6 +44,55 @@ impl HookedToolAdapter {
             agent_id,
         }
     }
+
+    fn run_before_tool_hook(
+        hooks: &HookRegistry,
+        agent_id: &str,
+        tool_name: &str,
+        tool_args: &str,
+    ) -> Result<(), ReactToolError> {
+        let mut ctx = HookContext::new(agent_id);
+        ctx.set("tool_name", tool_name);
+        ctx.set("tool_args", tool_args);
+
+        match hooks.trigger_blocking(HookEvent::BeforeToolCall, ctx) {
+            HookDecision::Error(msg) => Err(ReactToolError::Failed(format!(
+                "BeforeToolCall hook error: {}",
+                msg
+            ))),
+            HookDecision::Abort => Err(ReactToolError::Failed(
+                "Tool call aborted by hook".to_string(),
+            )),
+            HookDecision::Continue => Ok(()),
+        }
+    }
+
+    fn run_after_tool_hook(
+        hooks: &HookRegistry,
+        agent_id: &str,
+        tool_name: &str,
+        tool_args: &str,
+        hook_payload: Result<&serde_json::Value, &str>,
+    ) -> Result<(), ReactToolError> {
+        let mut ctx = HookContext::new(agent_id);
+        ctx.set("tool_name", tool_name);
+        ctx.set("tool_args", tool_args);
+        match hook_payload {
+            Ok(value) => ctx.set("tool_result", &value.to_string()),
+            Err(error) => ctx.set("error", error),
+        }
+
+        match hooks.trigger_blocking(HookEvent::AfterToolCall, ctx) {
+            HookDecision::Error(msg) => {
+                warn!("AfterToolCall hook error: {}", msg);
+                Ok(())
+            }
+            HookDecision::Abort => Err(ReactToolError::Failed(
+                "Tool call aborted by after hook".to_string(),
+            )),
+            HookDecision::Continue => Ok(()),
+        }
+    }
 }
 
 impl ReactToolTrait for HookedToolAdapter {
@@ -60,55 +109,27 @@ impl ReactToolTrait for HookedToolAdapter {
     }
 
     fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ReactToolError> {
-        // Use block_in_place + block_on for sync compatibility with react's sync Tool trait
         let hooks = self.hooks.clone();
         let agent_id = self.agent_id.clone();
         let tool_name = self.inner.name().to_string();
         let tool_args = input.to_string();
 
-        // Trigger BeforeToolCall hook (sync block)
-        let mut ctx = HookContext::new(&agent_id);
-        ctx.set("tool_name", &tool_name);
-        ctx.set("tool_args", &tool_args);
-        let decision = hooks.trigger_blocking(HookEvent::BeforeToolCall, ctx);
+        Self::run_before_tool_hook(&hooks, &agent_id, &tool_name, &tool_args)?;
 
-        match decision {
-            HookDecision::Error(msg) => {
-                return Err(ReactToolError::Failed(format!(
-                    "BeforeToolCall hook error: {}",
-                    msg
-                )));
-            }
-            HookDecision::Abort => {
-                return Err(ReactToolError::Failed(
-                    "Tool call aborted by hook".to_string(),
-                ));
-            }
-            HookDecision::Continue => {}
-        }
-
-        // Execute the tool
         let result =
             tokio::task::block_in_place(|| futures::executor::block_on(self.inner.execute(input)));
 
-        // Trigger AfterToolCall hook (sync block)
-        let mut ctx = HookContext::new(&agent_id);
-        ctx.set("tool_name", &tool_name);
-        ctx.set("tool_args", &tool_args);
         match &result {
-            Ok(v) => ctx.set("tool_result", &v.to_string()),
-            Err(e) => ctx.set("error", &e.to_string()),
-        }
-        let decision = hooks.trigger_blocking(HookEvent::AfterToolCall, ctx);
-
-        match decision {
-            HookDecision::Error(msg) => log::warn!("AfterToolCall hook error: {}", msg),
-            HookDecision::Abort => {
-                return Err(ReactToolError::Failed(
-                    "Tool call aborted by after hook".to_string(),
-                ));
+            Ok(value) => {
+                Self::run_after_tool_hook(&hooks, &agent_id, &tool_name, &tool_args, Ok(value))?
             }
-            HookDecision::Continue => {}
+            Err(error) => Self::run_after_tool_hook(
+                &hooks,
+                &agent_id,
+                &tool_name,
+                &tool_args,
+                Err(&error.to_string()),
+            )?,
         }
 
         result.map_err(|e| ReactToolError::Failed(e.to_string()))
@@ -162,25 +183,7 @@ impl ReactToolTrait for PluginToolAdapter {
         let tool_name = self.inner.name().to_string();
         let tool_args = input.to_string();
 
-        let mut ctx = HookContext::new(&agent_id);
-        ctx.set("tool_name", &tool_name);
-        ctx.set("tool_args", &tool_args);
-        let decision = hooks.trigger_blocking(HookEvent::BeforeToolCall, ctx);
-
-        match decision {
-            HookDecision::Error(msg) => {
-                return Err(ReactToolError::Failed(format!(
-                    "BeforeToolCall hook error: {}",
-                    msg
-                )));
-            }
-            HookDecision::Abort => {
-                return Err(ReactToolError::Failed(
-                    "Tool call aborted by hook".to_string(),
-                ));
-            }
-            HookDecision::Continue => {}
-        }
+        HookedToolAdapter::run_before_tool_hook(&hooks, &agent_id, &tool_name, &tool_args)?;
 
         let tool_call = ToolCallWrapper::new(&tool_name, input.clone(), None);
         let processed = plugins.process_tool_call_blocking(tool_call);
@@ -189,48 +192,45 @@ impl ReactToolTrait for PluginToolAdapter {
             futures::executor::block_on(self.inner.execute(&processed.args))
         });
 
-        let after_trigger: Result<(bool, serde_json::Value), ()> = match result {
-            Ok(result) => {
-                let tool_result = ToolResultWrapper::new(result);
+        let processed_result: Result<serde_json::Value, String> = match result {
+            Ok(value) => {
+                let tool_result = ToolResultWrapper::new(value);
                 let processed = plugins.process_tool_result_blocking(tool_result);
                 match processed.into_result() {
-                    Ok(v) => Ok((true, v)),
-                    Err(_) => Err(()),
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(e.to_string()),
                 }
             }
             Err(e) => {
-                let react_err = ReactToolError::Failed(e.to_string());
+                let error_message = e.to_string();
+                let react_err = ReactToolError::Failed(error_message.clone());
                 let tool_result = ToolResultWrapper::from_result(&Err(react_err));
                 let processed = plugins.process_tool_result_blocking(tool_result);
                 match processed.into_result() {
-                    Ok(v) => Ok((false, v)),
-                    Err(_) => Err(()),
+                    Ok(v) => Ok(v),
+                    Err(_) => Err(error_message),
                 }
             }
         };
 
-        let mut ctx = HookContext::new(&agent_id);
-        ctx.set("tool_name", &tool_name);
-        ctx.set("tool_args", &tool_args);
-        match &after_trigger {
-            Ok((_, v)) => ctx.set("tool_result", &v.to_string()),
-            Err(_) => ctx.set("error", "Tool execution failed"),
-        }
-        let decision = hooks.trigger_blocking(HookEvent::AfterToolCall, ctx);
-
-        match decision {
-            HookDecision::Error(msg) => log::warn!("AfterToolCall hook error: {}", msg),
-            HookDecision::Abort => {
-                return Err(ReactToolError::Failed(
-                    "Tool call aborted by after hook".to_string(),
-                ));
-            }
-            HookDecision::Continue => {}
+        match &processed_result {
+            Ok(value) => HookedToolAdapter::run_after_tool_hook(
+                &hooks,
+                &agent_id,
+                &tool_name,
+                &tool_args,
+                Ok(value),
+            )?,
+            Err(error) => HookedToolAdapter::run_after_tool_hook(
+                &hooks,
+                &agent_id,
+                &tool_name,
+                &tool_args,
+                Err(error.as_str()),
+            )?,
         }
 
-        after_trigger
-            .map(|(_, v)| v)
-            .map_err(|_| ReactToolError::Failed("Tool execution failed".to_string()))
+        processed_result.map_err(ReactToolError::Failed)
     }
 
     fn is_skill(&self) -> bool {
