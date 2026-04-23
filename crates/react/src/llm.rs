@@ -348,19 +348,13 @@ impl fmt::Debug for LlmRequest {
 
 #[derive(Debug, Clone)]
 pub enum LlmResponse {
-    Text(String),
-    Partial(String),
-    ToolCall {
-        name: String,
-        args: Value,
-        id: Option<String>,
-    },
-    Done,
+    OpenAI(ChatCompletionResponse)
 }
 
 #[derive(Debug, Clone)]
 pub enum StreamToken {
     Text(String),
+    ReasoningContent(String),
     ToolCall {
         name: String,
         args: Value,
@@ -473,3 +467,8 @@ impl LlmClient for ModelFallback {
 }
 
 pub mod vendor;
+
+pub use vendor::{
+    ChatCompletionResponse, ChatMessage, Choice, ToolCall, FunctionCall, Delta, ChunkChoice,
+    ChatCompletionChunk, Usage, LogProbs,
+};

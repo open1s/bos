@@ -23,3 +23,6 @@ uuid = {workspace = true}
 qserde = { path = "../qserde" }
 surfing = "0.1"
 quick-xml = "0.39"
+
+[dev-dependencies]
+config = { path = "../config" }

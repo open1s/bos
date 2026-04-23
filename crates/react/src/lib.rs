@@ -5,7 +5,7 @@ pub mod memory;
 pub mod prompts;
 pub mod resilience;
 pub mod search_tool;
-pub mod streaming_extractor;
+pub mod extractor;
 pub mod telemetry;
 pub mod token_counter;
 pub mod tool;
@@ -63,7 +63,8 @@ pub struct ExecutionOutput {
 
 pub use engine::{BuilderError, ReActEngine, ReActEngineBuilder};
 pub use llm::LlmMessage as Message;
-pub use llm::{LlmClient, LlmError};
+pub use llm::LlmMessage;
+pub use llm::{LlmClient, LlmError, LlmContext, LlmRequest};
 pub use memory::Memory;
 pub use prompts::PromptTemplate;
 pub use resilience::{
@@ -73,8 +74,8 @@ pub use resilience::{
 
 pub use telemetry::{Telemetry, TelemetryEvent};
 pub use tool::{Tool, ToolRegistry};
-pub use streaming_extractor::{JsonExtractor, StreamExtractor,MixedExtractor,MixedExtractorV2};
-pub use streaming_extractor::Span as StreamSpan;
-pub use streaming_extractor::Arena as StreamArena;
+pub use extractor::{StreamExtractor,JsonExtractor,MixedExtractor,MixedExtractorV2};
+pub use extractor::Span as StreamSpan;
+pub use extractor::Arena as StreamArena;
 
 pub use llm::StreamResponseAccumulator;

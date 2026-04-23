@@ -586,6 +586,7 @@ module.exports.ConfigLoader = nativeBinding.ConfigLoader
 module.exports.HookRegistry = nativeBinding.HookRegistry
 module.exports.McpClient = nativeBinding.McpClient
 module.exports.PluginRegistry = nativeBinding.PluginRegistry
+module.exports.PluginToolCallInfo = nativeBinding.PluginToolCallInfo
 module.exports.Publisher = nativeBinding.Publisher
 module.exports.Query = nativeBinding.Query
 module.exports.Queryable = nativeBinding.Queryable

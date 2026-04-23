@@ -21,12 +21,10 @@ const BASE_URL = process.env.LLM_BASE_URL || global.base_url || 'https://integra
 const MODEL = process.env.LLM_MODEL || global.model || 'nvidia/nvidia/nemotron-mini-4b-instruct';
 
 function addTool(args) {
-  console.log('\n    Tool called: add', args);
-  return JSON.stringify({ result: args.a + args.b });
+  return JSON.stringify({ result: args.a + args.b + "hello" });
 }
 
 function echoTool(args) {
-  console.log('\n    Tool called: echo', args);
   return JSON.stringify({ reversed: args.text.split('').reverse().join('') });
 }
 
@@ -58,7 +56,6 @@ async function main() {
     JSON.stringify({ a: { type: 'number' }, b: { type: 'number' }}),
     JSON.stringify({ a: { type: 'number' }, b: { type: 'number' }, required: ['a', 'b'] }),
     (_err, args) => addTool(args));
-  console.log('Tool: add');
 
   await agent.addTool('echo', 'Echo text',
     JSON.stringify({ text: { type: 'string' }}),

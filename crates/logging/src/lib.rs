@@ -92,7 +92,7 @@ pub fn auto_init_tracing() {
     let level = format!(
         "bus={level},agent={level},react={level},pybos={level},zenoh=off,h2=off,rustls=off"
     );
-    
+
     let file_spec = FileSpec::default().directory(logdir).basename("bos");
     let logger = Logger::try_with_str(level)
         .unwrap()

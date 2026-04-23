@@ -1,6 +1,37 @@
 use async_trait::async_trait;
+use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
 use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, TokenStream};
 use std::sync::{Arc, Mutex};
+
+fn make_text_response(content: String, is_final: bool) -> LlmResponse {
+    LlmResponse::OpenAI(ChatCompletionResponse {
+        id: "test-123".to_string(),
+        object: "chat.completion".to_string(),
+        created: 1234567890,
+        model: "test-model".to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(content),
+                tool_calls: None,
+                function_call: None,
+                reasoning_content: None,
+                extra: serde_json::Value::Object(serde_json::Map::new()),
+            },
+            finish_reason: if is_final {
+                Some("stop".to_string())
+            } else {
+                Some("continue".to_string())
+            },
+            stop_reason: None,
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        nvext: None,
+    })
+}
 
 #[allow(dead_code)]
 struct MockLlm {
@@ -24,7 +55,8 @@ impl LlmClient for MockLlm {
             let mut r = responses.lock().unwrap();
             r.remove(0)
         };
-        Ok(LlmResponse::Text(next))
+        let is_final = next.starts_with("Final Answer:");
+        Ok(make_text_response(next, is_final))
     }
 
     async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {

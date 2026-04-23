@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use crate::streaming_extractor::{JsonExtractor, StreamExtractor, StreamSpan};
+use crate::{extractor::{JsonExtractor, StreamExtractor}, llm::vendor::{OpenAIExtractor, openaicompatible::ChatCompletionResponse}};
 use async_trait::async_trait;
 use futures::StreamExt;
-use log::info;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Serialize};
 
 use crate::llm::{
     LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken, Stringfy,
@@ -62,72 +61,28 @@ struct FunctionCallJson {
     arguments: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct NvidiaResponse {
-    choices: Vec<Choice>,
-}
+// #[derive(Debug, Deserialize)]
+// struct NvidiaResponse {
+//     choices: Vec<Choice>,
+// }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct Choice {
-    message: MessageContent,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
+// #[derive(Debug, Deserialize)]
+// struct MessageContent {
+//     content: Option<String>,
+//     tool_calls: Option<Vec<ToolCall>>,
+// }
 
-#[derive(Debug, Deserialize)]
-struct MessageContent {
-    content: Option<String>,
-    tool_calls: Option<Vec<ToolCall>>,
-}
+// #[derive(Debug, Deserialize)]
+// struct ToolCall {
+//     id: Option<String>,
+//     function: FunctionCall,
+// }
 
-#[derive(Debug, Deserialize)]
-struct ToolCall {
-    id: Option<String>,
-    function: FunctionCall,
-}
-
-#[derive(Debug, Deserialize)]
-struct FunctionCall {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct StreamChoice {
-    delta: StreamDelta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamDelta {
-    #[allow(dead_code)]
-    content: Option<String>,
-    tool_calls: Option<Vec<StreamToolCall>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamToolCall {
-    id: Option<String>,
-    #[allow(dead_code)]
-    index: Option<usize>,
-    #[serde(rename = "type")]
-    _call_type: Option<String>,
-    function: StreamFunctionCall,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamFunctionCall {
-    name: Option<String>,
-    arguments: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NvidiaStreamResponse {
-    choices: Vec<StreamChoice>,
-}
+// #[derive(Debug, Deserialize)]
+// struct FunctionCall {
+//     name: String,
+//     arguments: String,
+// }
 
 impl NvidiaVendor {
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
@@ -213,7 +168,7 @@ impl NvidiaVendor {
                 .collect::<Vec<_>>()
                 .join("\n");
             let skill_schema = format!(
-                "You have access to the following skills(call load_skill to read it when needed):\n{}\n",
+                "Available Skills(call load_skill to read it when needed):\n{}\n",
                 available_skills
             );
             Some(skill_schema)
@@ -270,33 +225,35 @@ impl NvidiaVendor {
             messages.insert(0, meta);
         }
 
-        let tools = if !req.context.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = req
-                .context
-                .tools
-                .into_iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters
-                        }
-                    })
+let tools = if !req.context.tools.is_empty() {
+        let tools: Vec<serde_json::Value> = req
+            .context
+            .tools
+            .into_iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters
+                    }
                 })
-                .collect();
-            Some(tools)
-        } else {
-            None
-        };
+            })
+            .collect();
+        Some(tools)
+    } else {
+        None
+    };
+
+        let max_tokens = req.max_tokens.unwrap_or(128000);
 
         NvidiaRequest {
             model: req.model,
             messages,
             tools,
             temperature: req.temperature,
-            max_tokens: req.max_tokens,
+            max_tokens: Some(max_tokens),
             stream: Some(false),
             top_p: req.top_p,
             top_k: req.top_k,
@@ -344,33 +301,11 @@ impl LlmClient for NvidiaVendor {
             return Err(LlmError::Http(format!("HTTP {}: {}", status, body)));
         }
 
-        let body: NvidiaResponse = response
+        let value: ChatCompletionResponse = response
             .json()
             .await
             .map_err(|e| LlmError::Parse(e.to_string()))?;
-
-        let choice = body
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| LlmError::Parse("No choices in response".to_string()))?;
-
-        if let Some(tool_calls) = choice.message.tool_calls {
-            if let Some(tc) = tool_calls.into_iter().next() {
-                let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                return Ok(LlmResponse::ToolCall {
-                    name: tc.function.name,
-                    args,
-                    id: tc.id,
-                });
-            }
-        }
-
-        match choice.message.content {
-            Some(content) => Ok(LlmResponse::Text(content)),
-            None => Ok(LlmResponse::Done),
-        }
+        Ok(LlmResponse::OpenAI(value))        
     }
 
     async fn stream_complete(&self, mut request: LlmRequest) -> Result<TokenStream, LlmError> {
@@ -385,8 +320,6 @@ impl LlmClient for NvidiaVendor {
         let nvidia_req = self.build_stream_request(request);
 
         let url = format!("{}/chat/completions", endpoint);
-
-        info!("Nvidia Request: {:?}", &nvidia_req);
 
         let response = client
             .post(&url)
@@ -409,41 +342,22 @@ impl LlmClient for NvidiaVendor {
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
-            let mut extractor = JsonExtractor::default();
-            let mut last_scan_consume_index = 0usize;
+            let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
 
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes).to_string();
-                        info!("Nvidia chunk: {}", &text); 
-                        let spans = extractor.push(&text);
-
-                        for span in spans {
-                            if !span.is_root() {
-                                continue;
-                            }
-
-                            //handle before text
-                            if last_scan_consume_index < span.start {
-                                let s = StreamSpan::new(last_scan_consume_index, span.start, 0);
-                                let content = extractor.extract_str(&s);
-                                if let Some(text) = content {
-                                    let _ = tx.send(Ok(StreamToken::Text(text.to_string()))).await;
-                                    last_scan_consume_index += span.start;
-                                }
-                            }
-
-                            let json_match = extractor.extract_str(&span);
-                            if json_match.is_none() {
-                                continue;
-                            }
-
-                            let json_match = json_match.unwrap();
-                            if let Ok(resp) =
-                                serde_json::from_str::<NvidiaStreamResponse>(json_match)
-                            {
-                                for choice in &resp.choices {
+                        if let Some(chats) = extractor.push(&text) {
+                            for chat in chats {
+                                for choice in chat.choices {
+                                    if let Some(content) = &choice.delta.reasoning_content {
+                                        if !content.is_empty() {
+                                            let _ = tx
+                                                .send(Ok(StreamToken::ReasoningContent(content.clone())))
+                                                .await;
+                                        }
+                                    }
                                     if let Some(content) = &choice.delta.content {
                                         if !content.is_empty() {
                                             let _ = tx
@@ -453,35 +367,49 @@ impl LlmClient for NvidiaVendor {
                                     }
                                     if let Some(calls) = &choice.delta.tool_calls {
                                         for call in calls {
-                                            let name = call.function.name.as_ref();
-                                            let args = call.function.arguments.as_ref();
-                                            if let (Some(n), Some(a)) = (name, args) {
-                                                let args_val: serde_json::Value =
-                                                    match serde_json::from_str(a) {
-                                                        Ok(v) => v,
-                                                        Err(_) => serde_json::Value::Null,
-                                                    };
-                                                let _ = tx
-                                                    .send(Ok(StreamToken::ToolCall {
-                                                        name: n.clone(),
-                                                        args: args_val,
-                                                        id: call.id.clone(),
-                                                    }))
-                                                    .await;
-                                            }
+                                            let name = call.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
+                                            let args_str = call.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
+                                            let args_val: serde_json::Value = match serde_json::from_str(&args_str) {
+                                                Ok(v) => v,
+                                                Err(_) => serde_json::Value::Null,
+                                            };
+                                            let id = call.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                            let _ = tx
+                                                .send(Ok(StreamToken::ToolCall {
+                                                    name,
+                                                    args: args_val,
+                                                    id: Some(id),
+                                                }))
+                                                .await;
+                                        }
+                                    }
+
+                                    if let Some(func) = &choice.delta.function_call {
+                                        let name = func.name.clone().unwrap_or_default();
+                                        let args_str = func.arguments.clone().unwrap_or_default();
+                                        let args_val: serde_json::Value =
+                                            match serde_json::from_str(&args_str) {
+                                                Ok(v) => v,
+                                                Err(_) => serde_json::Value::Null,
+                                            };
+                                        let _ = tx
+                                            .send(Ok(StreamToken::ToolCall {
+                                                name: name.clone(),
+                                                args: args_val,
+                                                id: Some(uuid::Uuid::new_v4().to_string()),
+                                            }))
+                                            .await;
+                                    }
+
+                                    if let Some(reason) = &choice.finish_reason {
+                                        if !reason.is_empty() {
+                                            let _ = tx
+                                                .send(Ok(StreamToken::Done))
+                                                .await;
+                                            return;
                                         }
                                     }
                                 }
-
-                                last_scan_consume_index += span.end - span.start
-                            } else {
-                                info!("Nvidia not support: {}",json_match);
-                                let _ = tx
-                                    .send(Err(LlmError::Other(format!(
-                                        "Failed to parse JSON: {}",
-                                        json_match
-                                    ))))
-                                    .await;
                             }
                         }
                     }
@@ -548,5 +476,98 @@ impl NvidiaVendorBuilder {
 impl Default for NvidiaVendorBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use config::Section;
+    use serde::Deserialize;
+
+    use crate::{JsonExtractor, LlmClient, LlmRequest, StreamExtractor, llm::vendor::{NvidiaVendor, OpenAIExtractor}};
+
+    
+    #[test]
+    fn test() {
+        let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
+
+        let chunk = r#"data: {"id":"chatcmpl-958091ac43bbd265","object":"chat.completion.chunk","created":1777006903,"model":"meta/llama-4-maverick-17b-128e-instruct","choices":[{"index":0,"delta":{"content":"name","reasoning_content":null},"logprobs":null,"finish_reason":null,"token_ids":null}]}"#;
+
+        let spans = extractor.push(chunk);
+
+        //add tool call chunk
+        let chunk2 = r#"data: {"id":"chatcmpl-958091ac43bbd265","object":"chat.completion.chunk","created":1777006903,"model":"meta/llama-4-maverick-17b-128e-instruct","choices":[{"index":0,"delta":{"tool_calls":[{"id":"toolcall-123","type":"function","function":{"name":"get_current_weather","arguments":"{\"location\": \"San Francisco, CA\", \"unit\": \"celsius\"}"}}]},"logprobs":null,"finish_reason":null,"token_ids":null}]}"#;
+
+        let spans2 = extractor.push(chunk2);
+
+        assert!(spans.is_some());
+        assert!(spans2.is_some());
+        println!("Extracted spans: {:?}", spans);
+        println!("Extracted spans2: {:?}", spans2);
+    }
+
+    #[tokio::test]
+    async fn test_vendor(){
+        let mut section = Section::default();
+        let result = section.init();
+
+
+        let _config = match result.await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping test (no config): {}", e);
+                return;
+            }
+        };
+
+        #[derive(Debug,Deserialize, Clone)]
+        struct LlmConfig  {
+            model: String,
+            base_url: String,
+            api_key: String,
+        }
+
+        let llm_config: LlmConfig = match section.extract("global_model") {
+            Some(c) => c,
+            None => {
+                eprintln!("Skipping test (no global_model config)");
+                return;
+            }
+        };
+
+        let model_name = if llm_config.model.starts_with("nvidia/") {
+            llm_config.model.strip_prefix("nvidia/").unwrap().to_string()
+        } else {
+            llm_config.model.clone()
+        };
+
+        let vendor = NvidiaVendor::new(
+            llm_config.base_url.clone(),
+            model_name,
+            llm_config.api_key.clone(),
+        );
+
+        let request = LlmRequest::with_user(&llm_config.model, "What is 2+2?, must use add tool");
+        let result = match vendor.complete(request).await {
+            Ok(r) => r,
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("404") || err_str.contains("not found") {
+                    eprintln!(
+                        "NVIDIA endpoint/model not available (404), skipping test: {}",
+                        err_str
+                    );
+                    return;
+                }
+                if err_str.contains("429") || err_str.contains("rate limit") {
+                    eprintln!("NVIDIA rate limited, skipping test: {}", err_str);
+                    return;
+                }
+                panic!("NVIDIA request failed: {:?}", e);
+            }
+        };
+
+        println!("{:?}",result);
     }
 }

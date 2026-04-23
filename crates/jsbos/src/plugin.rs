@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -60,26 +61,49 @@ impl From<LlmRequestWrapper> for PluginLlmRequest {
 
 #[napi]
 pub enum PluginLlmResponse {
-  Text(String),
-  Partial(String),
-  ToolCall {
-    name: String,
-    args: String,
-    id: Option<String>,
+  OpenAI {
+    id: String,
+    model: String,
+    content: Option<String>,
   },
-  Done,
+}
+
+#[napi]
+pub struct PluginToolCallInfo {
+  pub id: String,
+  pub name: String,
+  pub arguments: String,
 }
 
 impl From<PluginLlmResponse> for LlmResponseWrapper {
   fn from(resp: PluginLlmResponse) -> Self {
     match resp {
-      PluginLlmResponse::Text(s) => LlmResponseWrapper::Text(s),
-      PluginLlmResponse::Partial(s) => LlmResponseWrapper::Partial(s),
-      PluginLlmResponse::ToolCall { name, args, id } => {
-        let args: serde_json::Value = serde_json::from_str(&args).unwrap_or_default();
-        LlmResponseWrapper::ToolCall { name, args, id }
+      PluginLlmResponse::OpenAI { id, model, content } => {
+        let choices = vec![Choice {
+          index: 0,
+          message: ChatMessage {
+            role: "assistant".to_string(),
+            content: content.clone(),
+            tool_calls: None,
+            function_call: None,
+            reasoning_content: None,
+            extra: serde_json::Value::Object(serde_json::Map::new()),
+          },
+          finish_reason: Some("stop".to_string()),
+          stop_reason: None,
+          logprobs: None,
+        }];
+        LlmResponseWrapper::OpenAI(ChatCompletionResponse {
+          id,
+          object: "chat.completion".to_string(),
+          created: 0,
+          model,
+          choices,
+          usage: None,
+          system_fingerprint: None,
+          nvext: None,
+        })
       }
-      PluginLlmResponse::Done => LlmResponseWrapper::Done,
     }
   }
 }
@@ -87,14 +111,14 @@ impl From<PluginLlmResponse> for LlmResponseWrapper {
 impl From<LlmResponseWrapper> for PluginLlmResponse {
   fn from(wrapper: LlmResponseWrapper) -> Self {
     match wrapper {
-      LlmResponseWrapper::Text(s) => PluginLlmResponse::Text(s),
-      LlmResponseWrapper::Partial(s) => PluginLlmResponse::Partial(s),
-      LlmResponseWrapper::ToolCall { name, args, id } => PluginLlmResponse::ToolCall {
-        name,
-        args: args.to_string(),
-        id,
-      },
-      LlmResponseWrapper::Done => PluginLlmResponse::Done,
+      LlmResponseWrapper::OpenAI(rsp) => {
+        let choice = rsp.choices.first();
+        PluginLlmResponse::OpenAI {
+          id: rsp.id,
+          model: rsp.model,
+          content: choice.and_then(|c| c.message.content.clone()),
+        }
+      }
     }
   }
 }
@@ -265,49 +289,53 @@ impl AgentPlugin for JSPlugin {
 
   async fn on_llm_response(&self, response: LlmResponseWrapper) -> Option<LlmResponseWrapper> {
     let callback = self.on_llm_response_cb.as_ref()?;
-    let input = match &response {
-      LlmResponseWrapper::Text(s) => serde_json::json!({"type": "Text", "content": s}),
-      LlmResponseWrapper::Partial(s) => serde_json::json!({"type": "Partial", "content": s}),
-      LlmResponseWrapper::ToolCall { name, args, id } => {
-        serde_json::json!({"type": "ToolCall", "name": name, "args": args, "id": id})
+
+    let (content, tool_calls) = match &response {
+      LlmResponseWrapper::OpenAI(rsp) => {
+        let choice = rsp.choices.first();
+        let content = choice.and_then(|c| c.message.content.clone());
+        let tool_calls = choice.and_then(|c| c.message.tool_calls.clone());
+        (content, tool_calls)
       }
-      LlmResponseWrapper::Done => serde_json::json!({"type": "Done"}),
     };
 
-    let result = Self::call_js_callback(callback, input)?;
+    let input = if let Some(ref tc) = tool_calls {
+      serde_json::json!({
+          "type": "ToolCall",
+          "name": tc.first().and_then(|t| t.function.name.clone()).unwrap_or_default(),
+          "args": tc.first().and_then(|t| t.function.arguments.clone()).unwrap_or_default(),
+          "id": tc.first().map(|t| t.id.clone())
+      })
+    } else {
+      serde_json::json!({"type": "Text", "content": content})
+    };
 
-    match result.get("type").and_then(|v| v.as_str()) {
-      Some("Text") => {
-        let content = result
-          .get("content")
-          .and_then(|v| v.as_str())
-          .unwrap_or("")
-          .to_string();
-        Some(LlmResponseWrapper::Text(content))
-      }
-      Some("Partial") => {
-        let content = result
-          .get("content")
-          .and_then(|v| v.as_str())
-          .unwrap_or("")
-          .to_string();
-        Some(LlmResponseWrapper::Partial(content))
-      }
-      Some("ToolCall") => {
-        let name = result
-          .get("name")
-          .and_then(|v| v.as_str())
-          .unwrap_or("")
-          .to_string();
-        let args = result.get("args").cloned().unwrap_or_default();
-        let id = result
-          .get("id")
-          .and_then(|v| v.as_str())
-          .map(|s| s.to_string());
-        Some(LlmResponseWrapper::ToolCall { name, args, id })
-      }
-      _ => None,
+let result = Self::call_js_callback(callback, input)?;
+
+    if result.get("type").and_then(|v| v.as_str()).is_some() {
+        let LlmResponseWrapper::OpenAI(mut rsp) = response;
+        if let Some(choice) = rsp.choices.first_mut() {
+          if let Some(c) = result.get("content").and_then(|v| v.as_str()) {
+            choice.message.content = Some(c.to_string());
+          }
+          if let Some(name) = result.get("name").and_then(|v| v.as_str()) {
+            if let Some(ref mut tc) = choice.message.tool_calls {
+              if let Some(first_tc) = tc.first_mut() {
+                first_tc.function.name = Some(name.to_string());
+              }
+            }
+          }
+          if let Some(args) = result.get("args") {
+            if let Some(ref mut tc) = choice.message.tool_calls {
+              if let Some(first_tc) = tc.first_mut() {
+                first_tc.function.arguments = Some(args.to_string());
+              }
+            }
+          }
+        }
+        return Some(LlmResponseWrapper::OpenAI(rsp));
     }
+    None
   }
 
   async fn on_tool_call(&self, tool_call: ToolCallWrapper) -> Option<ToolCallWrapper> {

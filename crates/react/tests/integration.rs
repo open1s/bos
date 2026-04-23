@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use react::calculator_tool::CalculatorTool;
 use react::engine::ReActEngineBuilder;
+use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
 use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, TokenStream};
 
 struct MockLlm {
@@ -20,6 +21,36 @@ impl MockLlm {
     }
 }
 
+fn make_text_response(content: String, is_final: bool) -> LlmResponse {
+    LlmResponse::OpenAI(ChatCompletionResponse {
+        id: "test-123".to_string(),
+        object: "chat.completion".to_string(),
+        created: 1234567890,
+        model: "test-model".to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(content),
+                tool_calls: None,
+                function_call: None,
+                reasoning_content: None,
+                extra: serde_json::Value::Object(serde_json::Map::new()),
+            },
+            stop_reason: None,
+            finish_reason: if is_final {
+                Some("stop".to_string())
+            } else {
+                Some("continue".to_string())
+            },
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        nvext: None,
+    })
+}
+
 #[async_trait]
 impl LlmClient for MockLlm {
     async fn complete(&self, _request: LlmRequest) -> LlmResponseResult {
@@ -27,12 +58,12 @@ impl LlmClient for MockLlm {
         let idx = self.index.clone();
         let i = idx.load(Ordering::SeqCst);
         idx.fetch_add(1, Ordering::SeqCst);
-        Ok(LlmResponse::Text(
-            responses
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| "Final Answer: 0".to_string()),
-        ))
+        let text = responses
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| "Final Answer: 0".to_string());
+        let is_final = text.starts_with("Final Answer:");
+        Ok(make_text_response(text, is_final))
     }
 
     async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {

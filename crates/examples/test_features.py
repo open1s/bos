@@ -15,13 +15,12 @@ from brainos import BrainOS, tool
 
 
 async def test_mcp():
-    """Test MCP client with a simple echo server."""
+    """Test MCP client with filesystem server."""
     print("=== Testing MCP Client ===")
     
     try:
-        # Try to spawn a simple MCP server
-        # Using npx to run @modelcontextprotocol/server-echo
-        client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-echo"])
+        # Use server-filesystem which exists in npm
+        client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
         
         print("MCP client spawned, initializing...")
         caps = await client.initialize()
@@ -29,11 +28,18 @@ async def test_mcp():
         
         print("Listing tools...")
         tools = await client.list_tools()
-        print(f"Tools: {tools}")
+        print(f"Tools: {len(tools)} available")
         
-        print("Calling echo tool...")
-        result = await client.call_tool("echo", '{"text": "hello from mcp"}')
-        print(f"Echo result: {result}")
+        tmpfile = "/private/tmp/test_mcp.txt"
+        with open(tmpfile, 'w') as f:
+            f.write("hello from mcp")
+        
+        print(f"Calling read_text_file on {tmpfile}...")
+        result = await client.call_tool("read_text_file", f'{{"path": "{tmpfile}"}}')
+        print(f"Result: {result}")
+        
+        import os
+        os.unlink(tmpfile)
         
         print("✅ MCP test passed!")
         return True

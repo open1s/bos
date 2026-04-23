@@ -3,8 +3,72 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
 use react::engine::{BuilderError, ReActEngineBuilder};
+use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
 use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, TokenStream};
 use react::tool::FnTool;
+
+fn make_text_response(content: String, is_final: bool) -> LlmResponse {
+    LlmResponse::OpenAI(ChatCompletionResponse {
+        id: "test-123".to_string(),
+        object: "chat.completion".to_string(),
+        created: 1234567890,
+        model: "test-model".to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(content),
+                tool_calls: None,
+                function_call: None,
+                reasoning_content: None,
+                extra: serde_json::Value::Object(serde_json::Map::new()),
+            },
+            stop_reason: None,
+            finish_reason: if is_final {
+                Some("stop".to_string())
+            } else {
+                Some("continue".to_string())
+            },
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        nvext: None,
+    })
+}
+
+fn make_tool_call_response(name: &str, args: Value, call_id: &str) -> LlmResponse {
+    LlmResponse::OpenAI(ChatCompletionResponse {
+        id: "test-123".to_string(),
+        object: "chat.completion".to_string(),
+        created: 1234567890,
+        model: "test-model".to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: call_id.to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: Some(name.to_string()),
+                        arguments: Some(args.to_string()),
+                    },
+                }]),
+                function_call: None,
+                reasoning_content: None,
+                extra: serde_json::Value::Object(serde_json::Map::new()),
+            },
+            finish_reason: Some("tool_calls".to_string()),
+            stop_reason: None,
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        nvext: None,
+    })
+}
 
 #[test]
 fn test_builder_pattern() {
@@ -25,17 +89,18 @@ fn test_builder_pattern() {
             let responses = self.responses.clone();
             let mut lock = responses.lock().unwrap();
             if lock.is_empty() {
-                Ok(LlmResponse::Text("Final Answer: 5".to_string()))
+                Ok(make_text_response("Final Answer: 5".to_string(), true))
             } else {
                 let resp = lock.remove(0);
                 if resp.contains("Action:") {
-                    Ok(LlmResponse::ToolCall {
-                        name: "calculator".to_string(),
-                        args: serde_json::json!({"expression": "2+3"}),
-                        id: Some("1".to_string()),
-                    })
+                    Ok(make_tool_call_response(
+                        "calculator",
+                        serde_json::json!({"expression": "2+3"}),
+                        "1",
+                    ))
                 } else {
-                    Ok(LlmResponse::Text(resp))
+                    let is_final = resp.starts_with("Final Answer:");
+                    Ok(make_text_response(resp, is_final))
                 }
             }
         }
@@ -120,7 +185,7 @@ fn test_message_log_input() {
                 .lock()
                 .unwrap()
                 .push(request.context.conversations.clone());
-            Ok(LlmResponse::Text("Hello back!".to_string()))
+            Ok(make_text_response("Hello back!".to_string(), true))
         }
 
         async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {
@@ -186,7 +251,10 @@ fn test_react_with_request() {
     impl LlmClient for MockLlmFullRequest {
         async fn complete(&self, request: LlmRequest) -> LlmResponseResult {
             *self.received_model.lock().unwrap() = Some(request.model.clone());
-            Ok(LlmResponse::Text("Answer from custom request".to_string()))
+            Ok(make_text_response(
+                "Answer from custom request".to_string(),
+                true,
+            ))
         }
 
         async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {

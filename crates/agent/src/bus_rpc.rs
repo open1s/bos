@@ -325,6 +325,9 @@ impl AgentRpcClient {
                     text.push_str(&t);
                     chunks.push(t);
                 }
+                crate::StreamToken::ReasoningContent(_t) => {
+                    //SKIP
+                }
                 crate::StreamToken::ToolCall { name, args, id } => chunks.push(format!(
                     "[tool_call] name={} id={} args={}",
                     name,
@@ -392,6 +395,9 @@ async fn handle_rpc_request(agent: Arc<Agent>, req: AgentRpcRequest) -> AgentRpc
                     Some(Ok(crate::StreamToken::Text(t))) => {
                         text.push_str(&t);
                         chunks.push(t);
+                    }
+                    Some(Ok(crate::StreamToken::ReasoningContent(_t))) => {
+                        //SKIP
                     }
                     Some(Ok(crate::StreamToken::ToolCall { name, args, id })) => {
                         chunks.push(format!(
@@ -730,6 +736,9 @@ async fn handle_incoming_query(
                     )
                     .await?;
                 }
+                Ok(crate::StreamToken::ReasoningContent(_t)) => {
+                    //SKIP
+                }
                 Ok(crate::StreamToken::ToolCall { name, args, id }) => {
                     reply_response(
                         &query,
@@ -810,16 +819,43 @@ mod tests {
     use super::*;
     use crate::tools::FunctionTool;
     use futures::Stream;
+    use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
     use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, StreamToken};
     use std::pin::Pin;
     use std::sync::Mutex;
 
     struct MockLlm;
 
+    fn make_text_response(content: String) -> LlmResponse {
+        LlmResponse::OpenAI(ChatCompletionResponse {
+            id: "test-mock".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1234567890,
+            model: "mock-model".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(content),
+                    tool_calls: None,
+                    function_call: None,
+                    reasoning_content: None,
+                    extra: serde_json::Value::Object(serde_json::Map::new()),
+                },
+                finish_reason: Some("stop".to_string()),
+                stop_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            nvext: None,
+        })
+    }
+
     #[async_trait]
     impl LlmClient for MockLlm {
         async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
-            Ok(LlmResponse::Text("mock-complete".to_string()))
+            Ok(make_text_response("mock-complete".to_string()))
         }
 
         async fn stream_complete(
@@ -1099,6 +1135,7 @@ mod tests {
                 crate::StreamToken::Text(t) => out.push_str(&t),
                 crate::StreamToken::Done => break,
                 crate::StreamToken::ToolCall { .. } => {}
+                crate::StreamToken::ReasoningContent(_) => {}
             }
         }
         assert_eq!(out, "s1s2");

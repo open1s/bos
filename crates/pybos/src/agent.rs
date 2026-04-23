@@ -847,6 +847,7 @@ impl PyAgent {
                 while let Some(token_result) = stream.next().await {
                     let item = match token_result {
                         Ok(StreamToken::Text(text)) => Ok(text),
+                        Ok(StreamToken::ReasoningContent(_)) => continue,
                         Ok(StreamToken::ToolCall { name, args, id }) => Ok(serde_json::json!({
                             "type": "tool_call",
                             "name": name,

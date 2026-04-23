@@ -55,6 +55,10 @@ impl Arena {
         self.buf.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     pub fn compact(&mut self, keep_from: usize) {
         if keep_from == 0 {
             return;
@@ -70,7 +74,9 @@ impl Arena {
 }
 
 pub trait StreamExtractor {
-    fn push(&mut self, chunk: &str) -> Vec<Span>;
+    type Item<'a>;
+
+    fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>>;
 
     fn extract<'a>(&'a self, span: &Span) -> &'a [u8];
 
@@ -79,11 +85,7 @@ pub trait StreamExtractor {
     }
 
     fn extract_string(&self, span: &Span) -> Option<String> {
-        let str = self.extract_str(span);
-        match str {
-            Some(s) => Some(s.to_string()),
-            None => None,
-        }
+        self.extract_str(span).map(|s| s.to_string())
     }
 
     fn reset(&mut self);
@@ -100,8 +102,10 @@ pub struct JsonExtractor {
 }
 
 impl StreamExtractor for JsonExtractor {
-    fn push(&mut self, chunk: &str) -> Vec<Span> {
-        if self.stack.is_empty() && self.arena.len() > 0 {
+    type Item<'a> = StreamSpan;
+
+    fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>> {
+        if self.stack.is_empty() && !self.arena.is_empty() {
             self.arena.compact(self.arena.len());
             self.scan = 0;
         } else if !self.stack.is_empty() {
@@ -197,7 +201,7 @@ impl StreamExtractor for JsonExtractor {
             }
         }
 
-        spans
+        Some(spans)
     }
 
     fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
@@ -222,8 +226,9 @@ pub struct XmlExtractor {
 }
 
 impl StreamExtractor for XmlExtractor {
-    fn push(&mut self, chunk: &str) -> Vec<Span> {
-        if self.stack.is_empty() && self.arena.len() > 0 {
+    type Item<'a> = StreamSpan;
+    fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>> {
+        if self.stack.is_empty() && !self.arena.is_empty() {
             self.arena.compact(self.arena.len());
             self.scan = 0;
         } else if !self.stack.is_empty() {
@@ -259,72 +264,70 @@ impl StreamExtractor for XmlExtractor {
                 } else if b == b'"' {
                     self.in_string = false;
                 }
-                i += 1;
-                continue;
-            }
+i += 1;
+            continue;
+        }
 
-            match b {
-                b'<' => {
-                    let next = buf.get(i + 1).copied();
-                    if next == Some(b'/') {
-                        // Closing tag
-                        let name_start = i + 2;
-                        let name_end = find_tag_end(buf, name_start);
-                        if let Some(name) = get_tag_name(buf, name_start, name_end) {
-                            let tag_end = name_end + 1;
-                            if let Some(idx) = self.stack.iter().position(|(n, _)| n == &name) {
-                                let (_, open_pos) = self.stack[idx];
-                                self.stack.remove(idx);
-                                let level = self.stack.len() + 1;
-                                let parent_idx = self.stack.len();
+        if b == b'<' {
+            let next = buf.get(i + 1).copied();
+            if next == Some(b'/') {
+                // Closing tag
+                let name_start = i + 2;
+                let name_end = find_tag_end(buf, name_start);
+                if let Some(name) = get_tag_name(buf, name_start, name_end) {
+                    let tag_end = name_end + 1;
+                    if let Some(idx) = self.stack.iter().position(|(n, _)| n == &name) {
+                        let (_, open_pos) = self.stack[idx];
+                        self.stack.remove(idx);
+                        let level = self.stack.len() + 1;
+                        let parent_idx = self.stack.len();
 
-                                spans.push(Span {
-                                    start: self.arena.start + open_pos,
-                                    end: self.arena.start + tag_end,
-                                    level,
-                                    parent_idx: None,
-                                });
+                        spans.push(Span {
+                            start: self.arena.start + open_pos,
+                            end: self.arena.start + tag_end,
+                            level,
+                            parent_idx: None,
+                        });
 
-                                if parent_idx > 0 {
-                                    if let Some(last) = spans.last_mut() {
-                                        last.parent_idx = Some(parent_idx - 1);
-                                    }
-                                }
-                            }
-                        }
-                    } else if next == Some(b'!') || next == Some(b'?') {
-                    } else {
-                        let name_start = i + 1;
-                        let name_end = find_tag_end(buf, name_start);
-                        if let Some(name) = get_tag_name(buf, name_start, name_end) {
-                            let is_void = name_end < buf.len() && buf[name_end] == b'/';
-                            if is_void {
-                                let end = name_end + 2;
-                                let level = self.stack.len() + 1;
-                                let parent_idx = self.stack.len();
-
-                                spans.push(Span {
-                                    start: self.arena.start + i,
-                                    end: self.arena.start + end,
-                                    level,
-                                    parent_idx: None,
-                                });
-
-                                if parent_idx > 0 {
-                                    if let Some(last) = spans.last_mut() {
-                                        last.parent_idx = Some(parent_idx - 1);
-                                    }
-                                }
-                            } else {
-                                self.stack.push((name, i));
+                        if parent_idx > 0 {
+                            if let Some(last) = spans.last_mut() {
+                                last.parent_idx = Some(parent_idx - 1);
                             }
                         }
                     }
                 }
-                _ => {}
-            }
+} else if next == Some(b'!') || next == Some(b'?') {
+                // Skip
+            } else {
+                let name_start = i + 1;
+                let name_end = find_tag_end(buf, name_start);
+                if let Some(name) = get_tag_name(buf, name_start, name_end) {
+                    let is_void = name_end < buf.len() && buf[name_end] == b'/';
+                    if is_void {
+                        let end = name_end + 2;
+                        let level = self.stack.len() + 1;
+                        let parent_idx = self.stack.len();
 
-            i += 1;
+                        spans.push(Span {
+                            start: self.arena.start + i,
+                            end: self.arena.start + end,
+                            level,
+                            parent_idx: None,
+                        });
+
+                        if parent_idx > 0 {
+                            if let Some(last) = spans.last_mut() {
+                                last.parent_idx = Some(parent_idx - 1);
+                            }
+                        }
+                    } else {
+                        self.stack.push((name, i));
+                    }
+                }
+            }
+        }
+
+        i += 1;
         }
 
         self.scan = i;
@@ -342,7 +345,7 @@ impl StreamExtractor for XmlExtractor {
             }
         }
 
-        spans
+        Some(spans)
     }
 
     fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
@@ -371,7 +374,8 @@ enum MixedMode {
 }
 
 impl StreamExtractor for MixedExtractor {
-    fn push(&mut self, chunk: &str) -> Vec<Span> {
+    type Item<'a> = StreamSpan;
+    fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>> {
         // Detect mode from first non-whitespace char
         if self.mode.is_none() {
             let first = chunk.trim().chars().next();
@@ -385,7 +389,7 @@ impl StreamExtractor for MixedExtractor {
         match self.mode {
             Some(MixedMode::Json) => self.json.push(chunk),
             Some(MixedMode::Xml) => self.xml.push(chunk),
-            None => Vec::new(),
+            None => None,
         }
     }
 
@@ -435,8 +439,11 @@ pub struct MixedExtractorV2 {
 }
 
 impl StreamExtractor for MixedExtractorV2 {
-    fn push(&mut self, chunk: &str) -> Vec<Span> {
-        self.push_typed(chunk).into_iter().map(|t| t.span).collect()
+    type Item<'a> = StreamSpan;
+    fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>> {
+        self.push_typed(chunk).map(|typed| {
+            typed.into_iter().map(|t| t.span).collect::<Vec<_>>()
+        })
     }
 
     fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
@@ -472,21 +479,35 @@ impl MixedExtractorV2 {
         }
     }
 
-    pub fn push_typed(&mut self, chunk: &str) -> Vec<TypedSpan> {
+    pub fn push_typed(&mut self, chunk: &str) -> Option<Vec<TypedSpan>> {
         let json_spans = self.json.push(chunk);
         let xml_spans = self.xml.push(chunk);
 
-        let mut typed: Vec<TypedSpan> = json_spans
-            .into_iter()
-            .map(|span| TypedSpan {
-                span,
-                source: SpanSource::Json,
-            })
-            .chain(xml_spans.into_iter().map(|span| TypedSpan {
-                span,
-                source: SpanSource::Xml,
-            }))
-            .collect();
+        let mut typed = Vec::new();
+
+        if let Some(spans) = json_spans {
+            let json_parts: Vec<TypedSpan> = spans
+                .into_iter()
+                .map(|span| TypedSpan {
+                    span,
+                    source: SpanSource::Json,
+                })
+                .collect();
+
+            typed.extend(json_parts);
+        }
+
+        if let Some(spans) = xml_spans {
+            let xml_parts: Vec<TypedSpan> = spans
+                .into_iter()
+                .map(|span| TypedSpan {
+                    span,
+                    source: SpanSource::Xml,
+                })
+                .collect();
+
+            typed.extend(xml_parts);
+        }
 
         typed.sort_by(|a, b| {
             b.span
@@ -494,10 +515,11 @@ impl MixedExtractorV2 {
                 .cmp(&a.span.level)
                 .then(a.span.start.cmp(&b.span.start))
         });
-        typed
+    
+        Some(typed)
     }
 
-    pub fn reset(&mut self) {
+    pub fn reset_typed(&mut self) {
         self.json.reset();
         self.xml.reset();
     }
@@ -529,7 +551,7 @@ fn get_tag_name(buf: &[u8], start: usize, end: usize) -> Option<Vec<u8>> {
 fn json_nested() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"a":{"b":1}}"#);
+    let spans = ex.push(r#"{"a":{"b":1}}"#).unwrap();
 
     assert_eq!(spans.len(), 2);
 
@@ -544,7 +566,7 @@ fn json_nested() {
 fn json_nested_partial() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"a":{"b":1}"#);
+    let spans = ex.push(r#"{"a":{"b":1}"#).unwrap();
 
     assert_eq!(spans.len(), 1);
 
@@ -557,7 +579,7 @@ fn json_nested_partial() {
 fn json_nested_partia_with_plain_text() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"before {"a":{"b":1} after"#);
+    let spans = ex.push(r#"before {"a":{"b":1} after"#).unwrap();
 
     assert_eq!(spans.len(), 1);
 
@@ -570,7 +592,7 @@ fn json_nested_partia_with_plain_text() {
 fn xml_nested() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root><child><value>1</value></child></root>"#);
+    let spans = ex.push(r#"<root><child><value>1</value></child></root>"#).unwrap();
 
     assert_eq!(spans.len(), 3);
 
@@ -587,7 +609,7 @@ fn xml_nested() {
 fn xml_self_closing() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root><item/><item/></root>"#);
+    let spans = ex.push(r#"<root><item/><item/></root>"#).unwrap();
 
     assert_eq!(spans.len(), 3);
 
@@ -604,7 +626,7 @@ fn xml_self_closing() {
 fn xml_with_attributes() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root id="1" class="foo"><child name="x"/></root>"#);
+    let spans = ex.push(r#"<root id="1" class="foo"><child name="x"/></root>"#).unwrap();
 
     assert_eq!(spans.len(), 1);
 
@@ -617,7 +639,7 @@ fn xml_with_attributes() {
 fn xml_with_text_content() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root>hello<child/>world</root>"#);
+    let spans = ex.push(r#"<root>hello<child/>world</root>"#).unwrap();
 
     assert_eq!(spans.len(), 2);
 
@@ -632,7 +654,7 @@ fn xml_with_text_content() {
 fn xml_mixed_with_plain_text() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"before <root><child/></root> after"#);
+    let spans = ex.push(r#"before <root><child/></root> after"#).unwrap();
 
     assert_eq!(spans.len(), 2);
 
@@ -647,10 +669,10 @@ fn xml_mixed_with_plain_text() {
 fn xml_streamed() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root><child"#);
+    let spans = ex.push(r#"<root><child"#).unwrap();
     assert_eq!(spans.len(), 0);
 
-    let spans = ex.push(r#"/>other</root>"#);
+    let spans = ex.push(r#"/>other</root>"#).unwrap();
 
     assert_eq!(spans.len(), 1);
 
@@ -663,7 +685,7 @@ fn xml_streamed() {
 fn xml_deeply_nested() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<a><b><c><d/></c></b></a>"#);
+    let spans = ex.push(r#"<a><b><c><d/></c></b></a>"#).unwrap();
     assert_eq!(spans.len(), 4);
 
     let s1 = std::str::from_utf8(ex.extract(&spans[0])).unwrap();
@@ -681,7 +703,7 @@ fn xml_deeply_nested() {
 fn xml_comment_and_cdata() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root><!-- comment --><item/></root>"#);
+    let spans = ex.push(r#"<root><!-- comment --><item/></root>"#).unwrap();
 
     assert_eq!(spans.len(), 2);
 
@@ -696,12 +718,12 @@ fn xml_comment_and_cdata() {
 fn xml_reset() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root><item/></root>"#);
+    let spans = ex.push(r#"<root><item/></root>"#).unwrap();
     assert_eq!(spans.len(), 2);
 
     ex.reset();
 
-    let spans = ex.push(r#"<new><child/></new>"#);
+    let spans = ex.push(r#"<new><child/></new>"#).unwrap();
     assert_eq!(spans.len(), 2);
 
     let s1 = std::str::from_utf8(ex.extract(&spans[0])).unwrap();
@@ -712,11 +734,11 @@ fn xml_reset() {
 fn json_nested_partial_with_stream() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"before {"a":{"b""#);
+    let spans = ex.push(r#"before {"a":{"b""#).unwrap();
 
     assert_eq!(spans.len(), 0);
 
-    let spans = ex.push(r#":1} after"#);
+    let spans = ex.push(r#":1} after"#).unwrap();
 
     let s1 = std::str::from_utf8(ex.extract(&spans[0])).unwrap();
 
@@ -727,7 +749,7 @@ fn json_nested_partial_with_stream() {
 fn json_with_string_values() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"a":"hello","b":"world"}"#);
+    let spans = ex.push(r#"{"a":"hello","b":"world"}"#).unwrap();
 
     assert_eq!(spans.len(), 1);
 
@@ -740,7 +762,7 @@ fn json_with_string_values() {
 fn json_with_escaped_quotes() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"msg":"say \"hello\" world"}"#);
+    let spans = ex.push(r#"{"msg":"say \"hello\" world"}"#).unwrap();
 
     assert_eq!(spans.len(), 1);
 
@@ -753,7 +775,7 @@ fn json_with_escaped_quotes() {
 fn json_with_nested_arrays() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"a":[1,2,{"b":3}]}"#);
+    let spans = ex.push(r#"{"a":[1,2,{"b":3}]}"#).unwrap();
 
     assert_eq!(spans.len(), 3);
 
@@ -770,7 +792,7 @@ fn json_with_nested_arrays() {
 fn json_mixed_with_text() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"text {"key":"value"} more text"#);
+    let spans = ex.push(r#"text {"key":"value"} more text"#).unwrap();
 
     assert_eq!(spans.len(), 1);
 
@@ -783,7 +805,7 @@ fn json_mixed_with_text() {
 fn json_multiple_objects() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"a":1}{"b":2}{"c":3}"#);
+    let spans = ex.push(r#"{"a":1}{"b":2}{"c":3}"#).unwrap();
 
     assert_eq!(spans.len(), 3);
 
@@ -800,7 +822,7 @@ fn json_multiple_objects() {
 fn json_unicode() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"msg":"你好世界"}"#);
+    let spans = ex.push(r#"{"msg":"你好世界"}"#).unwrap();
 
     assert_eq!(spans.len(), 1);
 
@@ -813,7 +835,7 @@ fn json_unicode() {
 fn json_deeply_nested() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"a":{"b":{"c":{"d":1}}}}"#);
+    let spans = ex.push(r#"{"a":{"b":{"c":{"d":1}}}}"#).unwrap();
 
     assert_eq!(spans.len(), 4);
 
@@ -832,12 +854,12 @@ fn json_deeply_nested() {
 fn json_reset() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"a":1}"#);
+    let spans = ex.push(r#"{"a":1}"#).unwrap();
     assert_eq!(spans.len(), 1);
 
     ex.reset();
 
-    let spans = ex.push(r#"{"b":2}"#);
+    let spans = ex.push(r#"{"b":2}"#).unwrap();
     assert_eq!(spans.len(), 1);
 
     let s1 = std::str::from_utf8(ex.extract(&spans[0])).unwrap();
@@ -848,7 +870,7 @@ fn json_reset() {
 fn mixed_json() {
     let mut ex = MixedExtractor::default();
 
-    let spans = ex.push(r#"{"key":"value"}"#);
+    let spans = ex.push(r#"{"key":"value"}"#).unwrap();
     assert_eq!(spans.len(), 1);
     assert_eq!(ex.mode(), Some("json"));
 
@@ -860,7 +882,7 @@ fn mixed_json() {
 fn mixed_xml() {
     let mut ex = MixedExtractor::default();
 
-    let spans = ex.push(r#"<root><item/></root>"#);
+    let spans = ex.push(r#"<root><item/></root>"#).unwrap();
     assert_eq!(spans.len(), 2);
     assert_eq!(ex.mode(), Some("xml"));
 
@@ -872,12 +894,12 @@ fn mixed_xml() {
 fn mixed_reset() {
     let mut ex = MixedExtractor::default();
 
-    let spans = ex.push(r#"{"a":1}"#);
+    let spans = ex.push(r#"{"a":1}"#).unwrap();
     assert_eq!(spans.len(), 1);
 
     ex.reset();
 
-    let spans = ex.push(r#"<root/>"#);
+    let spans = ex.push(r#"<root/>"#).unwrap();
     assert_eq!(spans.len(), 1);
 
     let s1 = std::str::from_utf8(ex.extract(&spans[0])).unwrap();
@@ -888,7 +910,7 @@ fn mixed_reset() {
 fn mixed_v2_both() {
     let mut ex = MixedExtractorV2::default();
 
-    let typed = ex.push_typed(r#"{"key":"value"}<root><item/></root>"#);
+    let typed = ex.push_typed(r#"{"key":"value"}<root><item/></root>"#).unwrap();
 
     assert_eq!(typed.len(), 3);
 
@@ -906,7 +928,7 @@ fn mixed_v2_both() {
 fn mixed_v2_json_only() {
     let mut ex = MixedExtractorV2::default();
 
-    let spans = ex.json.push(r#"{"a":1}{"b":2}"#);
+    let spans = ex.json.push(r#"{"a":1}{"b":2}"#).unwrap();
 
     assert_eq!(spans.len(), 2);
 
@@ -921,7 +943,7 @@ fn mixed_v2_json_only() {
 fn mixed_v2_xml_only() {
     let mut ex = MixedExtractorV2::default();
 
-    let typed = ex.push_typed(r#"<root><item/><item/></root>"#);
+    let typed = ex.push_typed(r#"<root><item/><item/></root>"#).unwrap();
 
     assert_eq!(typed.len(), 3);
 
@@ -939,12 +961,12 @@ fn mixed_v2_xml_only() {
 fn mixed_v2_reset() {
     let mut ex = MixedExtractorV2::default();
 
-    let typed = ex.push_typed(r#"{"a":1}"#);
+    let typed = ex.push_typed(r#"{"a":1}"#).unwrap();
     assert_eq!(typed.len(), 1);
 
     ex.reset();
 
-    let typed = ex.push_typed(r#"<root/>"#);
+    let typed = ex.push_typed(r#"<root/>"#).unwrap();
     assert_eq!(typed.len(), 1);
 
     let s1 = std::str::from_utf8(ex.extract_typed(&typed[0])).unwrap();
@@ -955,7 +977,7 @@ fn mixed_v2_reset() {
 fn json_parent_span() {
     let mut ex = JsonExtractor::default();
 
-    let spans = ex.push(r#"{"a":{"b":1}}"#);
+    let spans = ex.push(r#"{"a":{"b":1}}"#).unwrap();
     assert_eq!(spans.len(), 2);
 
     let inner = &spans[0];
@@ -976,7 +998,7 @@ fn json_parent_span() {
 fn xml_parent_span() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root><item/></root>"#);
+    let spans = ex.push(r#"<root><item/></root>"#).unwrap();
     assert_eq!(spans.len(), 2);
 
     let item = &spans[0];
@@ -1003,7 +1025,7 @@ mod nvidia_streaming_tests {
         let spans = ext.push(r#"{"choices":[{"delta":{"content":"Hello"}}]}"#);
 
         // Returns spans for all complete JSON at ALL nesting levels
-        assert!(!spans.is_empty());
+        assert!(!spans.unwrap().is_empty());
     }
 
     #[test]
@@ -1012,7 +1034,7 @@ mod nvidia_streaming_tests {
         let spans =
             ext.push(r#"{"choices":[{"delta":{"content":"A"}},{"delta":{"content":"B"}}]}"#);
 
-        assert!(!spans.is_empty());
+        assert!(!spans.unwrap().is_empty());
     }
 
     #[test]
@@ -1020,7 +1042,7 @@ mod nvidia_streaming_tests {
         let mut ext = JsonExtractor::default();
         let spans = ext.push(r#"{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"NYC\"}"}}]}}]}"#);
 
-        assert!(!spans.is_empty());
+        assert!(!spans.unwrap().is_empty());
     }
 
     #[test]
@@ -1030,6 +1052,6 @@ mod nvidia_streaming_tests {
             "some plain text prefix then json:{\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}";
         let spans = ext.push(text);
 
-        assert!(!spans.is_empty());
+        assert!(!spans.unwrap().is_empty());
     }
 }

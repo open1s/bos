@@ -17,12 +17,14 @@ agent = { path = "../agent" }
 bus = { path = "../bus" }
 config = { path = "../config" }
 logging = { path = "../logging" }
+react = { path = "../react" }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 napi = { version = "3", features = ["async", "serde-json", "tokio_rt"] }
 napi-derive = "3"
 async-trait = "0.1"
 futures = { workspace = true }
+uuid = { workspace = true }
 
 [build-dependencies]
 napi-build = "2"

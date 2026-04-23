@@ -4,7 +4,7 @@ use crate::agent::plugin::{
     ToolCallWrapper, ToolResultWrapper,
 };
 use crate::tools::FunctionTool;
-use crate::{AgentError, LlmClient, LlmResponse, StreamToken, Tool, ToolRegistry};
+use crate::{AgentError, LlmClient, LlmMessage, StreamToken, Tool, ToolRegistry};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use log::warn;
@@ -21,7 +21,7 @@ use react::llm::{
     TokenStream as ReactTokenStream,
 };
 use react::tool::{Tool as ReactToolTrait, ToolError as ReactToolError};
-use react::{CircuitBreakerConfig, RateLimiterConfig, ReActResilience};
+use react::{CircuitBreakerConfig, LlmContext, LlmRequest, RateLimiterConfig, ReActResilience};
 
 // ============================================================================
 // ReAct Adapters - Bridge between Agent and React crate
@@ -101,8 +101,8 @@ impl ExtensibleToolAdapter {
             ctx.set("effective_tool_args", effective_args);
         }
         match result {
-            Ok(v) => ctx.set("tool_result", &v.to_string()),
-            Err(e) => ctx.set("error", &e.to_string()),
+            Ok(v) => ctx.set("tool_result", v.to_string()),
+            Err(e) => ctx.set("error", e.to_string()),
         }
         let decision = self.hooks.trigger_blocking(HookEvent::AfterToolCall, ctx);
         match decision {
@@ -200,16 +200,7 @@ impl ReactLlmTrait for AgentLlmAdapter {
         let inner = self.inner.clone();
         let result = inner.complete(request).await;
         match result {
-            Ok(resp) => {
-                if let LlmResponse::ToolCall { name, args, id } = &resp {
-                    return Ok(ReactLlmResponse::ToolCall {
-                        name: name.clone(),
-                        args: args.clone(),
-                        id: id.clone(),
-                    });
-                }
-                Ok(resp)
-            }
+            Ok(resp) => Ok(resp),
             Err(e) => Err(ReactLlmError::Other(e.to_string())),
         }
     }
@@ -223,22 +214,19 @@ impl ReactLlmTrait for AgentLlmAdapter {
 
         match stream_result {
             Ok(stream) => {
-                let mut stream = Box::pin(stream);
-                let mut tokens: Vec<Result<ReactStreamToken, ReactLlmError>> = Vec::new();
-
-                while let Some(token) = stream.next().await {
-                    match token {
-                        Ok(StreamToken::ToolCall { name, args, id }) => {
-                            tokens.push(Ok(ReactStreamToken::ToolCall { name, args, id }));
-                        }
-                        Ok(StreamToken::Text(t)) => tokens.push(Ok(ReactStreamToken::Text(t))),
-                        Ok(StreamToken::Done) => tokens.push(Ok(ReactStreamToken::Done)),
-                        Err(e) => tokens.push(Err(ReactLlmError::Other(e.to_string()))),
+                // Pass through each token immediately without buffering
+                let converted = stream.map(|token| match token {
+                    Ok(StreamToken::ToolCall { name, args, id }) => {
+                        Ok(ReactStreamToken::ToolCall { name, args, id })
                     }
-                }
-
-                let stream = futures::stream::iter(tokens);
-                Ok(Box::pin(stream) as ReactTokenStream)
+                    Ok(StreamToken::Text(t)) => Ok(ReactStreamToken::Text(t)),
+                    Ok(StreamToken::ReasoningContent(t)) => {
+                        Ok(ReactStreamToken::ReasoningContent(t))
+                    }
+                    Ok(StreamToken::Done) => Ok(ReactStreamToken::Done),
+                    Err(e) => Err(ReactLlmError::Other(e.to_string())),
+                });
+                Ok(Box::pin(converted))
             }
             Err(e) => Err(ReactLlmError::Other(e.to_string())),
         }
@@ -278,13 +266,6 @@ impl ReactLlmTrait for PluginLlmAdapter {
                 let wrapper = LlmResponseWrapper::new(&resp);
                 let processed = self.plugins.process_llm_response(wrapper).await;
                 let modified_resp = processed.into_response();
-                if let LlmResponse::ToolCall { name, args, id } = &modified_resp {
-                    return Ok(ReactLlmResponse::ToolCall {
-                        name: name.clone(),
-                        args: args.clone(),
-                        id: id.clone(),
-                    });
-                }
                 Ok(modified_resp)
             }
             Err(e) => Err(ReactLlmError::Other(e.to_string())),
@@ -962,7 +943,7 @@ impl Agent {
                     msg
                 )))
             }
-            HookDecision::Abort => return Ok(String::new()),
+            HookDecision::Abort => return Ok("LLM call aborted by hook".to_string()),
             HookDecision::Continue => {}
         }
 
@@ -976,7 +957,7 @@ impl Agent {
                 let decision = self.hooks.trigger(HookEvent::AfterLlmCall, ctx).await;
                 match decision {
                     HookDecision::Error(msg) => log::warn!("AfterLlmCall hook error: {}", msg),
-                    HookDecision::Abort => return Ok(String::new()),
+                    HookDecision::Abort => return Ok("LLM call aborted by hook".to_string()),
                     HookDecision::Continue => {}
                 }
 
@@ -994,11 +975,11 @@ impl Agent {
             }
             Err(e) => {
                 let mut ctx = HookContext::new(&self.config.name);
-                ctx.set("error", &e.to_string());
+                ctx.set("error", e.to_string());
                 let decision = self.hooks.trigger(HookEvent::OnError, ctx).await;
                 match decision {
                     HookDecision::Error(msg) => log::warn!("OnError hook error: {}", msg),
-                    HookDecision::Abort => return Ok(String::new()),
+                    HookDecision::Abort => return Ok("LLM call aborted by hook".to_string()),
                     HookDecision::Continue => {}
                 }
                 Err(AgentError::Session(format!("ReAct run error: {}", e)))
@@ -1008,7 +989,7 @@ impl Agent {
 
     /// Run the agent using simple loop (no ReAct).
     /// Useful for testing or when ReAct format is not needed.
-    /// Supports tools and skills like react() does, but makes a single LLM call.
+    /// Supports tools and skills like react() does, with iteration control.
     pub async fn run_simple(&self, task: &str) -> Result<String, AgentError> {
         use react::llm::LlmMessage;
         use react::llm::{LlmContext, LlmRequest};
@@ -1023,15 +1004,43 @@ impl Agent {
 
         let context = LlmContext {
             conversations: all_conversations.clone(),
+            tools: self
+                .registry
+                .as_ref()
+                .map(|r| {
+                    r.iter()
+                        .map(|(name, tool)| react::llm::LlmTool {
+                            name: name.clone(),
+                            description: tool.description().short.clone(),
+                            parameters: tool.json_schema(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            skills: self
+                .skills
+                .iter()
+                .map(|s| react::llm::Skill {
+                    category: s.metadata.category.as_str().to_string(),
+                    name: s.metadata.name.clone(),
+                    description: s.metadata.description.clone(),
+                })
+                .collect(),
             ..Default::default()
         };
 
-        let req = LlmRequest {
+        let mut req = LlmRequest {
             model: self.config.model.clone(),
             context,
             temperature: Some(self.config.temperature),
             ..Default::default()
         };
+
+        // Iteration control - match stream() logic
+        let mut step_count = 0;
+        let max_steps = self.config.max_steps;
+        let mut loaded_skills: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         // Emit BeforeLlmCall hook
         let mut hook_ctx = HookContext::new(&self.config.name);
@@ -1045,158 +1054,289 @@ impl Agent {
                     msg
                 )))
             }
-            HookDecision::Abort => return Ok(String::new()),
+            HookDecision::Abort => return Ok("LLM call aborted by hook".to_string()),
             HookDecision::Continue => {}
         }
 
-        let response = engine.call_llm(req).await;
+        // Iteration loop - continue until Done or max steps
+        while step_count < max_steps {
+            step_count += 1;
 
-        if let Err(e) = &response {
-            let mut ctx = HookContext::new(&self.config.name);
-            ctx.set("error", "LLM call failed");
-            let decision = self.hooks.trigger(HookEvent::OnError, ctx).await;
+            let response = engine.call_llm(req.clone()).await;
+
+            if let Err(e) = &response {
+                let mut ctx = HookContext::new(&self.config.name);
+                ctx.set("error", "LLM call failed");
+                let decision = self.hooks.trigger(HookEvent::OnError, ctx).await;
+                match decision {
+                    HookDecision::Error(msg) => log::warn!("OnError hook error: {}", msg),
+                    HookDecision::Abort => return Ok("LLM call aborted by hook".to_string()),
+                    HookDecision::Continue => {}
+                }
+                return Err(AgentError::Session(format!("LLM call failed: {}", e)));
+            }
+
+            let response = response.unwrap();
+
+            // Emit AfterLlmCall hook
+            let mut hook_ctx = HookContext::new(&self.config.name);
+            hook_ctx.set("model", &self.config.model);
+            let response_type = match response {
+                react::llm::LlmResponse::OpenAI(ref rsp) => {
+                    if let Some(choice) = rsp.choices.first() {
+                        if choice.message.tool_calls.is_some() {
+                            "tool_call"
+                        } else {
+                            "text"
+                        }
+                    } else {
+                        "text"
+                    }
+                }
+            };
+            hook_ctx.set("response_type", response_type);
+            let decision = self.hooks.trigger(HookEvent::AfterLlmCall, hook_ctx).await;
             match decision {
-                HookDecision::Error(msg) => log::warn!("OnError hook error: {}", msg),
-                HookDecision::Abort => return Ok(String::new()),
+                HookDecision::Error(msg) => log::warn!("AfterLlmCall hook error: {}", msg),
+                HookDecision::Abort => return Ok("LLM call aborted by hook".to_string()),
                 HookDecision::Continue => {}
             }
-            return Err(AgentError::Session(format!("LLM call failed: {}", e)));
-        }
 
-        let response = response.unwrap();
+            match response {
+                react::llm::LlmResponse::OpenAI(rsp) => {
+                    let mut has_tool_calls = false;
+                    let mut tool_call_results: Vec<(String, String, serde_json::Value, String)> = Vec::new();
 
-        // Emit AfterLlmCall hook
-        let mut hook_ctx = HookContext::new(&self.config.name);
-        hook_ctx.set("model", &self.config.model);
-        let response_type = match response {
-            react::llm::LlmResponse::Text(_) => "text",
-            react::llm::LlmResponse::Partial(_) => "partial",
-            react::llm::LlmResponse::Done => "done",
-            react::llm::LlmResponse::ToolCall { .. } => "tool_call",
-        };
-        hook_ctx.set("response_type", response_type);
-        let decision = self.hooks.trigger(HookEvent::AfterLlmCall, hook_ctx).await;
-        match decision {
-            HookDecision::Error(msg) => log::warn!("AfterLlmCall hook error: {}", msg),
-            HookDecision::Abort => return Ok(String::new()),
-            HookDecision::Continue => {}
-        }
+                    for choice in &rsp.choices {
+                        if let Some(ref tool_calls) = choice.message.tool_calls {
+                            has_tool_calls = true;
+                            for tc in tool_calls {
+                                let name = tc.function.name.clone().unwrap_or_default();
+                                let args_str = tc.function.arguments.clone().unwrap_or_default();
+                                let args = serde_json::from_str(&args_str)
+                                    .unwrap_or(serde_json::json!({}));
+                                let call_id = if tc.id.is_empty() {
+                                    format!("call_{}", uuid::Uuid::new_v4().simple())
+                                } else {
+                                    tc.id.clone()
+                                };
 
-        let mut loaded_skills: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+                                let result = if name == "load_skill" {
+                                    let skill_name =
+                                        args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    if let Some(cached) = loaded_skills.get(skill_name) {
+                                        Ok(serde_json::json!({
+                                            "name": skill_name,
+                                            "instructions": cached,
+                                            "cached": true
+                                        }))
+                                    } else {
+                                        // Trigger BeforeToolCall hook before executing tool
+                                        let mut ctx = HookContext::new(&self.config.name);
+                                        ctx.set("tool_name", &name);
+                                        ctx.set("tool_args", args.to_string());
+                                        let decision =
+                                            self.hooks.trigger(HookEvent::BeforeToolCall, ctx).await;
+                                        match decision {
+                                            HookDecision::Error(msg) => {
+                                                return Ok(format!(
+                                                    "Tool blocked by BeforeToolCall hook: {}",
+                                                    msg
+                                                ));
+                                            }
+                                            HookDecision::Abort => {
+                                                return Ok("Tool call aborted by hook".to_string())
+                                            }
+                                            HookDecision::Continue => {}
+                                        }
+                                        engine.call_tool(&name, &args).await
+                                    }
+                                } else {
+                                    // Trigger BeforeToolCall hook before executing tool
+                                    let mut ctx = HookContext::new(&self.config.name);
+                                    ctx.set("tool_name", &name);
+                                    ctx.set("tool_args", args.to_string());
+                                    let decision =
+                                        self.hooks.trigger(HookEvent::BeforeToolCall, ctx).await;
+                                    match decision {
+                                        HookDecision::Error(msg) => {
+                                            return Ok(format!(
+                                                "Tool blocked by BeforeToolCall hook: {}",
+                                                msg
+                                            ));
+                                        }
+                                        HookDecision::Abort => {
+                                            return Ok("Tool call aborted by hook".to_string())
+                                        }
+                                        HookDecision::Continue => {}
+                                    }
+                                    engine.call_tool(&name, &args).await
+                                };
 
-        match response {
-            react::llm::LlmResponse::Text(content) => {
-                {
-                    let mut log = self.message_log.lock().unwrap();
-                    log.push(LlmMessage::user(task.to_string()));
-                    log.push(LlmMessage::assistant(content.clone()));
-                }
-                self.hooks
-                    .trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name))
-                    .await;
-                let mut ctx = HookContext::new(&self.config.name);
-                ctx.set("total_tokens", "0");
-                self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
-                Ok(content)
-            }
-            react::llm::LlmResponse::Partial(content) => {
-                {
-                    let mut log = self.message_log.lock().unwrap();
-                    log.push(LlmMessage::user(task.to_string()));
-                    log.push(LlmMessage::assistant(content.clone()));
-                }
-                self.hooks
-                    .trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name))
-                    .await;
-                let mut ctx = HookContext::new(&self.config.name);
-                ctx.set("total_tokens", "0");
-                self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
-                Ok(content)
-            }
-            react::llm::LlmResponse::Done => {
-                let mut ctx = HookContext::new(&self.config.name);
-                ctx.set("total_tokens", "0");
-                self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
-                Ok(String::new())
-            }
-            react::llm::LlmResponse::ToolCall { name, args, id } => {
-                let call_id =
-                    id.unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
+                                let result_text = match result {
+                                    Ok(ret) => {
+                                        if name == "load_skill" {
+                                            let skill_name =
+                                                args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                            let instructions = ret
+                                                .get("instructions")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            if !instructions.is_empty()
+                                                && !ret
+                                                    .get("cached")
+                                                    .and_then(|v| v.as_bool())
+                                                    .unwrap_or(false)
+                                            {
+                                                loaded_skills.insert(
+                                                    skill_name.to_string(),
+                                                    instructions.to_string(),
+                                                );
+                                            }
+                                        }
+                                        ret.to_string()
+                                    }
+                                    Err(e) => {
+                                        let mut ctx = HookContext::new(&self.config.name);
+                                        ctx.set("tool_name", &name);
+                                        ctx.set("tool_args", args.to_string());
+                                        ctx.set("error", e.to_string());
+                                        match self.hooks.trigger(HookEvent::OnError, ctx).await {
+                                            HookDecision::Error(msg) => {
+                                                return Ok(format!(
+                                                    "Tool blocked by OnError hook: {}",
+                                                    msg
+                                                ));
+                                            }
+                                            HookDecision::Abort => {
+                                                return Ok("LLM call aborted by hook".to_string())
+                                            }
+                                            HookDecision::Continue => {}
+                                        }
+                                        format!("Error: {}", e)
+                                    }
+                                };
 
-                let result = if name == "load_skill" {
-                    let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    if let Some(cached) = loaded_skills.get(skill_name) {
-                        Ok(serde_json::json!({
-                            "name": skill_name,
-                            "instructions": cached,
-                            "cached": true
-                        }))
-                    } else {
-                        engine.call_tool(&name, &args).await
+                                tool_call_results
+                                    .push((call_id, name, args, result_text));
+                            }
+                        }
                     }
-                } else {
-                    engine.call_tool(&name, &args).await
-                };
 
-                let result_text = match result {
-                    Ok(ret) => {
-                        if name == "load_skill" {
-                            let skill_name =
-                                args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let instructions = ret
-                                .get("instructions")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if !instructions.is_empty()
-                                && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false)
+                    if has_tool_calls {
+                        for (call_id, name, args, result_text) in tool_call_results {
+                            all_conversations.push(LlmMessage::assistant_tool_call(
+                                call_id.clone(),
+                                name.clone(),
+                                args.clone(),
+                            ));
+                            all_conversations.push(LlmMessage::tool_result(
+                                call_id.clone(),
+                                result_text.clone(),
+                            ));
+
+                            // Update message log
                             {
-                                loaded_skills
-                                    .insert(skill_name.to_string(), instructions.to_string());
+                                let mut log = self.message_log.lock().unwrap();
+                                log.push(LlmMessage::user(task.to_string()));
+                                log.push(LlmMessage::assistant_tool_call(
+                                    call_id.clone(),
+                                    name.clone(),
+                                    args.clone(),
+                                ));
+                                log.push(LlmMessage::tool_result(call_id, result_text));
                             }
                         }
-                        ret.to_string()
-                    }
-                    Err(e) => {
-                        let mut ctx = HookContext::new(&self.config.name);
-                        ctx.set("tool_name", &name);
-                        ctx.set("tool_args", &args.to_string());
-                        ctx.set("error", &e.to_string());
-                        match self.hooks.trigger(HookEvent::OnError, ctx).await {
-                            HookDecision::Error(msg) => {
-                                return Ok(format!("Tool blocked by OnError hook: {}", msg));
-                            }
-                            HookDecision::Abort => return Ok(String::new()),
-                            HookDecision::Continue => {}
-                        }
-                        format!("Error: {}", e)
-                    }
-                };
+                        self.hooks
+                            .trigger_all(
+                                HookEvent::OnMessage,
+                                HookContext::new(&self.config.name),
+                            )
+                            .await;
 
-                let mut log = self.message_log.lock().unwrap();
-                log.push(LlmMessage::user(task.to_string()));
-                log.push(LlmMessage::assistant_tool_call(
-                    call_id.clone(),
-                    name.clone(),
-                    args.clone(),
-                ));
-                log.push(LlmMessage::tool_result(call_id, result_text.clone()));
+                        // Continue to next iteration
+                        let context = LlmContext {
+                            conversations: all_conversations.clone(),
+                            tools: self
+                                .registry
+                                .as_ref()
+                                .map(|r| {
+                                    r.iter()
+                                        .map(|(name, tool)| react::llm::LlmTool {
+                                            name: name.clone(),
+                                            description: tool.description().short.clone(),
+                                            parameters: tool.json_schema(),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            skills: self
+                                .skills
+                                .iter()
+                                .map(|s| react::llm::Skill {
+                                    category: s.metadata.category.as_str().to_string(),
+                                    name: s.metadata.name.clone(),
+                                    description: s.metadata.description.clone(),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        };
 
-                Ok(result_text)
+                        req = LlmRequest {
+                            model: self.config.model.clone(),
+                            context,
+                            temperature: Some(self.config.temperature),
+                            ..Default::default()
+                        };
+
+                        continue;
+                    }
+
+                    // Handle text/final response (no tool calls)
+                    let content = rsp
+                        .choices
+                        .first()
+                        .and_then(|c| c.message.content.clone())
+                        .unwrap_or_default();
+                    {
+                        let mut log = self.message_log.lock().unwrap();
+                        log.push(LlmMessage::user(task.to_string()));
+                        log.push(LlmMessage::assistant(content.clone()));
+                    }
+                    self.hooks
+                        .trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name))
+                        .await;
+                    let mut ctx = HookContext::new(&self.config.name);
+                    ctx.set("total_tokens", "0");
+                    self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
+                    return Ok(content);
+                }
             }
         }
+
+        // Max steps reached without receiving final answer
+        let mut ctx = HookContext::new(&self.config.name);
+        ctx.set("total_tokens", "0");
+        ctx.set(
+            "error",
+            format!("Max steps ({}) reached without final answer", max_steps),
+        );
+        self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
+        Err(AgentError::Session(format!(
+            "Max steps ({}) reached without receiving final answer",
+            max_steps
+        )))
     }
 
-    /// Stream the agent response using simple approach.
-    /// Supports tools and skills like react() does, but makes a single LLM call.
+    /// Stream the agent response using ReAct-style loop.
+    /// Supports tools and skills with multi-turn LLM calls - executes tools and continues
+    /// until final response from LLM.
     pub fn stream(
         &self,
         task: &str,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send + '_>> {
-        use futures::stream::StreamExt;
-        use react::llm::{LlmContext, LlmMessage, LlmRequest};
-
-        let system_prompt = self.config.system_prompt.clone();
+        let mut system_prompt = self.config.system_prompt.clone();
+        system_prompt.push_str("Final answer: Final Answer: your answer");
         let engine_result = self.build_react_engine(system_prompt.clone());
         let task_str = task.to_string();
         let message_log_ptr = self.message_log.clone();
@@ -1207,28 +1347,25 @@ impl Agent {
                 Err(e) => {
                     yield Err(e);
                     return;
-                }
+                    }
             };
 
+            // Build initial context
             let mut all_conversations = vec![LlmMessage::system(system_prompt.clone())];
             all_conversations.extend(message_log_ptr.lock().unwrap().clone());
             all_conversations.push(LlmMessage::user(task_str.clone()));
 
-            let mut log = message_log_ptr.lock().unwrap().clone();
-            log.push(LlmMessage::user(task_str.clone()));
+            {
+                let mut log = message_log_ptr.lock().unwrap();
+                log.push(LlmMessage::user(task_str.clone()));
+            }
 
-            let context = LlmContext {
-                conversations: all_conversations,
-                ..Default::default()
-            };
+            // ReAct loop: continue until LLM returns final answer (not a tool call)
+            let mut step_count = 0;
+            let max_steps = self.config.max_steps;
+            let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-            let req = LlmRequest {
-                model: self.config.model.clone(),
-                context,
-                temperature: Some(0.7),
-                ..Default::default()
-            };
-
+            // Trigger BeforeLlmCall hook
             let mut ctx = HookContext::new(&self.config.name);
             ctx.set("model", &self.config.model);
             let decision = self.hooks.trigger(HookEvent::BeforeLlmCall, ctx).await;
@@ -1243,106 +1380,154 @@ impl Agent {
                 HookDecision::Continue => {}
             }
 
-            let llm_stream = match engine.call_llm_stream(req).await {
-                Ok(s) => s,
-                Err(e) => {
-                    yield Err(AgentError::Session(format!("LLM stream error: {}", e)));
-                    return;
-                }
-            };
-            futures::pin_mut!(llm_stream);
-            let mut full_response = String::new();
-            let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            // Trigger AfterLlmCall hook with response_type
+            let mut hook_ctx = HookContext::new(&self.config.name);
+            hook_ctx.set("model", &self.config.model);
+            hook_ctx.set("response_type", "stream");
+            let _ = self.hooks.trigger(HookEvent::AfterLlmCall, hook_ctx).await;
 
-            while let Some(item) = llm_stream.next().await {
-                match item {
-                    Ok(StreamToken::Text(text)) => {
-                        full_response.push_str(&text);
-                        yield Ok(StreamToken::Text(text));
+            // ReAct loop - continue until Done or max steps
+            while step_count < max_steps {
+                step_count += 1;
+
+                let context = LlmContext {
+                    conversations: all_conversations.clone(),
+                    tools: self.registry.as_ref().map(|r| r.iter().map(|(name, tool)| react::llm::LlmTool {
+                        name: name.clone(),
+                        description: tool.description().short.clone(),
+                        parameters: tool.json_schema(),
+                    }).collect()).unwrap_or_default(),
+                    skills: self.skills.iter().map(|s| react::llm::Skill {
+                        category: s.metadata.category.as_str().to_string(),
+                        name: s.metadata.name.clone(),
+                        description: s.metadata.description.clone(),
+                    }).collect(),
+                    ..Default::default()
+                };
+
+                let req = LlmRequest {
+                    model: self.config.model.clone(),
+                    context,
+                    temperature: Some(self.config.temperature),
+                    ..Default::default()
+                };
+
+                let llm_stream = match engine.call_llm_stream(req).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        yield Err(AgentError::Session(format!("LLM stream error: {}", e)));
+                        return;
                     }
-                    Ok(StreamToken::Done) => {
-                        yield Ok(StreamToken::Done);
-                    }
-                    Ok(StreamToken::ToolCall { name, args, id }) => {
-                        yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
+                };
 
-                        let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+                futures::pin_mut!(llm_stream);
+                let mut full_response = String::new();
+                let mut saw_tool_call = false;
 
-                        let result = if name == "load_skill" {
-                            let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            if let Some(cached) = loaded_skills.get(skill_name) {
-                                Ok(serde_json::json!({
-                                    "name": skill_name,
-                                    "instructions": cached,
-                                    "cached": true
-                                }))
+                while let Some(item) = llm_stream.next().await {
+                    match item {
+                        Ok(StreamToken::Text(text)) => {
+                            full_response.push_str(&text);
+                            yield Ok(StreamToken::Text(text));
+                        }
+                        Ok(StreamToken::ReasoningContent(text)) => {
+                            yield Ok(StreamToken::ReasoningContent(text));
+                        }
+                        Ok(StreamToken::Done) => {
+                            //current iteration done
+                            break;
+                        }
+                        Ok(StreamToken::ToolCall { name, args, id }) => {
+                            // Yield tool call to caller first
+                            yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
+                            saw_tool_call = true;
+
+                            let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+
+                            // Execute tool
+                            let result = if name == "load_skill" {
+                                let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                if let Some(cached) = loaded_skills.get(skill_name) {
+                                    Ok(serde_json::json!({
+                                        "name": skill_name,
+                                        "instructions": cached,
+                                        "cached": true
+                                    }))
+                                } else {
+                                    engine.call_tool(&name, &args).await
+                                }
                             } else {
                                 engine.call_tool(&name, &args).await
+                            };
+
+                            let result_text = match result {
+                                Ok(ret) => {
+                                    if name == "load_skill" {
+                                        let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
+                                        if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                            loaded_skills.insert(skill_name.to_string(), instructions.to_string());
+                                        }
+                                    }
+                                    ret.to_string()
+                                },
+                                Err(e) => {
+                                    let mut ctx = HookContext::new(&self.config.name);
+                                    ctx.set("tool_name", &name);
+                                    ctx.set("tool_args", args.to_string());
+                                    ctx.set("error", e.to_string());
+                                    match self.hooks.trigger(HookEvent::OnError, ctx).await {
+                                        HookDecision::Error(msg) => {
+                                            let error_text = format!("Tool blocked by OnError hook: {}", msg);
+                                            yield Ok(StreamToken::Text(error_text.clone()));
+                                            yield Ok(StreamToken::Done);
+                                            return;
+                                        }
+                                        HookDecision::Abort => {
+                                            return;
+                                        }
+                                        HookDecision::Continue => {}
+                                    }
+                                    format!("Error: {}", e)
+                                },
+                            };
+
+                            // Add tool result to conversation for next LLM call
+                            all_conversations.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), args.clone()));
+                            all_conversations.push(LlmMessage::tool_result(call_id.clone(), result_text.clone()));
+
+                            // Update message log
+                            {
+                                let mut log = message_log_ptr.lock().unwrap();
+                                log.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), args.clone()));
+                                log.push(LlmMessage::tool_result(call_id, result_text));
                             }
-                        } else {
-                            engine.call_tool(&name, &args).await
-                        };
-
-                        let result_text = match result {
-                            Ok(ret) => {
-                                if name == "load_skill" {
-                                    let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                    let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
-                                    if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                        loaded_skills.insert(skill_name.to_string(), instructions.to_string());
-                                    }
-                                }
-                                ret.to_string()
-                            },
-                            Err(e) => {
-                                let mut ctx = HookContext::new(&self.config.name);
-                                ctx.set("tool_name", &name);
-                                ctx.set("tool_args", &args.to_string());
-                                ctx.set("error", &e.to_string());
-                                match self.hooks.trigger(HookEvent::OnError, ctx).await {
-                                    HookDecision::Error(msg) => {
-                                        full_response.push_str(&format!("Tool blocked by OnError hook: {}", msg));
-                                        yield Ok(StreamToken::Text(format!("Tool blocked by OnError hook: {}", msg)));
-                                        return;
-                                    }
-                                    HookDecision::Abort => {
-                                        return;
-                                    }
-                                    HookDecision::Continue => {}
-                                }
-                                format!("Error: {}", e)
-                            },
-                        };
-
-                        full_response.push_str(&result_text);
-                        yield Ok(StreamToken::Text(result_text.clone()));
-                        {
-                            let mut log = message_log_ptr.lock().unwrap();
-                            log.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), args.clone()));
-                            log.push(LlmMessage::tool_result(call_id, result_text));
+                            self.hooks.trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name)).await;
                         }
-                        self.hooks.trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name)).await;
+                        Err(e) => {
+                            yield Err(AgentError::Session(format!("LLM stream error: {}", e)));
+                            return;
+                        }
                     }
-                    Err(e) => yield Err(AgentError::Session(format!("LLM stream error: {}", e))),
+                }
+
+                //add current iteration response
+                {
+                    let mut log = message_log_ptr.lock().unwrap();
+                    let response = full_response.clone();
+                    drop(full_response);
+                    if !response.is_empty() {
+                        log.push(LlmMessage::assistant(response));
+                    }
+                }
+
+                // If no tool call in this iteration, this is the final answer - exit loop
+                if !saw_tool_call {
+                    self.hooks.trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name)).await;
+                    yield Ok(StreamToken::Done);
+                    return;
                 }
             }
-
-            let mut ctx = HookContext::new(&self.config.name);
-            ctx.set("model", &self.config.model);
-            let decision = self.hooks.trigger(HookEvent::AfterLlmCall, ctx).await;
-            match decision {
-                HookDecision::Error(msg) => log::warn!("AfterLlmCall hook error: {}", msg),
-                HookDecision::Abort => return,
-                HookDecision::Continue => {}
-            }
-
-            {
-                let mut log = message_log_ptr.lock().unwrap();
-                if !full_response.is_empty() {
-                    log.push(LlmMessage::assistant(full_response.clone()));
-                }
-            }
-            self.hooks.trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name)).await;
         };
 
         Box::pin(stream)
@@ -1743,6 +1928,71 @@ mod message_log_tests {
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
+    // Helper functions to create LlmResponse::OpenAI variants
+    fn make_text_response(content: String) -> LlmResponse {
+        use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
+        LlmResponse::OpenAI(ChatCompletionResponse {
+            id: "test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "test".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(content),
+                    tool_calls: None,
+                    function_call: None,
+                    reasoning_content: None,
+                    extra: serde_json::json!({}),
+                },
+                finish_reason: Some("stop".to_string()),
+                stop_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            nvext: None,
+        })
+    }
+
+    fn make_tool_call_response(name: &str, args: serde_json::Value, call_id: &str) -> LlmResponse {
+        use react::llm::vendor::{
+            ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall,
+        };
+        let args_str = args.to_string();
+        LlmResponse::OpenAI(ChatCompletionResponse {
+            id: "test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "test".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: call_id.to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: Some(name.to_string()),
+                            arguments: Some(args_str),
+                        },
+                    }]),
+                    function_call: None,
+                    reasoning_content: None,
+                    extra: serde_json::json!({}),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+                stop_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            nvext: None,
+        })
+    }
+
     struct MockLlmClient {
         responses: Arc<TokioMutex<Vec<LlmResponse>>>,
     }
@@ -1752,7 +2002,9 @@ mod message_log_tests {
         async fn complete(&self, _req: react::llm::LlmRequest) -> LlmResponseResult {
             let mut responses = self.responses.lock().await;
             if responses.is_empty() {
-                Ok(LlmResponse::Text("Final answer: test response".to_string()))
+                Ok(make_text_response(
+                    "Final answer: test response".to_string(),
+                ))
             } else {
                 Ok(responses.remove(0))
             }
@@ -1865,7 +2117,9 @@ mod message_log_tests {
         async fn complete(&self, _req: react::llm::LlmRequest) -> LlmResponseResult {
             let mut responses = self.responses.lock().await;
             if responses.is_empty() {
-                Ok(LlmResponse::Text("Final answer: test response".to_string()))
+                Ok(make_text_response(
+                    "Final answer: test response".to_string(),
+                ))
             } else {
                 Ok(responses.remove(0))
             }
@@ -1906,7 +2160,7 @@ mod message_log_tests {
     #[tokio::test]
     async fn test_run_simple_llm_response_included_in_message_log() {
         let config = AgentConfig::default();
-        let responses = Arc::new(TokioMutex::new(vec![LlmResponse::Text(
+        let responses = Arc::new(TokioMutex::new(vec![make_text_response(
             "Final answer: LLM response text".to_string(),
         )]));
         let llm = Arc::new(MockLlmClient { responses });
@@ -1943,12 +2197,8 @@ mod message_log_tests {
         let config = AgentConfig::default();
         // First response is a tool call, second is the final answer
         let responses = Arc::new(TokioMutex::new(vec![
-            LlmResponse::ToolCall {
-                name: "test_tool".to_string(),
-                args: json!({"param": "value"}),
-                id: Some("call_123".to_string()),
-            },
-            LlmResponse::Text("Final answer: tool executed".to_string()),
+            make_tool_call_response("test_tool", json!({"param": "value"}), "call_123"),
+            make_text_response("Final answer: tool executed".to_string()),
         ]));
         let llm = Arc::new(MockLlmClient { responses });
 
@@ -2020,6 +2270,71 @@ mod hook_tests {
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
+    // Helper functions to create LlmResponse::OpenAI variants
+    fn make_text_response(content: String) -> LlmResponse {
+        use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
+        LlmResponse::OpenAI(ChatCompletionResponse {
+            id: "test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "test".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(content),
+                    tool_calls: None,
+                    function_call: None,
+                    reasoning_content: None,
+                    extra: serde_json::json!({}),
+                },
+                finish_reason: Some("stop".to_string()),
+                stop_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            nvext: None,
+        })
+    }
+
+    fn make_tool_call_response(name: &str, args: serde_json::Value, call_id: &str) -> LlmResponse {
+        use react::llm::vendor::{
+            ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall,
+        };
+        let args_str = args.to_string();
+        LlmResponse::OpenAI(ChatCompletionResponse {
+            id: "test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "test".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: call_id.to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: Some(name.to_string()),
+                            arguments: Some(args_str),
+                        },
+                    }]),
+                    function_call: None,
+                    reasoning_content: None,
+                    extra: serde_json::json!({}),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+                stop_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            nvext: None,
+        })
+    }
+
     #[derive(Clone)]
     struct RecordingHook {
         events: Arc<TokioMutex<Vec<(HookEvent, HookContext)>>>,
@@ -2056,7 +2371,9 @@ mod hook_tests {
         async fn complete(&self, _req: react::llm::LlmRequest) -> LlmResponseResult {
             let mut responses = self.responses.lock().await;
             if responses.is_empty() {
-                Ok(LlmResponse::Text("Final answer: test response".to_string()))
+                Ok(make_text_response(
+                    "Final answer: test response".to_string(),
+                ))
             } else {
                 Ok(responses.remove(0))
             }
@@ -2075,14 +2392,34 @@ mod hook_tests {
             } else {
                 let resp = responses.remove(0);
                 match resp {
-                    LlmResponse::ToolCall { name, args, id } => {
-                        vec![Ok(StreamToken::ToolCall { name, args, id })]
+                    LlmResponse::OpenAI(rsp) => {
+                        if let Some(choice) = rsp.choices.first() {
+                            if let Some(ref tool_calls) = choice.message.tool_calls {
+                                if let Some(tc) = tool_calls.first() {
+                                    let name = tc.function.name.clone().unwrap_or_default();
+                                    let args = tc
+                                        .function
+                                        .arguments
+                                        .as_ref()
+                                        .and_then(|s| serde_json::from_str(s).ok())
+                                        .unwrap_or(serde_json::json!({}));
+                                    let id = Some(tc.id.clone());
+                                    vec![Ok(StreamToken::ToolCall { name, args, id })]
+                                } else {
+                                    vec![Ok(StreamToken::Done)]
+                                }
+                            } else if let Some(ref content) = choice.message.content {
+                                vec![
+                                    Ok(StreamToken::Text(content.clone())),
+                                    Ok(StreamToken::Done),
+                                ]
+                            } else {
+                                vec![Ok(StreamToken::Done)]
+                            }
+                        } else {
+                            vec![Ok(StreamToken::Done)]
+                        }
                     }
-                    LlmResponse::Text(s) => vec![Ok(StreamToken::Text(s)), Ok(StreamToken::Done)],
-                    LlmResponse::Partial(s) => {
-                        vec![Ok(StreamToken::Text(s)), Ok(StreamToken::Done)]
-                    }
-                    LlmResponse::Done => vec![Ok(StreamToken::Done)],
                 }
             };
             Ok(Box::pin(futures::stream::iter(tokens)))
@@ -2237,12 +2574,12 @@ mod hook_tests {
     async fn test_tool_call_hooks_in_react() {
         let config = AgentConfig::default();
         let responses = vec![
-            LlmResponse::ToolCall {
-                name: "test_tool".to_string(),
-                args: serde_json::json!({ "param": "value" }),
-                id: Some("call_123".to_string()),
-            },
-            LlmResponse::Text("Final answer: done".to_string()),
+            make_tool_call_response(
+                "test_tool",
+                serde_json::json!({ "param": "value" }),
+                "call_123",
+            ),
+            make_text_response("Final answer: done".to_string()),
         ];
         let responses = Arc::new(TokioMutex::new(responses));
         let llm = Arc::new(MockLlmClient { responses });
@@ -2295,11 +2632,11 @@ mod hook_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_tool_call_hooks_in_run_simple() {
         let config = AgentConfig::default();
-        let responses = vec![LlmResponse::ToolCall {
-            name: "test_tool".to_string(),
-            args: serde_json::json!({ "param": "value" }),
-            id: Some("call_123".to_string()),
-        }];
+        let responses = vec![make_tool_call_response(
+            "test_tool",
+            serde_json::json!({ "param": "value" }),
+            "call_123",
+        )];
         let responses = Arc::new(TokioMutex::new(responses));
         let llm = Arc::new(MockLlmClient { responses });
         let mut agent = Agent::new(config, llm);
@@ -2350,11 +2687,11 @@ mod hook_tests {
     #[tokio::test]
     async fn test_before_tool_call_abort() {
         let config = AgentConfig::default();
-        let responses = vec![LlmResponse::ToolCall {
-            name: "test_tool".to_string(),
-            args: serde_json::json!({ "param": "value" }),
-            id: Some("call_123".to_string()),
-        }];
+        let responses = vec![make_tool_call_response(
+            "test_tool",
+            serde_json::json!({ "param": "value" }),
+            "call_123",
+        )];
         let responses = Arc::new(TokioMutex::new(responses));
         let llm = Arc::new(MockLlmClient { responses });
         let mut agent = Agent::new(config, llm);
@@ -2394,11 +2731,11 @@ mod hook_tests {
     #[tokio::test]
     async fn test_run_simple_tool_error_respects_on_error_abort() {
         let config = AgentConfig::default();
-        let responses = vec![LlmResponse::ToolCall {
-            name: "test_tool".to_string(),
-            args: serde_json::json!({ "param": "value" }),
-            id: Some("call_456".to_string()),
-        }];
+        let responses = vec![make_tool_call_response(
+            "test_tool",
+            serde_json::json!({ "param": "value" }),
+            "call_456",
+        )];
         let responses = Arc::new(TokioMutex::new(responses));
         let llm = Arc::new(MockLlmClient { responses });
         let mut agent = Agent::new(config, llm);
@@ -2426,8 +2763,8 @@ mod hook_tests {
 
         let result = agent.run_simple("test").await.unwrap_or_default();
         assert!(
-            result.is_empty(),
-            "run_simple should stop when OnError hook returns Abort"
+            !result.is_empty() && (result.contains("aborted") || result.contains("error")),
+            "run_simple should return message when OnError hook returns Abort"
         );
 
         let events = on_error.get_events().await;
@@ -2437,11 +2774,11 @@ mod hook_tests {
     #[tokio::test]
     async fn test_run_simple_tool_error_respects_on_error_error() {
         let config = AgentConfig::default();
-        let responses = vec![LlmResponse::ToolCall {
-            name: "test_tool".to_string(),
-            args: serde_json::json!({ "param": "value" }),
-            id: Some("call_789".to_string()),
-        }];
+        let responses = vec![make_tool_call_response(
+            "test_tool",
+            serde_json::json!({ "param": "value" }),
+            "call_789",
+        )];
         let responses = Arc::new(TokioMutex::new(responses));
         let llm = Arc::new(MockLlmClient { responses });
         let mut agent = Agent::new(config, llm);
@@ -2480,12 +2817,12 @@ mod hook_tests {
     async fn test_tool_call_hooks_in_stream() {
         let config = AgentConfig::default();
         let responses = vec![
-            LlmResponse::ToolCall {
-                name: "test_tool".to_string(),
-                args: serde_json::json!({ "param": "value" }),
-                id: Some("call_123".to_string()),
-            },
-            LlmResponse::Text("Final answer: done".to_string()),
+            make_tool_call_response(
+                "test_tool",
+                serde_json::json!({ "param": "value" }),
+                "call_123",
+            ),
+            make_text_response("Final answer: done".to_string()),
         ];
         let responses = Arc::new(TokioMutex::new(responses));
         let llm = Arc::new(MockLlmClient { responses });

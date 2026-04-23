@@ -1,10 +1,10 @@
-pub mod mock;
 pub mod nvidia;
 pub mod openai;
 pub mod openrouter;
 pub mod router;
-pub use mock::MockVendor;
+pub mod openaicompatible;
 pub use nvidia::NvidiaVendor;
 pub use openai::{OpenAiClient, OpenAiVendor, OpenAiVendorBuilder};
 pub use openrouter::OpenRouterVendor;
 pub use router::LlmRouter;
+pub use openaicompatible::{OpenAIExtractor, ChatCompletionResponse, ChatMessage, Choice, ToolCall, FunctionCall, Delta, ChunkChoice, ChatCompletionChunk, Usage, LogProbs, LogProbContent, FunctionCallDelta, ToolCallDelta};

@@ -106,6 +106,12 @@ export declare class PluginRegistry {
   clear(): Promise<void>
 }
 
+export declare class PluginToolCallInfo {
+  id: string
+  name: string
+  arguments: string
+}
+
 export declare class Publisher {
   static new(topic: string): Promise<Publisher>
   static withSession(topic: string, session: ExternalObject<Session>): Promise<Publisher>
@@ -209,10 +215,7 @@ export interface PluginLlmRequest {
 }
 
 export type PluginLlmResponse =
-  | { type: 'Text', field0: string }
-  | { type: 'Partial', field0: string }
-  | { type: 'ToolCall', name: string, args: string, id?: string }
-  | { type: 'Done' }
+  | { type: 'OpenAI', id: string, model: string, content?: string }
 
 export declare const enum PluginStage {
   PreRequest = 0,

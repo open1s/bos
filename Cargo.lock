@@ -2306,8 +2306,10 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "react",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3434,6 +3436,7 @@ dependencies = [
  "react",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3749,6 +3752,7 @@ name = "react"
 version = "1.0.0"
 dependencies = [
  "async-trait",
+ "config",
  "dashmap",
  "env_logger",
  "futures",

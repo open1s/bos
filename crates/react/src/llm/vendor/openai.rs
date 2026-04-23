@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use crate::{extractor::{JsonExtractor, StreamExtractor}, llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor}};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::llm::{
@@ -69,70 +70,6 @@ struct ToolCallJson {
 struct FunctionCallJson {
     name: String,
     arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct Choice {
-    message: MessageContent,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MessageContent {
-    content: Option<String>,
-    tool_calls: Option<Vec<ToolCall>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolCall {
-    id: Option<String>,
-    function: FunctionCall,
-}
-
-#[derive(Debug, Deserialize)]
-struct FunctionCall {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct StreamChoice {
-    delta: StreamDelta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamDelta {
-    content: Option<String>,
-    tool_calls: Option<Vec<StreamToolCall>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamToolCall {
-    id: Option<String>,
-    #[serde(rename = "type")]
-    _call_type: Option<String>,
-    function: StreamFunctionCall,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamFunctionCall {
-    name: Option<String>,
-    arguments: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiStreamResponse {
-    choices: Vec<StreamChoice>,
 }
 
 impl OpenAiVendor {
@@ -342,33 +279,12 @@ impl LlmClient for OpenAiVendor {
             return Err(LlmError::Http(format!("HTTP {}: {}", status, body)));
         }
 
-        let body: OpenAiResponse = response
+        let body: ChatCompletionResponse = response
             .json()
             .await
             .map_err(|e| LlmError::Parse(e.to_string()))?;
 
-        let choice = body
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| LlmError::Parse("No choices in response".to_string()))?;
-
-        if let Some(tool_calls) = choice.message.tool_calls {
-            if let Some(tc) = tool_calls.into_iter().next() {
-                let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                return Ok(LlmResponse::ToolCall {
-                    name: tc.function.name,
-                    args,
-                    id: tc.id,
-                });
-            }
-        }
-
-        match choice.message.content {
-            Some(content) => Ok(LlmResponse::Text(content)),
-            None => Ok(LlmResponse::Done),
-        }
+        Ok(LlmResponse::OpenAI(body))
     }
 
     async fn stream_complete(&self, mut request: LlmRequest) -> Result<TokenStream, LlmError> {
@@ -405,46 +321,71 @@ impl LlmClient for OpenAiVendor {
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
+            let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
 
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes).to_string();
-                        for line in text.lines() {
-                            if line.starts_with("data: ") {
-                                let data = line.strip_prefix("data: ").unwrap_or("");
-                                if data == "[DONE]" {
-                                    let _ = tx.send(Ok(StreamToken::Done)).await;
-                                    return;
-                                }
-                                if let Ok(response) =
-                                    serde_json::from_str::<OpenAiStreamResponse>(data)
-                                {
-                                    for choice in response.choices {
-                                        if let Some(content) = choice.delta.content {
-                                            if !content.is_empty() {
-                                                let _ =
-                                                    tx.send(Ok(StreamToken::Text(content))).await;
-                                            }
+                        if let Some(chats) = extractor.push(&text) {
+                            for chat in chats {
+                                for choice in chat.choices {
+                                    if let Some(content) = &choice.delta.reasoning_content {
+                                        if !content.is_empty() {
+                                            let _ = tx
+                                                .send(Ok(StreamToken::ReasoningContent(content.clone())))
+                                                .await;
                                         }
-                                        if let Some(calls) = choice.delta.tool_calls {
-                                            for call in calls {
-                                                if let (Some(name), Some(args)) =
-                                                    (call.function.name, call.function.arguments)
-                                                {
-                                                    let args_val: serde_json::Value =
-                                                        serde_json::from_str(&args)
-                                                            .ok()
-                                                            .unwrap_or(serde_json::json!({}));
-                                                    let _ = tx
-                                                        .send(Ok(StreamToken::ToolCall {
-                                                            name,
-                                                            args: args_val,
-                                                            id: call.id,
-                                                        }))
-                                                        .await;
-                                                }
-                                            }
+                                    }
+                                    if let Some(content) = &choice.delta.content {
+                                        if !content.is_empty() {
+                                            let _ = tx
+                                                .send(Ok(StreamToken::Text(content.clone())))
+                                                .await;
+                                        }
+                                    }
+                                    if let Some(calls) = &choice.delta.tool_calls {
+                                        for call in calls {
+                                            let name = call.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
+                                            let args_str = call.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
+                                            let args_val: serde_json::Value = match serde_json::from_str(&args_str) {
+                                                Ok(v) => v,
+                                                Err(_) => serde_json::Value::Null,
+                                            };
+                                            let id = call.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                            let _ = tx
+                                                .send(Ok(StreamToken::ToolCall {
+                                                    name,
+                                                    args: args_val,
+                                                    id: Some(id),
+                                                }))
+                                                .await;
+                                        }
+                                    }
+
+                                    if let Some(func) = &choice.delta.function_call {
+                                        let name = func.name.clone().unwrap_or_default();
+                                        let args_str = func.arguments.clone().unwrap_or_default();
+                                        let args_val: serde_json::Value =
+                                            match serde_json::from_str(&args_str) {
+                                                Ok(v) => v,
+                                                Err(_) => serde_json::Value::Null,
+                                            };
+                                        let _ = tx
+                                            .send(Ok(StreamToken::ToolCall {
+                                                name: name.clone(),
+                                                args: args_val,
+                                                id: Some(uuid::Uuid::new_v4().to_string()),
+                                            }))
+                                            .await;
+                                    }
+
+                                    if let Some(reason) = &choice.finish_reason {
+                                        if !reason.is_empty() {
+                                            let _ = tx
+                                                .send(Ok(StreamToken::Done))
+                                                .await;
+                                            return;
                                         }
                                     }
                                 }
@@ -459,6 +400,8 @@ impl LlmClient for OpenAiVendor {
                     }
                 }
             }
+
+            let _ = tx.send(Ok(StreamToken::Done)).await;
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
@@ -569,5 +512,76 @@ impl LlmClient for OpenAiClient {
 
     fn provider_name(&self) -> &'static str {
         "openai"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use config::Section;
+    use serde::Deserialize;
+
+    use crate::llm::vendor::OpenAiVendor;
+    use crate::{LlmClient, LlmRequest};
+
+    #[tokio::test]
+    async fn test_openai_vendor() {
+        let mut section = Section::default();
+        let result = section.init();
+
+        let _config = match result.await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping test (no config): {}", e);
+                return;
+            }
+        };
+
+        #[derive(Debug, Deserialize, Clone)]
+        struct LlmConfig {
+            model: String,
+            base_url: String,
+            api_key: String,
+        }
+
+        let llm_config: LlmConfig = match section.extract("global_model") {
+            Some(c) => c,
+            None => {
+                eprintln!("Skipping test (no global_model config)");
+                return;
+            }
+        };
+
+        let model_name = if llm_config.model.starts_with("openai/") {
+            llm_config.model.strip_prefix("openai/").unwrap().to_string()
+        } else if !llm_config.model.contains('/') {
+            llm_config.model.clone()
+        } else {
+            eprintln!("Skipping test: model should not contain provider prefix for OpenAI");
+            return;
+        };
+
+        let vendor = OpenAiVendor::new(
+            llm_config.base_url.clone(),
+            model_name,
+            llm_config.api_key.clone(),
+        );
+
+        let request = LlmRequest::with_user(&llm_config.model, "What is 2+2?");
+        let outcome = vendor.complete(request).await;
+        
+        if let Err(e) = outcome {
+            let err_str = format!("{:?}", e);
+            if err_str.contains("404") || err_str.contains("not found") {
+                eprintln!("OpenAI endpoint/model not available (404), skipping test: {}", err_str);
+                return;
+            }
+            if err_str.contains("429") || err_str.contains("rate limit") {
+                eprintln!("OpenAI rate limited, skipping test: {}", err_str);
+                return;
+            }
+            panic!("OpenAI request failed: {:?}", e);
+        }
+        
+        println!("{:?}", outcome);
     }
 }

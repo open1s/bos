@@ -5,6 +5,7 @@ use agent::agent::plugin::{
 };
 use async_trait::async_trait;
 use pyo3::prelude::*;
+use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
 use react::llm::LlmContext;
 use std::sync::Arc;
 
@@ -69,34 +70,37 @@ pub struct PyLlmResponseWrapper {
 impl From<&InnerLlmResponse> for PyLlmResponseWrapper {
     fn from(resp: &InnerLlmResponse) -> Self {
         match resp {
-            InnerLlmResponse::Text(s) => Self {
-                response_type: "Text".to_string(),
-                content: Some(s.clone()),
-                tool_name: None,
-                tool_args: None,
-                tool_id: None,
-            },
-            InnerLlmResponse::Partial(s) => Self {
-                response_type: "Partial".to_string(),
-                content: Some(s.clone()),
-                tool_name: None,
-                tool_args: None,
-                tool_id: None,
-            },
-            InnerLlmResponse::ToolCall { name, args, id } => Self {
-                response_type: "ToolCall".to_string(),
-                content: None,
-                tool_name: Some(name.clone()),
-                tool_args: Some(args.to_string()),
-                tool_id: id.clone(),
-            },
-            InnerLlmResponse::Done => Self {
-                response_type: "Done".to_string(),
-                content: None,
-                tool_name: None,
-                tool_args: None,
-                tool_id: None,
-            },
+            InnerLlmResponse::OpenAI(rsp) => {
+                if let Some(choice) = rsp.choices.first() {
+                    if let Some(tool_calls) = &choice.message.tool_calls {
+                        if let Some(tc) = tool_calls.first() {
+                            return Self {
+                                response_type: "ToolCall".to_string(),
+                                content: None,
+                                tool_name: tc.function.name.clone(),
+                                tool_args: tc.function.arguments.clone(),
+                                tool_id: Some(tc.id.clone()),
+                            };
+                        }
+                    }
+                    if let Some(content) = &choice.message.content {
+                        return Self {
+                            response_type: "Text".to_string(),
+                            content: Some(content.clone()),
+                            tool_name: None,
+                            tool_args: None,
+                            tool_id: None,
+                        };
+                    }
+                }
+                Self {
+                    response_type: "Done".to_string(),
+                    content: None,
+                    tool_name: None,
+                    tool_args: None,
+                    tool_id: None,
+                }
+            }
         }
     }
 }
@@ -104,16 +108,66 @@ impl From<&InnerLlmResponse> for PyLlmResponseWrapper {
 impl From<PyLlmResponseWrapper> for InnerLlmResponse {
     fn from(py_resp: PyLlmResponseWrapper) -> Self {
         match py_resp.response_type.as_str() {
-            "Text" => InnerLlmResponse::Text(py_resp.content.unwrap_or_default()),
-            "Partial" => InnerLlmResponse::Partial(py_resp.content.unwrap_or_default()),
-            "ToolCall" => InnerLlmResponse::ToolCall {
-                name: py_resp.tool_name.unwrap_or_default(),
-                args: py_resp
+            "ToolCall" => {
+                let args: serde_json::Value = py_resp
                     .tool_args
-                    .map_or(serde_json::json!({}), |s| serde_json::json!({"raw": s})),
-                id: py_resp.tool_id,
-            },
-            _ => InnerLlmResponse::Done,
+                    .map_or(serde_json::json!({}), |s| serde_json::json!({"raw": s}));
+                InnerLlmResponse::OpenAI(ChatCompletionResponse {
+                    id: format!("py-{}", uuid::Uuid::new_v4()),
+                    object: "chat.completion".to_string(),
+                    created: 1234567890,
+                    model: "python-model".to_string(),
+                    choices: vec![Choice {
+                        index: 0,
+                        message: ChatMessage {
+                            role: "assistant".to_string(),
+                            content: None,
+                            tool_calls: Some(vec![ToolCall {
+                                id: py_resp
+                                    .tool_id
+                                    .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())),
+                                r#type: "function".to_string(),
+                                function: FunctionCall {
+                                    name: py_resp.tool_name,
+                                    arguments: Some(args.to_string()),
+                                },
+                            }]),
+                            function_call: None,
+                            reasoning_content: None,
+                            extra: serde_json::Value::Object(serde_json::Map::new()),
+                        },
+                        finish_reason: Some("tool_calls".to_string()),
+                        stop_reason: None,
+                        logprobs: None,
+                    }],
+                    usage: None,
+                    system_fingerprint: None,
+                    nvext: None,
+                })
+            }
+            _ => InnerLlmResponse::OpenAI(ChatCompletionResponse {
+                id: format!("py-{}", uuid::Uuid::new_v4()),
+                object: "chat.completion".to_string(),
+                created: 1234567890,
+                model: "python-model".to_string(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ChatMessage {
+                        role: "assistant".to_string(),
+                        content: py_resp.content,
+                        tool_calls: None,
+                        function_call: None,
+                        reasoning_content: None,
+                        extra: serde_json::Value::Object(serde_json::Map::new()),
+                    },
+                    finish_reason: Some("stop".to_string()),
+                    stop_reason: None,
+                    logprobs: None,
+                }],
+                usage: None,
+                system_fingerprint: None,
+                nvext: None,
+            }),
         }
     }
 }

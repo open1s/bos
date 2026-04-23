@@ -56,19 +56,13 @@ impl LlmRequestWrapper {
 
 #[derive(Debug, Clone)]
 pub enum LlmResponseWrapper {
-    Text(String),
-    Partial(String),
-    ToolCall {
-        name: String,
-        args: serde_json::Value,
-        id: Option<String>,
-    },
-    Done,
+    OpenAI(react::llm::vendor::ChatCompletionResponse),
 }
 
 #[derive(Debug, Clone)]
 pub enum StreamTokenWrapper {
     Text(String),
+    ReasoningContent(String),
     ToolCall {
         name: String,
         args: serde_json::Value,
@@ -86,6 +80,9 @@ impl StreamTokenWrapper {
                 args: args.clone(),
                 id: id.clone(),
             },
+            react::llm::StreamToken::ReasoningContent(s) => {
+                StreamTokenWrapper::ReasoningContent(s.clone())
+            }
             react::llm::StreamToken::Done => StreamTokenWrapper::Done,
         }
     }
@@ -96,6 +93,7 @@ impl StreamTokenWrapper {
             StreamTokenWrapper::ToolCall { name, args, id } => {
                 react::llm::StreamToken::ToolCall { name, args, id }
             }
+            StreamTokenWrapper::ReasoningContent(s) => react::llm::StreamToken::ReasoningContent(s),
             StreamTokenWrapper::Done => react::llm::StreamToken::Done,
         }
     }
@@ -104,25 +102,13 @@ impl StreamTokenWrapper {
 impl LlmResponseWrapper {
     pub fn new(response: &react::llm::LlmResponse) -> Self {
         match response {
-            react::llm::LlmResponse::Text(s) => LlmResponseWrapper::Text(s.clone()),
-            react::llm::LlmResponse::Partial(s) => LlmResponseWrapper::Partial(s.clone()),
-            react::llm::LlmResponse::Done => LlmResponseWrapper::Done,
-            react::llm::LlmResponse::ToolCall { name, args, id } => LlmResponseWrapper::ToolCall {
-                name: name.clone(),
-                args: args.clone(),
-                id: id.clone(),
-            },
+            react::llm::LlmResponse::OpenAI(resp) => LlmResponseWrapper::OpenAI(resp.clone()),
         }
     }
 
     pub fn into_response(self) -> react::llm::LlmResponse {
         match self {
-            LlmResponseWrapper::Text(s) => react::llm::LlmResponse::Text(s),
-            LlmResponseWrapper::Partial(s) => react::llm::LlmResponse::Partial(s),
-            LlmResponseWrapper::Done => react::llm::LlmResponse::Done,
-            LlmResponseWrapper::ToolCall { name, args, id } => {
-                react::llm::LlmResponse::ToolCall { name, args, id }
-            }
+            LlmResponseWrapper::OpenAI(resp) => react::llm::LlmResponse::OpenAI(resp),
         }
     }
 }
@@ -589,47 +575,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_llm_response_wrapper_text() {
-        let response = react::llm::LlmResponse::Text("hello".to_string());
+    async fn test_llm_response_wrapper_openai() {
+        use react::llm::vendor::{
+            ChatCompletionResponse, Choice,
+        };
+        use react::llm::ChatMessage;
+        let response = react::llm::LlmResponse::OpenAI(ChatCompletionResponse {
+            id: "test-123".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1234567890,
+            model: "test-model".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("hello".to_string()),
+                    tool_calls: None,
+                    function_call: None,
+                    reasoning_content: None,
+                    extra: serde_json::Value::Object(serde_json::Map::new()),
+                },
+                finish_reason: Some("stop".to_string()),
+                stop_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            nvext: None,
+        });
         let wrapper = LlmResponseWrapper::new(&response);
         match wrapper {
-            LlmResponseWrapper::Text(s) => assert_eq!(s, "hello"),
-            _ => panic!("expected Text"),
+            LlmResponseWrapper::OpenAI(resp) => {
+                let content = resp.choices[0].message.content.clone();
+                assert_eq!(content, Some("hello".to_string()));
+            }
         }
     }
 
     #[tokio::test]
     async fn test_llm_response_wrapper_tool_call() {
-        let response = react::llm::LlmResponse::ToolCall {
-            name: "add".to_string(),
-            args: serde_json::json!({"a": 1, "b": 2}),
-            id: Some("call_123".to_string()),
+        use react::llm::vendor::{
+            ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall,
         };
+        let response = react::llm::LlmResponse::OpenAI(ChatCompletionResponse {
+            id: "test-123".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1234567890,
+            model: "test-model".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_123".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: Some("add".to_string()),
+                            arguments: Some(r#"{"a": 1, "b": 2}"#.to_string()),
+                        },
+                    }]),
+                    function_call: None,
+                    reasoning_content: None,
+                    extra: serde_json::Value::Object(serde_json::Map::new()),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+                stop_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            nvext: None,
+        });
         let wrapper = LlmResponseWrapper::new(&response);
         match wrapper {
-            LlmResponseWrapper::ToolCall { name, args: _, id } => {
-                assert_eq!(name, "add");
-                assert_eq!(id, Some("call_123".to_string()));
+            LlmResponseWrapper::OpenAI(resp) => {
+                let tc = resp.choices[0].message.tool_calls.as_ref().unwrap()[0].clone();
+                assert_eq!(tc.function.name, Some("add".to_string()));
+                assert_eq!(tc.id, "call_123");
             }
-            _ => panic!("expected ToolCall"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_llm_response_wrapper_done() {
-        let response = react::llm::LlmResponse::Done;
-        let wrapper = LlmResponseWrapper::new(&response);
-        match wrapper {
-            LlmResponseWrapper::Done => {}
-            _ => panic!("expected Done"),
         }
     }
 
     #[tokio::test]
     async fn test_llm_response_wrapper_into_response() {
-        let wrapper = LlmResponseWrapper::Text("response".to_string());
+        use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
+        let wrapper = LlmResponseWrapper::OpenAI(ChatCompletionResponse {
+            id: "test-123".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1234567890,
+            model: "test-model".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("response".to_string()),
+                    tool_calls: None,
+                    function_call: None,
+                    reasoning_content: None,
+                    extra: serde_json::Value::Object(serde_json::Map::new()),
+                },
+                finish_reason: Some("stop".to_string()),
+                stop_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            nvext: None,
+        });
         let response = wrapper.into_response();
-        assert!(matches!(response, react::llm::LlmResponse::Text(s) if s == "response"));
+        match response {
+            react::llm::LlmResponse::OpenAI(resp) => {
+                assert_eq!(
+                    resp.choices[0].message.content,
+                    Some("response".to_string())
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -820,7 +882,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(irrefutable_let_patterns)]
     async fn test_plugin_on_llm_response_modifies() {
+        use react::llm::vendor::ChatCompletionResponse;
+        use react::llm::{ChatMessage, Choice};
+
         #[derive(Debug)]
         struct ResponseModifier;
         #[async_trait]
@@ -832,8 +898,16 @@ mod tests {
                 &self,
                 response: LlmResponseWrapper,
             ) -> Option<LlmResponseWrapper> {
-                if let LlmResponseWrapper::Text(s) = response {
-                    return Some(LlmResponseWrapper::Text(s.to_uppercase()));
+                let LlmResponseWrapper::OpenAI(ref rsp) = response;
+                if let Some(choice) = rsp.choices.first() {
+                    if let Some(content) = &choice.message.content {
+                        let upper = content.to_uppercase();
+                        let mut new_rsp = rsp.clone();
+                        if let Some(c) = new_rsp.choices.first_mut() {
+                            c.message.content = Some(upper);
+                        }
+                        return Some(LlmResponseWrapper::OpenAI(new_rsp));
+                    }
                 }
                 None
             }
@@ -842,12 +916,40 @@ mod tests {
         let registry = PluginRegistry::new();
         registry.register(Arc::new(ResponseModifier)).await;
 
-        let wrapper = LlmResponseWrapper::Text("hello world".to_string());
+        let wrapper =
+            LlmResponseWrapper::new(&react::llm::LlmResponse::OpenAI(ChatCompletionResponse {
+                id: "test".to_string(),
+                object: "chat.completion".to_string(),
+                created: 0,
+                model: "test".to_string(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some("hello world".to_string()),
+                        tool_calls: None,
+                        function_call: None,
+                        reasoning_content: None,
+                        extra: serde_json::Value::Object(serde_json::Map::new()),
+                    },
+                    finish_reason: Some("stop".to_string()),
+                    stop_reason: None,
+                    logprobs: None,
+                }],
+                usage: None,
+                system_fingerprint: None,
+                nvext: None,
+            }));
         let result = registry.process_llm_response(wrapper).await;
-        match result {
-            LlmResponseWrapper::Text(s) => assert_eq!(s, "HELLO WORLD"),
-            _ => panic!("expected modified Text"),
+        if let LlmResponseWrapper::OpenAI(rsp) = result {
+            if let Some(choice) = rsp.choices.first() {
+                if let Some(content) = &choice.message.content {
+                    assert_eq!(content, "HELLO WORLD");
+                    return;
+                }
+            }
         }
+        panic!("expected modified Text");
     }
 
     #[tokio::test]
