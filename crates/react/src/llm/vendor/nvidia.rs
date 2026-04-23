@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::streaming_extractor::{JsonExtractor, StreamExtractor, StreamSpan};
 use async_trait::async_trait;
 use futures::StreamExt;
+use log::info;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +19,7 @@ pub struct NvidiaVendor {
     api_key: Arc<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize,Debug)]
 struct NvidiaRequest {
     model: String,
     messages: Vec<NvidiaMessageJson>,
@@ -36,7 +37,7 @@ struct NvidiaRequest {
     stream: Option<bool>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize,Debug, Clone)]
 struct NvidiaMessageJson {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -47,7 +48,7 @@ struct NvidiaMessageJson {
     tool_calls: Option<Vec<ToolCallJson>>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize,Debug, Clone)]
 struct ToolCallJson {
     id: String,
     #[serde(rename = "type")]
@@ -55,7 +56,7 @@ struct ToolCallJson {
     function: FunctionCallJson,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize,Debug, Clone)]
 struct FunctionCallJson {
     name: String,
     arguments: String,
@@ -385,6 +386,8 @@ impl LlmClient for NvidiaVendor {
 
         let url = format!("{}/chat/completions", endpoint);
 
+        info!("Nvidia Request: {:?}", &nvidia_req);
+
         let response = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
@@ -413,6 +416,7 @@ impl LlmClient for NvidiaVendor {
                 match chunk_result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes).to_string();
+                        info!("Nvidia chunk: {}", &text); 
                         let spans = extractor.push(&text);
 
                         for span in spans {
@@ -470,6 +474,14 @@ impl LlmClient for NvidiaVendor {
                                 }
 
                                 last_scan_consume_index += span.end - span.start
+                            } else {
+                                info!("Nvidia not support: {}",json_match);
+                                let _ = tx
+                                    .send(Err(LlmError::Other(format!(
+                                        "Failed to parse JSON: {}",
+                                        json_match
+                                    ))))
+                                    .await;
                             }
                         }
                     }
