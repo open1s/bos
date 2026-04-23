@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
+use crate::streaming_extractor::{JsonExtractor, StreamExtractor, StreamSpan};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use surfing::JSONParser;
 
-use crate::{llm::{
-    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamResponseAccumulator,
-    StreamToken, Stringfy, TokenStream,
-}};
+use crate::llm::{
+    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken, Stringfy,
+    TokenStream,
+};
 
 pub struct NvidiaVendor {
     client: Client,
@@ -406,73 +406,70 @@ impl LlmClient for NvidiaVendor {
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
-            let mut parser = JSONParser::new();
-            let mut accumulator = StreamResponseAccumulator::new(move |response, start_idx| {
-                let remaining = if start_idx < response.len() {
-                    &response[start_idx..]
-                } else {
-                    return (start_idx, None);
-                };
-
-                let mut all_tokens = Vec::new();
-                let mut bytes_written = Vec::new();
-
-                let write_result = {
-                    let mut writer = std::io::BufWriter::new(&mut bytes_written);
-                    parser.extract_json_from_stream(&mut writer, remaining)
-                };
-
-                if write_result.is_ok() {
-                    let json_str = String::from_utf8_lossy(&bytes_written);
-                    if let Ok(resp) = serde_json::from_str::<NvidiaStreamResponse>(&json_str) {
-                        for choice in &resp.choices {
-                            if let Some(content) = &choice.delta.content {
-                                if !content.is_empty() {
-                                    all_tokens.push(StreamToken::Text(content.clone()));
-                                }
-                            }
-                            if let Some(calls) = &choice.delta.tool_calls {
-                                for call in calls {
-                                    let name = call.function.name.as_ref();
-                                    let args = call.function.arguments.as_ref();
-                                    if let (Some(n), Some(a)) = (name, args) {
-                                        let args_val: serde_json::Value =
-                                            match serde_json::from_str(a) {
-                                                Ok(v) => v,
-                                                Err(_) => serde_json::Value::Null,
-                                            };
-                                        all_tokens.push(StreamToken::ToolCall {
-                                            name: n.clone(),
-                                            args: args_val,
-                                            id: call.id.clone(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        let new_idx = start_idx + bytes_written.len();
-                        return (new_idx, Some(all_tokens));
-                    }
-                }
-
-                (start_idx, None)
-            });
+            let mut extractor = JsonExtractor::default();
+            let mut last_scan_consume_index = 0usize;
 
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes).to_string();
-                        if let Some(tokens) = accumulator.push(&text) {
-                            for tk in tokens {
-                                match &tk {
-                                    StreamToken::Done => {
-                                        let _ = tx.send(Ok(StreamToken::Done)).await;
-                                        return;
+                        let spans = extractor.push(&text);
+
+                        for span in spans {
+                            if !span.is_root() {
+                                continue;
+                            }
+
+                            //handle before text
+                            if last_scan_consume_index < span.start {
+                                let s = StreamSpan::new(last_scan_consume_index, span.start, 0);
+                                let content = extractor.extract_str(&s);
+                                if let Some(text) = content {
+                                    let _ = tx.send(Ok(StreamToken::Text(text.to_string()))).await;
+                                    last_scan_consume_index += span.start;
+                                }
+                            }
+
+                            let json_match = extractor.extract_str(&span);
+                            if json_match.is_none() {
+                                continue;
+                            }
+
+                            let json_match = json_match.unwrap();
+                            if let Ok(resp) =
+                                serde_json::from_str::<NvidiaStreamResponse>(json_match)
+                            {
+                                for choice in &resp.choices {
+                                    if let Some(content) = &choice.delta.content {
+                                        if !content.is_empty() {
+                                            let _ = tx
+                                                .send(Ok(StreamToken::Text(content.clone())))
+                                                .await;
+                                        }
                                     }
-                                    _ => {
-                                        let _ = tx.send(Ok(tk)).await;
+                                    if let Some(calls) = &choice.delta.tool_calls {
+                                        for call in calls {
+                                            let name = call.function.name.as_ref();
+                                            let args = call.function.arguments.as_ref();
+                                            if let (Some(n), Some(a)) = (name, args) {
+                                                let args_val: serde_json::Value =
+                                                    match serde_json::from_str(a) {
+                                                        Ok(v) => v,
+                                                        Err(_) => serde_json::Value::Null,
+                                                    };
+                                                let _ = tx
+                                                    .send(Ok(StreamToken::ToolCall {
+                                                        name: n.clone(),
+                                                        args: args_val,
+                                                        id: call.id.clone(),
+                                                    }))
+                                                    .await;
+                                            }
+                                        }
                                     }
                                 }
+
+                                last_scan_consume_index += span.end - span.start
                             }
                         }
                     }
@@ -484,6 +481,8 @@ impl LlmClient for NvidiaVendor {
                     }
                 }
             }
+
+            let _ = tx.send(Ok(StreamToken::Done)).await;
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))

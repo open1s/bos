@@ -1855,6 +1855,7 @@ mod message_log_tests {
     }
 
     /// Mock LLM client that returns a tool call response for testing tool message logging
+    #[allow(dead_code)]
     struct ToolCallLlmClient {
         responses: Arc<TokioMutex<Vec<LlmResponse>>>,
     }
@@ -1909,7 +1910,7 @@ mod message_log_tests {
             "Final answer: LLM response text".to_string(),
         )]));
         let llm = Arc::new(MockLlmClient { responses });
-        let mut agent = Agent::new(config, llm);
+        let agent = Agent::new(config, llm);
 
         let result = agent.run_simple("test task").await;
 
@@ -1963,7 +1964,7 @@ mod message_log_tests {
                 },
                 "required": ["param"]
             }),
-            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "tool executed" })),
+            |_args: &serde_json::Value| Ok(serde_json::json!({ "result": "tool executed" })),
         ));
         agent.add_tool(tool);
 
@@ -1994,6 +1995,7 @@ mod message_log_tests {
     // ========================================================================
 
     /// Helper to count messages of a specific type
+    #[allow(dead_code)]
     fn count_message_type(messages: &[LlmMessage], variant: &str) -> usize {
         messages
             .iter()
@@ -2118,7 +2120,7 @@ mod hook_tests {
         let config = AgentConfig::default();
         let responses = Arc::new(TokioMutex::new(vec![]));
         let llm = Arc::new(MockLlmClient { responses });
-        let mut agent = Agent::new(config, llm);
+        let agent = Agent::new(config, llm);
 
         let before_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
         let after_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
@@ -2133,7 +2135,6 @@ mod hook_tests {
             .await;
 
         let _ = agent.react("test").await;
-
         let before_events = before_llm.get_events().await;
         let after_events = after_llm.get_events().await;
 
@@ -2149,7 +2150,7 @@ mod hook_tests {
         let config = AgentConfig::default();
         let responses = Arc::new(TokioMutex::new(vec![]));
         let llm = Arc::new(MockLlmClient { responses });
-        let mut agent = Agent::new(config, llm);
+        let agent = Agent::new(config, llm);
 
         let before_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
         let after_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
@@ -2183,7 +2184,7 @@ mod hook_tests {
         let config = AgentConfig::default();
         let responses = Arc::new(TokioMutex::new(vec![]));
         let llm = Arc::new(MockLlmClient { responses });
-        let mut agent = Agent::new(config, llm);
+        let agent = Agent::new(config, llm);
 
         let before_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
         let after_llm = Arc::new(RecordingHook::new(HookDecision::Continue));
@@ -2218,7 +2219,7 @@ mod hook_tests {
         let config = AgentConfig::default();
         let responses = Arc::new(TokioMutex::new(vec![]));
         let llm = Arc::new(MockLlmClient { responses });
-        let mut agent = Agent::new(config, llm);
+        let agent = Agent::new(config, llm);
 
         let on_error = Arc::new(RecordingHook::new(HookDecision::Continue));
         agent
@@ -2235,7 +2236,7 @@ mod hook_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_tool_call_hooks_in_react() {
         let config = AgentConfig::default();
-        let mut responses = vec![
+        let responses = vec![
             LlmResponse::ToolCall {
                 name: "test_tool".to_string(),
                 args: serde_json::json!({ "param": "value" }),
@@ -2251,13 +2252,13 @@ mod hook_tests {
             "test_tool",
             "A test tool",
             serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "param": { "type": "string" }
-                },
-                "required": ["param"]
+                            "type": "object",
+                            "properties": {
+                                "param": { "type": "string" }
+                            },
+                            "required": ["param"]
             }),
-            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
+            |_args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
         ));
         agent.add_tool(tool);
 
@@ -2274,7 +2275,6 @@ mod hook_tests {
             .await;
 
         let _ = agent.react("test").await;
-
         let before_events = before_tool.get_events().await;
         let after_events = after_tool.get_events().await;
 
@@ -2310,11 +2310,13 @@ mod hook_tests {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "param": { "type": "string" }
+                    "param": {
+                        "type": "string"
+                    }
                 },
                 "required": ["param"]
             }),
-            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
+            |_args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
         ));
         agent.add_tool(tool);
 
@@ -2367,7 +2369,7 @@ mod hook_tests {
                 },
                 "required": ["param"]
             }),
-            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
+            |_args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
         ));
         agent.add_tool(tool);
 
@@ -2499,7 +2501,7 @@ mod hook_tests {
                 },
                 "required": ["param"]
             }),
-            |args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
+            |_args: &serde_json::Value| Ok(serde_json::json!({ "result": "executed" })),
         ));
         agent.add_tool(tool);
 
@@ -2536,7 +2538,7 @@ mod hook_tests {
         let config = AgentConfig::default();
         let responses = Arc::new(TokioMutex::new(vec![]));
         let llm = Arc::new(MockLlmClient { responses });
-        let mut agent = Agent::new(config, llm);
+        let agent = Agent::new(config, llm);
 
         let on_error = Arc::new(RecordingHook::new(HookDecision::Continue));
         agent

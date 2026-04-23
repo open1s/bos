@@ -1,5 +1,3 @@
-
-
 /// Span representing a matched element with its position, nesting level, and parent span
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Span {
@@ -40,6 +38,8 @@ impl Span {
     }
 }
 
+pub type StreamSpan = Span;
+
 #[derive(Debug, Default)]
 pub struct Arena {
     buf: Vec<u8>,
@@ -71,6 +71,21 @@ impl Arena {
 
 pub trait StreamExtractor {
     fn push(&mut self, chunk: &str) -> Vec<Span>;
+
+    fn extract<'a>(&'a self, span: &Span) -> &'a [u8];
+
+    fn extract_str<'a>(&'a self, span: &Span) -> Option<&'a str> {
+        std::str::from_utf8(self.extract(span)).ok()
+    }
+
+    fn extract_string(&self, span: &Span) -> Option<String> {
+        let str = self.extract_str(span);
+        match str {
+            Some(s) => Some(s.to_string()),
+            None => None,
+        }
+    }
+
     fn reset(&mut self);
 }
 
@@ -131,9 +146,7 @@ impl StreamExtractor for JsonExtractor {
 
                 b'}' | b']' if !self.in_string => {
                     if let Some(&(open, start)) = self.stack.last() {
-                        let matched =
-                            (open == b'{' && b == b'}') ||
-                            (open == b'[' && b == b']');
+                        let matched = (open == b'{' && b == b'}') || (open == b'[' && b == b']');
 
                         if matched {
                             self.stack.pop();
@@ -187,17 +200,15 @@ impl StreamExtractor for JsonExtractor {
         spans
     }
 
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
-impl JsonExtractor {
-    pub fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
+    fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
         let start = span.start.saturating_sub(self.arena.start);
         let end = span.end.saturating_sub(self.arena.start);
 
         &self.arena.as_slice()[start..end]
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -334,17 +345,15 @@ impl StreamExtractor for XmlExtractor {
         spans
     }
 
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
-impl XmlExtractor {
-    pub fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
+    fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
         let start = span.start.saturating_sub(self.arena.start);
         let end = span.end.saturating_sub(self.arena.start);
 
         &self.arena.as_slice()[start..end]
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -380,6 +389,14 @@ impl StreamExtractor for MixedExtractor {
         }
     }
 
+    fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
+        match self.mode {
+            Some(MixedMode::Json) => self.json.extract(span),
+            Some(MixedMode::Xml) => self.xml.extract(span),
+            None => &[],
+        }
+    }
+
     fn reset(&mut self) {
         self.json.reset();
         self.xml.reset();
@@ -388,14 +405,6 @@ impl StreamExtractor for MixedExtractor {
 }
 
 impl MixedExtractor {
-    pub fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
-        match self.mode {
-            Some(MixedMode::Json) => self.json.extract(span),
-            Some(MixedMode::Xml) => self.xml.extract(span),
-            None => &[],
-        }
-    }
-
     pub fn mode(&self) -> Option<&'static str> {
         match self.mode {
             Some(MixedMode::Json) => Some("json"),
@@ -430,6 +439,13 @@ impl StreamExtractor for MixedExtractorV2 {
         self.push_typed(chunk).into_iter().map(|t| t.span).collect()
     }
 
+    fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
+        if let Some(extracted) = self.try_extract(span, SpanSource::Json) {
+            return extracted;
+        }
+        self.try_extract(span, SpanSource::Xml).unwrap_or(&[])
+    }
+
     fn reset(&mut self) {
         self.json.reset();
         self.xml.reset();
@@ -437,13 +453,6 @@ impl StreamExtractor for MixedExtractorV2 {
 }
 
 impl MixedExtractorV2 {
-    pub fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
-        if let Some(extracted) = self.try_extract(span, SpanSource::Json) {
-            return extracted;
-        }
-        self.try_extract(span, SpanSource::Xml).unwrap_or(&[])
-    }
-
     pub fn extract_typed<'a>(&'a self, typed: &TypedSpan) -> &'a [u8] {
         match typed.source {
             SpanSource::Json => self.json.extract(&typed.span),
@@ -480,7 +489,10 @@ impl MixedExtractorV2 {
             .collect();
 
         typed.sort_by(|a, b| {
-            b.span.level.cmp(&a.span.level).then(a.span.start.cmp(&b.span.start))
+            b.span
+                .level
+                .cmp(&a.span.level)
+                .then(a.span.start.cmp(&b.span.start))
         });
         typed
     }
@@ -527,7 +539,6 @@ fn json_nested() {
     assert_eq!(s1, r#"{"b":1}"#);
     assert_eq!(s2, r#"{"a":{"b":1}}"#);
 }
-
 
 #[test]
 fn json_nested_partial() {
@@ -980,4 +991,45 @@ fn xml_parent_span() {
     assert_eq!(parent.start, root.start);
     assert_eq!(parent.end, root.end);
     assert_eq!(parent.level, root.level);
+}
+
+#[cfg(test)]
+mod nvidia_streaming_tests {
+    use super::*;
+
+    #[test]
+    fn nvidia_style_text_token() {
+        let mut ext = JsonExtractor::default();
+        let spans = ext.push(r#"{"choices":[{"delta":{"content":"Hello"}}]}"#);
+
+        // Returns spans for all complete JSON at ALL nesting levels
+        assert!(!spans.is_empty());
+    }
+
+    #[test]
+    fn nvidia_style_multiple_choices() {
+        let mut ext = JsonExtractor::default();
+        let spans =
+            ext.push(r#"{"choices":[{"delta":{"content":"A"}},{"delta":{"content":"B"}}]}"#);
+
+        assert!(!spans.is_empty());
+    }
+
+    #[test]
+    fn nvidia_style_tool_call() {
+        let mut ext = JsonExtractor::default();
+        let spans = ext.push(r#"{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"NYC\"}"}}]}}]}"#);
+
+        assert!(!spans.is_empty());
+    }
+
+    #[test]
+    fn nvidia_style_with_plain_text_prefix() {
+        let mut ext = JsonExtractor::default();
+        let text =
+            "some plain text prefix then json:{\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}";
+        let spans = ext.push(text);
+
+        assert!(!spans.is_empty());
+    }
 }

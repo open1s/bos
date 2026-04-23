@@ -1,13 +1,13 @@
 use async_trait::async_trait;
-use react::calculator_tool::CalculatorTool;
 use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, TokenStream};
-use react::ReActEngine;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
+#[allow(dead_code)]
 struct MockLlm {
     responses: Arc<Mutex<Vec<String>>>,
 }
 
+#[allow(dead_code)]
 impl MockLlm {
     fn new(responses: Vec<String>) -> Self {
         Self {

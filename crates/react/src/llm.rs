@@ -382,7 +382,7 @@ impl<F, T> StreamResponseAccumulator<F, T>
 where
     F: FnMut(&str, usize) -> (usize, Option<Vec<T>>),
 {
-  pub fn new(handler: F) -> Self {
+    pub fn new(handler: F) -> Self {
         Self {
             response: String::new(),
             index: 0,

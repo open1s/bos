@@ -151,7 +151,7 @@ fn test_message_log_input() {
     ]);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (result, _context) = rt
+    let (_result, _context) = rt
         .block_on(async { engine.react("New message").await })
         .unwrap();
 

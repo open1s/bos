@@ -607,7 +607,7 @@ mod tests {
         };
         let wrapper = LlmResponseWrapper::new(&response);
         match wrapper {
-            LlmResponseWrapper::ToolCall { name, args, id } => {
+            LlmResponseWrapper::ToolCall { name, args: _, id } => {
                 assert_eq!(name, "add");
                 assert_eq!(id, Some("call_123".to_string()));
             }
@@ -651,7 +651,7 @@ mod tests {
         };
         let wrapper = StreamTokenWrapper::new(&token);
         match wrapper {
-            StreamTokenWrapper::ToolCall { name, args, id } => {
+            StreamTokenWrapper::ToolCall { name, args: _, id } => {
                 assert_eq!(name, "add");
                 assert_eq!(id, Some("call_456".to_string()));
             }
@@ -830,7 +830,7 @@ mod tests {
             }
             async fn on_llm_response(
                 &self,
-                mut response: LlmResponseWrapper,
+                response: LlmResponseWrapper,
             ) -> Option<LlmResponseWrapper> {
                 if let LlmResponseWrapper::Text(s) = response {
                     return Some(LlmResponseWrapper::Text(s.to_uppercase()));
@@ -922,7 +922,7 @@ mod tests {
             }
             async fn on_llm_request(
                 &self,
-                request: LlmRequestWrapper,
+                _request: LlmRequestWrapper,
             ) -> Option<LlmRequestWrapper> {
                 None
             }

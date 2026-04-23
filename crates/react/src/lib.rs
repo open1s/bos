@@ -1,11 +1,11 @@
 pub mod calculator_tool;
 pub mod engine;
-pub mod streaming_extractor;
 pub mod llm;
 pub mod memory;
 pub mod prompts;
 pub mod resilience;
 pub mod search_tool;
+pub mod streaming_extractor;
 pub mod telemetry;
 pub mod token_counter;
 pub mod tool;
@@ -70,5 +70,11 @@ pub use resilience::{
     CircuitBreaker, CircuitBreakerConfig, CircuitState, RateLimiter, RateLimiterConfig,
     ReActResilience, ResilienceConfig, ResilienceError,
 };
+
 pub use telemetry::{Telemetry, TelemetryEvent};
 pub use tool::{Tool, ToolRegistry};
+pub use streaming_extractor::{JsonExtractor, StreamExtractor,MixedExtractor,MixedExtractorV2};
+pub use streaming_extractor::Span as StreamSpan;
+pub use streaming_extractor::Arena as StreamArena;
+
+pub use llm::StreamResponseAccumulator;

@@ -1,9 +1,10 @@
 [package]
 name = "react"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 description = "ReAct-inspired reasoning and acting engine in Rust"
-license = "MIT OR Apache-2.0"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

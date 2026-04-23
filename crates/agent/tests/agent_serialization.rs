@@ -21,8 +21,6 @@ fn test_agent_config_has_archive_derive() {
 
 #[test]
 fn test_agent_has_archive_derive() {
-    use std::sync::Arc;
-
     let config = AgentConfig::default();
     let bytes = config.dump().expect("AgentConfig should serialize");
     assert!(!bytes.is_empty(), "Serialized bytes should not be empty");

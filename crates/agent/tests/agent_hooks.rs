@@ -17,10 +17,6 @@ impl TestHook {
             events: Arc::new(Mutex::new(Vec::new())),
         }
     }
-
-    async fn get_events(&self) -> Vec<HookEvent> {
-        self.events.lock().await.clone()
-    }
 }
 
 #[async_trait]

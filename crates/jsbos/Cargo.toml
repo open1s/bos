@@ -1,7 +1,9 @@
 [package]
 name = "jsbos"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 description = "JavaScript/Node.js bindings for BrainOS (agent/config/bus) via NAPI-RS"
 
 [package.metadata]
