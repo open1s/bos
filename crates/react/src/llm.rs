@@ -379,7 +379,7 @@ pub struct StreamResponseAccumulator<F> {
 
 impl<F> StreamResponseAccumulator<F>
 where
-    F: FnMut(&str,usize) -> (usize,Option<Vec<StreamToken>>), //index is the parsed index
+    F: FnMut(&str, usize) -> (usize, Option<Vec<StreamToken>>), //index is the parsed index
 {
     /// Create new accumulator with handler: fn(name, id, accumulated_args) -> Option<StreamToken>
     pub fn new(handler: F) -> Self {
@@ -395,12 +395,9 @@ where
     }
 
     /// Push a chunk of tool call data. Handler is called to try parse accumulated arguments.
-    pub fn push(
-        &mut self,
-        chunk: &str,
-    ) -> Option<Vec<StreamToken>> {
+    pub fn push(&mut self, chunk: &str) -> Option<Vec<StreamToken>> {
         self.response.push_str(chunk);
-        let (index, token) = (self.handler)(&self.response,self.index);
+        let (index, token) = (self.handler)(&self.response, self.index);
         self.index = index;
         token
     }
@@ -408,7 +405,7 @@ where
     pub fn reset(&mut self) {
         self.response.clear();
         self.index = 0;
-    }   
+    }
 }
 
 pub type LlmResponseResult = Result<LlmResponse, LlmError>;

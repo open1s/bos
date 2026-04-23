@@ -1,6 +1,6 @@
-use surfing::extract_json_to_string;
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::Reader;
+use surfing::extract_json_to_string;
 
 pub struct JsonXmlExtractor;
 
@@ -11,7 +11,7 @@ impl JsonXmlExtractor {
 
     pub fn extract_json(&mut self, input: &str) -> Vec<(usize, usize)> {
         let mut results = Vec::new();
-        
+
         if let Ok(json_str) = extract_json_to_string(input) {
             if !json_str.is_empty() {
                 if let Some(start) = input.find(&json_str) {
@@ -23,7 +23,7 @@ impl JsonXmlExtractor {
         results
     }
 
-    pub fn extract_part(&mut self,input: &str, start: usize, end: usize) -> String {
+    pub fn extract_part(&mut self, input: &str, start: usize, end: usize) -> String {
         input.get(start..end).unwrap().to_string()
     }
 
@@ -84,7 +84,7 @@ mod tests {
         let results = extractor.extract_json(input);
 
         // println!("{:?}", input.get(results[0].0..results[0].1));
-        
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 5);
         assert_eq!(results[0].1, 21);
@@ -95,7 +95,7 @@ mod tests {
         let mut extractor = JsonXmlExtractor::new();
         let input = r#"{"outer": {"inner": "value"}}"#;
         let results = extractor.extract_json(input);
-        
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], (0, 29));
     }
@@ -105,7 +105,7 @@ mod tests {
         let mut extractor = JsonXmlExtractor::new();
         let input = "text [1,2,3] after";
         let results = extractor.extract_json(input);
-        
+
         assert!(!results.is_empty());
     }
 
@@ -127,7 +127,7 @@ mod tests {
         let mut extractor = JsonXmlExtractor::new();
         let input = "<outer><inner>value</inner></outer>";
         let results = extractor.extract_xml(input);
-        
+
         assert_eq!(results.len(), 2);
     }
 
@@ -136,7 +136,7 @@ mod tests {
         let mut extractor = JsonXmlExtractor::new();
         let input = "text <br/> after";
         let results = extractor.extract_xml(input);
-        
+
         assert_eq!(results.len(), 1);
     }
 
@@ -145,7 +145,7 @@ mod tests {
         let mut extractor = JsonXmlExtractor::new();
         let input = "plain text only";
         let results = extractor.extract_json(input);
-        
+
         assert!(results.is_empty());
     }
 
@@ -154,7 +154,7 @@ mod tests {
         let mut extractor = JsonXmlExtractor::new();
         let input = "plain text only";
         let results = extractor.extract_xml(input);
-        
+
         assert!(results.is_empty());
     }
 }

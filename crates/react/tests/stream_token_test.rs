@@ -14,7 +14,7 @@ fn nvidia_handler(response: &str, start_idx: usize) -> (usize, Option<Vec<Stream
     while search_pos < remaining.len() {
         if let Some(start_json) = remaining[search_pos..].find("{\"") {
             let json_start = search_pos + start_json;
-            
+
             let mut brace_count = 0;
             let mut in_string = false;
             let mut escape_next = false;
@@ -40,8 +40,10 @@ fn nvidia_handler(response: &str, start_idx: usize) -> (usize, Option<Vec<Stream
                     }
                 }
             }
-            
-            let Some(json_end) = json_end else { break; };
+
+            let Some(json_end) = json_end else {
+                break;
+            };
             let json_slice = &remaining[json_start..json_end];
 
             #[derive(serde::Deserialize)]

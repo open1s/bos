@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use surfing::JSONParser;
 
 use crate::llm::{
-    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken,
-    Stringfy, TokenStream, StreamResponseAccumulator,
+    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamResponseAccumulator,
+    StreamToken, Stringfy, TokenStream,
 };
 
 pub struct NvidiaVendor {
@@ -417,12 +417,12 @@ impl LlmClient for NvidiaVendor {
 
                 let mut all_tokens = Vec::new();
                 let mut bytes_written = Vec::new();
-                
+
                 let write_result = {
                     let mut writer = std::io::BufWriter::new(&mut bytes_written);
                     parser.extract_json_from_stream(&mut writer, remaining)
                 };
-                
+
                 if write_result.is_ok() {
                     let json_str = String::from_utf8_lossy(&bytes_written);
                     if let Ok(resp) = serde_json::from_str::<NvidiaStreamResponse>(&json_str) {
@@ -455,7 +455,7 @@ impl LlmClient for NvidiaVendor {
                         return (new_idx, Some(all_tokens));
                     }
                 }
-                
+
                 (start_idx, None)
             });
 
