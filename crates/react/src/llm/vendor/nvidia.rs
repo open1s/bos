@@ -6,10 +6,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use surfing::JSONParser;
 
-use crate::llm::{
+use crate::{llm::{
     LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamResponseAccumulator,
     StreamToken, Stringfy, TokenStream,
-};
+}};
 
 pub struct NvidiaVendor {
     client: Client,
@@ -406,7 +406,6 @@ impl LlmClient for NvidiaVendor {
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
-            // Use surfing for JSON extraction
             let mut parser = JSONParser::new();
             let mut accumulator = StreamResponseAccumulator::new(move |response, start_idx| {
                 let remaining = if start_idx < response.len() {

@@ -1,6 +1,6 @@
 pub mod calculator_tool;
 pub mod engine;
-pub mod json_xml_extractor;
+pub mod streaming_extractor;
 pub mod llm;
 pub mod memory;
 pub mod prompts;

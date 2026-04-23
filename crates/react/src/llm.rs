@@ -371,22 +371,23 @@ pub enum StreamToken {
 
 /// Accumulates tool call data and invokes handler with raw accumulated data.
 /// Handler is responsible for parsing and returning StreamToken.
-pub struct StreamResponseAccumulator<F> {
+pub struct StreamResponseAccumulator<F, T = StreamToken> {
     response: String,
     index: usize,
     handler: F,
+    _marker: std::marker::PhantomData<T>,
 }
 
-impl<F> StreamResponseAccumulator<F>
+impl<F, T> StreamResponseAccumulator<F, T>
 where
-    F: FnMut(&str, usize) -> (usize, Option<Vec<StreamToken>>), //index is the parsed index
+    F: FnMut(&str, usize) -> (usize, Option<Vec<T>>),
 {
-    /// Create new accumulator with handler: fn(name, id, accumulated_args) -> Option<StreamToken>
-    pub fn new(handler: F) -> Self {
+  pub fn new(handler: F) -> Self {
         Self {
             response: String::new(),
             index: 0,
             handler,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -395,7 +396,7 @@ where
     }
 
     /// Push a chunk of tool call data. Handler is called to try parse accumulated arguments.
-    pub fn push(&mut self, chunk: &str) -> Option<Vec<StreamToken>> {
+    pub fn push(&mut self, chunk: &str) -> Option<Vec<T>> {
         self.response.push_str(chunk);
         let (index, token) = (self.handler)(&self.response, self.index);
         self.index = index;
