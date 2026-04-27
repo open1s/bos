@@ -10,6 +10,7 @@
       "import": "./index.mjs",
       "require": "./brainos.js",
       "types": "./index.d.ts"
+      
     }
   },
   "repository": {
