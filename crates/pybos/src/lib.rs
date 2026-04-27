@@ -9,6 +9,7 @@ mod bus;
 mod caller;
 mod config;
 mod hooks;
+mod llm_usage;
 mod logging;
 mod mcp;
 mod plugin;
@@ -29,6 +30,7 @@ pub use bus::{PyBus, PyBusConfig};
 pub use caller::{PyCallable, PyCaller};
 pub use config::PyConfigLoader;
 pub use hooks::{PyHookContext, PyHookDecision, PyHookEvent, PyHookRegistry};
+pub use llm_usage::{PyLlmUsage, PyPromptTokensDetails};
 pub use mcp::PyMcpClient;
 pub use plugin::{
     PyAgentPlugin, PyLlmRequestWrapper, PyLlmResponseWrapper, PyPluginRegistry, PyToolCallWrapper,
@@ -68,6 +70,8 @@ fn pybos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLlmResponseWrapper>()?;
     m.add_class::<PyToolCallWrapper>()?;
     m.add_class::<PyToolResultWrapper>()?;
+    m.add_class::<PyLlmUsage>()?;
+    m.add_class::<PyPromptTokensDetails>()?;
     m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(log_test_message, m)?)?;
     Ok(())

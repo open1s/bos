@@ -1,0 +1,103 @@
+use pyo3::prelude::*;
+use react::llm::vendor::openaicompatible::{PromptTokensDetails as InnerPromptTokensDetails, Usage as InnerUsage};
+
+#[pyclass(name = "PromptTokensDetails")]
+#[derive(Clone, Debug)]
+pub struct PyPromptTokensDetails {
+    #[pyo3(get, set)]
+    pub audio_tokens: Option<u32>,
+    #[pyo3(get, set)]
+    pub cached_tokens: Option<u32>,
+}
+
+#[pymethods]
+impl PyPromptTokensDetails {
+    #[new]
+    pub fn new(audio_tokens: Option<u32>, cached_tokens: Option<u32>) -> Self {
+        Self {
+            audio_tokens,
+            cached_tokens,
+        }
+    }
+}
+
+impl From<&InnerUsage> for PyPromptTokensDetails {
+    fn from(usage: &InnerUsage) -> Self {
+        if let Some(ref details) = usage.prompt_tokens_details {
+            Self {
+                audio_tokens: details.audio_tokens,
+                cached_tokens: details.cached_tokens,
+            }
+        } else {
+            Self {
+                audio_tokens: None,
+                cached_tokens: None,
+            }
+        }
+    }
+}
+
+#[pyclass(name = "LlmUsage")]
+#[derive(Clone, Debug)]
+pub struct PyLlmUsage {
+    #[pyo3(get, set)]
+    pub prompt_tokens: u32,
+    #[pyo3(get, set)]
+    pub completion_tokens: u32,
+    #[pyo3(get, set)]
+    pub total_tokens: u32,
+    #[pyo3(get, set)]
+    pub prompt_tokens_details: Option<PyPromptTokensDetails>,
+}
+
+#[pymethods]
+impl PyLlmUsage {
+    #[new]
+    pub fn new(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            prompt_tokens_details: None,
+        }
+    }
+}
+
+impl From<&InnerUsage> for PyLlmUsage {
+    fn from(usage: &InnerUsage) -> Self {
+        let details = if usage.prompt_tokens_details.is_some() {
+            Some(PyPromptTokensDetails::from(usage))
+        } else {
+            None
+        };
+        
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            prompt_tokens_details: details,
+        }
+    }
+}
+
+impl From<PyLlmUsage> for InnerUsage {
+    fn from(py_usage: PyLlmUsage) -> Self {
+        let details = py_usage.prompt_tokens_details.map(|d| {
+            InnerPromptTokensDetails {
+                audio_tokens: d.audio_tokens,
+                cached_tokens: d.cached_tokens,
+            }
+        });
+        
+        InnerUsage {
+            prompt_tokens: py_usage.prompt_tokens,
+            completion_tokens: py_usage.completion_tokens,
+            total_tokens: py_usage.total_tokens,
+            prompt_tokens_details: details,
+        }
+    }
+}

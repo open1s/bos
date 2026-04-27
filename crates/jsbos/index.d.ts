@@ -203,6 +203,13 @@ export declare const enum HookEvent {
 
 export declare function initTracing(): void
 
+export interface LlmUsage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  promptTokensDetails?: PromptTokensDetails
+}
+
 export declare function logTestMessage(message: string): void
 
 export interface PluginLlmRequest {
@@ -236,6 +243,11 @@ export interface PluginToolResult {
   success: boolean
   error?: string
   metadata: Record<string, string>
+}
+
+export interface PromptTokensDetails {
+  audioTokens?: number
+  cachedTokens?: number
 }
 
 export declare function version(): string

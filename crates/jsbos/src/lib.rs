@@ -6,6 +6,7 @@ mod caller;
 mod config;
 mod hooks;
 mod jsany;
+mod llm_usage;
 mod mcp;
 mod plugin;
 mod publisher;
@@ -18,6 +19,7 @@ pub use bus::{Bus, BusConfig, Session};
 pub use caller::{Callable, Caller};
 pub use config::ConfigLoader;
 pub use hooks::{HookContextData, HookDecision, HookEvent, HookRegistry};
+pub use llm_usage::{LlmUsage, PromptTokensDetails};
 pub use mcp::McpClient;
 pub use plugin::{
   PluginLlmRequest, PluginLlmResponse, PluginRegistry, PluginStage, PluginToolCall,
