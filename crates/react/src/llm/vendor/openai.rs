@@ -226,12 +226,14 @@ impl OpenAiVendor {
             None
         };
 
+        let max_tokens = req.max_tokens.unwrap_or(1280000);
+
         OpenAiRequest {
             model: req.model,
             messages,
             tools,
             temperature: req.temperature,
-            max_tokens: req.max_tokens,
+            max_tokens: Some(max_tokens),
             stream: Some(false),
         }
     }

@@ -1,92 +1,41 @@
-# Debug Session: agent_stream_demo.cjs slow
+# Debug Session: agent_stream_demo.cjs - streaming and thinking
 
-**Status**: ROOT CAUSE FOUND
+**Status**: RESOLVED
 **Started**: 2026-04-26
-**Fixed**: Yes (in progress)
+**Resolved**: 2026-04-27
 
-## ROOT CAUSE
+## Root Causes Fixed
 
-**Found in:** `crates/agent/src/agent/agentic.rs`, lines 208-239
+### 1. Invalid Model Name (jsbos)
+- **Issue**: Config had invalid model `nvidia/nvidia/nemotron-mini-4b-instruct` (double prefix)
+- **Fix**: Changed default to valid `z-ai/glm4.7` in demo
 
-The `AgentLlmAdapter::stream_complete` method **buffers the entire stream** before returning. It:
-
-1. Awaits all tokens from the inner stream into a `Vec`
-2. Creates a new stream from that collected vec
-3. Returns the buffered stream
-
-This defeats the entire purpose of streaming and causes extreme latency.
-
-### The Problematic Code:
-```rust
-async fn stream_complete(&self, request: ReactLlmRequest) -> Result<ReactTokenStream, ReactLlmError> {
-    let inner = self.inner.clone();
-    let stream_result = inner.stream_complete(request).await;
-
-    match stream_result {
-        Ok(stream) => {
-            let mut stream = Box::pin(stream);
-            let mut tokens: Vec<Result<ReactStreamToken, ReactLlmError>> = Vec::new();
-
-            // BUG: Buffers ALL tokens before returning - defeats streaming!
-            while let Some(token) = stream.next().await {
-                match token {
-                    // ... collect into vec
-                }
-            }
-
-            let stream = futures::stream::iter(tokens);  // Create NEW buffered stream
-            Ok(Box::pin(stream) as ReactTokenStream)
-        }
-        // ...
-    }
-}
-```
-
-## Fix Required
-
-Replace the buffered approach with a true pass-through stream:
-
-```rust
-async fn stream_complete(&self, request: ReactLlmRequest) -> Result<ReactTokenStream, ReactLlmError> {
-    let inner = self.inner.clone();
-    let stream_result = inner.stream_complete(request).await;
-
-    match stream_result {
-        Ok(stream) => {
-            // Pass through each token immediately, converting types
-            let converted = stream.map(|token| match token {
-                Ok(StreamToken::ToolCall { name, args, id }) => 
-                    Ok(ReactStreamToken::ToolCall { name, args, id }),
-                Ok(StreamToken::Text(t)) => Ok(ReactStreamToken::Text(t)),
-                Ok(StreamToken::ReasoningContent(t)) => Ok(ReactStreamToken::ReasoningContent(t)),
-                Ok(StreamToken::Done) => Ok(ReactStreamToken::Done),
-                Err(e) => Err(ReactLlmError::Other(e.to_string())),
-            });
-            Ok(Box::pin(converted))
-        }
-        Err(e) => Err(ReactLlmError::Other(e.to_string())),
-    }
-}
-```
-
-## Evidence
-
-1. The inner stream (from LLM) IS a true stream
-2. But this adapter collects everything into a Vec first
-3. User sees no output until entire response is complete
-
-## Status
-- [x] Root cause identified
-- [x] Fix implemented
-- [x] Tested - WORKS!
+### 2. Thinking Support Missing (pybos)
+- **Issue**: Line 850 was skipping ReasoningContent tokens with `continue`
+- **Fix**: Emit as JSON `{"type": "thinking", "text": "..."}`
 
 ## Test Results
 
-**Before fix:** Hangs indefinitely (timeout after 3+ minutes)
+### jsbos
+```bash
+cd crates/jsbos && node examples/agent_stream_demo.cjs
+# Output: Text + ToolCall tokens stream properly
+# Use SHOW_THINKING=1 to see thinking in stderr
+```
 
-**After fix (stream()):**
-- Total tokens: 19
-- Output: 2+2 = 4
-- Time: 3118 ms
+### pybos
+```python
+stream = await agent.stream('What is 1+1?')
+async for token in stream:
+    # token is either plain text OR {"type": "thinking", "text": "..."}
+```
+Tokens: 17, Thinking chunks: 14 ✓
 
-**Verification:** Streaming now works properly - tokens arrive incrementally, not all at once.
+## Files Changed
+- `crates/jsbos/examples/agent_stream_demo.cjs` - model fix
+- `crates/pybos/src/agent.rs:850` - thinking emission
+
+## Status
+- [x] jsbos streaming: Working
+- [x] jsbos model: Fixed
+- [x] pybos thinking: Working

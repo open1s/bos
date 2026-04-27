@@ -143,12 +143,14 @@ impl OpenRouterVendor {
             None
         };
 
+       let max_tokens = req.max_tokens.unwrap_or(1280000);
+
         OpenRouterRequest {
             model: req.model,
             messages,
             tools,
             temperature: req.temperature,
-            max_tokens: req.max_tokens,
+            max_tokens: Some(max_tokens),
             stream: false,
         }
     }

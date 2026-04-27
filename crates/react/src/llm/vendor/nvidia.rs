@@ -61,29 +61,6 @@ struct FunctionCallJson {
     arguments: String,
 }
 
-// #[derive(Debug, Deserialize)]
-// struct NvidiaResponse {
-//     choices: Vec<Choice>,
-// }
-
-// #[derive(Debug, Deserialize)]
-// struct MessageContent {
-//     content: Option<String>,
-//     tool_calls: Option<Vec<ToolCall>>,
-// }
-
-// #[derive(Debug, Deserialize)]
-// struct ToolCall {
-//     id: Option<String>,
-//     function: FunctionCall,
-// }
-
-// #[derive(Debug, Deserialize)]
-// struct FunctionCall {
-//     name: String,
-//     arguments: String,
-// }
-
 impl NvidiaVendor {
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
         let client = Client::builder()
@@ -225,28 +202,28 @@ impl NvidiaVendor {
             messages.insert(0, meta);
         }
 
-let tools = if !req.context.tools.is_empty() {
-        let tools: Vec<serde_json::Value> = req
-            .context
-            .tools
-            .into_iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters
-                    }
+        let tools = if !req.context.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = req
+                .context
+                .tools
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
                 })
-            })
-            .collect();
-        Some(tools)
-    } else {
-        None
-    };
+                .collect();
+            Some(tools)
+        } else {
+            None
+        };
 
-        let max_tokens = req.max_tokens.unwrap_or(128000);
+        let max_tokens = req.max_tokens.unwrap_or(1280000);
 
         NvidiaRequest {
             model: req.model,

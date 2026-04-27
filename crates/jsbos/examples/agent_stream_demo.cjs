@@ -18,10 +18,12 @@ const global = config.global_model || {};
 
 const API_KEY = process.env.OPENAI_API_KEY || global.api_key || '';
 const BASE_URL = process.env.LLM_BASE_URL || global.base_url || 'https://integrate.api.nvidia.com/v1';
-const MODEL = process.env.LLM_MODEL || global.model || 'nvidia/nvidia/nemotron-mini-4b-instruct';
+const MODEL = process.env.LLM_MODEL || global.model || 'z-ai/glm4.7';
 
 function addTool(args) {
-  return JSON.stringify({ result: args.a + args.b + "hello" });
+  const a = parseFloat(args.a || 0);
+  const b = parseFloat(args.b || 0);
+  return JSON.stringify({ result: a + b });
 }
 
 function echoTool(args) {
@@ -78,6 +80,10 @@ async function main() {
         case 'Text':
           if (token.text) process.stdout.write(token.text);
           break;
+        case 'ReasoningContent':
+          // Show thinking (if enabled)
+          process.stderr.write(token.text);
+          break;
         case 'ToolCall':
           console.log('\nTool:', token.name, JSON.stringify(token.args));
           break;
@@ -108,6 +114,9 @@ async function main() {
         case 'Text':
           if (token.text) process.stdout.write(token.text);
           break;
+        case 'ReasoningContent':
+          process.stderr.write('[thinking] ' + token.text);
+          break;
         case 'ToolCall':
           console.log('\nTool:', token.name, JSON.stringify(token.args));
           break;
@@ -124,6 +133,11 @@ async function main() {
   });
 
   console.log('\n=== Complete ===\n');
+  // Force exit after 5 seconds to prevent hanging
+  setTimeout(() => {
+    console.log('Forcing exit after timeout');
+    process.exit(0);
+  }, 5000);
 }
 
 main().catch(e => { console.error('Error:', e.message); process.exit(1); });
