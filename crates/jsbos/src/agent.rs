@@ -714,6 +714,57 @@ impl Agent {
   }
 
   #[napi]
+  pub fn session_context(&self) -> Result<serde_json::Value> {
+    let guard = self.inner.blocking_lock();
+    Ok(guard.session_context())
+  }
+
+  #[napi]
+  pub fn set_session_context(&self, context: serde_json::Value) -> Result<()> {
+    let mut guard = self.inner.blocking_lock();
+    guard.set_session_context(context);
+    Ok(())
+  }
+
+  #[napi]
+  pub fn clear_session_context(&self) -> Result<()> {
+    let mut guard = self.inner.blocking_lock();
+    guard.clear_session_context();
+    Ok(())
+  }
+
+  #[napi]
+  pub fn session_state(&self) -> Result<serde_json::Value> {
+    let guard = self.inner.blocking_lock();
+    let state = guard.session_state();
+    serde_json::to_value(state).map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  #[napi]
+  pub fn save_session(&self, path: String) -> Result<()> {
+    let guard = self.inner.blocking_lock();
+    guard
+      .save_session(&path)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  #[napi]
+  pub fn restore_session(&self, path: String) -> Result<()> {
+    let mut guard = self.inner.blocking_lock();
+    guard
+      .restore_session(&path)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  #[napi]
+  pub fn compact_message_log(&self) -> Result<()> {
+    let guard = self.inner.blocking_lock();
+    guard
+      .compact_message_log()
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  #[napi]
   pub async fn stream(
     &self,
     task: String,

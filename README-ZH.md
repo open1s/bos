@@ -9,25 +9,16 @@
 - **🚌 事件总线**: 高性能发布/订阅消息，支持查询/响应、RPC 模式
 - **⚙️ 配置管理**: 支持 TOML、YAML、环境变量的灵活配置加载
 - **🧠 ReAct 引擎**: 推理 + 行动循环脚手架，用于 AI 代理工作流
-- **🐍 Python 绑定**: `pip install brainos` - 统一 Python API
-- **📦 Node.js 绑定**: `npm install brainos` - 统一 JavaScript API
+- **🐍 Python 绑定**: `pip install brainos` - 统一高级 Python API
+- **📦 Node.js 绑定**: `npm install @open1s/jsbos` - 统一高级 JavaScript API
 - **🔄 内存持久化**: 跨会话内存支持
+- **🔌 MCP 客户端**: 连接 Model Context Protocol 服务器
 
 ---
 
 ## 快速开始
 
-### Rust
-
-```rust
-use agent::{Agent, AgentConfig};
-
-let config = AgentConfig::default().name("assistant");
-let agent = Agent::builder().config(config).build()?;
-let result = agent.run_simple("Hello").await?;
-```
-
-### Python
+### Python (brainos)
 
 ```python
 from brainos import BrainOS, tool
@@ -41,16 +32,32 @@ async with BrainOS() as brain:
     result = await agent.ask("2+2 等于多少?")
 ```
 
-### JavaScript
+### JavaScript (@open1s/jsbos / brainos-js)
 
 ```javascript
-const { BrainOS, ToolDef } = require('brainos');
+const { BrainOS, tool } = require('@open1s/jsbos/brainos');
 
-const addTool = new ToolDef('add', '两数相加', (args) => args.a + args.b, ...);
+class AddTool {
+  @tool('两数相加')
+  add(a, b) {
+    return a + b;
+  }
+}
+
 const brain = new BrainOS();
 await brain.start();
-const agent = brain.agent('assistant').register(addTool);
+const agent = brain.agent('assistant').withTools(new AddTool());
 const result = await agent.ask('2+2 等于多少?');
+```
+
+### Rust (agent crate)
+
+```rust
+use agent::{Agent, AgentConfig};
+
+let config = AgentConfig::default().name("assistant");
+let agent = Agent::builder().config(config).build()?;
+let result = agent.run_simple("Hello").await?;
 ```
 
 ---
@@ -60,33 +67,35 @@ const result = await agent.ask('2+2 等于多少?');
 ```
 bos/
 ├── crates/
-│   ├── agent/      # AI 代理框架，集成 LLM、技能、工具
-│   ├── bus/        # 发布/订阅、查询/响应、RPC 消息
-│   ├── config/     # TOML/YAML 配置加载
-│   ├── logging/    # 追踪和可观测性
-│   ├── react/      # ReAct 推理引擎
-│   ├── pybos/      # Python 绑定 (brainos 包)
-│   └── jsbos/      # Node.js 绑定 (brainos 包)
-├── docs/           # 用户指南
+│   ├── agent/          # AI 代理框架，集成 LLM、技能、工具、MCP
+│   ├── bus/            # 发布/订阅、查询/响应、RPC 消息
+│   ├── config/         # TOML/YAML 配置加载
+│   ├── logging/        # 追踪和可观测性
+│   ├── react/          # ReAct 推理引擎
+│   ├── pybos/          # Python 绑定 (brainos 包)
+│   │   └── brainos/    # 高级 Python 包装器
+│   └── jsbos/          # Node.js 绑定 (@open1s/jsbos)
+│       └── brainos.js  # 高级 JavaScript 包装器
+├── docs/               # 用户指南
 │   ├── python-user-guide.md
 │   ├── javascript-user-guide.md
 │   └── rust-user-guide.md
-└── Cargo.toml      # 工作空间
+└── Cargo.toml          # 工作空间
 ```
 
 ---
 
 ## 核心 Crate
 
-| Crate | 描述 |
-|-------|------|
-| `agent` | 核心代理，集成 LLM、工具、技能、MCP |
-| `bus` | 发布/订阅、查询/响应、RPC 消息 |
-| `config` | 从 TOML、YAML、环境变量加载配置 |
-| `logging` | 追踪和可观测性 |
-| `react` | ReAct 推理 + 行动引擎 |
-| `pybos` | Python 绑定 (`pip install brainos`) |
-| `jsbos` | Node.js 绑定 (`npm install brainos`) |
+| Crate | 描述 | 安装 |
+|-------|------|------|
+| `agent` | 核心代理，集成 LLM、工具、技能、MCP | `cargo add agent` |
+| `bus` | 发布/订阅、查询/响应、RPC 消息 | `cargo add bus` |
+| `config` | 从 TOML、YAML、环境变量加载配置 | `cargo add config` |
+| `logging` | 追踪和可观测性 | `cargo add logging` |
+| `react` | ReAct 推理 + 行动引擎 | `cargo add react` |
+| `pybos` | Python 绑定 | `pip install brainos` |
+| `jsbos` | Node.js 绑定 | `npm install @open1s/jsbos` |
 
 ---
 
@@ -103,10 +112,10 @@ cargo test --all
 cargo clippy --all
 cargo fmt --all
 
-# Python 绑定
+# Python 绑定（底层 pybos）
 cd crates/pybos && maturin develop
 
-# Node.js 绑定
+# Node.js 绑定（底层 jsbos）
 cd crates/jsbos && npm install && npm run build
 ```
 
@@ -115,7 +124,7 @@ cd crates/jsbos && npm install && npm run build
 ## 用户指南
 
 - **Python**: [docs/python-user-guide.md](docs/python-user-guide.md)
-- **JavaScript**: [docs/javascript-user-guide.md](docs/javascript-user-guide.md)  
+- **JavaScript**: [docs/javascript-user-guide.md](docs/javascript-user-guide.md)
 - **Rust**: [docs/rust-user-guide.md](docs/rust-user-guide.md)
 - **English**: [README.md](../README.md)
 
@@ -123,15 +132,54 @@ cd crates/jsbos && npm install && npm run build
 
 ## 统一 API
 
-Python 和 JavaScript API 保持一致：
+`brainos` 包（Python）和 `@open1s/jsbos/brainos.js`（JavaScript）提供一致的高级 API：
 
 | 功能 | Python | JavaScript |
 |------|--------|------------|
+| 导入 | `from brainos import BrainOS, tool` | `const { BrainOS, tool } = require('@open1s/jsbos/brainos')` |
+| 创建 brain | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
 | 创建代理 | `brain.agent("name")` | `brain.agent("name")` |
 | 链式配置 | `.with_model("gpt-4")` | `.withModel("gpt-4")` |
-| 注册工具 | `.register(tool)` | `.register(toolDef)` |
+| 注册工具 | `.register(tool)` | `.withTools(toolDef)` |
 | 运行 | `await agent.ask("...")` | `await agent.ask("...")` |
 | 总线工厂 | `BusManager()` | `BusManager.create()` |
+
+### 底层绑定
+
+直接访问 Rust 绑定：
+
+| 语言 | 包 | 导入 |
+|------|-----|------|
+| Python | `pybos` | `from pybos import Agent, Bus, ...` |
+| JavaScript | `@open1s/jsbos` | `const { Agent, Bus } = require('@open1s/jsbos')` |
+
+---
+
+## 配置
+
+创建 `~/.bos/conf/config.toml`:
+
+```toml
+[global_model]
+api_key = "your-api-key"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4"
+
+[bus]
+mode = "peer"
+listen = ["127.0.0.1:7890"]
+```
+
+或使用环境变量：`OPENAI_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`
+
+---
+
+## 示例
+
+查看示例目录：
+
+- Python: `crates/pybos/examples/`
+- JavaScript: `crates/jsbos/examples/`
 
 ---
 
@@ -141,4 +189,4 @@ MIT OR Apache-2.0
 
 ---
 
-**版本**: 0.1.0 | **更新日期**: 2026-04-05
+**版本**: 1.2.0 | **更新日期**: 2026-04-28

@@ -5,9 +5,11 @@ use crate::agent::plugin::{
 };
 use crate::tools::FunctionTool;
 use crate::{AgentError, LlmClient, LlmMessage, StreamToken, Tool, ToolRegistry};
+use crate::session::{AgentState, SessionSerializer};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use log::warn;
+use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -73,6 +75,13 @@ impl ExtensibleToolAdapter {
         tool_name: &str,
         original_args: &str,
     ) -> Result<(), ReactToolError> {
+        if !self
+            .hooks
+            .has_hooks_blocking(&HookEvent::BeforeToolCall)
+        {
+            return Ok(());
+        }
+
         let mut ctx = HookContext::new(&self.agent_id);
         ctx.set("tool_name", tool_name);
         ctx.set("tool_args", original_args);
@@ -94,6 +103,13 @@ impl ExtensibleToolAdapter {
         effective_args: Option<&str>,
         result: &Result<serde_json::Value, ReactToolError>,
     ) -> Result<(), ReactToolError> {
+        if !self
+            .hooks
+            .has_hooks_blocking(&HookEvent::AfterToolCall)
+        {
+            return Ok(());
+        }
+
         let mut ctx = HookContext::new(&self.agent_id);
         ctx.set("tool_name", tool_name);
         ctx.set("tool_args", original_args);
@@ -142,9 +158,12 @@ impl ReactToolTrait for ExtensibleToolAdapter {
 
         self.trigger_before_hook(&tool_name, &original_args)?;
 
-        let processed_call = self
-            .plugins
-            .process_tool_call_blocking(ToolCallWrapper::new(&tool_name, input.clone(), None));
+        let processed_call = if self.plugins.has_plugins() {
+            self.plugins
+                .process_tool_call_blocking(ToolCallWrapper::new(&tool_name, input.clone(), None))
+        } else {
+            ToolCallWrapper::new(&tool_name, input.clone(), None)
+        };
 
         if processed_call.name != tool_name {
             log::warn!(
@@ -256,7 +275,11 @@ impl PluginLlmAdapter {
 impl ReactLlmTrait for PluginLlmAdapter {
     async fn complete(&self, request: ReactLlmRequest) -> Result<ReactLlmResponse, ReactLlmError> {
         let wrapper = LlmRequestWrapper::new(&request);
-        let processed = self.plugins.process_llm_request(wrapper).await;
+        let processed = if self.plugins.has_plugins() {
+            self.plugins.process_llm_request(wrapper).await
+        } else {
+            wrapper
+        };
         let modified_request = processed.into_request();
 
         let result = self.inner.complete(modified_request).await;
@@ -277,7 +300,11 @@ impl ReactLlmTrait for PluginLlmAdapter {
         request: ReactLlmRequest,
     ) -> Result<ReactTokenStream, ReactLlmError> {
         let wrapper = LlmRequestWrapper::new(&request);
-        let processed = self.plugins.process_llm_request(wrapper).await;
+        let processed = if self.plugins.has_plugins() {
+            self.plugins.process_llm_request(wrapper).await
+        } else {
+            wrapper
+        };
         let modified_request = processed.into_request();
 
         let stream_result = self.inner.stream_complete(modified_request).await;
@@ -676,7 +703,7 @@ pub struct Agent {
     skills: Vec<crate::skills::SkillContent>,
     resilience: ReActResilience,
     #[rkyv(with = qserde::rkyv::with::Skip)]
-    message_log: Arc<std::sync::Mutex<Vec<react::llm::LlmMessage>>>,
+    session_state: Arc<std::sync::Mutex<AgentState>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     hooks: HookRegistry,
     #[rkyv(with = qserde::rkyv::with::Skip)]
@@ -686,6 +713,7 @@ pub struct Agent {
 impl Agent {
     /// Create a new Agent with the given config and LLM client.
     pub fn new(config: AgentConfig, llm: Arc<dyn LlmClient>) -> Self {
+        let session_name = config.name.clone();
         let resilience = ReActResilience::new(react::ResilienceConfig {
             circuit_breaker: config.circuit_breaker.clone().unwrap_or_default(),
             rate_limiter: config.rate_limit.clone().unwrap_or_default(),
@@ -697,7 +725,10 @@ impl Agent {
             skills_dir: None,
             skills: Vec::new(),
             resilience,
-            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            session_state: Arc::new(std::sync::Mutex::new(SessionSerializer::new_state(
+                session_name,
+                None,
+            ))),
             hooks: HookRegistry::new(),
             plugins: PluginRegistry::new(),
         }
@@ -721,7 +752,10 @@ impl Agent {
             skills_dir: None,
             skills: Vec::new(),
             resilience: ReActResilience::new(Default::default()),
-            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            session_state: Arc::new(std::sync::Mutex::new(SessionSerializer::new_state(
+                "agent".to_string(),
+                None,
+            ))),
             hooks: HookRegistry::new(),
             plugins: PluginRegistry::new(),
         }
@@ -747,18 +781,42 @@ impl Agent {
     }
 
     pub fn add_message(&mut self, message: react::llm::LlmMessage) {
-        self.message_log.lock().unwrap().push(message);
+        let mut state = self.session_state.lock().unwrap();
+        state.message_log.push(message);
+        SessionSerializer::update_metadata(&mut state);
         self.hooks
             .trigger_all_blocking(HookEvent::OnMessage, HookContext::new(&self.config.name));
     }
 
     pub fn get_messages(&self) -> Vec<react::llm::LlmMessage> {
-        self.message_log.lock().unwrap().clone()
+        self.session_state.lock().unwrap().message_log.clone()
+    }
+
+    pub fn session_context(&self) -> JsonValue {
+        self.session_state.lock().unwrap().context.clone()
+    }
+
+    pub fn set_session_context(&mut self, context: JsonValue) {
+        let mut state = self.session_state.lock().unwrap();
+        state.context = context;
+        SessionSerializer::update_metadata(&mut state);
+    }
+
+    pub fn clear_session_context(&mut self) {
+        let mut state = self.session_state.lock().unwrap();
+        state.context = JsonValue::Null;
+        SessionSerializer::update_metadata(&mut state);
+    }
+
+    pub fn session_state(&self) -> AgentState {
+        self.session_state.lock().unwrap().clone()
     }
 
     pub fn save_message_log(&self, path: &str) -> Result<(), AgentError> {
-        let json = serde_json::to_string_pretty(&*self.message_log.lock().unwrap())
-            .map_err(|e| AgentError::Session(format!("Serialize error: {}", e)))?;
+        let json = serde_json::to_string_pretty(
+            &self.session_state.lock().unwrap().message_log,
+        )
+        .map_err(|e| AgentError::Session(format!("Serialize error: {}", e)))?;
         std::fs::write(path, json).map_err(|e| AgentError::Session(format!("Write error: {}", e)))
     }
 
@@ -767,8 +825,123 @@ impl Agent {
             .map_err(|e| AgentError::Session(format!("Read error: {}", e)))?;
         let messages: Vec<react::llm::LlmMessage> = serde_json::from_str(&json)
             .map_err(|e| AgentError::Session(format!("Parse error: {}", e)))?;
-        *self.message_log.lock().unwrap() = messages;
+        let mut state = self.session_state.lock().unwrap();
+        state.message_log = messages;
+        SessionSerializer::update_metadata(&mut state);
         Ok(())
+    }
+
+    pub fn save_session(&self, path: &str) -> Result<(), AgentError> {
+        let mut state = self.session_state.lock().unwrap();
+        SessionSerializer::update_metadata(&mut state);
+        let bytes = SessionSerializer::serialize(&state)
+            .map_err(|e| AgentError::Session(e.to_string()))?;
+        std::fs::write(path, bytes).map_err(|e| AgentError::Session(format!("Write error: {}", e)))
+    }
+
+    pub fn restore_session(&mut self, path: &str) -> Result<(), AgentError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| AgentError::Session(format!("Read error: {}", e)))?;
+        let state = SessionSerializer::deserialize(&bytes)
+            .map_err(|e| AgentError::Session(e.to_string()))?;
+        *self.session_state.lock().unwrap() = state;
+        Ok(())
+    }
+
+    pub fn compact_message_log(&self) -> Result<(), AgentError> {
+        let mut state = self.session_state.lock().unwrap();
+        let messages = &state.message_log;
+        if messages.len() <= self.config.context_compaction_keep_recent_messages {
+            return Ok(());
+        }
+
+        let total_chars: usize = messages
+            .iter()
+            .map(|msg| match msg {
+                react::llm::LlmMessage::System { content }
+                | react::llm::LlmMessage::User { content }
+                | react::llm::LlmMessage::Assistant { content } => content.len(),
+                react::llm::LlmMessage::AssistantToolCall { name, args, .. } => {
+                    name.len() + args.to_string().len()
+                }
+                react::llm::LlmMessage::ToolResult { content, .. } => content.len(),
+            })
+            .sum();
+
+        let estimated_tokens = total_chars.saturating_div(4);
+        let threshold = (self.config.context_compaction_threshold_tokens as f32
+            * self.config.context_compaction_trigger_ratio)
+            as usize;
+
+        if estimated_tokens < threshold {
+            return Ok(());
+        }
+
+        let keep_count = self.config.context_compaction_keep_recent_messages;
+        let split_at = messages.len().saturating_sub(keep_count);
+        let removed = &messages[..split_at];
+        let recent = messages[split_at..].to_vec();
+
+        let summary_input: String = removed
+            .iter()
+            .filter_map(|msg| match msg {
+                react::llm::LlmMessage::System { content }
+                | react::llm::LlmMessage::User { content }
+                | react::llm::LlmMessage::Assistant { content } => Some(content.clone()),
+                react::llm::LlmMessage::AssistantToolCall { name, args, .. } => {
+                    Some(format!("Tool call {}: {}", name, args))
+                }
+                react::llm::LlmMessage::ToolResult { content, .. } => Some(content.clone()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let summary = if summary_input.is_empty() {
+            "Prior conversation history has been compacted.".to_string()
+        } else {
+            let summary_text = summary_input
+                .chars()
+                .take(self.config.context_compaction_max_summary_chars)
+                .collect::<String>();
+            format!(
+                "Prior conversation history has been compacted. Summary: {}",
+                summary_text
+            )
+        };
+
+        let summary_message = react::llm::LlmMessage::system(summary.clone());
+        let mut compacted = vec![summary_message];
+        compacted.extend(recent);
+
+        state.message_log = compacted;
+        match &mut state.context {
+            JsonValue::Object(map) => {
+                map.insert("compacted_summary".to_string(), JsonValue::String(summary));
+            }
+            context if !context.is_null() => {
+                state.context = serde_json::json!({
+                    "compacted_summary": summary,
+                    "previous_context": context.clone(),
+                });
+            }
+            _ => {
+                state.context = serde_json::json!({"compacted_summary": summary});
+            }
+        }
+        SessionSerializer::update_metadata(&mut state);
+        Ok(())
+    }
+
+    fn build_session_context_messages(&self) -> Vec<react::llm::LlmMessage> {
+        let state = self.session_state.lock().unwrap();
+        if state.context.is_null() {
+            Vec::new()
+        } else {
+            vec![react::llm::LlmMessage::system(format!(
+                "Session context: {}",
+                state.context
+            ))]
+        }
     }
 
     /// Add a tool that calls another agent via bus Caller.
@@ -947,7 +1120,11 @@ impl Agent {
             HookDecision::Continue => {}
         }
 
-        engine.set_input_messages(self.message_log.lock().unwrap().clone());
+        self.compact_message_log()?;
+        let session_context_len = self.build_session_context_messages().len();
+        let mut input_messages = self.build_session_context_messages();
+        input_messages.extend(self.session_state.lock().unwrap().message_log.clone());
+        engine.set_input_messages(input_messages);
         let result = engine.react(task).await;
 
         match result {
@@ -963,7 +1140,16 @@ impl Agent {
 
                 let mut log = context.conversations.clone();
                 log.remove(0);
-                *self.message_log.lock().unwrap() = log;
+                for _ in 0..session_context_len {
+                    if !log.is_empty() {
+                        log.remove(0);
+                    }
+                }
+                {
+                    let mut state = self.session_state.lock().unwrap();
+                    state.message_log = log;
+                    SessionSerializer::update_metadata(&mut state);
+                }
                 self.hooks
                     .trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name))
                     .await;
@@ -997,9 +1183,14 @@ impl Agent {
         let system_prompt = self.config.system_prompt.clone();
         let engine = self.build_react_engine(system_prompt.clone())?;
 
-        let conversations = self.message_log.lock().unwrap().clone();
+        self.compact_message_log()?;
+        let message_log = {
+            let state = self.session_state.lock().unwrap();
+            state.message_log.clone()
+        };
         let mut all_conversations = vec![LlmMessage::system(system_prompt.clone())];
-        all_conversations.extend(conversations);
+        all_conversations.extend(self.build_session_context_messages());
+        all_conversations.extend(message_log);
         all_conversations.push(LlmMessage::user(task.to_string()));
 
         let context = LlmContext {
@@ -1237,14 +1428,15 @@ impl Agent {
 
                             // Update message log
                             {
-                                let mut log = self.message_log.lock().unwrap();
-                                log.push(LlmMessage::user(task.to_string()));
-                                log.push(LlmMessage::assistant_tool_call(
+                                let mut state = self.session_state.lock().unwrap();
+                                state.message_log.push(LlmMessage::user(task.to_string()));
+                                state.message_log.push(LlmMessage::assistant_tool_call(
                                     call_id.clone(),
                                     name.clone(),
                                     args.clone(),
                                 ));
-                                log.push(LlmMessage::tool_result(call_id, result_text));
+                                state.message_log.push(LlmMessage::tool_result(call_id, result_text));
+                                SessionSerializer::update_metadata(&mut state);
                             }
                         }
                         self.hooks
@@ -1299,9 +1491,10 @@ impl Agent {
                         .and_then(|c| c.message.content.clone())
                         .unwrap_or_default();
                     {
-                        let mut log = self.message_log.lock().unwrap();
-                        log.push(LlmMessage::user(task.to_string()));
-                        log.push(LlmMessage::assistant(content.clone()));
+                        let mut state = self.session_state.lock().unwrap();
+                        state.message_log.push(LlmMessage::user(task.to_string()));
+                        state.message_log.push(LlmMessage::assistant(content.clone()));
+                        SessionSerializer::update_metadata(&mut state);
                     }
                     self.hooks
                         .trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name))
@@ -1339,7 +1532,7 @@ impl Agent {
         system_prompt.push_str("Final answer: Final Answer: your answer");
         let engine_result = self.build_react_engine(system_prompt.clone());
         let task_str = task.to_string();
-        let message_log_ptr = self.message_log.clone();
+        let message_log_ptr = Arc::clone(&self.session_state);
 
         let stream = async_stream::stream! {
             let engine = match engine_result {
@@ -1351,13 +1544,18 @@ impl Agent {
             };
 
             // Build initial context
+            self.compact_message_log().map_err(|e| {
+                AgentError::Session(format!("Compaction failed: {}", e))
+            })?;
             let mut all_conversations = vec![LlmMessage::system(system_prompt.clone())];
-            all_conversations.extend(message_log_ptr.lock().unwrap().clone());
+            all_conversations.extend(self.build_session_context_messages());
+            all_conversations.extend(message_log_ptr.lock().unwrap().message_log.clone());
             all_conversations.push(LlmMessage::user(task_str.clone()));
 
             {
-                let mut log = message_log_ptr.lock().unwrap();
-                log.push(LlmMessage::user(task_str.clone()));
+                let mut state = message_log_ptr.lock().unwrap();
+                state.message_log.push(LlmMessage::user(task_str.clone()));
+                SessionSerializer::update_metadata(&mut state);
             }
 
             // ReAct loop: continue until LLM returns final answer (not a tool call)
@@ -1498,9 +1696,14 @@ impl Agent {
 
                             // Update message log
                             {
-                                let mut log = message_log_ptr.lock().unwrap();
-                                log.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), args.clone()));
-                                log.push(LlmMessage::tool_result(call_id, result_text));
+                                let mut state = message_log_ptr.lock().unwrap();
+                                state.message_log.push(LlmMessage::assistant_tool_call(
+                                    call_id.clone(),
+                                    name.clone(),
+                                    args.clone(),
+                                ));
+                                state.message_log.push(LlmMessage::tool_result(call_id, result_text));
+                                SessionSerializer::update_metadata(&mut state);
                             }
                             self.hooks.trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name)).await;
                         }
@@ -1511,13 +1714,14 @@ impl Agent {
                     }
                 }
 
-                //add current iteration response
+                // add current iteration response
                 {
-                    let mut log = message_log_ptr.lock().unwrap();
+                    let mut state = message_log_ptr.lock().unwrap();
                     let response = full_response.clone();
                     drop(full_response);
                     if !response.is_empty() {
-                        log.push(LlmMessage::assistant(response));
+                        state.message_log.push(LlmMessage::assistant(response));
+                        SessionSerializer::update_metadata(&mut state);
                     }
                 }
 
@@ -1708,7 +1912,7 @@ impl Clone for Agent {
             skills_dir: self.skills_dir.clone(),
             skills: self.skills.clone(),
             resilience: self.resilience.clone(),
-            message_log: self.message_log.clone(),
+            session_state: self.session_state.clone(),
             hooks: self.hooks.clone(),
             plugins: self.plugins.clone(),
         }
@@ -1801,7 +2005,10 @@ mod agent_serialization_tests {
             skills_dir: None,
             skills: Vec::new(),
             resilience: ReActResilience::new(react::ResilienceConfig::default()),
-            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            session_state: Arc::new(std::sync::Mutex::new(SessionSerializer::new_state(
+                "agent".to_string(),
+                None,
+            ))),
             hooks: HookRegistry::new(),
             plugins: PluginRegistry::new(),
         };
@@ -1847,7 +2054,10 @@ mod agent_serialization_tests {
             skills_dir: None,
             skills: Vec::new(),
             resilience: ReActResilience::new(react::ResilienceConfig::default()),
-            message_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            session_state: Arc::new(std::sync::Mutex::new(SessionSerializer::new_state(
+                "agent".to_string(),
+                None,
+            ))),
             hooks: HookRegistry::new(),
             plugins: PluginRegistry::new(),
         };

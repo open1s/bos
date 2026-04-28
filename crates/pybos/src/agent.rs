@@ -1,5 +1,5 @@
 use crate::bus::PyBus;
-use crate::utils::{invoke_python_handler_to_pyany, json_to_py, to_py_runtime_error};
+use crate::utils::{invoke_python_handler_to_pyany, json_to_py, py_to_json, to_py_runtime_error};
 use agent::agent::hooks::HookEvent;
 use agent::{
     Agent, AgentCallableServer, AgentConfig, AgentRpcClient, CircuitBreakerConfig, LlmMessage,
@@ -1248,6 +1248,75 @@ impl PyAgent {
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
         guard
             .restore_message_log(&path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn session_context<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let context = guard.session_context();
+        json_to_py(py, &context).map(|py_obj| py_obj.into_bound(py))
+    }
+
+    fn set_session_context<'py>(&self, _py: Python<'py>, context: &Bound<'py, PyAny>) -> PyResult<()> {
+        let context_value: serde_json::Value = py_to_json(context)?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.set_session_context(context_value);
+        Ok(())
+    }
+
+    fn clear_session_context<'py>(&self, _py: Python<'py>) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.clear_session_context();
+        Ok(())
+    }
+
+    fn session_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let state = guard.session_state();
+        let state_json = serde_json::to_value(state)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        json_to_py(py, &state_json).map(|py_obj| py_obj.into_bound(py))
+    }
+
+    fn save_session<'py>(&self, _py: Python<'py>, path: String) -> PyResult<()> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard
+            .save_session(&path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn restore_session<'py>(&self, _py: Python<'py>, path: String) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard
+            .restore_session(&path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn compact_message_log<'py>(&self, _py: Python<'py>) -> PyResult<()> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard
+            .compact_message_log()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 

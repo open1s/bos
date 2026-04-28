@@ -159,6 +159,15 @@ impl HookRegistry {
         block_on_future(self.get_hooks(event))
     }
 
+    pub async fn has_hooks(&self, event: &HookEvent) -> bool {
+        let hooks = self.hooks.read().await;
+        hooks.get(event).map(|v| !v.is_empty()).unwrap_or(false)
+    }
+
+    pub fn has_hooks_blocking(&self, event: &HookEvent) -> bool {
+        block_on_future(self.has_hooks(event))
+    }
+
     /// Trigger all hooks for an event and aggregate decisions
     pub async fn trigger(&self, event: HookEvent, context: HookContext) -> HookDecision {
         let hooks = self.get_hooks(&event).await;
