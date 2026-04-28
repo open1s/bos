@@ -1,9 +1,9 @@
-use crate::llm::{LlmClient, LlmError, LlmRequest, LlmResponseResult, TokenStream};
+use crate::llm::{LlmClient, LlmError, LlmHooks, LlmRequest, LlmResponseResult, LlmSession, TokenStream};
 use async_trait::async_trait;
 use dashmap::DashMap;
 
 pub struct LlmRouter {
-    vendors: DashMap<String, Box<dyn LlmClient>>,
+    vendors: DashMap<String, Box<dyn LlmClient<SessionType = LlmSession, ContextType = LlmHooks>>>,
 }
 
 impl LlmRouter {
@@ -13,7 +13,7 @@ impl LlmRouter {
         }
     }
 
-    pub fn register_vendor(&mut self, name: String, vendor: Box<dyn LlmClient>) {
+    pub fn register_vendor(&mut self, name: String, vendor: Box<dyn LlmClient<SessionType = LlmSession, ContextType = LlmHooks>>) {
         self.vendors.insert(name, vendor);
     }
 
@@ -37,7 +37,10 @@ impl Default for LlmRouter {
 
 #[async_trait]
 impl LlmClient for LlmRouter {
-    async fn complete(&self, request: LlmRequest) -> LlmResponseResult {
+    type SessionType = LlmSession;
+    type ContextType = LlmHooks;
+
+    async fn complete(&self, request: LlmRequest, session: &mut Self::SessionType, context: &mut Self::ContextType) -> LlmResponseResult {
         let (vendor_id, model_id) = Self::split_model(&request.model);
 
         let vendor = if let Some(vid) = vendor_id {
@@ -50,7 +53,7 @@ impl LlmClient for LlmRouter {
             let model = model_id.to_string();
             let mut req = request;
             req.model = model;
-            v.complete(req).await
+            v.complete(req, session, context).await
         } else {
             Err(LlmError::Other(format!(
                 "Unknown vendor: {}",
@@ -59,7 +62,7 @@ impl LlmClient for LlmRouter {
         }
     }
 
-    async fn stream_complete(&self, request: LlmRequest) -> Result<TokenStream, LlmError> {
+    async fn stream_complete(&self, request: LlmRequest, session: &mut Self::SessionType, context: &mut Self::ContextType) -> Result<TokenStream, LlmError> {
         let (vendor_id, model_id) = Self::split_model(&request.model);
 
         let vendor = if let Some(vid) = vendor_id {
@@ -72,16 +75,12 @@ impl LlmClient for LlmRouter {
             let model = model_id.to_string();
             let mut req = request;
             req.model = model;
-            v.stream_complete(req).await
+            v.stream_complete(req, session, context).await
         } else {
             Ok(Box::pin(futures::stream::empty()))
         }
     }
 
-    fn supports_tools(&self) -> bool {
-        true
-    }
-    fn provider_name(&self) -> &'static str {
-        "llm-router"
-    }
+    fn supports_tools(&self) -> bool { true }
+    fn provider_name(&self) -> &'static str { "llm-router" }
 }

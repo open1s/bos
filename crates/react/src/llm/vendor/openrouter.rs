@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
-use crate::{extractor::{JsonExtractor, StreamExtractor}, llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor}};
+use crate::{
+    llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor},
+    utils::{JsonExtractor, StreamExtractor},
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
-use serde::{Serialize};
+use serde::Serialize;
 
+use crate::llm::types::ReactSession;
 use crate::llm::{
-    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken, Stringfy,
-    TokenStream,
+    LlmClient, LlmError, LlmHooks, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    StreamToken, TokenStream, VendorBuilderError,
 };
 
 pub struct OpenRouterVendor {
@@ -75,78 +79,146 @@ impl OpenRouterVendor {
         OpenRouterVendorBuilder::new()
     }
 
-    fn convert_request(&self, req: LlmRequest) -> OpenRouterRequest {
+    fn convert_request(
+        &self,
+        req: &LlmRequest,
+        session: &impl ReactSession,
+        context: &impl crate::llm::types::ReactContext,
+    ) -> OpenRouterRequest {
         let mut messages = Vec::new();
-
-        for message in req.context.conversations {
-            let json_msg = match message {
-                crate::llm::LlmMessage::System { content } => OpenRouterMessageJson {
-                    role: "system",
-                    content: Some(content),
-                    tool_call_id: None,
-                    tool_calls: None,
-                },
-                crate::llm::LlmMessage::User { content } => OpenRouterMessageJson {
-                    role: "user",
-                    content: Some(content),
-                    tool_call_id: None,
-                    tool_calls: None,
-                },
-                crate::llm::LlmMessage::Assistant { content } => OpenRouterMessageJson {
-                    role: "assistant",
-                    content: Some(content),
-                    tool_call_id: None,
-                    tool_calls: None,
-                },
-                crate::llm::LlmMessage::AssistantToolCall {
-                    tool_call_id: id,
-                    name,
-                    args,
-                } => {
-                    let args_str = serde_json::to_string(&args).unwrap_or_default();
-                    OpenRouterMessageJson {
+        let has_history = if let Some(history) = session.history() {
+            for message in history.iter().cloned() {
+                let json_msg = match message {
+                    crate::llm::LlmMessage::System { content } => OpenRouterMessageJson {
+                        role: "system",
+                        content: Some(content.clone()),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    },
+                    crate::llm::LlmMessage::User { content } => OpenRouterMessageJson {
+                        role: "user",
+                        content: Some(content.clone()),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    },
+                    crate::llm::LlmMessage::Assistant { content } => OpenRouterMessageJson {
+                        role: "assistant",
+                        content: Some(content.clone()),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    },
+                    crate::llm::LlmMessage::AssistantToolCall {
+                        tool_call_id: id,
+                        name,
+                        args,
+                    } => OpenRouterMessageJson {
                         role: "assistant",
                         content: None,
-                        tool_call_id: None,
+                        tool_call_id: Some(id.clone()),
                         tool_calls: Some(vec![ToolCallJson {
-                            id,
+                            id: id.clone(),
                             call_type: "function",
                             function: FunctionCallJson {
-                                name,
-                                arguments: args_str,
+                                name: name.clone(),
+                                arguments: args.to_string(),
                             },
                         }]),
-                    }
-                }
-                crate::llm::LlmMessage::ToolResult {
-                    tool_call_id,
-                    content,
-                } => OpenRouterMessageJson {
-                    role: "tool",
-                    content: Some(content),
-                    tool_call_id: Some(tool_call_id),
-                    tool_calls: None,
-                },
-            };
-            messages.push(json_msg);
-        }
-
-        let tools = if !req.context.tools.is_empty() {
-            let tools = req
-                .context
-                .tools
-                .into_iter()
-                .map(|t| t.to_value().unwrap())
-                .collect::<Vec<_>>();
-            Some(tools)
+                    },
+                    crate::llm::LlmMessage::ToolResult {
+                        tool_call_id,
+                        content,
+                    } => OpenRouterMessageJson {
+                        role: "tool",
+                        content: Some(content.clone()),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        tool_calls: None,
+                    },
+                };
+                messages.push(json_msg);
+            }
+            !history.is_empty()
         } else {
-            None
+            false
         };
 
-       let max_tokens = req.max_tokens.unwrap_or(1280000);
+        if !has_history {
+            messages.push(OpenRouterMessageJson {
+                role: "user",
+                content: Some(req.input.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
+        let tools = context.tools().map(|tools| {
+            tools
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let mut extra_system_prompt = String::new();
+
+        if let Some(skills) = context.skills() {
+            if !skills.is_empty() {
+                let skill_names = skills
+                    .iter()
+                    .map(|s| format!("- {}: {}", s.name, s.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                extra_system_prompt.push_str(&format!(
+                    "Available Skills (call load_skill to read instructions when needed):\n{}\n",
+                    skill_names
+                ));
+            }
+        }
+
+        if let Some(rules) = context.rules() {
+            if !rules.is_empty() {
+                let rule_texts = rules
+                    .iter()
+                    .map(|r| r.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                extra_system_prompt
+                    .push_str(&format!("You should follow below rules:\n{}\n", rule_texts));
+            }
+        }
+
+        if let Some(instructions) = context.instructions() {
+            if !instructions.is_empty() {
+                let inst_texts = instructions
+                    .iter()
+                    .map(|i| format!("- {}: {}", i.name, i.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                extra_system_prompt.push_str(&format!("Instructions:\n{}\n", inst_texts));
+            }
+        }
+
+        if !extra_system_prompt.is_empty() {
+            let meta = OpenRouterMessageJson {
+                role: "system",
+                content: Some(extra_system_prompt),
+                tool_call_id: None,
+                tool_calls: None,
+            };
+            messages.insert(0, meta);
+        }
+
+        let max_tokens = req.max_tokens.unwrap_or(1280000);
 
         OpenRouterRequest {
-            model: req.model,
+            model: req.model.clone(),
             messages,
             tools,
             temperature: req.temperature,
@@ -155,12 +227,17 @@ impl OpenRouterVendor {
         }
     }
 
-    fn build_stream_request(&self, mut req: LlmRequest) -> OpenRouterRequest {
+    fn build_stream_request(
+        &self,
+        mut req: LlmRequest,
+        session: &impl ReactSession,
+        context: &impl crate::llm::types::ReactContext,
+    ) -> OpenRouterRequest {
         if req.model.is_empty() {
             req.model = self.model.clone();
         }
 
-        let mut openrouter_req = self.convert_request(req);
+        let mut openrouter_req = self.convert_request(&req, session, context);
         openrouter_req.stream = true;
         openrouter_req
     }
@@ -168,7 +245,15 @@ impl OpenRouterVendor {
 
 #[async_trait]
 impl LlmClient for OpenRouterVendor {
-    async fn complete(&self, mut request: LlmRequest) -> LlmResponseResult {
+    type SessionType = LlmSession;
+    type ContextType = LlmHooks;
+
+    async fn complete(
+        &self,
+        mut request: LlmRequest,
+        session: &mut Self::SessionType,
+        context: &mut Self::ContextType,
+    ) -> LlmResponseResult {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
@@ -177,7 +262,9 @@ impl LlmClient for OpenRouterVendor {
             request.model = self.model.clone();
         }
 
-        let openrouter_req = self.convert_request(request);
+        context.notify_request(&request);
+
+        let openrouter_req = self.convert_request(&request, session, context);
 
         let url = format!("{}/chat/completions", endpoint);
 
@@ -188,23 +275,37 @@ impl LlmClient for OpenRouterVendor {
             .json(&openrouter_req)
             .send()
             .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+            .map_err(|e| {
+                let err = LlmError::Http(e.to_string());
+                context.notify_error(&err);
+                err
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::Http(format!("HTTP {}: {}", status, body)));
+            let err = LlmError::Http(format!("HTTP {}: {}", status, body));
+            context.notify_error(&err);
+            return Err(err);
         }
 
-        let body: ChatCompletionResponse = response
-            .json()
-            .await
-            .map_err(|e| LlmError::Parse(e.to_string()))?;
+        let body: ChatCompletionResponse = response.json().await.map_err(|e| {
+            let err = LlmError::Parse(e.to_string());
+            context.notify_error(&err);
+            err
+        })?;
 
-        Ok(LlmResponse::OpenAI(body))
+        let resp = LlmResponse::OpenAI(body);
+        context.notify_response(&resp);
+        Ok(resp)
     }
 
-    async fn stream_complete(&self, mut request: LlmRequest) -> Result<TokenStream, LlmError> {
+    async fn stream_complete(
+        &self,
+        mut request: LlmRequest,
+        session: &mut Self::SessionType,
+        context: &mut Self::ContextType,
+    ) -> Result<TokenStream, LlmError> {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
@@ -213,7 +314,9 @@ impl LlmClient for OpenRouterVendor {
             request.model = self.model.clone();
         }
 
-        let openrouter_req = self.build_stream_request(request);
+        context.notify_request(&request);
+
+        let openrouter_req = self.build_stream_request(request, session, context);
 
         let url = format!("{}/chat/completions", endpoint);
 
@@ -225,16 +328,23 @@ impl LlmClient for OpenRouterVendor {
             .json(&openrouter_req)
             .send()
             .await
-            .map_err(|e| LlmError::Other(format!("Request failed: {}", e)))?;
+            .map_err(|e| {
+                let err = LlmError::Other(format!("Request failed: {}", e));
+                context.notify_error(&err);
+                err
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::Other(format!("HTTP {}: {}", status, body)));
+            let err = LlmError::Other(format!("HTTP {}: {}", status, body));
+            context.notify_error(&err);
+            return Err(err);
         }
 
         use tokio::sync::mpsc;
         let (tx, rx) = mpsc::channel(32);
+        let on_chunk = context.on_chunk.clone();
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
@@ -249,13 +359,17 @@ impl LlmClient for OpenRouterVendor {
                                 for choice in chat.choices {
                                     if let Some(content) = &choice.delta.reasoning_content {
                                         if !content.is_empty() {
+                                            on_chunk.as_ref().map(|cb| cb(content));
                                             let _ = tx
-                                                .send(Ok(StreamToken::ReasoningContent(content.clone())))
+                                                .send(Ok(StreamToken::ReasoningContent(
+                                                    content.clone(),
+                                                )))
                                                 .await;
                                         }
                                     }
                                     if let Some(content) = &choice.delta.content {
                                         if !content.is_empty() {
+                                            on_chunk.as_ref().map(|cb| cb(content));
                                             let _ = tx
                                                 .send(Ok(StreamToken::Text(content.clone())))
                                                 .await;
@@ -263,13 +377,28 @@ impl LlmClient for OpenRouterVendor {
                                     }
                                     if let Some(calls) = &choice.delta.tool_calls {
                                         for call in calls {
-                                            let name = call.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
-                                            let args_str = call.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
-                                            let args_val: serde_json::Value = match serde_json::from_str(&args_str) {
-                                                Ok(v) => v,
-                                                Err(_) => serde_json::Value::Null,
-                                            };
-                                            let id = call.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                            let name = call
+                                                .function
+                                                .as_ref()
+                                                .and_then(|f| f.name.clone())
+                                                .unwrap_or_default();
+                                            let args_str = call
+                                                .function
+                                                .as_ref()
+                                                .and_then(|f| f.arguments.clone())
+                                                .unwrap_or_default();
+                                            let args_val: serde_json::Value =
+                                                match serde_json::from_str(&args_str) {
+                                                    Ok(v) => v,
+                                                    Err(_) => serde_json::Value::Null,
+                                                };
+                                            let id = call
+                                                .id
+                                                .clone()
+                                                .filter(|s| !s.is_empty())
+                                                .unwrap_or_else(|| {
+                                                    uuid::Uuid::new_v4().to_string()
+                                                });
                                             let _ = tx
                                                 .send(Ok(StreamToken::ToolCall {
                                                     name,
@@ -299,9 +428,7 @@ impl LlmClient for OpenRouterVendor {
 
                                     if let Some(reason) = &choice.finish_reason {
                                         if !reason.is_empty() {
-                                            let _ = tx
-                                                .send(Ok(StreamToken::Done))
-                                                .await;
+                                            let _ = tx.send(Ok(StreamToken::Done)).await;
                                             return;
                                         }
                                     }
@@ -310,15 +437,12 @@ impl LlmClient for OpenRouterVendor {
                         }
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(LlmError::Other(format!("Stream error: {}", e))))
-                            .await;
+                        let err = LlmError::Other(format!("Stream error: {}", e));
+                        let _ = tx.send(Err(err)).await;
                         return;
                     }
                 }
             }
-
-            let _ = tx.send(Ok(StreamToken::Done)).await;
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
@@ -327,7 +451,6 @@ impl LlmClient for OpenRouterVendor {
     fn supports_tools(&self) -> bool {
         true
     }
-
     fn provider_name(&self) -> &'static str {
         "openrouter"
     }
@@ -363,8 +486,8 @@ impl OpenRouterVendorBuilder {
         self
     }
 
-    pub fn build(self) -> Result<OpenRouterVendor, &'static str> {
-        let api_key = self.api_key.ok_or("api_key is required")?;
+    pub fn build(self) -> Result<OpenRouterVendor, VendorBuilderError> {
+        let api_key = self.api_key.ok_or(VendorBuilderError::MissingApiKey)?;
         Ok(OpenRouterVendor::new(self.endpoint, self.model, api_key))
     }
 }
@@ -381,7 +504,7 @@ mod tests {
     use serde::Deserialize;
 
     use crate::llm::vendor::OpenRouterVendor;
-    use crate::{LlmClient, LlmRequest};
+    use crate::llm::{LlmClient, LlmHooks, LlmRequest, LlmSession};
 
     #[tokio::test]
     async fn test_openrouter_vendor() {
@@ -412,7 +535,11 @@ mod tests {
         };
 
         let model_name = if llm_config.model.starts_with("openrouter/") {
-            llm_config.model.strip_prefix("openrouter/").unwrap().to_string()
+            llm_config
+                .model
+                .strip_prefix("openrouter/")
+                .unwrap()
+                .to_string()
         } else if llm_config.model.contains('/') {
             llm_config.model.clone()
         } else {
@@ -426,13 +553,25 @@ mod tests {
             llm_config.api_key.clone(),
         );
 
-        let request = LlmRequest::with_user(&llm_config.model, "What is 2+2?");
-        let outcome = vendor.complete(request).await;
-        
+        let request = LlmRequest {
+            model: llm_config.model.clone(),
+            input: "What is 2+2?".to_string(),
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            top_k: None,
+        };
+        let outcome = vendor
+            .complete(request, &mut LlmSession::new(), &mut LlmHooks::new())
+            .await;
+
         if let Err(e) = outcome {
             let err_str = format!("{:?}", e);
             if err_str.contains("404") || err_str.contains("not found") {
-                eprintln!("OpenRouter endpoint/model not available (404), skipping test: {}", err_str);
+                eprintln!(
+                    "OpenRouter endpoint/model not available (404), skipping test: {}",
+                    err_str
+                );
                 return;
             }
             if err_str.contains("429") || err_str.contains("rate limit") {
@@ -441,7 +580,7 @@ mod tests {
             }
             panic!("OpenRouter request failed: {:?}", e);
         }
-        
+
         println!("{:?}", outcome);
     }
 }

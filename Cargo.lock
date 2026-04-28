@@ -3751,6 +3751,7 @@ dependencies = [
 name = "react"
 version = "1.2.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "config",
  "dashmap",

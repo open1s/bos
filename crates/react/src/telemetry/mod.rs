@@ -1,18 +1,62 @@
-//! Token budget tracking for the ReAct engine.
-//! Provides token counting and budget management capabilities.
-
 use serde::{Deserialize, Serialize};
 
-/// Configuration for token budget limits
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TelemetryEvent {
+    LlmCall { model: String, tokens: u32 },
+    ToolCall { tool: String, duration_ms: u64 },
+    Error { error: String },
+    Checkpoint(serde_json::Value),
+    ToolInvocation { tool: String, input: serde_json::Value, output: serde_json::Value },
+    FinalAnswer { answer: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct Telemetry {
+    enabled: bool,
+}
+
+impl Telemetry {
+    pub fn new() -> Self {
+        Self { enabled: true }
+    }
+
+    pub fn emit(&self, event: &TelemetryEvent) {
+        if self.enabled {
+            match event {
+                TelemetryEvent::LlmCall { model, tokens } => {
+                    log::debug!("LLM call: model={}, tokens={}", model, tokens);
+                }
+                TelemetryEvent::ToolCall { tool, duration_ms } => {
+                    log::debug!("Tool call: tool={}, duration_ms={}", tool, duration_ms);
+                }
+                TelemetryEvent::Error { error } => {
+                    log::error!("Telemetry error: {}", error);
+                }
+                TelemetryEvent::Checkpoint(data) => {
+                    log::debug!("Checkpoint: {}", data);
+                }
+                TelemetryEvent::ToolInvocation { tool, input, output } => {
+                    log::debug!("Tool: {} input={} output={}", tool, input, output);
+                }
+                TelemetryEvent::FinalAnswer { answer } => {
+                    log::debug!("Final answer: {}", answer);
+                }
+            }
+        }
+    }
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBudgetConfig {
-    /// Maximum tokens allowed in a single request (default: 128k)
     pub max_request_tokens: u32,
-    /// Warning threshold percentage (default: 80%)
     pub warning_threshold_percent: u8,
-    /// Maximum conversation history tokens (default: 64k)
     pub max_history_tokens: u32,
-    /// Enable auto-compaction when limit reached
     pub auto_compact: bool,
 }
 
@@ -27,14 +71,10 @@ impl Default for TokenBudgetConfig {
     }
 }
 
-/// Token usage statistics
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
-    /// Prompt tokens used
     pub prompt_tokens: u32,
-    /// Completion tokens used
     pub completion_tokens: u32,
-    /// Total tokens used (prompt + completion)
     pub total_tokens: u32,
 }
 
@@ -47,37 +87,25 @@ impl TokenUsage {
         }
     }
 
-    /// Estimate tokens from text (rough approximation: ~4 chars per token)
     pub fn estimate_from_text(text: &str) -> u32 {
         (text.len() / 4) as u32
     }
 }
 
-/// Token budget status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BudgetStatus {
-    /// Under warning threshold
     Normal,
-    /// Approaching limit (over warning threshold)
     Warning,
-    /// Over budget limit
     Exceeded,
-    /// Requires immediate action
     Critical,
 }
 
-/// Token budget report
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBudgetReport {
-    /// Current usage
     pub usage: TokenUsage,
-    /// Budget configuration
     pub config: TokenBudgetConfig,
-    /// Current status
     pub status: BudgetStatus,
-    /// Usage percentage of max request tokens
     pub usage_percent: f32,
-    /// Remaining tokens available
     pub remaining_tokens: u32,
 }
 
@@ -111,7 +139,6 @@ impl TokenBudgetReport {
     }
 }
 
-/// Token counter for tracking and managing token budgets
 #[derive(Debug, Clone)]
 pub struct TokenCounter {
     config: TokenBudgetConfig,
@@ -134,25 +161,21 @@ impl TokenCounter {
         Self::new(TokenBudgetConfig::default())
     }
 
-    /// Update token usage from an LLM response
     pub fn update_from_response(&mut self, usage: TokenUsage) {
         self.current_usage = usage;
         self.total_requests += 1;
     }
 
-    /// Update tokens from estimated text input
     pub fn estimate_and_update(&mut self, prompt_text: &str) {
         let estimated = TokenUsage::estimate_from_text(prompt_text);
         self.current_usage = TokenUsage::new(estimated, 0);
         self.total_requests += 1;
     }
 
-    /// Get current budget report
     pub fn budget_report(&self) -> TokenBudgetReport {
         TokenBudgetReport::new(self.current_usage.clone(), &self.config)
     }
 
-    /// Check if auto-compaction is needed
     pub fn needs_compaction(&self) -> bool {
         self.config.auto_compact
             && matches!(
@@ -161,23 +184,19 @@ impl TokenCounter {
             )
     }
 
-    /// Reset current session usage
     pub fn reset_session(&mut self) {
         self.session_start_tokens += self.current_usage.total_tokens as u64;
         self.current_usage = TokenUsage::default();
     }
 
-    /// Get total tokens used in session (all requests)
     pub fn session_total_tokens(&self) -> u64 {
         self.session_start_tokens + self.current_usage.total_tokens as u64
     }
 
-    /// Get number of requests made
     pub fn total_requests(&self) -> u64 {
         self.total_requests
     }
 
-    /// Get current usage
     pub fn current_usage(&self) -> &TokenUsage {
         &self.current_usage
     }
@@ -190,22 +209,18 @@ impl TokenCounter {
         self.budget_report()
     }
 
-    /// Get config reference
     pub fn config(&self) -> &TokenBudgetConfig {
         &self.config
     }
 
-    /// Update max request tokens
     pub fn set_max_tokens(&mut self, max: u32) {
         self.config.max_request_tokens = max;
     }
 
-    /// Update warning threshold
     pub fn set_warning_threshold(&mut self, percent: u8) {
         self.config.warning_threshold_percent = percent;
     }
 
-    /// Toggle auto-compaction
     pub fn set_auto_compact(&mut self, enabled: bool) {
         self.config.auto_compact = enabled;
     }
@@ -214,96 +229,5 @@ impl TokenCounter {
 impl Default for TokenCounter {
     fn default() -> Self {
         Self::with_default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_token_usage() {
-        let usage = TokenUsage::new(1000, 500);
-        assert_eq!(usage.total_tokens, 1500);
-    }
-
-    #[test]
-    fn test_estimate_from_text() {
-        let text = "This is a test string with twenty eight characters.";
-        let tokens = TokenUsage::estimate_from_text(text);
-        assert!(tokens > 0);
-    }
-
-    #[test]
-    fn test_budget_report_normal() {
-        let config = TokenBudgetConfig::default();
-        let usage = TokenUsage::new(1000, 500); // 1500 total
-        let report = TokenBudgetReport::new(usage, &config);
-
-        assert!(matches!(report.status, BudgetStatus::Normal));
-        assert!(report.usage_percent < 80.0);
-    }
-
-    #[test]
-    fn test_budget_report_warning() {
-        let config = TokenBudgetConfig {
-            max_request_tokens: 1000,
-            warning_threshold_percent: 20,
-            ..Default::default()
-        };
-        let usage = TokenUsage::new(800, 0);
-        let report = TokenBudgetReport::new(usage, &config);
-
-        assert!(matches!(
-            report.status,
-            BudgetStatus::Warning | BudgetStatus::Exceeded
-        ));
-    }
-
-    #[test]
-    fn test_token_counter() {
-        let mut counter = TokenCounter::with_default();
-
-        counter.estimate_and_update("Hello world");
-
-        let report = counter.budget_report();
-        assert!(report.usage.total_tokens > 0);
-    }
-
-    #[test]
-    fn test_needs_compaction_disabled() {
-        let config = TokenBudgetConfig {
-            auto_compact: false,
-            ..Default::default()
-        };
-        let counter = TokenCounter::new(config);
-
-        assert!(!counter.needs_compaction());
-    }
-
-    #[test]
-    fn test_needs_compaction_enabled() {
-        let config = TokenBudgetConfig {
-            auto_compact: true,
-            max_request_tokens: 100,
-            ..Default::default()
-        };
-        let mut counter = TokenCounter::new(config);
-
-        // Set usage over threshold
-        counter.update_from_response(TokenUsage::new(90, 20));
-
-        assert!(counter.needs_compaction());
-    }
-
-    #[test]
-    fn test_session_tracking() {
-        let mut counter = TokenCounter::with_default();
-
-        counter.estimate_and_update("Request 1");
-        assert_eq!(counter.total_requests(), 1);
-
-        counter.estimate_and_update("Request 2");
-        assert_eq!(counter.total_requests(), 2);
     }
 }

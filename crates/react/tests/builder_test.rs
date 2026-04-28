@@ -4,8 +4,16 @@ use std::sync::{Arc, Mutex};
 
 use react::engine::{BuilderError, ReActEngineBuilder};
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
-use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, TokenStream};
+use react::llm::{LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession, TokenStream};
 use react::tool::FnTool;
+use react::runtime::ReActApp;
+
+#[derive(Default)]
+struct TestApp;
+impl ReActApp for TestApp {
+    type Session = LlmSession;
+    type Context = LlmContext;
+}
 
 fn make_text_response(content: String, is_final: bool) -> LlmResponse {
     LlmResponse::OpenAI(ChatCompletionResponse {
@@ -85,7 +93,10 @@ fn test_builder_pattern() {
 
     #[async_trait]
     impl LlmClient for MockLlm {
-        async fn complete(&self, _request: LlmRequest) -> LlmResponseResult {
+        type SessionType = LlmSession;
+        type ContextType = LlmContext;
+
+        async fn complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> LlmResponseResult {
             let responses = self.responses.clone();
             let mut lock = responses.lock().unwrap();
             if lock.is_empty() {
@@ -105,7 +116,7 @@ fn test_builder_pattern() {
             }
         }
 
-        async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {
+        async fn stream_complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> Result<TokenStream, LlmError> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -122,10 +133,11 @@ fn test_builder_pattern() {
         "Final Answer: 5".to_string(),
     ]);
 
-    let mut engine = ReActEngineBuilder::new()
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
         .llm(Box::new(mock_llm))
         .with_tool(Box::new(FnTool {
             name: "calculator".to_string(),
+            description: "Calculates expressions".to_string(),
             f: Box::new(|input: &Value| {
                 let expr = input
                     .get("expression")
@@ -143,15 +155,18 @@ fn test_builder_pattern() {
         .expect("Failed to build engine");
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async { engine.react("2+3").await });
-    assert_eq!(result.unwrap().0, "5");
+    let mut session = LlmSession::default();
+    let mut context = LlmContext::default();
+    let result = rt.block_on(async { engine.react(LlmRequest::new("test-model"), &mut session, &mut context).await });
+    assert_eq!(result.unwrap(), "5");
 }
 
 #[test]
 fn test_builder_missing_llm() {
-    let err = ReActEngineBuilder::new()
+    let err = ReActEngineBuilder::<TestApp>::new()
         .with_tool(Box::new(FnTool {
             name: "dummy".to_string(),
+            description: "Dummy tool".to_string(),
             f: Box::new(|_| Value::String("0".to_string())),
         }))
         .build();
@@ -164,31 +179,33 @@ fn test_builder_missing_llm() {
 
 #[test]
 fn test_message_log_input() {
-    use react::llm::LlmMessage;
     use std::sync::{Arc, Mutex};
 
     struct MockLlmWithHistory {
-        received_conversations: Arc<Mutex<Vec<Vec<LlmMessage>>>>,
+        received_inputs: Arc<Mutex<Vec<String>>>,
     }
     impl MockLlmWithHistory {
         fn new() -> Self {
             Self {
-                received_conversations: Arc::new(Mutex::new(Vec::new())),
+                received_inputs: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
 
     #[async_trait]
     impl LlmClient for MockLlmWithHistory {
-        async fn complete(&self, request: LlmRequest) -> LlmResponseResult {
-            self.received_conversations
+        type SessionType = LlmSession;
+        type ContextType = LlmContext;
+
+        async fn complete(&self, request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> LlmResponseResult {
+            self.received_inputs
                 .lock()
                 .unwrap()
-                .push(request.context.conversations.clone());
+                .push(request.input.clone());
             Ok(make_text_response("Hello back!".to_string(), true))
         }
 
-        async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {
+        async fn stream_complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> Result<TokenStream, LlmError> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -202,34 +219,26 @@ fn test_message_log_input() {
     }
 
     let mock = MockLlmWithHistory::new();
-    let received = mock.received_conversations.clone();
+    let received = mock.received_inputs.clone();
 
-    let mut engine = ReActEngineBuilder::new()
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
         .llm(Box::new(mock))
         .max_steps(1)
         .build()
         .expect("Failed to build engine");
 
-    engine.set_input_messages(vec![
-        LlmMessage::user("Previous conversation"),
-        LlmMessage::assistant("I remember that"),
-    ]);
-
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (_result, _context) = rt
-        .block_on(async { engine.react("New message").await })
+    let mut session = LlmSession::default();
+    let mut context = LlmContext::default();
+    let mut request = LlmRequest::new("test");
+    request.input = "New message".to_string();
+    let _result = rt
+        .block_on(async { engine.react(request, &mut session, &mut context).await })
         .unwrap();
 
-    let convos = received.lock().unwrap();
-    assert!(!convos.is_empty());
-    let first_convo = &convos[0];
-    assert!(
-        first_convo.len() >= 3,
-        "Should have system + history + new user"
-    );
-    assert!(
-        matches!(first_convo[1], LlmMessage::User { content: ref c } if c == "Previous conversation")
-    );
+    let inputs = received.lock().unwrap();
+    assert!(!inputs.is_empty());
+    assert_eq!(inputs[0], "New message");
 }
 
 #[test]
@@ -249,7 +258,10 @@ fn test_react_with_request() {
 
     #[async_trait]
     impl LlmClient for MockLlmFullRequest {
-        async fn complete(&self, request: LlmRequest) -> LlmResponseResult {
+        type SessionType = LlmSession;
+        type ContextType = LlmContext;
+
+        async fn complete(&self, request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> LlmResponseResult {
             *self.received_model.lock().unwrap() = Some(request.model.clone());
             Ok(make_text_response(
                 "Answer from custom request".to_string(),
@@ -257,7 +269,7 @@ fn test_react_with_request() {
             ))
         }
 
-        async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {
+        async fn stream_complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> Result<TokenStream, LlmError> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -273,7 +285,7 @@ fn test_react_with_request() {
     let mock = MockLlmFullRequest::new();
     let received_model = mock.received_model.clone();
 
-    let mut engine = ReActEngineBuilder::new()
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
         .llm(Box::new(mock))
         .max_steps(1)
         .build()
@@ -281,15 +293,18 @@ fn test_react_with_request() {
 
     let mut context = LlmContext::default();
     context.conversations.push(LlmMessage::user("Hello"));
+    let mut session = LlmSession::default();
     let request = LlmRequest {
         model: "custom-model".to_string(),
-        context,
         temperature: Some(0.9),
-        ..Default::default()
+        input: String::new(),
+        top_p: None,
+        top_k: None,
+        max_tokens: None,
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async { engine.react_with_request(request).await })
+    rt.block_on(async { engine.react(request, &mut session, &mut context).await })
         .unwrap();
 
     let model = received_model.lock().unwrap();

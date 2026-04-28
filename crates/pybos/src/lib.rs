@@ -30,7 +30,7 @@ pub use bus::{PyBus, PyBusConfig};
 pub use caller::{PyCallable, PyCaller};
 pub use config::PyConfigLoader;
 pub use hooks::{PyHookContext, PyHookDecision, PyHookEvent, PyHookRegistry};
-pub use llm_usage::{PyLlmUsage, PyPromptTokensDetails};
+pub use llm_usage::{PyBudgetStatus, PyLlmUsage, PyPromptTokensDetails, PyTokenBudgetReport, PyTokenUsage};
 pub use mcp::PyMcpClient;
 pub use plugin::{
     PyAgentPlugin, PyLlmRequestWrapper, PyLlmResponseWrapper, PyPluginRegistry, PyToolCallWrapper,
@@ -72,6 +72,9 @@ fn pybos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyToolResultWrapper>()?;
     m.add_class::<PyLlmUsage>()?;
     m.add_class::<PyPromptTokensDetails>()?;
+    m.add_class::<PyTokenUsage>()?;
+    m.add_class::<PyTokenBudgetReport>()?;
+    m.add_class::<PyBudgetStatus>()?;
     m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(log_test_message, m)?)?;
     Ok(())

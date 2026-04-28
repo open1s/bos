@@ -1,15 +1,19 @@
 use std::sync::Arc;
 
-use crate::{extractor::{JsonExtractor, StreamExtractor}, llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor}};
+use crate::{
+    llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor},
+    utils::{JsonExtractor, StreamExtractor},
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
+use crate::llm::types::ReactSession;
 use crate::llm::{
-    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, StreamToken, Stringfy,
-    TokenStream,
+    LlmClient, LlmError, LlmHooks, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    StreamToken, TokenStream, VendorBuilderError,
 };
 
 pub struct OpenAiVendor {
@@ -91,117 +95,130 @@ impl OpenAiVendor {
         OpenAiVendorBuilder::new()
     }
 
-    fn convert_request(&self, req: LlmRequest) -> OpenAiRequest {
+    fn convert_request(
+        &self,
+        req: &LlmRequest,
+        session: &impl ReactSession,
+        context: &impl crate::llm::types::ReactContext,
+    ) -> OpenAiRequest {
         let mut messages = Vec::new();
-
-        for message in req.context.conversations {
-            let json_msg = match message {
-                crate::llm::LlmMessage::System { content } => OpenAiMessageJson {
-                    role: "system",
-                    content: Some(content),
-                    tool_call_id: None,
-                    tool_calls: None,
-                },
-                crate::llm::LlmMessage::User { content } => OpenAiMessageJson {
-                    role: "user",
-                    content: Some(content),
-                    tool_call_id: None,
-                    tool_calls: None,
-                },
-                crate::llm::LlmMessage::Assistant { content } => OpenAiMessageJson {
-                    role: "assistant",
-                    content: Some(content),
-                    tool_call_id: None,
-                    tool_calls: None,
-                },
-                crate::llm::LlmMessage::AssistantToolCall {
-                    tool_call_id: id,
-                    name,
-                    args,
-                } => {
-                    let args_str = serde_json::to_string(&args).unwrap_or_default();
-                    OpenAiMessageJson {
+        let has_history = if let Some(history) = session.history() {
+            for message in history.iter().cloned() {
+                let json_msg = match message {
+                    crate::llm::LlmMessage::System { content } => OpenAiMessageJson {
+                        role: "system",
+                        content: Some(content.clone()),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    },
+                    crate::llm::LlmMessage::User { content } => OpenAiMessageJson {
+                        role: "user",
+                        content: Some(content.clone()),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    },
+                    crate::llm::LlmMessage::Assistant { content } => OpenAiMessageJson {
+                        role: "assistant",
+                        content: Some(content.clone()),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    },
+                    crate::llm::LlmMessage::AssistantToolCall {
+                        tool_call_id: id,
+                        name,
+                        args,
+                    } => OpenAiMessageJson {
                         role: "assistant",
                         content: None,
-                        tool_call_id: None,
+                        tool_call_id: Some(id.clone()),
                         tool_calls: Some(vec![ToolCallJson {
-                            id,
+                            id: id.clone(),
                             call_type: "function",
                             function: FunctionCallJson {
-                                name,
-                                arguments: args_str,
+                                name: name.clone(),
+                                arguments: args.to_string(),
                             },
                         }]),
-                    }
-                }
-                crate::llm::LlmMessage::ToolResult {
-                    tool_call_id,
-                    content,
-                } => OpenAiMessageJson {
-                    role: "tool",
-                    content: Some(content),
-                    tool_call_id: Some(tool_call_id),
-                    tool_calls: None,
-                },
-            };
-            messages.push(json_msg);
+                    },
+                    crate::llm::LlmMessage::ToolResult {
+                        tool_call_id,
+                        content,
+                    } => OpenAiMessageJson {
+                        role: "tool",
+                        content: Some(content.clone()),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        tool_calls: None,
+                    },
+                };
+                messages.push(json_msg);
+            }
+            !history.is_empty()
+        } else {
+            false
+        };
+
+        if !has_history {
+            messages.push(OpenAiMessageJson {
+                role: "user",
+                content: Some(req.input.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
         }
 
-        //Availale Skill as system
-        let available_skills = if !req.context.skills.is_empty() {
-            let available_skills = req
-                .context
-                .skills
+        let tools = context.tools().map(|tools| {
+            tools
                 .into_iter()
-                .map(|s| s.json())
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
+                })
                 .collect::<Vec<_>>()
-                .join("\n");
-            let skill_schema = format!(
-                "You have access to the following skills(call load_skill to read it when needed):\n{}\n",
-                available_skills
-            );
-            Some(skill_schema)
-        } else {
-            None
-        };
+        });
 
-        let available_rules = if !req.context.rules.is_empty() {
-            let available_rules = req
-                .context
-                .rules
-                .into_iter()
-                .map(|r| r.json())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let rules = format!("You should follow below rules:\n{}\n", available_rules);
-            Some(rules)
-        } else {
-            None
-        };
+        let mut extra_system_prompt = String::new();
 
-        let available_instructions = if !req.context.instructions.is_empty() {
-            let available_insts = req
-                .context
-                .instructions
-                .into_iter()
-                .map(|i| i.yaml())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let insts = format!("You should follow below rules:\n{}\n", available_insts);
-            Some(insts)
-        } else {
-            None
-        };
-
-        let mut extra_system_prompt = available_skills.unwrap_or_default();
-
-        extra_system_prompt.push('\n');
-        if let Some(rules) = available_rules {
-            extra_system_prompt.push_str(&rules);
+        if let Some(skills) = context.skills() {
+            if !skills.is_empty() {
+                let skill_names = skills
+                    .iter()
+                    .map(|s| format!("- {}: {}", s.name, s.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                extra_system_prompt.push_str(&format!(
+                    "Available Skills (call load_skill to read instructions when needed):\n{}\n",
+                    skill_names
+                ));
+            }
         }
 
-        if let Some(instructions) = available_instructions {
-            extra_system_prompt.push_str(&instructions);
+        if let Some(rules) = context.rules() {
+            if !rules.is_empty() {
+                let rule_texts = rules
+                    .iter()
+                    .map(|r| r.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                extra_system_prompt
+                    .push_str(&format!("You should follow below rules:\n{}\n", rule_texts));
+            }
+        }
+
+        if let Some(instructions) = context.instructions() {
+            if !instructions.is_empty() {
+                let inst_texts = instructions
+                    .iter()
+                    .map(|i| format!("- {}: {}", i.name, i.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                extra_system_prompt.push_str(&format!("Instructions:\n{}\n", inst_texts));
+            }
         }
 
         if !extra_system_prompt.is_empty() {
@@ -214,22 +231,10 @@ impl OpenAiVendor {
             messages.insert(0, meta);
         }
 
-        let tools = if !req.context.tools.is_empty() {
-            let tools = req
-                .context
-                .tools
-                .into_iter()
-                .map(|t| t.to_value().unwrap())
-                .collect::<Vec<_>>();
-            Some(tools)
-        } else {
-            None
-        };
-
         let max_tokens = req.max_tokens.unwrap_or(1280000);
 
         OpenAiRequest {
-            model: req.model,
+            model: req.model.clone(),
             messages,
             tools,
             temperature: req.temperature,
@@ -238,14 +243,13 @@ impl OpenAiVendor {
         }
     }
 
-    fn build_stream_request(&self, req: LlmRequest) -> OpenAiRequest {
-        let mut req = req;
-
-        if req.model.is_empty() {
-            req.model = self.model.clone();
-        }
-
-        let mut openai_req = self.convert_request(req);
+    fn build_stream_request(
+        &self,
+        req: &LlmRequest,
+        session: &impl ReactSession,
+        context: &impl crate::llm::types::ReactContext,
+    ) -> OpenAiRequest {
+        let mut openai_req = self.convert_request(req, session, context);
         openai_req.stream = Some(true);
         openai_req
     }
@@ -253,7 +257,15 @@ impl OpenAiVendor {
 
 #[async_trait]
 impl LlmClient for OpenAiVendor {
-    async fn complete(&self, mut request: LlmRequest) -> LlmResponseResult {
+    type SessionType = LlmSession;
+    type ContextType = LlmHooks;
+
+    async fn complete(
+        &self,
+        mut request: LlmRequest,
+        session: &mut Self::SessionType,
+        context: &mut Self::ContextType,
+    ) -> LlmResponseResult {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
@@ -262,7 +274,9 @@ impl LlmClient for OpenAiVendor {
             request.model = self.model.clone();
         }
 
-        let openai_req = self.convert_request(request);
+        context.notify_request(&request);
+
+        let openai_req = self.convert_request(&request, session, context);
 
         let url = format!("{}/chat/completions", endpoint);
 
@@ -273,23 +287,37 @@ impl LlmClient for OpenAiVendor {
             .json(&openai_req)
             .send()
             .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+            .map_err(|e| {
+                let err = LlmError::Http(e.to_string());
+                context.notify_error(&err);
+                err
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::Http(format!("HTTP {}: {}", status, body)));
+            let err = LlmError::Http(format!("HTTP {}: {}", status, body));
+            context.notify_error(&err);
+            return Err(err);
         }
 
-        let body: ChatCompletionResponse = response
-            .json()
-            .await
-            .map_err(|e| LlmError::Parse(e.to_string()))?;
+        let body: ChatCompletionResponse = response.json().await.map_err(|e| {
+            let err = LlmError::Parse(e.to_string());
+            context.notify_error(&err);
+            err
+        })?;
 
-        Ok(LlmResponse::OpenAI(body))
+        let resp = LlmResponse::OpenAI(body);
+        context.notify_response(&resp);
+        Ok(resp)
     }
 
-    async fn stream_complete(&self, mut request: LlmRequest) -> Result<TokenStream, LlmError> {
+    async fn stream_complete(
+        &self,
+        mut request: LlmRequest,
+        session: &mut Self::SessionType,
+        context: &mut Self::ContextType,
+    ) -> Result<TokenStream, LlmError> {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
@@ -298,7 +326,9 @@ impl LlmClient for OpenAiVendor {
             request.model = self.model.clone();
         }
 
-        let openai_req = self.build_stream_request(request);
+        context.notify_request(&request);
+
+        let openai_req = self.build_stream_request(&request, session, context);
 
         let url = format!("{}/chat/completions", endpoint);
 
@@ -310,16 +340,22 @@ impl LlmClient for OpenAiVendor {
             .json(&openai_req)
             .send()
             .await
-            .map_err(|e| LlmError::Other(format!("Request failed: {}", e)))?;
+            .map_err(|e| {
+                let err = LlmError::Other(format!("Request failed: {}", e));
+                context.notify_error(&err);
+                err
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::Other(format!("HTTP {}: {}", status, body)));
+            let err = LlmError::Other(format!("HTTP {}: {}", status, body));
+            context.notify_error(&err);
+            return Err(err);
         }
 
-        use tokio::sync::mpsc;
         let (tx, rx) = mpsc::channel(32);
+        let on_chunk = context.on_chunk.clone();
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
@@ -334,13 +370,17 @@ impl LlmClient for OpenAiVendor {
                                 for choice in chat.choices {
                                     if let Some(content) = &choice.delta.reasoning_content {
                                         if !content.is_empty() {
+                                            on_chunk.as_ref().map(|cb| cb(content));
                                             let _ = tx
-                                                .send(Ok(StreamToken::ReasoningContent(content.clone())))
+                                                .send(Ok(StreamToken::ReasoningContent(
+                                                    content.clone(),
+                                                )))
                                                 .await;
                                         }
                                     }
                                     if let Some(content) = &choice.delta.content {
                                         if !content.is_empty() {
+                                            on_chunk.as_ref().map(|cb| cb(content));
                                             let _ = tx
                                                 .send(Ok(StreamToken::Text(content.clone())))
                                                 .await;
@@ -348,13 +388,28 @@ impl LlmClient for OpenAiVendor {
                                     }
                                     if let Some(calls) = &choice.delta.tool_calls {
                                         for call in calls {
-                                            let name = call.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
-                                            let args_str = call.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
-                                            let args_val: serde_json::Value = match serde_json::from_str(&args_str) {
-                                                Ok(v) => v,
-                                                Err(_) => serde_json::Value::Null,
-                                            };
-                                            let id = call.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                            let name = call
+                                                .function
+                                                .as_ref()
+                                                .and_then(|f| f.name.clone())
+                                                .unwrap_or_default();
+                                            let args_str = call
+                                                .function
+                                                .as_ref()
+                                                .and_then(|f| f.arguments.clone())
+                                                .unwrap_or_default();
+                                            let args_val: serde_json::Value =
+                                                match serde_json::from_str(&args_str) {
+                                                    Ok(v) => v,
+                                                    Err(_) => serde_json::Value::Null,
+                                                };
+                                            let id = call
+                                                .id
+                                                .clone()
+                                                .filter(|s| !s.is_empty())
+                                                .unwrap_or_else(|| {
+                                                    uuid::Uuid::new_v4().to_string()
+                                                });
                                             let _ = tx
                                                 .send(Ok(StreamToken::ToolCall {
                                                     name,
@@ -384,9 +439,7 @@ impl LlmClient for OpenAiVendor {
 
                                     if let Some(reason) = &choice.finish_reason {
                                         if !reason.is_empty() {
-                                            let _ = tx
-                                                .send(Ok(StreamToken::Done))
-                                                .await;
+                                            let _ = tx.send(Ok(StreamToken::Done)).await;
                                             return;
                                         }
                                     }
@@ -395,15 +448,12 @@ impl LlmClient for OpenAiVendor {
                         }
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(LlmError::Other(format!("Stream error: {}", e))))
-                            .await;
+                        let err = LlmError::Other(format!("Stream error: {}", e));
+                        let _ = tx.send(Err(err)).await;
                         return;
                     }
                 }
             }
-
-            let _ = tx.send(Ok(StreamToken::Done)).await;
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
@@ -416,7 +466,6 @@ impl LlmClient for OpenAiVendor {
         "openai"
     }
 }
-
 pub struct OpenAiVendorBuilder {
     endpoint: String,
     model: String,
@@ -447,8 +496,8 @@ impl OpenAiVendorBuilder {
         self
     }
 
-    pub fn build(self) -> Result<OpenAiVendor, &'static str> {
-        let api_key = self.api_key.ok_or("api_key is required")?;
+    pub fn build(self) -> Result<OpenAiVendor, VendorBuilderError> {
+        let api_key = self.api_key.ok_or(VendorBuilderError::MissingApiKey)?;
         Ok(OpenAiVendor::new(self.endpoint, self.model, api_key))
     }
 }
@@ -481,37 +530,30 @@ impl OpenAiClient {
 
 #[async_trait]
 impl LlmClient for OpenAiClient {
-    async fn complete(&self, req: LlmRequest) -> LlmResponseResult {
-        self.inner.complete(req).await
+    type SessionType = LlmSession;
+    type ContextType = LlmHooks;
+
+    async fn complete(
+        &self,
+        req: LlmRequest,
+        session: &mut Self::SessionType,
+        context: &mut Self::ContextType,
+    ) -> LlmResponseResult {
+        self.inner.complete(req, session, context).await
     }
 
-    async fn stream_complete(&self, req: LlmRequest) -> Result<TokenStream, LlmError> {
-        let (tx, rx) = mpsc::channel(32);
-        let inner = self.inner.clone();
-
-        tokio::spawn(async move {
-            match inner.stream_complete(req).await {
-                Ok(stream) => {
-                    let mut stream = Box::pin(stream);
-                    while let Some(item) = stream.next().await {
-                        if tx.send(item).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                }
-            }
-        });
-
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    async fn stream_complete(
+        &self,
+        req: LlmRequest,
+        session: &mut Self::SessionType,
+        context: &mut Self::ContextType,
+    ) -> Result<TokenStream, LlmError> {
+        self.inner.stream_complete(req, session, context).await
     }
 
     fn supports_tools(&self) -> bool {
         true
     }
-
     fn provider_name(&self) -> &'static str {
         "openai"
     }
@@ -523,7 +565,7 @@ mod tests {
     use serde::Deserialize;
 
     use crate::llm::vendor::OpenAiVendor;
-    use crate::{LlmClient, LlmRequest};
+    use crate::llm::{LlmClient, LlmHooks, LlmRequest, LlmSession};
 
     #[tokio::test]
     async fn test_openai_vendor() {
@@ -554,7 +596,11 @@ mod tests {
         };
 
         let model_name = if llm_config.model.starts_with("openai/") {
-            llm_config.model.strip_prefix("openai/").unwrap().to_string()
+            llm_config
+                .model
+                .strip_prefix("openai/")
+                .unwrap()
+                .to_string()
         } else if !llm_config.model.contains('/') {
             llm_config.model.clone()
         } else {
@@ -568,13 +614,25 @@ mod tests {
             llm_config.api_key.clone(),
         );
 
-        let request = LlmRequest::with_user(&llm_config.model, "What is 2+2?");
-        let outcome = vendor.complete(request).await;
-        
+        let request = LlmRequest {
+            model: llm_config.model.clone(),
+            input: "What is 2+2?".to_string(),
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            top_k: None,
+        };
+        let outcome = vendor
+            .complete(request, &mut LlmSession::new(), &mut LlmHooks::new())
+            .await;
+
         if let Err(e) = outcome {
             let err_str = format!("{:?}", e);
             if err_str.contains("404") || err_str.contains("not found") {
-                eprintln!("OpenAI endpoint/model not available (404), skipping test: {}", err_str);
+                eprintln!(
+                    "OpenAI endpoint/model not available (404), skipping test: {}",
+                    err_str
+                );
                 return;
             }
             if err_str.contains("429") || err_str.contains("rate limit") {
@@ -583,7 +641,7 @@ mod tests {
             }
             panic!("OpenAI request failed: {:?}", e);
         }
-        
+
         println!("{:?}", outcome);
     }
 }

@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 async-trait = "0.1"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 tokio-stream = "0.1"
+async-stream = { workspace = true }
 dashmap = {workspace = true}
 uuid = {workspace = true}
 qserde = { path = "../qserde" }

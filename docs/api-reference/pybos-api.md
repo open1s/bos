@@ -101,6 +101,23 @@ Use chainable methods to configure the agent:
 | `tools` | `list[str]` | Registered tool names |
 | `config` | `dict` | Agent configuration |
 
+#### Token Usage
+
+The Agent provides methods to monitor token consumption:
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `token_usage()` | Get current token usage statistics | `TokenUsage` |
+| `token_budget_report()` | Get detailed token budget report with status | `TokenBudgetReport` |
+
+#### Classes
+
+| Class | Description |
+|-------|-------------|
+| `TokenUsage` | Token usage statistics (prompt, completion, total) |
+| `TokenBudgetReport` | Budget report with status and usage percentage |
+| `BudgetStatus` | Enum: Normal, Warning, Exceeded, Critical |
+
 #### Resilience Configuration
 
 The Agent supports configuring circuit breaker and rate limiter for resilience:

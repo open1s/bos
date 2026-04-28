@@ -86,6 +86,8 @@ Options:
 | `runSimple(message)` | Simple run (no tool use) | `Promise<string>` |
 | `react(task)` | Run with ReAct reasoning | `Promise<string>` |
 | `stream(task)` | Stream response tokens | `AsyncIterable<string>` |
+| `tokenUsage()` | Get current token usage | `TokenUsage` |
+| `tokenBudgetReport()` | Get token budget report | `TokenBudgetReport` |
 
 #### Properties
 
@@ -93,6 +95,23 @@ Options:
 |----------|------|-------------|
 | `tools` | `string[]` | Registered tool names |
 | `config` | `object` | Agent configuration |
+
+#### Token Usage
+
+The Agent provides methods to monitor token consumption:
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `tokenUsage()` | Get current token usage statistics | `TokenUsage` |
+| `tokenBudgetReport()` | Get detailed token budget report with status | `TokenBudgetReport` |
+
+#### Classes
+
+| Class | Description |
+|-------|-------------|
+| `TokenUsage` | Token usage statistics (prompt, completion, total) |
+| `TokenBudgetReport` | Budget report with status and usage percentage |
+| `BudgetStatus` | Enum: Normal, Warning, Exceeded, Critical |
 
 #### Resilience Configuration
 

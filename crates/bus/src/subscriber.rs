@@ -116,7 +116,7 @@ where
     }
 
     /// Create a stream of messages (requires subscriber to be initialized)
-    pub fn stream(&mut self) -> tokio::sync::mpsc::Receiver<T> {
+    pub fn _stream_placeholder_(&mut self) -> tokio::sync::mpsc::Receiver<T> {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
         let subscriber = self.subscriber.take();

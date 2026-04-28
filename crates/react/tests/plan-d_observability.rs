@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
-use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, TokenStream};
+use react::llm::{LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession, TokenStream};
 use std::sync::{Arc, Mutex};
 
 fn make_text_response(content: String, is_final: bool) -> LlmResponse {
@@ -49,7 +49,10 @@ impl MockLlm {
 
 #[async_trait]
 impl LlmClient for MockLlm {
-    async fn complete(&self, _request: LlmRequest) -> LlmResponseResult {
+    type SessionType = LlmSession;
+    type ContextType = LlmContext;
+
+    async fn complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> LlmResponseResult {
         let responses = self.responses.clone();
         let next = {
             let mut r = responses.lock().unwrap();
@@ -59,7 +62,7 @@ impl LlmClient for MockLlm {
         Ok(make_text_response(next, is_final))
     }
 
-    async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {
+    async fn stream_complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> Result<TokenStream, LlmError> {
         Ok(Box::pin(futures::stream::empty()))
     }
 

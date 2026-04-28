@@ -166,7 +166,7 @@ impl Query {
     }
 
     /// Send a query and process responses with a callback
-    pub async fn stream<Q, R>(&self, payload: &Q) -> Result<Vec<R>, ZenohError>
+    pub async fn _stream_placeholder_<Q, R>(&self, payload: &Q) -> Result<Vec<R>, ZenohError>
     where
         Q: Archive,
         for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,

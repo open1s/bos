@@ -228,7 +228,7 @@ impl AgentRpcClient {
             })
             .await?;
 
-        let stream = async_stream::stream! {
+        stream = async_stream::_stream_placeholder_! {
             tokio::pin!(response_stream);
             while let Some(item) = response_stream.next().await {
                 match item {
@@ -308,7 +308,7 @@ impl AgentRpcClient {
             }
         };
 
-        Ok(Box::pin(stream))
+        Ok(Box::pin(_stream_placeholder_))
     }
 
     /// Run remote stream endpoint and aggregate response for compatibility.
@@ -318,8 +318,8 @@ impl AgentRpcClient {
     ) -> Result<serde_json::Value, ToolError> {
         let mut text = String::new();
         let mut chunks = Vec::new();
-        let mut stream = self.stream_run_live(task).await?;
-        while let Some(item) = stream.next().await {
+        let mut _stream_placeholder_ = self.stream_run_live(task).await?;
+        while let Some(item) = _stream_placeholder_.next().await {
             match item? {
                 crate::StreamToken::Text(t) => {
                     text.push_str(&t);
@@ -387,11 +387,11 @@ async fn handle_rpc_request(agent: Arc<Agent>, req: AgentRpcRequest) -> AgentRpc
         }
         "stream/run" | "stream_run" => {
             let task = req.task.unwrap_or_default();
-            let mut stream = agent.stream(&task);
+            let mut _stream_placeholder_ = agent.stream(&task);
             let mut text = String::new();
             let mut chunks: Vec<String> = Vec::new();
             loop {
-                match stream.next().await {
+                match _stream_placeholder_.next().await {
                     Some(Ok(crate::StreamToken::Text(t))) => {
                         text.push_str(&t);
                         chunks.push(t);
@@ -713,10 +713,10 @@ async fn handle_incoming_query(
 
     if matches!(req.method.as_str(), "stream/run" | "stream_run") {
         let task = req.task.unwrap_or_default();
-        let mut stream = agent.stream(&task);
+        let mut _stream_placeholder_ = agent.stream(&task);
         let mut full_text = String::new();
 
-        while let Some(item) = stream.next().await {
+        while let Some(item) = _stream_placeholder_.next().await {
             match item {
                 Ok(crate::StreamToken::Text(t)) => {
                     full_text.push_str(&t);
@@ -854,16 +854,21 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for MockLlm {
-        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+        type SessionType = ();
+        type ContextType = ();
+
+        async fn complete(&self, _req: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> Result<LlmResponse, LlmError> {
             Ok(make_text_response("mock-complete".to_string()))
         }
 
         async fn stream_complete(
             &self,
             _req: LlmRequest,
+            _session: &mut Self::SessionType,
+            _context: &mut Self::ContextType,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError>
         {
-            Ok(Box::pin(futures::stream::iter(vec![
+            Ok(Box::pin(futures::_stream_placeholder_::iter(vec![
                 Ok(StreamToken::Text("s1".to_string())),
                 Ok(StreamToken::Text("s2".to_string())),
                 Ok(StreamToken::Done),
@@ -1129,8 +1134,8 @@ mod tests {
         let client = AgentRpcClient::with_transport("agent/rpc/x", transport);
 
         let mut out = String::new();
-        let mut stream = client.stream_run_live("hello").await.unwrap();
-        while let Some(item) = stream.next().await {
+        let mut _stream_placeholder_ = client.stream_run_live("hello").await.unwrap();
+        while let Some(item) = _stream_placeholder_.next().await {
             match item.unwrap() {
                 crate::StreamToken::Text(t) => out.push_str(&t),
                 crate::StreamToken::Done => break,

@@ -2,10 +2,46 @@ use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use react::calculator_tool::CalculatorTool;
 use react::engine::ReActEngineBuilder;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
-use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, TokenStream};
+use react::llm::{LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession, TokenStream};
+use react::tool::{Tool, ToolError};
+use react::runtime::ReActApp;
+use serde_json::Value;
+
+#[derive(Default)]
+struct TestApp;
+
+impl ReActApp for TestApp {
+    type Session = LlmSession;
+    type Context = LlmContext;
+}
+
+struct TestCalculator;
+
+impl Tool for TestCalculator {
+    fn name(&self) -> &str {
+        "calculator"
+    }
+
+    fn description(&self) -> String {
+        "Calculate math expression".to_string()
+    }
+
+    fn category(&self) -> String {
+        "utility".to_string()
+    }
+
+    fn run(&self, input: &Value) -> Result<Value, ToolError> {
+        let expr = input
+            .get("expression")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let result: i32 = expr.parse().unwrap_or(0);
+        Ok(Value::String(result.to_string()))
+    }
+}
 
 struct MockLlm {
     responses: Arc<Vec<String>>,
@@ -53,7 +89,10 @@ fn make_text_response(content: String, is_final: bool) -> LlmResponse {
 
 #[async_trait]
 impl LlmClient for MockLlm {
-    async fn complete(&self, _request: LlmRequest) -> LlmResponseResult {
+    type SessionType = LlmSession;
+    type ContextType = LlmContext;
+
+    async fn complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> LlmResponseResult {
         let responses = self.responses.clone();
         let idx = self.index.clone();
         let i = idx.load(Ordering::SeqCst);
@@ -66,7 +105,7 @@ impl LlmClient for MockLlm {
         Ok(make_text_response(text, is_final))
     }
 
-    async fn stream_complete(&self, _request: LlmRequest) -> Result<TokenStream, LlmError> {
+    async fn stream_complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> Result<TokenStream, LlmError> {
         Ok(Box::pin(futures::stream::empty()))
     }
 
@@ -85,14 +124,18 @@ async fn test_react_engine_basic() {
         "Final Answer: 4".to_string(),
     ]);
 
-    let mut engine = ReActEngineBuilder::new()
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
         .llm(Box::new(llm))
-        .with_tool(Box::new(CalculatorTool))
+        .with_tool(Box::new(TestCalculator))
         .max_steps(2)
         .build()
         .unwrap();
 
-    let result = engine.react("What is 2+2?").await;
+    let mut session = LlmSession::default();
+    let mut context = LlmContext::default();
+    let mut request = LlmRequest::new("test");
+    request.input = "What is 2+2?".to_string();
+    let result = engine.react(request, &mut session, &mut context).await;
     if let Err(e) = &result {
         eprintln!("Error: {:?}", e);
     }
@@ -103,12 +146,16 @@ async fn test_react_engine_basic() {
 async fn test_react_engine_no_tool() {
     let llm = MockLlm::new(vec!["Final Answer: 42".to_string()]);
 
-    let mut engine = ReActEngineBuilder::new()
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
         .llm(Box::new(llm))
         .max_steps(1)
         .build()
         .unwrap();
 
-    let result = engine.react("What is the answer?").await;
+    let mut session = LlmSession::default();
+    let mut context = LlmContext::default();
+    let mut request = LlmRequest::new("test");
+    request.input = "What is the answer?".to_string();
+    let result = engine.react(request, &mut session, &mut context).await;
     assert!(result.is_ok());
 }

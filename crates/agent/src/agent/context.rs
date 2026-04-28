@@ -1,5 +1,7 @@
 use crate::OpenAiMessage;
+use react::llm::vendor::ToolCall;
 use react::Message;
+
 #[derive(Debug, Clone, Default)]
 pub struct MessageContext {
     pub(crate) messages: Vec<Message>,
@@ -57,33 +59,71 @@ impl MessageContext {
     pub fn extend_api_format(&self, target: &mut Vec<OpenAiMessage>) {
         target.reserve(self.messages.len());
         for message in &self.messages {
-            target.push(match message {
-                Message::User { content } => OpenAiMessage::User {
-                    content: content.clone(),
-                },
-                Message::System { content: profile } => OpenAiMessage::System {
-                    content: profile.clone(),
-                },
-                Message::Assistant { content } => OpenAiMessage::Assistant {
-                    content: content.clone(),
-                },
+            match message {
+                Message::User { content } => {
+                    target.push(OpenAiMessage {
+                        role: "user".to_string(),
+                        content: Some(content.clone()),
+                        tool_calls: None,
+                        function_call: None,
+                        reasoning_content: None,
+                        extra: serde_json::Value::Object(serde_json::Map::new()),
+                    });
+                }
+                Message::System { content } => {
+                    target.push(OpenAiMessage {
+                        role: "system".to_string(),
+                        content: Some(content.clone()),
+                        tool_calls: None,
+                        function_call: None,
+                        reasoning_content: None,
+                        extra: serde_json::Value::Object(serde_json::Map::new()),
+                    });
+                }
+                Message::Assistant { content } => {
+                    target.push(OpenAiMessage {
+                        role: "assistant".to_string(),
+                        content: Some(content.clone()),
+                        tool_calls: None,
+                        function_call: None,
+                        reasoning_content: None,
+                        extra: serde_json::Value::Object(serde_json::Map::new()),
+                    });
+                }
                 Message::AssistantToolCall {
                     tool_call_id,
                     name,
                     args,
-                } => OpenAiMessage::AssistantToolCall {
-                    tool_call_id: tool_call_id.clone(),
-                    name: name.clone(),
-                    args: args.clone(),
-                },
+                } => {
+                    target.push(OpenAiMessage {
+                        role: "assistant".to_string(),
+                        content: None,
+                        tool_calls: Some(vec![ToolCall {
+                            id: tool_call_id.clone(),
+                            function: react::llm::vendor::FunctionCall {
+                                name: name.clone(),
+                                arguments: args.to_string(),
+                            },
+                        }]),
+                        function_call: None,
+                        reasoning_content: None,
+                        extra: serde_json::Value::Object(serde_json::Map::new()),
+                    });
+                }
                 Message::ToolResult {
                     tool_call_id,
                     content,
-                } => OpenAiMessage::ToolResult {
-                    tool_call_id: tool_call_id.clone(),
-                    content: content.clone(),
-                },
-            });
+                } => {
+                    target.push(OpenAiMessage {
+                        role: "tool".to_string(),
+                        content: Some(content.clone()),
+                        tool_calls: None,
+                        function_call: None,
+                        reasoning_content: None,
+                        extra: serde_json::Value::Object(serde_json::Map::new()),
+                    });
+                }
+            }
         }
     }
 

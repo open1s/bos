@@ -830,7 +830,7 @@ impl PyAgent {
         })
     }
 
-    fn stream<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
+    fn _stream_placeholder_<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
         let agent = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
 
@@ -843,8 +843,8 @@ impl PyAgent {
             let (tx, rx) = mpsc::channel::<Result<String, String>>(32);
 
             tokio::spawn(async move {
-                let mut stream = agent_clone.stream(&task);
-                while let Some(token_result) = stream.next().await {
+                let mut _stream_placeholder_ = agent_clone.stream(&task);
+                while let Some(token_result) = _stream_placeholder_.next().await {
                     let item = match token_result {
                         Ok(StreamToken::Text(text)) => Ok(text),
                         Ok(StreamToken::ReasoningContent(text)) => Ok(serde_json::json!({
@@ -1362,5 +1362,21 @@ impl PyAgent {
 
         self.inner.lock().unwrap().add_plugin(plugin_arc);
         Ok(())
+    }
+
+    fn token_usage(&self) -> PyResult<crate::llm_usage::PyTokenUsage> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.token_usage().into())
+    }
+
+    fn token_budget_report(&self) -> PyResult<crate::llm_usage::PyTokenBudgetReport> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.token_budget_report().into())
     }
 }

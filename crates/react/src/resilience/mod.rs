@@ -503,6 +503,29 @@ impl ReActResilience {
         self.circuit_breaker.as_ref().map(|b| b.get_state())
     }
 
+    /// Check circuit breaker and return error if open.
+    pub fn check_circuit(&self) -> Result<(), ResilienceError<()>> {
+        if let Some(breaker) = &self.circuit_breaker {
+            breaker.check()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Record success with circuit breaker.
+    pub fn record_success(&self) {
+        if let Some(breaker) = &self.circuit_breaker {
+            breaker.record_success();
+        }
+    }
+
+    /// Record failure with circuit breaker.
+    pub fn record_failure(&self) {
+        if let Some(breaker) = &self.circuit_breaker {
+            breaker.record_failure();
+        }
+    }
+
     /// Get remaining rate limit capacity (for telemetry).
     pub fn rate_limit_remaining(&self) -> Option<u32> {
         self.rate_limiter.as_ref().map(|l| l.remaining())

@@ -5,7 +5,7 @@
 
 use config::ConfigLoader;
 use react::llm::vendor::{NvidiaVendor, OpenRouterVendor};
-use react::llm::{LlmClient, LlmRequest, LlmResponse};
+use react::llm::{LlmClient, LlmHooks, LlmRequest, LlmResponse, LlmSession};
 
 /// Configuration extracted from config file for LLM providers.
 #[derive(Debug, Clone)]
@@ -58,9 +58,14 @@ async fn load_config() -> Result<serde_json::Value, String> {
 
 /// Create a simple text completion request.
 fn make_simple_request(model: &str) -> LlmRequest {
-    LlmRequest::with_user(model, "Say 'Hello, World!' in exactly those words.")
-        .temperature(0.7)
-        .max_tokens(50)
+    LlmRequest {
+        model: model.to_string(),
+        input: "Say 'Hello, World!' in exactly those words.".to_string(),
+        temperature: Some(0.7),
+        max_tokens: Some(50),
+        top_p: None,
+        top_k: None,
+    }
 }
 
 /// Verify the response is valid and contains expected content.
@@ -131,7 +136,7 @@ async fn test_nvidia_vendor_with_config() {
 
     // Make a simple request
     let request = make_simple_request(&llm_config.model);
-    let result = vendor.complete(request).await;
+    let result = vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
 
     match result {
         Ok(response) => {
@@ -183,15 +188,15 @@ async fn test_nvidia_vendor_stream_with_config() {
 
     // Make a streaming request
     let request = make_simple_request(&llm_config.model);
-    let stream_result = vendor.stream_complete(request).await;
+    let stream_result = vendor.stream_complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
 
     match stream_result {
-        Ok(mut stream) => {
+        Ok(mut _stream_placeholder_) => {
             use futures::StreamExt;
             let mut collected_text = String::new();
             let mut has_content = false;
 
-            while let Some(token_result) = stream.next().await {
+            while let Some(token_result) = _stream_placeholder_.next().await {
                 match token_result {
                     Ok(token) => {
                         use react::llm::StreamToken;
@@ -265,7 +270,7 @@ async fn test_openrouter_vendor_with_config() {
 
     // Make a simple request
     let request = make_simple_request(&llm_config.model);
-    let result = vendor.complete(request).await;
+    let result = vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
 
     match result {
         Ok(response) => {
@@ -320,15 +325,15 @@ async fn test_openrouter_vendor_stream_with_config() {
 
     // Make a streaming request
     let request = make_simple_request(&llm_config.model);
-    let stream_result = vendor.stream_complete(request).await;
+    let stream_result = vendor.stream_complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
 
     match stream_result {
-        Ok(mut stream) => {
+        Ok(mut _stream_placeholder_) => {
             use futures::StreamExt;
             let mut collected_text = String::new();
             let mut has_content = false;
 
-            while let Some(token_result) = stream.next().await {
+            while let Some(token_result) = _stream_placeholder_.next().await {
                 match token_result {
                     Ok(token) => {
                         use react::llm::StreamToken;
@@ -382,7 +387,7 @@ async fn test_nvidia_vendor_invalid_api_key() {
     );
 
     let request = make_simple_request("nvidia/z-ai/glm4-9b");
-    let result = vendor.complete(request).await;
+    let result = vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
 
     // Should return an error (not panic)
     assert!(result.is_err(), "Invalid API key should produce an error");
@@ -401,7 +406,7 @@ async fn test_openrouter_vendor_invalid_api_key() {
     );
 
     let request = make_simple_request("openrouter/meta-llama/llama-3.2-3b-instruct");
-    let result = vendor.complete(request).await;
+    let result = vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
 
     // Should return an error (not panic)
     assert!(result.is_err(), "Invalid API key should produce an error");
@@ -436,8 +441,15 @@ async fn test_nvidia_response_parsing() {
         llm_config.api_key.clone(),
     );
 
-    let request = LlmRequest::with_user(&llm_config.model, "What is 2+2?");
-    let result = match vendor.complete(request).await {
+    let request = LlmRequest {
+        model: llm_config.model.clone(),
+        input: "What is 2+2?".to_string(),
+        temperature: None,
+        max_tokens: None,
+        top_p: None,
+        top_k: None,
+    };
+    let result = match vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await {
         Ok(r) => r,
         Err(e) => {
             let err_str = e.to_string();
@@ -558,8 +570,15 @@ async fn test_openrouter_response_parsing() {
         llm_config.api_key.clone(),
     );
 
-    let request = LlmRequest::with_user(&llm_config.model, "What is 3+3?");
-    let result = match vendor.complete(request).await {
+    let request = LlmRequest {
+        model: llm_config.model.clone(),
+        input: "What is 3+3?".to_string(),
+        temperature: None,
+        max_tokens: None,
+        top_p: None,
+        top_k: None,
+    };
+    let result = match vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await {
         Ok(r) => r,
         Err(e) => {
             let err_str = e.to_string();
@@ -662,21 +681,23 @@ async fn test_nvidia_tool_calls_stream_with_config() {
     );
 
     // System prompt that encourages the model to use a tool
-    let request = LlmRequest::with_user(
-        &llm_config.model,
-        "You have access to a tool called 'get_weather'. \
+    let request = LlmRequest {
+        model: llm_config.model.clone(),
+        input: "You have access to a tool called 'get_weather'. \
         When the user asks about weather, you MUST call get_weather \
         with {\"location\": \"San Francisco, CA\"}. \
-        User question: What is the weather in San Francisco?",
-    )
-    .system_message("You are a helpful assistant with access to tools.")
-    .temperature(0.7)
-    .max_tokens(256);
+        User question: What is the weather in San Francisco?"
+            .to_string(),
+        temperature: Some(0.7),
+        max_tokens: Some(256),
+        top_p: None,
+        top_k: None,
+    };
 
-    let stream_result = vendor.stream_complete(request).await;
+    let stream_result = vendor.stream_complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
 
     match stream_result {
-        Ok(mut stream) => {
+        Ok(mut _stream_placeholder_) => {
             let mut has_tool_call = false;
             let mut tool_call_name = String::new();
             #[allow(unused_assignments)]
@@ -684,7 +705,7 @@ async fn test_nvidia_tool_calls_stream_with_config() {
             let mut tool_call_id: Option<String> = None;
             let mut collected_text = String::new();
 
-            while let Some(token_result) = stream.next().await {
+            while let Some(token_result) = _stream_placeholder_.next().await {
                 match token_result {
                     Ok(token) => {
                         use react::llm::StreamToken;

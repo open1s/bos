@@ -765,7 +765,7 @@ impl Agent {
   }
 
   #[napi]
-  pub async fn stream(
+  pub async fn _stream_placeholder_(
     &self,
     task: String,
     callback: ThreadsafeFunction<serde_json::Value>,
@@ -775,11 +775,11 @@ impl Agent {
       guard.clone()
     };
 
-    let stream = agent.stream(&task);
-    use futures::stream::StreamExt;
+    stream = agent.stream(&task);
+    use futures::_stream_placeholder_::StreamExt;
 
-    futures::pin_mut!(stream);
-    while let Some(token_result) = stream.next().await {
+    futures::pin_mut!(_stream_placeholder_);
+    while let Some(token_result) = _stream_placeholder_.next().await {
       match token_result {
         Ok(token) => {
           let json = match token {
@@ -813,6 +813,22 @@ impl Agent {
       }
     }
     Ok(())
+  }
+
+  #[napi]
+  pub fn token_usage(&self) -> Result<TokenUsage> {
+    let guard = self.inner.lock().map_err(|_| {
+      Error::new(napi::Status::GenericFailure, "Agent lock poisoned")
+    })?;
+    Ok(guard.token_usage().into())
+  }
+
+  #[napi]
+  pub fn token_budget_report(&self) -> Result<TokenBudgetReport> {
+    let guard = self.inner.lock().map_err(|_| {
+      Error::new(napi::Status::GenericFailure, "Agent lock poisoned")
+    })?;
+    Ok(guard.token_budget_report().into())
   }
 }
 
