@@ -31,6 +31,13 @@ export declare class Agent {
   getMessages(): Array<any>
   saveMessageLog(path: string): void
   restoreMessageLog(path: string): void
+  sessionContext(): any
+  setSessionContext(context: any): void
+  clearSessionContext(): void
+  sessionState(): any
+  saveSession(path: string): void
+  restoreSession(path: string): void
+  compactMessageLog(): void
   stream(task: string, callback: ((err: Error | null, arg: any) => any)): Promise<void>
 }
 

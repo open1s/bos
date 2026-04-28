@@ -563,6 +563,7 @@ Agent(bus, name="assistant", model=..., base_url=..., api_key=..., system_prompt
 | `with_prompt(prompt)` | Set system prompt | `Agent` |
 | `with_temperature(temp)` | Set temperature | `Agent` |
 | `with_timeout(secs)` | Set timeout | `Agent` |
+| `with_resilience(**opts)` | Set resilience config | `Agent` |
 | `register(tool)` | Register a tool | `Agent` |
 | `register_many(*tools)` | Register multiple tools | `Agent` |
 | `start()` | Initialize agent | `Agent` |
@@ -574,10 +575,58 @@ Agent(bus, name="assistant", model=..., base_url=..., api_key=..., system_prompt
 
 ### Resilience Configuration
 
-The Agent supports configuring circuit breaker and rate limiter for resilience:
+The Agent supports configuring circuit breaker and rate limiter for resilience via three methods:
 
+**Method 1: Fluent API (`with_resilience()`)**
 ```python
-# Using pybos directly for full config options
+from brainos import BrainOS, tool
+
+@tool("Add two numbers")
+def add(a: int, b: int) -> int:
+    return a + b
+
+async with BrainOS(api_key="sk-...") as brain:
+    agent = brain.agent("assistant").register(add)
+    agent.with_resilience(
+        rate_limit_capacity=40,           # max requests per window
+        rate_limit_window_secs=60,         # window duration in seconds
+        rate_limit_max_retries=3,          # retry attempts on 429 errors
+        rate_limit_retry_backoff_secs=1,      # backoff between retries
+        rate_limit_auto_wait=True,            # auto-wait when rate limited
+        circuit_breaker_max_failures=5,       # failures before opening circuit
+        circuit_breaker_cooldown_secs=30,     # seconds before attempting recovery
+    )
+    result = await agent.ask("What is 42 + 58?")
+```
+
+**Method 2: Constructor kwargs**
+```python
+async with BrainOS(api_key="sk-...") as brain:
+    agent = brain.agent(
+        "assistant",
+        rate_limit_capacity=40,
+        rate_limit_window_secs=60,
+        rate_limit_max_retries=3,
+        rate_limit_auto_wait=True,
+        circuit_breaker_max_failures=5,
+        circuit_breaker_cooldown_secs=30,
+    )
+    result = await agent.ask("What is 42 + 58?")
+```
+
+**Method 3: `BrainOS.agent()` with resilience params**
+```python
+async with BrainOS(api_key="sk-...") as brain:
+    agent = brain.agent(
+        "assistant",
+        rate_limit_capacity=20,
+        circuit_breaker_max_failures=5,
+    )
+    result = await agent.ask("What is 42 + 58?")
+```
+
+**Method 4: Using pybos directly**
+```python
 from pybos import Agent, AgentConfig
 
 cfg = AgentConfig(
@@ -586,14 +635,13 @@ cfg = AgentConfig(
     api_key="sk-...",
     # Circuit Breaker - prevents cascading failures
     circuit_breaker_max_failures=5,      # failures before opening circuit
-    circuit_breaker_cooldown_secs=30,    # seconds before attempting recovery
-    
+    circuit_breaker_cooldown_secs=30,      # seconds before attempting recovery
     # Rate Limiter - prevents 429 errors
-    rate_limit_capacity=40,              # max requests per window
-    rate_limit_window_secs=60,            # window duration in seconds
-    rate_limit_max_retries=3,             # retry attempts on rate limit
-    rate_limit_retry_backoff_secs=1,      # backoff between retries
-    rate_limit_auto_wait=True,            # auto-wait when rate limited
+    rate_limit_capacity=40,               # max requests per window
+    rate_limit_window_secs=60,             # window duration in seconds
+    rate_limit_max_retries=3,            # retry attempts on rate limit
+    rate_limit_retry_backoff_secs=1,    # backoff between retries
+    rate_limit_auto_wait=True,             # auto-wait when rate limited
 )
 agent = Agent.from_config(cfg)
 ```

@@ -40,7 +40,7 @@ npm run build
 ## Quick Start
 
 ```javascript
-const { BrainOS, tool } = require('brainos');
+const { BrainOS, tool } = require('@open1s/jsbos/brainos');
 
 async function main() {
   const brain = new BrainOS();
@@ -161,7 +161,7 @@ Hooks allow you to intercept and react to events during agent execution. Use `on
 ### Using Hooks with BrainOS Agent
 
 ```javascript
-const { BrainOS, HookEvent } = require('brainos');
+const { Agent, HookEvent } = require('@open1s/jsbos');
 
 const brain = new BrainOS({ apiKey: 'sk-...' });
 await brain.start();
@@ -264,7 +264,7 @@ The callback receives a `HookContextData` object:
 Due to JavaScript's limitations with decorators, the recommended approach is using `ToolDef`:
 
 ```javascript
-const { ToolDef } = require('brainos');
+const { ToolDef } = require('@open1s/jsbos/brainos');
 
 // Simple function tool
 function add(args) {
@@ -324,7 +324,7 @@ agent.register(weatherTool);
 ### Using the Decorator (Experimental)
 
 ```javascript
-const { tool } = require('brainos');
+const { tool } = require('@open1s/jsbos/brainos');
 
 class MyTools {
   @tool('Add two numbers')
@@ -352,7 +352,7 @@ The Bus provides pub/sub messaging between components.
 ### Using BusManager
 
 ```javascript
-const { BusManager } = require('brainos');
+const { BusManager } = require('@open1s/jsbos/brainos');
 
 const bus = await BusManager.create();
 await bus.start();
@@ -402,7 +402,7 @@ Request-response pattern with timeout support. Uses `BusManager` factory methods
 ### Server Side (Queryable)
 
 ```javascript
-const { BusManager } = require('brainos');
+const { BusManager } = require('@open1s/jsbos/brainos');
 
 const bus = await BusManager.create();
 await bus.start();
@@ -452,7 +452,7 @@ RPC-style request-response pattern. Uses `BusManager` factory methods.
 ### Server Side (Callable)
 
 ```javascript
-const { BusManager } = require('brainos');
+const { BusManager } = require('@open1s/jsbos/brainos');
 
 const bus = await BusManager.create();
 await bus.start();
@@ -513,7 +513,7 @@ model = "gpt-4"
 ### Using ConfigLoader Class
 
 ```javascript
-const { ConfigLoader } = require('brainos');
+const { ConfigLoader } = require('@open1s/jsbos/brainos');
 
 const loader = new ConfigLoader();
 loader.discover();
@@ -539,7 +539,7 @@ BrainOS supports MCP (Model Context Protocol) for connecting to external tools a
 ### Using MCP Client
 
 ```javascript
-const { McpClient } = require('brainos');
+const { McpClient } = require('@open1s/jsbos/brainos');
 
 async function main() {
   // Spawn an MCP server process
@@ -573,7 +573,7 @@ main().catch(console.error);
 ### Connect via HTTP
 
 ```javascript
-const { McpClient } = require('brainos');
+const { McpClient } = require('@open1s/jsbos/brainos');
 
 const client = McpClient.connectHttp('http://localhost:3000');
 await client.initialize();
@@ -652,22 +652,22 @@ new Agent(bus, options = {})
 The Agent supports configuring circuit breaker and rate limiter for resilience:
 
 ```javascript
-const { Agent } = require('brainos');
+const { Agent } = require('@open1s/jsbos/brainos');
 
 const agent = await Agent.create({
   name: "assistant",
   model: "gpt-4",
   apiKey: "sk-...",
   // Circuit Breaker - prevents cascading failures
-  circuitBreakerMaxFailures: 5,      // failures before opening circuit
-  circuitBreakerCooldownSecs: 30,    // seconds before attempting recovery
-  
+  circuitBreakerMaxFailures: 5,         // failures before opening circuit
+  circuitBreakerCooldownSecs: 30,       // seconds before attempting recovery
+
   // Rate Limiter - prevents 429 errors
-  rateLimitCapacity: 40,              // max requests per window
-  rateLimitWindowSecs: 60,            // window duration in seconds
-  rateLimitMaxRetries: 3,             // retry attempts on rate limit
-  rateLimitRetryBackoffSecs: 1,       // backoff between retries
-  rateLimitAutoWait: true,            // auto-wait when rate limited
+  rateLimitCapacity: 40,               // max requests per window
+  rateLimitWindowSecs: 60,             // window duration in seconds
+  rateLimitMaxRetries: 3,            // retry attempts on rate limit
+  rateLimitRetryBackoffSecs: 1,         // backoff between retries
+  rateLimitAutoWait: true,             // auto-wait when rate limited
 });
 ```
 
@@ -846,7 +846,7 @@ MCP (Model Context Protocol) client for connecting to external tools and service
 ### Complete Example with Tools
 
 ```javascript
-const { BrainOS, ToolDef } = require('brainos');
+const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos');
 
 function add(args) {
   return args.a + args.b;
@@ -893,7 +893,7 @@ main().catch(console.error);
 ### Pub/Sub Example
 
 ```javascript
-const { BusManager } = require('brainos');
+const { BusManager } = require('@open1s/jsbos/brainos');
 
 async function publisher() {
   const bus = await BusManager.create();
@@ -920,7 +920,7 @@ async function subscriber() {
 ### Query/Response Example
 
 ```javascript
-const { BusManager } = require('brainos');
+const { BusManager } = require('@open1s/jsbos/brainos');
 
 function uppercase(text) {
   return text.toUpperCase();
@@ -949,14 +949,16 @@ main().catch(console.error);
 
 ## Hooks, Plugins, and Sessions
 
-### Hooks
+Hooks, plugins, and session management are available through the low-level `jsbos` bindings.
+
+### Hooks (jsbos)
 
 Hooks allow you to intercept and react to events during agent execution.
 
 #### Using Hooks
 
 ```javascript
-const { BrainOS, HookEvent } = require('brainos');
+const { Agent, HookEvent } = require('@open1s/jsbos');
 
 async function main() {
   const brain = new BrainOS();
@@ -1039,7 +1041,7 @@ Plugins allow you to preprocess and postprocess LLM requests and responses.
 #### Using Plugins
 
 ```javascript
-const { BrainOS } = require('brainos');
+const { BrainOS } = require('@open1s/jsbos/brainos');
 
 class MyPlugin {
   async processLlmRequest(wrapper) {
@@ -1083,7 +1085,7 @@ BrainOS provides session management for persisting agent state across restarts.
 #### Session Operations
 
 ```javascript
-const { BrainOS } = require('brainos');
+const { BrainOS } = require('@open1s/jsbos/brainos');
 
 async function main() {
   const brain = new BrainOS();

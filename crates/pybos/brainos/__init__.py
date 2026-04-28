@@ -26,7 +26,7 @@ from brainos.bus import BusManager, Publisher, Subscriber
 from brainos.query import Query, Queryable
 from brainos.caller import Caller, Callable
 from brainos.config import Config
-from pybos import AgentConfig, AgentPlugin, PluginRegistry, ConfigLoader
+from pybos import AgentConfig, AgentPlugin, PluginRegistry, ConfigLoader, init_tracing as InitTracing
 
 __all__ = [
     "BrainOS", "Agent",
@@ -39,5 +39,6 @@ __all__ = [
     "AgentPlugin",
     "PluginRegistry",
     "ConfigLoader",
+    "InitTracing",
 ]
-__version__ = "0.1.0"
+__version__ = "1.2.0"

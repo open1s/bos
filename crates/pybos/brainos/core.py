@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
 from contextlib import AbstractAsyncContextManager
 
+logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(name)s: %(message)s')
+_LOG = logging.getLogger("brainos.core")
 from pybos import Agent as PyAgent
 from pybos import AgentConfig as PyAgentConfig
 from pybos import Bus as PyBus
@@ -38,6 +41,14 @@ class Agent:
         temperature: float = 0.7,
         max_tokens: int | None = None,
         timeout_secs: int = 120,
+        # Resilience config
+        rate_limit_capacity: int | None = None,
+        rate_limit_window_secs: int | None = None,
+        rate_limit_max_retries: int | None = None,
+        rate_limit_retry_backoff_secs: int | None = None,
+        rate_limit_auto_wait: bool | None = None,
+        circuit_breaker_max_failures: int | None = None,
+        circuit_breaker_cooldown_secs: int | None = None,
     ) -> None:
         self._bus = bus
         self._tools: list[ToolDef] = []
@@ -54,7 +65,11 @@ class Agent:
             if temperature != 0.7: self._config.temperature = temperature
             if max_tokens is not None: self._config.max_tokens = max_tokens
             if timeout_secs != 120: self._config.timeout_secs = timeout_secs
-            
+            self._apply_resilience(
+                rate_limit_capacity, rate_limit_window_secs, rate_limit_max_retries,
+                rate_limit_retry_backoff_secs, rate_limit_auto_wait,
+                circuit_breaker_max_failures, circuit_breaker_cooldown_secs,
+            )
             # Since we got config directly, we can create the agent immediately
             self._agent = PyAgent.from_config(self._config)
             self._bus = None
@@ -69,6 +84,34 @@ class Agent:
             if max_tokens is not None:
                 self._config.max_tokens = max_tokens
             self._config.timeout_secs = timeout_secs
+            self._apply_resilience(
+                rate_limit_capacity, rate_limit_window_secs, rate_limit_max_retries,
+                rate_limit_retry_backoff_secs, rate_limit_auto_wait,
+                circuit_breaker_max_failures, circuit_breaker_cooldown_secs,
+            )
+
+    def _apply_resilience(self, rate_limit_capacity, rate_limit_window_secs, rate_limit_max_retries, rate_limit_retry_backoff_secs, rate_limit_auto_wait, circuit_breaker_max_failures, circuit_breaker_cooldown_secs):
+        if rate_limit_capacity is not None:
+            self._config.rate_limit_capacity = rate_limit_capacity
+            _LOG.debug(f"Set rate_limit_capacity={rate_limit_capacity}")
+        if rate_limit_window_secs is not None:
+            self._config.rate_limit_window_secs = rate_limit_window_secs
+            _LOG.debug(f"Set rate_limit_window_secs={rate_limit_window_secs}")
+        if rate_limit_max_retries is not None:
+            self._config.rate_limit_max_retries = rate_limit_max_retries
+            _LOG.debug(f"Set rate_limit_max_retries={rate_limit_max_retries}")
+        if rate_limit_retry_backoff_secs is not None:
+            self._config.rate_limit_retry_backoff_secs = rate_limit_retry_backoff_secs
+            _LOG.debug(f"Set rate_limit_retry_backoff_secs={rate_limit_retry_backoff_secs}")
+        if rate_limit_auto_wait is not None:
+            self._config.rate_limit_auto_wait = rate_limit_auto_wait
+            _LOG.debug(f"Set rate_limit_auto_wait={rate_limit_auto_wait}")
+        if circuit_breaker_max_failures is not None:
+            self._config.circuit_breaker_max_failures = circuit_breaker_max_failures
+            _LOG.debug(f"Set circuit_breaker_max_failures={circuit_breaker_max_failures}")
+        if circuit_breaker_cooldown_secs is not None:
+            self._config.circuit_breaker_cooldown_secs = circuit_breaker_cooldown_secs
+            _LOG.debug(f"Set circuit_breaker_cooldown_secs={circuit_breaker_cooldown_secs}")
 
     # ── Fluent config ──────────────────────────────────────────────
 
@@ -86,6 +129,28 @@ class Agent:
 
     def with_timeout(self, secs: int) -> Agent:
         self._config.timeout_secs = secs
+        return self
+
+    def with_resilience(
+        self,
+        rate_limit_capacity: int = 40,
+        rate_limit_window_secs: int = 60,
+        rate_limit_max_retries: int = 3,
+        rate_limit_retry_backoff_secs: int = 1,
+        rate_limit_auto_wait: bool = True,
+        circuit_breaker_max_failures: int = 5,
+        circuit_breaker_cooldown_secs: int = 30,
+    ) -> Agent:
+        _LOG.debug(f"Applying resilience config:")
+        _LOG.debug(f"  rate_limit: capacity={rate_limit_capacity}, window={rate_limit_window_secs}s, max_retries={rate_limit_max_retries}")
+        _LOG.debug(f"  circuit_breaker: max_failures={circuit_breaker_max_failures}, cooldown={circuit_breaker_cooldown_secs}s")
+        self._config.rate_limit_capacity = rate_limit_capacity
+        self._config.rate_limit_window_secs = rate_limit_window_secs
+        self._config.rate_limit_max_retries = rate_limit_max_retries
+        self._config.rate_limit_retry_backoff_secs = rate_limit_retry_backoff_secs
+        self._config.rate_limit_auto_wait = rate_limit_auto_wait
+        self._config.circuit_breaker_max_failures = circuit_breaker_max_failures
+        self._config.circuit_breaker_cooldown_secs = circuit_breaker_cooldown_secs
         return self
 
     # ── Tool registration ──────────────────────────────────────────
@@ -223,6 +288,13 @@ class BrainOS(AbstractAsyncContextManager):
         model: str | None = None,
         temperature: float = 0.7,
         timeout_secs: int = 120,
+        rate_limit_capacity: int | None = None,
+        rate_limit_window_secs: int | None = None,
+        rate_limit_max_retries: int | None = None,
+        rate_limit_retry_backoff_secs: int | None = None,
+        rate_limit_auto_wait: bool | None = None,
+        circuit_breaker_max_failures: int | None = None,
+        circuit_breaker_cooldown_secs: int | None = None,
     ) -> Agent:
         """Create a new agent with the given configuration."""
         return Agent(
@@ -234,6 +306,13 @@ class BrainOS(AbstractAsyncContextManager):
             system_prompt=system_prompt,
             temperature=temperature,
             timeout_secs=timeout_secs,
+            rate_limit_capacity=rate_limit_capacity,
+            rate_limit_window_secs=rate_limit_window_secs,
+            rate_limit_max_retries=rate_limit_max_retries,
+            rate_limit_retry_backoff_secs=rate_limit_retry_backoff_secs,
+            rate_limit_auto_wait=rate_limit_auto_wait,
+            circuit_breaker_max_failures=circuit_breaker_max_failures,
+            circuit_breaker_cooldown_secs=circuit_breaker_cooldown_secs,
         )
 
     @property

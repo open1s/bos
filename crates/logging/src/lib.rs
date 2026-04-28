@@ -68,19 +68,20 @@ pub fn auto_init_tracing() {
         return;
     }
 
-    let level = std::env::var("BOS_LOG");
-    let level = level.unwrap_or_else(|_| {
-        let mut loader = config::loader::ConfigLoader::new().discover();
-        match loader.load_sync() {
-            Ok(config) => config
-                .get("logging")
-                .and_then(|l| l.get("level"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("error")
-                .to_string(),
-            Err(_) => "error".to_string(),
-        }
-    });
+    let level = std::env::var("RUST_LOG")
+        .or_else(|_| std::env::var("BOS_LOG"))
+        .unwrap_or_else(|_| {
+            let mut loader = config::loader::ConfigLoader::new().discover();
+            match loader.load_sync() {
+                Ok(config) => config
+                    .get("logging")
+                    .and_then(|l| l.get("level"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("error")
+                    .to_string(),
+                Err(_) => "error".to_string(),
+            }
+        });
 
     let valid_levels = ["error", "warn", "info", "debug", "trace"];
     let level = if valid_levels.contains(&level.as_str()) {

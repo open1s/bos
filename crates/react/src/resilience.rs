@@ -427,9 +427,12 @@ impl ReActResilience {
         for attempt in 0..=max_retries {
             // Rate limit check - use acquire() to wait when about to exceed
             if let Some(limiter) = &self.rate_limiter {
+                log::debug!("[Resilience] Attempt {}/{}: rate_limit check", attempt + 1, max_retries + 1);
                 if limiter.acquire().await.is_err() {
+                    log::warn!("[Resilience] Rate limited, attempt {}/{}", attempt + 1, max_retries + 1);
                     if attempt < max_retries {
                         let duration = base_backoff * (1 << attempt).min(6);
+                        log::info!("[Resilience] Retrying in {:?}", duration);
                         tokio::time::sleep(duration).await;
                         continue;
                     }
@@ -439,9 +442,13 @@ impl ReActResilience {
 
             // 2) Circuit breaker check
             if let Some(breaker) = &self.circuit_breaker {
+                log::debug!("[Resilience] Circuit breaker state: {:?}", breaker.get_state());
                 match breaker.check() {
                     Ok(()) => {}
-                    Err(ResilienceError::CircuitOpen) => return Err(ResilienceError::CircuitOpen),
+                    Err(ResilienceError::CircuitOpen) => {
+                        log::warn!("[Resilience] Circuit breaker is OPEN");
+                        return Err(ResilienceError::CircuitOpen);
+                    }
                     Err(ResilienceError::RateLimited) => {
                         let duration = base_backoff * (1 << attempt).min(6);
                         tokio::time::sleep(duration).await;
@@ -474,8 +481,14 @@ impl ReActResilience {
             // 5) Record outcome in circuit breaker
             if let Some(breaker) = &self.circuit_breaker {
                 match &result {
-                    Ok(_) => breaker.record_success(),
-                    Err(_) => breaker.record_failure(),
+                    Ok(_) => {
+                        log::debug!("[Resilience] Success, closing circuit if open");
+                        breaker.record_success();
+                    }
+                    Err(e) => {
+                        log::warn!("[Resilience] Failure recorded: {:?}", e);
+                        breaker.record_failure();
+                    }
                 }
             }
 

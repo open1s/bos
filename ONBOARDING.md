@@ -25,12 +25,18 @@ async with BrainOS() as brain:
 **JavaScript**:
 
 ```javascript
-const { BrainOS, ToolDef } = require('brainos');
+const { BrainOS, tool } = require('@open1s/jsbos/brainos');
 
-const addTool = new ToolDef('add', 'Add', (args) => args.a + args.b, ...);
+class AddTool {
+  @tool('Add two numbers')
+  add(a, b) {
+    return a + b;
+  }
+}
+
 const brain = new BrainOS();
 await brain.start();
-const agent = brain.agent('assistant').register(addTool);
+const agent = brain.agent('assistant').withTools(new AddTool());
 const result = await agent.ask('What is 2+2?');
 ```
 
@@ -43,39 +49,39 @@ The Python and JavaScript APIs are intentionally consistent -- `brain.agent("nam
 ### System Architecture
 
 ```
-  Application Code (Python/JS/Rust)
-  |
-  | Tool calls, agent.ask()
-  v
+Application Code (Python/JS/Rust)
+|
+| Tool calls, agent.ask()
+v
 +------------------------+
 | Python/JS Bindings     |
-| pybos / jsbos          |
+| brainos / brainos.js   |
 +------------------------+
-  |
-  | Calls through bus
-  v
+|
+| Calls through bus
+v
 +------------------------+
 | ReAct Engine           |
 | crates/react           |
 +------------------------+
-  |
-  | Skills, Tools, LLM
-  v
+|
+| Skills, Tools, LLM
+v
 +----------------+------------------+
-| Agent Framework | Tool Registry   |
-| crates/agent    | (extensible)    |
+| Agent Framework| Tool Registry    |
+| crates/agent   | (extensible)     |
 +----------------+------------------+
-  |
-  | All cross-crate communication
-  v
+|
+| All cross-crate communication
+v
 +------------------------+
 | Event Bus              |
 | crates/bus             |
 | Pub/Sub, Query, RPC    |
 +------------------------+
-  |
-  | Config, Logging, Memory
-  v
+|
+| Config, Logging, Memory
+v
 +------------------------+
 | Infrastructure Layer   |
 | config/ logging/ react |
@@ -87,17 +93,18 @@ The Python and JavaScript APIs are intentionally consistent -- `brain.agent("nam
 ```
 bos/
 ├── crates/
-│   ├── agent/      # Agent lifecycle, skills, tools, LLM providers
-│   ├── bus/        # Pub/sub, query/response, RPC messaging
-│   ├── config/     # TOML/YAML/env config loading
-│   ├── logging/    # Tracing and observability
-│   ├── react/      # ReAct reasoning + acting engine
-│   ├── pybos/      # Python bindings (pip install brainos)
-│   ├── jsbos/      # Node.js bindings (npm install brainos)
-│   └── qserde/     # Serialization utilities
-├── docs/           # User guides and API references
-├── examples/       # Usage examples
-└── Cargo.toml      # Workspace manifest
+│   ├── agent/          # Agent lifecycle, skills, tools, LLM providers
+│   ├── bus/            # Pub/sub, query/response, RPC messaging
+│   ├── config/         # TOML/YAML/env config loading
+│   ├── logging/        # Tracing and observability
+│   ├── react/          # ReAct reasoning + acting engine
+│   ├── pybos/          # Python bindings (pip install brainos)
+│   │   └── brainos/    # High-level Python wrapper
+│   └── jsbos/          # Node.js bindings (@open1s/jsbos)
+│       └── brainos.js  # High-level JavaScript wrapper
+├── docs/               # User guides and API references
+├── examples/           # Usage examples
+└── Cargo.toml          # Workspace manifest
 ```
 
 | Module | Responsibility |
@@ -107,8 +114,10 @@ bos/
 | `crates/react/` | ReAct loop: reasoning, action dispatch, memory, resilience |
 | `crates/config/` | Config file loading, env var overrides, schema validation |
 | `crates/logging/` | Tracing spans, structured logs, metrics exporters |
-| `crates/pybos/` | Python cding (maturin) exposing Rust API to Python |
+| `crates/pybos/` | Python bindings (maturin) exposing Rust API to Python |
+| `crates/pybos/brainos/` | High-level Python wrapper with @tool decorator |
 | `crates/jsbos/` | Node.js bindings (NAPI-RS) exposing Rust API to JS |
+| `crates/jsbos/brainos.js` | High-level JavaScript wrapper with @tool decorator |
 
 ### Crate Dependencies
 
@@ -118,7 +127,7 @@ All cross-crate communication flows through `bus`.
 agent ──► bus, config, logging, react
 pybos ──► agent, bus, config
 jsbos ──► agent, bus, config
-react  ──► agent, bus, config, logging
+react ──► agent, bus, config, logging
 ```
 
 ### External Integrations
@@ -145,7 +154,7 @@ This project appears self-contained with no required external service dependenci
 | `Publisher` | Emits events to a topic |
 | `Subscriber` | Receives events from a topic |
 | `Queryable` | Request/response pattern on a topic |
-| `ReAct Engine | Reasoning + Acting loop that orchestrates agent execution |
+| `ReAct Engine` | Reasoning + Acting loop that orchestrates agent execution |
 | `Session` | Isolated execution context with scoped bus communication |
 | Circuit Breaker | Resilience pattern that fails fast after repeated failures |
 | `ConfigLoader.discover()` | Auto-loads `~/.bos/conf/config.toml` |
@@ -167,7 +176,7 @@ This project appears self-contained with no required external service dependenci
 User calls agent.ask("What is 2+2?")
 |
 v
-Python/JS binding (pybos/jsbos)
+Python/JS binding (brainos/brainos.js)
 |
 v
 ReAct Engine.run() - starts reasoning loop
@@ -221,7 +230,7 @@ Agent uses tool at runtime via ReAct engine
 
 ### Setup
 
-Prerequisites: Rust 1.70+, Python 3.10+ or Node.js 18+, maturin (for Python bindings)
+Prerequisites: Rust 1.70+, Python 3.9+ or Node.js 18+, maturin (for Python bindings)
 
 ```bash
 # Clone and enter the project
@@ -262,12 +271,12 @@ RUST_LOG=debug cargo test -p agent
 This project uses **jj (jujutsu)** instead of git. Key commands:
 
 ```bash
-jj status        # See working tree status
-jj new           # Create a new change
+jj status               # See working tree status
+jj new                  # Create a new change
 jj describe -m "<crate>: <description>"  # Describe your change
-jj log           # View the change stack
-jj edit <change_id>   # Edit an existing change
-jj squash        # Squash into parent change
+jj log                  # View the change stack
+jj edit <change_id>     # Edit an existing change
+jj squash               # Squash into parent change
 jj rebase -r <change_id> -d <destination>  # Reorder changes
 ```
 
@@ -309,7 +318,7 @@ jj rebase -r <change_id> -d <destination>  # Reorder changes
 ## Documentation
 
 - [README.md](README.md) -- Project overview and quick start
-- [ARCHITECTURE.md](ARCHITECTURE.md) -- Detailed system architecture (747 lines)
+- [ARCHITECTURE.md](ARCHITECTURE.md) -- Detailed system architecture
 - [docs/python-user-guide.md](docs/python-user-guide.md) -- Python API guide
 - [docs/javascript-user-guide.md](docs/javascript-user-guide.md) -- JavaScript API guide
 - [docs/rust-user-guide.md](docs/rust-user-guide.md) -- Rust API guide

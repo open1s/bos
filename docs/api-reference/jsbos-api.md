@@ -105,13 +105,12 @@ const agent = await Agent.create({
   apiKey: "sk-...",
   // Circuit Breaker - prevents cascading failures
   circuitBreakerMaxFailures: 5,      // failures before opening circuit
-  circuitBreakerCooldownSecs: 30,    // seconds before attempting recovery
-  
+  circuitBreakerCooldownSecs: 30,      // seconds before attempting recovery
   // Rate Limiter - prevents 429 errors
-  rateLimitCapacity: 40,              // max requests per window
-  rateLimitWindowSecs: 60,            // window duration in seconds
+  rateLimitCapacity: 40,            // max requests per window
+  rateLimitWindowSecs: 60,          // window duration in seconds
   rateLimitMaxRetries: 3,             // retry attempts on rate limit
-  rateLimitRetryBackoffSecs: 1,       // backoff between retries
+  rateLimitRetryBackoffSecs: 1,        // backoff between retries
   rateLimitAutoWait: true,            // auto-wait when rate limited
 });
 ```

@@ -525,6 +525,11 @@ impl ReActEngineBuilder {
     }
 
     pub fn resilience(mut self, resilience: ReActResilience) -> Self {
+        log::debug!(
+            "[ReActEngine] Resilience enabled: circuit_state={:?}, rate_limit_remaining={:?}",
+            resilience.circuit_state(),
+            resilience.rate_limit_remaining()
+        );
         self.resilience = Some(resilience);
         self
     }
@@ -771,6 +776,11 @@ impl ReActEngine {
     /// Call LLM with optional resilience wrapper.
     pub async fn call_llm(&self, request: LlmRequest) -> Result<LlmResponse, ReactError> {
         let result = if let Some(ref resilience) = self.resilience {
+            log::debug!(
+                "[ReActEngine] call_llm with resilience: remaining={:?}, circuit={:?}",
+                resilience.rate_limit_remaining(),
+                resilience.circuit_state()
+            );
             let llm = &self.llm;
             let request = request.clone();
             resilience
@@ -778,6 +788,7 @@ impl ReActEngine {
                 .await
                 .map_err(ReactError::from)?
         } else {
+            log::debug!("[ReActEngine] call_llm without resilience (direct)");
             self.llm.complete(request).await.map_err(ReactError::from)?
         };
 
@@ -792,6 +803,11 @@ impl ReActEngine {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send + '_>>, ReactError>
     {
         if let Some(ref resilience) = self.resilience {
+            log::debug!(
+                "[ReActEngine] call_llm_stream with resilience: remaining={:?}, circuit={:?}",
+                resilience.rate_limit_remaining(),
+                resilience.circuit_state()
+            );
             let llm = &self.llm;
             let request = request.clone();
             // Apply resilience to the future that produces the stream
@@ -801,6 +817,7 @@ impl ReActEngine {
             Ok(stream_result)
         } else {
             // Without resilience, just await and return the stream
+            log::debug!("[ReActEngine] call_llm_stream without resilience (direct)");
             let stream = self.llm.stream_complete(request).await?;
             Ok(stream)
         }
