@@ -7,12 +7,15 @@
 use async_trait::async_trait;
 use bus::Publisher;
 use futures::FutureExt;
+use react::runtime::ReActApp;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
+
+use crate::agent::context::{AgentReactContext, AgentSession};
 
 /// Events that can be hooked into during agent execution
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -114,23 +117,15 @@ pub trait AgentHook: Send + Sync + 'static {
 }
 
 /// Decision returned by hooks to control execution flow
-#[derive(Debug, Clone, Default)]
-pub enum HookDecision {
-    /// Continue with normal execution
-    #[default]
-    Continue,
-    /// Abort execution immediately
-    Abort,
-    /// Abort with an error
-    Error(String),
-}
+/// Re-exports react::runtime::HookDecision for unified type across the codebase.
+pub use react::runtime::HookDecision;
 
 /// Registry for managing hooks
 #[derive(Default, Clone)]
 pub struct HookRegistry {
-    hooks: Arc<RwLock<HashMap<HookEvent, Vec<Arc<dyn AgentHook>>>>>,
+    hooks: Arc<Mutex<HashMap<HookEvent, Vec<Arc<dyn AgentHook>>>>>,
     bus_enabled: Arc<AtomicBool>,
-    bus_publishers: Arc<RwLock<HashMap<HookEvent, Publisher>>>,
+    bus_publishers: Arc<Mutex<HashMap<HookEvent, Publisher>>>,
 }
 
 impl HookRegistry {
@@ -140,42 +135,45 @@ impl HookRegistry {
     }
 
     /// Register a hook for an event
-    pub async fn register(&self, event: HookEvent, hook: Arc<dyn AgentHook>) {
-        let mut hooks = self.hooks.write().await;
+    pub fn register(&self, event: HookEvent, hook: Arc<dyn AgentHook>) {
+        let mut hooks = self.hooks.lock().unwrap();
         hooks.entry(event).or_insert_with(Vec::new).push(hook);
     }
 
-    pub fn register_blocking(&self, event: HookEvent, hook: Arc<dyn AgentHook>) {
-        block_on_future(self.register(event, hook));
-    }
-
     /// Get all hooks registered for an event
-    pub async fn get_hooks(&self, event: &HookEvent) -> Vec<Arc<dyn AgentHook>> {
-        let hooks = self.hooks.read().await;
+    pub fn get_hooks(&self, event: &HookEvent) -> Vec<Arc<dyn AgentHook>> {
+        let hooks = self.hooks.lock().unwrap();
         hooks.get(event).cloned().unwrap_or_default()
     }
 
-    pub fn get_hooks_blocking(&self, event: &HookEvent) -> Vec<Arc<dyn AgentHook>> {
-        block_on_future(self.get_hooks(event))
-    }
-
-    pub async fn has_hooks(&self, event: &HookEvent) -> bool {
-        let hooks = self.hooks.read().await;
+    pub fn has_hooks(&self, event: &HookEvent) -> bool {
+        let hooks = self.hooks.lock().unwrap();
         hooks.get(event).map(|v| !v.is_empty()).unwrap_or(false)
     }
 
+    pub fn register_blocking(&self, event: HookEvent, hook: Arc<dyn AgentHook>) {
+        self.register(event, hook);
+    }
+
+    pub fn get_hooks_blocking(&self, event: &HookEvent) -> Vec<Arc<dyn AgentHook>> {
+        self.get_hooks(event)
+    }
+
     pub fn has_hooks_blocking(&self, event: &HookEvent) -> bool {
-        block_on_future(self.has_hooks(event))
+        self.has_hooks(event)
+    }
+
+    pub fn trigger_blocking(&self, event: HookEvent, context: HookContext) -> HookDecision {
+        block_on_future(self.trigger(event, context))
     }
 
     /// Trigger all hooks for an event and aggregate decisions
     pub async fn trigger(&self, event: HookEvent, context: HookContext) -> HookDecision {
-        let hooks = self.get_hooks(&event).await;
+        let hooks = self.get_hooks(&event);
         let mut final_decision = HookDecision::Continue;
         for hook in hooks {
-            let decision = AssertUnwindSafe(hook.on_event(event.clone(), &context))
-                .catch_unwind()
-                .await;
+            let wrapped = AssertUnwindSafe(hook.on_event(event.clone(), &context));
+            let decision = wrapped.catch_unwind().await;
             let decision = match decision {
                 Ok(d) => d,
                 Err(_) => {
@@ -194,13 +192,8 @@ impl HookRegistry {
         final_decision
     }
 
-    pub fn trigger_blocking(&self, event: HookEvent, context: HookContext) -> HookDecision {
-        block_on_future(self.trigger(event, context))
-    }
-
     /// Trigger event to both callbacks and bus (if enabled)
     pub async fn trigger_all(&self, event: HookEvent, context: HookContext) {
-        // Trigger callback hooks
         match self.trigger(event.clone(), context.clone()).await {
             HookDecision::Continue => {}
             HookDecision::Abort => {
@@ -217,24 +210,19 @@ impl HookRegistry {
                 );
             }
         }
-
-        // Publish to bus if enabled
-        if self.bus_enabled.load(Ordering::Acquire) {
-            self.publish_to_bus(&event, &context).await;
-        }
     }
 
     pub fn trigger_all_blocking(&self, event: HookEvent, context: HookContext) {
-        block_on_future(self.trigger_all(event, context));
+        block_on_future(self.trigger_all(event, context))
     }
 
     /// Enable bus publishing for this registry
-    pub async fn enable_bus(&self, enabled: bool) {
+    pub fn enable_bus(&self, enabled: bool) {
         self.bus_enabled.store(enabled, Ordering::Release);
     }
 
     /// Check if bus is enabled
-    pub async fn is_bus_enabled(&self) -> bool {
+    pub fn is_bus_enabled(&self) -> bool {
         self.bus_enabled.load(Ordering::Acquire)
     }
 
@@ -243,36 +231,128 @@ impl HookRegistry {
     }
 
     /// Register a publisher for a specific event type
-    pub async fn register_bus_publisher(&self, event: HookEvent, publisher: Publisher) {
-        let mut publishers = self.bus_publishers.write().await;
+    pub fn register_bus_publisher(&self, event: HookEvent, publisher: Publisher) {
+        let mut publishers = self.bus_publishers.lock().unwrap();
         publishers.insert(event, publisher);
     }
 
-    /// Publish event to bus
-    async fn publish_to_bus(&self, event: &HookEvent, context: &HookContext) {
-        let publishers = self.bus_publishers.read().await;
-        if let Some(publisher) = publishers.get(event) {
-            let payload = HookPayload::new(event, context);
-            if let Err(e) = publisher.publish(&payload).await {
-                log::warn!("Failed to publish hook event to bus: {}", e);
-            }
-        }
-    }
-
     /// Unregister all hooks for an event
-    pub async fn clear(&self, event: &HookEvent) {
-        let mut hooks = self.hooks.write().await;
+    pub fn clear(&self, event: &HookEvent) {
+        let mut hooks = self.hooks.lock().unwrap();
         hooks.remove(event);
     }
 
     /// Unregister all hooks
-    pub async fn clear_all(&self) {
-        let mut hooks = self.hooks.write().await;
+    pub fn clear_all(&self) {
+        let mut hooks = self.hooks.lock().unwrap();
         hooks.clear();
     }
 
     pub fn clear_all_blocking(&self) {
-        block_on_future(self.clear_all());
+        self.clear_all();
+    }
+}
+
+impl ReActApp for HookRegistry {
+    type Session = AgentSession;
+    type Context = AgentReactContext;
+
+    fn name(&self) -> &str {
+        "hook_registry"
+    }
+
+    async fn before_llm_call(
+        &self,
+        req: &mut react::llm::LlmRequest,
+        _session: &mut Self::Session,
+        _context: &mut Self::Context,
+    ) -> HookDecision {
+        let mut ctx = HookContext::new("");
+        ctx.set("model", &req.model);
+        match self.trigger(HookEvent::BeforeLlmCall, ctx).await {
+            HookDecision::Continue => HookDecision::Continue,
+            HookDecision::Abort => HookDecision::Abort,
+            HookDecision::Error(msg) => HookDecision::Error(msg),
+        }
+    }
+
+    async fn after_llm_response(
+        &self,
+        _response: &mut react::llm::LlmResponse,
+        _session: &mut Self::Session,
+        _context: &mut Self::Context,
+    ) {
+        let ctx = HookContext::new("");
+        let _ = self.trigger(HookEvent::AfterLlmCall, ctx).await;
+    }
+
+    async fn after_llm_response_step(
+        &self,
+        response_text: &str,
+        had_tool_call: bool,
+        _session: &mut Self::Session,
+        _context: &mut Self::Context,
+    ) {
+        let mut ctx = HookContext::new("");
+        ctx.set("response_type", "stream");
+        ctx.set("response_text", response_text);
+        ctx.set("had_tool_call", &had_tool_call.to_string());
+        let _ = self.trigger(HookEvent::AfterLlmCall, ctx).await;
+    }
+
+    async fn before_tool_call(
+        &self,
+        tool_name: &str,
+        args: &mut Value,
+        _session: &mut Self::Session,
+        _context: &mut Self::Context,
+    ) -> HookDecision {
+        let mut ctx = HookContext::new("");
+        ctx.set("tool_name", tool_name);
+        ctx.set("tool_args", args.to_string());
+        match self.trigger(HookEvent::BeforeToolCall, ctx).await {
+            HookDecision::Continue => HookDecision::Continue,
+            HookDecision::Abort => HookDecision::Abort,
+            HookDecision::Error(msg) => HookDecision::Error(msg),
+        }
+    }
+
+    async fn after_tool_result(
+        &self,
+        tool_name: &str,
+        result: &mut Result<Value, react::engine::ReactError>,
+        _session: &mut Self::Session,
+        _context: &mut Self::Context,
+    ) {
+        let mut ctx = HookContext::new("");
+        ctx.set("tool_name", tool_name);
+        ctx.set(
+            "tool_result",
+            &result.as_ref().map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let _ = self.trigger(HookEvent::AfterToolCall, ctx).await;
+    }
+
+    async fn on_thought(
+        &self,
+        thought: &str,
+        _session: &mut Self::Session,
+        _context: &mut Self::Context,
+    ) {
+        let mut ctx = HookContext::new("");
+        ctx.set("thought", thought);
+        let _ = self.trigger(HookEvent::OnMessage, ctx).await;
+    }
+
+    async fn on_final_answer(
+        &self,
+        answer: &str,
+        _session: &mut Self::Session,
+        _context: &mut Self::Context,
+    ) {
+        let mut ctx = HookContext::new("");
+        ctx.set("result", answer);
+        let _ = self.trigger(HookEvent::OnComplete, ctx).await;
     }
 }
 
@@ -295,7 +375,6 @@ fn block_on_future<F: Future>(future: F) -> F::Output {
 mod tests {
     use super::*;
 
-    /// Test hook that tracks events
     #[derive(Debug, Clone)]
     struct TestHook {
         events: Arc<std::sync::Mutex<Vec<HookEvent>>>,
@@ -317,58 +396,50 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_hook_registry_register() {
+    #[test]
+    fn test_hook_registry_register() {
         let registry = HookRegistry::new();
         let hook = Arc::new(TestHook::new());
 
-        registry
-            .register(HookEvent::AfterToolCall, hook.clone())
-            .await;
+        registry.register(HookEvent::AfterToolCall, hook.clone());
 
-        let hooks = registry.get_hooks(&HookEvent::AfterToolCall).await;
+        let hooks = registry.get_hooks(&HookEvent::AfterToolCall);
         assert_eq!(hooks.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_hook_registry_multiple_events() {
+    #[test]
+    fn test_hook_registry_multiple_events() {
         let registry = HookRegistry::new();
         let hook = Arc::new(TestHook::new());
 
-        registry
-            .register(HookEvent::AfterToolCall, hook.clone())
-            .await;
-        registry.register(HookEvent::OnComplete, hook.clone()).await;
+        registry.register(HookEvent::AfterToolCall, hook.clone());
+        registry.register(HookEvent::OnComplete, hook.clone());
 
-        let tool_hooks = registry.get_hooks(&HookEvent::AfterToolCall).await;
-        let complete_hooks = registry.get_hooks(&HookEvent::OnComplete).await;
+        let tool_hooks = registry.get_hooks(&HookEvent::AfterToolCall);
+        let complete_hooks = registry.get_hooks(&HookEvent::OnComplete);
 
         assert_eq!(tool_hooks.len(), 1);
         assert_eq!(complete_hooks.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_hook_registry_different_hooks() {
+    #[test]
+    fn test_hook_registry_different_hooks() {
         let registry = HookRegistry::new();
         let hook1 = Arc::new(TestHook::new());
         let hook2 = Arc::new(TestHook::new());
 
-        registry
-            .register(HookEvent::AfterToolCall, hook1.clone())
-            .await;
-        registry
-            .register(HookEvent::OnComplete, hook2.clone())
-            .await;
+        registry.register(HookEvent::AfterToolCall, hook1.clone());
+        registry.register(HookEvent::OnComplete, hook2.clone());
 
-        let tool_hooks = registry.get_hooks(&HookEvent::AfterToolCall).await;
-        let complete_hooks = registry.get_hooks(&HookEvent::OnComplete).await;
+        let tool_hooks = registry.get_hooks(&HookEvent::AfterToolCall);
+        let complete_hooks = registry.get_hooks(&HookEvent::OnComplete);
 
         assert_eq!(tool_hooks.len(), 1);
         assert_eq!(complete_hooks.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_hook_event_variants() {
+    #[test]
+    fn test_hook_event_variants() {
         let event1 = HookEvent::BeforeToolCall;
         let event2 = HookEvent::BeforeToolCall;
         let event3 = HookEvent::AfterToolCall;
@@ -377,16 +448,16 @@ mod tests {
         assert_ne!(event1, event3);
     }
 
-    #[tokio::test]
-    async fn test_hook_context_new() {
+    #[test]
+    fn test_hook_context_new() {
         let context = HookContext::new("test-agent");
 
         assert_eq!(context.agent_id, "test-agent");
         assert!(context.data.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_hook_context_with_data() {
+    #[test]
+    fn test_hook_context_with_data() {
         let mut context = HookContext::new("test-agent");
         context.set("tool_name", "bash");
 
@@ -417,9 +488,7 @@ mod tests {
         }
 
         let registry = HookRegistry::new();
-        registry
-            .register(HookEvent::BeforeLlmCall, Arc::new(PanicHook))
-            .await;
+        registry.register(HookEvent::BeforeLlmCall, Arc::new(PanicHook));
 
         let decision = registry
             .trigger(HookEvent::BeforeLlmCall, HookContext::new("agent"))

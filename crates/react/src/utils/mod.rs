@@ -264,70 +264,70 @@ impl StreamExtractor for XmlExtractor {
                 } else if b == b'"' {
                     self.in_string = false;
                 }
-i += 1;
-            continue;
-        }
+                i += 1;
+                continue;
+            }
 
-        if b == b'<' {
-            let next = buf.get(i + 1).copied();
-            if next == Some(b'/') {
-                // Closing tag
-                let name_start = i + 2;
-                let name_end = find_tag_end(buf, name_start);
-                if let Some(name) = get_tag_name(buf, name_start, name_end) {
-                    let tag_end = name_end + 1;
-                    if let Some(idx) = self.stack.iter().position(|(n, _)| n == &name) {
-                        let (_, open_pos) = self.stack[idx];
-                        self.stack.remove(idx);
-                        let level = self.stack.len() + 1;
-                        let parent_idx = self.stack.len();
+            if b == b'<' {
+                let next = buf.get(i + 1).copied();
+                if next == Some(b'/') {
+                    // Closing tag
+                    let name_start = i + 2;
+                    let name_end = find_tag_end(buf, name_start);
+                    if let Some(name) = get_tag_name(buf, name_start, name_end) {
+                        let tag_end = name_end + 1;
+                        if let Some(idx) = self.stack.iter().position(|(n, _)| n == &name) {
+                            let (_, open_pos) = self.stack[idx];
+                            self.stack.remove(idx);
+                            let level = self.stack.len() + 1;
+                            let parent_idx = self.stack.len();
 
-                        spans.push(Span {
-                            start: self.arena.start + open_pos,
-                            end: self.arena.start + tag_end,
-                            level,
-                            parent_idx: None,
-                        });
+                            spans.push(Span {
+                                start: self.arena.start + open_pos,
+                                end: self.arena.start + tag_end,
+                                level,
+                                parent_idx: None,
+                            });
 
-                        if parent_idx > 0 {
-                            if let Some(last) = spans.last_mut() {
-                                last.parent_idx = Some(parent_idx - 1);
+                            if parent_idx > 0 {
+                                if let Some(last) = spans.last_mut() {
+                                    last.parent_idx = Some(parent_idx - 1);
+                                }
                             }
                         }
                     }
-                }
-} else if next == Some(b'!') || next == Some(b'?') {
-                // Skip
-            } else {
-                let name_start = i + 1;
-                let name_end = find_tag_end(buf, name_start);
-                if let Some(name) = get_tag_name(buf, name_start, name_end) {
-                    let is_void = name_end < buf.len() && buf[name_end] == b'/';
-                    if is_void {
-                        let end = name_end + 2;
-                        let level = self.stack.len() + 1;
-                        let parent_idx = self.stack.len();
+                } else if next == Some(b'!') || next == Some(b'?') {
+                    // Skip
+                } else {
+                    let name_start = i + 1;
+                    let name_end = find_tag_end(buf, name_start);
+                    if let Some(name) = get_tag_name(buf, name_start, name_end) {
+                        let is_void = name_end < buf.len() && buf[name_end] == b'/';
+                        if is_void {
+                            let end = name_end + 2;
+                            let level = self.stack.len() + 1;
+                            let parent_idx = self.stack.len();
 
-                        spans.push(Span {
-                            start: self.arena.start + i,
-                            end: self.arena.start + end,
-                            level,
-                            parent_idx: None,
-                        });
+                            spans.push(Span {
+                                start: self.arena.start + i,
+                                end: self.arena.start + end,
+                                level,
+                                parent_idx: None,
+                            });
 
-                        if parent_idx > 0 {
-                            if let Some(last) = spans.last_mut() {
-                                last.parent_idx = Some(parent_idx - 1);
+                            if parent_idx > 0 {
+                                if let Some(last) = spans.last_mut() {
+                                    last.parent_idx = Some(parent_idx - 1);
+                                }
                             }
+                        } else {
+                            self.stack.push((name, i));
                         }
-                    } else {
-                        self.stack.push((name, i));
                     }
                 }
             }
-        }
 
-        i += 1;
+            i += 1;
         }
 
         self.scan = i;
@@ -441,9 +441,8 @@ pub struct MixedExtractorV2 {
 impl StreamExtractor for MixedExtractorV2 {
     type Item<'a> = StreamSpan;
     fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>> {
-        self.push_typed(chunk).map(|typed| {
-            typed.into_iter().map(|t| t.span).collect::<Vec<_>>()
-        })
+        self.push_typed(chunk)
+            .map(|typed| typed.into_iter().map(|t| t.span).collect::<Vec<_>>())
     }
 
     fn extract<'a>(&'a self, span: &Span) -> &'a [u8] {
@@ -515,7 +514,7 @@ impl MixedExtractorV2 {
                 .cmp(&a.span.level)
                 .then(a.span.start.cmp(&b.span.start))
         });
-    
+
         Some(typed)
     }
 
@@ -592,7 +591,9 @@ fn json_nested_partia_with_plain_text() {
 fn xml_nested() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root><child><value>1</value></child></root>"#).unwrap();
+    let spans = ex
+        .push(r#"<root><child><value>1</value></child></root>"#)
+        .unwrap();
 
     assert_eq!(spans.len(), 3);
 
@@ -626,7 +627,9 @@ fn xml_self_closing() {
 fn xml_with_attributes() {
     let mut ex = XmlExtractor::default();
 
-    let spans = ex.push(r#"<root id="1" class="foo"><child name="x"/></root>"#).unwrap();
+    let spans = ex
+        .push(r#"<root id="1" class="foo"><child name="x"/></root>"#)
+        .unwrap();
 
     assert_eq!(spans.len(), 1);
 
@@ -910,7 +913,9 @@ fn mixed_reset() {
 fn mixed_v2_both() {
     let mut ex = MixedExtractorV2::default();
 
-    let typed = ex.push_typed(r#"{"key":"value"}<root><item/></root>"#).unwrap();
+    let typed = ex
+        .push_typed(r#"{"key":"value"}<root><item/></root>"#)
+        .unwrap();
 
     assert_eq!(typed.len(), 3);
 

@@ -1,7 +1,7 @@
 use react::llm::vendor::{
     ChatCompletionResponse, ChatMessage, Choice, FunctionCall, OpenAiVendorBuilder, ToolCall,
 };
-use react::llm::{LlmClient, LlmResponse};
+use react::llm::{LlmClient, LlmContext, LlmResponse, LlmSession};
 
 fn make_text_response(content: String, is_final: bool) -> LlmResponse {
     LlmResponse::OpenAI(ChatCompletionResponse {
@@ -81,7 +81,7 @@ fn test_openai_vendor_builder_with_model() {
         .build()
         .expect("Should build vendor");
 
-    assert!(vendor.supports_tools());
+    assert!(LlmClient::<LlmSession, LlmContext>::supports_tools(&vendor));
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn test_openai_vendor_builder_with_endpoint() {
         .build()
         .expect("Should build vendor");
 
-    assert!(vendor.supports_tools());
+    assert!(LlmClient::<LlmSession, LlmContext>::supports_tools(&vendor));
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn test_openai_vendor_builder_with_api_key() {
         .build()
         .expect("Should build vendor");
 
-    assert!(vendor.supports_tools());
+    assert!(LlmClient::<LlmSession, LlmContext>::supports_tools(&vendor));
 }
 
 #[test]
@@ -114,8 +114,11 @@ fn test_openai_vendor_builder_fluent() {
         .build()
         .expect("Should build vendor");
 
-    assert!(vendor.supports_tools());
-    assert_eq!(vendor.provider_name(), "openai");
+    assert!(LlmClient::<LlmSession, LlmContext>::supports_tools(&vendor));
+    assert_eq!(
+        LlmClient::<LlmSession, LlmContext>::provider_name(&vendor),
+        "openai"
+    );
 }
 
 #[test]
@@ -186,5 +189,8 @@ async fn test_vendor_clonable() {
         .expect("Should build");
 
     let cloned = vendor.clone();
-    assert_eq!(cloned.provider_name(), vendor.provider_name());
+    assert_eq!(
+        LlmClient::<LlmSession, LlmContext>::provider_name(&cloned),
+        LlmClient::<LlmSession, LlmContext>::provider_name(&vendor)
+    );
 }

@@ -1,10 +1,14 @@
 pub mod nvidia;
 pub mod openai;
+pub mod openaicompatible;
 pub mod openrouter;
 pub mod router;
-pub mod openaicompatible;
 pub use nvidia::NvidiaVendor;
 pub use openai::{OpenAiClient, OpenAiVendor, OpenAiVendorBuilder};
+pub use openaicompatible::{
+    ChatCompletionChunk, ChatCompletionResponse, ChatMessage, Choice, ChunkChoice, Delta,
+    FunctionCall, FunctionCallDelta, LogProbContent, LogProbs, OpenAIExtractor, ToolCall,
+    ToolCallDelta, Usage,
+};
 pub use openrouter::OpenRouterVendor;
 pub use router::LlmRouter;
-pub use openaicompatible::{OpenAIExtractor, ChatCompletionResponse, ChatMessage, Choice, ToolCall, FunctionCall, Delta, ChunkChoice, ChatCompletionChunk, Usage, LogProbs, LogProbContent, FunctionCallDelta, ToolCallDelta};

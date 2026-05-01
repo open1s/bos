@@ -14,21 +14,39 @@ pub trait ReactContext {
     fn tools(&self) -> Option<Vec<LlmTool>>;
     fn rules(&self) -> Option<Vec<Rule>>;
     fn instructions(&self) -> Option<Vec<Instruction>>;
+
+    fn notify_request(&self, _req: &LlmRequest) {}
+    fn notify_response(&self, _resp: &super::LlmResponse) {}
+    fn notify_error(&self, _err: &LlmError) {}
+    fn on_chunk(&self, _chunk: &str) {}
+    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
+        None
+    }
 }
 
 impl ReactContext for () {
     fn session_id(&self) -> String {
         "unit_session".to_string()
     }
-    fn skills(&self) -> Option<Vec<Skill>> { None }
-    fn tools(&self) -> Option<Vec<LlmTool>> { None }
-    fn rules(&self) -> Option<Vec<Rule>> { None }
-    fn instructions(&self) -> Option<Vec<Instruction>> { None }
+    fn skills(&self) -> Option<Vec<Skill>> {
+        None
+    }
+    fn tools(&self) -> Option<Vec<LlmTool>> {
+        None
+    }
+    fn rules(&self) -> Option<Vec<Rule>> {
+        None
+    }
+    fn instructions(&self) -> Option<Vec<Instruction>> {
+        None
+    }
 }
 
 impl ReactSession for () {
     fn push(&mut self, _msg: LlmMessage) {}
-    fn history(&self) -> Option<Vec<LlmMessage>> { None }
+    fn history(&self) -> Option<Vec<LlmMessage>> {
+        None
+    }
 }
 
 pub trait Stringfy: Serialize + for<'de> Deserialize<'de> {
@@ -79,7 +97,11 @@ pub enum VendorBuilderError {
 
 impl From<reqwest::Error> for LlmError {
     fn from(e: reqwest::Error) -> Self {
-        if e.is_timeout() { LlmError::Timeout } else { LlmError::Http(e.to_string()) }
+        if e.is_timeout() {
+            LlmError::Timeout
+        } else {
+            LlmError::Http(e.to_string())
+        }
     }
 }
 
@@ -89,9 +111,15 @@ impl From<reqwest::Error> for LlmError {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum LlmMessage {
-    System { content: String },
-    User { content: String },
-    Assistant { content: String },
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+    },
     AssistantToolCall {
         tool_call_id: String,
         name: String,
@@ -105,15 +133,25 @@ pub enum LlmMessage {
 
 impl LlmMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self::System { content: content.into() }
+        Self::System {
+            content: content.into(),
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self::User { content: content.into() }
+        Self::User {
+            content: content.into(),
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self::Assistant { content: content.into() }
+        Self::Assistant {
+            content: content.into(),
+        }
     }
-    pub fn assistant_tool_call(id: impl Into<String>, name: impl Into<String>, args: Value) -> Self {
+    pub fn assistant_tool_call(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        args: Value,
+    ) -> Self {
         Self::AssistantToolCall {
             tool_call_id: id.into(),
             name: name.into(),
@@ -223,13 +261,13 @@ pub struct LlmRequest {
 impl LlmRequest {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
-                    model: model.into(),
-                    input: String::new(),
-                    temperature: Some(0.7),
-                    max_tokens: None,
-                    top_p: None,
-                    top_k: None,
-                }
+            model: model.into(),
+            input: String::new(),
+            temperature: Some(0.7),
+            max_tokens: None,
+            top_p: None,
+            top_k: None,
+        }
     }
 
     pub fn temperature(mut self, temp: f32) -> Self {
@@ -273,7 +311,9 @@ pub struct LlmSession {
 
 impl LlmSession {
     pub fn new() -> Self {
-        Self { history: Vec::new() }
+        Self {
+            history: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, msg: LlmMessage) {

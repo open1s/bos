@@ -830,7 +830,11 @@ impl PyAgent {
         })
     }
 
-    fn _stream_placeholder_<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
+    fn _stream_placeholder_<'py>(
+        &self,
+        py: Python<'py>,
+        task: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let agent = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
 
@@ -850,7 +854,8 @@ impl PyAgent {
                         Ok(StreamToken::ReasoningContent(text)) => Ok(serde_json::json!({
                             "type": "thinking",
                             "text": text
-                        }).to_string()),
+                        })
+                        .to_string()),
                         Ok(StreamToken::ToolCall { name, args, id }) => Ok(serde_json::json!({
                             "type": "tool_call",
                             "name": name,
@@ -1260,7 +1265,11 @@ impl PyAgent {
         json_to_py(py, &context).map(|py_obj| py_obj.into_bound(py))
     }
 
-    fn set_session_context<'py>(&self, _py: Python<'py>, context: &Bound<'py, PyAny>) -> PyResult<()> {
+    fn set_session_context<'py>(
+        &self,
+        _py: Python<'py>,
+        context: &Bound<'py, PyAny>,
+    ) -> PyResult<()> {
         let context_value: serde_json::Value = py_to_json(context)?;
         let mut guard = self
             .inner

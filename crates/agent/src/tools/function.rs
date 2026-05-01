@@ -1,7 +1,6 @@
-use async_trait::async_trait;
 use std::sync::Arc;
 
-use super::{Tool, ToolDescription, ToolError};
+use react::tool::{Tool, ToolError};
 
 /// A wrapper that converts an async function into a Tool implementation.
 ///
@@ -9,7 +8,7 @@ use super::{Tool, ToolDescription, ToolError};
 #[allow(clippy::type_complexity)]
 pub struct FunctionTool {
     name: String,
-    description: ToolDescription,
+    description: String,
     schema: serde_json::Value,
     func: Arc<dyn Fn(&serde_json::Value) -> Result<serde_json::Value, ToolError> + Send + Sync>,
     skill: bool,
@@ -26,10 +25,7 @@ impl FunctionTool {
     {
         Self {
             name: name.to_string(),
-            description: ToolDescription {
-                short: description.to_string(),
-                parameters: "JSON object with function parameters".to_string(),
-            },
+            description: description.to_string(),
             schema,
             func: Arc::new(func),
             skill: false,
@@ -43,10 +39,7 @@ impl FunctionTool {
     {
         Self {
             name: name.to_string(),
-            description: ToolDescription {
-                short: description.to_string(),
-                parameters: "JSON object with function parameters".to_string(),
-            },
+            description: description.to_string(),
             schema,
             func: Arc::new(func),
             skill: true,
@@ -91,13 +84,12 @@ impl FunctionTool {
     }
 }
 
-#[async_trait]
 impl Tool for FunctionTool {
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn description(&self) -> ToolDescription {
+    fn description(&self) -> String {
         self.description.clone()
     }
 
@@ -105,7 +97,7 @@ impl Tool for FunctionTool {
         self.schema.clone()
     }
 
-    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         (self.func)(args)
     }
 
@@ -113,8 +105,8 @@ impl Tool for FunctionTool {
         self.skill
     }
 
-    fn category(&self) -> &str {
-        &self.category
+    fn category(&self) -> String {
+        self.category.clone()
     }
 }
 
@@ -132,7 +124,7 @@ mod tests {
         );
 
         assert_eq!(tool.name(), "echo");
-        assert_eq!(tool.description().short, "Echo the input");
+        assert_eq!(tool.description(), "Echo the input");
     }
 
     #[test]
@@ -141,10 +133,10 @@ mod tests {
             FunctionTool::numeric("add", "Add two numbers", 2, |args: &serde_json::Value| {
                 let a = args["a"]
                     .as_f64()
-                    .ok_or_else(|| ToolError::ExecutionFailed("a required".to_string()))?;
+                    .ok_or_else(|| ToolError::Failed("a required".to_string()))?;
                 let b = args["b"]
                     .as_f64()
-                    .ok_or_else(|| ToolError::ExecutionFailed("b required".to_string()))?;
+                    .ok_or_else(|| ToolError::Failed("b required".to_string()))?;
                 Ok(serde_json::json!(a + b))
             });
 
@@ -155,8 +147,8 @@ mod tests {
         assert_eq!(schema["required"], serde_json::json!(["a", "b"]));
     }
 
-    #[tokio::test]
-    async fn test_function_tool_execute() {
+    #[test]
+    fn test_function_tool_execute() {
         let tool = FunctionTool::numeric(
             "multiply",
             "Multiply two numbers",
@@ -164,16 +156,16 @@ mod tests {
             |args: &serde_json::Value| {
                 let a = args["a"]
                     .as_f64()
-                    .ok_or_else(|| ToolError::ExecutionFailed("a required".to_string()))?;
+                    .ok_or_else(|| ToolError::Failed("a required".to_string()))?;
                 let b = args["b"]
                     .as_f64()
-                    .ok_or_else(|| ToolError::ExecutionFailed("b required".to_string()))?;
+                    .ok_or_else(|| ToolError::Failed("b required".to_string()))?;
                 Ok(serde_json::json!(a * b))
             },
         );
 
         let args = serde_json::json!({"a": 3.0, "b": 4.0});
-        let result = tool.execute(&args).await.unwrap();
+        let result = tool.run(&args).unwrap();
         assert_eq!(result, serde_json::json!(12.0));
     }
 }

@@ -1,2 +1,2 @@
 pub mod app;
-pub use app::{ReActApp, NoopApp};
+pub use app::{HookDecision, NoopApp, ReActApp};

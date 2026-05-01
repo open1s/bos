@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use async_stream::stream;
 use async_trait::async_trait;
 use bus::{Caller, Session, ZenohError, DEFAULT_CODEC};
 use futures::{Stream, StreamExt};
@@ -10,9 +11,10 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use zenoh::query::{ConsolidationMode, Query as ZenohQuery};
 
-use crate::agent::agentic::Agent;
-use crate::error::{AgentError, ToolError};
-use crate::tools::{Tool, ToolDescription};
+use crate::agent::Agent;
+use crate::error::AgentError;
+use react::tool::Tool;
+pub use react::ToolError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentRpcRequest {
@@ -39,7 +41,7 @@ fn encode_response(resp: AgentRpcResponse) -> Result<String, String> {
 
 fn decode_response(payload: &str) -> Result<AgentRpcResponse, ToolError> {
     serde_json::from_str(payload)
-        .map_err(|e| ToolError::ExecutionFailed(format!("invalid response JSON: {}", e)))
+        .map_err(|e| ToolError::Failed(format!("invalid response JSON: {}", e)))
 }
 
 type RpcResponseStream = Pin<Box<dyn Stream<Item = Result<String, ToolError>> + Send>>;
@@ -62,13 +64,13 @@ impl RpcTransport for BusCallerTransport {
         self.caller
             .call::<String, String>(&payload.to_string())
             .await
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
+            .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
     async fn request_stream(&self, payload: &str) -> Result<RpcResponseStream, ToolError> {
         let bytes = DEFAULT_CODEC
             .encode(&payload.to_string())
-            .map_err(|e| ToolError::ExecutionFailed(format!("encode request failed: {}", e)))?;
+            .map_err(|e| ToolError::Failed(format!("encode request failed: {}", e)))?;
 
         let replies = self
             .session
@@ -76,7 +78,7 @@ impl RpcTransport for BusCallerTransport {
             .payload(bytes)
             .consolidation(ConsolidationMode::None)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         tokio::spawn(async move {
@@ -92,7 +94,7 @@ impl RpcTransport for BusCallerTransport {
                             }
                             Err(e) => {
                                 let _ = tx
-                                    .send(Err(ToolError::ExecutionFailed(format!(
+                                    .send(Err(ToolError::Failed(format!(
                                         "decode response failed: {}",
                                         e
                                     ))))
@@ -102,9 +104,7 @@ impl RpcTransport for BusCallerTransport {
                         }
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(ToolError::ExecutionFailed(e.to_string())))
-                            .await;
+                        let _ = tx.send(Err(ToolError::Failed(e.to_string()))).await;
                         break;
                     }
                 }
@@ -154,13 +154,13 @@ impl AgentRpcClient {
 
     async fn invoke_rpc(&self, req: AgentRpcRequest) -> Result<serde_json::Value, ToolError> {
         let payload = serde_json::to_string(&req)
-            .map_err(|e| ToolError::ExecutionFailed(format!("encode request failed: {}", e)))?;
+            .map_err(|e| ToolError::Failed(format!("encode request failed: {}", e)))?;
         let response_payload = self.transport.request(&payload).await?;
         let response = decode_response(&response_payload)?;
         if response.ok {
             Ok(response.result.unwrap_or(serde_json::Value::Null))
         } else {
-            Err(ToolError::ExecutionFailed(
+            Err(ToolError::Failed(
                 response.error.unwrap_or_else(|| "remote error".to_string()),
             ))
         }
@@ -171,7 +171,7 @@ impl AgentRpcClient {
         req: AgentRpcRequest,
     ) -> Result<RpcResponseStream, ToolError> {
         let payload = serde_json::to_string(&req)
-            .map_err(|e| ToolError::ExecutionFailed(format!("encode request failed: {}", e)))?;
+            .map_err(|e| ToolError::Failed(format!("encode request failed: {}", e)))?;
         self.transport.request_stream(&payload).await
     }
 
@@ -228,7 +228,7 @@ impl AgentRpcClient {
             })
             .await?;
 
-        stream = async_stream::_stream_placeholder_! {
+        let stream = stream! {
             tokio::pin!(response_stream);
             while let Some(item) = response_stream.next().await {
                 match item {
@@ -242,7 +242,7 @@ impl AgentRpcClient {
                         };
 
                         if !response.ok {
-                            yield Err(ToolError::ExecutionFailed(
+                            yield Err(ToolError::Failed(
                                 response.error.unwrap_or_else(|| "remote error".to_string()),
                             ));
                             break;
@@ -308,7 +308,7 @@ impl AgentRpcClient {
             }
         };
 
-        Ok(Box::pin(_stream_placeholder_))
+        Ok(Box::pin(stream))
     }
 
     /// Run remote stream endpoint and aggregate response for compatibility.
@@ -339,33 +339,6 @@ impl AgentRpcClient {
         }
         Ok(serde_json::json!({ "text": text, "chunks": chunks }))
     }
-}
-
-fn tool_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "method": {
-                "type": "string",
-                "enum": ["llm/run", "stream/run", "tool/list", "tool/call"],
-                "description": "Remote operation"
-            },
-            "task": {
-                "type": "string",
-                "description": "Required for method=llm/run or stream/run"
-            },
-            "tool_name": {
-                "type": "string",
-                "description": "Required for method=tool/call"
-            },
-            "args": {
-                "type": "object",
-                "description": "Arguments for remote tool call"
-            }
-        },
-        "required": ["method"],
-        "additionalProperties": false
-    })
 }
 
 async fn handle_rpc_request(agent: Arc<Agent>, req: AgentRpcRequest) -> AgentRpcResponse {
@@ -434,7 +407,7 @@ async fn handle_rpc_request(agent: Arc<Agent>, req: AgentRpcRequest) -> AgentRpc
                     .map(|(name, tool)| {
                         serde_json::json!({
                             "name": name,
-                            "description": tool.description().short,
+                            "description": tool.description(),
                             "parameters": tool.json_schema(),
                         })
                     })
@@ -452,11 +425,9 @@ async fn handle_rpc_request(agent: Arc<Agent>, req: AgentRpcRequest) -> AgentRpc
             let tool_name = req.tool_name.unwrap_or_default();
             let tool_args = req.args.unwrap_or_else(|| serde_json::json!({}));
             let result = if let Some(reg) = agent.registry() {
-                reg.execute(&tool_name, &tool_args).await
+                reg.execute(&tool_name, &tool_args)
             } else {
-                Err(ToolError::ExecutionFailed(
-                    "tool registry not available".to_string(),
-                ))
+                Err(ToolError::Failed("tool registry not available".to_string()))
             };
             match result {
                 Ok(value) => AgentRpcResponse {
@@ -546,27 +517,19 @@ impl AgentCallerTool {
     }
 }
 
-#[async_trait]
 impl Tool for AgentCallerTool {
     fn name(&self) -> &str {
         &self.tool_name
     }
 
-    fn description(&self) -> ToolDescription {
-        ToolDescription {
-            short: format!(
-                "Call remote agent via bus endpoint '{}' using method=llm/run/stream/run/tool/list/tool/call",
-                self.client.endpoint()
-            ),
-            parameters: "JSON object".to_string(),
-        }
+    fn description(&self) -> String {
+        format!(
+            "Call remote agent via bus endpoint '{}' using method=llm/run/stream/run/tool/list/tool/call",
+            self.client.endpoint()
+        )
     }
 
-    fn json_schema(&self) -> serde_json::Value {
-        tool_schema()
-    }
-
-    async fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         let method = args
             .get("method")
             .and_then(|v| v.as_str())
@@ -582,34 +545,35 @@ impl Tool for AgentCallerTool {
             })
             .unwrap_or_else(|| "tool/list".to_string());
 
+        let rt = tokio::runtime::Handle::current();
         match method.as_str() {
             "llm/run" | "llm_run" => {
                 let task = args
                     .get("task")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::ExecutionFailed("missing 'task'".to_string()))?;
-                self.llm_run(task.to_string()).await
+                    .ok_or_else(|| ToolError::Failed("missing 'task'".to_string()))?;
+                rt.block_on(self.llm_run(task.to_string()))
             }
             "stream/run" | "stream_run" => {
                 let task = args
                     .get("task")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::ExecutionFailed("missing 'task'".to_string()))?;
-                self.stream_run(task.to_string()).await
+                    .ok_or_else(|| ToolError::Failed("missing 'task'".to_string()))?;
+                rt.block_on(self.stream_run(task.to_string()))
             }
-            "tool/list" => self.list().await,
+            "tool/list" => rt.block_on(self.list()),
             "tool/call" => {
                 let tool_name = args
                     .get("tool_name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::ExecutionFailed("missing 'tool_name'".to_string()))?;
+                    .ok_or_else(|| ToolError::Failed("missing 'tool_name'".to_string()))?;
                 let call_args = args
                     .get("args")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                self.call(tool_name.to_string(), call_args).await
+                rt.block_on(self.call(tool_name.to_string(), call_args))
             }
-            _ => Err(ToolError::ExecutionFailed(
+            _ => Err(ToolError::Failed(
                 "method must be one of: llm/run, stream/run, tool/list, tool/call".to_string(),
             )),
         }
@@ -817,6 +781,8 @@ async fn handle_incoming_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::agentic::{Agent, AgentConfig, LlmProvider};
+    use crate::agent::context::{AgentReactContext, AgentSession};
     use crate::tools::FunctionTool;
     use futures::Stream;
     use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
@@ -853,22 +819,24 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmClient for MockLlm {
-        type SessionType = ();
-        type ContextType = ();
-
-        async fn complete(&self, _req: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> Result<LlmResponse, LlmError> {
+    impl LlmClient<AgentSession, AgentReactContext> for MockLlm {
+        async fn complete(
+            &self,
+            _req: LlmRequest,
+            _session: &mut AgentSession,
+            _context: &mut AgentReactContext,
+        ) -> Result<LlmResponse, LlmError> {
             Ok(make_text_response("mock-complete".to_string()))
         }
 
         async fn stream_complete(
             &self,
             _req: LlmRequest,
-            _session: &mut Self::SessionType,
-            _context: &mut Self::ContextType,
+            _session: &mut AgentSession,
+            _context: &mut AgentReactContext,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError>
         {
-            Ok(Box::pin(futures::_stream_placeholder_::iter(vec![
+            Ok(Box::pin(futures::stream::iter(vec![
                 Ok(StreamToken::Text("s1".to_string())),
                 Ok(StreamToken::Text("s2".to_string())),
                 Ok(StreamToken::Done),
@@ -909,8 +877,21 @@ mod tests {
         }
     }
 
+    fn make_llm_provider() -> LlmProvider {
+        let mut provider = LlmProvider::new();
+        provider.register_vendor("mock".to_string(), Box::new(MockLlm));
+        provider
+    }
+
+    fn make_test_config() -> AgentConfig {
+        AgentConfig {
+            model: "mock/gpt-4".to_string(),
+            ..AgentConfig::default()
+        }
+    }
+
     fn make_test_agent_with_echo_tool() -> Arc<Agent> {
-        let mut agent = Agent::new(crate::AgentConfig::default(), Arc::new(MockLlm));
+        let mut agent = Agent::new(make_test_config(), Arc::new(make_llm_provider()));
         agent
             .try_add_tool(Arc::new(FunctionTool::new(
                 "echo_json",
@@ -966,7 +947,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_rpc_llm_run() {
-        let agent = Arc::new(Agent::new(crate::AgentConfig::default(), Arc::new(MockLlm)));
+        let agent = Arc::new(Agent::new(
+            make_test_config(),
+            Arc::new(make_llm_provider()),
+        ));
         let resp = handle_rpc_request(
             agent,
             AgentRpcRequest {
@@ -1153,7 +1137,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_rpc_stream_run() {
-        let agent = Arc::new(Agent::new(crate::AgentConfig::default(), Arc::new(MockLlm)));
+        let agent = Arc::new(Agent::new(
+            make_test_config(),
+            Arc::new(make_llm_provider()),
+        ));
         let resp = handle_rpc_request(
             agent,
             AgentRpcRequest {
@@ -1179,35 +1166,22 @@ mod tests {
         let config = zenoh::Config::default();
         let session = Arc::new(zenoh::open(config).await.unwrap());
 
-        let llm = Arc::new(react::llm::vendor::OpenAiClient::new(
-            "https://api.openai.com/v1".to_string(),
-            "gpt-4".to_string(),
-            "dummy".to_string(),
-        ));
-        let mut callee = Agent::new(crate::AgentConfig::default(), llm);
-        callee
-            .try_add_tool(Arc::new(FunctionTool::new(
-                "echo_json",
-                "echo args",
-                serde_json::json!({"type":"object"}),
-                |args| Ok(args.clone()),
-            )))
-            .unwrap();
-
-        let mut server =
-            AgentCallableServer::new("agent/rpc/test-callee", session.clone(), Arc::new(callee));
+        let callee = make_test_agent_with_echo_tool();
+        let mut server = AgentCallableServer::new("agent/rpc/test-callee", session.clone(), callee);
         server.start().await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let tool = AgentCallerTool::new("call_callee", "agent/rpc/test-callee", session);
-        let result = tool
-            .execute(&serde_json::json!({
+        let result = tokio::task::spawn_blocking(move || {
+            tool.run(&serde_json::json!({
                 "method":"tool/call",
                 "tool_name":"echo_json",
                 "args":{"k":"v"}
             }))
-            .await
-            .unwrap();
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(result, serde_json::json!({"k":"v"}));
     }
 }

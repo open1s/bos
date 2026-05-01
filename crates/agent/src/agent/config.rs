@@ -4,9 +4,10 @@ use std::sync::Arc;
 use serde::Deserialize;
 use zenoh::Session as ZenohSession;
 
-use crate::agent::agentic::{Agent, AgentConfig};
+use crate::agent::agentic::LlmProvider;
+use crate::agent::{Agent, AgentConfig};
 use crate::error::AgentError;
-use crate::tools::{FunctionTool, Tool, ToolRegistry};
+use crate::tools::{FunctionTool, Tool};
 use react::llm::vendor::OpenAiClient;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -145,21 +146,26 @@ impl TomlAgentBuilder {
             .map(|tools| tools.iter().map(|t| t.to_openai_tool()).collect())
     }
 
-    pub async fn build(self, session: Option<Arc<ZenohSession>>) -> Result<Agent, AgentError> {
-        let llm = Arc::new(OpenAiClient::new(
-            self.config.base_url.clone(),
-            self.config.model.clone(),
-            self.config.api_key.clone(),
-        ));
+    pub async fn build(self, _session: Option<Arc<ZenohSession>>) -> Result<Agent, AgentError> {
+        let mut llm = LlmProvider::new();
+        llm.register_vendor(
+            "openai".to_string(),
+            Box::new(OpenAiClient::new(
+                self.config.base_url.clone(),
+                self.config.model.clone(),
+                self.config.api_key.clone(),
+            )),
+        );
+        let llm = Arc::new(llm);
 
         let config: AgentConfig = self.config.clone().into();
 
-        let mut registry = ToolRegistry::new();
+        let mut agent = Agent::new(config, llm);
+
         for tool in self.tools {
-            registry.register(tool)?;
+            agent.try_add_tool(tool)?;
         }
 
-        // Load tools from config if specified
         if let Some(toml_tools) = self.config.tools {
             for toml_tool in toml_tools {
                 if let Some(schema) = toml_tool.schema {
@@ -169,32 +175,10 @@ impl TomlAgentBuilder {
                         schema,
                         |_args| Ok(serde_json::json!("tool not yet implemented")),
                     ));
-                    registry.register(tool)?;
+                    agent.try_add_tool(tool)?;
                 }
             }
         }
-
-        // Register bus tools if session is provided
-        if let Some(session) = session {
-            let _ = session;
-        }
-
-        let agent = Agent::builder()
-            .name(config.name.clone())
-            .model(config.model.clone())
-            .base_url(config.base_url.clone())
-            .api_key(config.api_key.clone())
-            .system_prompt(config.system_prompt.clone())
-            .temperature(config.temperature)
-            .max_tokens(config.max_tokens.unwrap_or(4096))
-            .timeout(config.timeout_secs)
-            .context_compaction_threshold_tokens(config.context_compaction_threshold_tokens)
-            .context_compaction_trigger_ratio(config.context_compaction_trigger_ratio)
-            .context_compaction_keep_recent_messages(config.context_compaction_keep_recent_messages)
-            .context_compaction_max_summary_chars(config.context_compaction_max_summary_chars)
-            .context_compaction_summary_max_tokens(config.context_compaction_summary_max_tokens)
-            .tools(registry.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>())
-            .build_with_llm(llm)?;
 
         Ok(agent)
     }

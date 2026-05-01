@@ -1,6 +1,7 @@
+use crate::telemetry::TokenUsage;
+use futures::Stream;
 use serde_json::Value;
 use std::pin::Pin;
-use futures::Stream;
 
 use super::types::LlmError;
 
@@ -12,11 +13,26 @@ pub enum LlmResponse {
     OpenAI(ChatCompletionResponse),
 }
 
+impl LlmResponse {
+    pub fn usage(&self) -> Option<TokenUsage> {
+        match self {
+            LlmResponse::OpenAI(rsp) => rsp
+                .usage
+                .as_ref()
+                .map(|u| TokenUsage::new(u.prompt_tokens, u.completion_tokens)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamToken {
     Text(String),
     ReasoningContent(String),
-    ToolCall { name: String, args: Value, id: Option<String> },
+    ToolCall {
+        name: String,
+        args: Value,
+        id: Option<String>,
+    },
     Done,
 }
 
@@ -39,7 +55,9 @@ where
             _marker: std::marker::PhantomData,
         }
     }
-    pub fn index(&self) -> usize { self.index }
+    pub fn index(&self) -> usize {
+        self.index
+    }
     pub fn push(&mut self, chunk: &str) -> Option<Vec<T>> {
         self.response.push_str(chunk);
         let (index, token) = (self.handler)(&self.response, self.index);
@@ -53,6 +71,6 @@ where
 }
 
 pub use crate::llm::vendor::openaicompatible::{
-    ChatCompletionResponse, ChatMessage, Choice, ToolCall, FunctionCall, Delta, ChunkChoice,
-    ChatCompletionChunk, Usage, LogProbs, LogProbContent, FunctionCallDelta, ToolCallDelta,
+    ChatCompletionChunk, ChatCompletionResponse, ChatMessage, Choice, ChunkChoice, Delta,
+    FunctionCall, FunctionCallDelta, LogProbContent, LogProbs, ToolCall, ToolCallDelta, Usage,
 };

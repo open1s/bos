@@ -1,19 +1,21 @@
-use crate::llm::{LlmClient, LlmError, LlmHooks, LlmRequest, LlmResponseResult, LlmSession, TokenStream};
+use crate::llm::{
+    LlmClient, LlmError, LlmRequest, LlmResponseResult, ReactContext, ReactSession, TokenStream,
+};
 use async_trait::async_trait;
 use dashmap::DashMap;
 
-pub struct LlmRouter {
-    vendors: DashMap<String, Box<dyn LlmClient<SessionType = LlmSession, ContextType = LlmHooks>>>,
+pub struct LlmRouter<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> {
+    vendors: DashMap<String, Box<dyn LlmClient<S, C>>>,
 }
 
-impl LlmRouter {
+impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmRouter<S, C> {
     pub fn new() -> Self {
         Self {
             vendors: DashMap::new(),
         }
     }
 
-    pub fn register_vendor(&mut self, name: String, vendor: Box<dyn LlmClient<SessionType = LlmSession, ContextType = LlmHooks>>) {
+    pub fn register_vendor(&mut self, name: String, vendor: Box<dyn LlmClient<S, C>>) {
         self.vendors.insert(name, vendor);
     }
 
@@ -29,18 +31,22 @@ impl LlmRouter {
     }
 }
 
-impl Default for LlmRouter {
+impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> Default for LlmRouter<S, C> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl LlmClient for LlmRouter {
-    type SessionType = LlmSession;
-    type ContextType = LlmHooks;
-
-    async fn complete(&self, request: LlmRequest, session: &mut Self::SessionType, context: &mut Self::ContextType) -> LlmResponseResult {
+impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
+    for LlmRouter<S, C>
+{
+    async fn complete(
+        &self,
+        request: LlmRequest,
+        session: &mut S,
+        context: &mut C,
+    ) -> LlmResponseResult {
         let (vendor_id, model_id) = Self::split_model(&request.model);
 
         let vendor = if let Some(vid) = vendor_id {
@@ -62,7 +68,12 @@ impl LlmClient for LlmRouter {
         }
     }
 
-    async fn stream_complete(&self, request: LlmRequest, session: &mut Self::SessionType, context: &mut Self::ContextType) -> Result<TokenStream, LlmError> {
+    async fn stream_complete(
+        &self,
+        request: LlmRequest,
+        session: &mut S,
+        context: &mut C,
+    ) -> Result<TokenStream, LlmError> {
         let (vendor_id, model_id) = Self::split_model(&request.model);
 
         let vendor = if let Some(vid) = vendor_id {
@@ -81,6 +92,10 @@ impl LlmClient for LlmRouter {
         }
     }
 
-    fn supports_tools(&self) -> bool { true }
-    fn provider_name(&self) -> &'static str { "llm-router" }
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn provider_name(&self) -> &'static str {
+        "llm-router"
+    }
 }

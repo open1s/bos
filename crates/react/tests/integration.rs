@@ -4,9 +4,13 @@ use std::sync::Arc;
 
 use react::engine::ReActEngineBuilder;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
-use react::llm::{LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession, TokenStream};
-use react::tool::{Tool, ToolError};
+use react::llm::{
+    LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    TokenStream,
+};
 use react::runtime::ReActApp;
+use react::tool::registry::ToolVariant;
+use react::tool::{Tool, ToolError};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -88,11 +92,13 @@ fn make_text_response(content: String, is_final: bool) -> LlmResponse {
 }
 
 #[async_trait]
-impl LlmClient for MockLlm {
-    type SessionType = LlmSession;
-    type ContextType = LlmContext;
-
-    async fn complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> LlmResponseResult {
+impl LlmClient<LlmSession, LlmContext> for MockLlm {
+    async fn complete(
+        &self,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> LlmResponseResult {
         let responses = self.responses.clone();
         let idx = self.index.clone();
         let i = idx.load(Ordering::SeqCst);
@@ -105,7 +111,12 @@ impl LlmClient for MockLlm {
         Ok(make_text_response(text, is_final))
     }
 
-    async fn stream_complete(&self, _request: LlmRequest, _session: &mut Self::SessionType, _context: &mut Self::ContextType) -> Result<TokenStream, LlmError> {
+    async fn stream_complete(
+        &self,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> Result<TokenStream, LlmError> {
         Ok(Box::pin(futures::stream::empty()))
     }
 
@@ -126,7 +137,7 @@ async fn test_react_engine_basic() {
 
     let mut engine = ReActEngineBuilder::<TestApp>::new()
         .llm(Box::new(llm))
-        .with_tool(Box::new(TestCalculator))
+        .with_tool(ToolVariant::Sync(Box::new(TestCalculator)))
         .max_steps(2)
         .build()
         .unwrap();

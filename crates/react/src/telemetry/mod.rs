@@ -1,13 +1,28 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TelemetryEvent {
-    LlmCall { model: String, tokens: u32 },
-    ToolCall { tool: String, duration_ms: u64 },
-    Error { error: String },
+    LlmCall {
+        model: String,
+        tokens: u32,
+    },
+    ToolCall {
+        tool: String,
+        duration_ms: u64,
+    },
+    Error {
+        error: String,
+    },
     Checkpoint(serde_json::Value),
-    ToolInvocation { tool: String, input: serde_json::Value, output: serde_json::Value },
-    FinalAnswer { answer: String },
+    ToolInvocation {
+        tool: String,
+        input: serde_json::Value,
+        output: serde_json::Value,
+    },
+    FinalAnswer {
+        answer: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +50,11 @@ impl Telemetry {
                 TelemetryEvent::Checkpoint(data) => {
                     log::debug!("Checkpoint: {}", data);
                 }
-                TelemetryEvent::ToolInvocation { tool, input, output } => {
+                TelemetryEvent::ToolInvocation {
+                    tool,
+                    input,
+                    output,
+                } => {
                     log::debug!("Tool: {} input={} output={}", tool, input, output);
                 }
                 TelemetryEvent::FinalAnswer { answer } => {
@@ -139,20 +158,54 @@ impl TokenBudgetReport {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TokenCounter {
     config: TokenBudgetConfig,
-    current_usage: TokenUsage,
-    total_requests: u64,
+    current_usage: AtomicTokenUsage,
+    total_requests: AtomicU64,
     session_start_tokens: u64,
+}
+
+#[derive(Debug)]
+pub struct AtomicTokenUsage {
+    pub prompt_tokens: AtomicU32,
+    pub completion_tokens: AtomicU32,
+    pub total_tokens: AtomicU32,
+}
+
+impl AtomicTokenUsage {
+    pub fn new() -> Self {
+        Self {
+            prompt_tokens: AtomicU32::new(0),
+            completion_tokens: AtomicU32::new(0),
+            total_tokens: AtomicU32::new(0),
+        }
+    }
+
+    pub fn set(&self, usage: TokenUsage) {
+        self.prompt_tokens
+            .store(usage.prompt_tokens, Ordering::Relaxed);
+        self.completion_tokens
+            .store(usage.completion_tokens, Ordering::Relaxed);
+        self.total_tokens
+            .store(usage.total_tokens, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: self.prompt_tokens.load(Ordering::Relaxed),
+            completion_tokens: self.completion_tokens.load(Ordering::Relaxed),
+            total_tokens: self.total_tokens.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl TokenCounter {
     pub fn new(config: TokenBudgetConfig) -> Self {
         Self {
             config,
-            current_usage: TokenUsage::default(),
-            total_requests: 0,
+            current_usage: AtomicTokenUsage::new(),
+            total_requests: AtomicU64::new(0),
             session_start_tokens: 0,
         }
     }
@@ -161,19 +214,22 @@ impl TokenCounter {
         Self::new(TokenBudgetConfig::default())
     }
 
-    pub fn update_from_response(&mut self, usage: TokenUsage) {
-        self.current_usage = usage;
-        self.total_requests += 1;
+    pub fn update_from_response(&self, usage: TokenUsage) {
+        self.current_usage.set(usage);
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn estimate_and_update(&mut self, prompt_text: &str) {
+    pub fn estimate_and_update(&self, prompt_text: &str) {
         let estimated = TokenUsage::estimate_from_text(prompt_text);
-        self.current_usage = TokenUsage::new(estimated, 0);
-        self.total_requests += 1;
+        let current = self.current_usage.get();
+        let new_usage =
+            TokenUsage::new(current.prompt_tokens + estimated, current.completion_tokens);
+        self.current_usage.set(new_usage);
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn budget_report(&self) -> TokenBudgetReport {
-        TokenBudgetReport::new(self.current_usage.clone(), &self.config)
+        TokenBudgetReport::new(self.current_usage.get(), &self.config)
     }
 
     pub fn needs_compaction(&self) -> bool {
@@ -185,24 +241,24 @@ impl TokenCounter {
     }
 
     pub fn reset_session(&mut self) {
-        self.session_start_tokens += self.current_usage.total_tokens as u64;
-        self.current_usage = TokenUsage::default();
+        self.session_start_tokens += self.current_usage.get().total_tokens as u64;
+        self.current_usage.set(TokenUsage::default());
     }
 
     pub fn session_total_tokens(&self) -> u64 {
-        self.session_start_tokens + self.current_usage.total_tokens as u64
+        self.session_start_tokens + self.current_usage.get().total_tokens as u64
     }
 
     pub fn total_requests(&self) -> u64 {
-        self.total_requests
+        self.total_requests.load(Ordering::Relaxed)
     }
 
-    pub fn current_usage(&self) -> &TokenUsage {
-        &self.current_usage
+    pub fn current_usage(&self) -> TokenUsage {
+        self.current_usage.get()
     }
 
     pub fn usage(&self) -> TokenUsage {
-        self.current_usage.clone()
+        self.current_usage.get()
     }
 
     pub fn report(&self) -> TokenBudgetReport {

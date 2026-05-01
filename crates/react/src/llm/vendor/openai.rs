@@ -10,14 +10,13 @@ use reqwest::Client;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::llm::types::ReactSession;
 use crate::llm::{
-    LlmClient, LlmError, LlmHooks, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, ReactContext, ReactSession,
     StreamToken, TokenStream, VendorBuilderError,
 };
 
 pub struct OpenAiVendor {
-    client: Client,
+    client: Arc<Client>,
     endpoint: String,
     model: String,
     api_key: Arc<String>,
@@ -26,13 +25,10 @@ pub struct OpenAiVendor {
 impl Clone for OpenAiVendor {
     fn clone(&self) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("Failed to create HTTP client"),
+            client: Arc::clone(&self.client),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
-            api_key: self.api_key.clone(),
+            api_key: Arc::clone(&self.api_key),
         }
     }
 }
@@ -78,10 +74,12 @@ struct FunctionCallJson {
 
 impl OpenAiVendor {
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = Arc::new(
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("Failed to create HTTP client"),
+        );
 
         Self {
             client,
@@ -256,15 +254,14 @@ impl OpenAiVendor {
 }
 
 #[async_trait]
-impl LlmClient for OpenAiVendor {
-    type SessionType = LlmSession;
-    type ContextType = LlmHooks;
-
+impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
+    for OpenAiVendor
+{
     async fn complete(
         &self,
         mut request: LlmRequest,
-        session: &mut Self::SessionType,
-        context: &mut Self::ContextType,
+        session: &mut S,
+        context: &mut C,
     ) -> LlmResponseResult {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
@@ -315,8 +312,8 @@ impl LlmClient for OpenAiVendor {
     async fn stream_complete(
         &self,
         mut request: LlmRequest,
-        session: &mut Self::SessionType,
-        context: &mut Self::ContextType,
+        session: &mut S,
+        context: &mut C,
     ) -> Result<TokenStream, LlmError> {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
@@ -355,7 +352,7 @@ impl LlmClient for OpenAiVendor {
         }
 
         let (tx, rx) = mpsc::channel(32);
-        let on_chunk = context.on_chunk.clone();
+        let on_chunk = context.on_chunk_callback();
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
@@ -529,15 +526,14 @@ impl OpenAiClient {
 }
 
 #[async_trait]
-impl LlmClient for OpenAiClient {
-    type SessionType = LlmSession;
-    type ContextType = LlmHooks;
-
+impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
+    for OpenAiClient
+{
     async fn complete(
         &self,
         req: LlmRequest,
-        session: &mut Self::SessionType,
-        context: &mut Self::ContextType,
+        session: &mut S,
+        context: &mut C,
     ) -> LlmResponseResult {
         self.inner.complete(req, session, context).await
     }
@@ -545,8 +541,8 @@ impl LlmClient for OpenAiClient {
     async fn stream_complete(
         &self,
         req: LlmRequest,
-        session: &mut Self::SessionType,
-        context: &mut Self::ContextType,
+        session: &mut S,
+        context: &mut C,
     ) -> Result<TokenStream, LlmError> {
         self.inner.stream_complete(req, session, context).await
     }
@@ -565,7 +561,7 @@ mod tests {
     use serde::Deserialize;
 
     use crate::llm::vendor::OpenAiVendor;
-    use crate::llm::{LlmClient, LlmHooks, LlmRequest, LlmSession};
+    use crate::llm::{LlmClient, LlmContext, LlmRequest, LlmSession};
 
     #[tokio::test]
     async fn test_openai_vendor() {
@@ -623,7 +619,7 @@ mod tests {
             top_k: None,
         };
         let outcome = vendor
-            .complete(request, &mut LlmSession::new(), &mut LlmHooks::new())
+            .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
             .await;
 
         if let Err(e) = outcome {

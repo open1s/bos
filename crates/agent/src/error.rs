@@ -64,6 +64,12 @@ pub enum ToolError {
     Timeout,
 }
 
+impl From<react::ToolError> for ToolError {
+    fn from(e: react::ToolError) -> Self {
+        ToolError::ExecutionFailed(e.to_string())
+    }
+}
+
 /// Top-level agent errors.
 #[derive(Error, Debug, Clone)]
 pub enum AgentError {
@@ -95,6 +101,25 @@ impl From<ReactLlmError> for AgentError {
 impl From<SkillError> for AgentError {
     fn from(e: SkillError) -> Self {
         AgentError::Session(e.to_string())
+    }
+}
+
+impl From<react::ToolError> for AgentError {
+    fn from(e: react::ToolError) -> Self {
+        AgentError::Tool(ToolError::ExecutionFailed(e.to_string()))
+    }
+}
+
+impl From<crate::error::ToolError> for react::ToolError {
+    fn from(e: crate::error::ToolError) -> Self {
+        match e {
+            crate::error::ToolError::NotFound(s) => react::ToolError::NotFound(s),
+            crate::error::ToolError::SchemaMismatch { message } => {
+                react::ToolError::InvalidInput(message)
+            }
+            crate::error::ToolError::ExecutionFailed(s) => react::ToolError::Failed(s),
+            crate::error::ToolError::Timeout => react::ToolError::Failed("timeout".to_string()),
+        }
     }
 }
 

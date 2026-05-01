@@ -36,7 +36,6 @@ impl From<PluginLlmRequest> for LlmRequestWrapper {
   fn from(req: PluginLlmRequest) -> Self {
     LlmRequestWrapper {
       model: req.model,
-      context: Default::default(),
       temperature: req.temperature.map(|t| t as f32),
       max_tokens: req.max_tokens,
       top_p: req.top_p.map(|p| p as f32),
@@ -310,30 +309,30 @@ impl AgentPlugin for JSPlugin {
       serde_json::json!({"type": "Text", "content": content})
     };
 
-let result = Self::call_js_callback(callback, input)?;
+    let result = Self::call_js_callback(callback, input)?;
 
     if result.get("type").and_then(|v| v.as_str()).is_some() {
-        let LlmResponseWrapper::OpenAI(mut rsp) = response;
-        if let Some(choice) = rsp.choices.first_mut() {
-          if let Some(c) = result.get("content").and_then(|v| v.as_str()) {
-            choice.message.content = Some(c.to_string());
-          }
-          if let Some(name) = result.get("name").and_then(|v| v.as_str()) {
-            if let Some(ref mut tc) = choice.message.tool_calls {
-              if let Some(first_tc) = tc.first_mut() {
-                first_tc.function.name = Some(name.to_string());
-              }
-            }
-          }
-          if let Some(args) = result.get("args") {
-            if let Some(ref mut tc) = choice.message.tool_calls {
-              if let Some(first_tc) = tc.first_mut() {
-                first_tc.function.arguments = Some(args.to_string());
-              }
+      let LlmResponseWrapper::OpenAI(mut rsp) = response;
+      if let Some(choice) = rsp.choices.first_mut() {
+        if let Some(c) = result.get("content").and_then(|v| v.as_str()) {
+          choice.message.content = Some(c.to_string());
+        }
+        if let Some(name) = result.get("name").and_then(|v| v.as_str()) {
+          if let Some(ref mut tc) = choice.message.tool_calls {
+            if let Some(first_tc) = tc.first_mut() {
+              first_tc.function.name = Some(name.to_string());
             }
           }
         }
-        return Some(LlmResponseWrapper::OpenAI(rsp));
+        if let Some(args) = result.get("args") {
+          if let Some(ref mut tc) = choice.message.tool_calls {
+            if let Some(first_tc) = tc.first_mut() {
+              first_tc.function.arguments = Some(args.to_string());
+            }
+          }
+        }
+      }
+      return Some(LlmResponseWrapper::OpenAI(rsp));
     }
     None
   }

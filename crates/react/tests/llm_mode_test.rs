@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use react::engine::ReActEngineBuilder;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
-use react::llm::{LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession, TokenStream};
+use react::llm::{
+    LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    TokenStream,
+};
 use react::runtime::ReActApp;
 
 #[derive(Default)]
@@ -14,11 +17,13 @@ impl ReActApp for TestApp {
 struct MockLlm;
 
 #[async_trait]
-impl LlmClient for MockLlm {
-    type SessionType = LlmSession;
-    type ContextType = LlmContext;
-
-    async fn complete(&self, _request: LlmRequest, _session: &mut LlmSession, _context: &mut LlmContext) -> LlmResponseResult {
+impl LlmClient<LlmSession, LlmContext> for MockLlm {
+    async fn complete(
+        &self,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> LlmResponseResult {
         Ok(LlmResponse::OpenAI(ChatCompletionResponse {
             id: "test".to_string(),
             object: "chat.completion".to_string(),
@@ -44,12 +49,21 @@ impl LlmClient for MockLlm {
         }))
     }
 
-    async fn stream_complete(&self, _request: LlmRequest, _session: &mut LlmSession, _context: &mut LlmContext) -> Result<TokenStream, LlmError> {
+    async fn stream_complete(
+        &self,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> Result<TokenStream, LlmError> {
         Ok(Box::pin(futures::stream::empty()))
     }
 
-    fn supports_tools(&self) -> bool { false }
-    fn provider_name(&self) -> &'static str { "mock" }
+    fn supports_tools(&self) -> bool {
+        false
+    }
+    fn provider_name(&self) -> &'static str {
+        "mock"
+    }
 }
 
 #[tokio::test]

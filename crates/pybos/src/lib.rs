@@ -30,7 +30,9 @@ pub use bus::{PyBus, PyBusConfig};
 pub use caller::{PyCallable, PyCaller};
 pub use config::PyConfigLoader;
 pub use hooks::{PyHookContext, PyHookDecision, PyHookEvent, PyHookRegistry};
-pub use llm_usage::{PyBudgetStatus, PyLlmUsage, PyPromptTokensDetails, PyTokenBudgetReport, PyTokenUsage};
+pub use llm_usage::{
+    PyBudgetStatus, PyLlmUsage, PyPromptTokensDetails, PyTokenBudgetReport, PyTokenUsage,
+};
 pub use mcp::PyMcpClient;
 pub use plugin::{
     PyAgentPlugin, PyLlmRequestWrapper, PyLlmResponseWrapper, PyPluginRegistry, PyToolCallWrapper,

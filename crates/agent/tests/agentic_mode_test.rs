@@ -1,5 +1,5 @@
+use agent::agent::agentic::{Agent, AgentConfig, LlmProvider};
 use agent::error::AgentError;
-use agent::{Agent, AgentConfig};
 use react::llm::vendor::OpenAiVendorBuilder;
 use std::sync::Arc;
 
@@ -11,8 +11,11 @@ async fn test_agent_builds_with_vendor() {
         .build()
         .expect("Failed to build vendor");
 
+    let mut llm = LlmProvider::new();
+    llm.register_vendor("openai".to_string(), Box::new(vendor));
+
     let config = AgentConfig::default();
-    let _agent: Agent = Agent::new(config, Arc::new(vendor));
+    let _agent: Agent = Agent::new(config, Arc::new(llm));
 }
 
 #[tokio::test]
@@ -23,8 +26,11 @@ async fn test_agent_run_simple() {
         .build()
         .expect("Failed to build vendor");
 
+    let mut llm = LlmProvider::new();
+    llm.register_vendor("openai".to_string(), Box::new(vendor));
+
     let config = AgentConfig::default();
-    let agent = Agent::new(config, Arc::new(vendor));
+    let agent = Agent::new(config, Arc::new(llm));
 
     let result: Result<String, AgentError> = agent.run_simple("hi").await;
     // With invalid key, it will error - but no panic

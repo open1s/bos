@@ -1,8 +1,7 @@
-
 use crate::{JsonExtractor, StreamExtractor, StreamSpan};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug,Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -10,13 +9,13 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
-#[derive(Debug,Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: Option<String>,
     pub arguments: Option<String>, // JSON string
 }
 
-#[derive(Debug,Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -25,7 +24,7 @@ pub struct Usage {
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
-#[derive(Debug,Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub audio_tokens: Option<u32>,
@@ -33,18 +32,17 @@ pub struct PromptTokensDetails {
     pub cached_tokens: Option<u32>,
 }
 
-#[derive(Debug,Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogProbs {
     pub content: Option<Vec<LogProbContent>>,
 }
 
-#[derive(Debug,Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogProbContent {
     pub token: String,
     pub logprob: f32,
     pub bytes: Option<Vec<u8>>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FunctionCallDelta {
@@ -67,7 +65,7 @@ pub struct Delta {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<ToolCallDelta>>,
     pub function_call: Option<FunctionCallDelta>,
-    pub reasoning_content: Option<String>
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,7 +73,7 @@ pub struct ChunkChoice {
     pub index: u32,
     pub delta: Delta,
     pub finish_reason: Option<String>,
-    pub logprobs: Option<LogProbs>
+    pub logprobs: Option<LogProbs>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,7 +85,7 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChunkChoice>,
 }
 
-#[derive(Debug,Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<String>,
@@ -106,7 +104,7 @@ pub struct ChatMessage {
     pub extra: serde_json::Value,
 }
 
-#[derive(Debug,Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Choice {
     pub index: u32,
     pub message: ChatMessage,
@@ -116,7 +114,7 @@ pub struct Choice {
     pub logprobs: Option<LogProbs>,
 }
 
-#[derive(Debug,Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String, // "chat.completion"
@@ -129,11 +127,11 @@ pub struct ChatCompletionResponse {
     pub nvext: Option<serde_json::Value>,
 }
 
-pub struct OpenAIExtractor{
+pub struct OpenAIExtractor {
     inner: JsonExtractor,
 }
 
-impl  OpenAIExtractor {
+impl OpenAIExtractor {
     pub fn new(inner: JsonExtractor) -> Self {
         Self { inner }
     }
@@ -155,11 +153,11 @@ impl StreamExtractor for OpenAIExtractor {
         }
         None
     }
-    
+
     fn extract<'a>(&'a self, span: &StreamSpan) -> &'a [u8] {
         self.inner.extract(span)
     }
-    
+
     fn reset(&mut self) {
         self.inner.reset();
     }

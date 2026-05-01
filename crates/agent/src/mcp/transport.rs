@@ -17,8 +17,6 @@ pub struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    #[allow(dead_code)]
-    stderr: tokio::process::ChildStderr,
 }
 
 #[derive(Debug, Clone)]
@@ -27,7 +25,6 @@ pub enum TransportError {
     Process(String),
     NoStdout,
     NoStdin,
-    NoStderr,
 }
 
 impl std::fmt::Display for TransportError {
@@ -37,7 +34,6 @@ impl std::fmt::Display for TransportError {
             Self::Process(s) => write!(f, "Process error: {}", s),
             Self::NoStdout => write!(f, "No stdout"),
             Self::NoStdin => write!(f, "No stdin"),
-            Self::NoStderr => write!(f, "No stderr"),
         }
     }
 }
@@ -56,20 +52,17 @@ impl StdioTransport {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| TransportError::Process(e.to_string()))?;
 
         let stdin = child.stdin.take().ok_or(TransportError::NoStdin)?;
         let stdout = child.stdout.take().ok_or(TransportError::NoStdout)?;
-        let stderr = child.stderr.take().ok_or(TransportError::NoStderr)?;
 
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
-            stderr,
         })
     }
 

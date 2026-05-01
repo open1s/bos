@@ -1,13 +1,7 @@
-use super::{Tool, ToolDescription};
-use crate::error::ToolError;
 use crate::security::WorkspaceValidator;
-use async_trait::async_trait;
-use log::{info, warn};
+use react::tool::{Tool, ToolError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BashToolConfig {
@@ -60,123 +54,6 @@ impl BashTool {
         self.config.workspace_root = Some(workspace_root.to_string());
         self
     }
-
-    fn validate_command(&self, command: &str) -> Result<(), String> {
-        if WorkspaceValidator::is_destructive_command(command) {
-            warn!("[BashTool] Destructive command detected: {}", command);
-            return Err(format!(
-                "Destructive command not allowed: {}. Use with caution.",
-                command
-            ));
-        }
-        if WorkspaceValidator::requires_elevated_privilege(command) {
-            warn!(
-                "[BashTool] Elevated privilege command detected: {}",
-                command
-            );
-            return Err(format!(
-                "Elevated privilege command not allowed: {}",
-                command
-            ));
-        }
-
-        if let Some(ref allowed) = self.config.allowed_commands {
-            if !allowed.iter().any(|c| command.contains(c)) {
-                return Err("Command not in allowed list".to_string());
-            }
-        }
-
-        if let Some(ref denied) = self.config.denied_commands {
-            if denied.iter().any(|c| command.contains(c)) {
-                return Err("Command is in denied list".to_string());
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn execute_streaming(&self, command: &str) -> Result<BashExecutionResult, String> {
-        let validation = self.validate_command(command);
-        if let Err(e) = validation {
-            return Err(e);
-        }
-
-        let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            c.args(["/C", command]);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", command]);
-            c
-        };
-
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-
-        info!("[BashTool] Executing: {}", command);
-
-        let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn: {}", e))?;
-
-        let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
-        let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
-
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
-
-        let mut stdout_output = String::new();
-        let mut stderr_output = String::new();
-
-        loop {
-            tokio::select! {
-                line = stdout_reader.next_line() => {
-                    match line {
-                        Ok(Some(l)) => {
-                            stdout_output.push_str(&l);
-                            stdout_output.push('\n');
-                            info!("[BashTool] stdout: {}", l);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!("[BashTool] stdout error: {}", e);
-                        }
-                    }
-                }
-                line = stderr_reader.next_line() => {
-                    match line {
-                        Ok(Some(l)) => {
-                            stderr_output.push_str(&l);
-                            stderr_output.push('\n');
-                            info!("[BashTool] stderr: {}", l);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!("[BashTool] stderr error: {}", e);
-                        }
-                    }
-                }
-                status = child.wait() => {
-                    match status {
-                        Ok(exit_status) => {
-                            let exit_code = exit_status.code().unwrap_or(-1);
-                            info!("[BashTool] Exit code: {}", exit_code);
-                            return Ok(BashExecutionResult {
-                                stdout: stdout_output,
-                                stderr: stderr_output,
-                                exit_code,
-                                success: exit_status.success(),
-                            });
-                        }
-                        Err(e) => {
-                            return Err(format!("Process error: {}", e));
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,61 +64,54 @@ pub struct BashExecutionResult {
     pub success: bool,
 }
 
-#[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn description(&self) -> ToolDescription {
-        ToolDescription {
-            short: "Execute shell commands with streaming output and exit code propagation"
-                .to_string(),
-            parameters: "JSON object with 'command' (required) and 'working_directory' (optional)"
-                .to_string(),
+    fn description(&self) -> String {
+        "Execute shell commands with streaming output and exit code propagation".to_string()
+    }
+
+    fn category(&self) -> String {
+        "system".to_string()
+    }
+
+    fn run(&self, input: &Value) -> Result<Value, ToolError> {
+        let command = input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or(ToolError::Failed(
+                "Missing required field: command".to_string(),
+            ))?;
+
+        if let Some(ref validator) = self.validator {
+            if WorkspaceValidator::is_destructive_command(command) {
+                return Err(ToolError::Failed(
+                    "Destructive command blocked by security policy".to_string(),
+                ));
+            }
+
+            if WorkspaceValidator::requires_elevated_privilege(command) {
+                return Err(ToolError::Failed(
+                    "Elevated privilege command blocked by security policy".to_string(),
+                ));
+            }
         }
-    }
 
-    fn json_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute"
-                },
-                "working_directory": {
-                    "type": "string",
-                    "description": "Optional working directory for the command"
-                }
-            },
-            "required": ["command"]
-        })
-    }
+        let output = std::process::Command::new("sh")
+            .args(["-c", command])
+            .output()
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-    fn category(&self) -> &str {
-        "system"
-    }
+        let result = BashExecutionResult {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+            success: output.status.success(),
+        };
 
-    fn is_skill(&self) -> bool {
-        false
-    }
-
-    async fn execute(&self, input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
-        let command =
-            input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .ok_or(ToolError::ExecutionFailed(
-                    "Missing required field: command".to_string(),
-                ))?;
-
-        let result = self
-            .execute_streaming(command)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(e))?;
-
-        Ok(serde_json::to_value(result).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?)
+        Ok(serde_json::to_value(result).map_err(|e| ToolError::Failed(e.to_string()))?)
     }
 }
 
@@ -249,32 +119,32 @@ impl Tool for BashTool {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_simple_command() {
+    #[test]
+    fn test_simple_command() {
         let tool = BashTool::new("bash");
         let input = serde_json::json!({ "command": "echo hello" });
-        let result = tool.execute(&input).await;
+        let result = tool.run(&input);
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["stdout"].as_str().unwrap().trim(), "hello");
     }
 
-    #[tokio::test]
-    async fn test_exit_code() {
+    #[test]
+    fn test_exit_code() {
         let tool = BashTool::new("bash");
         let input = serde_json::json!({ "command": "exit 42" });
-        let result = tool.execute(&input).await;
+        let result = tool.run(&input);
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["exit_code"], 42);
         assert!(!value["success"].as_bool().unwrap());
     }
 
-    #[tokio::test]
-    async fn test_destructive_blocked() {
+    #[test]
+    fn test_destructive_blocked() {
         let tool = BashTool::new("bash").with_workspace("/tmp");
         let input = serde_json::json!({ "command": "rm -rf /" });
-        let result = tool.execute(&input).await;
+        let result = tool.run(&input);
         assert!(result.is_err());
     }
 }

@@ -6,13 +6,13 @@ pub use error::{ConfigError, ConfigResult};
 pub use loader::ConfigLoader;
 pub use types::{ConfigFormat, ConfigMergeStrategy};
 
-#[derive(Debug,Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Section {
-    config: serde_json::Value
+    config: serde_json::Value,
 }
 
 impl Section {
-    pub async fn init(&mut self) ->Result<(), String>{
+    pub async fn init(&mut self) -> Result<(), String> {
         let mut loader = ConfigLoader::new().discover();
         if loader.sources().is_empty() {
             return Err(
@@ -20,11 +20,11 @@ impl Section {
             );
         }
         let result = loader
-        .load()
-        .await
-        .map_err(|e| e.to_string())
-        .cloned()
-        .map(|v| v.clone());
+            .load()
+            .await
+            .map_err(|e| e.to_string())
+            .cloned()
+            .map(|v| v.clone());
 
         self.config = result?;
 

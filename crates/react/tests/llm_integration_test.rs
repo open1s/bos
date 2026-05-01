@@ -5,7 +5,7 @@
 
 use config::ConfigLoader;
 use react::llm::vendor::{NvidiaVendor, OpenRouterVendor};
-use react::llm::{LlmClient, LlmHooks, LlmRequest, LlmResponse, LlmSession};
+use react::llm::{LlmClient, LlmContext, LlmRequest, LlmResponse, LlmSession};
 
 /// Configuration extracted from config file for LLM providers.
 #[derive(Debug, Clone)]
@@ -136,7 +136,9 @@ async fn test_nvidia_vendor_with_config() {
 
     // Make a simple request
     let request = make_simple_request(&llm_config.model);
-    let result = vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
+    let result = vendor
+        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .await;
 
     match result {
         Ok(response) => {
@@ -188,7 +190,9 @@ async fn test_nvidia_vendor_stream_with_config() {
 
     // Make a streaming request
     let request = make_simple_request(&llm_config.model);
-    let stream_result = vendor.stream_complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
+    let stream_result = vendor
+        .stream_complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .await;
 
     match stream_result {
         Ok(mut _stream_placeholder_) => {
@@ -270,7 +274,9 @@ async fn test_openrouter_vendor_with_config() {
 
     // Make a simple request
     let request = make_simple_request(&llm_config.model);
-    let result = vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
+    let result = vendor
+        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .await;
 
     match result {
         Ok(response) => {
@@ -325,7 +331,9 @@ async fn test_openrouter_vendor_stream_with_config() {
 
     // Make a streaming request
     let request = make_simple_request(&llm_config.model);
-    let stream_result = vendor.stream_complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
+    let stream_result = vendor
+        .stream_complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .await;
 
     match stream_result {
         Ok(mut _stream_placeholder_) => {
@@ -387,7 +395,9 @@ async fn test_nvidia_vendor_invalid_api_key() {
     );
 
     let request = make_simple_request("nvidia/z-ai/glm4-9b");
-    let result = vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
+    let result = vendor
+        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .await;
 
     // Should return an error (not panic)
     assert!(result.is_err(), "Invalid API key should produce an error");
@@ -406,7 +416,9 @@ async fn test_openrouter_vendor_invalid_api_key() {
     );
 
     let request = make_simple_request("openrouter/meta-llama/llama-3.2-3b-instruct");
-    let result = vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
+    let result = vendor
+        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .await;
 
     // Should return an error (not panic)
     assert!(result.is_err(), "Invalid API key should produce an error");
@@ -449,7 +461,10 @@ async fn test_nvidia_response_parsing() {
         top_p: None,
         top_k: None,
     };
-    let result = match vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await {
+    let result = match vendor
+        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let err_str = e.to_string();
@@ -578,7 +593,10 @@ async fn test_openrouter_response_parsing() {
         top_p: None,
         top_k: None,
     };
-    let result = match vendor.complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await {
+    let result = match vendor
+        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let err_str = e.to_string();
@@ -694,7 +712,9 @@ async fn test_nvidia_tool_calls_stream_with_config() {
         top_k: None,
     };
 
-    let stream_result = vendor.stream_complete(request, &mut LlmSession::new(), &mut LlmHooks::new()).await;
+    let stream_result = vendor
+        .stream_complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .await;
 
     match stream_result {
         Ok(mut _stream_placeholder_) => {
@@ -723,9 +743,7 @@ async fn test_nvidia_tool_calls_stream_with_config() {
                                 tool_call_id = id;
                                 println!(
                                     "ToolCall received: name={}, id={:?}, args={:?}",
-                                    tool_call_name,
-                                    tool_call_id,
-                                    tool_call_args
+                                    tool_call_name, tool_call_id, tool_call_args
                                 );
                             }
                             StreamToken::Done => break,

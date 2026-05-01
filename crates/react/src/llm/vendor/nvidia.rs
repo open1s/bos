@@ -10,10 +10,9 @@ use reqwest::Client;
 use serde::Serialize;
 
 use crate::llm::{
-    LlmClient, LlmError, LlmHooks, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, ReactContext, ReactSession,
     StreamToken, TokenStream, VendorBuilderError,
 };
-use crate::llm::types::ReactSession;
 
 pub struct NvidiaVendor {
     client: Client,
@@ -89,7 +88,7 @@ impl NvidiaVendor {
         req: &LlmRequest,
         session: &impl ReactSession,
         context: &impl crate::llm::types::ReactContext,
-) -> NvidiaRequest {
+    ) -> NvidiaRequest {
         let mut messages = Vec::new();
         let has_history = if let Some(history) = session.history() {
             for message in history.iter().cloned() {
@@ -253,15 +252,14 @@ impl NvidiaVendor {
 }
 
 #[async_trait]
-impl LlmClient for NvidiaVendor {
-    type SessionType = LlmSession;
-    type ContextType = LlmHooks;
-
+impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
+    for NvidiaVendor
+{
     async fn complete(
         &self,
         mut request: LlmRequest,
-        session: &mut Self::SessionType,
-        context: &mut Self::ContextType,
+        session: &mut S,
+        context: &mut C,
     ) -> LlmResponseResult {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
@@ -311,8 +309,8 @@ impl LlmClient for NvidiaVendor {
     async fn stream_complete(
         &self,
         mut request: LlmRequest,
-        session: &mut Self::SessionType,
-        context: &mut Self::ContextType,
+        session: &mut S,
+        context: &mut C,
     ) -> Result<TokenStream, LlmError> {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
@@ -352,7 +350,7 @@ impl LlmClient for NvidiaVendor {
 
         use tokio::sync::mpsc;
         let (tx, rx) = mpsc::channel(32);
-        let on_chunk = context.on_chunk.clone();
+        let on_chunk = context.on_chunk_callback();
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
@@ -511,7 +509,7 @@ mod tests {
     use config::Section;
     use serde::Deserialize;
 
-    use crate::llm::{LlmClient, LlmHooks, LlmRequest, LlmSession};
+    use crate::llm::{LlmClient, LlmRequest, LlmSession};
     use crate::{
         llm::vendor::{NvidiaVendor, OpenAIExtractor},
         JsonExtractor, StreamExtractor,
@@ -589,7 +587,7 @@ mod tests {
             top_k: None,
         };
         let result = match vendor
-            .complete(request, &mut LlmSession::new(), &mut LlmHooks::new())
+            .complete(request, &mut LlmSession::new(), &mut ())
             .await
         {
             Ok(r) => r,

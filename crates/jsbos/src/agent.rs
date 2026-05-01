@@ -817,17 +817,19 @@ impl Agent {
 
   #[napi]
   pub fn token_usage(&self) -> Result<TokenUsage> {
-    let guard = self.inner.lock().map_err(|_| {
-      Error::new(napi::Status::GenericFailure, "Agent lock poisoned")
-    })?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(napi::Status::GenericFailure, "Agent lock poisoned"))?;
     Ok(guard.token_usage().into())
   }
 
   #[napi]
   pub fn token_budget_report(&self) -> Result<TokenBudgetReport> {
-    let guard = self.inner.lock().map_err(|_| {
-      Error::new(napi::Status::GenericFailure, "Agent lock poisoned")
-    })?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(napi::Status::GenericFailure, "Agent lock poisoned"))?;
     Ok(guard.token_budget_report().into())
   }
 }

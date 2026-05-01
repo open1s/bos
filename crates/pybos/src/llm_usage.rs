@@ -1,8 +1,12 @@
 use pyo3::prelude::*;
-use react::llm::vendor::openaicompatible::{PromptTokensDetails as InnerPromptTokensDetails, Usage as InnerUsage};
-use react::token_counter::{TokenUsage as InnerTokenUsage, TokenBudgetReport as InnerTokenBudgetReport, BudgetStatus};
+use react::llm::vendor::openaicompatible::{
+    PromptTokensDetails as InnerPromptTokensDetails, Usage as InnerUsage,
+};
+use react::token_counter::{
+    BudgetStatus, TokenBudgetReport as InnerTokenBudgetReport, TokenUsage as InnerTokenUsage,
+};
 
-#[pyclass(name = "PromptTokensDetails",skip_from_py_object)]
+#[pyclass(name = "PromptTokensDetails", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyPromptTokensDetails {
     #[pyo3(get, set)]
@@ -54,11 +58,7 @@ pub struct PyLlmUsage {
 #[pymethods]
 impl PyLlmUsage {
     #[new]
-    pub fn new(
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        total_tokens: u32,
-    ) -> Self {
+    pub fn new(prompt_tokens: u32, completion_tokens: u32, total_tokens: u32) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
@@ -75,7 +75,7 @@ impl From<&InnerUsage> for PyLlmUsage {
         } else {
             None
         };
-        
+
         Self {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
@@ -87,13 +87,13 @@ impl From<&InnerUsage> for PyLlmUsage {
 
 impl From<PyLlmUsage> for InnerUsage {
     fn from(py_usage: PyLlmUsage) -> Self {
-        let details = py_usage.prompt_tokens_details.map(|d| {
-            InnerPromptTokensDetails {
+        let details = py_usage
+            .prompt_tokens_details
+            .map(|d| InnerPromptTokensDetails {
                 audio_tokens: d.audio_tokens,
                 cached_tokens: d.cached_tokens,
-            }
-        });
-        
+            });
+
         InnerUsage {
             prompt_tokens: py_usage.prompt_tokens,
             completion_tokens: py_usage.completion_tokens,

@@ -9,9 +9,8 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
 
-use crate::llm::types::ReactSession;
 use crate::llm::{
-    LlmClient, LlmError, LlmHooks, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, ReactContext, ReactSession,
     StreamToken, TokenStream, VendorBuilderError,
 };
 
@@ -244,15 +243,14 @@ impl OpenRouterVendor {
 }
 
 #[async_trait]
-impl LlmClient for OpenRouterVendor {
-    type SessionType = LlmSession;
-    type ContextType = LlmHooks;
-
+impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
+    for OpenRouterVendor
+{
     async fn complete(
         &self,
         mut request: LlmRequest,
-        session: &mut Self::SessionType,
-        context: &mut Self::ContextType,
+        session: &mut S,
+        context: &mut C,
     ) -> LlmResponseResult {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
@@ -303,8 +301,8 @@ impl LlmClient for OpenRouterVendor {
     async fn stream_complete(
         &self,
         mut request: LlmRequest,
-        session: &mut Self::SessionType,
-        context: &mut Self::ContextType,
+        session: &mut S,
+        context: &mut C,
     ) -> Result<TokenStream, LlmError> {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
@@ -344,7 +342,7 @@ impl LlmClient for OpenRouterVendor {
 
         use tokio::sync::mpsc;
         let (tx, rx) = mpsc::channel(32);
-        let on_chunk = context.on_chunk.clone();
+        let on_chunk = context.on_chunk_callback();
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
@@ -504,7 +502,7 @@ mod tests {
     use serde::Deserialize;
 
     use crate::llm::vendor::OpenRouterVendor;
-    use crate::llm::{LlmClient, LlmHooks, LlmRequest, LlmSession};
+    use crate::llm::{LlmClient, LlmContext, LlmRequest, LlmSession};
 
     #[tokio::test]
     async fn test_openrouter_vendor() {
@@ -562,7 +560,7 @@ mod tests {
             top_k: None,
         };
         let outcome = vendor
-            .complete(request, &mut LlmSession::new(), &mut LlmHooks::new())
+            .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
             .await;
 
         if let Err(e) = outcome {
