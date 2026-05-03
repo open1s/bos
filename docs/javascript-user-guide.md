@@ -120,6 +120,10 @@ const agent = brain.agent('assistant')
   .withTemperature(0.3)
   .withPrompt('You are a math tutor.')
   .withTimeout(300);
+
+// Add a Bash tool for shell execution
+const agentWithBash = brain.agent('assistant')
+  .withBashTool('bash', '/path/to/workspace');  // name, workspaceRoot
 ```
 
 ### Running the Agent
@@ -134,6 +138,14 @@ const result = await agent.react('Calculate 2 + 2');
 // Simple conversation
 const result = await agent.chat('Hello!');
 const result = await agent.runSimple('Hello!');
+
+// Streaming response
+const result = await agent.stream('Tell me a story', (token) => {
+  process.stdout.write(token);
+});
+
+// Collect all streaming tokens into a string
+const fullResponse = await agent.streamCollect('Tell me a story');
 ```
 
 ### Registering Tools
@@ -257,11 +269,43 @@ The callback receives a `HookContextData` object:
 
 ## Tool Registration
 
-## Tool Registration
+### Using the `tool()` Decorator (Recommended)
 
-### Using the `tool()` Decorator
+The `tool()` decorator is the recommended way to define tools in JavaScript:
 
-Due to JavaScript's limitations with decorators, the recommended approach is using `ToolDef`:
+```javascript
+const { tool } = require('@open1s/jsbos/brainos');
+
+class MyTools {
+  @tool('Add two numbers')
+  add(args) {
+    return args.a + args.b;
+  }
+
+  @tool('Multiply two numbers', { name: 'multiply' })
+  multiply(args) {
+    return args.a * args.b;
+  }
+}
+
+// Create instance and extract tool definitions
+const instance = new MyTools();
+const addTool = instance.add.toolDef;
+const multiplyTool = instance.multiply.toolDef;
+
+// Register with agent
+agent.register(addTool);
+agent.register(multiplyTool);
+
+// Or use registerMany
+agent.registerMany(addTool, multiplyTool);
+```
+
+**Note:** The `@tool` decorator is a function that attaches a `toolDef` property to the method. Access it via `instance.methodName.toolDef`.
+
+### Using `ToolDef` Directly
+
+For simpler cases without class decorators:
 
 ```javascript
 const { ToolDef } = require('@open1s/jsbos/brainos');
@@ -585,13 +629,54 @@ const tools = await client.listTools();
 | Method | Description |
 |--------|-------------|
 | `McpClient.spawn(command, args)` | Spawn an MCP server process |
-| `McpClient.connect_http(url)` | Connect via HTTP |
+| `McpClient.connectHttp(url)` | Connect via HTTP URL |
 | `initialize()` | Initialize MCP connection |
-| `list_tools()` | List available tools |
-| `call_tool(name, args_json)` | Call a tool with JSON args |
-| `list_prompts()` | List available prompts |
-| `list_resources()` | List available resources |
-| `read_resource(uri)` | Read a resource by URI |
+| `listTools()` | List available tools |
+| `callTool(name, argsJson)` | Call a tool with JSON string args |
+| `listPrompts()` | List available prompts |
+| `listResources()` | List available resources |
+| `readResource(uri)` | Read a resource by URI |
+
+---
+
+## Performance and Tracing
+
+### Performance Metrics
+
+```javascript
+const { BrainOS } = require('@open1s/jsbos/brainos');
+
+async function main() {
+  const brain = new BrainOS({ apiKey: 'sk-...' });
+  await brain.start();
+
+  const agent = brain.agent('assistant');
+
+  // Get performance metrics
+  const metrics = agent.getPerfMetrics();
+  console.log('Metrics:', metrics);
+
+  // Reset metrics
+  agent.resetPerfMetrics();
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+### Tracing
+
+```javascript
+const { initTracing } = require('@open1s/jsbos/brainos');
+
+// Initialize tracing (usually called once at app start)
+initTracing();
+
+// Log a test message
+const { logTestMessage } = require('@open1s/jsbos/brainos');
+logTestMessage('Test trace message');
+```
 
 ---
 

@@ -142,16 +142,22 @@ impl StreamExtractor for OpenAIExtractor {
 
     fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>> {
         let spans = self.inner.push(chunk)?;
+        let mut chats = Vec::new();
 
         for span in spans.iter() {
             if span.is_root() {
                 let json_str = self.inner.extract(span);
                 if let Ok(chat) = serde_json::from_slice::<ChatCompletionChunk>(json_str) {
-                    return Some(vec![chat]);
+                    chats.push(chat);
                 }
             }
         }
-        None
+
+        if chats.is_empty() {
+            None
+        } else {
+            Some(chats)
+        }
     }
 
     fn extract<'a>(&'a self, span: &StreamSpan) -> &'a [u8] {
@@ -160,5 +166,47 @@ impl StreamExtractor for OpenAIExtractor {
 
     fn reset(&mut self) {
         self.inner.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(content: &str, finish_reason: Option<&str>) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": content },
+                "finish_reason": finish_reason,
+                "logprobs": null
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn extracts_all_coalesced_sse_json_chunks() {
+        let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
+        let payload = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            chunk("The", None),
+            chunk(" result is 100.", None),
+            chunk("", Some("stop"))
+        );
+
+        let chunks = extractor.push(&payload).unwrap();
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("The"));
+        assert_eq!(
+            chunks[1].choices[0].delta.content.as_deref(),
+            Some(" result is 100.")
+        );
+        assert_eq!(chunks[2].choices[0].finish_reason.as_deref(), Some("stop"));
     }
 }

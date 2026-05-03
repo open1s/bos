@@ -542,6 +542,11 @@ impl ReActResilience {
         self.rate_limiter.as_ref().map(|l| l.remaining())
     }
 
+    /// Get the rate limiter configuration.
+    pub fn rate_limit_config(&self) -> &RateLimiterConfig {
+        &self.rate_limit_config
+    }
+
     /// Try to acquire a rate limit slot without executing anything.
     /// Returns Ok(()) if allowed, Err(RateLimited) if exhausted.
     pub fn try_acquire(&self) -> Result<(), ResilienceError<()>> {

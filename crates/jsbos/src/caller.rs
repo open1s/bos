@@ -1,9 +1,39 @@
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{
-  ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
-};
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::sync::Arc;
+
+fn call_string_handler(
+  handler: &ThreadsafeFunction<String, napi::Unknown<'static>>,
+  input: String,
+) -> std::result::Result<String, String> {
+  let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<String, String>>();
+  let tx_clone = tx.clone();
+
+  handler.call_with_return_value(
+    Ok(input),
+    ThreadsafeFunctionCallMode::NonBlocking,
+    move |result: std::result::Result<napi::Unknown<'_>, napi::Error>, _env| -> Result<()> {
+      match result {
+        Ok(value) => {
+          let string_value = value
+            .coerce_to_string()?
+            .into_utf8()?
+            .as_str()?
+            .to_string();
+          let _ = tx_clone.send(Ok(string_value));
+        }
+        Err(e) => {
+          let _ = tx_clone.send(Err(e.to_string()));
+        }
+      }
+      Ok(())
+    },
+  );
+
+  rx.recv()
+    .unwrap_or_else(|_| Err("handler channel closed".to_string()))
+}
 
 #[napi]
 pub struct Caller {
@@ -41,7 +71,7 @@ impl Caller {
 pub struct Callable {
   inner: Arc<tokio::sync::Mutex<Option<bus::Callable<String, String>>>>,
   pub(crate) handler:
-    Arc<std::sync::Mutex<Option<Arc<ThreadsafeFunction<String, UnknownReturnValue>>>>>,
+    Arc<std::sync::Mutex<Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>>>>>>,
   is_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -56,7 +86,10 @@ impl Callable {
   }
 
   #[napi]
-  pub fn set_handler(&self, handler: ThreadsafeFunction<String, UnknownReturnValue>) -> Result<()> {
+  pub fn set_handler(
+    &self,
+    handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
+  ) -> Result<()> {
     let mut guard = self.handler.lock().unwrap();
     *guard = Some(Arc::new(handler));
     Ok(())
@@ -87,13 +120,8 @@ impl Callable {
         .set_handler(move |input: String| {
           let tsfn_clone = tsfn.clone();
           async move {
-            let (_tx, _rx) = std::sync::mpsc::channel::<Result<String, String>>();
-            // New API: .call() only takes 2 args, no callback
-            // The ThreadsafeFunction itself handles the JS callback
-            tsfn_clone.call(Ok(input.clone()), ThreadsafeFunctionCallMode::Blocking);
-            // For now, return the input as-is since TSFN doesn't directly return values
-            // The actual callback result would need a different pattern
-            Ok(input)
+            call_string_handler(&tsfn_clone, input)
+              .map_err(bus::ZenohError::Query)
           }
         })
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
@@ -111,7 +139,10 @@ impl Callable {
   }
 
   #[napi]
-  pub async fn run(&self, handler: ThreadsafeFunction<String, UnknownReturnValue>) -> Result<()> {
+  pub async fn run(
+    &self,
+    handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
+  ) -> Result<()> {
     {
       let mut guard = self.handler.lock().unwrap();
       *guard = Some(Arc::new(handler));
@@ -122,7 +153,7 @@ impl Callable {
   #[napi]
   pub async fn run_json(
     &self,
-    handler: ThreadsafeFunction<String, UnknownReturnValue>,
+    handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
   ) -> Result<()> {
     self.run(handler).await
   }

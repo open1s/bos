@@ -32,31 +32,39 @@ async def demo_http_local_server():
 
     server_thread = threading.Thread(target=lambda: run_server(8765), daemon=True)
     server_thread.start()
-    await asyncio.sleep(0.5)
+    
+    # Wait longer for server to start
+    print("  ⏳ Waiting for HTTP server to start...")
+    await asyncio.sleep(2)
 
-    client = McpClient.connect_http("http://127.0.0.1:8765/mcp")
-    print("  🔗 HTTP client created")
+    try:
+        client = McpClient.connect_http("http://127.0.0.1:8765/mcp")
+        print("  🔗 HTTP client created")
 
-    caps = await client.initialize()
-    print(f"  📋 Initialized — server: {caps.get('serverInfo', {}).get('name')}")
-    print(f"     capabilities: tools={bool(caps.get('tools'))}, resources={bool(caps.get('resources'))}")
+        caps = await client.initialize()
+        print(f"  📋 Initialized — server: {caps.get('serverInfo', {}).get('name')}")
+        print(f"     capabilities: tools={bool(caps.get('tools'))}, resources={bool(caps.get('resources'))}")
 
-    tools = await client.list_tools()
-    print(f"  🔧 Available tools: {len(tools)}")
-    for t in tools:
-        print(f"     - {t.get('name')}: {t.get('description', '')}")
+        tools = await client.list_tools()
+        print(f"  🔧 Available tools: {len(tools)}")
+        for t in tools:
+            print(f"     - {t.get('name')}: {t.get('description', '')}")
 
-    greet = await client.call_tool("greet", json.dumps({"name": "BrainOS"}))
-    text = greet["content"][0]["text"]
-    print(f"  📤 greet(BrainOS) → {text}")
+        greet = await client.call_tool("greet", json.dumps({"name": "BrainOS"}))
+        text = greet["content"][0]["text"]
+        print(f"  📤 greet(BrainOS) → {text}")
 
-    calc = await client.call_tool("calc", json.dumps({"a": 10, "b": 3, "op": "mul"}))
-    text = calc["content"][0]["text"]
-    print(f"  📤 calc(10 * 3) → {text}")
+        calc = await client.call_tool("calc", json.dumps({"a": 10, "b": 3, "op": "mul"}))
+        text = calc["content"][0]["text"]
+        print(f"  📤 calc(10 * 3) → {text}")
 
-    ts = await client.call_tool("time", "{}")
-    text = ts["content"][0]["text"]
-    print(f"  📤 time() → {text}")
+        ts = await client.call_tool("time", "{}")
+        text = ts["content"][0]["text"]
+        print(f"  📤 time() → {text}")
+
+        print(f"  ✅ Demo 1 passed\n")
+    except Exception as e:
+        print(f"  ❌ Demo 1 failed: {e}\n")
 
     print("  ✅ HTTP local server demo done\n")
 

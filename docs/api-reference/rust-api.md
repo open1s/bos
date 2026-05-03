@@ -8,43 +8,46 @@ This document provides the complete API reference for the BrainOS Rust crate (`a
 
 The main abstraction for AI agents with LLM integration, tool registries, and skill management.
 
-#### Builder Pattern
+### AgentBuilder (TOML-based)
 
-Create an agent using the fluent builder pattern:
+Create agents from TOML configuration using `AgentBuilder` (aliased as `TomlAgentBuilder`):
 
 ```rust
-use agent::{Agent, AgentConfig};
+use agent::AgentBuilder;
 
-let agent = Agent::builder()
-    .name("assistant")
-    .model("gpt-4")
-    .system_prompt("You are a helpful assistant.")
-    .temperature(0.7)
-    .timeout_secs(120)
-    .build()?;
+let toml = r#"
+    name = "assistant"
+    model = "gpt-4"
+    base_url = "https://api.openai.com/v1"
+    api_key = "sk-..."
+"#;
+
+let builder = AgentBuilder::from_toml(toml)?;
+// Or from file:
+let builder = AgentBuilder::from_file("/path/to/config.toml")?;
+
+// Add tools
+builder = builder.with_tool(Arc::new(MyTool));
+
+// Build the agent (None for no Zenoh session)
+let agent = builder.build(None).await?;
 ```
 
-#### Direct Construction
+### Direct Construction
 
 ```rust
 use agent::{Agent, AgentConfig};
-use react::llm::vendor::OpenAiClient;
+use std::sync::Arc;
 
 let config = AgentConfig::default()
     .name("assistant")
-    .model("gpt-4")
-    .system_prompt("You are a helpful assistant.")
-    .temperature(0.7)
-    .timeout_secs(120);
+    .model("gpt-4");
 
-let llm = Arc::new(OpenAiClient::new(
-    config.base_url.clone(),
-    config.model.clone(),
-    config.api_key.clone(),
-));
-
-let agent = Agent::new(config, llm);
+// Agent::new requires a config and an LLM provider
+let agent = Agent::new(config, llm_provider);
 ```
+
+**Note:** The `Agent::builder()` pattern shown in older examples is deprecated. Use `AgentBuilder::from_toml()` or `Agent::new(config, llm)` instead.
 
 #### Configuration Methods
 
@@ -113,6 +116,13 @@ let config = AgentConfig::default()
 | `add_remote_agent_tool(&mut self, tool_name: impl Into<String>, endpoint: impl Into<String>, session: Arc<bus::Session>) -> Result<(), ToolError>` | Add tool that calls remote agent | `Result<(), ToolError>` |
 | `rpc_client(&self, endpoint: impl Into<String>, session: Arc<bus::Session>) -> AgentRpcClient` | Create RPC client for another agent | `AgentRpcClient` |
 | `as_callable_server(&self, endpoint: impl Into<String>, session: Arc<bus::Session>) -> AgentCallableServer` | Expose agent as callable server | `AgentCallableServer` |
+| `register_mcp_tools(&self, client: Arc<McpClient>) -> Result<(), McpError>` | Register MCP tools | `Result<(), McpError>` |
+| `register_mcp_tools_with_namespace(&self, client: Arc<McpClient>, namespace: &str) -> Result<(), McpError>` | Register MCP tools with namespace | `Result<(), McpError>` |
+| `register_skills_from_dir(&self, dir: PathBuf) -> Result<(), SkillError>` | Load skills from directory | `Result<(), SkillError>` |
+| `get_skills_schemas(&self) -> Vec<Value>` | Get skill schemas for LLM | `Vec<Value>` |
+| `get_skills_content(&self) -> Vec<(&str, &str)>` | Get skill content pairs | `Vec<(&str, &str)>` |
+| `metrics(&self) -> CallMetrics` | Get call metrics | `CallMetrics` |
+| `reset_metrics(&self)` | Reset metrics | `()` |
 
 #### Running the Agent
 
@@ -177,33 +187,32 @@ impl Tool for Calculator {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = AgentConfig::default()
-        .name("assistant")
-        .model("gpt-4");
-    
-    let mut registry = agent::tools::ToolRegistry::new();
-    registry.add(Arc::new(Calculator)).await?;
-    
-    let agent = Agent::builder()
-        .config(config)
-        .registry(registry)
-        .build()?;
-    
+    // Using AgentBuilder (recommended)
+    let toml = r#"
+        name = "assistant"
+        model = "gpt-4"
+    "#;
+
+    let mut builder = AgentBuilder::from_toml(toml)?;
+    builder = builder.with_tool(Arc::new(Calculator));
+
+    let agent = builder.build(None).await?;
+
     // Simple Q&A (no tool use)
     let result = agent.run_simple("What is Python?").await?;
     println!("Simple result: {}", result);
-    
+
     // Run with tool use (ReAct)
     let result = agent.react("What is 2 + 2? What is 10 * 5?").await?;
     println!("ReAct result: {}", result);
-    
+
     // Streaming response
     let mut stream = agent.stream("Count from 1 to 3").await?;
     while let Some(token) = stream.next().await {
         print!("{}", token?);
     }
     println!();
-    
+
     Ok(())
 }
 ```

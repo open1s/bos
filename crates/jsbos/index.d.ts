@@ -27,18 +27,16 @@ export declare class Agent {
   listMcpPrompts(): Promise<Array<any>>
   rpcClient(endpoint: string, bus: ExternalObject<Session>): Promise<AgentRpcClient>
   asCallableServer(endpoint: string, bus: ExternalObject<Session>): Promise<AgentCallableServer>
-  addMessage(message: any): Promise<void>
-  getMessages(): Array<any>
-  saveMessageLog(path: string): void
-  restoreMessageLog(path: string): void
-  sessionContext(): any
-  setSessionContext(context: any): void
-  clearSessionContext(): void
-  sessionState(): any
-  saveSession(path: string): void
-  restoreSession(path: string): void
-  compactMessageLog(): void
   stream(task: string, callback: ((err: Error | null, arg: any) => any)): Promise<void>
+  getSessionJson(): string
+  exportSession(): string
+  restoreSessionJson(json: string): void
+  saveSession(path: string): void
+  restoreSessionFromFile(path: string): void
+  clearSession(): void
+  compactSession(keepRecent: number, maxSummaryChars: number): void
+  getPerfMetrics(): PerfSnapshot
+  resetPerfMetrics(): void
 }
 
 export declare class AgentCallableServer {
@@ -50,7 +48,6 @@ export declare class AgentRpcClient {
   get endpoint(): string
   list(): Promise<any>
   call(toolName: string, argsJson: string): Promise<any>
-  llmRun(task: string): Promise<any>
 }
 
 export declare class Bus {
@@ -110,7 +107,7 @@ export declare class McpClient {
 
 export declare class PluginRegistry {
   constructor()
-  clear(): Promise<void>
+  clear(): void
 }
 
 export declare class PluginToolCallInfo {
@@ -180,6 +177,13 @@ export interface AgentConfig {
   contextCompactionSummaryMaxTokens?: number
 }
 
+export declare const enum BudgetStatus {
+  Normal = 0,
+  Warning = 1,
+  Exceeded = 2,
+  Critical = 3
+}
+
 export interface BusConfig {
   mode: string
   connect?: Array<string>
@@ -219,7 +223,31 @@ export interface LlmUsage {
 
 export declare function logTestMessage(message: string): void
 
+/**
+ * Performance metrics collected across LLM calls.
+ * All timing values are in microseconds.
+ */
+export interface PerfSnapshot {
+  /** Number of LLM calls completed */
+  callCount: number
+  totalWallTimeUs: number
+  avgWallTimeUs: number
+  minWallTimeUs: number
+  maxWallTimeUs: number
+  totalEngineTimeUs: number
+  totalResilienceTimeUs: number
+  rateLimitWaits: number
+  totalRateLimitWaitUs: number
+  circuitTrips: number
+  llmErrors: number
+  toolCallCount: number
+  totalToolTimeUs: number
+  totalInputTokens: number
+  totalOutputTokens: number
+}
+
 export interface PluginLlmRequest {
+  input: string
   model: string
   temperature?: number
   maxTokens?: number
@@ -255,6 +283,19 @@ export interface PluginToolResult {
 export interface PromptTokensDetails {
   audioTokens?: number
   cachedTokens?: number
+}
+
+export interface TokenBudgetReport {
+  usage: TokenUsage
+  status: BudgetStatus
+  usagePercent: number
+  remainingTokens: number
+}
+
+export interface TokenUsage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
 }
 
 export declare function version(): string

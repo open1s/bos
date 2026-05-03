@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use log::info;
 use crate::{
     llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor},
     utils::{JsonExtractor, StreamExtractor},
@@ -17,7 +18,7 @@ use crate::llm::{
 
 pub struct OpenAiVendor {
     client: Arc<Client>,
-    endpoint: String,
+    endpoint: Arc<String>,
     model: String,
     api_key: Arc<String>,
 }
@@ -83,7 +84,7 @@ impl OpenAiVendor {
 
         Self {
             client,
-            endpoint,
+            endpoint: Arc::new(endpoint),
             model,
             api_key: Arc::new(api_key),
         }
@@ -229,7 +230,7 @@ impl OpenAiVendor {
             messages.insert(0, meta);
         }
 
-        let max_tokens = req.max_tokens.unwrap_or(1280000);
+        let max_tokens = req.max_tokens.unwrap_or(12800);
 
         OpenAiRequest {
             model: req.model.clone(),
@@ -305,6 +306,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         })?;
 
         let resp = LlmResponse::OpenAI(body);
+
+        info!("Resp: {}", serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into()));
+
         context.notify_response(&resp);
         Ok(resp)
     }

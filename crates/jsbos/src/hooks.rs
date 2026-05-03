@@ -7,6 +7,7 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 #[napi]
 pub enum HookEvent {
@@ -59,28 +60,27 @@ impl AgentHook for JSHook {
     };
     let callback = self.callback.clone();
 
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let tx_clone = tx.clone();
+    let (tx, rx) = oneshot::channel::<String>();
 
-    callback.call_with_return_value(
-      Ok(ctx_data),
-      ThreadsafeFunctionCallMode::NonBlocking,
-      move |result: std::result::Result<napi::Unknown<'_>, napi::Error>,
-            _env|
-            -> napi::Result<()> {
-        match result {
-          Ok(_val) => {
-            let _ = tx_clone.send("continue".to_string());
-          }
-          Err(e) => {
-            let _ = tx_clone.send(format!("error:{}", e));
-          }
-        }
-        Ok(())
-      },
-    );
+    let handle = tokio::runtime::Handle::current();
+    handle.spawn_blocking(move || {
+      callback.call_with_return_value(
+        Ok(ctx_data),
+        ThreadsafeFunctionCallMode::Blocking,
+        move |result: std::result::Result<napi::Unknown<'_>, napi::Error>,
+              _env|
+              -> napi::Result<()> {
+          let decision = match result {
+            Ok(_val) => "continue".to_string(),
+            Err(e) => format!("error:{}", e),
+          };
+          let _ = tx.send(decision);
+          Ok(())
+        },
+      );
+    });
 
-    let decision_str = rx.recv().unwrap_or_default();
+    let decision_str = rx.await.unwrap_or_default();
     if decision_str.starts_with("error") {
       agent::agent::hooks::HookDecision::Error(decision_str)
     } else if decision_str == "abort" {
@@ -132,7 +132,7 @@ impl HookRegistry {
     let hook = JSHook {
       callback: callback.into(),
     };
-    self.inner.register(event, Arc::new(hook)).await;
+    self.inner.register(event, Arc::new(hook));
     Ok(())
   }
 }

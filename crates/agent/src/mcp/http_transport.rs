@@ -31,6 +31,8 @@ impl HttpTransport {
         Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
+                .http1_only()
+                .no_proxy()
                 .build()
                 .unwrap(),
             base_url: url,
@@ -58,6 +60,7 @@ impl HttpTransport {
         self.capture_session_id(&resp);
 
         let status = resp.status();
+
         let content_type = resp
             .headers()
             .get("content-type")
@@ -74,12 +77,18 @@ impl HttpTransport {
                 .text()
                 .await
                 .unwrap_or_else(|_| format!("HTTP {status}"));
+            if body.is_empty() {
+                return Err(HttpTransportError::Http(format!("HTTP {} (empty body)", status)));
+            }
             return Err(HttpTransportError::Http(body));
         }
 
-        resp.text()
+        let body = resp
+            .text()
             .await
-            .map_err(|e| HttpTransportError::Http(e.to_string()))
+            .map_err(|e| HttpTransportError::Http(format!("Error reading response body: {}", e)))?;
+        
+        Ok(body)
     }
 
     pub fn set_session_id(&self, id: String) {

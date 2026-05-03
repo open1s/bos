@@ -31,7 +31,7 @@ async function demoDirectPublish() {
 
   await sleep(300);
 
-  await bus.publishText('demo/greet', 'Hello from jsbosx!');
+  await bus.publishText('demo/greet', 'Hello from jsbos!');
   console.log('  📨 Published: "Hello from jsbos!"');
 
   const msg = await recvPromise;

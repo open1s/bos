@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use log::info;
 use crate::{
     llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor},
     utils::{JsonExtractor, StreamExtractor},
@@ -15,8 +16,8 @@ use crate::llm::{
 };
 
 pub struct OpenRouterVendor {
-    client: Client,
-    endpoint: String,
+    client: Arc<Client>,
+    endpoint: Arc<String>,
     model: String,
     api_key: Arc<String>,
 }
@@ -67,8 +68,8 @@ impl OpenRouterVendor {
             .expect("Failed to create HTTP client");
 
         Self {
-            client,
-            endpoint,
+            client: Arc::new(client),
+            endpoint: Arc::new(endpoint),
             model,
             api_key: Arc::new(api_key),
         }
@@ -214,7 +215,7 @@ impl OpenRouterVendor {
             messages.insert(0, meta);
         }
 
-        let max_tokens = req.max_tokens.unwrap_or(1280000);
+        let max_tokens = req.max_tokens.unwrap_or(12800);
 
         OpenRouterRequest {
             model: req.model.clone(),
@@ -253,8 +254,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         context: &mut C,
     ) -> LlmResponseResult {
         let api_key = self.api_key.clone();
-        let client = self.client.clone();
-        let endpoint = self.endpoint.clone();
+        let client = Arc::clone(&self.client);
+        let endpoint = Arc::clone(&self.endpoint);
 
         if request.model.is_empty() {
             request.model = self.model.clone();
@@ -294,6 +295,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         })?;
 
         let resp = LlmResponse::OpenAI(body);
+
+        info!("Resp: {}", serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into()));
+
         context.notify_response(&resp);
         Ok(resp)
     }
@@ -305,8 +309,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         context: &mut C,
     ) -> Result<TokenStream, LlmError> {
         let api_key = self.api_key.clone();
-        let client = self.client.clone();
-        let endpoint = self.endpoint.clone();
+        let client = Arc::clone(&self.client);
+        let endpoint = Arc::clone(&self.endpoint);
 
         if request.model.is_empty() {
             request.model = self.model.clone();

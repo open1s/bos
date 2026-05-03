@@ -14,7 +14,7 @@ use agent::BashTool;
 
 struct JSTool {
   name: String,
-  description: agent::ToolDescription,
+  description: String,
   schema: serde_json::Value,
   callback: Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>>>,
 }
@@ -25,7 +25,7 @@ impl agent::Tool for JSTool {
     &self.name
   }
 
-  fn description(&self) -> agent::ToolDescription {
+  fn description(&self) -> String {
     self.description.clone()
   }
 
@@ -33,10 +33,10 @@ impl agent::Tool for JSTool {
     self.schema.clone()
   }
 
-  async fn execute(
+  fn run(
     &self,
     args: &serde_json::Value,
-  ) -> std::result::Result<serde_json::Value, agent::ToolError> {
+  ) -> std::result::Result<serde_json::Value, react::ToolError> {
     let args_json = args.clone();
     let callback = self.callback.clone();
 
@@ -51,12 +51,12 @@ impl agent::Tool for JSTool {
             -> napi::Result<()> {
         match result {
           Ok(val) => {
-            let json_val: serde_json::Value = val
+            let utf8 = val
               .coerce_to_string()?
-              .into_utf8()?
-              .as_str()?
-              .parse()
-              .unwrap_or(serde_json::Value::Null);
+              .into_utf8()?;
+            let string_val = utf8.as_str()?;
+            let json_val: serde_json::Value = serde_json::from_str(string_val)
+              .unwrap_or_else(|_| serde_json::json!(string_val));
             let _ = tx_clone.send(Ok(json_val));
           }
           Err(e) => {
@@ -69,8 +69,8 @@ impl agent::Tool for JSTool {
 
     match rx.recv() {
       Ok(Ok(result)) => std::result::Result::Ok(result),
-      Ok(Err(e)) => std::result::Result::Err(agent::ToolError::ExecutionFailed(e.to_string())),
-      Err(_) => std::result::Result::Err(agent::ToolError::ExecutionFailed(
+      Ok(Err(e)) => std::result::Result::Err(react::ToolError::Failed(e.to_string())),
+      Err(_) => std::result::Result::Err(react::ToolError::Failed(
         "handler channel closed".to_string(),
       )),
     }
@@ -195,8 +195,10 @@ impl From<AgentConfig> for agent::AgentConfig {
 pub struct Agent {
   inner: Arc<Mutex<agent::Agent>>,
   bus_session: Option<Arc<crate::Session>>,
+  #[allow(dead_code)]
   hooks: std::sync::Arc<std::sync::Mutex<HookRegistry>>,
   plugins: std::sync::Arc<std::sync::Mutex<PluginRegistry>>,
+  perf: std::sync::Arc<crate::perf::PerformanceMetrics>,
 }
 
 #[napi]
@@ -205,29 +207,31 @@ impl Agent {
   pub async fn create(config: AgentConfig) -> Result<Self> {
     let cfg: agent::AgentConfig = config.into();
     let js_hooks = HookRegistry::new();
-    let js_hooks_clone = js_hooks.clone_inner();
     let js_plugins = PluginRegistry::new();
-    let js_plugins_clone = js_plugins.clone_inner();
 
-    let agent = agent::Agent::builder()
-      .name(cfg.name)
-      .model(cfg.model)
-      .base_url(cfg.base_url)
-      .api_key(cfg.api_key)
-      .system_prompt(cfg.system_prompt)
-      .temperature(cfg.temperature)
-      .max_tokens(cfg.max_tokens.unwrap_or(4096) as u32)
-      .timeout(cfg.timeout_secs as u64)
-      .with_hooks(js_hooks_clone)
-      .with_plugins(js_plugins_clone)
-      .build()
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    let mut llm_provider = agent::agent::agentic::LlmProvider::new();
+
+    let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
+      (cfg.model[..pos].to_string(), cfg.model[pos + 1..].to_string())
+    } else {
+      ("openai".to_string(), cfg.model.clone())
+    };
+
+    let vendor = Box::new(react::llm::vendor::OpenAiClient::new(
+      cfg.base_url.clone(),
+      model_name,
+      cfg.api_key.clone(),
+    ));
+    llm_provider.register_vendor(vendor_name, vendor);
+
+    let agent = agent::Agent::new(cfg, Arc::new(llm_provider));
 
     Ok(Agent {
       inner: Arc::new(Mutex::new(agent)),
       bus_session: None,
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
       plugins: std::sync::Arc::new(std::sync::Mutex::new(js_plugins)),
+      perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
     })
   }
 
@@ -238,53 +242,45 @@ impl Agent {
   ) -> Result<Self> {
     let cfg: agent::AgentConfig = config.into();
     let js_hooks = HookRegistry::new();
-    let js_hooks_clone = js_hooks.clone_inner();
     let js_plugins = PluginRegistry::new();
-    let js_plugins_clone = js_plugins.clone_inner();
 
-    let agent = agent::Agent::builder()
-      .name(cfg.name)
-      .model(cfg.model)
-      .base_url(cfg.base_url)
-      .api_key(cfg.api_key)
-      .system_prompt(cfg.system_prompt)
-      .temperature(cfg.temperature)
-      .max_tokens(cfg.max_tokens.unwrap_or(4096) as u32)
-      .timeout(cfg.timeout_secs as u64)
-      .with_hooks(js_hooks_clone)
-      .with_plugins(js_plugins_clone)
-      .build()
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    let mut llm_provider = agent::agent::agentic::LlmProvider::new();
+
+    let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
+      (cfg.model[..pos].to_string(), cfg.model[pos + 1..].to_string())
+    } else {
+      ("openai".to_string(), cfg.model.clone())
+    };
+
+    let vendor = Box::new(react::llm::vendor::OpenAiClient::new(
+      cfg.base_url.clone(),
+      model_name,
+      cfg.api_key.clone(),
+    ));
+    llm_provider.register_vendor(vendor_name, vendor);
+
+    let agent = agent::Agent::new(cfg, Arc::new(llm_provider));
 
     Ok(Agent {
       inner: Arc::new(Mutex::new(agent)),
       bus_session: None,
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
       plugins: std::sync::Arc::new(std::sync::Mutex::new(js_plugins)),
+      perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
     })
   }
 
   #[napi]
   pub async fn run_simple(&self, task: String) -> Result<String> {
-    let agent = {
-      let guard = self.inner.lock().await;
-      guard.clone()
-    };
-    agent
-      .run_simple(&task)
-      .await
+    let guard = self.inner.lock().await;
+    guard.run_simple(&task).await
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
   #[napi]
   pub async fn react(&self, task: String) -> Result<String> {
-    let agent = {
-      let guard = self.inner.lock().await;
-      guard.clone()
-    };
-    agent
-      .react(&task)
-      .await
+    let guard = self.inner.lock().await;
+    guard.react(&task).await
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
@@ -332,11 +328,8 @@ impl Agent {
       HookEvent::OnError => agent::agent::hooks::HookEvent::OnError,
     };
 
-    let registry = {
-      let mut guard = self.hooks.lock().unwrap();
-      guard.inner_mut().clone()
-    };
-    registry.register_blocking(event, std::sync::Arc::new(hook));
+    let guard = self.inner.blocking_lock();
+    guard.hooks().register_blocking(event, Arc::new(hook));
     Ok(())
   }
 
@@ -379,16 +372,13 @@ impl Agent {
     &self,
     name: String,
     description: String,
-    parameters: String,
+    _parameters: String,
     schema: String,
     callback: ThreadsafeFunction<JSAny>,
   ) -> Result<String> {
     let tool = JSTool {
       name: name.clone(),
-      description: agent::ToolDescription {
-        short: description,
-        parameters,
-      },
+      description,
       schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
       callback: callback.into(),
     };
@@ -474,7 +464,7 @@ impl Agent {
         .map(|(name, tool)| {
           serde_json::json!({
               "name": name,
-              "description": tool.description().short,
+              "description": tool.description(),
           })
         })
         .collect();
@@ -494,7 +484,7 @@ impl Agent {
         .map(|(name, tool)| {
           serde_json::json!({
               "name": name,
-              "description": tool.description().short,
+              "description": tool.description(),
           })
         })
         .collect();
@@ -514,7 +504,7 @@ impl Agent {
         .map(|(name, tool)| {
           serde_json::json!({
               "name": name,
-              "description": tool.description().short,
+              "description": tool.description(),
           })
         })
         .collect();
@@ -567,219 +557,17 @@ impl Agent {
   }
 
   #[napi]
-  pub async fn add_message(&self, message: serde_json::Value) -> Result<()> {
-    let llm_message = if let Some(role) = message.get("role").and_then(|v| v.as_str()) {
-      match role {
-        "system" => {
-          let content = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-          agent::LlmMessage::System {
-            content: content.to_string(),
-          }
-        }
-        "user" => {
-          let content = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-          agent::LlmMessage::User {
-            content: content.to_string(),
-          }
-        }
-        "assistant" => {
-          let content = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-          agent::LlmMessage::Assistant {
-            content: content.to_string(),
-          }
-        }
-        "assistant_tool_call" => {
-          let tool_call_id = message
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-          let name = message.get("name").and_then(|v| v.as_str()).unwrap_or("");
-          let args = message
-            .get("args")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-          agent::LlmMessage::AssistantToolCall {
-            tool_call_id: tool_call_id.to_string(),
-            name: name.to_string(),
-            args,
-          }
-        }
-        "tool_result" => {
-          let tool_call_id = message
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-          let content = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-          agent::LlmMessage::ToolResult {
-            tool_call_id: tool_call_id.to_string(),
-            content: content.to_string(),
-          }
-        }
-        _ => {
-          return Err(Error::new(
-            napi::Status::GenericFailure,
-            format!("Invalid role: {}", role),
-          ))
-        }
-      }
-    } else {
-      return Err(Error::new(
-        napi::Status::GenericFailure,
-        "Message must have a 'role' field",
-      ));
-    };
-    let mut guard = self.inner.lock().await;
-    guard.add_message(llm_message);
-    Ok(())
-  }
-
-  #[napi]
-  pub fn get_messages(&self) -> Result<Vec<serde_json::Value>> {
-    let guard = self.inner.blocking_lock();
-    let messages = guard.get_messages();
-    let json_messages: Vec<serde_json::Value> = messages
-      .iter()
-      .map(|msg| match msg {
-        agent::LlmMessage::System { content } => {
-          serde_json::json!({
-            "role": "system",
-            "content": content
-          })
-        }
-        agent::LlmMessage::User { content } => {
-          serde_json::json!({
-            "role": "user",
-            "content": content
-          })
-        }
-        agent::LlmMessage::Assistant { content } => {
-          serde_json::json!({
-            "role": "assistant",
-            "content": content
-          })
-        }
-        agent::LlmMessage::AssistantToolCall {
-          tool_call_id,
-          name,
-          args,
-        } => {
-          serde_json::json!({
-            "role": "assistant_tool_call",
-            "tool_call_id": tool_call_id,
-            "name": name,
-            "args": args
-          })
-        }
-        agent::LlmMessage::ToolResult {
-          tool_call_id,
-          content,
-        } => {
-          serde_json::json!({
-            "role": "tool_result",
-            "tool_call_id": tool_call_id,
-            "content": content
-          })
-        }
-      })
-      .collect();
-    Ok(json_messages)
-  }
-
-  #[napi]
-  pub fn save_message_log(&self, path: String) -> Result<()> {
-    let guard = self.inner.blocking_lock();
-    guard
-      .save_message_log(&path)
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
-  }
-
-  #[napi]
-  pub fn restore_message_log(&self, path: String) -> Result<()> {
-    let mut guard = self.inner.blocking_lock();
-    guard
-      .restore_message_log(&path)
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
-  }
-
-  #[napi]
-  pub fn session_context(&self) -> Result<serde_json::Value> {
-    let guard = self.inner.blocking_lock();
-    Ok(guard.session_context())
-  }
-
-  #[napi]
-  pub fn set_session_context(&self, context: serde_json::Value) -> Result<()> {
-    let mut guard = self.inner.blocking_lock();
-    guard.set_session_context(context);
-    Ok(())
-  }
-
-  #[napi]
-  pub fn clear_session_context(&self) -> Result<()> {
-    let mut guard = self.inner.blocking_lock();
-    guard.clear_session_context();
-    Ok(())
-  }
-
-  #[napi]
-  pub fn session_state(&self) -> Result<serde_json::Value> {
-    let guard = self.inner.blocking_lock();
-    let state = guard.session_state();
-    serde_json::to_value(state).map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
-  }
-
-  #[napi]
-  pub fn save_session(&self, path: String) -> Result<()> {
-    let guard = self.inner.blocking_lock();
-    guard
-      .save_session(&path)
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
-  }
-
-  #[napi]
-  pub fn restore_session(&self, path: String) -> Result<()> {
-    let mut guard = self.inner.blocking_lock();
-    guard
-      .restore_session(&path)
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
-  }
-
-  #[napi]
-  pub fn compact_message_log(&self) -> Result<()> {
-    let guard = self.inner.blocking_lock();
-    guard
-      .compact_message_log()
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
-  }
-
-  #[napi]
-  pub async fn _stream_placeholder_(
+  pub async fn stream(
     &self,
     task: String,
     callback: ThreadsafeFunction<serde_json::Value>,
   ) -> Result<()> {
-    let agent = {
-      let guard = self.inner.lock().await;
-      guard.clone()
-    };
+    let guard = self.inner.lock().await;
 
-    stream = agent.stream(&task);
-    use futures::_stream_placeholder_::StreamExt;
-
-    futures::pin_mut!(_stream_placeholder_);
-    while let Some(token_result) = _stream_placeholder_.next().await {
+    let stream = guard.stream(&task);
+    use futures::StreamExt;
+    futures::pin_mut!(stream);
+    while let Some(token_result) = stream.next().await {
       match token_result {
         Ok(token) => {
           let json = match token {
@@ -816,27 +604,92 @@ impl Agent {
   }
 
   #[napi]
-  pub fn token_usage(&self) -> Result<TokenUsage> {
-    let guard = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(napi::Status::GenericFailure, "Agent lock poisoned"))?;
-    Ok(guard.token_usage().into())
+  pub fn get_session_json(&self) -> Result<String> {
+    let guard = self.inner.blocking_lock();
+    let session = guard.session();
+    let value = serde_json::to_value(&*session)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    serde_json::to_string_pretty(&value)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
   #[napi]
-  pub fn token_budget_report(&self) -> Result<TokenBudgetReport> {
-    let guard = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(napi::Status::GenericFailure, "Agent lock poisoned"))?;
-    Ok(guard.token_budget_report().into())
+  pub fn export_session(&self) -> Result<String> {
+    self.get_session_json()
+  }
+
+  #[napi]
+  pub fn restore_session_json(&self, json: String) -> Result<()> {
+    let mut guard = self.inner.blocking_lock();
+    let result = guard.session_mut().restore_from_json(&json);
+    match result {
+      Ok(()) => Ok(()),
+      Err(e) => Err(Error::new(napi::Status::GenericFailure, e.to_string()))
+    }
+  }
+
+  #[napi]
+  pub fn save_session(&self, path: String) -> Result<()> {
+    let json = self.get_session_json()?;
+    std::fs::write(&path, json)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  #[napi]
+  pub fn restore_session_from_file(&self, path: String) -> Result<()> {
+    let json = std::fs::read_to_string(&path)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    self.restore_session_json(json)
+  }
+
+  #[napi]
+  pub fn clear_session(&self) -> Result<()> {
+    let mut guard = self.inner.blocking_lock();
+    guard.session_mut().clear();
+    Ok(())
+  }
+
+  #[napi]
+  pub fn compact_session(&self, keep_recent: u32, max_summary_chars: u32) -> Result<()> {
+    let mut guard = self.inner.blocking_lock();
+    guard.session_mut().compact(keep_recent as usize, max_summary_chars as usize);
+    Ok(())
+  }
+
+  #[napi]
+  pub fn get_perf_metrics(&self) -> crate::perf::PerfSnapshot {
+    let guard = self.inner.blocking_lock();
+    let cm = guard.metrics();
+    crate::perf::PerfSnapshot {
+      call_count: cm.call_count as i64,
+      total_wall_time_us: cm.total_wall_time.as_micros() as i64,
+      avg_wall_time_us: if cm.call_count > 0 { cm.total_wall_time.as_micros() as i64 / cm.call_count as i64 } else { 0 },
+      min_wall_time_us: 0,
+      max_wall_time_us: 0,
+      total_engine_time_us: cm.total_engine_time.as_micros() as i64,
+      total_resilience_time_us: cm.total_resilience_time.as_micros() as i64,
+      rate_limit_waits: cm.rate_limit_waits as i64,
+      total_rate_limit_wait_us: cm.total_rate_limit_wait.as_micros() as i64,
+      circuit_trips: cm.circuit_trips as i64,
+      llm_errors: cm.llm_errors as i64,
+      tool_call_count: cm.tool_call_count as i64,
+      total_tool_time_us: cm.total_tool_time.as_micros() as i64,
+      total_input_tokens: cm.total_input_tokens as i64,
+      total_output_tokens: cm.total_output_tokens as i64,
+    }
+  }
+
+  #[napi]
+  pub fn reset_perf_metrics(&self) {
+    let guard = self.inner.blocking_lock();
+    guard.reset_metrics();
+    self.perf.reset();
   }
 }
 
 #[napi]
 pub struct AgentRpcClient {
-  inner: std::sync::Arc<agent::bus_rpc::AgentRpcClient>,
+  inner: std::sync::Arc<agent::bus::AgentRpcClient>,
 }
 
 #[napi]
@@ -867,21 +720,11 @@ impl AgentRpcClient {
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
     Ok(result)
   }
-
-  #[napi]
-  pub async fn llm_run(&self, task: String) -> Result<serde_json::Value> {
-    let result = self
-      .inner
-      .llm_run(&task)
-      .await
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
-    Ok(result)
-  }
 }
 
 #[napi]
 pub struct AgentCallableServer {
-  inner: std::sync::Arc<agent::bus_rpc::AgentCallableServer>,
+  inner: std::sync::Arc<agent::bus::AgentCallableServer>,
 }
 
 #[napi]

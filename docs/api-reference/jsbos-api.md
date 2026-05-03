@@ -78,6 +78,9 @@ Options:
 | `withPrompt(prompt)` | Set system prompt | `Agent` |
 | `withTemperature(temp)` | Set temperature | `Agent` |
 | `withTimeout(secs)` | Set timeout | `Agent` |
+| `withTools(...toolDefs)` | Register tools to be wired at start | `Agent` |
+| `withBashTool(name, workspaceRoot)` | Add a Bash tool | `Agent` |
+| `onHook(event, callback)` | Register a lifecycle hook | `Agent` |
 | `register(toolDef)` | Register a tool | `Agent` |
 | `registerMany(...toolDefs)` | Register multiple tools | `Agent` |
 | `start()` | Initialize agent | `Promise<Agent>` |
@@ -85,9 +88,12 @@ Options:
 | `chat(message)` | Simple chat | `Promise<string>` |
 | `runSimple(message)` | Simple run (no tool use) | `Promise<string>` |
 | `react(task)` | Run with ReAct reasoning | `Promise<string>` |
-| `stream(task)` | Stream response tokens | `AsyncIterable<string>` |
+| `stream(task, onToken)` | Stream response tokens | `Promise<string>` |
+| `streamCollect(task)` | Collect all streaming tokens | `Promise<string>` |
 | `tokenUsage()` | Get current token usage | `TokenUsage` |
 | `tokenBudgetReport()` | Get token budget report | `TokenBudgetReport` |
+| `getPerfMetrics()` | Get performance metrics | `object` |
+| `resetPerfMetrics()` | Reset performance metrics | `void` |
 
 #### Properties
 
@@ -161,6 +167,40 @@ console.log(result);
 
 await brain.stop();
 ```
+
+---
+
+## @tool() Decorator
+
+Decorator factory for creating tools from class methods.
+
+### Usage
+
+```javascript
+const { tool } = require('brainos');
+
+class MyTools {
+  @tool('Add two numbers')
+  add(args) {
+    return args.a + args.b;
+  }
+
+  @tool('Multiply two numbers', { name: 'multiply' })
+  multiply(args) {
+    return args.a * args.b;
+  }
+}
+
+// Create instance and extract tool definitions
+const instance = new MyTools();
+const addTool = instance.add.toolDef;  // Access via .toolDef property
+```
+
+### Parameters
+
+- `description` (string): Description of what the tool does
+- `options` (object, optional): Additional options
+  - `name` (string): Override the function name as tool name
 
 ---
 

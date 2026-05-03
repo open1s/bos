@@ -32,6 +32,9 @@ BASE_URL = os.environ.get(
 MODEL = os.environ.get("LLM_MODEL", _global.get("model", "nvidia/meta/llama-3.1-8b-instruct"))
 
 
+MODEL = "nvidia/meta/llama-3.1-8b-instruct"  # Default model for the demo, can be overridden by config or env var
+
+
 # ── Tool implementations ──────────────────────────────────────────────
 
 def calculator_tool(args: dict) -> str:
@@ -135,6 +138,7 @@ async def main():
         temperature=0.7,
         timeout_secs=120,
     )
+
     agent = await Agent.create(config, bus)
 
     # Step 2: Register tools BEFORE any conversation
@@ -180,6 +184,7 @@ async def main():
         ("Time", "What time is it now in UTC?"),
         ("Mixed", "Calculate 99 * 99 and tell me the weather in Paris."),
     ]
+
 
     for label, prompt in prompts:
         print(f"\n  [{label}] User: {prompt}")

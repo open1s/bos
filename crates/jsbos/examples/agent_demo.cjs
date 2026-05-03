@@ -11,7 +11,9 @@
  *     node crates/jsbos/examples/agent_demo.js
  */
 
-const { Bus, Agent, ConfigLoader, version } = require('../index.js');
+const { Bus, Agent, ConfigLoader, versio, initTracing } = require('../index.js');
+
+initTracing();
 
 const loader = new ConfigLoader();
 loader.discover();

@@ -24,6 +24,7 @@ pub enum PluginStage {
 
 #[napi(object)]
 pub struct PluginLlmRequest {
+  pub input: String,
   pub model: String,
   pub temperature: Option<f64>,
   pub max_tokens: Option<u32>,
@@ -36,6 +37,7 @@ impl From<PluginLlmRequest> for LlmRequestWrapper {
   fn from(req: PluginLlmRequest) -> Self {
     LlmRequestWrapper {
       model: req.model,
+      input: req.input,
       temperature: req.temperature.map(|t| t as f32),
       max_tokens: req.max_tokens,
       top_p: req.top_p.map(|p| p as f32),
@@ -48,6 +50,7 @@ impl From<PluginLlmRequest> for LlmRequestWrapper {
 impl From<LlmRequestWrapper> for PluginLlmRequest {
   fn from(wrapper: LlmRequestWrapper) -> Self {
     PluginLlmRequest {
+      input: wrapper.input,
       model: wrapper.model,
       temperature: wrapper.temperature.map(|t| t as f64),
       max_tokens: wrapper.max_tokens,
@@ -406,7 +409,7 @@ impl PluginRegistry {
   }
 
   #[napi]
-  pub async fn clear(&self) {
-    self.inner.clear().await;
+  pub fn clear(&self) {
+    self.inner.clear();
   }
 }

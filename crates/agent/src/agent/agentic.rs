@@ -1,12 +1,10 @@
 use crate::agent::context::{AgentReActApp, AgentReactContext, AgentSession};
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
-use crate::agent::plugin::{
-    AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, PluginRegistry, StreamTokenWrapper,
-    ToolCallWrapper, ToolResultWrapper,
-};
+use crate::agent::plugin::{AgentPlugin, PluginRegistry};
 use crate::session::AgentState;
 use crate::tools::FunctionTool;
 use crate::{AgentError, LlmClient, StreamToken, Tool, ToolRegistry};
+use react::LlmMessage;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use log::warn;
@@ -17,11 +15,11 @@ use std::sync::Arc;
 use react::engine::{ReActEngine, ReActEngineBuilder};
 use react::llm::vendor::LlmRouter;
 use react::llm::{
-    LlmClient as ReactLlmTrait, LlmError as ReactLlmError, LlmRequest as ReactLlmRequest,
-    LlmResponse as ReactLlmResponse, ReactContext, ReactSession, TokenStream as ReactTokenStream,
+    LlmError as ReactLlmError, LlmResponse as ReactLlmResponse, TokenStream as ReactTokenStream,
     TokenStream,
 };
-use react::tool::{registry::ToolVariant, Tool as ReactToolTrait, ToolError as ReactToolError};
+use react::tool::registry::{AsyncTool, ToolVariant};
+use react::tool::{Tool as ReactToolTrait, ToolError as ReactToolError};
 use react::{CircuitBreakerConfig, LlmRequest, RateLimiterConfig, ReActResilience};
 
 pub struct LlmProvider {
@@ -116,6 +114,7 @@ impl LlmClient<AgentSession, AgentReactContext> for LlmProvider {
 
 struct ExtensibleToolAdapter {
     inner: Arc<dyn Tool + Send + Sync>,
+    #[allow(dead_code)]
     plugins: PluginRegistry,
     hooks: HookRegistry,
     agent_id: String,
@@ -241,6 +240,50 @@ impl ReactToolTrait for ExtensibleToolAdapter {
     }
 }
 
+struct AsyncExtensibleToolAdapter {
+    inner: Arc<dyn AsyncTool + Send + Sync>,
+}
+
+impl AsyncExtensibleToolAdapter {
+    fn new(inner: Arc<dyn AsyncTool + Send + Sync>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl AsyncTool for AsyncExtensibleToolAdapter {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> String {
+        self.inner.description()
+    }
+
+    fn category(&self) -> String {
+        "async".to_string()
+    }
+
+    async fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ReactToolError> {
+        self.inner
+            .run(input)
+            .await
+            .map_err(|e| ReactToolError::Failed(e.to_string()))
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        self.inner.json_schema()
+    }
+
+    fn to_openai_definition(&self) -> react::tool::descriptor::ToolDefinition {
+        self.inner.to_openai_definition()
+    }
+
+    fn is_skill(&self) -> bool {
+        self.inner.is_skill()
+    }
+}
+
 // ============================================================================
 // Simplified Agent API - Builder Pattern
 // ============================================================================
@@ -309,9 +352,15 @@ pub struct Agent {
     #[rkyv(with = qserde::rkyv::with::Skip)]
     session: std::sync::Mutex<AgentSession>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
+    metrics: std::sync::Arc<crate::metrics::MetricsCollector>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     hooks: HookRegistry,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     plugins: PluginRegistry,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    engine_cache: std::sync::Mutex<Option<ReActEngine<AgentReActApp>>>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    context_cache: std::sync::Mutex<Option<AgentReactContext>>,
 }
 
 impl Agent {
@@ -329,8 +378,11 @@ impl Agent {
             skills: Vec::new(),
             resilience,
             session: std::sync::Mutex::new(AgentSession::new()),
+            metrics: std::sync::Arc::new(crate::metrics::MetricsCollector::new()),
             hooks: HookRegistry::new(),
             plugins: PluginRegistry::new(),
+            engine_cache: std::sync::Mutex::new(None),
+            context_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -371,6 +423,22 @@ impl Agent {
                 message_count: session.len(),
             },
         }
+    }
+
+    pub fn session(&self) -> std::sync::MutexGuard<'_, AgentSession> {
+        self.session.lock().unwrap()
+    }
+
+    pub fn session_mut(&mut self) -> std::sync::MutexGuard<'_, AgentSession> {
+        self.session.lock().unwrap()
+    }
+
+    pub fn metrics(&self) -> crate::metrics::CallMetrics {
+        self.metrics.snapshot()
+    }
+
+    pub fn reset_metrics(&self) {
+        self.metrics.reset()
     }
 
     pub fn save_session(&self, path: &str) -> Result<(), AgentError> {
@@ -473,6 +541,15 @@ impl Agent {
                 ));
                 builder = builder.with_tool(ToolVariant::Sync(tool_adapter));
             }
+
+            // Handle async tools (like MCP tools) that implement AsyncTool
+            for name in registry.async_tool_names() {
+                if let Some(async_tool) = registry.get_async(&name) {
+                    let tool_adapter =
+                        Box::new(AsyncExtensibleToolAdapter::new(async_tool));
+                    builder = builder.with_tool(ToolVariant::Async(tool_adapter));
+                }
+            }
         }
 
         let has_skills = !self.skills.is_empty();
@@ -564,20 +641,33 @@ impl Agent {
     /// and writes results back after completion. Session is not locked during
     /// engine execution to avoid deadlocks with hooks.
     pub async fn react(&self, task: &str) -> Result<String, AgentError> {
-        let mut engine = self.build_react_engine()?;
+        let wall_start = std::time::Instant::now();
 
-        // Clone messages out of the shared session so the lock is released
-        // before engine execution (hooks may need to access the session).
-        let initial_messages = {
-            let session = self.session.lock().unwrap();
-            session.messages().to_vec()
+        // Get or build engine + context (lock held only briefly for cache check)
+        let (mut engine, mut context) = {
+            let mut engine_cache = self.engine_cache.lock().unwrap();
+            let mut context_cache = self.context_cache.lock().unwrap();
+            if engine_cache.is_none() || context_cache.is_none() {
+                drop(engine_cache);
+                drop(context_cache);
+                let eng = self.build_react_engine()?;
+                let ctx = self.prepare_context();
+                let mut ec = self.engine_cache.lock().unwrap();
+                let mut cc = self.context_cache.lock().unwrap();
+                *ec = Some(eng);
+                *cc = Some(ctx);
+                (Some(ec.take().unwrap()), Some(cc.take().unwrap()))
+            } else {
+                (Some(engine_cache.take().unwrap()), Some(context_cache.take().unwrap()))
+            }
+        };
+
+        let messages = {
+            let mut session = self.session.lock().unwrap();
+            session.take_messages()
         };
         let mut agent_session = AgentSession::new();
-        for msg in initial_messages {
-            agent_session.push(msg);
-        }
-
-        let mut context = self.prepare_context();
+        agent_session.restore_messages(messages);
 
         let request = LlmRequest {
             model: self.config.model.clone(),
@@ -586,20 +676,30 @@ impl Agent {
             ..Default::default()
         };
 
+        let engine_start = std::time::Instant::now();
         let result = engine
-            .react(request, &mut agent_session, &mut context)
+            .as_mut()
+            .unwrap()
+            .react(request, &mut agent_session, &mut *context.as_mut().unwrap())
             .await;
+        let engine_time = engine_start.elapsed();
 
-        // Write results back to the shared session
         {
             let mut session = self.session.lock().unwrap();
-            for msg in agent_session.messages().to_vec() {
-                session.push(msg);
-            }
+            session.restore_messages(agent_session.take_messages());
         }
 
         match result {
             Ok(answer) => {
+                {
+                    let mut ec = self.engine_cache.lock().unwrap();
+                    *ec = engine.take();
+                    let mut cc = self.context_cache.lock().unwrap();
+                    *cc = context.take();
+                }
+                let wall_time = wall_start.elapsed();
+                self.metrics
+                    .record_call(wall_time, engine_time, std::time::Duration::ZERO, 0, 0);
                 self.hooks
                     .trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name))
                     .await;
@@ -609,6 +709,9 @@ impl Agent {
                 Ok(answer)
             }
             Err(e) => {
+                drop(engine);
+                drop(context);
+                self.metrics.record_llm_error();
                 let mut ctx = HookContext::new(&self.config.name);
                 ctx.set("error", e.to_string());
                 let decision = self.hooks.trigger(HookEvent::OnError, ctx).await;
@@ -634,28 +737,43 @@ impl Agent {
         &self,
         task: &str,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send + '_>> {
-        let engine_result = self.build_react_engine();
         let task_str = task.to_string();
 
-        let mut context = self.prepare_context();
-
-        let initial_messages = {
-            let session = self.session.lock().unwrap();
-            session.messages().to_vec()
+        let cached_engine = {
+            let mut cache = self.engine_cache.lock().unwrap();
+            cache.take()
         };
-        let mut agent_session = AgentSession::new();
-        for msg in initial_messages {
-            agent_session.push(msg);
-        }
-
-        let stream = async_stream::stream! {
-            let engine = match engine_result {
+        let engine = match cached_engine {
+            Some(e) => e,
+            None => match self.build_react_engine() {
                 Ok(e) => e,
                 Err(e) => {
-                    yield Err(e);
-                    return;
-                    }
-            };
+                    return Box::pin(async_stream::stream! {
+                        yield Err(e);
+                    });
+                }
+            }
+        };
+
+        let cached_context = {
+            let mut cache = self.context_cache.lock().unwrap();
+            cache.take()
+        };
+        let context = match cached_context {
+            Some(c) => c,
+            None => self.prepare_context(),
+        };
+
+        let messages = {
+            let mut session = self.session.lock().unwrap();
+            session.take_messages()
+        };
+        let mut agent_session = AgentSession::new();
+        agent_session.restore_messages(messages);
+
+        let stream = async_stream::stream! {
+            let engine = engine;
+            let mut context = context;
 
             let request = LlmRequest {
                 model: self.config.model.clone(),
@@ -664,7 +782,9 @@ impl Agent {
                 ..Default::default()
             };
 
-            // Consume stream in its own scope to release borrow of agent_session
+            // Push user message to session (must be done before calling engine)
+            agent_session.push(LlmMessage::user(task_str.clone()));
+
             {
                 let react_stream = engine.react_stream(request, &mut agent_session, &mut context);
                 futures::pin_mut!(react_stream);
@@ -673,14 +793,19 @@ impl Agent {
                 }
             }
 
-            // Write results back to the shared session
             {
                 let mut session = self.session.lock().unwrap();
-                for msg in agent_session.messages().to_vec() {
-                    session.push(msg);
-                }
+                session.restore_messages(agent_session.take_messages());
             }
 
+            {
+                let mut cache = self.engine_cache.lock().unwrap();
+                *cache = Some(engine);
+            }
+            {
+                let mut cache = self.context_cache.lock().unwrap();
+                *cache = Some(context);
+            }
         };
 
         Box::pin(stream)
@@ -707,6 +832,8 @@ impl Agent {
         self.registry = Some(Arc::new(ToolRegistry::new()));
         self.hooks.clear_all_blocking();
         self.plugins.clear_blocking();
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
     }
 
     /// Register a tool and return explicit error on failure.
@@ -718,6 +845,8 @@ impl Agent {
             reg.register(tool)?;
             self.registry = Some(Arc::new(reg));
         }
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
         Ok(())
     }
 
@@ -759,6 +888,8 @@ impl Agent {
             self.skills.push(content);
         }
         self.skills_dir = Some(dir);
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
         Ok(())
     }
 
@@ -831,15 +962,16 @@ impl Agent {
         for tool in tools {
             let schema = tool.input_schema.clone();
             let tool_name = tool.name.clone();
-            let mcp_tool = std::sync::Arc::new(McpToolAdapter::new(
-                client.clone(),
-                tool_name.clone(),
-                tool_name.clone(),
-                tool.description.clone(),
-                schema,
-            ));
+            let mcp_tool: std::sync::Arc<dyn react::tool::registry::AsyncTool> =
+                std::sync::Arc::new(McpToolAdapter::new(
+                    client.clone(),
+                    tool_name.clone(),
+                    tool_name.clone(),
+                    tool.description.clone(),
+                    schema,
+                ));
             reg_mut
-                .register_with_namespace(mcp_tool, namespace)
+                .register_async_with_namespace(mcp_tool, namespace)
                 .map_err(|e| {
                     crate::mcp::McpError::Protocol(format!(
                         "Failed to register MCP tool '{}': {}",
@@ -847,6 +979,8 @@ impl Agent {
                     ))
                 })?;
         }
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
         Ok(())
     }
 }
@@ -862,8 +996,11 @@ impl Clone for Agent {
             skills: self.skills.clone(),
             resilience: self.resilience.clone(),
             session: std::sync::Mutex::new(self.session.lock().unwrap().clone()),
+            metrics: self.metrics.clone(),
             hooks: self.hooks.clone(),
             plugins: self.plugins.clone(),
+            engine_cache: std::sync::Mutex::new(None),
+            context_cache: std::sync::Mutex::new(None),
         }
     }
 }

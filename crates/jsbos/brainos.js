@@ -125,8 +125,13 @@ withTools(...tools) {
     return this;
   }
 
+  onHook(event, callback) {
+    this._hooks.push({ event, callback });
+    return this;
+  }
+
   async start() {
-    const { Agent: RawAgent } = require('./jsbos.js');
+    const { Agent: RawAgent } = require('./index.js');
     this._inner = await RawAgent.create(this._config);
     for (const t of this._tools) {
       const schema = JSON.stringify(t.schema);
@@ -220,7 +225,7 @@ class BusManager {
   }
 
   async start() {
-    const { Bus: RawBus } = require('./jsbos.js');
+    const { Bus: RawBus } = require('./index.js');
     const cfg = {
       mode: this._mode,
       connect: this._connect,

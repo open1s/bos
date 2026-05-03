@@ -146,7 +146,25 @@ agent.register_many(tool1, tool2, tool3)
 
 # Or chain them
 agent.register(tool1).register(tool2)
+
+# Register skills from a directory
+agent.register_skills("/path/to/skills_directory")
 ```
+
+### Loading Skills from Directory
+
+Skills are Python modules containing `@tool` decorated functions. Use `register_skills()` to load all skills from a directory:
+
+```python
+# Directory structure:
+# /path/to/skills/
+#   ├── math.py        # contains @tool decorated functions
+#   └── search.py      # contains @tool decorated functions
+
+agent.register_skills("/path/to/skills")
+```
+
+When `start()` is called, all skills in the directory are automatically registered.
 
 ---
 
@@ -541,6 +559,11 @@ Main entry point for BrainOS.
 BrainOS(api_key=None, base_url=None, model=None)
 ```
 
+**Attributes:**
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `__version__` | `str` | BrainOS package version (e.g., "1.2.0") |
+
 **Methods:**
 | Method | Description |
 |--------|-------------|
@@ -625,7 +648,7 @@ async with BrainOS(api_key="sk-...") as brain:
     result = await agent.ask("What is 42 + 58?")
 ```
 
-**Method 4: Using pybos directly**
+**Method 4: Using pybos directly with AgentConfig**
 ```python
 from pybos import Agent, AgentConfig
 
@@ -633,6 +656,7 @@ cfg = AgentConfig(
     name="assistant",
     model="gpt-4",
     api_key="sk-...",
+    base_url="https://api.openai.com/v1",
     # Circuit Breaker - prevents cascading failures
     circuit_breaker_max_failures=5,      # failures before opening circuit
     circuit_breaker_cooldown_secs=30,      # seconds before attempting recovery
@@ -643,7 +667,9 @@ cfg = AgentConfig(
     rate_limit_retry_backoff_secs=1,    # backoff between retries
     rate_limit_auto_wait=True,             # auto-wait when rate limited
 )
-agent = Agent.from_config(cfg)
+
+# Create agent from config
+agent = Agent(cfg)
 ```
 
 **Circuit Breaker Options:**

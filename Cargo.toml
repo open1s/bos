@@ -13,10 +13,10 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1.1.2"
 serde_yaml = "0.9"
 dashmap = "6.1.0"
 anyhow = "1.0"
@@ -24,25 +24,25 @@ thiserror = "2.0"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.23", features = ["v4"] }
 futures = "0.3"
 tokio-stream = "0.1"
 async-stream = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
-fastrand = "2.0"
-reqwest = { version = "0.12", features = ["json"] }
-zenoh = "1.8"
+fastrand = "2.4"
+reqwest = { version = "0.13", features = ["json"] }
+zenoh = "1.9"
 regex = "1.12"
 glob = "0.3"
 urlencoding = "2.1"
-rkyv = { version = "0.8", features = ["unaligned"] }
-rkyv_derive = "0.8"
+rkyv = { version = "0.8.16", features = ["unaligned"] }
+rkyv_derive = "0.8.16"
 async-channel = "2.5"
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
-pprof = { version = "0.13", features = ["criterion", "flamegraph"] }
+criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
+pprof = { version = "0.15", features = ["criterion", "flamegraph"] }
 
 [workspace.package]
-version = "1.2.0"
+version = "2.0.0"
 edition = "2021"
 authors = ["BrickOS Team"]
 license = "MIT OR Apache-2.0"

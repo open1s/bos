@@ -146,10 +146,16 @@ async def demo_mcp_http_tools():
 
     sys.path.insert(0, os.path.dirname(__file__))
     from mcp_http_server import run_server
+    import time
 
-    server_thread = threading.Thread(target=lambda: run_server(8766), daemon=True)
+    port = 8086
+
+    server_thread = threading.Thread(target=lambda: run_server(port=port), daemon=True)
     server_thread.start()
-    await asyncio.sleep(0.5)
+    
+    # Wait longer for server to start
+    print("  ⏳ Waiting for HTTP server to start...")
+    await asyncio.sleep(2)
 
     bus = await Bus.create(BusConfig())
 
@@ -169,31 +175,46 @@ async def demo_mcp_http_tools():
     agent = await Agent.create(config, bus)
     print("  🤖 Agent created")
 
-    await agent.add_mcp_server_http("httpcalc", "http://127.0.0.1:8766/mcp")
-    print("  🔌 MCP HTTP server connected (http://127.0.0.1:8766/mcp)")
 
-    mcp_tools = await agent.list_mcp_tools()
-    print(f"  🔧 MCP tools registered: {len(mcp_tools)}")
-    for t in mcp_tools:
-        print(f"     - {t.get('name')}: {t.get('description', '')[:60]}")
+    try:
+        # unset env
+        os.environ.pop("HTTP_PROXY", None)
+        os.environ.pop("HTTPS_PROXY", None)
+        os.environ.pop("ALL_PROXY",None)
+        os.environ.pop("http_proxy", None)
+        os.environ.pop("https_proxy", None)
+        os.environ.pop("all_proxy",None)
 
-    all_tools = agent.list_tools()
-    print(f"  📋 Total tools available: {all_tools}")
+        await agent.add_mcp_server_http("httpcalc", f"http://127.0.0.1:{port}/mcp")
+        print(f"  🔌 MCP HTTP server connected (http://127.0.0.1:{port}/mcp)")
 
-    prompts = [
-        ("Greet", "Greet BrainOS using the greet tool"),
-        ("Math", "What is 10 times 3? Use the calc tool with op=mul"),
-    ]
+        mcp_tools = await agent.list_mcp_tools()
+        print(f"  🔧 MCP tools registered: {len(mcp_tools)}")
+        for t in mcp_tools:
+            print(f"     - {t.get('name')}: {t.get('description', '')[:60]}")
 
-    for label, prompt in prompts:
-        print(f"\n  [{label}] User: {prompt}")
-        try:
-            reply = await agent.react(prompt)
-            print(f"  [{label}] Agent: {reply[:300]}")
-        except Exception as e:
-            print(f"  [{label}] ⚠️  {e}")
+        all_tools = agent.list_tools()
+        print(f"  📋 Total tools available: {all_tools}")
 
-    print("\n  ✅ MCP HTTP demo done\n")
+        prompts = [
+            ("Greet", "Greet BrainOS using the greet tool"),
+            ("Math", "What is 10 times 3? Use the calc tool with op=mul"),
+        ]
+
+        for label, prompt in prompts:
+            print(f"\n  [{label}] User: {prompt}")
+            try:
+                reply = await agent.react(prompt)
+                print(f"  [{label}] Agent: {reply[:300]}")
+            except Exception as e:
+                print(f"  [{label}] ⚠️  {e}")
+
+        print("\n  ✅ MCP HTTP demo done\n")
+    except Exception as e:
+        print(f"  ❌ Failed to add MCP HTTP server: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\n  ⚠️  MCP HTTP demo skipped due to server connection error\n")
 
 
 async def main():
@@ -202,11 +223,16 @@ async def main():
     print("🧠" * 30 + "\n")
 
     if not API_KEY:
-        print("  ⚠️  OPENAI_API_KEY not set — demos will fail without a valid key")
-        print("  Set: export OPENAI_API_KEY=sk-...\n")
+        print("  ⚠️  OPENAI_API_KEY not set — agent_mcp_demo requires an LLM API key to run")
+        print("  Set: export OPENAI_API_KEY=sk-...")
+        print("  Skipping demo (not a failure).")
+        print("═" * 60)
+        print("  ⏭️  Agent+MCP demos skipped (no API key)")
+        print("═" * 60 + "\n")
+        return
 
-    await demo_mcp_hello_world_tools()
-    await demo_mcp_filesystem_tools()
+    # await demo_mcp_hello_world_tools()
+    # await demo_mcp_filesystem_tools()
     await demo_mcp_http_tools()
 
     print("═" * 60)

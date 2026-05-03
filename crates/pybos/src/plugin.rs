@@ -6,7 +6,6 @@ use agent::agent::plugin::{
 use async_trait::async_trait;
 use pyo3::prelude::*;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
-use react::llm::LlmContext;
 use std::sync::Arc;
 
 #[pyclass(name = "LlmRequestWrapper", from_py_object)]
@@ -38,11 +37,9 @@ impl From<&InnerLlmRequest> for PyLlmRequestWrapper {
 
 impl From<PyLlmRequestWrapper> for InnerLlmRequest {
     fn from(py_req: PyLlmRequestWrapper) -> Self {
-        let mut ctx = LlmContext::default();
-        ctx.conversations = vec![];
         InnerLlmRequest {
             model: py_req.model,
-            context: ctx,
+            input: String::new(),
             temperature: py_req.temperature,
             max_tokens: py_req.max_tokens,
             top_p: py_req.top_p,

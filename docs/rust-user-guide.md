@@ -35,8 +35,36 @@ serde_json = { workspace = true }
 
 ## Quick Start
 
+### Using AgentBuilder (TOML-based, Recommended)
+
+```rust
+use agent::AgentBuilder;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let toml = r#"
+        name = "assistant"
+        model = "nvidia/meta/llama-3.1-8b-instruct"
+        base_url = "https://integrate.api.nvidia.com/v1"
+        api_key = "your-api-key"
+    "#;
+
+    let builder = AgentBuilder::from_toml(toml)?;
+    let agent = builder.build(None).await?;
+
+    let result = agent.run_simple("What is 42 + 58?").await?;
+    println!("{}", result);
+
+    Ok(())
+}
+```
+
+### Using AgentConfig Directly
+
 ```rust
 use agent::{Agent, AgentConfig};
+use agent::llm::LlmProvider;
+use agent::llm::openai::OpenAiClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,9 +72,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("assistant")
         .model("nvidia/meta/llama-3.1-8b-instruct");
 
-    let agent = Agent::builder()
-        .config(config)
-        .build()?;
+    let provider = LlmProvider::new();
+    provider.register_vendor("openai", Box::new(OpenAiClient::new(
+        "https://api.openai.com/v1",
+        "sk-...".to_string(),
+    )));
+
+    let agent = Agent::new(config, Arc::new(provider));
 
     let result = agent.run_simple("What is 42 + 58?").await?;
     println!("{}", result);
@@ -59,6 +91,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Core Concepts
 
+### AgentBuilder (TOML-based)
+
+The recommended way to create an Agent is using `AgentBuilder` which can load configuration from TOML:
+
+```rust
+use agent::AgentBuilder;
+
+let builder = AgentBuilder::from_toml(toml_str)?;
+// Or from a file:
+let builder = AgentBuilder::from_file("/path/to/config.toml")?;
+
+// Add tools
+builder = builder.with_tool(Arc::new(MyTool));
+
+// Build the agent
+let agent = builder.build(None).await?;
+```
+
 ### Agent
 
 The `Agent` is the main component that powers AI interactions with tool support:
@@ -70,9 +120,8 @@ let config = AgentConfig::default()
     .name("assistant")
     .system_prompt("You are a helpful assistant.");
 
-let agent = Agent::builder()
-    .config(config)
-    .build()?;
+// Agent::new requires a config and an LLM provider
+let agent = Agent::new(config, llm_provider);
 ```
 
 ### Tool
@@ -233,6 +282,54 @@ let mut registry = ToolRegistry::new();
 registry.add(Arc::new(MyTool)).await?;
 ```
 
+### MCP Tools (Model Context Protocol)
+
+Register MCP tools from an MCP client:
+
+```rust
+use agent::McpClient;
+use std::sync::Arc;
+
+// Create and initialize MCP client
+let mcp_client = Arc::new(McpClient::new());
+agent.register_mcp_tools(mcp_client.clone()).await?;
+
+// With namespace
+agent.register_mcp_tools_with_namespace(mcp_client, "mcp").await?;
+```
+
+### Remote Agent Tools
+
+Create tools that call other agents via RPC:
+
+```rust
+use bus::Session;
+
+// Add a remote agent as a tool
+agent.add_remote_agent_tool(
+    "remote_assistant",  // tool name
+    "tcp://localhost:5555".to_string(),  // endpoint
+    Arc::new(session),   // bus session
+).await?;
+```
+
+### Skills Loading
+
+Load skills from a directory:
+
+```rust
+use std::path::PathBuf;
+
+// Register skills from a directory
+agent.register_skills_from_dir(PathBuf::from("/path/to/skills"))?;
+
+// Get skill schemas for LLM
+let schemas = agent.get_skills_schemas();
+
+// Get skill content (name, description pairs)
+let content = agent.get_skills_content();
+```
+
 ---
 
 ## Bus Communication
@@ -388,12 +485,9 @@ For the complete API reference, see [Rust API Reference](./api-reference/rust-ap
 
 LLM-powered agent with tool support.
 
-**Builder:**
+**Constructor:**
 ```rust
-Agent::builder()
-    .config(config)
-    .registry(registry)
-    .build()
+Agent::new(config: AgentConfig, llm: Arc<LlmProvider>) -> Self
 ```
 
 **Methods:**
@@ -402,14 +496,52 @@ Agent::builder()
 | `run_simple(task)` | Simple conversation |
 | `react(task)` | Run with ReAct reasoning |
 | `stream(task)` | Stream response |
+| `add_remote_agent_tool(...)` | Add a remote agent as a tool |
+| `register_mcp_tools(...)` | Register MCP tools |
+| `register_skills_from_dir(path)` | Load skills from directory |
+| `get_skills_schemas()` | Get skill schemas for LLM |
+| `save_session(path)` | Save agent session to file |
+| `restore_session(path)` | Restore session from file |
+
+### `AgentBuilder`
+
+TOML-based builder for creating agents (alias: `TomlAgentBuilder`).
+
+**Factory Methods:**
+| Method | Description |
+|--------|-------------|
+| `from_toml(toml_str)` | Create from TOML string |
+| `from_file(path)` | Create from TOML file |
+| `with_tool(tool)` | Add a tool |
+
+**Example:**
+```rust
+let builder = AgentBuilder::from_toml(toml_str)?;
+let agent = builder.build(None).await?;
+```
 
 ### `AgentConfig`
 
 Agent configuration.
 
-**Methods:**
-| Method | Description |
-|--------|-------------|
+**Fields:**
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | `"agent"` | Agent name |
+| `model` | `"gpt-4"` | Model name |
+| `base_url` | `"https://api.openai.com/v1"` | API base URL |
+| `api_key` | `""` | API key |
+| `system_prompt` | `"You are a helpful assistant."` | System prompt |
+| `temperature` | `0.7` | Sampling temperature |
+| `timeout_secs` | `60` | Request timeout |
+| `max_steps` | `10` | Maximum ReAct steps |
+| `circuit_breaker` | `None` | Circuit breaker config |
+| `rate_limit` | `None` | Rate limiter config |
+| `context_compaction_threshold_tokens` | `24000` | Tokens before compaction |
+| `context_compaction_trigger_ratio` | `0.85` | Trigger ratio for compaction |
+| `context_compaction_keep_recent_messages` | `12` | Messages to keep during compaction |
+| `context_compaction_max_summary_chars` | `4000` | Max summary length |
+| `context_compaction_summary_max_tokens` | `600` | Max summary tokens |
 | `name(name)` | Set agent name |
 | `model(model)` | Set model |
 | `system_prompt(prompt)` | Set system prompt |

@@ -85,7 +85,7 @@ impl Tool for BashTool {
                 "Missing required field: command".to_string(),
             ))?;
 
-        if let Some(ref validator) = self.validator {
+        if let Some(ref _validator) = self.validator {
             if WorkspaceValidator::is_destructive_command(command) {
                 return Err(ToolError::Failed(
                     "Destructive command blocked by security policy".to_string(),

@@ -1,15 +1,15 @@
 use crate::bus::PyBus;
-use crate::utils::{invoke_python_handler_to_pyany, json_to_py, py_to_json, to_py_runtime_error};
+use crate::utils::{json_to_py, py_to_json, to_py_runtime_error};
+use agent::agent::agentic::LlmProvider;
 use agent::agent::hooks::HookEvent;
 use agent::{
     Agent, AgentCallableServer, AgentConfig, AgentRpcClient, CircuitBreakerConfig, LlmMessage,
-    RateLimiterConfig, StreamToken, Tool, ToolDescription,
+    RateLimiterConfig, StreamToken, Tool,
 };
-use async_trait::async_trait;
 use futures::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
-use pyo3::IntoPyObjectExt;
+use react::llm::vendor::OpenAiClient;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -201,7 +201,7 @@ impl PyStreamIterator {
 #[pyclass(name = "PythonTool", skip_from_py_object)]
 pub struct PyPythonTool {
     name: String,
-    description: ToolDescription,
+    description: String,
     schema: serde_json::Value,
     callback: Py<PyAny>,
 }
@@ -212,16 +212,13 @@ impl PyPythonTool {
     fn new(
         name: String,
         description: String,
-        parameters: String,
+        _parameters: String,
         schema: String,
         callback: Py<PyAny>,
     ) -> Self {
         Self {
             name,
-            description: ToolDescription {
-                short: description,
-                parameters,
-            },
+            description,
             schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
             callback,
         }
@@ -230,15 +227,18 @@ impl PyPythonTool {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
 }
 
-#[async_trait]
 impl Tool for PyPythonTool {
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn description(&self) -> ToolDescription {
+    fn description(&self) -> String {
         self.description.clone()
     }
 
@@ -246,34 +246,30 @@ impl Tool for PyPythonTool {
         self.schema.clone()
     }
 
-    async fn execute(
-        &self,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value, agent::ToolError> {
-        let py_arg = Python::attach(|py| -> Result<Py<PyAny>, agent::ToolError> {
-            let arg_json = serde_json::to_string(args)
-                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-            Ok(arg_json
-                .into_bound_py_any(py)
-                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?
-                .unbind())
-        })?;
+    fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, react::ToolError> {
+        let arg_json = serde_json::to_string(args)
+            .map_err(|e| react::ToolError::Failed(e.to_string()))?;
 
-        let result = invoke_python_handler_to_pyany(&self.callback, py_arg)
-            .await
-            .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-
-        // Convert the result back to serde_json::Value
-        let result_json = Python::attach(|py| -> Result<serde_json::Value, agent::ToolError> {
-            let result_str = result
-                .bind(py)
-                .extract::<String>()
-                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-            serde_json::from_str(&result_str)
-                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))
-        })?;
-
-        Ok(result_json)
+        Python::attach(|py| -> Result<serde_json::Value, react::ToolError> {
+            let json_mod = py
+                .import("json")
+                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
+            let args_dict = json_mod
+                .call_method1("loads", (arg_json,))
+                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
+            self.callback
+                .call1(py, (args_dict,))
+                .map_err(|e: PyErr| react::ToolError::Failed(e.to_string()))
+                .and_then(|result| {
+                    result
+                        .extract::<String>(py)
+                        .map_err(|e| react::ToolError::Failed(e.to_string()))
+                })
+                .and_then(|result_str| {
+                    serde_json::from_str(&result_str)
+                        .map_err(|e| react::ToolError::Failed(e.to_string()))
+                })
+        })
     }
 }
 
@@ -282,17 +278,16 @@ impl Tool for PyPythonTool {
 struct PyPythonToolWrapper {
     inner: Py<PyPythonTool>,
     name: String,
-    description: ToolDescription,
+    description: String,
     schema: serde_json::Value,
 }
 
-#[async_trait]
 impl Tool for PyPythonToolWrapper {
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn description(&self) -> ToolDescription {
+    fn description(&self) -> String {
         self.description.clone()
     }
 
@@ -300,36 +295,29 @@ impl Tool for PyPythonToolWrapper {
         self.schema.clone()
     }
 
-    async fn execute(
-        &self,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value, agent::ToolError> {
+    fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, react::ToolError> {
         let args_clone = args.clone();
-        let py_arg = Python::attach(|py| -> Result<Py<PyAny>, agent::ToolError> {
+        Python::attach(|py| {
             let inner = self.inner.clone_ref(py);
             let tool = inner.borrow(py);
             let arg_json = serde_json::to_string(&args_clone)
-                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-            // Parse JSON string into Python dict
+                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
             let json_mod = py
                 .import("json")
-                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
+                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
             let args_dict = json_mod
                 .call_method1("loads", (arg_json,))
-                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
-            tool.callback
+                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
+            let result = tool
+                .callback
                 .clone_ref(py)
                 .call1(py, (args_dict,))
-                .map_err(|e: PyErr| agent::ToolError::ExecutionFailed(e.to_string()))
-        })?;
-
-        Python::attach(|py| -> Result<serde_json::Value, agent::ToolError> {
-            let result_str = py_arg
-                .bind(py)
-                .extract::<String>()
-                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))?;
+                .map_err(|e: PyErr| react::ToolError::Failed(e.to_string()))?;
+            let result_str = result
+                .extract::<String>(py)
+                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
             serde_json::from_str(&result_str)
-                .map_err(|e| agent::ToolError::ExecutionFailed(e.to_string()))
+                .map_err(|e| react::ToolError::Failed(e.to_string()))
         })
     }
 }
@@ -658,25 +646,26 @@ impl PyAgent {
     ) -> PyResult<Self> {
         let cfg: AgentConfig = config.clone().into();
         let py_hooks = crate::hooks::PyHookRegistry::create();
-        let hooks = py_hooks.to_hook_registry();
 
-        let agent = Agent::builder()
-            .name(cfg.name)
-            .model(cfg.model)
-            .base_url(cfg.base_url)
-            .api_key(cfg.api_key)
-            .system_prompt(cfg.system_prompt)
-            .temperature(cfg.temperature)
-            .max_tokens(cfg.max_tokens.unwrap_or(4096))
-            .timeout(cfg.timeout_secs)
-            .context_compaction_threshold_tokens(cfg.context_compaction_threshold_tokens)
-            .context_compaction_trigger_ratio(cfg.context_compaction_trigger_ratio)
-            .context_compaction_keep_recent_messages(cfg.context_compaction_keep_recent_messages)
-            .context_compaction_max_summary_chars(cfg.context_compaction_max_summary_chars)
-            .context_compaction_summary_max_tokens(cfg.context_compaction_summary_max_tokens)
-            .with_hooks(hooks)
-            .build()
-            .map_err(to_py_runtime_error)?;
+        let mut llm = LlmProvider::new();
+
+        let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
+            (cfg.model[..pos].to_string(), cfg.model[pos + 1..].to_string())
+        } else {
+            ("openai".to_string(), cfg.model.clone())
+        };
+
+        llm.register_vendor(
+            vendor_name,
+            Box::new(OpenAiClient::new(
+                cfg.base_url.clone(),
+                model_name,
+                cfg.api_key.clone(),
+            )),
+        );
+        let llm = std::sync::Arc::new(llm);
+
+        let agent = Agent::new(cfg, llm);
 
         Ok(Self {
             inner: std::sync::Arc::new(Mutex::new(agent)),
@@ -696,27 +685,26 @@ impl PyAgent {
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let py_hooks = crate::hooks::PyHookRegistry::create();
-            let hooks = py_hooks.to_hook_registry();
 
-            let agent = Agent::builder()
-                .name(cfg.name)
-                .model(cfg.model)
-                .base_url(cfg.base_url)
-                .api_key(cfg.api_key)
-                .system_prompt(cfg.system_prompt)
-                .temperature(cfg.temperature)
-                .max_tokens(cfg.max_tokens.unwrap_or(4096))
-                .timeout(cfg.timeout_secs)
-                .context_compaction_threshold_tokens(cfg.context_compaction_threshold_tokens)
-                .context_compaction_trigger_ratio(cfg.context_compaction_trigger_ratio)
-                .context_compaction_keep_recent_messages(
-                    cfg.context_compaction_keep_recent_messages,
-                )
-                .context_compaction_max_summary_chars(cfg.context_compaction_max_summary_chars)
-                .context_compaction_summary_max_tokens(cfg.context_compaction_summary_max_tokens)
-                .with_hooks(hooks)
-                .build()
-                .map_err(to_py_runtime_error)?;
+            let mut llm = LlmProvider::new();
+
+            let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
+                (cfg.model[..pos].to_string(), cfg.model[pos + 1..].to_string())
+            } else {
+                ("openai".to_string(), cfg.model.clone())
+            };
+
+            llm.register_vendor(
+                vendor_name,
+                Box::new(OpenAiClient::new(
+                    cfg.base_url.clone(),
+                    model_name,
+                    cfg.api_key.clone(),
+                )),
+            );
+            let llm = std::sync::Arc::new(llm);
+
+            let agent = Agent::new(cfg, llm);
 
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let py_agent = Py::new(
@@ -830,7 +818,7 @@ impl PyAgent {
         })
     }
 
-    fn _stream_placeholder_<'py>(
+    fn stream<'py>(
         &self,
         py: Python<'py>,
         task: String,
@@ -1030,7 +1018,7 @@ impl PyAgent {
         let agent = self.inner.clone();
         let py_tool = tool.borrow(py);
         let tool_name = py_tool.name().to_string();
-        let tool_description = py_tool.description();
+        let tool_description = py_tool.description().to_string();
         let tool_schema = py_tool.json_schema();
         drop(py_tool);
 
@@ -1131,6 +1119,30 @@ impl PyAgent {
         })
     }
 
+    fn add_bash_tool<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        workspace_root: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let agent = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let tool = if let Some(root) = workspace_root {
+                agent::BashTool::new(&name).with_workspace(&root)
+            } else {
+                agent::BashTool::new(&name)
+            };
+            let mut guard = agent.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
+            })?;
+            guard
+                .try_add_tool(Arc::new(tool))
+                .map_err(to_py_runtime_error)?;
+            Ok(())
+        })
+    }
+
     fn list_mcp_tools<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let agent = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
@@ -1146,8 +1158,7 @@ impl PyAgent {
                         .map(|(name, tool)| {
                             serde_json::json!({
                                 "name": name,
-                                "description": tool.description().short,
-                                "parameters": tool.description().parameters,
+                                "description": tool.description(),
                             })
                         })
                         .collect::<Vec<_>>()
@@ -1181,7 +1192,7 @@ impl PyAgent {
                         .map(|(name, tool)| {
                             serde_json::json!({
                                 "name": name,
-                                "description": tool.description().short,
+                                "description": tool.description(),
                             })
                         })
                         .collect::<Vec<_>>()
@@ -1227,7 +1238,7 @@ impl PyAgent {
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        let messages = guard.get_messages();
+        let messages = guard.session().messages().to_vec();
         let py_list = pyo3::types::PyList::empty(py);
         for msg in messages {
             let wrapper = PyLlmMessage { inner: msg.clone() };
@@ -1242,7 +1253,7 @@ impl PyAgent {
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
         guard
-            .save_message_log(&path)
+            .save_session(&path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -1252,7 +1263,7 @@ impl PyAgent {
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
         guard
-            .restore_message_log(&path)
+            .restore_session(&path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -1261,7 +1272,7 @@ impl PyAgent {
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        let context = guard.session_context();
+        let context = guard.session().session_context();
         json_to_py(py, &context).map(|py_obj| py_obj.into_bound(py))
     }
 
@@ -1275,7 +1286,7 @@ impl PyAgent {
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        guard.set_session_context(context_value);
+        guard.session_mut().set_session_context(context_value);
         Ok(())
     }
 
@@ -1284,7 +1295,7 @@ impl PyAgent {
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        guard.clear_session_context();
+        guard.session_mut().clear_session_context();
         Ok(())
     }
 
@@ -1320,13 +1331,12 @@ impl PyAgent {
     }
 
     fn compact_message_log<'py>(&self, _py: Python<'py>) -> PyResult<()> {
-        let guard = self
+        let mut guard = self
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        guard
-            .compact_message_log()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        guard.session_mut().compact(12, 4000);
+        Ok(())
     }
 
     fn register_hook(&self, event: &Bound<'_, PyAny>, callback: Py<PyAny>) -> PyResult<()> {
@@ -1371,21 +1381,5 @@ impl PyAgent {
 
         self.inner.lock().unwrap().add_plugin(plugin_arc);
         Ok(())
-    }
-
-    fn token_usage(&self) -> PyResult<crate::llm_usage::PyTokenUsage> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        Ok(guard.token_usage().into())
-    }
-
-    fn token_budget_report(&self) -> PyResult<crate::llm_usage::PyTokenBudgetReport> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        Ok(guard.token_budget_report().into())
     }
 }

@@ -63,6 +63,21 @@ impl AgentSession {
         self.metadata.message_count = self.messages.len();
     }
 
+    pub fn take_messages(&mut self) -> Vec<Message> {
+        let msgs = std::mem::take(&mut self.messages);
+        self.update_metadata();
+        msgs
+    }
+
+    pub fn restore_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+        self.update_metadata();
+    }
+
+    pub fn history_ref(&self) -> &[Message] {
+        &self.messages
+    }
+
     pub fn to_api_format(&self) -> Vec<OpenAiMessage> {
         let mut api_messages = Vec::with_capacity(self.messages.len());
         self.extend_api_format(&mut api_messages);
@@ -178,12 +193,27 @@ impl AgentSession {
 
     pub fn restore(&mut self, path: &str) -> Result<(), std::io::Error> {
         let json = std::fs::read_to_string(path)?;
-        let restored: AgentSession = serde_json::from_str(&json)
+        self.restore_from_json(&json)
+    }
+
+    pub fn restore_from_json(&mut self, json: &str) -> Result<(), std::io::Error> {
+        let restored: AgentSession = serde_json::from_str(json)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         self.messages = restored.messages;
         self.context = restored.context;
         self.metadata = restored.metadata;
         Ok(())
+    }
+
+    pub fn to_json_string(&self) -> Result<String, std::io::Error> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    pub fn clear(&mut self) {
+        self.messages.retain(|msg| matches!(msg, Message::System { .. }));
+        self.context = JsonValue::Null;
+        self.metadata.updated_at = current_timestamp();
     }
 
     pub fn compact(&mut self, keep_recent: usize, max_summary_chars: usize) {

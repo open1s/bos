@@ -8,6 +8,7 @@ mod hooks;
 mod jsany;
 mod llm_usage;
 mod mcp;
+mod perf;
 mod plugin;
 mod publisher;
 mod query;
@@ -28,6 +29,8 @@ pub use plugin::{
 pub use publisher::Publisher;
 pub use query::{Query, Queryable};
 pub use subscriber::Subscriber;
+
+pub use perf::PerfSnapshot;
 
 // Note: logging is a dependency but used in binaries
 

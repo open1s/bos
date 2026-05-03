@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
  * Agent Streaming Demo
- * 
- * Demonstrates the agent.stream() API and token types
- * 
+ *
+ * Demonstrates the agent.stream() API for token-by-token streaming
+ *
  * Usage: node agent_stream_demo.cjs
  */
 
-const { Bus, Agent, ConfigLoader,initTracing } = require('../index.js');
+const { Bus, Agent, ConfigLoader, initTracing } = require('../index.js');
 
 initTracing();
 
@@ -18,7 +18,9 @@ const global = config.global_model || {};
 
 const API_KEY = process.env.OPENAI_API_KEY || global.api_key || '';
 const BASE_URL = process.env.LLM_BASE_URL || global.base_url || 'https://integrate.api.nvidia.com/v1';
-const MODEL = process.env.LLM_MODEL || global.model || 'z-ai/glm4.7';
+const MODEL = process.env.LLM_MODEL || global.model || 'nvidia/z-ai/glm4.7';
+
+// MODEL="nvidia/meta/llama-3.1-8b-instruct"
 
 function addTool(args) {
   const a = parseFloat(args.a || 0);
@@ -26,8 +28,54 @@ function addTool(args) {
   return JSON.stringify({ result: a + b });
 }
 
-function echoTool(args) {
-  return JSON.stringify({ reversed: args.text.split('').reverse().join('') });
+const ADD_SCHEMA = {
+  type: 'object',
+  properties: {
+    a: { type: 'number', description: 'First number' },
+    b: { type: 'number', description: 'Second number' },
+  },
+  required: ['a', 'b'],
+};
+
+async function streamTask(agent, task) {
+  console.log(`\n--- Stream: "${task}" ---`);
+
+  await new Promise((resolve, reject) => {
+    let tokenCount = 0;
+    let reasoningCount = 0;
+
+    agent.stream(task, (err, token) => {
+      if (err) { reject(err); return; }
+      if (!token) return;
+
+      tokenCount++;
+      const type = token.type || 'unknown';
+
+      switch (type) {
+        case 'Text':
+          if (token.text) process.stdout.write(token.text);
+          break;
+        case 'ReasoningContent':
+          reasoningCount++;
+          process.stderr.write('[thinking] ' + token.text);
+          break;
+        case 'ToolCall':
+          console.log('\n[ToolCall]', token.name, JSON.stringify(token.args));
+          break;
+        case 'Done':
+          console.log('\n[DONE] (' + tokenCount + ' tokens)');
+          if (reasoningCount === 0) {
+            console.log('[NO THINKING] Model did not emit reasoning_content chunks');
+          }
+          resolve();
+          break;
+        case 'Error':
+          console.log('\n[ERROR]', token.error);
+          reject(new Error(token.error));
+          break;
+      }
+    });
+  });
 }
 
 async function main() {
@@ -55,89 +103,16 @@ async function main() {
   console.log('Agent created');
 
   await agent.addTool('add', 'Add numbers',
-    JSON.stringify({ a: { type: 'number' }, b: { type: 'number' }}),
-    JSON.stringify({ a: { type: 'number' }, b: { type: 'number' }, required: ['a', 'b'] }),
+    JSON.stringify(ADD_SCHEMA.properties),
+    JSON.stringify(ADD_SCHEMA),
     (_err, args) => addTool(args));
+  console.log('Tools registered');
 
-  await agent.addTool('echo', 'Echo text',
-    JSON.stringify({ text: { type: 'string' }}),
-    JSON.stringify({ text: { type: 'string' }, required: ['text'] }),
-    (_err, args) => echoTool(args));
-  console.log('Tool: echo');
-
-  console.log('\n--- Stream: "What is 2 + 3?" ---');
-
-  await new Promise((resolve, reject) => {
-    let tokenCount = 0;
-    agent.stream('What is 2 + 3?', (err, token) => {
-      if (err) { reject(err); return; }
-      if (!token) return;
-      
-      tokenCount++;
-      const type = token.type || 'unknown';
-      
-      switch (type) {
-        case 'Text':
-          if (token.text) process.stdout.write(token.text);
-          break;
-        case 'ReasoningContent':
-          // Show thinking (if enabled)
-          process.stderr.write(token.text);
-          break;
-        case 'ToolCall':
-          console.log('\nTool:', token.name, JSON.stringify(token.args));
-          break;
-        case 'Done':
-          console.log('\nDone (' + tokenCount + ' tokens)');
-          resolve();
-          break;
-        case 'Error':
-          console.log('\nError:', token.error);
-          reject(new Error(token.error));
-          break;
-      }
-    });
-  });
-
-  console.log('\n--- Stream: "Echo hello" ---');
-
-  await new Promise((resolve, reject) => {
-    let tokenCount = 0;
-    agent.stream('Echo "hello"', (err, token) => {
-      if (err) { reject(err); return; }
-      if (!token) return;
-      
-      tokenCount++;
-      const type = token.type || 'unknown';
-      
-      switch (type) {
-        case 'Text':
-          if (token.text) process.stdout.write(token.text);
-          break;
-        case 'ReasoningContent':
-          process.stderr.write('[thinking] ' + token.text);
-          break;
-        case 'ToolCall':
-          console.log('\nTool:', token.name, JSON.stringify(token.args));
-          break;
-        case 'Done':
-          console.log('\nDone (' + tokenCount + ' tokens)');
-          resolve();
-          break;
-        case 'Error':
-          console.log('\nError:', token.error);
-          reject(new Error(token.error));
-          break;
-      }
-    });
-  });
+  await streamTask(agent, 'What is 2 + 3?');
+  await streamTask(agent, 'What is 99 + 1?');
 
   console.log('\n=== Complete ===\n');
-  // Force exit after 5 seconds to prevent hanging
-  setTimeout(() => {
-    console.log('Forcing exit after timeout');
-    process.exit(0);
-  }, 5000);
+  process.exit(0);
 }
 
 main().catch(e => { console.error('Error:', e.message); process.exit(1); });

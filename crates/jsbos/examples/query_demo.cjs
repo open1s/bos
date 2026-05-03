@@ -26,6 +26,7 @@ async function demoInlineHandler() {
   console.log('  🚌 Bus created');
 
   const queryable = await bus.createQueryable('svc/upper');
+  queryable.setHandler((err, input) => input.toUpperCase());
   await queryable.start();
   console.log('  📡 Queryable started on: svc/upper');
 
@@ -47,6 +48,11 @@ async function demoRunHandler() {
   console.log('  🚌 Bus created');
 
   const queryable = await bus.createQueryable('svc/echo');
+  queryable.setHandler((err, input) => {
+    const data = JSON.parse(input);
+    data.echo = true;
+    return JSON.stringify(data);
+  });
   await queryable.start();
   console.log('  📡 Queryable started on: svc/echo');
 
@@ -57,6 +63,7 @@ async function demoRunHandler() {
   const resp = await query.queryText(payload);
   const result = JSON.parse(resp);
   console.log(`  📤 Query: ${JSON.stringify(result)}`);
+  console.log(`  📥 Response: ${resp}`);
   console.log('  ✅ Run handler done\n');
 }
 
@@ -69,6 +76,7 @@ async function demoTimeout() {
   console.log('  🚌 Bus created');
 
   const queryable = await bus.createQueryable('svc/slow');
+  queryable.setHandler((err, input) => input);
   await queryable.start();
   console.log('  📡 Queryable started on: svc/slow');
 
@@ -95,4 +103,4 @@ async function main() {
   console.log('═'.repeat(60) + '\n');
 }
 
-main().catch(console.error);
+main().catch(console.error).finally(() => process.exit(0));

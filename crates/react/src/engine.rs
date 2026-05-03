@@ -267,7 +267,22 @@ impl<A: ReActApp + Default> ReActEngine<A> {
         self.tools.register_async(t);
     }
 
-    /// Call LLM with optional resilience wrapper.
+    /// Check if an error is transient (retryable).
+    fn is_transient_error(err: &LlmError) -> bool {
+        let err_str = format!("{:?}", err);
+        err_str.contains("429")
+            || err_str.contains("Too Many Requests")
+            || err_str.contains("rate limit")
+            || err_str.contains("timeout")
+            || err_str.contains("timed out")
+            || err_str.contains("connection refused")
+            || err_str.contains("service unavailable")
+            || err_str.contains("502")
+            || err_str.contains("503")
+            || err_str.contains("504")
+    }
+
+    /// Call LLM with optional resilience wrapper and retry on transient errors.
     pub async fn call_llm(
         &mut self,
         request: LlmRequest,
@@ -277,27 +292,61 @@ impl<A: ReActApp + Default> ReActEngine<A> {
     where
         A::Session: ReactSession,
     {
-        let result = if let Some(resilience) = &self.resilience {
-            resilience.acquire().await.map_err(ReactError::from)?;
-            resilience.check_circuit().map_err(ReactError::from)?;
-            self.llm.complete(request, session, context).await
-        } else {
-            self.llm.complete(request, session, context).await
-        };
+        let max_retries = self
+            .resilience
+            .as_ref()
+            .map(|r| r.rate_limit_config().max_retries)
+            .unwrap_or(3);
 
-        // Record outcome in circuit breaker so it learns from actual LLM results
-        if let Some(ref resilience) = self.resilience {
-            match &result {
-                Ok(_) => resilience.record_success(),
-                Err(_) => resilience.record_failure(),
+        let mut attempt = 0;
+
+        loop {
+            let result = if let Some(resilience) = &self.resilience {
+                resilience.acquire().await.map_err(ReactError::from)?;
+                resilience.check_circuit().map_err(ReactError::from)?;
+                self.llm.complete(request.clone(), session, context).await
+            } else {
+                self.llm.complete(request.clone(), session, context).await
+            };
+
+            // Record outcome in circuit breaker so it learns from actual LLM results
+            if let Some(ref resilience) = self.resilience {
+                match &result {
+                    Ok(_) => resilience.record_success(),
+                    Err(_) => resilience.record_failure(),
+                }
             }
-        }
 
-        if let Some(usage) = result.as_ref().ok().and_then(|r| r.usage()) {
-            self.token_counter.update_from_response(usage);
-        }
+            if let Some(usage) = result.as_ref().ok().and_then(|r| r.usage()) {
+                self.token_counter.update_from_response(usage);
+            }
 
-        result.map_err(ReactError::from)
+            // If successful, return
+            if result.is_ok() {
+                return result.map_err(ReactError::from);
+            }
+
+            // Check if error is transient and we should retry
+            let should_retry = if let Err(ref err) = result {
+                Self::is_transient_error(err)
+            } else {
+                false
+            };
+
+            if !should_retry {
+                return result.map_err(ReactError::from);
+            }
+
+            // Check if we should retry
+            attempt += 1;
+            if attempt >= max_retries {
+                return result.map_err(ReactError::from);
+            }
+
+            // Exponential backoff: 500ms, 1s, 2s, 4s...
+            let delay_ms = 500 * (1 << (attempt - 1));
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
     }
 
     /// Call LLM for streaming with optional resilience wrapper.
@@ -685,7 +734,9 @@ impl<A: ReActApp + Default> ReActEngine<A> {
 
                 if !full_response.is_empty() {
                     self.react_app.on_thought(&full_response, session, context).await;
-                    session.push(LlmMessage::assistant(full_response.clone()));
+                    if !saw_tool_call {
+                        session.push(LlmMessage::assistant(full_response.clone()));
+                    }
                 }
 
                 if !saw_tool_call {

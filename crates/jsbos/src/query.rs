@@ -1,9 +1,39 @@
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{
-  ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
-};
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::sync::Arc;
+
+fn call_string_handler(
+  handler: &ThreadsafeFunction<String, napi::Unknown<'static>>,
+  input: String,
+) -> std::result::Result<String, String> {
+  let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<String, String>>();
+  let tx_clone = tx.clone();
+
+  handler.call_with_return_value(
+    Ok(input),
+    ThreadsafeFunctionCallMode::NonBlocking,
+    move |result: std::result::Result<napi::Unknown<'_>, napi::Error>, _env| -> Result<()> {
+      match result {
+        Ok(value) => {
+          let string_value = value
+            .coerce_to_string()?
+            .into_utf8()?
+            .as_str()?
+            .to_string();
+          let _ = tx_clone.send(Ok(string_value));
+        }
+        Err(e) => {
+          let _ = tx_clone.send(Err(e.to_string()));
+        }
+      }
+      Ok(())
+    },
+  );
+
+  rx.recv()
+    .unwrap_or_else(|_| Err("handler channel closed".to_string()))
+}
 
 #[napi]
 pub struct Query {
@@ -62,9 +92,9 @@ impl Query {
 pub struct Queryable {
   pub(crate) inner: Arc<tokio::sync::Mutex<bus::QueryableWrapper<String, String>>>,
   pub(crate) handler:
-    Arc<std::sync::Mutex<Option<Arc<ThreadsafeFunction<String, UnknownReturnValue>>>>>,
+    Arc<std::sync::Mutex<Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>>>>>>,
   pub(crate) stream_handler:
-    Arc<std::sync::Mutex<Option<Arc<ThreadsafeFunction<String, UnknownReturnValue>>>>>,
+    Arc<std::sync::Mutex<Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>>>>>>,
 }
 
 #[napi]
@@ -83,7 +113,10 @@ impl Queryable {
   }
 
   #[napi]
-  pub fn set_handler(&self, handler: ThreadsafeFunction<String, UnknownReturnValue>) -> Result<()> {
+  pub fn set_handler(
+    &self,
+    handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
+  ) -> Result<()> {
     let mut guard = self.handler.lock().unwrap();
     *guard = Some(Arc::new(handler));
     Ok(())
@@ -98,8 +131,8 @@ impl Queryable {
         .set_handler(move |input: String| {
           let tsfn_clone = Arc::clone(&tsfn);
           async move {
-            tsfn_clone.call(Ok(input.clone()), ThreadsafeFunctionCallMode::Blocking);
-            Ok(input)
+            call_string_handler(&tsfn_clone, input)
+              .map_err(bus::ZenohError::Query)
           }
         })
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
@@ -112,7 +145,10 @@ impl Queryable {
   }
 
   #[napi]
-  pub async fn run(&self, handler: ThreadsafeFunction<String, UnknownReturnValue>) -> Result<()> {
+  pub async fn run(
+    &self,
+    handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
+  ) -> Result<()> {
     let mut guard = self.inner.lock().await;
 
     let tsfn = Arc::new(handler);
@@ -120,8 +156,8 @@ impl Queryable {
       .set_handler(move |input: String| {
         let tsfn_clone = Arc::clone(&tsfn);
         async move {
-          tsfn_clone.call(Ok(input.clone()), ThreadsafeFunctionCallMode::Blocking);
-          Ok(input)
+          call_string_handler(&tsfn_clone, input)
+            .map_err(bus::ZenohError::Query)
         }
       })
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
@@ -135,7 +171,7 @@ impl Queryable {
   #[napi]
   pub async fn run_json(
     &self,
-    handler: ThreadsafeFunction<String, UnknownReturnValue>,
+    handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
   ) -> Result<()> {
     self.run(handler).await
   }
@@ -143,7 +179,7 @@ impl Queryable {
   #[napi]
   pub async fn run_stream(
     &self,
-    handler: ThreadsafeFunction<String, UnknownReturnValue>,
+    handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
   ) -> Result<()> {
     let mut guard = self.inner.lock().await;
 
@@ -152,8 +188,10 @@ impl Queryable {
       .set_stream_handler(move |input: String, tx| {
         let tsfn_clone = Arc::clone(&tsfn);
         async move {
-          tsfn_clone.call(Ok(input.clone()), ThreadsafeFunctionCallMode::Blocking);
-          let _ = tx.send(Ok(input));
+          let _ = tx.send(
+            call_string_handler(&tsfn_clone, input)
+              .map_err(bus::ZenohError::Query),
+          );
         }
       })
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;

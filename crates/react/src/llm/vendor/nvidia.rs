@@ -6,6 +6,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::StreamExt;
+use log::info;
 use reqwest::Client;
 use serde::Serialize;
 
@@ -15,8 +16,8 @@ use crate::llm::{
 };
 
 pub struct NvidiaVendor {
-    client: Client,
-    endpoint: String,
+    client: Arc<Client>,
+    endpoint: Arc<String>,
     model: String,
     api_key: Arc<String>,
 }
@@ -72,8 +73,8 @@ impl NvidiaVendor {
             .expect("Failed to create HTTP client");
 
         Self {
-            client,
-            endpoint,
+            client: Arc::new(client),
+            endpoint: Arc::new(endpoint),
             model,
             api_key: Arc::new(api_key),
         }
@@ -221,7 +222,7 @@ impl NvidiaVendor {
             messages.insert(0, meta);
         }
 
-        let max_tokens = req.max_tokens.unwrap_or(1280000);
+        let max_tokens = req.max_tokens.unwrap_or(12800);
 
         NvidiaRequest {
             model: req.model.clone(),
@@ -261,9 +262,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         session: &mut S,
         context: &mut C,
     ) -> LlmResponseResult {
-        let api_key = self.api_key.clone();
-        let client = self.client.clone();
-        let endpoint = self.endpoint.clone();
+        let api_key = Arc::clone(&self.api_key);
+        let client = Arc::clone(&self.client);
+        let endpoint = Arc::clone(&self.endpoint);
 
         if request.model.is_empty() {
             request.model = self.model.clone();
@@ -274,6 +275,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         let nvidia_req = self.convert_request(&request, session, context);
 
         let url = format!("{}/chat/completions", endpoint);
+
+        info!("Req: {}", serde_json::to_string(&nvidia_req).unwrap_or_else(|_| "Failed to serialize request".into()));
 
         let response = client
             .post(&url)
@@ -302,6 +305,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             err
         })?;
         let resp = LlmResponse::OpenAI(value);
+
+        info!("Resp: {}", serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into()));
+
         context.notify_response(&resp);
         Ok(resp)
     }
@@ -312,9 +318,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         session: &mut S,
         context: &mut C,
     ) -> Result<TokenStream, LlmError> {
-        let api_key = self.api_key.clone();
-        let client = self.client.clone();
-        let endpoint = self.endpoint.clone();
+        let api_key = Arc::clone(&self.api_key);
+        let client = Arc::clone(&self.client);
+        let endpoint = Arc::clone(&self.endpoint);
 
         if request.model.is_empty() {
             request.model = self.model.clone();
@@ -323,6 +329,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         context.notify_request(&request);
 
         let nvidia_req = self.build_stream_request(request, session, context);
+
+        info!("Req: {}", serde_json::to_string(&nvidia_req).unwrap_or_else(|_| "Failed to serialize request".into()));
+
 
         let url = format!("{}/chat/completions", endpoint);
 

@@ -26,6 +26,10 @@ async function demoInlineHandler() {
   console.log('  🚌 Bus created');
 
   const callable = await bus.createCallable('rpc/add');
+  callable.setHandler((err, input) => {
+    const [a, b] = input.split(',').map(Number);
+    return String(a + b);
+  });
   await callable.start();
   console.log('  📡 Callable started: rpc/add');
 

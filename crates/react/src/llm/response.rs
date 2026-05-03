@@ -1,5 +1,6 @@
 use crate::telemetry::TokenUsage;
 use futures::Stream;
+use serde::Serialize;
 use serde_json::Value;
 use std::pin::Pin;
 
@@ -8,7 +9,7 @@ use super::types::LlmError;
 pub type LlmResponseResult = Result<LlmResponse, LlmError>;
 pub type TokenStream = Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum LlmResponse {
     OpenAI(ChatCompletionResponse),
 }

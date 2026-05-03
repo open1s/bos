@@ -125,7 +125,6 @@ The Agent supports configuring circuit breaker and rate limiter for resilience:
 ```python
 from pybos import Agent, AgentConfig
 from react import CircuitBreakerConfig, RateLimiterConfig
-import time
 
 cfg = AgentConfig(
     name="assistant",
@@ -144,7 +143,7 @@ cfg = AgentConfig(
         auto_wait=True,
     )
 )
-agent = Agent.from_config(cfg)
+agent = Agent(cfg)  # Pass config directly to constructor
 ```
 
 #### Circuit Breaker Options
@@ -524,18 +523,15 @@ Create agent from configuration:
 ```python
 from pybos import Agent, AgentConfig
 
-async def main():
-    cfg = AgentConfig(
-        name="assistant",
-        model="gpt-4.1",
-        api_key="sk-...",
-        base_url="https://api.openai.com/v1",
-    )
-    agent = Agent.from_config(cfg)
-    text = await agent.react("Say hello in one sentence")
-    print(text)
-
-asyncio.run(main())
+cfg = AgentConfig(
+    name="assistant",
+    model="gpt-4.1",
+    api_key="sk-...",
+    base_url="https://api.openai.com/v1",
+)
+agent = Agent(cfg)
+text = await agent.react("Say hello in one sentence")
+print(text)
 ```
 
 #### AgentConfig Methods
