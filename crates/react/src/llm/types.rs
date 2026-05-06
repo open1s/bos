@@ -15,7 +15,7 @@ pub trait ReactContext {
     fn rules(&self) -> Option<Vec<Rule>>;
     fn instructions(&self) -> Option<Vec<Instruction>>;
 
-    fn add_tool(&mut self, _tool: LlmTool) {}
+    fn add_tool(&mut self, tool: LlmTool);
 
     fn notify_request(&self, _req: &LlmRequest) {}
     fn notify_response(&self, _resp: &super::LlmResponse) {}

@@ -365,6 +365,10 @@ impl ReactContext for AgentReactContext {
             Some(self.instructions.clone())
         }
     }
+
+    fn add_tool(&mut self, tool: LlmTool) {
+        self.tools.push(tool);
+    }
 }
 
 /// AgentReActApp integrates the Agent's hooks, plugins, and configuration with the ReAct engine.
