@@ -15,8 +15,9 @@ from datetime import datetime, timezone
 
 from pybos import Agent, AgentConfig, Bus, BusConfig, PythonTool
 
-from pybos import Agent, AgentConfig, Bus, BusConfig, PythonTool, ConfigLoader
+from pybos import Agent, AgentConfig, Bus, BusConfig, PythonTool, ConfigLoader,init_tracing
 
+init_tracing()
 loader = ConfigLoader()
 loader.discover()
 _config = loader.load_sync()

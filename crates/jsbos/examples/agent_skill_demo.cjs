@@ -12,10 +12,12 @@
  *     node crates/jsbos/examples/agent_skill_demo.js
  */
 
-const { Bus, Agent, ConfigLoader, version } = require('../index.js');
+const { Bus, Agent, ConfigLoader, version, initTracing } = require('../index.js');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+
+initTracing();
 
 const loader = new ConfigLoader();
 loader.discover();

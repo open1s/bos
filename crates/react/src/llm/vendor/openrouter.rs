@@ -150,21 +150,48 @@ impl OpenRouterVendor {
             });
         }
 
-        let tools = context.tools().map(|tools| {
-            tools
-                .into_iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters
-                        }
+        let mut tools: Vec<serde_json::Value> = context
+            .tools()
+            .map(|tools| {
+                tools
+                    .into_iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.parameters
+                            }
+                        })
                     })
-                })
-                .collect::<Vec<_>>()
-        });
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if let Some(skills) = context.skills() {
+            if !skills.is_empty() {
+                tools.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "load_skill",
+                        "description": "Load skill instructions by name. Returns the skill's instructions which you should use to answer the user's question.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "description": "Name of the skill to load"
+                                }
+                            },
+                            "required": ["name"]
+                        }
+                    }
+                }));
+            }
+        }
+
+        let tools = if tools.is_empty() { None } else { Some(tools) };
 
         let mut extra_system_prompt = String::new();
 
@@ -266,6 +293,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         let openrouter_req = self.convert_request(&request, session, context);
 
         let url = format!("{}/chat/completions", endpoint);
+
+        info!("Req: {}", serde_json::to_string(&openrouter_req).unwrap_or_else(|_| "Failed to serialize request".into()));
+
 
         let response = client
             .post(&url)

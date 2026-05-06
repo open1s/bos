@@ -28,10 +28,11 @@ import tempfile
 import shutil
 from pathlib import Path
 
-from pybos import Agent as PyAgent, AgentConfig as PyAgentConfig, Bus as PyBus, BusConfig as PyBusConfig, ConfigLoader
+from pybos import Agent as PyAgent, AgentConfig as PyAgentConfig, Bus as PyBus, BusConfig as PyBusConfig, ConfigLoader,init_tracing
 
 # from brainos import Agent
 
+init_tracing()
 loader = ConfigLoader()
 loader.discover()
 _config = loader.load_sync()
