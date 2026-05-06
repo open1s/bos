@@ -13,6 +13,7 @@
 - **📦 Node.js 绑定**: `npm install @open1s/jsbos` - 统一高级 JavaScript API
 - **🔄 内存持久化**: 跨会话内存支持
 - **🔌 MCP 客户端**: 连接 Model Context Protocol 服务器
+- **📚 技能系统**: 从目录定义加载代理能力
 
 ---
 
@@ -59,6 +60,48 @@ let config = AgentConfig::default().name("assistant");
 let agent = Agent::builder().config(config).build()?;
 let result = agent.run_simple("Hello").await?;
 ```
+
+---
+
+## 技能系统
+
+代理可以从目录定义加载能力：
+
+```python
+# 创建技能目录并注册
+skills_dir = "/path/to/skills"
+agent.register_skills_from_dir(skills_dir)
+```
+
+### 技能格式
+
+每个技能是一个目录，包含 `SKILL.md` 文件和 YAML frontmatter：
+
+```
+skills/
+├── python-coding/
+│   └── SKILL.md
+├── api-design/
+│   └── SKILL.md
+└── database-ops/
+    └── SKILL.md
+```
+
+**SKILL.md 格式：**
+```markdown
+---
+name: python-coding
+description: 项目 Python 编码规范
+category: coding
+version: 1.0.0
+---
+
+# Python 编码规范
+
+你的技能说明内容...
+```
+
+LLM 会在系统提示词中收到可用技能列表，并可调用 `load_skill` 获取完整指令。
 
 ---
 
@@ -180,6 +223,7 @@ listen = ["127.0.0.1:7890"]
 
 - Python: `crates/pybos/examples/`
 - JavaScript: `crates/jsbos/examples/`
+- Rust: `crates/examples/` (包含 `agent_skill_demo.rs`)
 
 ---
 
@@ -189,4 +233,4 @@ MIT OR Apache-2.0
 
 ---
 
-**版本**: 1.2.0 | **更新日期**: 2026-04-28
+**版本**: 2.0.0 | **更新日期**: 2026-05-06

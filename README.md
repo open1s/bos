@@ -13,6 +13,7 @@ A modular Rust-based operating system and runtime framework for building intelli
 - **📦 Node.js Bindings**: `npm install @open1s/jsbos` - unified high-level JavaScript API
 - **🔄 Memory Persistence**: Cross-session memory support for agents
 - **🔌 MCP Client**: Connect to Model Context Protocol servers
+- **📚 Skills System**: Load agent capabilities from directory-based skill definitions
 
 ---
 
@@ -59,6 +60,48 @@ let config = AgentConfig::default().name("assistant");
 let agent = Agent::builder().config(config).build()?;
 let result = agent.run_simple("Hello").await?;
 ```
+
+---
+
+## Skills System
+
+Agents can load capabilities from directory-based skill definitions:
+
+```python
+# Create skills directory with skill folders
+skills_dir = "/path/to/skills"
+agent.register_skills_from_dir(skills_dir)
+```
+
+### Skill Format
+
+Each skill is a directory containing a `SKILL.md` file with YAML frontmatter:
+
+```
+skills/
+├── python-coding/
+│   └── SKILL.md
+├── api-design/
+│   └── SKILL.md
+└── database-ops/
+    └── SKILL.md
+```
+
+**SKILL.md format:**
+```markdown
+---
+name: python-coding
+description: Python coding conventions for this project
+category: coding
+version: 1.0.0
+---
+
+# Python Coding Conventions
+
+Your skill instructions here...
+```
+
+The agent's LLM receives available skills in the system prompt and can call `load_skill` to retrieve full instructions.
 
 ---
 
@@ -180,6 +223,7 @@ See the examples directories:
 
 - Python: `crates/pybos/examples/`
 - JavaScript: `crates/jsbos/examples/`
+- Rust: `crates/examples/` (includes `agent_skill_demo.rs`)
 
 ---
 
@@ -189,4 +233,4 @@ MIT OR Apache-2.0
 
 ---
 
-**Version**: 1.2.0 | **Last Updated**: 2026-04-28
+**Version**: 2.0.0 | **Last Updated**: 2026-05-06
