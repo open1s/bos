@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use log::warn;
 use std::collections::HashSet;
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -673,8 +674,14 @@ impl Agent {
             model: self.config.model.clone(),
             input: task.to_string(),
             temperature: Some(self.config.temperature),
+            max_tokens: self.config.max_tokens,
             ..Default::default()
         };
+        eprintln!("[DEBUG-max_tokens] react: config.max_tokens={:?}, request.max_tokens={:?}",
+            self.config.max_tokens, request.max_tokens);
+        std::io::stderr().flush().unwrap();
+        log::info!("[DEBUG-max_tokens] react: config.max_tokens={:?}, request.max_tokens={:?}",
+            self.config.max_tokens, request.max_tokens);
 
         let engine_start = std::time::Instant::now();
         let result = engine
@@ -779,6 +786,7 @@ impl Agent {
                 model: self.config.model.clone(),
                 input: task_str.clone(),
                 temperature: Some(self.config.temperature),
+                max_tokens: self.config.max_tokens,
                 ..Default::default()
             };
 

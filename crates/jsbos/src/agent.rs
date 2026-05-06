@@ -133,6 +133,7 @@ impl Default for AgentConfig {
 
 impl From<AgentConfig> for agent::AgentConfig {
   fn from(value: AgentConfig) -> Self {
+    eprintln!("[DEBUG-jsbos] From AgentConfig: received value.max_tokens={:?}", value.max_tokens);
     let circuit_breaker = if value.circuit_breaker_max_failures.is_some()
       || value.circuit_breaker_cooldown_secs.is_some()
     {
@@ -163,6 +164,9 @@ impl From<AgentConfig> for agent::AgentConfig {
       None
     };
 
+    let max_tokens_converted = value.max_tokens.map(|v| v as u32);
+    eprintln!("[DEBUG-jsbos] From AgentConfig: max_tokens_converted={:?}", max_tokens_converted);
+
     Self {
       name: value.name,
       model: value.model,
@@ -170,7 +174,7 @@ impl From<AgentConfig> for agent::AgentConfig {
       api_key: value.api_key,
       system_prompt: value.system_prompt,
       temperature: value.temperature as f32,
-      max_tokens: value.max_tokens.map(|v| v as u32),
+      max_tokens: max_tokens_converted,
       timeout_secs: value.timeout_secs as u64,
       max_steps: value.max_steps.unwrap_or(10) as usize,
       circuit_breaker,
@@ -206,6 +210,7 @@ impl Agent {
   #[napi(factory)]
   pub async fn create(config: AgentConfig) -> Result<Self> {
     let cfg: agent::AgentConfig = config.into();
+    std::fs::write("/tmp/jsbos-debug.log", format!("create: cfg.max_tokens={:?}\n", cfg.max_tokens)).ok();
     let js_hooks = HookRegistry::new();
     let js_plugins = PluginRegistry::new();
 
