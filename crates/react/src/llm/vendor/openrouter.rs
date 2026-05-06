@@ -252,7 +252,7 @@ impl OpenRouterVendor {
 impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
     for OpenRouterVendor
 {
-    async fn complete(
+async fn complete(
         &self,
         mut request: LlmRequest,
         session: &mut S,
@@ -268,13 +268,16 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         context.notify_request(&request);
 
+        let t0 = std::time::Instant::now();
         let openrouter_req = self.convert_request(&request, session, context);
+        info!("[TIMING] convert_request: {:?}", t0.elapsed());
 
         let url = format!("{}/chat/completions", endpoint);
 
         info!("Req: {}", serde_json::to_string(&openrouter_req).unwrap_or_else(|_| "Failed to serialize request".into()));
 
 
+        let t1 = std::time::Instant::now();
         let response = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
@@ -287,6 +290,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 context.notify_error(&err);
                 err
             })?;
+        info!("[TIMING] HTTP send+wait: {:?}", t1.elapsed());
 
         if !response.status().is_success() {
             let status = response.status();
@@ -296,12 +300,14 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             return Err(err);
         }
 
+        let t2 = std::time::Instant::now();
         let body: ChatCompletionResponse = response.json().await.map_err(|e| {
             let err = LlmError::Parse(e.to_string());
             context.notify_error(&err);
             err
         })?;
-
+        info!("[TIMING] response.json(): {:?}", t2.elapsed());
+        info!("[TIMING] complete total: {:?}", t0.elapsed());
         let resp = LlmResponse::OpenAI(body);
 
         info!("Resp: {}", serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into()));

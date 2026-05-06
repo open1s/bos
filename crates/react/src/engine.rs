@@ -8,6 +8,7 @@ use crate::tool::{Tool, ToolRegistry};
 use async_stream::stream;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
+use log::info;
 use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -299,8 +300,10 @@ impl<A: ReActApp + Default> ReActEngine<A> {
             .unwrap_or(3);
 
         let mut attempt = 0;
+        let t0 = std::time::Instant::now();
 
         loop {
+            let t_iter = std::time::Instant::now();
             let result = if let Some(resilience) = &self.resilience {
                 resilience.acquire().await.map_err(ReactError::from)?;
                 resilience.check_circuit().map_err(ReactError::from)?;
@@ -308,6 +311,7 @@ impl<A: ReActApp + Default> ReActEngine<A> {
             } else {
                 self.llm.complete(request.clone(), session, context).await
             };
+            info!("[TIMING] call_llm attempt {}: {:?}", attempt, t_iter.elapsed());
 
             // Record outcome in circuit breaker so it learns from actual LLM results
             if let Some(ref resilience) = self.resilience {
@@ -323,6 +327,7 @@ impl<A: ReActApp + Default> ReActEngine<A> {
 
             // If successful, return
             if result.is_ok() {
+                info!("[TIMING] call_llm total (attempt {}): {:?}", attempt, t0.elapsed());
                 return result.map_err(ReactError::from);
             }
 
@@ -334,17 +339,20 @@ impl<A: ReActApp + Default> ReActEngine<A> {
             };
 
             if !should_retry {
+                info!("[TIMING] call_llm total (non-retry error): {:?}", t0.elapsed());
                 return result.map_err(ReactError::from);
             }
 
             // Check if we should retry
             attempt += 1;
             if attempt >= max_retries {
+                info!("[TIMING] call_llm total (max retries): {:?}", t0.elapsed());
                 return result.map_err(ReactError::from);
             }
 
             // Exponential backoff: 500ms, 1s, 2s, 4s...
             let delay_ms = 500 * (1 << (attempt - 1));
+            info!("[TIMING] call_llm retrying after {}ms delay", delay_ms);
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
     }

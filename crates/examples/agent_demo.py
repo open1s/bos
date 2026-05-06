@@ -103,12 +103,9 @@ TIME_SCHEMA = {
 # ── Helpers ────────────────────────────────────────────────────────────
 
 def make_tool(name: str, description: str, schema: dict, callback):
+    # _parameters (3rd arg) is ignored by Rust but required positionally
     return PythonTool(
-        name=name,
-        description=description,
-        parameters=json.dumps(schema.get("properties", {})),
-        schema=json.dumps(schema),
-        callback=callback,
+        name, description, "", json.dumps(schema), callback
     )
 
 
