@@ -1,4 +1,4 @@
-use crate::llm::types::{ReactContext, ReactSession};
+use crate::llm::types::{load_skill_tool, ReactContext, ReactSession};
 use crate::llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken};
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::runtime::{HookDecision, ReActApp};
@@ -601,6 +601,8 @@ impl<A: ReActApp + Default> ReActEngine<A> {
             self.model.clone_from(&request.model);
         }
 
+        context.add_tool(load_skill_tool());
+
         let result = self.react_loop(request, session, context).await?;
 
         Ok(result)
@@ -621,6 +623,8 @@ impl<A: ReActApp + Default> ReActEngine<A> {
             let max_steps = self.max_steps;
             let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             let mut request = request;
+
+            context.add_tool(load_skill_tool());
 
             while step_count < max_steps {
                 step_count += 1;

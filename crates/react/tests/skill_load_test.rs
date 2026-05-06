@@ -40,7 +40,7 @@ fn make_text_response(content: String) -> LlmResponseResult {
 }
 
 fn build_tools_from_context(context: &impl ReactContext) -> Vec<serde_json::Value> {
-    let mut tools: Vec<serde_json::Value> = context
+    context
         .tools()
         .map(|tools| {
             tools
@@ -57,30 +57,7 @@ fn build_tools_from_context(context: &impl ReactContext) -> Vec<serde_json::Valu
                 })
                 .collect()
         })
-        .unwrap_or_default();
-
-    if let Some(skills) = context.skills() {
-        if !skills.is_empty() {
-            tools.push(serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "load_skill",
-                    "description": "Load skill instructions by name. Returns the skill's instructions which you should use to answer the user's question.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "Name of the skill to load"
-                            }
-                        },
-                        "required": ["name"]
-                    }
-                }
-            }));
-        }
-    }
-    tools
+        .unwrap_or_default()
 }
 
 #[test]

@@ -155,7 +155,7 @@ impl NvidiaVendor {
             });
         }
 
-        let mut tools: Vec<serde_json::Value> = context
+        let tools: Vec<serde_json::Value> = context
             .tools()
             .map(|tools| {
                 tools
@@ -173,28 +173,6 @@ impl NvidiaVendor {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-
-        if let Some(skills) = context.skills() {
-            if !skills.is_empty() {
-                tools.push(serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": "load_skill",
-                        "description": "Load skill instructions by name. Returns the skill's instructions which you should use to answer the user's question.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "name": {
-                                    "type": "string",
-                                    "description": "Name of the skill to load"
-                                }
-                            },
-                            "required": ["name"]
-                        }
-                    }
-                }));
-            }
-        }
 
         let tools = if tools.is_empty() { None } else { Some(tools) };
 

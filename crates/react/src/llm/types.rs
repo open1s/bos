@@ -15,6 +15,8 @@ pub trait ReactContext {
     fn rules(&self) -> Option<Vec<Rule>>;
     fn instructions(&self) -> Option<Vec<Instruction>>;
 
+    fn add_tool(&mut self, _tool: LlmTool) {}
+
     fn notify_request(&self, _req: &LlmRequest) {}
     fn notify_response(&self, _resp: &super::LlmResponse) {}
     fn notify_error(&self, _err: &LlmError) {}
@@ -40,6 +42,7 @@ impl ReactContext for () {
     fn instructions(&self) -> Option<Vec<Instruction>> {
         None
     }
+    fn add_tool(&mut self, _tool: LlmTool) {}
 }
 
 impl ReactSession for () {
@@ -194,6 +197,23 @@ pub struct LlmTool {
 
 impl Stringfy for LlmTool {}
 
+pub fn load_skill_tool() -> LlmTool {
+    LlmTool {
+        name: "load_skill".to_string(),
+        description: "Load skill instructions by name. Returns the skill's instructions which you should use to answer the user's question.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the skill to load"
+                }
+            },
+            "required": ["name"]
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Rule {
     pub name: String,
@@ -241,6 +261,9 @@ impl ReactContext for LlmContext {
     }
     fn instructions(&self) -> Option<Vec<Instruction>> {
         Some(self.instructions.clone())
+    }
+    fn add_tool(&mut self, tool: LlmTool) {
+        self.tools.push(tool);
     }
 }
 
