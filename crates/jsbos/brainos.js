@@ -82,7 +82,6 @@ class Agent {
     this._inner = null;
     this._tools = [];
     this._hooks = [];
-    console.error('[DEBUG-brainos] Agent constructor options.maxTokens=', options.maxTokens);
     this._config = {
       name: options.name || 'assistant',
       model: options.model || 'nvidia/meta/llama-3.1-8b-instruct',
@@ -91,7 +90,7 @@ class Agent {
       systemPrompt: options.systemPrompt || 'You are a helpful assistant.',
       temperature: options.temperature ?? 0.7,
       timeoutSecs: options.timeoutSecs || 120,
-      maxTokens: options.maxTokens,
+      max_tokens: options.maxTokens ?? options.max_tokens,
     };
   }
 
@@ -128,7 +127,6 @@ withTools(...tools) {
   }
 
   withMaxTokens(tokens) {
-    console.error('[DEBUG-brainos] withMaxTokens called, tokens=', tokens);
     this._config.maxTokens = tokens;
     return this;
   }
@@ -140,9 +138,7 @@ withTools(...tools) {
 
   async start() {
     const { Agent: RawAgent } = require('./index.js');
-    console.error('[DEBUG-brainos] start: calling RawAgent.create with config=', JSON.stringify(this._config));
     this._inner = await RawAgent.create(this._config);
-    console.error('[DEBUG-brainos] start: RawAgent.create returned');
     for (const t of this._tools) {
       const schema = JSON.stringify(t.schema);
       const params = JSON.stringify(t.parameters);

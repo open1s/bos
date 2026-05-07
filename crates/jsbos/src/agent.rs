@@ -133,7 +133,6 @@ impl Default for AgentConfig {
 
 impl From<AgentConfig> for agent::AgentConfig {
   fn from(value: AgentConfig) -> Self {
-    eprintln!("[DEBUG-jsbos] From AgentConfig: received value.max_tokens={:?}", value.max_tokens);
     let circuit_breaker = if value.circuit_breaker_max_failures.is_some()
       || value.circuit_breaker_cooldown_secs.is_some()
     {
@@ -164,8 +163,7 @@ impl From<AgentConfig> for agent::AgentConfig {
       None
     };
 
-    let max_tokens_converted = value.max_tokens.map(|v| v as u32);
-    eprintln!("[DEBUG-jsbos] From AgentConfig: max_tokens_converted={:?}", max_tokens_converted);
+let max_tokens_converted = value.max_tokens.map(|v| v as u32);
 
     Self {
       name: value.name,
@@ -206,11 +204,10 @@ pub struct Agent {
 }
 
 #[napi]
-impl Agent {
+  impl Agent {
   #[napi(factory)]
   pub async fn create(config: AgentConfig) -> Result<Self> {
     let cfg: agent::AgentConfig = config.into();
-    std::fs::write("/tmp/jsbos-debug.log", format!("create: cfg.max_tokens={:?}\n", cfg.max_tokens)).ok();
     let js_hooks = HookRegistry::new();
     let js_plugins = PluginRegistry::new();
 

@@ -236,7 +236,6 @@ impl OpenAiVendor {
         }
 
         let max_tokens = req.max_tokens.unwrap_or(12800);
-        log::info!("[DEBUG-max_tokens] convert_request: req.max_tokens={:?}, using max_tokens={}", req.max_tokens, max_tokens);
 
         OpenAiRequest {
             model: req.model.clone(),
