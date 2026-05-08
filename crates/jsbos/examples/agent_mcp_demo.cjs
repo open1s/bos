@@ -12,7 +12,9 @@
  *     node crates/jsbos/examples/agent_mcp_demo.js
  */
 
-const { Bus, Agent, AgentConfig, ConfigLoader, version } = require('../index.js');
+const { Bus, Agent, AgentConfig, ConfigLoader, version,initTracing } = require('../index.js');
+
+initTracing();
 
 const loader = new ConfigLoader();
 loader.discover();
@@ -52,7 +54,7 @@ async function demoMcpHelloWorldTools() {
   console.log("  🔌 MCP server 'hello' connected");
 
   // MCP server needs time to initialize after spawning
-  await sleep(5000);
+  await sleep(500);
 
   const mcpTools = await agent.listMcpTools();
   console.log(`  🔧 MCP tools registered: ${mcpTools.length}`);
@@ -145,7 +147,7 @@ async function main() {
 
   await demoMcpHelloWorldTools();
   // Note: demoMcpFilesystemTools() requires npx and filesystem access
-  // await demoMcpFilesystemTools();
+  await demoMcpFilesystemTools();
 
   console.log('═'.repeat(60));
   console.log('  ✅ All Agent+MCP demos completed!');

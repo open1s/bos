@@ -528,7 +528,7 @@ impl Agent {
         let mut context = AgentReactContext::new(self.config.name.clone());
 
         if let Some(ref registry) = self.registry {
-            context.tools = registry
+            let mut tools: Vec<react::llm::LlmTool> = registry
                 .iter()
                 .map(|(name, tool)| react::llm::LlmTool {
                     name: name.clone(),
@@ -536,6 +536,18 @@ impl Agent {
                     parameters: tool.json_schema(),
                 })
                 .collect();
+
+            for name in registry.async_tool_names() {
+                if let Some(async_tool) = registry.get_async(&name) {
+                    tools.push(react::llm::LlmTool {
+                        name: async_tool.name().to_string(),
+                        description: async_tool.description(),
+                        parameters: async_tool.json_schema(),
+                    });
+                }
+            }
+
+            context.tools = tools;
         }
 
         if !self.skills.is_empty() {
@@ -1000,20 +1012,21 @@ impl Agent {
         for tool in tools {
             let schema = tool.input_schema.clone();
             let tool_name = tool.name.clone();
+            let namespaced_name = format!("{}/{}", namespace, tool_name);
             let mcp_tool: std::sync::Arc<dyn react::tool::registry::AsyncTool> =
                 std::sync::Arc::new(McpToolAdapter::new(
                     client.clone(),
-                    tool_name.clone(),
+                    namespaced_name.clone(),
                     tool_name.clone(),
                     tool.description.clone(),
                     schema,
                 ));
             reg_mut
-                .register_async_with_namespace(mcp_tool, namespace)
+                .register_async(mcp_tool)
                 .map_err(|e| {
                     crate::mcp::McpError::Protocol(format!(
                         "Failed to register MCP tool '{}': {}",
-                        tool_name, e
+                        namespaced_name, e
                     ))
                 })?;
         }

@@ -69,7 +69,7 @@ impl ToolRegistry {
         tool: Arc<dyn AsyncTool>,
         namespace: &str,
     ) -> Result<(), ToolError> {
-        let namespaced_name = format!("{}_{}", namespace, tool.name());
+        let namespaced_name = format!("{}/{}", namespace, tool.name());
         let schema = tool.json_schema();
         self.schema_cache.insert(namespaced_name.clone(), schema);
         self.async_tools.insert(namespaced_name, tool);

@@ -20,7 +20,9 @@ import os
 import sys
 import threading
 
-from pybos import Agent, AgentConfig, Bus, BusConfig, ConfigLoader
+from pybos import Agent, AgentConfig, Bus, BusConfig, ConfigLoader,init_tracing
+
+init_tracing()
 
 loader = ConfigLoader()
 loader.discover()

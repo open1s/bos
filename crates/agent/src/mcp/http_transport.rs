@@ -1,7 +1,6 @@
 use ureq;
 
 pub struct HttpTransport {
-    agent: ureq::Agent,
     base_url: String,
     session_id: std::sync::Mutex<Option<String>>,
 }
@@ -29,7 +28,6 @@ impl HttpTransport {
     pub fn new(base_url: impl Into<String>) -> Self {
         let url = base_url.into().trim_end_matches('/').to_string();
         Self {
-            agent: ureq::Agent::new(),
             base_url: url,
             session_id: std::sync::Mutex::new(None),
         }
