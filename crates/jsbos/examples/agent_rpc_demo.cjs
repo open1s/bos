@@ -53,6 +53,9 @@ async function demoAgentMcp() {
   await agent.addMcpServer('hello', 'npx', ['-y', 'mcp-hello-world@latest']);
   console.log(' 🔌 Agent connected to MCP hello-world server');
 
+  // MCP server needs time to initialize after spawning
+  await new Promise(resolve => setTimeout(resolve, 2000));
+
   const mcpTools = await agent.listMcpTools();
   console.log(` 🔧 MCP tools available: ${mcpTools.map(t => t.name).join(', ')}`);
 

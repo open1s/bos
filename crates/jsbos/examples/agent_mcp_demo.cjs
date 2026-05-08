@@ -51,6 +51,9 @@ async function demoMcpHelloWorldTools() {
   await agent.addMcpServer('hello', 'npx', ['-y', 'mcp-hello-world@latest']);
   console.log("  🔌 MCP server 'hello' connected");
 
+  // MCP server needs time to initialize after spawning
+  await sleep(5000);
+
   const mcpTools = await agent.listMcpTools();
   console.log(`  🔧 MCP tools registered: ${mcpTools.length}`);
   for (const t of mcpTools) {

@@ -212,10 +212,11 @@ impl PyPythonTool {
     fn new(
         name: String,
         description: String,
-        _parameters: String,
+        parameters: String,
         schema: String,
         callback: Py<PyAny>,
     ) -> Self {
+        let _ = parameters;
         Self {
             name,
             description,

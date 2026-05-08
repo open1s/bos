@@ -1,7 +1,7 @@
-use reqwest::{Client, Response};
+use ureq;
 
 pub struct HttpTransport {
-    client: Client,
+    agent: ureq::Agent,
     base_url: String,
     session_id: std::sync::Mutex<Option<String>>,
 }
@@ -29,65 +29,64 @@ impl HttpTransport {
     pub fn new(base_url: impl Into<String>) -> Self {
         let url = base_url.into().trim_end_matches('/').to_string();
         Self {
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .http1_only()
-                .no_proxy()
-                .build()
-                .unwrap(),
+            agent: ureq::Agent::new(),
             base_url: url,
             session_id: std::sync::Mutex::new(None),
         }
     }
 
     pub async fn send(&self, msg: &serde_json::Value) -> Result<String, HttpTransportError> {
-        let mut req = self
-            .client
-            .post(&self.base_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .json(msg);
+        let base_url = self.base_url.clone();
+        let body = serde_json::to_string(msg).map_err(|e| HttpTransportError::Http(e.to_string()))?;
+        let session_id = self.session_id.lock().unwrap().clone();
 
-        if let Some(session) = self.session_id.lock().unwrap().clone() {
-            req = req.header("Mcp-Session-Id", session);
+        let response = tokio::task::spawn_blocking(move || {
+            let mut req = ureq::post(&base_url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json, text/event-stream");
+
+            if let Some(ref sid) = session_id {
+                req = req.set("Mcp-Session-Id", sid);
+            }
+
+            req.send_string(&body)
+        })
+        .await
+        .map_err(|e| HttpTransportError::Http(format!("Join error: {e}")))?
+        .map_err(|e| HttpTransportError::Http(format!("Request error: {e}")))?;
+
+        let status = response.status();
+        let session_id_header = response.header("Mcp-Session-Id");
+        if let Some(sid) = session_id_header {
+            *self.session_id.lock().unwrap() = Some(sid.to_string());
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| HttpTransportError::Http(e.to_string()))?;
-
-        self.capture_session_id(&resp);
-
-        let status = resp.status();
-
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
+        let content_type = response
+            .header("Content-Type")
             .unwrap_or("")
             .to_string();
 
         if content_type.contains("text/event-stream") {
-            return self.read_sse_response(resp).await;
+            let text = response
+                .into_string()
+                .map_err(|e| HttpTransportError::Http(format!("Read error: {e}")))?;
+            return self.parse_sse_response(&text);
         }
 
-        if !status.is_success() {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| format!("HTTP {status}"));
+        if !(200..=299).contains(&status) && status != 202 {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|_| format!("HTTP {}", status));
             if body.is_empty() {
                 return Err(HttpTransportError::Http(format!("HTTP {} (empty body)", status)));
             }
             return Err(HttpTransportError::Http(body));
         }
 
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| HttpTransportError::Http(format!("Error reading response body: {}", e)))?;
-        
+        let body = response
+            .into_string()
+            .map_err(|e| HttpTransportError::Http(format!("Read body error: {e}")))?;
+
         Ok(body)
     }
 
@@ -100,55 +99,33 @@ impl HttpTransport {
     }
 
     pub async fn terminate_session(&self) -> Result<(), HttpTransportError> {
-        let session = self.session_id.lock().unwrap().clone();
-        if let Some(id) = session {
-            let req = self
-                .client
-                .delete(&self.base_url)
-                .header("Mcp-Session-Id", &id);
+        let base_url = self.base_url.clone();
+        let session_id = self.session_id.lock().unwrap().clone();
+        *self.session_id.lock().unwrap() = None;
 
-            let _ = req.send().await;
-            *self.session_id.lock().unwrap() = None;
+        if let Some(id) = session_id {
+            tokio::task::spawn_blocking(move || {
+                ureq::delete(&base_url)
+                    .set("Mcp-Session-Id", &id)
+                    .call()
+                    .ok();
+            })
+            .await
+            .ok();
         }
         Ok(())
     }
 
-    fn capture_session_id(&self, resp: &Response) {
-        if let Some(sid) = resp
-            .headers()
-            .get("Mcp-Session-Id")
-            .and_then(|v| v.to_str().ok())
-        {
-            *self.session_id.lock().unwrap() = Some(sid.to_string());
-        }
-    }
-
-    async fn read_sse_response(&self, resp: Response) -> Result<String, HttpTransportError> {
-        use tokio::io::AsyncBufReadExt;
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| HttpTransportError::Http(e.to_string()))?;
-
-        let text = String::from_utf8(bytes.to_vec())
-            .map_err(|e| HttpTransportError::Http(e.to_string()))?;
-
-        let mut lines = tokio::io::BufReader::new(std::io::Cursor::new(text));
-        let mut buf = String::new();
+    fn parse_sse_response(&self, text: &str) -> Result<String, HttpTransportError> {
         let mut last_data = String::new();
-
-        while lines.read_line(&mut buf).await.unwrap_or(0) > 0 {
-            let line = buf.clone();
-            buf.clear();
+        for line in text.lines() {
             let trimmed = line.trim_end();
-
             if let Some(stripped) = trimmed.strip_prefix("data: ") {
                 last_data = stripped.to_string();
             } else if trimmed.is_empty() && !last_data.is_empty() {
                 return Ok(last_data.clone());
             }
         }
-
         if !last_data.is_empty() {
             Ok(last_data)
         } else {
