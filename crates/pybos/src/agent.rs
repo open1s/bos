@@ -9,7 +9,7 @@ use agent::{
 use futures::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
-use react::llm::vendor::OpenAiClient;
+use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -655,14 +655,24 @@ impl PyAgent {
             ("openai".to_string(), cfg.model.clone())
         };
 
-        llm.register_vendor(
-            vendor_name,
-            Box::new(OpenAiClient::new(
+        let vendor: Box<dyn react::llm::LlmClient<_, _>> = match vendor_name.as_str() {
+            "nvidia" => Box::new(NvidiaVendor::new(
                 cfg.base_url.clone(),
                 model_name,
                 cfg.api_key.clone(),
             )),
-        );
+            "openrouter" => Box::new(OpenRouterVendor::new(
+                cfg.base_url.clone(),
+                model_name,
+                cfg.api_key.clone(),
+            )),
+            _ => Box::new(OpenAiClient::new(
+                cfg.base_url.clone(),
+                model_name,
+                cfg.api_key.clone(),
+            )),
+        };
+        llm.register_vendor(vendor_name, vendor);
         let llm = std::sync::Arc::new(llm);
 
         let agent = Agent::new(cfg, llm);
@@ -694,14 +704,24 @@ impl PyAgent {
                 ("openai".to_string(), cfg.model.clone())
             };
 
-            llm.register_vendor(
-                vendor_name,
-                Box::new(OpenAiClient::new(
+            let vendor: Box<dyn react::llm::LlmClient<_, _>> = match vendor_name.as_str() {
+                "nvidia" => Box::new(NvidiaVendor::new(
                     cfg.base_url.clone(),
                     model_name,
                     cfg.api_key.clone(),
                 )),
-            );
+                "openrouter" => Box::new(OpenRouterVendor::new(
+                    cfg.base_url.clone(),
+                    model_name,
+                    cfg.api_key.clone(),
+                )),
+                _ => Box::new(OpenAiClient::new(
+                    cfg.base_url.clone(),
+                    model_name,
+                    cfg.api_key.clone(),
+                )),
+            };
+            llm.register_vendor(vendor_name, vendor);
             let llm = std::sync::Arc::new(llm);
 
             let agent = Agent::new(cfg, llm);

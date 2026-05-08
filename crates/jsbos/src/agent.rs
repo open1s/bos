@@ -11,6 +11,7 @@ use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
 use crate::plugin::PluginRegistry;
 use agent::BashTool;
+use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
 
 struct JSTool {
   name: String,
@@ -220,11 +221,23 @@ pub struct Agent {
       ("openai".to_string(), cfg.model.clone())
     };
 
-    let vendor = Box::new(react::llm::vendor::OpenAiClient::new(
-      cfg.base_url.clone(),
-      model_name,
-      cfg.api_key.clone(),
-    ));
+    let vendor: Box<dyn react::llm::LlmClient<_, _>> = match vendor_name.as_str() {
+      "nvidia" => Box::new(NvidiaVendor::new(
+        cfg.base_url.clone(),
+        model_name,
+        cfg.api_key.clone(),
+      )),
+      "openrouter" => Box::new(OpenRouterVendor::new(
+        cfg.base_url.clone(),
+        model_name,
+        cfg.api_key.clone(),
+      )),
+      _ => Box::new(OpenAiClient::new(
+        cfg.base_url.clone(),
+        model_name,
+        cfg.api_key.clone(),
+      )),
+    };
     llm_provider.register_vendor(vendor_name, vendor);
 
     let agent = agent::Agent::new(cfg, Arc::new(llm_provider));
@@ -255,11 +268,23 @@ pub struct Agent {
       ("openai".to_string(), cfg.model.clone())
     };
 
-    let vendor = Box::new(react::llm::vendor::OpenAiClient::new(
-      cfg.base_url.clone(),
-      model_name,
-      cfg.api_key.clone(),
-    ));
+    let vendor: Box<dyn react::llm::LlmClient<_, _>> = match vendor_name.as_str() {
+      "nvidia" => Box::new(NvidiaVendor::new(
+        cfg.base_url.clone(),
+        model_name,
+        cfg.api_key.clone(),
+      )),
+      "openrouter" => Box::new(OpenRouterVendor::new(
+        cfg.base_url.clone(),
+        model_name,
+        cfg.api_key.clone(),
+      )),
+      _ => Box::new(OpenAiClient::new(
+        cfg.base_url.clone(),
+        model_name,
+        cfg.api_key.clone(),
+      )),
+    };
     llm_provider.register_vendor(vendor_name, vendor);
 
     let agent = agent::Agent::new(cfg, Arc::new(llm_provider));
