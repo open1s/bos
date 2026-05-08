@@ -486,7 +486,7 @@ pub struct Agent {
   pub async fn list_mcp_tools(&self) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
     if let Some(registry) = guard.registry() {
-      let tools: Vec<serde_json::Value> = registry
+      let mut tools: Vec<serde_json::Value> = registry
         .iter()
         .filter(|(name, _)| name.contains('/'))
         .map(|(name, tool)| {
@@ -496,6 +496,16 @@ pub struct Agent {
           })
         })
         .collect();
+      for name in registry.async_tool_names() {
+        if name.contains('/') {
+          if let Some(async_tool) = registry.get_async(&name) {
+            tools.push(serde_json::json!({
+              "name": name,
+              "description": async_tool.description(),
+            }));
+          }
+        }
+      }
       Ok(tools)
     } else {
       Ok(Vec::new())
