@@ -4,16 +4,16 @@ use crate::agent::plugin::{AgentPlugin, PluginRegistry};
 use crate::session::AgentState;
 use crate::tools::FunctionTool;
 use crate::{AgentError, LlmClient, StreamToken, Tool, ToolRegistry};
-use react::LlmMessage;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use log::warn;
+use react::LlmMessage;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use react::engine::{ReActEngine, ReActEngineBuilder};
-use react::llm::vendor::{LlmRouter, NvidiaVendor, OpenAiClient, OpenRouterVendor};
+use react::llm::vendor::{LlmRouter, NvidiaVendor, OpenRouterVendor};
 use react::llm::{
     LlmError as ReactLlmError, LlmResponse as ReactLlmResponse, TokenStream as ReactTokenStream,
     TokenStream,
@@ -43,6 +43,40 @@ impl LlmProvider {
 
     pub fn as_dyn(self: Arc<Self>) -> Box<dyn LlmClient<AgentSession, AgentReactContext>> {
         Box::new(ArcLlmClient(self))
+    }
+
+    pub fn with_nvidia(&mut self, model: &str, base_url: &str, api_key: &str) -> &mut Self {
+        if !model.starts_with("nvidia/") {
+            return self;
+        }
+
+        let model = model.strip_prefix("nvidia/").unwrap_or(model);
+        self.register_vendor(
+            "nvidia".into(),
+            Box::new(NvidiaVendor::new(
+                base_url.to_string(),
+                model.to_string(),
+                api_key.to_string(),
+            )),
+        );
+        self
+    }
+
+    pub fn with_openrouter(&mut self, model: &str, base_url: &str, api_key: &str) -> &mut Self {
+        if !model.starts_with("openrouter/") {
+            return self;
+        }
+
+        let model = model.strip_prefix("openrouter/").unwrap_or(model);
+        self.register_vendor(
+            "openrouter".into(),
+            Box::new(OpenRouterVendor::new(
+                base_url.to_string(),
+                model.to_string(),
+                api_key.to_string(),
+            )),
+        );
+        self
     }
 }
 
@@ -545,8 +579,7 @@ impl Agent {
             // Handle async tools (like MCP tools) that implement AsyncTool
             for name in registry.async_tool_names() {
                 if let Some(async_tool) = registry.get_async(&name) {
-                    let tool_adapter =
-                        Box::new(AsyncExtensibleToolAdapter::new(async_tool));
+                    let tool_adapter = Box::new(AsyncExtensibleToolAdapter::new(async_tool));
                     builder = builder.with_tool(ToolVariant::Async(tool_adapter));
                 }
             }
@@ -658,7 +691,10 @@ impl Agent {
                 *cc = Some(ctx);
                 (Some(ec.take().unwrap()), Some(cc.take().unwrap()))
             } else {
-                (Some(engine_cache.take().unwrap()), Some(context_cache.take().unwrap()))
+                (
+                    Some(engine_cache.take().unwrap()),
+                    Some(context_cache.take().unwrap()),
+                )
             }
         };
 
@@ -753,7 +789,7 @@ impl Agent {
                         yield Err(e);
                     });
                 }
-            }
+            },
         };
 
         let cached_context = {
