@@ -7,12 +7,18 @@
  *     # Requires an MCP HTTP server running at http://127.0.0.1:8000/mcp
  */
 
-const { Agent, Bus, McpClient, version,initTracing } = require('../index.js');
+const { Agent, Bus,ConfigLoader, McpClient, version,initTracing } = require('../index.js');
 initTracing();
 
-const MODEL = process.env.LLM_MODEL || 'nvidia/llama-3.1-nemotron-70b-instruct';
-const BASE_URL = process.env.LLM_BASE_URL || 'https://integrate.api.nvidia.com/v1';
-const API_KEY = process.env.OPENAI_API_KEY || '';
+const loader = new ConfigLoader();
+loader.discover();
+const _config = JSON.parse(loader.loadSync());
+const _global = _config.global_model || {};
+
+const API_KEY = process.env.OPENAI_API_KEY || _global.api_key || '';
+const BASE_URL = process.env.LLM_BASE_URL || _global.base_url || 'https://integrate.api.nvidia.com/v1';
+const MODEL = process.env.LLM_MODEL || _global.model || 'nvidia/meta/llama-3.1-8b-instruct';
+
 
 async function demoAgentHttpMcp() {
   console.log('═'.repeat(60));
@@ -85,9 +91,6 @@ async function demoStandaloneHttpClient() {
 
     const client = McpClient.connectHttp(MCP_URL);
     await client.initialize();
-
-    const caps = client.getCapabilities();
-    console.log(`  📋 Server capabilities:`, caps ? 'connected' : 'none');
 
     const tools = await client.listTools();
     console.log(`  🔧 Available tools: ${tools.length}`);
