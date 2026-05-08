@@ -12,7 +12,9 @@
  * Usage: node session_demo.cjs
  */
 
-const { Bus, Agent, ConfigLoader, version } = require('../index.js');
+const { Bus, Agent, ConfigLoader, version,initTracing } = require('../index.js');
+
+initTracing();
 
 const loader = new ConfigLoader();
 loader.discover();
