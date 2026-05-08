@@ -548,7 +548,11 @@ client = await McpClient.spawn("npx", ["-y", "server-filesystem", "/tmp"])
 await client.initialize()
 
 # Or HTTP
-client = McpClient.connect_http("https://mcp.example.com/sse")
+client = McpClient.connect_http("http://127.0.0.1:8000/mcp")
+await client.initialize()
+
+# Or HTTPS
+client = McpClient.connect_http("https://mcp.example.com/mcp")
 await client.initialize()
 
 # Use

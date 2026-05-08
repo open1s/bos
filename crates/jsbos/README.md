@@ -398,7 +398,11 @@ const client = await McpClient.spawn('npx', ['-y', '@modelcontextprotocol/server
 await client.initialize();
 
 // Or HTTP
-const client = McpClient.connectHttp('https://mcp.example.com/sse');
+const client = McpClient.connectHttp('http://127.0.0.1:8000/mcp');
+await client.initialize();
+
+// Or HTTPS
+const client = McpClient.connectHttp('https://mcp.example.com/mcp');
 await client.initialize();
 
 // Use MCP

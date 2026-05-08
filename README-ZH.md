@@ -12,7 +12,7 @@
 - **🐍 Python 绑定**: `pip install brainos` - 统一高级 Python API
 - **📦 Node.js 绑定**: `npm install @open1s/jsbos` - 统一高级 JavaScript API
 - **🔄 内存持久化**: 跨会话内存支持
-- **🔌 MCP 客户端**: 连接 Model Context Protocol 服务器
+- **🔌 MCP 客户端**: 连接 Model Context Protocol 服务器（stdio 和 HTTP）
 - **📚 技能系统**: 从目录定义加载代理能力
 
 ---
@@ -193,8 +193,58 @@ cd crates/jsbos && npm install && npm run build
 
 | 语言 | 包 | 导入 |
 |------|-----|------|
-| Python | `pybos` | `from pybos import Agent, Bus, ...` |
-| JavaScript | `@open1s/jsbos` | `const { Agent, Bus } = require('@open1s/jsbos')` |
+| Python | `pybos` | `from pybos import Agent, Bus, McpClient, ...` |
+| JavaScript | `@open1s/jsbos` | `const { Agent, Bus, McpClient } = require('@open1s/jsbos')` |
+
+---
+
+## MCP 客户端
+
+通过 stdio 或 HTTP 连接到 MCP 服务器：
+
+### Python
+
+```python
+from pybos import McpClient
+
+# 基于进程的服务器
+client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+await client.initialize()
+
+# HTTP 服务器
+client = McpClient.connect_http("http://127.0.0.1:8000/mcp")
+await client.initialize()
+
+# 使用工具
+tools = await client.list_tools()
+result = await client.call_tool("echo", '{"text": "hello"}')
+```
+
+### JavaScript
+
+```javascript
+const { McpClient } = require('@open1s/jsbos');
+
+// 基于进程的服务器
+const client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]);
+await client.initialize();
+
+// HTTP 服务器
+const client = McpClient.connectHttp("http://127.0.0.1:8000/mcp");
+await client.initialize();
+
+// 使用工具
+const tools = await client.listTools();
+const result = await client.callTool("echo", '{"text": "hello"}');
+```
+
+### HTTP 服务器示例
+
+```bash
+# 启动 MCP HTTP 服务器
+python3 crates/examples/mcp_http_server.py
+# 服务器运行在 http://127.0.0.1:8000/mcp
+```
 
 ---
 
@@ -207,6 +257,12 @@ cd crates/jsbos && npm install && npm run build
 api_key = "your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4"
+
+# 或使用 NVIDIA NIM
+[global_model]
+api_key = "nv-..."
+base_url = "https://api.nvidia.com/v"
+model = "nvidia/llama-3.1-nemotron-70b-instruct"
 
 [bus]
 mode = "peer"
@@ -225,6 +281,16 @@ listen = ["127.0.0.1:7890"]
 - JavaScript: `crates/jsbos/examples/`
 - Rust: `crates/examples/` (包含 `agent_skill_demo.rs`)
 
+### MCP 演示
+
+```bash
+# JavaScript MCP HTTP 演示
+node crates/jsbos/examples/mcp_http_agent_demo.cjs
+
+# Python MCP HTTP 演示（先启动服务器，然后使用）
+python3 crates/examples/mcp_http_server.py
+```
+
 ---
 
 ## 许可证
@@ -233,4 +299,4 @@ MIT OR Apache-2.0
 
 ---
 
-**版本**: 2.0.0 | **更新日期**: 2026-05-06
+**版本**: 2.0.1 | **更新日期**: 2026-05-08

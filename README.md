@@ -12,7 +12,7 @@ A modular Rust-based operating system and runtime framework for building intelli
 - **🐍 Python Bindings**: `pip install brainos` - unified high-level Python API
 - **📦 Node.js Bindings**: `npm install @open1s/jsbos` - unified high-level JavaScript API
 - **🔄 Memory Persistence**: Cross-session memory support for agents
-- **🔌 MCP Client**: Connect to Model Context Protocol servers
+- **🔌 MCP Client**: Connect to Model Context Protocol servers (stdio & HTTP)
 - **📚 Skills System**: Load agent capabilities from directory-based skill definitions
 
 ---
@@ -193,8 +193,58 @@ For direct access to Rust bindings:
 
 | Language | Package | Import |
 |----------|---------|--------|
-| Python | `pybos` | `from pybos import Agent, Bus, ...` |
-| JavaScript | `@open1s/jsbos` | `const { Agent, Bus } = require('@open1s/jsbos')` |
+| Python | `pybos` | `from pybos import Agent, Bus, McpClient, ...` |
+| JavaScript | `@open1s/jsbos` | `const { Agent, Bus, McpClient } = require('@open1s/jsbos')` |
+
+---
+
+## MCP Client
+
+Connect to MCP servers via stdio or HTTP transport:
+
+### Python
+
+```python
+from pybos import McpClient
+
+# Process-based server
+client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+await client.initialize()
+
+# HTTP server
+client = McpClient.connect_http("http://127.0.0.1:8000/mcp")
+await client.initialize()
+
+# Use tools
+tools = await client.list_tools()
+result = await client.call_tool("echo", '{"text": "hello"}')
+```
+
+### JavaScript
+
+```javascript
+const { McpClient } = require('@open1s/jsbos');
+
+// Process-based server
+const client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]);
+await client.initialize();
+
+// HTTP server
+const client = McpClient.connectHttp("http://127.0.0.1:8000/mcp");
+await client.initialize();
+
+// Use tools
+const tools = await client.listTools();
+const result = await client.callTool("echo", '{"text": "hello"}');
+```
+
+### HTTP Server Example
+
+```bash
+# Start an MCP HTTP server
+python3 crates/examples/mcp_http_server.py
+# Server runs on http://127.0.0.1:8000/mcp
+```
 
 ---
 
@@ -207,6 +257,12 @@ Create `~/.bos/conf/config.toml`:
 api_key = "your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4"
+
+# Or use NVIDIA NIM
+[global_model]
+api_key = "nv-..."
+base_url = "https://api.nvidia.com/v"
+model = "nvidia/llama-3.1-nemotron-70b-instruct"
 
 [bus]
 mode = "peer"
@@ -225,6 +281,16 @@ See the examples directories:
 - JavaScript: `crates/jsbos/examples/`
 - Rust: `crates/examples/` (includes `agent_skill_demo.rs`)
 
+### MCP Demos
+
+```bash
+# JavaScript MCP HTTP demo
+node crates/jsbos/examples/mcp_http_agent_demo.cjs
+
+# Python MCP HTTP demo (run server first, then use)
+python3 crates/examples/mcp_http_server.py
+```
+
 ---
 
 ## License
@@ -233,4 +299,4 @@ MIT OR Apache-2.0
 
 ---
 
-**Version**: 2.0.0 | **Last Updated**: 2026-05-06
+**Version**: 2.0.1 | **Last Updated**: 2026-05-08
