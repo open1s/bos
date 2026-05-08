@@ -49,17 +49,18 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
     ) -> LlmResponseResult {
         let (vendor_id, model_id) = Self::split_model(&request.model);
 
-        let vendor = if let Some(vid) = vendor_id {
+        let entry = if let Some(vid) = vendor_id {
             self.vendors.get(vid)
         } else {
-            return Err(LlmError::Other("Vendor not found".to_string()));
+            let first_key = self.vendors.iter().next().map(|r| r.key().clone());
+            first_key.and_then(|k| self.vendors.get(&k))
         };
 
-        if let Some(v) = vendor {
+        if let Some(e) = entry {
             let model = model_id.to_string();
             let mut req = request;
             req.model = model;
-            v.complete(req, session, context).await
+            e.value().complete(req, session, context).await
         } else {
             Err(LlmError::Other(format!(
                 "Unknown vendor: {}",
@@ -76,17 +77,18 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
     ) -> Result<TokenStream, LlmError> {
         let (vendor_id, model_id) = Self::split_model(&request.model);
 
-        let vendor = if let Some(vid) = vendor_id {
+        let entry = if let Some(vid) = vendor_id {
             self.vendors.get(vid)
         } else {
-            return Ok(Box::pin(futures::stream::empty()));
+            let first_key = self.vendors.iter().next().map(|r| r.key().clone());
+            first_key.and_then(|k| self.vendors.get(&k))
         };
 
-        if let Some(v) = vendor {
+        if let Some(e) = entry {
             let model = model_id.to_string();
             let mut req = request;
             req.model = model;
-            v.stream_complete(req, session, context).await
+            e.value().stream_complete(req, session, context).await
         } else {
             Ok(Box::pin(futures::stream::empty()))
         }

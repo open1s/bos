@@ -133,9 +133,10 @@ impl Default for AgentConfig {
 
 impl From<AgentConfig> for agent::AgentConfig {
   fn from(value: AgentConfig) -> Self {
-    let circuit_breaker = if value.circuit_breaker_max_failures.is_some()
-      || value.circuit_breaker_cooldown_secs.is_some()
-    {
+    // 0 means "disable circuit breaker" - treat as None to disable entirely
+    let cb_enabled = value.circuit_breaker_max_failures.unwrap_or(0) > 0
+      || value.circuit_breaker_cooldown_secs.is_some();
+    let circuit_breaker = if cb_enabled {
       Some(agent::CircuitBreakerConfig {
         max_failures: value.circuit_breaker_max_failures.unwrap_or(5) as usize,
         cooldown: std::time::Duration::from_secs(

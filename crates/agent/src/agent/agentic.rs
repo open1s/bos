@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use react::engine::{ReActEngine, ReActEngineBuilder};
-use react::llm::vendor::LlmRouter;
+use react::llm::vendor::{LlmRouter, NvidiaVendor, OpenAiClient, OpenRouterVendor};
 use react::llm::{
     LlmError as ReactLlmError, LlmResponse as ReactLlmResponse, TokenStream as ReactTokenStream,
     TokenStream,

@@ -36,3 +36,11 @@ ureq = "2"
 
 [features]
 internal-api = []
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[[example]]
+name = "with_resilience"
+path = "examples/with_resilience.rs"

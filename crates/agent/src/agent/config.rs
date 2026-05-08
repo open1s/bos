@@ -8,7 +8,7 @@ use crate::agent::agentic::LlmProvider;
 use crate::agent::{Agent, AgentConfig};
 use crate::error::AgentError;
 use crate::tools::{FunctionTool, Tool};
-use react::llm::vendor::OpenAiClient;
+use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TomlToolRef {
@@ -148,14 +148,45 @@ impl TomlAgentBuilder {
 
     pub async fn build(self, _session: Option<Arc<ZenohSession>>) -> Result<Agent, AgentError> {
         let mut llm = LlmProvider::new();
-        llm.register_vendor(
-            "openai".to_string(),
-            Box::new(OpenAiClient::new(
-                self.config.base_url.clone(),
-                self.config.model.clone(),
-                self.config.api_key.clone(),
-            )),
-        );
+
+        let (vendor_name, model_for_vendor) = if let Some(pos) = self.config.model.find('/') {
+            (self.config.model[..pos].to_string(), self.config.model[pos + 1..].to_string())
+        } else {
+            ("openai".to_string(), self.config.model.clone())
+        };
+
+        match vendor_name.as_str() {
+            "nvidia" => {
+                llm.register_vendor(
+                    "nvidia".to_string(),
+                    Box::new(NvidiaVendor::new(
+                        self.config.base_url.clone(),
+                        model_for_vendor,
+                        self.config.api_key.clone(),
+                    )),
+                );
+            }
+            "openrouter" => {
+                llm.register_vendor(
+                    "openrouter".to_string(),
+                    Box::new(OpenRouterVendor::new(
+                        self.config.base_url.clone(),
+                        model_for_vendor,
+                        self.config.api_key.clone(),
+                    )),
+                );
+            }
+            _ => {
+                llm.register_vendor(
+                    "openai".to_string(),
+                    Box::new(OpenAiClient::new(
+                        self.config.base_url.clone(),
+                        model_for_vendor,
+                        self.config.api_key.clone(),
+                    )),
+                );
+            }
+        }
         let llm = Arc::new(llm);
 
         let config: AgentConfig = self.config.clone().into();
