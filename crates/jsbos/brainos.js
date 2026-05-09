@@ -290,6 +290,121 @@ function toolMethod(description, options = {}) {
   };
 }
 
+/**
+ * Elegant tool definition API - fluent builder pattern
+ * 
+ * Usage:
+ *   const add = tool('add', 'Add two numbers')({ a: 0, b: 0 })((args) => args.a + args.b);
+ *   const brain = new BrainOS();
+ *   brain.tools(add);
+ * 
+ * Or with full schema:
+ *   const add = tool('add', 'Add two numbers')({
+ *     a: { type: 'number', description: 'First number' },
+ *     b: { type: 'number', description: 'Second number' }
+ *   })((args) => args.a + args.b);
+ */
+function defineTool(name, description) {
+  // Returns a function that takes paramSchema
+  const paramSchemaBuilder = (paramSchema) => {
+    // Returns a function that takes the callback
+    const callbackBuilder = (callback) => {
+      const properties = {};
+      const required = [];
+      
+      for (const [key, spec] of Object.entries(paramSchema)) {
+        if (typeof spec === 'object' && spec !== null) {
+          properties[key] = { ...spec };
+          if (spec.required) required.push(key);
+        } else {
+          // Simple type shorthand: { a: number } → { a: { type: 'number' } }
+          properties[key] = { type: 'number', default: spec };
+        }
+      }
+      
+      const schema = {
+        type: 'object',
+        properties,
+        required: required.length > 0 ? required : Object.keys(properties)
+      };
+      
+      return new ToolDef(name, description, callback, schema, schema);
+    };
+    
+    callbackBuilder.returns = (returnSchema) => {
+      // Returns a function that takes the callback
+      const callbackBuilderWithReturns = (callback) => {
+        const properties = {};
+        const required = [];
+        
+        for (const [key, spec] of Object.entries(paramSchema)) {
+          if (typeof spec === 'object' && spec !== null) {
+            properties[key] = { ...spec };
+            if (spec.required) required.push(key);
+          } else {
+            properties[key] = { type: 'number', default: spec };
+          }
+        }
+        
+        const paramSchemaDef = {
+          type: 'object',
+          properties,
+          required: required.length > 0 ? required : Object.keys(properties)
+        };
+        
+        const returnProperties = {};
+        for (const [key, spec] of Object.entries(returnSchema)) {
+          if (typeof spec === 'object' && spec !== null) {
+            returnProperties[key] = { ...spec };
+          } else {
+            returnProperties[key] = { type: 'number', default: spec };
+          }
+        }
+        const returnSchemaDef = {
+          type: 'object',
+          properties: returnProperties
+        };
+        
+        return new ToolDef(name, description, callback, paramSchemaDef, returnSchemaDef);
+      };
+      return callbackBuilderWithReturns;
+    };
+    
+    return callbackBuilder;
+  };
+  
+  return paramSchemaBuilder;
+}
+
+/**
+ * Batch define tools from an object
+ * 
+ * Usage:
+ *   const { add, multiply } = defineTools({
+ *     add: {
+ *       description: 'Add two numbers',
+ *       params: { a: 0, b: 0 }
+ *     },
+ *     multiply: {
+ *       description: 'Multiply',
+ *       params: { a: 0, b: 0 },
+ *       fn: (args) => args.a * args.b  // inline function
+ *     }
+ *   });
+ */
+function defineTools(toolDefs) {
+  const result = {};
+  for (const [name, def] of Object.entries(toolDefs)) {
+    const { description, params, returns, fn } = def;
+    const toolDef = defineTool(name, description)(params)(fn || (() => {}));
+    result[name] = toolDef;
+  }
+  return result;
+}
+
+// Backwards compatibility alias
+const createTool = defineTool;
+
 class SessionManager {
   constructor(inner) {
     this._inner = inner;

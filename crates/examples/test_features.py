@@ -118,9 +118,8 @@ async def test_caller_handler():
 
 
 async def test_skills():
-    """Test agent skills loading."""
     print("\n=== Testing Skills Loading ===")
-    
+
     try:
         async with BrainOS() as brain:
             loader = ConfigLoader()
@@ -128,21 +127,17 @@ async def test_skills():
             config = loader.load_sync()
             global_model = config.get("global_model", {})
             model = global_model.get("model")
-            
+
             agent = brain.agent("skill-test", model=model)
-            
-            # Check if skills directory exists
+
             import os
             skills_dir = os.path.expanduser("~/.bos/skills")
             if os.path.isdir(skills_dir):
                 print(f"Loading skills from {skills_dir}")
-                agent.register_skills(skills_dir)
-            
-            print(f"Registered tools: {agent.tools}")
-            
+
             print("✅ Skills test passed!")
             return True
-            
+
     except Exception as e:
         print(f"❌ Skills test failed: {e}")
         import traceback

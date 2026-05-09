@@ -29,25 +29,29 @@ def add(a: int, b: int) -> int:
     return a + b
 
 async with BrainOS() as brain:
-    agent = brain.agent("assistant").register(add)
+    agent = brain.agent("assistant").with_tools(add)
     result = await agent.ask("2+2 等于多少?")
 ```
 
 ### JavaScript (@open1s/jsbos / brainos-js)
 
 ```javascript
-const { BrainOS, tool } = require('@open1s/jsbos/brainos');
+const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos');
 
-class AddTool {
-  @tool('两数相加')
-  add(a, b) {
-    return a + b;
-  }
-}
+// 创建工具使用 ToolDef
+const addTool = new ToolDef(
+  'add',
+  '两数相加',
+  (args) => (args.a || 0) + (args.b || 0),
+  { type: 'object', properties: { result: { type: 'number' } }, required: ['result'] },
+  { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }
+);
 
 const brain = new BrainOS();
 await brain.start();
-const agent = brain.agent('assistant').withTools(new AddTool());
+const agent = await brain.agent('assistant')
+  .register(addTool)
+  .start();
 const result = await agent.ask('2+2 等于多少?');
 ```
 

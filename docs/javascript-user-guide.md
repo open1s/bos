@@ -40,16 +40,28 @@ npm run build
 ## Quick Start
 
 ```javascript
-const { BrainOS, tool } = require('@open1s/jsbos/brainos');
+const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos');
+
+// Create a tool definition
+const addTool = new ToolDef(
+  'add',
+  'Add two numbers',
+  (args) => (args.a || 0) + (args.b || 0),
+  { type: 'object', properties: { result: { type: 'number' } }, required: ['result'] },
+  { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }
+);
 
 async function main() {
   const brain = new BrainOS();
   await brain.start();
-  
-  const agent = brain.agent('assistant');
-  const result = await agent.ask('What is 42 + 58?');
+
+  const agent = await brain.agent('assistant')
+    .register(addTool)
+    .start();
+
+  const result = await agent.ask('What is 2+2?');
   console.log(result);
-  
+
   await brain.stop();
 }
 
@@ -168,64 +180,81 @@ agent.registerMany(tool1, tool2);
 
 ## Hooks
 
-Hooks allow you to intercept and react to events during agent execution. Use `onHook()` to register callback functions.
+Hooks allow you to intercept and react to events during agent execution. Use `.hook()` in the fluent chain to register callbacks.
 
 ### Using Hooks with BrainOS Agent
 
 ```javascript
-const { Agent, HookEvent } = require('@open1s/jsbos');
+const { BrainOS, HookEvent } = require('@open1s/jsbos/brainos');
 
-const brain = new BrainOS({ apiKey: 'sk-...' });
-await brain.start();
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
 
-// Register hooks
-brain.agent('assistant')
-  .onHook(HookEvent.BeforeToolCall, (ctx) => {
-    console.log('[BeforeToolCall]', ctx.data.tool_name);
-    return 'continue';  // proceed normally
-  })
-  .onHook(HookEvent.AfterToolCall, (ctx) => {
-    console.log('[AfterToolCall]', ctx.data.tool_name);
-    return 'continue';
-  })
-  .onHook(HookEvent.BeforeLlmCall, (ctx) => {
-    console.log('[BeforeLlmCall] Starting LLM call');
-    return 'continue';
-  })
-  .onHook(HookEvent.AfterLlmCall, (ctx) => {
-    console.log('[AfterLlmCall] LLM call completed');
-    return 'continue';
-  })
-  .onHook(HookEvent.OnError, (ctx) => {
-    console.log('[OnError]', ctx.data.error);
-    return 'continue';
-  });
+  // Register hooks in the fluent chain, then call .start()
+  const agent = await brain.agent('assistant')
+    .hook(HookEvent.BeforeToolCall, (ctx) => {
+      console.log('[BeforeToolCall]', ctx?.data?.tool_name || 'unknown');
+      return 'continue';
+    })
+    .hook(HookEvent.AfterToolCall, (ctx) => {
+      console.log('[AfterToolCall]', ctx?.data?.tool_name || 'unknown');
+      return 'continue';
+    })
+    .hook(HookEvent.BeforeLlmCall, (ctx) => {
+      console.log('[BeforeLlmCall] Starting LLM call');
+      return 'continue';
+    })
+    .hook(HookEvent.AfterLlmCall, (ctx) => {
+      console.log('[AfterLlmCall] LLM call completed');
+      return 'continue';
+    })
+    .hook(HookEvent.OnError, (ctx) => {
+      console.log('[OnError]', ctx?.data?.error || 'unknown error');
+      return 'continue';
+    })
+    .start();
+
+  const result = await agent.ask('What is 2+2?');
+  console.log(result);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
 ```
 
-### Using Hooks with Raw Agent
+### Using Hooks with Raw Agent (Low-level API)
 
 ```javascript
-const { Agent, HookEvent } = require('./index.js');
+const { Agent, HookEvent } = require('@open1s/jsbos');
 
-const agent = await Agent.create({
-  name: 'assistant',
-  model: 'gpt-4',
-  apiKey: 'sk-...',
-  baseUrl: 'https://api.openai.com/v1',
-  systemPrompt: 'You are helpful.',
-  temperature: 0.7,
-  timeoutSecs: 120,
-});
+async function main() {
+  const agent = await Agent.create({
+    name: 'assistant',
+    model: 'gpt-4',
+    apiKey: 'sk-...',
+    baseUrl: 'https://api.openai.com/v1',
+    systemPrompt: 'You are helpful.',
+    temperature: 0.7,
+    timeoutSecs: 120,
+  });
 
-agent.registerHook(HookEvent.BeforeToolCall, (ctx) => {
-  console.log('[BeforeToolCall]', ctx.data.tool_name);
-  return 'continue';
-});
+  await agent.registerHook(HookEvent.BeforeToolCall, (ctx) => {
+    console.log('[BeforeToolCall]', ctx.data.tool_name);
+    return 'continue';
+  });
 
-agent.registerHook(HookEvent.AfterToolCall, (ctx) => {
-  console.log('[AfterToolCall]', ctx.data.tool_name);
-  return 'continue';
-});
+  await agent.registerHook(HookEvent.AfterToolCall, (ctx) => {
+    console.log('[AfterToolCall]', ctx.data.tool_name);
+    return 'continue';
+  });
+
+  const result = await agent.runSimple('Hello');
+  console.log(result);
+}
+
+main().catch(console.error);
 ```
 
 ### Hook Events
@@ -269,43 +298,9 @@ The callback receives a `HookContextData` object:
 
 ## Tool Registration
 
-### Using the `tool()` Decorator (Recommended)
-
-The `tool()` decorator is the recommended way to define tools in JavaScript:
-
-```javascript
-const { tool } = require('@open1s/jsbos/brainos');
-
-class MyTools {
-  @tool('Add two numbers')
-  add(args) {
-    return args.a + args.b;
-  }
-
-  @tool('Multiply two numbers', { name: 'multiply' })
-  multiply(args) {
-    return args.a * args.b;
-  }
-}
-
-// Create instance and extract tool definitions
-const instance = new MyTools();
-const addTool = instance.add.toolDef;
-const multiplyTool = instance.multiply.toolDef;
-
-// Register with agent
-agent.register(addTool);
-agent.register(multiplyTool);
-
-// Or use registerMany
-agent.registerMany(addTool, multiplyTool);
-```
-
-**Note:** The `@tool` decorator is a function that attaches a `toolDef` property to the method. Access it via `instance.methodName.toolDef`.
-
 ### Using `ToolDef` Directly
 
-For simpler cases without class decorators:
+Create tool definitions using the `ToolDef` class:
 
 ```javascript
 const { ToolDef } = require('@open1s/jsbos/brainos');
@@ -315,10 +310,10 @@ function add(args) {
   return args.a + args.b;
 }
 
-const toolDef = new ToolDef(
+const addTool = new ToolDef(
   'add',                           // name
   'Add two numbers together',       // description
-  add,                              // callback function
+  add,                             // callback function
   { a: { type: 'integer' }, b: { type: 'integer' } },  // parameters
   {                                 // schema
     type: 'object',
@@ -331,7 +326,7 @@ const toolDef = new ToolDef(
 );
 
 // Register with agent
-agent.register(toolDef);
+agent.register(addTool);
 ```
 
 ### Tool with JSON Schema
@@ -363,28 +358,6 @@ const weatherTool = new ToolDef(
 );
 
 agent.register(weatherTool);
-```
-
-### Using the Decorator (Experimental)
-
-```javascript
-const { tool } = require('@open1s/jsbos/brainos');
-
-class MyTools {
-  @tool('Add two numbers')
-  add(args) {
-    return args.a + args.b;
-  }
-  
-  @tool('Multiply two numbers', { name: 'multiply' })
-  multiply(args) {
-    return args.a * args.b;
-  }
-}
-
-// Then extract toolDefs and register
-const instance = new MyTools();
-// Access: instance.add.toolDef
 ```
 
 ---
@@ -1040,58 +1013,50 @@ Hooks, plugins, and session management are available through the low-level `jsbo
 
 Hooks allow you to intercept and react to events during agent execution.
 
-#### Using Hooks
+#### Using Hooks with Low-level API
 
 ```javascript
 const { Agent, HookEvent } = require('@open1s/jsbos');
 
 async function main() {
-  const brain = new BrainOS();
-  await brain.start();
-  
-  const agent = brain.agent('assistant');
-  
-  // Register hooks
-  agent.hooks().register(HookEvent.BeforeToolCall, (ctx) => {
-    return {
-      toolName: ctx.data.tool_name,
-      decision: 'continue'  // or 'abort' or { decision: 'error', message: 'error message' }
-    };
+  const agent = await Agent.create({
+    name: 'assistant',
+    model: 'gpt-4',
+    apiKey: 'sk-...',
+    baseUrl: 'https://api.openai.com/v1',
+    systemPrompt: 'You are helpful.',
+    temperature: 0.7,
+    timeoutSecs: 120,
   });
-  
-  agent.hooks().register(HookEvent.AfterToolCall, (ctx) => {
-    return {
-      toolName: ctx.data.tool_name,
-      toolResult: ctx.data.tool_result,
-      decision: 'continue'
-    };
+
+  // Register hooks using registerHook()
+  await agent.registerHook(HookEvent.BeforeToolCall, (ctx) => {
+    console.log('[BeforeToolCall]', ctx.data?.tool_name);
+    return 'continue';
   });
-  
-  agent.hooks().register(HookEvent.BeforeLlmCall, (ctx) => {
-    return {
-      prompt: ctx.data.prompt,
-      decision: 'continue'
-    };
+
+  await agent.registerHook(HookEvent.AfterToolCall, (ctx) => {
+    console.log('[AfterToolCall]', ctx.data?.tool_name);
+    return 'continue';
   });
-  
-  agent.hooks().register(HookEvent.AfterLlmCall, (ctx) => {
-    return {
-      response: ctx.data.response,
-      decision: 'continue'
-    };
+
+  await agent.registerHook(HookEvent.BeforeLlmCall, (ctx) => {
+    console.log('[BeforeLlmCall] Starting LLM call');
+    return 'continue';
   });
-  
-  agent.hooks().register(HookEvent.OnError, (ctx) => {
-    return {
-      error: ctx.data.error,
-      decision: 'continue'
-    };
+
+  await agent.registerHook(HookEvent.AfterLlmCall, (ctx) => {
+    console.log('[AfterLlmCall] LLM call completed');
+    return 'continue';
   });
-  
-  const result = await agent.ask('Hello');
+
+  await agent.registerHook(HookEvent.OnError, (ctx) => {
+    console.log('[OnError]', ctx.data?.error);
+    return 'continue';
+  });
+
+  const result = await agent.runSimple('Hello');
   console.log(result);
-  
-  await brain.stop();
 }
 
 main().catch(console.error);
@@ -1111,53 +1076,94 @@ main().catch(console.error);
 
 #### Hook Decisions
 
-Return an object to control execution:
+Return a string to control execution:
 
 | Decision | Description |
 |----------|-------------|
-| `{ decision: 'continue' }` | Proceed normally (default) |
-| `{ decision: 'abort' }` | Abort current operation |
-| `{ decision: 'error', message: 'error message' }` | Return an error |
+| `'continue'` | Proceed normally (default) |
+| `'abort'` | Abort current operation |
+| `'error:message'` | Return an error |
 
 ### Plugins
 
 Plugins allow you to preprocess and postprocess LLM requests and responses.
 
-#### Using Plugins
+#### Using Plugins with brainos.js (High-level API)
 
 ```javascript
 const { BrainOS } = require('@open1s/jsbos/brainos');
 
-class MyPlugin {
-  async processLlmRequest(wrapper) {
-    // Modify request before sending to LLM
-    // Example: add system prompt prefix
-    const request = wrapper.intoRequest();
-    // Modify request here
-    return wrapper.constructor(request);
-  }
-  
-  async processLlmResponse(wrapper) {
-    // Modify response after receiving from LLM
-    const response = wrapper.intoResponse();
-    // Modify response here
-    return wrapper.constructor(response);
-  }
-}
-
 async function main() {
   const brain = new BrainOS();
   await brain.start();
-  
-  const agent = brain.agent('assistant');
-  
-  // Register plugin
-  agent.plugins().registerBlocking(new MyPlugin());
-  
+
+  // Use .plugin() in the fluent chain
+  const agent = await brain.agent('assistant')
+    .plugin('DemoPlugin', {
+      onLlmRequest: (req) => {
+        console.log('[Plugin:on_llm_request]');
+        return req;
+      },
+      onLlmResponse: (resp) => {
+        console.log('[Plugin:on_llm_response]');
+        return resp;
+      },
+      onToolCall: (call) => {
+        console.log('[Plugin:on_tool_call]', call.name);
+        return call;
+      },
+      onToolResult: (result) => {
+        console.log('[Plugin:on_tool_result]');
+        return result;
+      }
+    })
+    .start();
+
   const result = await agent.ask('Hello');
   console.log(result);
-  
+
   await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+#### Using Plugins with Low-level API (jsbos)
+
+```javascript
+const { Agent } = require('@open1s/jsbos');
+
+async function main() {
+  const agent = await Agent.create({
+    name: 'assistant',
+    model: 'gpt-4',
+    apiKey: 'sk-...',
+    baseUrl: 'https://api.openai.com/v1',
+  });
+
+  // Register plugin with all 4 intercept points
+  agent.registerPlugin(
+    'DemoInterceptor',
+    (err, request) => {
+      console.log('[Plugin:on_llm_request]');
+      return JSON.stringify(request);
+    },
+    (err, response) => {
+      console.log('[Plugin:on_llm_response]');
+      return JSON.stringify(response);
+    },
+    (err, toolCall) => {
+      console.log('[Plugin:on_tool_call]', toolCall.name);
+      return JSON.stringify(toolCall);
+    },
+    (err, toolResult) => {
+      console.log('[Plugin:on_tool_result]');
+      return JSON.stringify(toolResult);
+    },
+  );
+
+  const result = await agent.runSimple('Hello');
+  console.log(result);
 }
 
 main().catch(console.error);

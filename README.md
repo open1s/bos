@@ -29,25 +29,29 @@ def add(a: int, b: int) -> int:
     return a + b
 
 async with BrainOS() as brain:
-    agent = brain.agent("assistant").register(add)
+    agent = brain.agent("assistant").with_tools(add)
     result = await agent.ask("What is 2+2?")
 ```
 
 ### JavaScript (@open1s/jsbos / brainos-js)
 
 ```javascript
-const { BrainOS, tool } = require('@open1s/jsbos/brainos');
+const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos');
 
-class AddTool {
-  @tool('Add two numbers')
-  add(a, b) {
-    return a + b;
-  }
-}
+// Create tool using ToolDef
+const addTool = new ToolDef(
+  'add',
+  'Add two numbers',
+  (args) => (args.a || 0) + (args.b || 0),
+  { type: 'object', properties: { result: { type: 'number' } }, required: ['result'] },
+  { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }
+);
 
 const brain = new BrainOS();
 await brain.start();
-const agent = brain.agent('assistant').withTools(new AddTool());
+const agent = await brain.agent('assistant')
+  .register(addTool)
+  .start();
 const result = await agent.ask('What is 2+2?');
 ```
 
@@ -179,11 +183,11 @@ The `brainos` package (Python) and `@open1s/jsbos/brainos.js` (JavaScript) provi
 
 | Feature | Python | JavaScript |
 |---------|--------|------------|
-| Import | `from brainos import BrainOS, tool` | `const { BrainOS, tool } = require('@open1s/jsbos/brainos')` |
+| Import | `from brainos import BrainOS, tool` | `const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos')` |
 | Create brain | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
 | Create agent | `brain.agent("name")` | `brain.agent("name")` |
 | Fluent config | `.with_model("gpt-4")` | `.withModel("gpt-4")` |
-| Register tools | `.register(tool)` | `.withTools(toolDef)` |
+| Register tools | `.with_tools(tool)` | `.register(toolDef)` |
 | Run | `await agent.ask("...")` | `await agent.ask("...")` |
 | Bus factory | `BusManager()` | `BusManager.create()` |
 

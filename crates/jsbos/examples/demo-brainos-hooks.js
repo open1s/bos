@@ -4,38 +4,35 @@ async function demo() {
   console.log('=== JSBOS BrainOS Hook Demo ===\n');
 
   const brain = new BrainOS({
-    apiKey: process.env.OPENAI_API_KEY || 'sk-test',
-    model: 'gpt-4',
+    apiKey: process.env.OPENAI_API_KEY || 'nvapi-...',
   });
 
   await brain.start();
 
-  console.log('1. Adding hooks via onHook()...');
-  
-  brain.agent('assistant').onHook(HookEvent.BeforeToolCall, (ctx) => {
-    console.log('   [BeforeToolCall]', ctx.data.tool_name || 'unknown');
-    return 'continue';
-  });
-  
-  brain.agent('assistant').onHook(HookEvent.AfterToolCall, (ctx) => {
-    console.log('   [AfterToolCall]', ctx.data.tool_name || 'unknown');
-    return 'continue';
-  });
-  
-  brain.agent('assistant').onHook(HookEvent.BeforeLlmCall, (ctx) => {
-    console.log('   [BeforeLlmCall] Starting LLM call');
-    return 'continue';
-  });
-  
-  brain.agent('assistant').onHook(HookEvent.AfterLlmCall, (ctx) => {
-    console.log('   [AfterLlmCall] LLM call completed');
-    return 'continue';
-  });
-  
-  brain.agent('assistant').onHook(HookEvent.OnError, (ctx) => {
-    console.log('   [OnError]', ctx.data.error || 'unknown error');
-    return 'continue';
-  });
+  console.log('1. Building agent with hooks via .hook()...');
+
+  const agent = await brain.agent('assistant')
+    .hook(HookEvent.BeforeToolCall, (ctx) => {
+      console.log('   [BeforeToolCall]', ctx?.data?.tool_name || 'unknown');
+      return 'continue';
+    })
+    .hook(HookEvent.AfterToolCall, (ctx) => {
+      console.log('   [AfterToolCall]', ctx?.data?.tool_name || 'unknown');
+      return 'continue';
+    })
+    .hook(HookEvent.BeforeLlmCall, (ctx) => {
+      console.log('   [BeforeLlmCall] Starting LLM call');
+      return 'continue';
+    })
+    .hook(HookEvent.AfterLlmCall, (ctx) => {
+      console.log('   [AfterLlmCall] LLM call completed');
+      return 'continue';
+    })
+    .hook(HookEvent.OnError, (ctx) => {
+      console.log('   [OnError]', ctx?.data?.error || 'unknown error');
+      return 'continue';
+    })
+    .start();
 
   console.log('   Hooks registered!\n');
 
@@ -46,10 +43,10 @@ async function demo() {
 
   console.log('3. Running agent (hooks will fire during execution)...');
   try {
-    const result = await brain.agent('assistant').ask('Say "test" in one word');
-    console.log('   Result:', result.substring(0, 100) + '...');
+    const result = await agent.ask('Say "test" in one word');
+    console.log('   Result:', result?.substring?.(0, 100) + '...' || result);
   } catch (e) {
-    console.log('   (Expected - using dummy API key)');
+    console.log('   Error (may be expected with rate limiting):', e.message?.substring(0, 100));
   }
 
   console.log('\n=== Done ===');
