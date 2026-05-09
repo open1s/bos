@@ -183,28 +183,23 @@ pub trait AgentPlugin: Send + Sync + 'static {
     fn name(&self) -> &str;
 
     async fn on_llm_request(&self, request: LlmRequestWrapper) -> Option<LlmRequestWrapper> {
-        let _ = request;
-        None
+        Some(request)
     }
 
     async fn on_llm_response(&self, response: LlmResponseWrapper) -> Option<LlmResponseWrapper> {
-        let _ = response;
-        None
+        Some(response)
     }
 
     async fn on_tool_call(&self, tool_call: ToolCallWrapper) -> Option<ToolCallWrapper> {
-        let _ = tool_call;
-        None
+        Some(tool_call)
     }
 
     async fn on_tool_result(&self, tool_result: ToolResultWrapper) -> Option<ToolResultWrapper> {
-        let _ = tool_result;
-        None
+        Some(tool_result)
     }
 
     async fn on_stream_token(&self, token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
-        let _ = token;
-        None
+        Some(token)
     }
 }
 
@@ -259,5 +254,66 @@ impl PluginRegistry {
 
     pub fn clear_blocking(&self) {
         self.clear();
+    }
+
+    /// Run all plugins' on_llm_request in order. Each plugin's output feeds the next.
+    /// Returns Some(request) if the chain completes, None if any plugin vetoes.
+    pub async fn on_llm_request(&self, mut request: LlmRequestWrapper) -> Option<LlmRequestWrapper> {
+        let plugins = self.plugins();
+        for plugin in &plugins {
+            match plugin.on_llm_request(request).await {
+                Some(r) => request = r,
+                None => return None,
+            }
+        }
+        Some(request)
+    }
+
+    /// Run all plugins' on_llm_response in order.
+    pub async fn on_llm_response(&self, mut response: LlmResponseWrapper) -> Option<LlmResponseWrapper> {
+        let plugins = self.plugins();
+        for plugin in &plugins {
+            match plugin.on_llm_response(response).await {
+                Some(r) => response = r,
+                None => return None,
+            }
+        }
+        Some(response)
+    }
+
+    /// Run all plugins' on_tool_call in order.
+    pub async fn on_tool_call(&self, mut tool_call: ToolCallWrapper) -> Option<ToolCallWrapper> {
+        let plugins = self.plugins();
+        for plugin in &plugins {
+            match plugin.on_tool_call(tool_call).await {
+                Some(r) => tool_call = r,
+                None => return None,
+            }
+        }
+        Some(tool_call)
+    }
+
+    /// Run all plugins' on_tool_result in order.
+    pub async fn on_tool_result(&self, mut tool_result: ToolResultWrapper) -> Option<ToolResultWrapper> {
+        let plugins = self.plugins();
+        for plugin in &plugins {
+            match plugin.on_tool_result(tool_result).await {
+                Some(r) => tool_result = r,
+                None => return None,
+            }
+        }
+        Some(tool_result)
+    }
+
+    /// Run all plugins' on_stream_token in order.
+    pub async fn on_stream_token(&self, mut token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
+        let plugins = self.plugins();
+        for plugin in &plugins {
+            match plugin.on_stream_token(token).await {
+                Some(r) => token = r,
+                None => return None,
+            }
+        }
+        Some(token)
     }
 }

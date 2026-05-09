@@ -529,7 +529,7 @@ class AgentBuilder {
     }
 
     for (const p of this._plugins) {
-      this._inner.registerPlugin(p.name, p.onRequest, p.onResponse, p.onToolCall, p.onToolResult);
+      this._inner.registerPlugin(p.name, p.on_llm_request || p.onLlmRequest || p.onRequest, p.on_llm_response || p.onLlmResponse || p.onResponse, p.on_tool_call || p.onToolCall, p.on_tool_result || p.onToolResult);
     }
 
     for (const s of this._skills) {

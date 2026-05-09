@@ -14,16 +14,13 @@ pub trait ReactContext {
     fn tools(&self) -> Option<Vec<LlmTool>>;
     fn rules(&self) -> Option<Vec<Rule>>;
     fn instructions(&self) -> Option<Vec<Instruction>>;
-
     fn add_tool(&mut self, tool: LlmTool);
 
-    fn notify_request(&self, _req: &LlmRequest) {}
-    fn notify_response(&self, _resp: &super::LlmResponse) {}
-    fn notify_error(&self, _err: &LlmError) {}
-    fn on_chunk(&self, _chunk: &str) {}
-    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
-        None
-    }
+    fn notify_request(&self, _req: &LlmRequest);
+    fn notify_response(&self, _resp: &super::LlmResponse);
+    fn notify_error(&self, _err: &LlmError);
+    fn on_chunk(&self, _chunk: &str);
+    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>;
 }
 
 impl ReactContext for () {
@@ -43,6 +40,22 @@ impl ReactContext for () {
         None
     }
     fn add_tool(&mut self, _tool: LlmTool) {}
+    
+    fn notify_request(&self, _req: &LlmRequest) {     
+    }
+    
+    fn notify_response(&self, _resp: &super::LlmResponse) {
+    }
+    
+    fn notify_error(&self, _err: &LlmError) {
+    }
+    
+    fn on_chunk(&self, _chunk: &str) {
+    }
+    
+    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
+        None
+    }
 }
 
 impl ReactSession for () {

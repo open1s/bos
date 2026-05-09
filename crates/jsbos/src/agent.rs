@@ -201,7 +201,6 @@ pub struct Agent {
   bus_session: Option<Arc<crate::Session>>,
   #[allow(dead_code)]
   hooks: std::sync::Arc<std::sync::Mutex<HookRegistry>>,
-  plugins: std::sync::Arc<std::sync::Mutex<PluginRegistry>>,
   perf: std::sync::Arc<crate::perf::PerformanceMetrics>,
 }
 
@@ -211,7 +210,6 @@ pub struct Agent {
   pub async fn create(config: AgentConfig) -> Result<Self> {
     let cfg: agent::AgentConfig = config.into();
     let js_hooks = HookRegistry::new();
-    let js_plugins = PluginRegistry::new();
 
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
 
@@ -246,7 +244,6 @@ pub struct Agent {
       inner: Arc::new(Mutex::new(agent)),
       bus_session: None,
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
-      plugins: std::sync::Arc::new(std::sync::Mutex::new(js_plugins)),
       perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
     })
   }
@@ -258,7 +255,6 @@ pub struct Agent {
   ) -> Result<Self> {
     let cfg: agent::AgentConfig = config.into();
     let js_hooks = HookRegistry::new();
-    let js_plugins = PluginRegistry::new();
 
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
 
@@ -291,9 +287,8 @@ pub struct Agent {
 
     Ok(Agent {
       inner: Arc::new(Mutex::new(agent)),
-      bus_session: None,
+      bus_session: Some(_bus.as_ref().clone()),
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
-      plugins: std::sync::Arc::new(std::sync::Mutex::new(js_plugins)),
       perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
     })
   }
@@ -380,10 +375,8 @@ pub struct Agent {
     let plugin_arc: std::sync::Arc<dyn agent::agent::plugin::AgentPlugin> =
       std::sync::Arc::new(js_plugin);
 
-    let plugins_guard = self.plugins.lock().unwrap();
-    let inner = plugins_guard.inner().clone();
-    drop(plugins_guard);
-    inner.register_blocking(plugin_arc);
+    let mut guard = self.inner.blocking_lock();
+    guard.add_plugin(plugin_arc);
     Ok(())
   }
 

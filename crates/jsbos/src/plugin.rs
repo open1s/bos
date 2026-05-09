@@ -264,7 +264,10 @@ impl AgentPlugin for JSPlugin {
   }
 
   async fn on_llm_request(&self, request: LlmRequestWrapper) -> Option<LlmRequestWrapper> {
-    let callback = self.on_llm_request_cb.as_ref()?;
+    let callback = match self.on_llm_request_cb.as_ref() {
+      Some(cb) => cb,
+      None => return Some(request),
+    };
     let input = serde_json::json!({
         "model": request.model,
         "temperature": request.temperature,
@@ -274,7 +277,10 @@ impl AgentPlugin for JSPlugin {
         "metadata": request.metadata,
     });
 
-    let result = Self::call_js_callback(callback, input)?;
+    let result = match Self::call_js_callback(callback, input) {
+      Some(r) => r,
+      None => return Some(request),
+    };
 
     let mut modified = request;
     if let Some(model) = result.get("model").and_then(|v| v.as_str()) {
@@ -290,7 +296,10 @@ impl AgentPlugin for JSPlugin {
   }
 
   async fn on_llm_response(&self, response: LlmResponseWrapper) -> Option<LlmResponseWrapper> {
-    let callback = self.on_llm_response_cb.as_ref()?;
+    let callback = match self.on_llm_response_cb.as_ref() {
+      Some(cb) => cb,
+      None => return Some(response),
+    };
 
     let (content, tool_calls) = match &response {
       LlmResponseWrapper::OpenAI(rsp) => {
@@ -312,7 +321,10 @@ impl AgentPlugin for JSPlugin {
       serde_json::json!({"type": "Text", "content": content})
     };
 
-    let result = Self::call_js_callback(callback, input)?;
+    let result = match Self::call_js_callback(callback, input) {
+      Some(r) => r,
+      None => return Some(response),
+    };
 
     if result.get("type").and_then(|v| v.as_str()).is_some() {
       let LlmResponseWrapper::OpenAI(mut rsp) = response;
@@ -337,11 +349,14 @@ impl AgentPlugin for JSPlugin {
       }
       return Some(LlmResponseWrapper::OpenAI(rsp));
     }
-    None
+    Some(response)
   }
 
   async fn on_tool_call(&self, tool_call: ToolCallWrapper) -> Option<ToolCallWrapper> {
-    let callback = self.on_tool_call_cb.as_ref()?;
+    let callback = match self.on_tool_call_cb.as_ref() {
+      Some(cb) => cb,
+      None => return Some(tool_call),
+    };
     let input = serde_json::json!({
         "name": tool_call.name,
         "args": tool_call.args,
@@ -349,7 +364,10 @@ impl AgentPlugin for JSPlugin {
         "metadata": tool_call.metadata,
     });
 
-    let result = Self::call_js_callback(callback, input)?;
+    let result = match Self::call_js_callback(callback, input) {
+      Some(r) => r,
+      None => return Some(tool_call),
+    };
 
     let mut modified = tool_call;
     if let Some(name) = result.get("name").and_then(|v| v.as_str()) {
@@ -362,7 +380,10 @@ impl AgentPlugin for JSPlugin {
   }
 
   async fn on_tool_result(&self, tool_result: ToolResultWrapper) -> Option<ToolResultWrapper> {
-    let callback = self.on_tool_result_cb.as_ref()?;
+    let callback = match self.on_tool_result_cb.as_ref() {
+      Some(cb) => cb,
+      None => return Some(tool_result),
+    };
     let input = serde_json::json!({
         "result": tool_result.result,
         "success": tool_result.success,

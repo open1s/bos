@@ -375,16 +375,17 @@ impl ReactContext for AgentReactContext {
 /// This allows the agent to intercept and react to events during the ReAct loop.
 pub struct AgentReActApp {
     hooks: Arc<HookRegistry>,
+    plugins: Arc<PluginRegistry>,
     agent_name: String,
 }
 
 impl AgentReActApp {
     pub fn new(
         hooks: Arc<HookRegistry>,
-        _plugins: Arc<PluginRegistry>,
+        plugins: Arc<PluginRegistry>,
         agent_name: String,
     ) -> Self {
-        Self { hooks, agent_name }
+        Self { hooks, plugins, agent_name }
     }
 }
 
@@ -402,13 +403,25 @@ impl ReActApp for AgentReActApp {
         req: &mut ReactLlmRequest,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) -> impl Future<Output = react::runtime::HookDecision> + Send + '_ {
+    ) -> impl Future<Output = react::runtime::HookDecision> + Send {
         let agent_name = self.agent_name.clone();
-        let model = req.model.clone();
+        let hooks = self.hooks.clone();
+        let plugins = self.plugins.clone();
         async move {
+            if plugins.has_plugins() {
+                let wrapper = crate::agent::plugin::LlmRequestWrapper::new(&*req);
+                if let Some(modified) = plugins.on_llm_request(wrapper).await {
+                    req.model = modified.model;
+                    req.input = modified.input;
+                    req.temperature = modified.temperature;
+                    req.max_tokens = modified.max_tokens;
+                    req.top_p = modified.top_p;
+                    req.top_k = modified.top_k;
+                }
+            }
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
-            ctx.set("model", &model);
-            self.hooks
+            ctx.set("model", &req.model);
+            hooks
                 .trigger(crate::agent::hooks::HookEvent::BeforeLlmCall, ctx)
                 .await
         }
@@ -417,16 +430,23 @@ impl ReActApp for AgentReActApp {
     #[allow(refining_impl_trait)]
     fn after_llm_response(
         &self,
-        _response: &mut ReactLlmResponse,
+        response: &mut ReactLlmResponse,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + Send {
         let agent_name = self.agent_name.clone();
+        let hooks = self.hooks.clone();
+        let plugins = self.plugins.clone();
         async move {
+            if plugins.has_plugins() {
+                let wrapper = crate::agent::plugin::LlmResponseWrapper::new(&*response);
+                if let Some(modified) = plugins.on_llm_response(wrapper).await {
+                    *response = modified.into_response();
+                }
+            }
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("response_type", "react");
-            let _ = self
-                .hooks
+            let _ = hooks
                 .trigger(crate::agent::hooks::HookEvent::AfterLlmCall, ctx)
                 .await;
         }
@@ -439,8 +459,9 @@ impl ReActApp for AgentReActApp {
         had_tool_call: bool,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + Send {
         let agent_name = self.agent_name.clone();
+        let hooks = self.hooks.clone();
         let response_text = response_text.to_string();
         let had_tool_call = had_tool_call;
         async move {
@@ -448,8 +469,7 @@ impl ReActApp for AgentReActApp {
             ctx.set("response_type", "stream");
             ctx.set("response_text", &response_text);
             ctx.set("had_tool_call", &had_tool_call.to_string());
-            let _ = self
-                .hooks
+            let _ = hooks
                 .trigger(crate::agent::hooks::HookEvent::AfterLlmCall, ctx)
                 .await;
         }
@@ -462,15 +482,24 @@ impl ReActApp for AgentReActApp {
         args: &mut JsonValue,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) -> impl Future<Output = react::runtime::HookDecision> + Send + '_ {
+    ) -> impl Future<Output = react::runtime::HookDecision> + Send {
         let agent_name = self.agent_name.clone();
+        let hooks = self.hooks.clone();
         let tool_name = tool_name.to_string();
-        let args_json = args.to_string();
+        let plugins = self.plugins.clone();
         async move {
+            if plugins.has_plugins() {
+                let wrapper = crate::agent::plugin::ToolCallWrapper::new(
+                    &tool_name, args.clone(), None,
+                );
+                if let Some(modified) = plugins.on_tool_call(wrapper).await {
+                    *args = modified.args;
+                }
+            }
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("tool_name", &tool_name);
-            ctx.set("tool_args", &args_json);
-            self.hooks
+            ctx.set("tool_args", &args.to_string());
+            hooks
                 .trigger(crate::agent::hooks::HookEvent::BeforeToolCall, ctx)
                 .await
         }
@@ -483,16 +512,37 @@ impl ReActApp for AgentReActApp {
         result: &mut Result<JsonValue, ReactError>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + Send {
         let agent_name = self.agent_name.clone();
+        let hooks = self.hooks.clone();
         let tool_name = tool_name.to_string();
+        let plugins = self.plugins.clone();
         let result_text = result.as_ref().map(|v| v.to_string()).unwrap_or_default();
         async move {
+            if plugins.has_plugins() {
+                let tool_result = match &*result {
+                    Ok(v) => crate::agent::plugin::ToolResultWrapper::new(v.clone()),
+                    Err(e) => crate::agent::plugin::ToolResultWrapper {
+                        result: serde_json::Value::Null,
+                        success: false,
+                        error: Some(e.to_string()),
+                        metadata: std::collections::HashMap::new(),
+                    },
+                };
+                if let Some(modified) = plugins.on_tool_result(tool_result).await {
+                    if modified.success {
+                        *result = Ok(modified.result);
+                    } else {
+                        *result = Err(ReactError::ToolError(
+                            modified.error.unwrap_or_else(|| "Plugin error".to_string()),
+                        ));
+                    }
+                }
+            }
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("tool_name", &tool_name);
             ctx.set("tool_result", &result_text);
-            let _ = self
-                .hooks
+            let _ = hooks
                 .trigger(crate::agent::hooks::HookEvent::AfterToolCall, ctx)
                 .await;
         }
@@ -504,14 +554,14 @@ impl ReActApp for AgentReActApp {
         thought: &str,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + Send {
         let agent_name = self.agent_name.clone();
+        let hooks = self.hooks.clone();
         let thought = thought.to_string();
         async move {
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("thought", &thought);
-            let _ = self
-                .hooks
+            let _ = hooks
                 .trigger(crate::agent::hooks::HookEvent::OnMessage, ctx)
                 .await;
         }
@@ -523,14 +573,14 @@ impl ReActApp for AgentReActApp {
         answer: &str,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + Send {
         let agent_name = self.agent_name.clone();
+        let hooks = self.hooks.clone();
         let answer = answer.to_string();
         async move {
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("answer", &answer);
-            let _ = self
-                .hooks
+            let _ = hooks
                 .trigger(crate::agent::hooks::HookEvent::OnComplete, ctx)
                 .await;
         }
