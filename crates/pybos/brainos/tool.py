@@ -1,17 +1,4 @@
-"""Tool decorator and definition for brainos.
-
-Usage:
-    from brainos import tool
-
-    @tool("Calculate a math expression")
-    def calc(expression: str) -> float:
-        return eval(expression)
-
-    # Or with explicit schema:
-    @tool("Get weather", schema={...})
-    def weather(city: str) -> dict:
-        return {"city": city, "temp": 22}
-"""
+"""Tool decorator and definition for brainos."""
 
 from __future__ import annotations
 
@@ -23,13 +10,26 @@ from typing import Any, Callable
 
 @dataclass
 class ToolDef:
-    """A tool definition — created by @tool() or manually."""
-
     name: str
     description: str
     callback: Callable[[dict], Any]
     parameters: dict[str, Any] = field(default_factory=dict)
     schema: dict[str, Any] = field(default_factory=dict)
+
+
+class ToolResult:
+    def __init__(self, success: bool, data: Any = None, error: str | None = None):
+        self.success = success
+        self.data = data
+        self.error = error
+
+    @staticmethod
+    def success(data: Any) -> "ToolResult":
+        return ToolResult(True, data)
+
+    @staticmethod
+    def error(message: str) -> "ToolResult":
+        return ToolResult(False, None, message)
 
 
 def tool(
@@ -38,21 +38,6 @@ def tool(
     name: str | None = None,
     schema: dict[str, Any] | None = None,
 ) -> Callable[[Callable], ToolDef]:
-    """Decorator that turns a function into a BrainOS tool.
-
-    Args:
-        description: Human-readable description of what the tool does.
-        name: Tool name (defaults to function name).
-        schema: JSON Schema for parameters (auto-generated from signature if omitted).
-
-    Returns:
-        A ToolDef that can be registered with Agent.register().
-
-    Example:
-        @tool("Add two numbers together")
-        def add(a: int, b: int) -> int:
-            return a + b
-    """
 
     def decorator(func: Callable) -> ToolDef:
         tool_name = name or func.__name__
@@ -66,10 +51,18 @@ def tool(
                 if value is not None:
                     json_type = spec.get("type", "string")
                     kwargs[k] = _coerce_type(value, json_type)
-            result = func(**kwargs)
-            if isinstance(result, str):
-                return result
-            return json.dumps(result)
+            try:
+                result = func(**kwargs)
+                if isinstance(result, ToolResult):
+                    if result.success:
+                        return json.dumps(result.data) if result.data is not None else ""
+                    else:
+                        return json.dumps({"error": result.error})
+                if isinstance(result, str):
+                    return result
+                return json.dumps(result)
+            except Exception as e:
+                return json.dumps({"error": str(e)})
 
         return ToolDef(
             name=tool_name,
@@ -83,7 +76,6 @@ def tool(
 
 
 def _extract_params(func: Callable) -> dict[str, Any]:
-    """Extract JSON Schema from function signature."""
     sig = inspect.signature(func)
     properties: dict[str, Any] = {}
     required: list[str] = []
@@ -104,12 +96,13 @@ def _extract_params(func: Callable) -> dict[str, Any]:
         param_type = param.annotation
         json_type = type_map.get(param_type, "string")
 
-        properties[param_name] = {"type": json_type}
-
-        if param.default is inspect.Parameter.empty:
-            required.append(param_name)
+        prop = {"type": json_type}
+        if param.default is not inspect.Parameter.empty:
+            prop["default"] = param.default
         else:
-            properties[param_name]["default"] = param.default
+            required.append(param_name)
+
+        properties[param_name] = prop
 
     return {"type": "object", "properties": properties, "required": required}
 
@@ -131,7 +124,6 @@ def _coerce_type(value: Any, json_type: str) -> Any:
 
 
 def _build_schema(params: dict) -> dict[str, Any]:
-    """Wrap parameters dict into full JSON Schema."""
     if "type" in params:
         return params
     return {"type": "object", "properties": params}

@@ -21,6 +21,10 @@ from pybos import Bus as PyBus
 from pybos import BusConfig as PyBusConfig
 from pybos import Publisher as PyPublisher
 from pybos import Subscriber as PySubscriber
+from pybos import Query as PyQuery
+from pybos import Queryable as PyQueryable
+from pybos import Caller as PyCaller
+from pybos import Callable as PyCallable
 
 
 # ── BusManager ──────────────────────────────────────────────────────
@@ -90,32 +94,28 @@ class BusManager:
         from brainos.query import Query
         if self._bus is None:
             raise RuntimeError("Bus not started. Use 'async with' context.")
-        raw = await self._bus.create_query(topic)
+        raw = await PyQuery.create(self._bus, topic)
         return Query(raw)
 
     async def create_queryable(self, topic: str, handler=None):
         from brainos.query import Queryable
         if self._bus is None:
             raise RuntimeError("Bus not started. Use 'async with' context.")
-        raw = await self._bus.create_queryable(topic)
-        if handler:
-            raw.set_handler(handler)
+        raw = await PyQueryable.create(self._bus, topic, handler)
         return Queryable(raw)
 
     async def create_caller(self, name: str):
         from brainos.caller import Caller
         if self._bus is None:
             raise RuntimeError("Bus not started. Use 'async with' context.")
-        raw = await self._bus.create_caller(name)
+        raw = await PyCaller.create(self._bus, name)
         return Caller(raw)
 
     async def create_callable(self, uri: str, handler=None):
         from brainos.caller import Callable
         if self._bus is None:
             raise RuntimeError("Bus not started. Use 'async with' context.")
-        raw = await self._bus.create_callable(uri)
-        if handler:
-            raw.set_handler(handler)
+        raw = await PyCallable.create(self._bus, uri, handler)
         return Callable(raw)
 
     @property
