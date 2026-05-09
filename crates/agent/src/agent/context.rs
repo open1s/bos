@@ -381,6 +381,7 @@ impl ReactContext for AgentReactContext {
 
 /// AgentReActApp integrates the Agent's hooks, plugins, and configuration with the ReAct engine.
 /// This allows the agent to intercept and react to events during the ReAct loop.
+#[derive(Default)]
 pub struct AgentReActApp {
     hooks: Arc<HookRegistry>,
     plugins: Arc<PluginRegistry>,

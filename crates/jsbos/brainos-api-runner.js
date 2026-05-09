@@ -11,7 +11,7 @@ const {
   BusManager,
   SessionManager,
   tool,
-} = require('../brainos.js');
+} = require('./brainos.js');
 
 async function runTests() {
   let passed = 0;

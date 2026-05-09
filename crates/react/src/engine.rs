@@ -210,7 +210,9 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         self.react_app = Some(app);
         self
     }
+}
 
+impl<A: ReActApp + Default> ReActEngineBuilder<A> {
     pub fn build(self) -> Result<ReActEngine<A>, BuilderError> {
         let llm = self.llm.ok_or(BuilderError::MissingLlm)?;
         Ok(ReActEngine {
@@ -221,7 +223,7 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             llm_timeout_secs: self.llm_timeout_secs,
             model: self.model,
             token_counter: self.token_counter,
-            react_app: self.react_app.unwrap_or_else(|| panic!("App must be provided via .app() method")),
+            react_app: self.react_app.unwrap_or_default(),
             resilience: self.resilience,
             skill_cache: self.skill_cache,
         })

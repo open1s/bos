@@ -10,7 +10,6 @@
       "import": "./index.mjs",
       "require": "./brainos.js",
       "types": "./index.d.ts"
-
     }
   },
   "repository": {
@@ -65,7 +64,7 @@
     "format:rs": "cargo fmt",
     "lint": "oxlint .",
     "prepublishOnly": "napi prepublish -t npm",
-    "test": "ava",
+    "test": "ava && node brainos-api-runner.js",
     "preversion": "napi build --platform && git add .",
     "version": "napi version",
     "prepare": "husky"
