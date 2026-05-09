@@ -148,87 +148,16 @@ impl LlmClient<AgentSession, AgentReactContext> for LlmProvider {
 
 struct ExtensibleToolAdapter {
     inner: Arc<dyn Tool + Send + Sync>,
-    #[allow(dead_code)]
-    plugins: PluginRegistry,
-    hooks: HookRegistry,
-    agent_id: String,
 }
 
 impl ExtensibleToolAdapter {
     fn new(
         inner: Arc<dyn Tool + Send + Sync>,
-        plugins: PluginRegistry,
-        hooks: HookRegistry,
-        agent_id: String,
+        _plugins: PluginRegistry,
+        _hooks: HookRegistry,
+        _agent_id: String,
     ) -> Self {
-        Self {
-            inner,
-            plugins,
-            hooks,
-            agent_id,
-        }
-    }
-
-    fn trigger_before_hook(
-        &self,
-        tool_name: &str,
-        original_args: &str,
-    ) -> Result<(), ReactToolError> {
-        if !self.hooks.has_hooks_blocking(&HookEvent::BeforeToolCall) {
-            return Ok(());
-        }
-
-        let mut ctx = HookContext::new(&self.agent_id);
-        ctx.set("tool_name", tool_name);
-        ctx.set("tool_args", original_args);
-        let decision = self.hooks.trigger_blocking(HookEvent::BeforeToolCall, ctx);
-        match decision {
-            HookDecision::Error(msg) => Err(ReactToolError::Failed(format!(
-                "BeforeToolCall hook error: {}",
-                msg
-            ))),
-            HookDecision::Abort => Err(ReactToolError::Failed("Tool call aborted by hook".into())),
-            HookDecision::Continue => Ok(()),
-        }
-    }
-
-    fn trigger_after_hook(
-        &self,
-        tool_name: &str,
-        original_args: &str,
-        effective_args: Option<&str>,
-        result: &Result<serde_json::Value, ReactToolError>,
-    ) -> Result<(), ReactToolError> {
-        if !self.hooks.has_hooks_blocking(&HookEvent::AfterToolCall) {
-            return Ok(());
-        }
-
-        let mut ctx = HookContext::new(&self.agent_id);
-        ctx.set("tool_name", tool_name);
-        ctx.set("tool_args", original_args);
-        if let Some(effective_args) = effective_args {
-            ctx.set("effective_tool_args", effective_args);
-        }
-        match result {
-            Ok(v) => ctx.set("tool_result", v.to_string()),
-            Err(e) => ctx.set("error", e.to_string()),
-        }
-        let decision = self.hooks.trigger_blocking(HookEvent::AfterToolCall, ctx);
-        match decision {
-            HookDecision::Error(msg) => {
-                return Err(ReactToolError::Failed(format!(
-                    "AfterToolCall hook error: {}",
-                    msg
-                )));
-            }
-            HookDecision::Abort => {
-                return Err(ReactToolError::Failed(
-                    "Tool call aborted by after hook".to_string(),
-                ));
-            }
-            HookDecision::Continue => {}
-        }
-        Ok(())
+        Self { inner }
     }
 }
 

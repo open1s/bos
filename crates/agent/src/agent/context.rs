@@ -369,6 +369,14 @@ impl ReactContext for AgentReactContext {
     fn add_tool(&mut self, tool: LlmTool) {
         self.tools.push(tool);
     }
+
+    fn notify_request(&self, _req: &ReactLlmRequest) {}
+    fn notify_response(&self, _resp: &ReactLlmResponse) {}
+    fn notify_error(&self, _err: &react::llm::LlmError) {}
+    fn on_chunk(&self, _chunk: &str) {}
+    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
+        None
+    }
 }
 
 /// AgentReActApp integrates the Agent's hooks, plugins, and configuration with the ReAct engine.

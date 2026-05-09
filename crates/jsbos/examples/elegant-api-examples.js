@@ -3,7 +3,7 @@ const raw = require('../index.js');
 const fs = require('fs');
 const path = require('path');
 
-// enableTracing(); // Enable detailed logging for tracing the elegant API features
+enableTracing(); // Enable detailed logging for tracing the elegant API features
 
 async function main() {
   console.log('═══════════════════════════════════════════════════════════');

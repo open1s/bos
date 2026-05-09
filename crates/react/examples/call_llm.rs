@@ -32,6 +32,14 @@ impl ReactContext for DummyContext {
         None
     }
     fn add_tool(&mut self, _tool: react::llm::LlmTool) {}
+
+    fn notify_request(&self, _req: &LlmRequest) {}
+    fn notify_response(&self, _resp: &react::llm::LlmResponse) {}
+    fn notify_error(&self, _err: &react::llm::LlmError) {}
+    fn on_chunk(&self, _chunk: &str) {}
+    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
+        None
+    }
 }
 
 struct VendorConfig {

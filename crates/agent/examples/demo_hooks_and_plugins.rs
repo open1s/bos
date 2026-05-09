@@ -3,13 +3,12 @@
 //! Run with: cargo run -p agent --example demo_hooks_and_plugins
 
 use agent::agent::agentic::{Agent, AgentConfig, LlmProvider};
-use agent::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
-use agent::agent::plugin::{AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, PluginRegistry, ToolCallWrapper, ToolResultWrapper};
+use agent::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent};
+use agent::agent::plugin::{AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, ToolCallWrapper, ToolResultWrapper};
 use async_trait::async_trait;
 use config::ConfigLoader;
 use react::llm::vendor::{NvidiaVendor, OpenRouterVendor};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 /// Test hook that tracks events and prints them
 #[derive(Debug, Clone)]
@@ -55,6 +54,7 @@ impl TestPlugin {
     }
 }
 
+#[async_trait]
 impl AgentPlugin for TestPlugin {
     fn name(&self) -> &str {
         "TestPlugin"
@@ -107,6 +107,14 @@ impl VendorConfig {
             api_key: nvidia.get("api_key")?.as_str()?.to_string(),
         })
     }
+    fn from_openrouter(config: &serde_json::Value) -> Option<Self> {
+        let or = config.get("llm")?.get("openrouter")?;
+        Some(Self {
+            model: or.get("model")?.as_str()?.to_string(),
+            base_url: or.get("base_url")?.as_str()?.to_string(),
+            api_key: or.get("api_key")?.as_str()?.to_string(),
+        })
+    }
 }
 
 fn build_llm_provider(config: &serde_json::Value) -> LlmProvider {
@@ -148,10 +156,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create agent config
     let mut agent_config = AgentConfig::default();
     agent_config.model = nvidia_cfg.model;
-    agent_config.timeout = Duration::from_secs(120);
+    agent_config.timeout_secs = 120;
 
     // Create agent
-    let mut agent = Agent::new(agent_config, Arc::new(provider));
+    let agent = Agent::new(agent_config, Arc::new(provider));
 
     // Create and register test hook
     let test_hook = Arc::new(TestHook::new());

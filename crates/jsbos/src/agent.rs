@@ -9,7 +9,6 @@ use tokio::sync::Mutex;
 
 use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
-use crate::plugin::PluginRegistry;
 use agent::BashTool;
 use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
 
