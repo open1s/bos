@@ -1,6 +1,6 @@
 {
   "name": "@open1s/jsbos",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "BrainOS JavaScript bindings - AI agent framework with ReAct engine",
   "main": "./brainos.js",
   "module": "./index.mjs",
