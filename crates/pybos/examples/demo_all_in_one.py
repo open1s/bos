@@ -75,19 +75,19 @@ def on_complete_hook(event: HookEvent, ctx: HookContext) -> HookDecision:
 def make_logging_plugin():
     def on_llm_request(wrapped):
         print(f"  [PLUGIN] LLM Request")
-        return None
+        return wrapped
 
     def on_llm_response(wrapped):
         print(f"  [PLUGIN] LLM Response")
-        return None
+        return wrapped
 
     def on_tool_call(wrapped):
         print(f"  [PLUGIN] Tool call")
-        return None
+        return wrapped
 
     def on_tool_result(wrapped):
         print(f"  [PLUGIN] Tool result")
-        return None
+        return wrapped
 
     return {
         "name": "logging-plugin",

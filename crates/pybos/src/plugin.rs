@@ -21,6 +21,8 @@ pub struct PyLlmRequestWrapper {
     pub top_p: Option<f32>,
     #[pyo3(get, set)]
     pub top_k: Option<u32>,
+    #[pyo3(get, set)]
+    pub input: String,
 }
 
 impl From<&InnerLlmRequest> for PyLlmRequestWrapper {
@@ -31,6 +33,7 @@ impl From<&InnerLlmRequest> for PyLlmRequestWrapper {
             max_tokens: req.max_tokens,
             top_p: req.top_p,
             top_k: req.top_k,
+            input: req.input.clone(),
         }
     }
 }
@@ -39,7 +42,7 @@ impl From<PyLlmRequestWrapper> for InnerLlmRequest {
     fn from(py_req: PyLlmRequestWrapper) -> Self {
         InnerLlmRequest {
             model: py_req.model,
-            input: String::new(),
+            input: py_req.input,
             temperature: py_req.temperature,
             max_tokens: py_req.max_tokens,
             top_p: py_req.top_p,
@@ -108,7 +111,9 @@ impl From<PyLlmResponseWrapper> for InnerLlmResponse {
             "ToolCall" => {
                 let args: serde_json::Value = py_resp
                     .tool_args
-                    .map_or(serde_json::json!({}), |s| serde_json::json!({"raw": s}));
+                    .as_ref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
                 InnerLlmResponse::OpenAI(ChatCompletionResponse {
                     id: format!("py-{}", uuid::Uuid::new_v4()),
                     object: "chat.completion".to_string(),
@@ -192,9 +197,10 @@ impl From<&InnerToolCall> for PyToolCallWrapper {
 
 impl From<PyToolCallWrapper> for InnerToolCall {
     fn from(py_tc: PyToolCallWrapper) -> Self {
+        let args: serde_json::Value = serde_json::from_str(&py_tc.args).unwrap_or_else(|_| serde_json::json!(py_tc.args));
         InnerToolCall {
             name: py_tc.name,
-            args: serde_json::json!(py_tc.args),
+            args,
             id: py_tc.id,
             metadata: Default::default(),
         }
@@ -252,10 +258,21 @@ impl InnerPlugin for PythonPlugin {
         let py_request = PyLlmRequestWrapper::from(&request);
         Python::attach(|py| -> Option<InnerLlmRequest> {
             let result = callback.call1(py, (py_request,));
-            result
-                .ok()
-                .and_then(|val| val.extract::<PyLlmRequestWrapper>(py).ok())
-                .map(|r| r.into())
+            match result {
+                Ok(val) if val.is_none(py) => None,
+                Ok(val) => val.extract::<PyLlmRequestWrapper>(py).ok().map(|wrapped| {
+                    InnerLlmRequest {
+                        model: wrapped.model,
+                        input: wrapped.input,
+                        temperature: wrapped.temperature,
+                        max_tokens: wrapped.max_tokens,
+                        top_p: wrapped.top_p,
+                        top_k: wrapped.top_k,
+                        metadata: request.metadata.clone(),
+                    }
+                }),
+                Err(_) => None,
+            }
         })
     }
 
@@ -264,10 +281,11 @@ impl InnerPlugin for PythonPlugin {
         let py_response = PyLlmResponseWrapper::from(&response);
         Python::attach(|py| -> Option<InnerLlmResponse> {
             let result = callback.call1(py, (py_response,));
-            result
-                .ok()
-                .and_then(|val| val.extract::<PyLlmResponseWrapper>(py).ok())
-                .map(|r| r.into())
+            match result {
+                Ok(val) if val.is_none(py) => None,
+                Ok(val) => val.extract::<PyLlmResponseWrapper>(py).ok().map(|r| r.into()),
+                Err(_) => None,
+            }
         })
     }
 
@@ -276,10 +294,11 @@ impl InnerPlugin for PythonPlugin {
         let py_tool_call = PyToolCallWrapper::from(&tool_call);
         Python::attach(|py| -> Option<InnerToolCall> {
             let result = callback.call1(py, (py_tool_call,));
-            result
-                .ok()
-                .and_then(|val| val.extract::<PyToolCallWrapper>(py).ok())
-                .map(|r| r.into())
+            match result {
+                Ok(val) if val.is_none(py) => None,
+                Ok(val) => val.extract::<PyToolCallWrapper>(py).ok().map(|r| r.into()),
+                Err(_) => None,
+            }
         })
     }
 
@@ -288,10 +307,11 @@ impl InnerPlugin for PythonPlugin {
         let py_tool_result = PyToolResultWrapper::from(&tool_result);
         Python::attach(|py| -> Option<InnerToolResult> {
             let result = callback.call1(py, (py_tool_result,));
-            result
-                .ok()
-                .and_then(|val| val.extract::<PyToolResultWrapper>(py).ok())
-                .map(|r| r.into())
+            match result {
+                Ok(val) if val.is_none(py) => None,
+                Ok(val) => val.extract::<PyToolResultWrapper>(py).ok().map(|r| r.into()),
+                Err(_) => None,
+            }
         })
     }
 }
