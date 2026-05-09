@@ -229,22 +229,33 @@ class ToolRegistry {
   }
 }
 
-function tool(description, options = {}) {
+function tool(descriptionOrOptions, maybeOptions = {}) {
+  const options = typeof descriptionOrOptions === 'string' 
+    ? { description: descriptionOrOptions, ...maybeOptions }
+    : descriptionOrOptions || {};
+  const { description = '', schema = {}, name: customName } = options;
+
   return function (target, propertyKey, descriptor) {
     const originalMethod = descriptor.value;
-    const toolName = options.name || propertyKey;
-    const schema = options.schema || {};
-    const properties = schema.properties || {};
+    const toolName = customName || propertyKey;
+    const paramSchema = schema.properties || {};
+    const required = schema.required || Object.keys(paramSchema);
 
     const wrapper = function (args) {
       const params = {};
-      for (const [key, spec] of Object.entries(properties)) {
-        params[key] = args[key] !== undefined ? args[key] : spec.default;
+      for (const [key, spec] of Object.entries(paramSchema)) {
+        params[key] = args[key] !== undefined ? args[key] : (spec.default ?? undefined);
       }
       return originalMethod.call(this, params);
     };
 
-    const toolDef = new ToolDef(toolName, description, wrapper, properties, schema);
+    const fullSchema = {
+      type: 'object',
+      properties: paramSchema,
+      required
+    };
+
+    const toolDef = new ToolDef(toolName, description, wrapper, fullSchema, fullSchema);
     descriptor.value.toolDef = toolDef;
     descriptor.value.toolName = toolName;
     return descriptor;
@@ -284,30 +295,8 @@ function extractTools(instance) {
   return tools;
 }
 
-function toolMethod(description, options = {}) {
-  return function (target, propertyKey, descriptor) {
-    return tool(description, options)(target, propertyKey, descriptor);
-  };
-}
-
-/**
- * Elegant tool definition API - fluent builder pattern
- * 
- * Usage:
- *   const add = tool('add', 'Add two numbers')({ a: 0, b: 0 })((args) => args.a + args.b);
- *   const brain = new BrainOS();
- *   brain.tools(add);
- * 
- * Or with full schema:
- *   const add = tool('add', 'Add two numbers')({
- *     a: { type: 'number', description: 'First number' },
- *     b: { type: 'number', description: 'Second number' }
- *   })((args) => args.a + args.b);
- */
 function defineTool(name, description) {
-  // Returns a function that takes paramSchema
   const paramSchemaBuilder = (paramSchema) => {
-    // Returns a function that takes the callback
     const callbackBuilder = (callback) => {
       const properties = {};
       const required = [];
@@ -317,7 +306,6 @@ function defineTool(name, description) {
           properties[key] = { ...spec };
           if (spec.required) required.push(key);
         } else {
-          // Simple type shorthand: { a: number } → { a: { type: 'number' } }
           properties[key] = { type: 'number', default: spec };
         }
       }
@@ -332,7 +320,6 @@ function defineTool(name, description) {
     };
     
     callbackBuilder.returns = (returnSchema) => {
-      // Returns a function that takes the callback
       const callbackBuilderWithReturns = (callback) => {
         const properties = {};
         const required = [];
@@ -376,22 +363,6 @@ function defineTool(name, description) {
   return paramSchemaBuilder;
 }
 
-/**
- * Batch define tools from an object
- * 
- * Usage:
- *   const { add, multiply } = defineTools({
- *     add: {
- *       description: 'Add two numbers',
- *       params: { a: 0, b: 0 }
- *     },
- *     multiply: {
- *       description: 'Multiply',
- *       params: { a: 0, b: 0 },
- *       fn: (args) => args.a * args.b  // inline function
- *     }
- *   });
- */
 function defineTools(toolDefs) {
   const result = {};
   for (const [name, def] of Object.entries(toolDefs)) {
@@ -402,7 +373,6 @@ function defineTools(toolDefs) {
   return result;
 }
 
-// Backwards compatibility alias
 const createTool = defineTool;
 
 class SessionManager {
@@ -1239,6 +1209,9 @@ module.exports = {
   Config,
   ConfigLoader,
   extractTools,
+  defineTool,
+  defineTools,
+  createTool,
   version: getVersion,
   enableTracing,
   logTestMessage,

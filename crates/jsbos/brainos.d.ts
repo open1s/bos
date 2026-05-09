@@ -49,7 +49,31 @@ export class ToolDef {
   callback: (args: unknown) => unknown;
 }
 
-export function tool(description: string, options?: { schema?: object; parameters?: object }): MethodDecorator;
+export function tool(description: string, options?: { schema?: object; name?: string }): MethodDecorator;
+export function tool(options: { description?: string; schema?: object; name?: string }): MethodDecorator;
+
+export type ParamSchema = Record<string, { type?: string; description?: string; default?: any; required?: boolean } | number>;
+export type ReturnSchema = Record<string, { type?: string; description?: string } | number>;
+
+export interface ToolDefOptions {
+  description: string;
+  params?: ParamSchema;
+  returns?: ReturnSchema;
+  fn?: (args: any) => any;
+}
+
+export function defineTool(name: string, description: string): {
+  (params: ParamSchema): {
+    (callback: (args: any) => any): ToolDef;
+    returns(returnSchema: ReturnSchema): (callback: (args: any) => any) => ToolDef;
+  };
+};
+
+export function defineTools(toolDefs: Record<string, ToolDefOptions>): Record<string, ToolDef>;
+
+export const createTool: typeof defineTool;
+
+export function extractTools(instance: object): ToolDef[];
 
 export class BusManager {
   constructor(options?: object);
