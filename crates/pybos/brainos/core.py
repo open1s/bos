@@ -1,15 +1,36 @@
-"""Core BrainOS wrapper — lifecycle management and agent creation."""
+"""Core BrainOS wrapper — lifecycle management and agent creation.
+
+Elegant, chainable API for building AI agents with tools.
+
+Usage:
+    from brainos import BrainOS, tool
+
+    @tool("Add two numbers")
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    async with BrainOS() as brain:
+        agent = (
+            brain.agent("assistant")
+            .with_tools(add)
+            .with_prompt("You are a helpful math assistant.")
+        )
+        result = await agent.ask("What is 2+2?")
+"""
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from contextlib import AbstractAsyncContextManager
+
+if TYPE_CHECKING:
+    pass
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(name)s: %(message)s')
 _LOG = logging.getLogger("brainos.core")
+
 from pybos import Agent as PyAgent
 from pybos import AgentConfig as PyAgentConfig
 from pybos import Bus as PyBus
@@ -21,21 +42,27 @@ from brainos.tool import ToolDef
 
 
 class Agent:
-    """High-level agent wrapper with fluent API.
+    """High-level agent wrapper with fluent, chainable API.
 
-    Usage:
-        agent = Agent(bus, name="assistant")
-        agent.register(my_tool)
-        result = await agent.ask("What is 2+2?")
+    All configuration methods return `self` for chaining:
+
+        agent = (
+            brain.agent("assistant")
+            .with_model("gpt-4")
+            .with_tools(add, multiply)
+            .with_temperature(0.5)
+        )
+
+    Auto-starts on first `ask()` — or call `.start()` explicitly.
     """
 
     def __init__(
         self,
-        bus: PyBus = None,
+        bus: PyBus | None,
         *,
         name: str = "assistant",
-        model: str = "nvidia/meta/llama-3.1-8b-instruct",
-        base_url: str = "https://integrate.api.nvidia.com/v1",
+        model: str | None = None,
+        base_url: str | None = None,
         api_key: str | None = None,
         system_prompt: str = "You are a helpful assistant.",
         temperature: float = 0.7,
@@ -53,81 +80,71 @@ class Agent:
         self._bus = bus
         self._tools: list[ToolDef] = []
         self._agent: PyAgent | None = None
+        self._started = False
 
-        if isinstance(bus, PyAgentConfig):
-            # Backwards compatibility / direct config support
-            self._config = bus
-            if name != "assistant": self._config.name = name
-            if model != "nvidia/meta/llama-3.1-8b-instruct": self._config.model = model
-            if base_url != "https://integrate.api.nvidia.com/v1": self._config.base_url = base_url
-            if api_key is not None: self._config.api_key = api_key
-            if system_prompt != "You are a helpful assistant.": self._config.system_prompt = system_prompt
-            if temperature != 0.7: self._config.temperature = temperature
-            if max_tokens is not None: self._config.max_tokens = max_tokens
-            if timeout_secs != 120: self._config.timeout_secs = timeout_secs
-            self._apply_resilience(
-                rate_limit_capacity, rate_limit_window_secs, rate_limit_max_retries,
-                rate_limit_retry_backoff_secs, rate_limit_auto_wait,
-                circuit_breaker_max_failures, circuit_breaker_cooldown_secs,
-            )
-            # Since we got config directly, we can create the agent immediately
-            self._agent = PyAgent.from_config(self._config)
-            self._bus = None
-        else:
-            self._config = PyAgentConfig()
-            self._config.name = name
-            self._config.model = model
-            self._config.base_url = base_url
-            self._config.api_key = api_key or ""
-            self._config.system_prompt = system_prompt
-            self._config.temperature = temperature
-            if max_tokens is not None:
-                self._config.max_tokens = max_tokens
-            self._config.timeout_secs = timeout_secs
-            self._apply_resilience(
-                rate_limit_capacity, rate_limit_window_secs, rate_limit_max_retries,
-                rate_limit_retry_backoff_secs, rate_limit_auto_wait,
-                circuit_breaker_max_failures, circuit_breaker_cooldown_secs,
-            )
+        # Build config with defaults from environment/config file
+        loader = PyConfigLoader()
+        loader.discover()
+        config = loader.load_sync()
+        global_model = config.get("global_model", {})
+
+        self._config = PyAgentConfig()
+        self._config.name = name
+        self._config.model = model or global_model.get("model", "nvidia/meta/llama-3.1-8b-instruct")
+        self._config.base_url = base_url or global_model.get("base_url", "https://integrate.api.nvidia.com/v1")
+        self._config.api_key = api_key or global_model.get("api_key") or ""
+        self._config.system_prompt = system_prompt
+        self._config.temperature = temperature
+        if max_tokens is not None:
+            self._config.max_tokens = max_tokens
+        self._config.timeout_secs = timeout_secs
+
+        self._apply_resilience(
+            rate_limit_capacity, rate_limit_window_secs, rate_limit_max_retries,
+            rate_limit_retry_backoff_secs, rate_limit_auto_wait,
+            circuit_breaker_max_failures, circuit_breaker_cooldown_secs,
+        )
 
     def _apply_resilience(self, rate_limit_capacity, rate_limit_window_secs, rate_limit_max_retries, rate_limit_retry_backoff_secs, rate_limit_auto_wait, circuit_breaker_max_failures, circuit_breaker_cooldown_secs):
         if rate_limit_capacity is not None:
             self._config.rate_limit_capacity = rate_limit_capacity
-            _LOG.debug(f"Set rate_limit_capacity={rate_limit_capacity}")
         if rate_limit_window_secs is not None:
             self._config.rate_limit_window_secs = rate_limit_window_secs
-            _LOG.debug(f"Set rate_limit_window_secs={rate_limit_window_secs}")
         if rate_limit_max_retries is not None:
             self._config.rate_limit_max_retries = rate_limit_max_retries
-            _LOG.debug(f"Set rate_limit_max_retries={rate_limit_max_retries}")
         if rate_limit_retry_backoff_secs is not None:
             self._config.rate_limit_retry_backoff_secs = rate_limit_retry_backoff_secs
-            _LOG.debug(f"Set rate_limit_retry_backoff_secs={rate_limit_retry_backoff_secs}")
         if rate_limit_auto_wait is not None:
             self._config.rate_limit_auto_wait = rate_limit_auto_wait
-            _LOG.debug(f"Set rate_limit_auto_wait={rate_limit_auto_wait}")
         if circuit_breaker_max_failures is not None:
             self._config.circuit_breaker_max_failures = circuit_breaker_max_failures
-            _LOG.debug(f"Set circuit_breaker_max_failures={circuit_breaker_max_failures}")
         if circuit_breaker_cooldown_secs is not None:
             self._config.circuit_breaker_cooldown_secs = circuit_breaker_cooldown_secs
-            _LOG.debug(f"Set circuit_breaker_cooldown_secs={circuit_breaker_cooldown_secs}")
 
-    # ── Fluent config ──────────────────────────────────────────────
+    # ── Fluent config ──────────────────────────────────────────────────────────
 
-    def with_model(self, model: str) -> Agent:
+    def with_model(self, model: str) -> "Agent":
+        """Set the LLM model. E.g. 'gpt-4', 'nvidia/llama-3.1-nemotron-70b'."""
         self._config.model = model
         return self
 
-    def with_prompt(self, prompt: str) -> Agent:
+    def with_prompt(self, prompt: str) -> "Agent":
+        """Set the system prompt."""
         self._config.system_prompt = prompt
         return self
 
-    def with_temperature(self, temp: float) -> Agent:
-        self._config.temperature = temp
+    def with_temperature(self, temperature: float) -> "Agent":
+        """Set sampling temperature (0.0–2.0)."""
+        self._config.temperature = temperature
         return self
 
-    def with_timeout(self, secs: int) -> Agent:
+    def with_max_tokens(self, max_tokens: int) -> "Agent":
+        """Set max tokens in response."""
+        self._config.max_tokens = max_tokens
+        return self
+
+    def with_timeout(self, secs: int) -> "Agent":
+        """Set request timeout in seconds."""
         self._config.timeout_secs = secs
         return self
 
@@ -140,10 +157,8 @@ class Agent:
         rate_limit_auto_wait: bool = True,
         circuit_breaker_max_failures: int = 5,
         circuit_breaker_cooldown_secs: int = 30,
-    ) -> Agent:
-        _LOG.debug(f"Applying resilience config:")
-        _LOG.debug(f"  rate_limit: capacity={rate_limit_capacity}, window={rate_limit_window_secs}s, max_retries={rate_limit_max_retries}")
-        _LOG.debug(f"  circuit_breaker: max_failures={circuit_breaker_max_failures}, cooldown={circuit_breaker_cooldown_secs}s")
+    ) -> "Agent":
+        """Configure rate limiting and circuit breaker."""
         self._config.rate_limit_capacity = rate_limit_capacity
         self._config.rate_limit_window_secs = rate_limit_window_secs
         self._config.rate_limit_max_retries = rate_limit_max_retries
@@ -153,30 +168,42 @@ class Agent:
         self._config.circuit_breaker_cooldown_secs = circuit_breaker_cooldown_secs
         return self
 
-    # ── Tool registration ──────────────────────────────────────────
+    # ── Tool registration ───────────────────────────────────────────────────────
 
-    def register(self, tool_def: ToolDef) -> Agent:
-        """Register a tool created with @tool()."""
-        self._tools.append(tool_def)
-        return self
+    def with_tools(self, *tools: ToolDef) -> "Agent":
+        """Register one or more tools. Chainable.
 
-    def register_many(self, *tools: ToolDef) -> Agent:
-        """Register multiple tools at once."""
+        Usage:
+            agent.with_tools(add)
+            agent.with_tools(add, multiply, weather)
+        """
         for t in tools:
             self._tools.append(t)
         return self
 
-    # ── Skills ─────────────────────────────────────────────────────
+    def register(self, tool_def: ToolDef) -> "Agent":
+        """Register a single tool (alias for with_tools for compatibility)."""
+        self._tools.append(tool_def)
+        return self
 
-    def register_skills(self, dir_path: str) -> Agent:
+    def register_many(self, *tools: ToolDef) -> "Agent":
+        """Register multiple tools at once (alias for with_tools)."""
+        return self.with_tools(*tools)
+
+    # ── Skills ─────────────────────────────────────────────────────────────────
+
+    def with_skills(self, dir_path: str) -> "Agent":
+        """Load skills from a directory."""
         self._skills_dir = dir_path
         return self
 
-    # ── Lifecycle ──────────────────────────────────────────────────
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
 
-    async def start(self) -> Agent:
-        """Build the underlying pybos agent and register tools."""
-        self._agent = await PyAgent.create(self._config, self._bus)
+    async def start(self) -> "Agent":
+        """Eagerly initialize the agent. Optional — auto-starts on first ask()."""
+        if self._started:
+            return self
+        self._agent = await PyAgent.create(self._config, self._bus or PyBus.create(PyBusConfig()))
         for t in self._tools:
             py_tool = PythonTool(
                 name=t.name,
@@ -188,45 +215,43 @@ class Agent:
             await self._agent.add_tool(py_tool)
         if hasattr(self, '_skills_dir') and self._skills_dir:
             await self._agent.register_skills_from_dir(self._skills_dir)
+        self._started = True
         return self
 
-    # ── Interaction ────────────────────────────────────────────────
+    # ── Interaction ─────────────────────────────────────────────────────────────
 
     async def ask(self, question: str) -> str:
-        """Ask the agent a question. Uses run_simple with tools and skills."""
-        if self._agent is None:
+        """Ask the agent a question. Auto-starts if needed."""
+        if not self._started:
             await self.start()
         return await self._agent.run_simple(question)
 
     async def chat(self, message: str) -> str:
-        """Send a message using simple conversation (no ReAct loop)."""
-        if self._agent is None:
-            await self.start()
-        return await self._agent.run_simple(message)
+        """Send a message (alias for ask)."""
+        return await self.ask(message)
 
     async def run_simple(self, message: str) -> str:
-        """Run a simple conversation (single LLM call with tools and skills)."""
-        if self._agent is None:
+        """Run a simple conversation (single LLM call with tools)."""
+        return await self.ask(message)
+
+    async def react(self, task: str) -> str:
+        """Run the agent with ReAct reasoning loop (tool use)."""
+        if not self._started:
             await self.start()
-        return await self._agent.run_simple(message)
+        return await self._agent.react(task)
 
     async def stream(self, task: str):
         """Stream tokens as they are generated.
 
-        Returns an async iterator yielding text chunks.
         Usage:
             async for chunk in await agent.stream("hello"):
                 print(chunk, end="", flush=True)
         """
-        if self._agent is None:
+        if not self._started:
             await self.start()
         return await self._agent.stream(task)
 
-    async def react(self, task: str) -> str:
-        """Run the agent with ReAct reasoning (tool use)."""
-        if self._agent is None:
-            await self.start()
-        return await self._agent.react(task)
+    # ── Introspection ───────────────────────────────────────────────────────────
 
     @property
     def tools(self) -> list[str]:
@@ -238,17 +263,17 @@ class Agent:
     @property
     def config(self) -> dict[str, Any]:
         """Get agent config as dict."""
-        if self._agent is None:
-            return {
-                "name": self._config.name,
-                "model": self._config.model,
-                "base_url": self._config.base_url,
-            }
-        return self._agent.config()
+        return {
+            "name": self._config.name,
+            "model": self._config.model,
+            "base_url": self._config.base_url,
+        }
 
 
 class BrainOS(AbstractAsyncContextManager):
     """Main entry point — manages Bus lifecycle and agent creation.
+
+    Auto-discovers config from ~/.bos/conf/config.toml and environment variables.
 
     Usage:
         async with BrainOS() as brain:
@@ -263,11 +288,12 @@ class BrainOS(AbstractAsyncContextManager):
         base_url: str | None = None,
         model: str | None = None,
     ) -> None:
+        # Load global config
         loader = PyConfigLoader()
         loader.discover()
         config = loader.load_sync()
-
         global_model = config.get("global_model", {})
+
         self._api_key = api_key or global_model.get("api_key")
         self._base_url = base_url or global_model.get("base_url", "https://integrate.api.nvidia.com/v1")
         self._model = model or global_model.get("model", "nvidia/meta/llama-3.1-8b-instruct")
@@ -284,20 +310,29 @@ class BrainOS(AbstractAsyncContextManager):
         self,
         name: str = "assistant",
         *,
+        tools: list[ToolDef] | None = None,
         system_prompt: str = "You are a helpful assistant.",
         model: str | None = None,
         temperature: float = 0.7,
         timeout_secs: int = 120,
-        rate_limit_capacity: int | None = None,
-        rate_limit_window_secs: int | None = None,
-        rate_limit_max_retries: int | None = None,
-        rate_limit_retry_backoff_secs: int | None = None,
-        rate_limit_auto_wait: bool | None = None,
-        circuit_breaker_max_failures: int | None = None,
-        circuit_breaker_cooldown_secs: int | None = None,
     ) -> Agent:
-        """Create a new agent with the given configuration."""
-        return Agent(
+        """Create a new agent with the given configuration.
+
+        Usage:
+            # Minimal
+            agent = brain.agent("assistant")
+
+            # With tools
+            agent = brain.agent("math-bot", tools=[add, multiply])
+
+            # With full config
+            agent = (
+                brain.agent("assistant", model="gpt-4", temperature=0.5)
+                .with_tools(add, multiply)
+                .with_prompt("You are a math expert.")
+            )
+        """
+        agent = Agent(
             bus=self._bus,
             name=name,
             model=model or self._model,
@@ -306,14 +341,10 @@ class BrainOS(AbstractAsyncContextManager):
             system_prompt=system_prompt,
             temperature=temperature,
             timeout_secs=timeout_secs,
-            rate_limit_capacity=rate_limit_capacity,
-            rate_limit_window_secs=rate_limit_window_secs,
-            rate_limit_max_retries=rate_limit_max_retries,
-            rate_limit_retry_backoff_secs=rate_limit_retry_backoff_secs,
-            rate_limit_auto_wait=rate_limit_auto_wait,
-            circuit_breaker_max_failures=circuit_breaker_max_failures,
-            circuit_breaker_cooldown_secs=circuit_breaker_cooldown_secs,
         )
+        if tools:
+            agent.with_tools(*tools)
+        return agent
 
     @property
     def bus(self) -> PyBus:

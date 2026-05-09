@@ -3,7 +3,7 @@ const raw = require('../index.js');
 const fs = require('fs');
 const path = require('path');
 
-enableTracing(); // Enable detailed logging for tracing the elegant API features
+//enableTracing(); // Enable detailed logging for tracing the elegant API features
 
 async function main() {
   console.log('═══════════════════════════════════════════════════════════');
@@ -109,7 +109,28 @@ Use type hints, snake_case, docstrings.`);
   console.log('Result:', r2, '\n');
 
   console.log('───────────────────────────────────────────────────────────');
-  console.log('5. SESSION MANAGEMENT');
+  console.log('5. STREAMING');
+  console.log('───────────────────────────────────────────────────────────\n');
+
+  console.log('Streaming (callback): "Count from 1 to 3"\n');
+  let tokenCount = 0;
+  await agent.stream('Count from 1 to 3', (token) => {
+    tokenCount++;
+    if (token.type === 'Error' || token.type === 'Done') return;
+    if (token.type === 'Text') process.stdout.write(token.text);
+    if (token.type === 'ReasoningContent') process.stdout.write(`[${token.text}]`);
+  });
+  console.log(`\nTotal streaming tokens: ${tokenCount}\n`);
+
+  console.log('Streaming (collect): "What is 5+3?"\n');
+  const tokens = await agent.streamCollect('What is 5+3?');
+  const fullText = tokens.filter(t => t.type === 'Text').map(t => t.text).join('');
+  console.log('Collected text:', fullText);
+  const toolCalls = tokens.filter(t => t.type === 'ToolCall');
+  console.log('Tool calls in stream:', toolCalls.length > 0 ? toolCalls.map(t => t.name).join(', ') : 'none', '\n');
+
+  console.log('───────────────────────────────────────────────────────────');
+  console.log('6. SESSION MANAGEMENT');
   console.log('───────────────────────────────────────────────────────────\n');
 
   const session = agent.session;
@@ -140,7 +161,7 @@ Use type hints, snake_case, docstrings.`);
   console.log('Session file cleaned up\n');
 
   console.log('───────────────────────────────────────────────────────────');
-  console.log('6. SKILLS');
+  console.log('7. SKILLS');
   console.log('───────────────────────────────────────────────────────────\n');
 
   console.log('Skills loaded from:', skillsDir);
@@ -152,7 +173,7 @@ Use type hints, snake_case, docstrings.`);
 
   await brain.stop();
   console.log('───────────────────────────────────────────────────────────');
-  console.log('✓ All features: Tools, Plugins, Hooks, Session, Skills!');
+  console.log('✓ All features: Tools, Plugins, Hooks, Streaming, Session, Skills!');
   console.log('───────────────────────────────────────────────────────────');
   process.exit(0);
 }

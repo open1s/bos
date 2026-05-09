@@ -137,8 +137,20 @@ class ToolRegistry {
     } else if (typeof tool === 'function') {
       const t = BaseTool.fromFunction(tool, tool.name || 'anonymous', tool.description || '');
       this._tools.set(t.metadata.name, t);
+    } else if (typeof tool === 'object' && tool !== null) {
+      if (tool.name && tool.description && typeof tool.callback === 'function') {
+        this._tools.set(tool.name, new ToolDef(tool.name, tool.description, tool.callback, tool.parameters || {}, tool.schema || {}));
+      } else {
+        const extracted = extractTools(tool);
+        if (extracted.length === 0) {
+          console.warn('ToolRegistry.add: Object has no valid tool definitions or decorated methods.', tool);
+        }
+        for (const t of extracted) {
+          this._tools.set(t.name, t);
+        }
+      }
     } else {
-      throw new Error('Tool must be BaseTool, ToolDef, or function');
+      throw new Error('Tool must be BaseTool, ToolDef, function, plain object, or decorated class instance');
     }
     return this;
   }
@@ -229,7 +241,7 @@ function tool(description, options = {}) {
       for (const [key, spec] of Object.entries(properties)) {
         params[key] = args[key] !== undefined ? args[key] : spec.default;
       }
-      return originalMethod(params);
+      return originalMethod.call(this, params);
     };
 
     const toolDef = new ToolDef(toolName, description, wrapper, properties, schema);
@@ -240,7 +252,8 @@ function tool(description, options = {}) {
 }
 
 function createToolClass(classDefinition) {
-  for (const [name, method] of Object.entries(classDefinition.prototype)) {
+  for (const name of Object.getOwnPropertyNames(classDefinition.prototype)) {
+    const method = classDefinition.prototype[name];
     if (name === 'constructor' || typeof method !== 'function') continue;
     if (method.toolDef) {
       const td = method.toolDef;
@@ -254,29 +267,18 @@ function createToolClass(classDefinition) {
   return classDefinition;
 }
 
-function decorateClass(targetClass) {
-  const proto = targetClass.prototype;
-  const className = targetClass.name;
-  
-  for (const name of Object.getOwnPropertyNames(proto)) {
-    const method = proto[name];
-    if (name === 'constructor' || typeof method !== 'function') continue;
-    if (method.toolDef) continue;
-    
-    const desc = String(method).match(/^\(?[^)]*\)?\s*=>|^function\s*\([^)]*\)/);
-  }
-  
-  return targetClass;
-}
-
 function extractTools(instance) {
   const tools = [];
   const proto = Object.getPrototypeOf(instance);
-  for (const name of Object.getOwnPropertyNames(proto)) {
+  const props = new Set([...Object.getOwnPropertyNames(proto || {}), ...Object.getOwnPropertyNames(instance)]);
+  
+  for (const name of props) {
     const method = instance[name];
     if (name === 'constructor' || typeof method !== 'function') continue;
     if (method.toolDef) {
-      tools.push(method.toolDef);
+      const td = method.toolDef;
+      const boundWrapper = (args) => td.callback.call(instance, args);
+      tools.push(new ToolDef(td.name, td.description, boundWrapper, td.parameters, td.schema));
     }
   }
   return tools;
@@ -487,8 +489,12 @@ class AgentBuilder {
     return this;
   }
 
-  plugin(name, handlers = {}) {
-    this._plugins.push({ name, ...handlers });
+  plugin(nameOrObj, handlers = {}) {
+    if (typeof nameOrObj === 'object') {
+      this._plugins.push(nameOrObj);
+    } else {
+      this._plugins.push({ name: nameOrObj, ...handlers });
+    }
     return this;
   }
 
@@ -1079,16 +1085,10 @@ class BrainOS {
     return this._registry;
   }
 
-  get isStarted() {
-    return this._started;
-  }
-
-  get registry() {
-    return this._registry;
-  }
-
   registerGlobal(...tools) {
-    this._registry.add(...tools);
+    for (const t of tools) {
+      this._registry.add(t);
+    }
     return this;
   }
 
