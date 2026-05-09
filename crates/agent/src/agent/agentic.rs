@@ -246,27 +246,11 @@ impl ReactToolTrait for ExtensibleToolAdapter {
     }
 
     fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ReactToolError> {
-        let tool_name = self.inner.name().to_string();
-        let original_args = input.to_string();
-
-        self.trigger_before_hook(&tool_name, &original_args)?;
-
-        let effective_args = input.clone();
-        let effective_args_str = None;
-
-        let execution_result = self
-            .inner
-            .run(&effective_args)
-            .map_err(|e| ReactToolError::Failed(e.to_string()));
-
-        self.trigger_after_hook(
-            &tool_name,
-            &original_args,
-            effective_args_str,
-            &execution_result,
-        )?;
-
-        execution_result
+        // Note: Hook triggering is handled by AgentReActApp at the agent level
+        // to avoid duplicate hook firing
+        self.inner
+            .run(input)
+            .map_err(|e| ReactToolError::Failed(e.to_string()))
     }
 
     fn is_skill(&self) -> bool {
@@ -570,12 +554,19 @@ impl Agent {
     fn build_react_engine(&self) -> Result<ReActEngine<AgentReActApp>, AgentError> {
         let react_llm = self.llm.clone().as_dyn();
 
+        let app = AgentReActApp::new(
+            Arc::new(self.hooks.clone()),
+            Arc::new(self.plugins.clone()),
+            self.config.name.clone(),
+        );
+
         let mut builder = ReActEngineBuilder::<AgentReActApp>::new()
             .llm(react_llm)
             .resilience(self.resilience.clone())
             .llm_timeout(self.config.timeout_secs)
             .max_steps(self.config.max_steps)
-            .model(self.config.model.clone());
+            .model(self.config.model.clone())
+            .app(app);
 
         if let Some(ref registry) = self.registry {
             for (_name, tool) in registry.iter() {

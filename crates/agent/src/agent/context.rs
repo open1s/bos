@@ -388,15 +388,6 @@ impl AgentReActApp {
     }
 }
 
-impl Default for AgentReActApp {
-    fn default() -> Self {
-        Self {
-            hooks: Arc::new(HookRegistry::new()),
-            agent_name: "agent".to_string(),
-        }
-    }
-}
-
 impl ReActApp for AgentReActApp {
     type Session = AgentSession;
     type Context = AgentReactContext;

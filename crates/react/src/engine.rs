@@ -106,7 +106,7 @@ pub enum BuilderError {
     MissingLlm,
 }
 
-pub struct ReActEngine<A: ReActApp + Default> {
+pub struct ReActEngine<A: ReActApp> {
     llm: Box<dyn LlmClient<A::Session, A::Context> + Send + Sync>,
     tools: ToolRegistry,
     max_steps: usize,
@@ -119,7 +119,7 @@ pub struct ReActEngine<A: ReActApp + Default> {
     skill_cache: SkillCache,
 }
 
-pub struct ReActEngineBuilder<A: ReActApp + Default> {
+pub struct ReActEngineBuilder<A: ReActApp> {
     llm: Option<Box<dyn LlmClient<A::Session, A::Context>>>,
     tools: ToolRegistry,
     max_steps: usize,
@@ -129,10 +129,11 @@ pub struct ReActEngineBuilder<A: ReActApp + Default> {
     model: String,
     token_counter: TokenCounter,
     skill_cache: SkillCache,
+    react_app: Option<A>,
     _phantom: std::marker::PhantomData<A>,
 }
 
-impl<A: ReActApp + Default> ReActEngineBuilder<A> {
+impl<A: ReActApp> ReActEngineBuilder<A> {
     pub fn new() -> Self {
         Self {
             llm: None,
@@ -144,6 +145,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             model: String::new(),
             token_counter: TokenCounter::with_default(),
             skill_cache: SkillCache::new(Duration::from_secs(300)), // 5 min TTL
+            react_app: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -204,11 +206,12 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
         self
     }
 
-    pub fn build(self) -> Result<ReActEngine<A>, BuilderError>
-    where
-        A::Session: Default,
-        A::Context: Default,
-    {
+    pub fn app(mut self, app: A) -> Self {
+        self.react_app = Some(app);
+        self
+    }
+
+    pub fn build(self) -> Result<ReActEngine<A>, BuilderError> {
         let llm = self.llm.ok_or(BuilderError::MissingLlm)?;
         Ok(ReActEngine {
             llm,
@@ -218,7 +221,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             llm_timeout_secs: self.llm_timeout_secs,
             model: self.model,
             token_counter: self.token_counter,
-            react_app: A::default(),
+            react_app: self.react_app.unwrap_or_else(|| panic!("App must be provided via .app() method")),
             resilience: self.resilience,
             skill_cache: self.skill_cache,
         })
@@ -231,13 +234,14 @@ impl<A: ReActApp + Default> Default for ReActEngineBuilder<A> {
     }
 }
 
-impl<A: ReActApp + Default> ReActEngine<A> {
+impl<A: ReActApp> ReActEngine<A> {
     pub fn new<
         S: Send + Sync + Clone + Default + 'static,
         C: Send + Sync + Clone + Default + 'static,
     >(
         llm: Box<dyn LlmClient<S, C>>,
         max_steps: usize,
+        app: A,
     ) -> Self
     where
         A: ReActApp<Session = S, Context = C>,
@@ -250,7 +254,7 @@ impl<A: ReActApp + Default> ReActEngine<A> {
             llm_timeout_secs: 120,
             model: String::new(),
             token_counter: TokenCounter::with_default(),
-            react_app: A::default(),
+            react_app: app,
             resilience: None,
             skill_cache: SkillCache::new(Duration::from_secs(300)),
         }
@@ -680,24 +684,9 @@ impl<A: ReActApp + Default> ReActEngine<A> {
                             saw_tool_call = true;
                             yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
 
-                            match self.react_app
-                                .before_tool_call(&name, &mut args, session, context)
-                                .await
-                            {
-                                HookDecision::Continue => {}
-                                HookDecision::Abort => {
-                                    yield Err(ReactError::HookAbort("before_tool_call aborted".to_string()));
-                                    break;
-                                }
-                                HookDecision::Error(msg) => {
-                                    yield Err(ReactError::HookAbort(msg));
-                                    break;
-                                }
-                            }
-
                             let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
 
-                            let mut result = if name == "load_skill" {
+                            let result = if name == "load_skill" {
                                 let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                 if let Some(cached) = loaded_skills.get(skill_name) {
                                     Ok(serde_json::json!({
@@ -711,10 +700,6 @@ impl<A: ReActApp + Default> ReActEngine<A> {
                             } else {
                                 self.call_tool(&name, &mut args).await
                             };
-
-                            self.react_app
-                                .after_tool_result(&name, &mut result, session, context)
-                                .await;
 
                             let result_text = match result {
                                 Ok(ret) => {
