@@ -2,12 +2,40 @@
  * Type declarations for brainos.js high-level API
  */
 
+export interface BusOptions {
+  mode?: string;
+  connect?: string[];
+  listen?: string[];
+  peer?: string;
+}
+
+export interface BrainOSOptions {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  systemPrompt?: string;
+  temperature?: number;
+  timeoutSecs?: number;
+  maxTokens?: number;
+  busMode?: string;
+  busConnect?: string[];
+  busListen?: string[];
+  busPeer?: string;
+}
+
 export class BrainOS {
-  constructor(options?: { apiKey?: string; baseUrl?: string; model?: string });
+  constructor(options?: BrainOSOptions);
   start(): Promise<this>;
   stop(): Promise<void>;
-  agent(name?: string, options?: object): Agent;
-  get bus(): unknown;
+  isStarted: boolean;
+  agent(name?: string, options?: BrainOSOptions): AgentBuilder;
+  bus: BusManager;
+  config: Config;
+  registry: ToolRegistry;
+  registerGlobal(...tools: any[]): this;
+  tools(...tools: any[]): this;
+  createBus(options?: BusOptions): Promise<BusManager>;
+  static create(options?: BrainOSOptions): Promise<BrainOS>;
 }
 
 export class Agent {

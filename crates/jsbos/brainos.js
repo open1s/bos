@@ -1107,6 +1107,15 @@ class Config {
   }
 }
 
+function normalizeEndpoints(endpoints) {
+  if (!endpoints) return endpoints;
+  if (!Array.isArray(endpoints)) return endpoints;
+  return endpoints.map(ep => {
+    if (typeof ep !== 'string') return ep;
+    return ep.replace(/^(\w+):\/\//, '$1/');
+  });
+}
+
 class BrainOS {
   constructor(options = {}) {
     this._options = options;
@@ -1125,7 +1134,13 @@ class BrainOS {
     this._model = this._options.model || gm.model || DEFAULT_MODEL;
     this._config = config;
 
-    this._bus = await BusManager.create({ mode: 'peer' });
+    const busOptions = {
+      mode: this._options.busMode || this._options.mode || 'peer',
+      connect: normalizeEndpoints(this._options.busConnect || this._options.connect),
+      listen: normalizeEndpoints(this._options.busListen || this._options.listen),
+      peer: this._options.busPeer || this._options.peer,
+    };
+    this._bus = await BusManager.create(busOptions);
     this._started = true;
     return this;
   }
@@ -1183,6 +1198,12 @@ class BrainOS {
 
   async createBus(options = {}) {
     return BusManager.create(options);
+  }
+
+  static async create(options = {}) {
+    const instance = new BrainOS(options);
+    await instance.start();
+    return instance;
   }
 }
 

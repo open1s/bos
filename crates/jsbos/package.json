@@ -1,6 +1,6 @@
 {
   "name": "@open1s/jsbos",
-  "version": "2.0.6",
+  "version": "2.1.0",
   "description": "BrainOS JavaScript bindings - AI agent framework with ReAct engine",
   "main": "./brainos.js",
   "module": "./index.mjs",
@@ -10,6 +10,11 @@
       "import": "./index.mjs",
       "require": "./brainos.js",
       "types": "./index.d.ts"
+    },
+    "./brainos.js": {
+      "import": "./brainos.js",
+      "require": "./brainos.js",
+      "types": "./brainos.d.ts"
     }
   },
   "repository": {
@@ -33,6 +38,7 @@
     "index.js",
     "index.mjs",
     "brainos.js",
+    "brainos.d.ts",
     "*.node"
   ],
   "napi": {

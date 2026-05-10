@@ -37,16 +37,4 @@ export const {
 } = index;
 
 // Re-export high-level API from brainos.js
-export const {
-  BrainOS,
-  tool,
-  ToolDef,
-  BusManager,
-  PublisherWrapper,
-  SubscriberWrapper,
-  QueryClient,
-  QueryableServer,
-  CallerClient,
-  CallableServer,
-  HookContextData,
-} = brainos;
+export * from './brainos.js';
