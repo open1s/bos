@@ -51,9 +51,10 @@ async def main():
 
         global_model = config.get("global_model", {})
         model = global_model.get("model")
-        agent = (
+        agent = await (
             brain.agent("assistant", system_prompt="You are a helpful assistant. Use tools when available.")
-            .register_many(calculator, weather, current_time)
+            .with_tools(calculator, weather, current_time)
+            .start()
         )
 
         print(f"Registered tools: {agent.tools}\n")

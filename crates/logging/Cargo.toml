@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+description = "Tracing and observability for BrainOS"
+documentation = "https://github.com/open1s/bos#readme"
+homepage = "https://github.com/open1s/bos"
+repository = "https://github.com/open1s/bos"
 
 [dependencies]
 ctor = "0.6.3"

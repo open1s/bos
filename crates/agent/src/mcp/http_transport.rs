@@ -1,5 +1,3 @@
-use ureq;
-
 pub struct HttpTransport {
     base_url: String,
     session_id: std::sync::Mutex<Option<String>>,
@@ -35,57 +33,63 @@ impl HttpTransport {
 
     pub async fn send(&self, msg: &serde_json::Value) -> Result<String, HttpTransportError> {
         let base_url = self.base_url.clone();
-        let body = serde_json::to_string(msg).map_err(|e| HttpTransportError::Http(e.to_string()))?;
+        let body =
+            serde_json::to_string(msg).map_err(|e| HttpTransportError::Http(e.to_string()))?;
         let session_id = self.session_id.lock().unwrap().clone();
 
         let response = tokio::task::spawn_blocking(move || {
             let mut req = ureq::post(&base_url)
-                .set("Content-Type", "application/json")
-                .set("Accept", "application/json, text/event-stream");
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream");
 
             if let Some(ref sid) = session_id {
-                req = req.set("Mcp-Session-Id", sid);
+                req = req.header("Mcp-Session-Id", sid);
             }
 
-            req.send_string(&body)
+            req.send(body.as_bytes()).map_err(|e| format!("Request error: {e}"))
         })
         .await
-        .map_err(|e| HttpTransportError::Http(format!("Join error: {e}")))?
-        .map_err(|e| HttpTransportError::Http(format!("Request error: {e}")))?;
+        .map_err(|e| HttpTransportError::Http(format!("Join error: {e}")))?;
 
-        let status = response.status();
-        let session_id_header = response.header("Mcp-Session-Id");
+        let response = response.map_err(|e| HttpTransportError::Http(e))?;
+
+        let status = response.status().as_u16();
+        let session_id_header = response
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok());
         if let Some(sid) = session_id_header {
             *self.session_id.lock().unwrap() = Some(sid.to_string());
         }
 
         let content_type = response
-            .header("Content-Type")
-            .unwrap_or("")
-            .to_string();
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
 
         if content_type.contains("text/event-stream") {
-            let text = response
-                .into_string()
+            let text = response.into_body().read_to_string()
                 .map_err(|e| HttpTransportError::Http(format!("Read error: {e}")))?;
             return self.parse_sse_response(&text);
         }
 
         if !(200..=299).contains(&status) && status != 202 {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|_| format!("HTTP {}", status));
-            if body.is_empty() {
-                return Err(HttpTransportError::Http(format!("HTTP {} (empty body)", status)));
+            let body_text = response.into_body().read_to_string()
+                .unwrap_or_else(|_| String::new());
+            if body_text.is_empty() {
+                return Err(HttpTransportError::Http(format!(
+                    "HTTP {} (empty body)",
+                    status
+                )));
             }
-            return Err(HttpTransportError::Http(body));
+            return Err(HttpTransportError::Http(body_text));
         }
 
-        let body = response
-            .into_string()
+        let body_str = response.into_body().read_to_string()
             .map_err(|e| HttpTransportError::Http(format!("Read body error: {e}")))?;
 
-        Ok(body)
+        Ok(body_str)
     }
 
     pub fn set_session_id(&self, id: String) {
@@ -104,7 +108,7 @@ impl HttpTransport {
         if let Some(id) = session_id {
             tokio::task::spawn_blocking(move || {
                 ureq::delete(&base_url)
-                    .set("Mcp-Session-Id", &id)
+                    .header("Mcp-Session-Id", &id)
                     .call()
                     .ok();
             })

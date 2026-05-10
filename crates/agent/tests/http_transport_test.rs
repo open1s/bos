@@ -55,13 +55,13 @@ async fn test_http_mcp_with_ureq() {
     
     let body_str = serde_json::to_string(&body).unwrap();
     match ureq::post(base_url)
-        .set("Content-Type", "application/json")
-        .send_string(&body_str)
+        .header("Content-Type", "application/json")
+        .send(body_str.as_bytes())
     {
         Ok(resp) => {
-            let status = resp.status();
+            let status = resp.status().as_u16();
             println!("Status: {}", status);
-            let body = resp.into_string().unwrap_or_default();
+            let body = resp.into_body().read_to_string().unwrap_or_default();
             println!("Body: {:?}", body);
             assert_eq!(status, 200, "ureq initialize should return 200");
         }
@@ -80,11 +80,11 @@ async fn test_http_mcp_with_ureq() {
     });
     let body_str2 = serde_json::to_string(&body).unwrap();
     let resp = ureq::post(base_url)
-        .set("Content-Type", "application/json")
-        .send_string(&body_str2)
+        .header("Content-Type", "application/json")
+        .send(body_str2.as_bytes())
         .unwrap();
-    println!("Status: {}", resp.status());
-    assert_eq!(resp.status(), 200, "ureq tools/list should return 200");
+    println!("Status: {}", resp.status().as_u16());
+    assert_eq!(resp.status().as_u16(), 200, "ureq tools/list should return 200");
 
     // Test 3: tools/call
     println!("\n3. Testing tools/call with ureq...");
@@ -99,13 +99,13 @@ async fn test_http_mcp_with_ureq() {
     });
     let body_str3 = serde_json::to_string(&body).unwrap();
     let resp = ureq::post(base_url)
-        .set("Content-Type", "application/json")
-        .send_string(&body_str3)
+        .header("Content-Type", "application/json")
+        .send(body_str3.as_bytes())
         .unwrap();
-    println!("Status: {}", resp.status());
-    assert_eq!(resp.status(), 200, "ureq tools/call should return 200");
-    
-    let body = resp.into_string().unwrap();
+    println!("Status: {}", resp.status().as_u16());
+    assert_eq!(resp.status().as_u16(), 200, "ureq tools/call should return 200");
+
+    let body = resp.into_body().read_to_string().unwrap();
     let resp_json: serde_json::Value = serde_json::from_str(&body).unwrap();
     let content = resp_json["result"]["content"][0]["text"].as_str().unwrap();
     assert!(content.contains("BrainOS"), "Response should contain 'BrainOS'");

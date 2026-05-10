@@ -32,10 +32,10 @@ async def main():
         global_model = config.get("global_model", {})
         model = global_model.get("model")
 
-        agent = (
-            brain.agent("math-bot",model=model, system_prompt="You are a math assistant. Use tools to compute answers.")
-            .register(add)
-            .register(multiply)
+        agent = await (
+            brain.agent("math-bot", model=model, system_prompt="You are a math assistant. Use tools to compute answers.")
+            .with_tools(add, multiply)
+            .start()
         )
 
         print("Tools:", agent.tools)

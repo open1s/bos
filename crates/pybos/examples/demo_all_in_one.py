@@ -105,9 +105,10 @@ async def demo_basic_agent(brain):
     print("DEMO 1: Basic Agent with Tools")
     print("=" * 60)
 
-    agent = (
+    agent = await (
         brain.agent("assistant", system_prompt="You are a helpful math assistant.")
         .with_tools(add, multiply, calculator)
+        .start()
     )
 
     print("\n--- Test: Simple calculation ---")
@@ -126,9 +127,10 @@ async def demo_react_agent(brain):
     print("DEMO 2: ReAct Agent with Tool Use")
     print("=" * 60)
 
-    agent = (
+    agent = await (
         brain.agent("assistant", system_prompt="You are a math expert. Use tools when needed.")
         .with_tools(add, multiply, calculator)
+        .start()
     )
 
     print("\n--- Test: Calculator tool ---")
@@ -142,9 +144,10 @@ async def demo_streaming(brain):
     print("DEMO 3: Streaming Response")
     print("=" * 60)
 
-    agent = (
+    agent = await (
         brain.agent("assistant", system_prompt="You are a creative writer.")
         .with_tools(current_time, get_weather)
+        .start()
     )
 
     print("\n--- Test: Stream response ---")
@@ -185,10 +188,11 @@ async def demo_hooks(brain):
         "OnComplete": on_complete_hook,
     }
 
-    agent = (
+    agent = await (
         brain.agent("assistant", system_prompt="You are a helpful assistant.")
         .with_tools(add)
         .with_hooks(hooks)
+        .start()
     )
 
     print("\n--- Hooks will fire during execution ---")
@@ -203,10 +207,11 @@ async def demo_plugins(brain):
 
     plugin = make_logging_plugin()
 
-    agent = (
+    agent = await (
         brain.agent("assistant", system_prompt="You are a helpful assistant. Use tools when needed.")
         .with_tools(add, multiply, calculator)
         .with_plugins(plugin)
+        .start()
     )
 
     print("\n--- Plugin intercepting LLM, tool calls and tool results ---")
@@ -223,7 +228,7 @@ async def demo_fluent_chain(brain):
     print("DEMO 6: Fluent Builder Chain")
     print("=" * 60)
 
-    agent = (
+    agent = await (
         brain.agent("assistant")
         .with_model("nvidia/meta/llama-3.1-8b-instruct")
         .with_prompt("You are a terse assistant. Give short answers.")
@@ -231,6 +236,7 @@ async def demo_fluent_chain(brain):
         .with_max_tokens(100)
         .with_tools(add, multiply, current_time, get_weather)
         .with_hooks({"BeforeToolCall": before_tool_hook})
+        .start()
     )
 
     print("\n--- All config via fluent chain ---")

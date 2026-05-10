@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+description = "AI agent framework with LLM integration, tools, skills, and MCP"
+documentation = "https://github.com/open1s/bos#readme"
+homepage = "https://github.com/open1s/bos"
+repository = "https://github.com/open1s/bos"
 
 [dependencies]
 bus = { path = "../bus" }
@@ -12,7 +16,7 @@ logging = { path = "../logging" }
 log = "0.4.29"
 tokio = { workspace = true, features = ["full"] }
 reqwest = { workspace = true }
-ureq = "2"
+ureq = "3.3"
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,7 +37,7 @@ ctor = "1.0.1"
 dirs = "6.0.0"
 
 [dev-dependencies]
-ureq = "2"
+ureq = "3.3"
 
 [features]
 internal-api = []

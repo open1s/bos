@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Derive helpers for the BOS serde crate"
+documentation = "https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md"
+homepage = "https://github.com/open1s/bos"
+repository = "https://github.com/open1s/bos"
 
 [lib]
 proc-macro = true

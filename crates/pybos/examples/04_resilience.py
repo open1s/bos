@@ -42,7 +42,7 @@ async def main():
     print("DEMO 1: Fluent API with .with_resilience()")
     print("=" * 60)
     async with BrainOS() as brain:
-        agent = (
+        agent = await (
             brain.agent("demo1", model=model, system_prompt="You are a math assistant.")
             .with_resilience(
                 rate_limit_capacity=10,
@@ -51,12 +51,12 @@ async def main():
                 circuit_breaker_max_failures=3,
                 circuit_breaker_cooldown_secs=60,
             )
-            .register(add)
+            .with_tools(add)
+            .start()
         )
         print("Agent configured via fluent API with resilience:")
-        print(f"  rate_limit_capacity={agent._config.rate_limit_capacity}")
-        print(f"  rate_limit_window_secs={agent._config.rate_limit_window_secs}")
-        print(f"  circuit_breaker_max_failures={agent._config.circuit_breaker_max_failures}")
+        print(f"  rate_limit_capacity={agent.config.get('rate_limit_capacity')}")
+        print(f"  circuit_breaker_max_failures={agent.config.get('circuit_breaker_max_failures')}")
         try:
             result = await agent.ask("What is 10 + 20?")
             print(f"  Result: {result}")
@@ -67,25 +67,25 @@ async def main():
     print("=" * 60)
     print("DEMO 2: Constructor kwargs")
     print("=" * 60)
-    from brainos import Agent
-    agent2 = Agent(
-        name="demo2",
-        model=model,
-        rate_limit_capacity=5,
-        rate_limit_window_secs=15,
-        circuit_breaker_max_failures=2,
-        circuit_breaker_cooldown_secs=10,
-    )
-    print("Agent2 created via constructor:")
-    print(f"  rate_limit_capacity={agent2._config.rate_limit_capacity}")
-    print(f"  circuit_breaker_max_failures={agent2._config.circuit_breaker_max_failures}")
+    async with BrainOS() as brain:
+        agent2 = await brain.agent(
+            "demo2",
+            model=model,
+            rate_limit_capacity=5,
+            rate_limit_window_secs=15,
+            circuit_breaker_max_failures=2,
+            circuit_breaker_cooldown_secs=10,
+        ).start()
+        print("Agent2 created via constructor:")
+        print(f"  rate_limit_capacity={agent2.config.get('rate_limit_capacity')}")
+        print(f"  circuit_breaker_max_failures={agent2.config.get('circuit_breaker_max_failures')}")
 
     print()
     print("=" * 60)
     print("DEMO 3: BrainOS.agent() with resilience params")
     print("=" * 60)
     async with BrainOS() as brain:
-        agent3 = brain.agent(
+        builder = brain.agent(
             "demo3",
             model=model,
             rate_limit_capacity=20,
@@ -93,8 +93,8 @@ async def main():
             circuit_breaker_max_failures=5,
         )
         print("Agent3 via BrainOS.agent():")
-        print(f"  rate_limit_capacity={agent3._config.rate_limit_capacity}")
-        print(f"  circuit_breaker_max_failures={agent3._config.circuit_breaker_max_failures}")
+        print(f"  rate_limit_capacity={builder._config.rate_limit_capacity}")
+        print(f"  circuit_breaker_max_failures={builder._config.circuit_breaker_max_failures}")
 
     print()
     print("All config demos passed - resilience flows correctly from Python to Rust")

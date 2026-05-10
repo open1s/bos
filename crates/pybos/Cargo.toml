@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Python bindings for BrainOS (agent/config/bus)"
+documentation = "https://github.com/open1s/bos/blob/main/docs/python-user-guide.md"
+homepage = "https://github.com/open1s/bos"
+repository = "https://github.com/open1s/bos"
 
 [lib]
 name = "pybos"

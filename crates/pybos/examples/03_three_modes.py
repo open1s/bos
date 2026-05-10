@@ -34,9 +34,10 @@ async def main():
         global_model = config.get("global_model", {})
         model = global_model.get("model")
 
-        agent = (
+        agent = await (
             brain.agent("multi-mode", system_prompt="You are a helpful assistant.")
-            .register_many(current_time, weather)
+            .with_tools(current_time, weather)
+            .start()
         )
 
         # ── Mode 1: react() — Direct conversation, no tools ──

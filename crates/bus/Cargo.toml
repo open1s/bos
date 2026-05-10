@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "BrainOS Zenoh communication wrapper"
+documentation = "https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md"
+homepage = "https://github.com/open1s/bos"
+repository = "https://github.com/open1s/bos"
 
 [features]
 python-extension = ["pyo3", "pyo3-async-runtimes"]
