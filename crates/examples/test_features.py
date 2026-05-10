@@ -4,7 +4,7 @@ Test MCP client and query handlers.
 """
 
 import asyncio
-from pybos import (
+from pybrainos import (
     Bus, BusConfig,
     Query, Queryable,
     Caller, Callable,

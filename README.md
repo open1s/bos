@@ -159,8 +159,8 @@ cargo test --all
 cargo clippy --all
 cargo fmt --all
 
-# Python bindings (low-level pybos)
-cd crates/pybos && maturin develop
+# Python bindings (low-level pybrainos)
+cd crates/pybrainos && maturin develop
 
 # Node.js bindings (low-level jsbos)
 cd crates/jsbos && npm install && npm run build
@@ -197,7 +197,7 @@ For direct access to Rust bindings:
 
 | Language | Package | Import |
 |----------|---------|--------|
-| Python | `pybos` | `from pybos import Agent, Bus, McpClient, ...` |
+| Python | `pybrainos` | `from pybrainos import Agent, Bus, McpClient, ...` |
 | JavaScript | `@open1s/jsbos` | `const { Agent, Bus, McpClient } = require('@open1s/jsbos')` |
 
 ---
@@ -209,7 +209,7 @@ Connect to MCP servers via stdio or HTTP transport:
 ### Python
 
 ```python
-from pybos import McpClient
+from pybrainos import McpClient
 
 # Process-based server
 client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
@@ -281,7 +281,7 @@ Or use environment variables: `OPENAI_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`
 
 See the examples directories:
 
-- Python: `crates/pybos/examples/`
+- Python: `crates/pybrainos/examples/`
 - JavaScript: `crates/jsbos/examples/`
 - Rust: `crates/examples/` (includes `agent_skill_demo.rs`)
 

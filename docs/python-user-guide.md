@@ -26,7 +26,7 @@ pip install brainos
 Or install from source:
 
 ```bash
-cd crates/pybos
+cd crates/pybrainos
 pip install -e .
 ```
 
@@ -548,7 +548,7 @@ asyncio.run(main())
 
 ## API Reference
 
-For the complete API reference, see [Python API Reference](./api-reference/pybos-api.md).
+For the complete API reference, see [Python API Reference](./api-reference/pybrainos-api.md).
 
 ### `BrainOS`
 
@@ -648,9 +648,10 @@ async with BrainOS(api_key="sk-...") as brain:
     result = await agent.ask("What is 42 + 58?")
 ```
 
-**Method 4: Using pybos directly with AgentConfig**
+**Method 4: Using pybrainos directly with AgentConfig**
+
 ```python
-from pybos import Agent, AgentConfig
+from pybrainos import Agent, AgentConfig
 
 cfg = AgentConfig(
     name="assistant",

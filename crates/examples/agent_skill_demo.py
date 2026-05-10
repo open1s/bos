@@ -28,7 +28,7 @@ import tempfile
 import shutil
 from pathlib import Path
 
-from pybos import Agent as PyAgent, AgentConfig as PyAgentConfig, Bus as PyBus, BusConfig as PyBusConfig, ConfigLoader,init_tracing
+from pybrainos import Agent as PyAgent, AgentConfig as PyAgentConfig, Bus as PyBus, BusConfig as PyBusConfig, ConfigLoader,init_tracing
 
 # from brainos import Agent
 
@@ -215,7 +215,7 @@ async def demo_skills_with_tools():
     agent = await PyAgent.create(config, bus)
     print("  🤖 Agent created")
 
-    from pybos import PythonTool
+    from pybrainos import PythonTool
 
     def calc_callback(args):
         a, b, op = args.get("a", 0), args.get("b", 0), args.get("op", "add")

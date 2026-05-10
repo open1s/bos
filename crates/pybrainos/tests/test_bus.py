@@ -1,7 +1,7 @@
 """Tests for Bus and BusConfig binding"""
 import pytest
 import asyncio
-from pybos import Bus, BusConfig
+from pybrainos import Bus, BusConfig
 
 
 class TestBusConfig:

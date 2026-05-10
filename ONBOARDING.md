@@ -114,7 +114,7 @@ bos/
 | `crates/react/` | ReAct loop: reasoning, action dispatch, memory, resilience |
 | `crates/config/` | Config file loading, env var overrides, schema validation |
 | `crates/logging/` | Tracing spans, structured logs, metrics exporters |
-| `crates/pybos/` | Python bindings (maturin) exposing Rust API to Python |
+| `crates/pybrainos/` | Python bindings (maturin) exposing Rust API to Python |
 | `crates/pybos/brainos/` | High-level Python wrapper with @tool decorator |
 | `crates/jsbos/` | Node.js bindings (NAPI-RS) exposing Rust API to JS |
 | `crates/jsbos/brainos.js` | High-level JavaScript wrapper with @tool decorator |
@@ -125,7 +125,7 @@ All cross-crate communication flows through `bus`.
 
 ```
 agent ──► bus, config, logging, react
-pybos ──► agent, bus, config
+pybrainos ──► agent, bus, config
 jsbos ──► agent, bus, config
 react ──► agent, bus, config, logging
 ```
@@ -246,8 +246,8 @@ cargo test --all
 cargo clippy --all
 cargo fmt --all
 
-# Python bindings (from pybos directory)
-cd crates/pybos && maturin develop
+# Python bindings (from pybrainos directory)
+cd crates/pybrainos && maturin develop
 
 # Node.js bindings (from jsbos directory)
 cd crates/jsbos && npm install && npm run build

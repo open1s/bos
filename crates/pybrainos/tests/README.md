@@ -1,6 +1,6 @@
-# PyBOS Test Suite
+# PyBrainOS Test Suite
 
-Comprehensive Python tests for the BOS Python bindings (pybos).
+Comprehensive Python tests for the BOS Python bindings (pybrainos).
 
 ## Setup
 
@@ -12,9 +12,9 @@ Comprehensive Python tests for the BOS Python bindings (pybos).
 
 ### Installation
 
-1. **Build the pybos extension**:
+1. **Build the pybrainos extension**:
    ```bash
-   maturin develop -m crates/pybos/Cargo.toml
+   maturin develop -m crates/pybrainos/Cargo.toml
    ```
 
 2. **Install test dependencies**:
@@ -26,33 +26,33 @@ Comprehensive Python tests for the BOS Python bindings (pybos).
 
 ### Run all tests:
 ```bash
-pytest crates/pybos/tests/ -v
+pytest crates/pybrainos/tests/ -v
 ```
 
 ### Run specific test file:
 ```bash
-pytest crates/pybos/tests/test_config_loader.py -v
-pytest crates/pybos/tests/test_bus.py -v
-pytest crates/pybos/tests/test_publisher_subscriber.py -v
-pytest crates/pybos/tests/test_query_queryable.py -v
-pytest crates/pybos/tests/test_caller_callable.py -v
-pytest crates/pybos/tests/test_agent.py -v
-pytest crates/pybos/tests/test_integration.py -v
+pytest crates/pybrainos/tests/test_config_loader.py -v
+pytest crates/pybrainos/tests/test_bus.py -v
+pytest crates/pybrainos/tests/test_publisher_subscriber.py -v
+pytest crates/pybrainos/tests/test_query_queryable.py -v
+pytest crates/pybrainos/tests/test_caller_callable.py -v
+pytest crates/pybrainos/tests/test_agent.py -v
+pytest crates/pybrainos/tests/test_integration.py -v
 ```
 
 ### Run specific test:
 ```bash
-pytest crates/pybos/tests/test_config_loader.py::TestConfigLoader::test_config_loader_creation -v
+pytest crates/pybrainos/tests/test_config_loader.py::TestConfigLoader::test_config_loader_creation -v
 ```
 
 ### Run with output:
 ```bash
-pytest crates/pybos/tests/ -v -s
+pytest crates/pybrainos/tests/ -v -s
 ```
 
 ### Run with coverage:
 ```bash
-pytest crates/pybos/tests/ --cov=pybos --cov-report=html
+pytest crates/pybrainos/tests/ --cov=pybrainos --cov-report=html
 ```
 
 ## Test Organization
@@ -147,10 +147,10 @@ with pytest.raises(Exception):
 
 ## Troubleshooting
 
-### "pybos module not found"
+### "pybrainos module not found"
 Make sure to build the extension first:
 ```bash
-maturin develop -m crates/pybos/Cargo.toml
+maturin develop -m crates/pybrainos/Cargo.toml
 ```
 
 ### Tests timeout
@@ -207,6 +207,6 @@ async def test_new_feature():
 ## See Also
 
 - [README.md](../README.md) - API documentation
-- [crates/pybos/Cargo.toml](../Cargo.toml) - Dependencies
+- [crates/pybrainos/Cargo.toml](../Cargo.toml) - Dependencies
 - [pytest documentation](https://docs.pytest.org/)
 - [pytest-asyncio](https://github.com/pytest-dev/pytest-asyncio)

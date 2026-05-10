@@ -159,8 +159,8 @@ cargo test --all
 cargo clippy --all
 cargo fmt --all
 
-# Python 绑定（底层 pybos）
-cd crates/pybos && maturin develop
+# Python 绑定（底层 pybrainos）
+cd crates/pybrainos && maturin develop
 
 # Node.js 绑定（底层 jsbos）
 cd crates/jsbos && npm install && npm run build
@@ -197,7 +197,7 @@ cd crates/jsbos && npm install && npm run build
 
 | 语言 | 包 | 导入 |
 |------|-----|------|
-| Python | `pybos` | `from pybos import Agent, Bus, McpClient, ...` |
+| Python | `pybrainos` | `from pybrainos import Agent, Bus, McpClient, ...` |
 | JavaScript | `@open1s/jsbos` | `const { Agent, Bus, McpClient } = require('@open1s/jsbos')` |
 
 ---
@@ -209,7 +209,7 @@ cd crates/jsbos && npm install && npm run build
 ### Python
 
 ```python
-from pybos import McpClient
+from pybrainos import McpClient
 
 # 基于进程的服务器
 client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
@@ -281,7 +281,7 @@ listen = ["127.0.0.1:7890"]
 
 查看示例目录：
 
-- Python: `crates/pybos/examples/`
+- Python: `crates/pybrainos/examples/`
 - JavaScript: `crates/jsbos/examples/`
 - Rust: `crates/examples/` (包含 `agent_skill_demo.rs`)
 

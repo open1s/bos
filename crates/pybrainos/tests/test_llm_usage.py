@@ -1,6 +1,6 @@
 """Tests for LlmUsage binding"""
 import pytest
-from pybos import LlmUsage, PromptTokensDetails
+from pybrainos import LlmUsage, PromptTokensDetails
 
 
 class TestLlmUsage:

@@ -1,7 +1,7 @@
 """Tests for Queryable stream_handler (server-side streaming)"""
 import pytest
 import asyncio
-from pybos import Bus, BusConfig, Query, Queryable, StreamSender
+from pybrainos import Bus, BusConfig, Query, Queryable, StreamSender
 
 
 class TestQueryableStream:

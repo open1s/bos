@@ -1,7 +1,7 @@
 """Tests for Caller and Callable binding"""
 import pytest
 import asyncio
-from pybos import Bus, BusConfig, Caller, Callable
+from pybrainos import Bus, BusConfig, Caller, Callable
 
 
 class TestCallable:

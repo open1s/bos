@@ -19,7 +19,7 @@ Usage:
 import asyncio
 import json
 
-from pybos import McpClient
+from pybrainos import McpClient
 
 
 async def demo_mcp_hello_world():

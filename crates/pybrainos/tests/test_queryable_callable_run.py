@@ -5,13 +5,13 @@ import asyncio
 import json
 from pyee import Handler
 import pytest
-from pybos import Bus, BusConfig
+from pybrainos import Bus, BusConfig
 
 
 @pytest.mark.asyncio
 async def test_callable_run_text_handler():
     """Test Callable.run() with text handler"""
-    from pybos import Callable, Caller
+    from pybrainos import Callable, Caller
     
     bus = await Bus.create(BusConfig())
     
@@ -58,7 +58,7 @@ async def test_callable_run_text_handler():
 @pytest.mark.asyncio
 async def test_callable_run_json_handler():
     """Test Callable.run_json() with JSON dict handler"""
-    from pybos import Callable, Caller
+    from pybrainos import Callable, Caller
 
     bus = await Bus.create(BusConfig())
 
@@ -105,7 +105,7 @@ async def test_callable_run_json_handler():
 @pytest.mark.asyncio
 async def test_callable_run_text_handler():
     """Test Callable.run() with text handler"""
-    from pybos import Callable, Caller
+    from pybrainos import Callable, Caller
     
     bus = await Bus.create(BusConfig())
     
@@ -148,7 +148,7 @@ async def test_callable_run_text_handler():
 @pytest.mark.asyncio
 async def test_callable_run_json_handler():
     """Test Callable.run_json() with JSON dict handler"""
-    from pybos import Callable, Caller
+    from pybrainos import Callable, Caller
     
     bus = await Bus.create(BusConfig())
     
@@ -189,7 +189,7 @@ async def test_callable_run_json_handler():
 @pytest.mark.asyncio
 async def test_callable_sync_handler():
     """Test that sync handlers also work with Callable.run()"""
-    from pybos import Callable, Caller
+    from pybrainos import Callable, Caller
 
     bus = await Bus.create(BusConfig())
 
@@ -225,7 +225,7 @@ async def test_callable_sync_handler():
 
     print("✅ Callable.run() sync handler test passed")
     """Test that sync handlers also work with Callable.run()"""
-    from pybos import Callable, Caller
+    from pybrainos import Callable, Caller
     
     bus = await Bus.create(BusConfig())
     
@@ -260,7 +260,7 @@ async def test_callable_sync_handler():
 @pytest.mark.asyncio
 async def test_multiple_callables():
     """Test multiple callables running simultaneously"""
-    from pybos import Callable, Caller
+    from pybrainos import Callable, Caller
 
     bus = await Bus.create(BusConfig())
 

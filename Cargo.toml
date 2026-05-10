@@ -5,7 +5,7 @@ members = [
     "crates/agent",
     "crates/logging",
     "crates/react",
-    "crates/pybos",
+    "crates/pybrainos",
     "crates/jsbos",
     "crates/qserde",
     "crates/qserde_derive"
