@@ -303,4 +303,4 @@ MIT OR Apache-2.0
 
 ---
 
-**Version**: 2.0.5 | **Last Updated**: 2026-05-08
+**Version**: 2.0.6 | **Last Updated**: 2026-05-10
