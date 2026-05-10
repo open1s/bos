@@ -20,8 +20,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from pybos import Query as PyQuery
-from pybos import Queryable as PyQueryable
+from pybrainos import Query as PyQuery
+from pybrainos import Queryable as PyQueryable
 
 
 class Query:

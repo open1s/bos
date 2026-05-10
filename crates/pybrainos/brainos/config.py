@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pybos import ConfigLoader as PyConfigLoader
+from pybrainos import ConfigLoader as PyConfigLoader
 
 
 class Config:

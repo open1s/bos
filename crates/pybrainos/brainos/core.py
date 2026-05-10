@@ -13,14 +13,14 @@ from contextlib import AbstractAsyncContextManager
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(name)s: %(message)s')
 _LOG = logging.getLogger("brainos.core")
 
-from pybos import Agent as PyAgent
-from pybos import AgentConfig as PyAgentConfig
-from pybos import AgentPlugin as PyAgentPlugin
-from pybos import Bus as PyBus
-from pybos import BusConfig as PyBusConfig
-from pybos import ConfigLoader as PyConfigLoader
-from pybos import PythonTool
-from pybos import HookEvent, HookDecision, HookContext
+from pybrainos import Agent as PyAgent
+from pybrainos import AgentConfig as PyAgentConfig
+from pybrainos import AgentPlugin as PyAgentPlugin
+from pybrainos import Bus as PyBus
+from pybrainos import BusConfig as PyBusConfig
+from pybrainos import ConfigLoader as PyConfigLoader
+from pybrainos import PythonTool
+from pybrainos import HookEvent, HookDecision, HookContext
 
 from brainos.tool import ToolDef
 

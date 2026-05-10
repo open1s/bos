@@ -1305,3 +1305,7 @@ python examples/01_quickstart.py
 
 - [@open1s/jsbos](./jsbos/) — JavaScript/Node.js bindings
 - [BrainOS](https://github.com/open1s/bos) — Core Rust framework
+
+## Miscs
+- export MATURIN_PYPI_TOKEN=pypi-xxx
+- maturin publish

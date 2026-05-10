@@ -29,7 +29,7 @@ from brainos.bus import BusManager, Publisher, Subscriber
 from brainos.query import Query, Queryable
 from brainos.caller import Caller, Callable
 from brainos.config import Config
-from pybos import (
+from pybrainos import (
     AgentConfig,
     AgentPlugin,
     PluginRegistry,
