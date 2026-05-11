@@ -36,7 +36,7 @@ Options:
 #### Example
 
 ```javascript
-const { BrainOS } = require('brainos');
+import { BrainOS } from 'brainos';
 
 const brain = new BrainOS({
   apiKey: 'sk-...',
@@ -143,7 +143,7 @@ const agent = await Agent.create({
 #### Example
 
 ```javascript
-const { BrainOS, ToolDef } = require('brainos');
+import { BrainOS, ToolDef } from 'brainos';
 
 const brain = new BrainOS();
 await brain.start();
@@ -177,7 +177,7 @@ Decorator factory for creating tools from class methods.
 ### Usage
 
 ```javascript
-const { tool } = require('brainos');
+import { tool } from 'brainos';
 
 class MyTools {
   @tool('Add two numbers')
@@ -233,7 +233,7 @@ All properties are accessible directly:
 #### Example
 
 ```javascript
-const { ToolDef } = require('brainos');
+import { ToolDef } from 'brainos';
 
 const weatherTool = new ToolDef(
   'get_weather',
@@ -303,7 +303,7 @@ Options:
 #### Example
 
 ```javascript
-const { BusManager } = require('brainos');
+import { BusManager } from 'brainos';
 
 const bus = await BusManager.create();
 await bus.start();
@@ -363,7 +363,7 @@ Message subscriber with receive methods.
 #### Example
 
 ```javascript
-const { BusManager } = require('brainos');
+import { BusManager } from 'brainos';
 
 const bus = await BusManager.create();
 await bus.start();
@@ -400,7 +400,7 @@ Request-response pattern implementation.
 #### Example
 
 ```javascript
-const { BusManager } = require('brainos');
+import { BusManager } from 'brainos';
 
 const bus = await BusManager.create();
 await bus.start();
@@ -442,7 +442,7 @@ RPC pattern implementation.
 #### Example
 
 ```javascript
-const { BusManager } = require('brainos');
+import { BusManager } from 'brainos';
 
 const bus = await BusManager.create();
 await bus.start();
@@ -486,7 +486,7 @@ new ConfigLoader()
 #### Example
 
 ```javascript
-const { ConfigLoader } = require('brainos');
+import { ConfigLoader } from 'brainos';
 
 const loader = new ConfigLoader();
 loader.discover();
@@ -524,7 +524,7 @@ MCP (Model Context Protocol) client for connecting to external tools and service
 #### Example
 
 ```javascript
-const { McpClient } = require('brainos');
+import { McpClient } from 'brainos';
 
 async function main() {
   // Spawn an MCP server process
@@ -582,7 +582,7 @@ Return a string to control execution:
 #### Example
 
 ```javascript
-const { BrainOS, HookEvent } = require('brainos');
+import { BrainOS, HookEvent } from 'brainos';
 
 const brain = new BrainOS({ apiKey: 'sk-...' });
 await brain.start();

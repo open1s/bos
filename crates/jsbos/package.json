@@ -1,20 +1,15 @@
 {
   "name": "@open1s/jsbos",
   "version": "2.1.0",
+  "type": "module",
   "description": "BrainOS JavaScript bindings - AI agent framework with ReAct engine",
-  "main": "./brainos.js",
-  "module": "./index.mjs",
+  "main": "./index.js",
+  "module": "./index.js",
   "types": "index.d.ts",
   "exports": {
     ".": {
-      "import": "./index.mjs",
-      "require": "./brainos.js",
+      "import": "./index.js",
       "types": "./index.d.ts"
-    },
-    "./brainos.js": {
-      "import": "./brainos.js",
-      "require": "./brainos.js",
-      "types": "./brainos.d.ts"
     }
   },
   "repository": {
@@ -36,9 +31,9 @@
   "files": [
     "index.d.ts",
     "index.js",
-    "index.mjs",
-    "brainos.js",
-    "brainos.d.ts",
+    "jsbos.js",
+    "jsbos.d.ts",
+    "scripts/",
     "*.node"
   ],
   "napi": {
@@ -62,23 +57,24 @@
   "scripts": {
     "artifacts": "napi artifacts",
     "bench": "node --import @oxc-node/core/register benchmark/bench.ts",
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
+    "build": "napi build --platform --release --esm --dts jsbos.d.ts --js jsbos.js && node scripts/generate-dts.js",
+    "generate:dts": "node scripts/generate-dts.js",
+    "build:debug": "napi build --platform --esm --dts jsbos.d.ts --js jsbos.js && node scripts/generate-dts.js",
     "format": "run-p format:prettier format:rs format:toml",
     "format:prettier": "prettier . -w",
     "format:toml": "taplo format",
     "format:rs": "cargo fmt",
     "lint": "oxlint .",
     "prepublishOnly": "napi prepublish -t npm",
-    "test": "ava && node brainos-api-runner.js",
+    "test": "ava",
     "preversion": "napi build --platform && git add .",
     "version": "napi version",
     "prepare": "husky"
   },
   "devDependencies": {
-    "@emnapi/core": "^1.5.0",
-    "@emnapi/runtime": "^1.5.0",
-    "@napi-rs/cli": "^3.6.0",
+    "@emnapi/core": "^1.10.0",
+    "@emnapi/runtime": "^1.10.0",
+    "@napi-rs/cli": "^3.6",
     "@oxc-node/core": "^0.1.0",
     "@taplo/cli": "^0.7.0",
     "@tybys/wasm-util": "^0.10.0",
@@ -90,7 +86,7 @@
     "oxlint": "^1.14.0",
     "prettier": "^3.6.2",
     "tinybench": "^6.0.0",
-    "typescript": "^6.0.0"
+    "typescript": "^6.0"
   },
   "lint-staged": {
     "*.@(js|ts|tsx)": [

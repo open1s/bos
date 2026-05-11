@@ -12,25 +12,29 @@
  *     node crates/jsbos/examples/agent_skill_demo.js
  */
 
-const { Bus, Agent, ConfigLoader, version, initTracing } = require('../index.js');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
+import { Bus, Agent, ConfigLoader, version, initTracing } from '../index.js'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import { fileURLToPath } from 'url'
 
-initTracing();
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
-const loader = new ConfigLoader();
-loader.discover();
-const _config = JSON.parse(loader.loadSync());
-const _global = _config.global_model || {};
+initTracing()
 
-const API_KEY = process.env.OPENAI_API_KEY || _global.api_key || '';
-const BASE_URL = process.env.LLM_BASE_URL || _global.base_url || 'https://integrate.api.nvidia.com/v1';
-const MODEL = process.env.LLM_MODEL || _global.model || 'nvidia/meta/llama-3.1-8b-instruct';
+const loader = new ConfigLoader()
+loader.discover()
+const _config = JSON.parse(loader.loadSync())
+const _global = _config.global_model || {}
+
+const API_KEY = process.env.OPENAI_API_KEY || _global.api_key || ''
+const BASE_URL = process.env.LLM_BASE_URL || _global.base_url || 'https://integrate.api.nvidia.com/v1'
+const MODEL = process.env.LLM_MODEL || _global.model || 'nvidia/meta/llama-3.1-8b-instruct'
 
 function createSampleSkills(skillsDir) {
-  const pythonSkill = path.join(skillsDir, 'python-coding');
-  fs.mkdirSync(pythonSkill, { recursive: true });
+  const pythonSkill = path.join(skillsDir, 'python-coding')
+  fs.mkdirSync(pythonSkill, { recursive: true })
   fs.writeFileSync(path.join(pythonSkill, 'SKILL.md'), `---
 name: python-coding
 description: Python coding conventions and best practices for the project
@@ -61,10 +65,10 @@ tags: [python, style, conventions]
 - One test per function
 - Use pytest fixtures for setup
 - Mock external services
-`);
+`)
 
-  const dbSkill = path.join(skillsDir, 'database-ops');
-  fs.mkdirSync(dbSkill, { recursive: true });
+  const dbSkill = path.join(skillsDir, 'database-ops')
+  fs.mkdirSync(dbSkill, { recursive: true })
   fs.writeFileSync(path.join(dbSkill, 'SKILL.md'), `---
 name: database-ops
 description: Database query patterns and connection management
@@ -92,10 +96,10 @@ provides: [db-queries, db-connections]
 - Retry transient errors with exponential backoff
 - Max 3 retries before failing
 - Log query parameters (excluding secrets) on failure
-`);
+`)
 
-  const apiSkill = path.join(skillsDir, 'api-design');
-  fs.mkdirSync(apiSkill, { recursive: true });
+  const apiSkill = path.join(skillsDir, 'api-design')
+  fs.mkdirSync(apiSkill, { recursive: true })
   fs.writeFileSync(path.join(apiSkill, 'SKILL.md'), `---
 name: api-design
 description: REST API design patterns and conventions
@@ -121,19 +125,19 @@ tags: [api, rest, design]
 - Use JWT tokens in Authorization header
 - Token expiry: 1 hour
 - Refresh tokens valid for 7 days
-`);
+`)
 }
 
 async function demoSkills() {
-  console.log('═'.repeat(60));
-  console.log('  Demo — Agent with Skills');
-  console.log('═'.repeat(60));
+  console.log('═'.repeat(60))
+  console.log('  Demo — Agent with Skills')
+  console.log('═'.repeat(60))
 
-  const skillsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brainos_skills_'));
-  console.log(`\n  📁 Creating skills in: ${skillsDir}`);
-  createSampleSkills(skillsDir);
+  const skillsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brainos_skills_'))
+  console.log(`\n  📁 Creating skills in: ${skillsDir}`)
+  createSampleSkills(skillsDir)
 
-  const bus = await Bus.create();
+  const bus = await Bus.create()
   const agent = await Agent.create({
     name: 'skill-agent',
     model: MODEL,
@@ -146,48 +150,48 @@ async function demoSkills() {
       'Format: Thought: <reasoning>\nFinal Answer: <response>',
     temperature: 0.7,
     timeoutSecs: 120,
-  }, bus);
-  console.log('  🤖 Agent created');
+  }, bus)
+  console.log('  🤖 Agent created')
 
-  await agent.registerSkillsFromDir(skillsDir);
-  console.log('  📚 Skills registered from directory');
+  await agent.registerSkillsFromDir(skillsDir)
+  console.log('  📚 Skills registered from directory')
 
   const prompts = [
     ['Python Style', 'What are the Python naming conventions for this project?'],
     ['Database', 'How should I handle database connections and retries?'],
     ['API Design', "What's the correct way to version our REST API?"],
-  ];
+  ]
 
   for (const [label, prompt] of prompts) {
-    console.log(`\n  ── ${label} ──`);
-    console.log(`  📤 User: ${prompt}`);
+    console.log(`\n  ── ${label} ──`)
+    console.log(`  📤 User: ${prompt}`)
     try {
-      const reply = await agent.react(prompt);
-      console.log(`  📥 Agent: ${reply.substring(0, 300)}`);
+      const reply = await agent.react(prompt)
+      console.log(`  📥 Agent: ${reply.substring(0, 300)}`)
     } catch (e) {
-      console.log(`  ⚠️  ${e.message}`);
+      console.log(`  ⚠️  ${e.message}`)
     }
   }
 
-  fs.rmSync(skillsDir, { recursive: true, force: true });
-  console.log('\n  ✅ Skills demo done\n');
+  fs.rmSync(skillsDir, { recursive: true, force: true })
+  console.log('\n  ✅ Skills demo done\n')
 }
 
 async function main() {
-  console.log('\n' + '📚'.repeat(30));
-  console.log('  BrainOS — Agent Skills Demo');
-  console.log('📚'.repeat(30) + '\n');
+  console.log('\n' + '📚'.repeat(30))
+  console.log('  BrainOS — Agent Skills Demo')
+  console.log('📚'.repeat(30) + '\n')
 
   if (!API_KEY) {
-    console.log('  ⚠️  OPENAI_API_KEY not set — LLM calls will fail');
-    console.log('  Set: export OPENAI_API_KEY=sk-...\n');
+    console.log('  ⚠️  OPENAI_API_KEY not set — LLM calls will fail')
+    console.log('  Set: export OPENAI_API_KEY=sk-...\n')
   }
 
-  await demoSkills();
+  await demoSkills()
 
-  console.log('═'.repeat(60));
-  console.log('  ✅ All Skills demos completed!');
-  console.log('═'.repeat(60) + '\n');
+  console.log('═'.repeat(60))
+  console.log('  ✅ All Skills demos completed!')
+  console.log('═'.repeat(60) + '\n')
 }
 
-main().catch(console.error).finally(() => process.exit(0));
+main().catch(console.error).finally(() => process.exit(0))

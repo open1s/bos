@@ -36,7 +36,7 @@ async with BrainOS() as brain:
 ### JavaScript (@open1s/jsbos / brainos-js)
 
 ```javascript
-const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos');
+import { BrainOS, ToolDef } from '@open1s/jsbos';
 
 // Create tool using ToolDef
 const addTool = new ToolDef(
@@ -183,7 +183,7 @@ The `brainos` package (Python) and `@open1s/jsbos/brainos.js` (JavaScript) provi
 
 | Feature | Python | JavaScript |
 |---------|--------|------------|
-| Import | `from brainos import BrainOS, tool` | `const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos')` |
+| Import | `from brainos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
 | Create brain | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
 | Create agent | `brain.agent("name")` | `brain.agent("name")` |
 | Fluent config | `.with_model("gpt-4")` | `.withModel("gpt-4")` |
@@ -198,7 +198,7 @@ For direct access to Rust bindings:
 | Language | Package | Import |
 |----------|---------|--------|
 | Python | `pybrainos` | `from pybrainos import Agent, Bus, McpClient, ...` |
-| JavaScript | `@open1s/jsbos` | `const { Agent, Bus, McpClient } = require('@open1s/jsbos')` |
+| JavaScript | `@open1s/jsbos` | `import { Agent, Bus, McpClient } from '@open1s/jsbos'` |
 
 ---
 
@@ -227,7 +227,7 @@ result = await client.call_tool("echo", '{"text": "hello"}')
 ### JavaScript
 
 ```javascript
-const { McpClient } = require('@open1s/jsbos');
+import { McpClient } from '@open1s/jsbos';
 
 // Process-based server
 const client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]);
@@ -289,7 +289,7 @@ See the examples directories:
 
 ```bash
 # JavaScript MCP HTTP demo
-node crates/jsbos/examples/mcp_http_agent_demo.cjs
+node crates/jsbos/examples/mcp_http_agent_demo.js
 
 # Python MCP HTTP demo (run server first, then use)
 python3 crates/examples/mcp_http_server.py

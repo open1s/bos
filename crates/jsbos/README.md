@@ -33,7 +33,7 @@ yarn add @open1s/jsbos
 ## Quick Start
 
 ```javascript
-const { Agent, Bus } = require('@open1s/jsbos');
+import { Agent, Bus } from '@open1s/jsbos';
 
 async function main() {
   // Create a message bus for inter-agent communication
@@ -391,7 +391,7 @@ await registry.register('BeforeToolCall', (err, ctx) => {
 Standalone MCP client (not requiring an agent).
 
 ```javascript
-const { McpClient } = require('@open1s/jsbos');
+import { McpClient } from '@open1s/jsbos';
 
 // From command
 const client = await McpClient.spawn('npx', ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']);
@@ -430,7 +430,7 @@ const config = JSON.parse(loader.loadSync());
 ### Logging
 
 ```javascript
-const { initTracing, logTestMessage } = require('@open1s/jsbos');
+import { initTracing, logTestMessage } from '@open1s/jsbos';
 
 // Initialize tracing (for debugging)
 initTracing();
@@ -463,21 +463,21 @@ See the [examples](./examples/) directory for complete examples:
 
 | Example | Description |
 |---------|-------------|
-| `agent_demo.cjs` | Basic agent with tools |
-| `agent_mcp_demo.cjs` | Agent with MCP servers |
-| `bus_demo.cjs` | Pub/sub messaging |
-| `caller_demo.cjs` | RPC pattern |
-| `query_demo.cjs` | Request/response queries |
-| `mcp_demo.cjs` | Standalone MCP client |
-| `mcp_http_demo.cjs` | HTTP MCP connections |
-| `agent_stream_demo.cjs` | Streaming responses |
-| `demo-hooks.cjs` | Lifecycle hooks |
-| `demo-plugins.cjs` | Plugin system |
-| `config_demo.cjs` | Configuration loading |
+| `agent_demo.js` | Basic agent with tools |
+| `agent_mcp_demo.js` | Agent with MCP servers |
+| `bus_demo.js` | Pub/sub messaging |
+| `caller_demo.js` | RPC pattern |
+| `query_demo.js` | Request/response queries |
+| `mcp_demo.js` | Standalone MCP client |
+| `mcp_http_demo.js` | HTTP MCP connections |
+| `agent_stream_demo.js` | Streaming responses |
+| `demo-hooks.js` | Lifecycle hooks |
+| `demo-plugins.js` | Plugin system |
+| `config_demo.js` | Configuration loading |
 
 Run an example:
 ```bash
-node examples/agent_demo.cjs
+node examples/agent_demo.js
 ```
 
 ## Development
