@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "nbos"
-version = "2.1.1"
+version = "2.1.2"
 description = "Multi-language AI agent framework. Agents, tools, event bus, MCP, skills, memory — in Python."
 requires-python = ">=3.9"
 authors = [{name = "BrainOS Team", email = "oss@open1s.com"}]
