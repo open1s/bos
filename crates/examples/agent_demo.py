@@ -13,9 +13,7 @@ import json
 import os
 from datetime import datetime, timezone
 
-from pybrainos import Agent, AgentConfig, Bus, BusConfig, PythonTool
-
-from pybrainos import Agent, AgentConfig, Bus, BusConfig, PythonTool, ConfigLoader,init_tracing
+from pybrainos import Agent, AgentConfig, Bus, BusConfig, PythonTool, ConfigLoader, init_tracing
 
 init_tracing()
 loader = ConfigLoader()
@@ -31,9 +29,6 @@ BASE_URL = os.environ.get(
 )
 
 MODEL = os.environ.get("LLM_MODEL", _global.get("model", "nvidia/meta/llama-3.1-8b-instruct"))
-
-
-MODEL = "nvidia/meta/llama-3.1-8b-instruct"  # Default model for the demo, can be overridden by config or env var
 
 
 # ── Tool implementations ──────────────────────────────────────────────

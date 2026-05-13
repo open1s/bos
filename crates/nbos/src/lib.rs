@@ -43,7 +43,7 @@ pub use query::{PyQuery, PyQueryStreamIterator, PyQueryable, PyStreamSender};
 pub use subscriber::PySubscriber;
 
 #[pymodule]
-fn pybrainos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn nbos(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConfigLoader>()?;
     m.add_class::<PyBusConfig>()?;
     m.add_class::<PyBus>()?;

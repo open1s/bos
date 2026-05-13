@@ -310,16 +310,23 @@ class AgentBuilder:
         return Agent(self._inner, self._tools)
 
     async def ask(self, prompt: str) -> str:
+        """Run an LLM query with tool calling. Lazy-starts the agent."""
         if not self._inner:
             await self.start()
         return await self._inner.run_simple(prompt)
 
+    async def chat(self, message: str) -> str:
+        """Alias for ask(). Lazy-starts the agent."""
+        return await self.ask(message)
+
     async def react(self, task: str) -> str:
+        """Run with explicit ReAct reasoning loop. Lazy-starts the agent."""
         if not self._inner:
             await self.start()
         return await self._inner.react(task)
 
     async def stream(self, task: str):
+        """Stream response tokens. Lazy-starts the agent."""
         if not self._inner:
             await self.start()
         return await self._inner.stream(task)
@@ -336,30 +343,34 @@ class Agent:
         self._tools = tools
 
     async def ask(self, prompt: str) -> str:
+        """Run an LLM query with tool calling (primary method)."""
         return await self._inner.run_simple(prompt)
 
     async def chat(self, message: str) -> str:
-        return await self.ask(message)
-
-    async def run_simple(self, message: str) -> str:
+        """Alias for ask()."""
         return await self.ask(message)
 
     async def react(self, task: str) -> str:
+        """Run with explicit ReAct reasoning loop."""
         return await self._inner.react(task)
 
     async def stream(self, task: str):
+        """Stream response tokens via async iterator."""
         return await self._inner.stream(task)
 
     @property
     def session(self) -> SessionManager:
+        """Session manager for conversation history."""
         return SessionManager(self._inner)
 
     @property
     def tools(self) -> list[str]:
+        """List registered tool names."""
         return self._inner.list_tools()
 
     @property
     def config(self) -> dict[str, Any]:
+        """Agent configuration dict."""
         return self._inner.config()
 
 

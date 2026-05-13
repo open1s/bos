@@ -3,8 +3,8 @@ requires = ["maturin>=1.6,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pybrainos"
-version = "2.0.7"
+name = "nbos"
+version = "2.1.0"
 description = "Python bindings for BrainOS (agent/config/bus)"
 requires-python = ">=3.9"
 classifiers = [
@@ -14,5 +14,5 @@ classifiers = [
 ]
 
 [tool.maturin]
-module-name = "pybrainos"
+module-name = "nbos"
 python-packages = ["brainos"]

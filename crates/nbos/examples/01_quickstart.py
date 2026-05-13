@@ -10,7 +10,7 @@ Demonstrates:
 
 import asyncio
 from brainos import BrainOS, tool
-from pybos import ConfigLoader as PyConfigLoader
+from pybrainos import ConfigLoader as PyConfigLoader
 
 @tool("Add two numbers together")
 def add(a: int, b: int) -> int:

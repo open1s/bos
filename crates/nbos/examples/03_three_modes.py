@@ -10,7 +10,7 @@ Demonstrates:
 import asyncio
 import json
 from datetime import datetime, timezone
-from pybos import ConfigLoader as PyConfigLoader
+from pybrainos import ConfigLoader as PyConfigLoader
 
 from brainos import BrainOS, tool
 

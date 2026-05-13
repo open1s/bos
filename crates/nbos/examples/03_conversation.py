@@ -3,15 +3,15 @@
 Example 3: Conversational Agent — Multi-turn chat with context.
 
 Demonstrates:
-- agent.chat() for natural conversation (no ReAct)
-- agent.ask() for tool-aware reasoning
+- agent.ask() for both conversation and tool-aware reasoning
+- Lazy builder initialization (no .start() needed for ask())
 - Switching between conversation and tool use
 """
 
 import asyncio
 import json
 from datetime import datetime, timezone
-from pybos import ConfigLoader as PyConfigLoader
+from pybrainos import ConfigLoader as PyConfigLoader
 
 from brainos import BrainOS, tool
 
@@ -36,14 +36,14 @@ async def main():
         model = global_model.get("model")
         agent = (
             brain.agent("chatbot", system_prompt="You are a friendly conversational assistant.")
-            .register_many(current_time, weather)
+            .with_tools(current_time, weather)
         )
 
         # Natural conversation (no tool use)
         print("=== Conversation ===")
         for msg in ["Hello!", "What can you help me with?"]:
             print(f"  You: {msg}")
-            reply = await agent.chat(msg)
+            reply = await agent.ask(msg)
             print(f"  Agent: {reply}\n")
 
         # Tool-aware queries
