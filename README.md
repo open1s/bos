@@ -122,7 +122,6 @@ bos/
 │   ├── pybos/          # Python bindings (brainos package)
 │   │   └── brainos/    # High-level Python wrapper
 │   └── jsbos/          # Node.js bindings (@open1s/jsbos)
-│       └── brainos.js  # High-level JavaScript wrapper
 ├── docs/               # User guides
 │   ├── python-user-guide.md
 │   ├── javascript-user-guide.md

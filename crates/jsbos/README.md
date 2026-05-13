@@ -233,7 +233,7 @@ const prompts = await agent.listMcpPrompts();
 Intercept agent events and optionally modify behavior.
 
 ```javascript
-agent.registerHook('BeforeToolCall', (ctx) => {
+agent.registerHook('BeforeToolCall', (err, ctx) => {
   console.log('About to call:', ctx.data.toolName);
   return 'continue'; // or 'abort' to block
 });
@@ -255,10 +255,10 @@ Add a plugin to intercept LLM requests/responses and tool calls.
 ```javascript
 agent.registerPlugin(
   'my-plugin',
-  (req) => { /* modify LLM request */ return req; },
-  (resp) => { /* modify LLM response */ return resp; },
-  (call) => { /* intercept tool call */ return call; },
-  (result) => { /* modify tool result */ return result; }
+  (err, req) => { /* modify LLM request */ return req; },
+  (err, resp) => { /* modify LLM response */ return resp; },
+  (err, call) => { /* intercept tool call */ return call; },
+  (err, result) => { /* modify tool result */ return result; }
 );
 ```
 
@@ -345,7 +345,7 @@ const query = await bus.createQuery('compute');
 
 // On the responding side:
 const queryable = await bus.createQueryable('compute');
-await queryable.setHandler(async (input) => {
+await queryable.setHandler(async (err, input) => {
   return JSON.stringify({ result: compute(input) });
 });
 await queryable.start();
@@ -367,7 +367,7 @@ const result = await caller.callText('request data');
 
 // Callable (service)
 const callable = await bus.createCallable('my-service');
-await callable.setHandler(async (input) => {
+await callable.setHandler(async (err, input) => {
   return await processRequest(input);
 });
 await callable.start();
@@ -380,7 +380,7 @@ Standalone hook registry for external use.
 ```javascript
 const registry = new HookRegistry();
 
-await registry.register('BeforeToolCall', (ctx) => {
+await registry.register('BeforeToolCall', (err, ctx) => {
   console.log('Tool call:', ctx.agentId, ctx.data);
   return 'continue';
 });

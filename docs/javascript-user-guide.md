@@ -142,7 +142,7 @@ const agentWithBash = brain.agent('assistant')
 
 ```javascript
 // Simple Q&A (no tool use)
-const result = await agent.runSimple('What is Python?');
+const result = await agent.ask('What is Python?');
 
 // Run with tool use enabled
 const result = await agent.react('Calculate 2 + 2');
@@ -169,7 +169,8 @@ const toolDef = new ToolDef(
 );
 
 agent.register(toolDef);
-agent.registerMany(tool1, tool2);
+agent.register(tool1);
+agent.register(tool2);
 ```
 
 ---
@@ -189,23 +190,23 @@ async function main() {
 
   // Register hooks in the fluent chain, then call .start()
   const agent = await brain.agent('assistant')
-    .hook(HookEvent.BeforeToolCall, (ctx) => {
+    .hook(HookEvent.BeforeToolCall, (err, ctx) => {
       console.log('[BeforeToolCall]', ctx?.data?.tool_name || 'unknown');
       return 'continue';
     })
-    .hook(HookEvent.AfterToolCall, (ctx) => {
+    .hook(HookEvent.AfterToolCall, (err, ctx) => {
       console.log('[AfterToolCall]', ctx?.data?.tool_name || 'unknown');
       return 'continue';
     })
-    .hook(HookEvent.BeforeLlmCall, (ctx) => {
+    .hook(HookEvent.BeforeLlmCall, (err, ctx) => {
       console.log('[BeforeLlmCall] Starting LLM call');
       return 'continue';
     })
-    .hook(HookEvent.AfterLlmCall, (ctx) => {
+    .hook(HookEvent.AfterLlmCall, (err, ctx) => {
       console.log('[AfterLlmCall] LLM call completed');
       return 'continue';
     })
-    .hook(HookEvent.OnError, (ctx) => {
+    .hook(HookEvent.OnError, (err, ctx) => {
       console.log('[OnError]', ctx?.data?.error || 'unknown error');
       return 'continue';
     })
@@ -236,12 +237,12 @@ async function main() {
     timeoutSecs: 120,
   });
 
-  await agent.registerHook(HookEvent.BeforeToolCall, (ctx) => {
+  await agent.registerHook(HookEvent.BeforeToolCall, (err, ctx) => {
     console.log('[BeforeToolCall]', ctx.data.tool_name);
     return 'continue';
   });
 
-  await agent.registerHook(HookEvent.AfterToolCall, (ctx) => {
+  await agent.registerHook(HookEvent.AfterToolCall, (err, ctx) => {
     console.log('[AfterToolCall]', ctx.data.tool_name);
     return 'continue';
   });
@@ -398,7 +399,7 @@ msg = await sub.recvWithTimeoutMs(5000);
 const data = await sub.recvJsonWithTimeoutMs(5000);
 
 // Callback loop
-await sub.run((msg) => console.log(`Received: ${msg}`));
+await sub.run((err, msg) => console.log(`Received: ${msg}`));
 
 // Async iteration
 for await (const msg of sub) {
@@ -429,8 +430,8 @@ await q.start();
 
 ```javascript
 const query = await bus.createQuery('svc/upper');
-const result = await query.queryText('hello');  // "HELLO"
-const result = await query.queryTextTimeoutMs('hello', 5000);  // with timeout
+const result = await query.ask('hello');  // "HELLO"
+const result = await query.ask('hello', 5000);  // with timeout
 ```
 
 ### QueryClient API
@@ -451,7 +452,7 @@ const result = await query.queryTextTimeoutMs('hello', 5000);  // with timeout
 **Methods:**
 | Method | Description |
 |--------|-------------|
-| `setHandler(handler)` | Set handler function |
+| `handle(handler)` | Set handler function |
 | `start()` | Start server |
 | `run(handler)` | Run with handler |
 | `runJson(handler)` | Run JSON handler |
@@ -479,7 +480,7 @@ await srv.start();
 
 ```javascript
 const caller = await bus.createCaller('svc/echo');
-const result = await caller.callText('ping');  // "echo: ping"
+const result = await caller.call('ping');  // "echo: ping"
 ```
 
 ### CallerClient API
@@ -499,7 +500,7 @@ const result = await caller.callText('ping');  // "echo: ping"
 **Methods:**
 | Method | Description |
 |--------|-------------|
-| `setHandler(handler)` | Set handler function |
+| `handle(handler)` | Set handler function |
 | `start()` | Start server |
 | `run(handler)` | Run with handler |
 | `runJson(handler)` | Run JSON handler |
@@ -689,17 +690,16 @@ new Agent(bus, options = {})
 **Methods:**
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `withModel(model)` | Set model | `Agent` |
-| `withPrompt(prompt)` | Set system prompt | `Agent` |
-| `withTemperature(temp)` | Set temperature | `Agent` |
-| `withTimeout(secs)` | Set timeout | `Agent` |
-| `register(toolDef)` | Register a tool | `Agent` |
-| `registerMany(...toolDefs)` | Register multiple tools | `Agent` |
-| `start()` | Initialize agent | `Agent` |
+| `model(model)` | Set model | `AgentBuilder` |
+| `prompt(prompt)` | Set system prompt | `AgentBuilder` |
+| `temperature(temp)` | Set temperature | `AgentBuilder` |
+| `timeout(secs)` | Set timeout | `AgentBuilder` |
+| `register(toolDef)` | Register a tool | `AgentBuilder` |
+| `start()` | Initialize agent | `Promise<Agent>` |
 | `ask(question)` | Run agent | `Promise<string>` |
-| `chat(message)` | Simple chat | `Promise<string>` |
-| `runSimple(message)` | Simple run | `Promise<string>` |
 | `react(task)` | Run with ReAct | `Promise<string>` |
+| `stream(task, callback)` | Stream response | `Promise<void>` |
+| `streamCollect(task)` | Collect stream tokens | `Promise<any[]>` |
 
 ### Resilience Configuration
 
@@ -796,8 +796,9 @@ Message publisher for a specific topic.
 **Methods:**
 | Method | Description |
 |--------|-------------|
-| `publishText(payload)` | Publish text |
-| `publishJson(data)` | Publish JSON |
+| `text(payload)` | Publish text |
+| `json(data)` | Publish JSON |
+| `publish(payload, isJson?)` | Publish with format flag |
 
 ### `SubscriberWrapper`
 
@@ -811,9 +812,8 @@ Message subscriber with receive methods.
 **Methods:**
 | Method | Description |
 |--------|-------------|
-| `recv()` | Receive message (blocking) |
-| `recvWithTimeoutMs(ms)` | Receive with timeout |
-| `recvJsonWithTimeoutMs(ms)` | Receive JSON with timeout |
+| `recv(timeoutMs?)` | Receive message (with optional timeout) |
+| `recvJson(timeoutMs?)` | Receive JSON with optional timeout |
 | `run(callback)` | Run callback loop |
 | `runJson(callback)` | Run JSON callback loop |
 
@@ -824,13 +824,13 @@ Request-response pattern.
 **QueryClient Methods:**
 | Method | Description |
 |--------|-------------|
-| `queryText(payload)` | Send query |
-| `queryTextTimeoutMs(payload, ms)` | Send with timeout |
+| `ask(payload, timeoutMs?)` | Send query (optional timeout) |
+| `askJson(payload, timeoutMs?)` | Send JSON query |
 
 **QueryableServer Methods:**
 | Method | Description |
 |--------|-------------|
-| `setHandler(handler)` | Set handler |
+| `handle(handler)` | Set handler |
 | `start()` | Start server |
 | `run(handler)` | Run with handler |
 | `runJson(handler)` | Run JSON handler |
@@ -842,12 +842,13 @@ RPC pattern.
 **CallerClient Methods:**
 | Method | Description |
 |--------|-------------|
-| `callText(payload)` | Call remote service |
+| `call(payload)` | Call remote service |
+| `callJson(payload)` | Call with JSON payload |
 
 **CallableServer Methods:**
 | Method | Description |
 |--------|-------------|
-| `setHandler(handler)` | Set handler |
+| `handle(handler)` | Set handler |
 | `start()` | Start server |
 | `run(handler)` | Run with handler |
 | `runJson(handler)` | Run JSON handler |
@@ -881,17 +882,17 @@ MCP (Model Context Protocol) client for connecting to external tools and service
 | Method | Description |
 |--------|-------------|
 | `McpClient.spawn(command, args)` | Spawn an MCP server process |
-| `McpClient.connect_http(url)` | Connect via HTTP URL |
+| `McpClient.connectHttp(url)` | Connect via HTTP URL |
 
 **Methods:**
 | Method | Description |
 |--------|-------------|
 | `initialize()` | Initialize MCP connection |
-| `list_tools()` | List available tools |
-| `call_tool(name, args_json)` | Call a tool with JSON string args |
-| `list_prompts()` | List available prompts |
-| `list_resources()` | List available resources |
-| `read_resource(uri)` | Read a resource by URI |
+| `listTools()` | List available tools |
+| `callTool(name, argsJson)` | Call a tool with JSON string args |
+| `listPrompts()` | List available prompts |
+| `listResources()` | List available resources |
+| `readResource(uri)` | Read a resource by URI |
 
 ---
 
@@ -1026,12 +1027,12 @@ async function main() {
   });
 
   // Register hooks using registerHook()
-  await agent.registerHook(HookEvent.BeforeToolCall, (ctx) => {
+  await agent.registerHook(HookEvent.BeforeToolCall, (err, ctx) => {
     console.log('[BeforeToolCall]', ctx.data?.tool_name);
     return 'continue';
   });
 
-  await agent.registerHook(HookEvent.AfterToolCall, (ctx) => {
+  await agent.registerHook(HookEvent.AfterToolCall, (err, ctx) => {
     console.log('[AfterToolCall]', ctx.data?.tool_name);
     return 'continue';
   });

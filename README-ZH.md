@@ -36,7 +36,7 @@ async with BrainOS() as brain:
 ### JavaScript (@open1s/jsbos / brainos-js)
 
 ```javascript
-const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos');
+import { BrainOS, ToolDef } from '@open1s/jsbos';
 
 // 创建工具使用 ToolDef
 const addTool = new ToolDef(
@@ -52,7 +52,7 @@ await brain.start();
 const agent = await brain.agent('assistant')
   .register(addTool)
   .start();
-const result = await agent.ask('2+2 等于多少?');
+const result = await agent.runSimple('2+2 等于多少?');
 ```
 
 ### Rust (agent crate)
@@ -122,7 +122,6 @@ bos/
 │   ├── pybos/          # Python 绑定 (brainos 包)
 │   │   └── brainos/    # 高级 Python 包装器
 │   └── jsbos/          # Node.js 绑定 (@open1s/jsbos)
-│       └── brainos.js  # 高级 JavaScript 包装器
 ├── docs/               # 用户指南
 │   ├── python-user-guide.md
 │   ├── javascript-user-guide.md
@@ -179,16 +178,16 @@ cd crates/jsbos && npm install && npm run build
 
 ## 统一 API
 
-`brainos` 包（Python）和 `@open1s/jsbos/brainos.js`（JavaScript）提供一致的高级 API：
+`brainos` 包（Python）和 `@open1s/jsbos`（JavaScript）提供一致的高级 API：
 
 | 功能 | Python | JavaScript |
 |------|--------|------------|
-| 导入 | `from brainos import BrainOS, tool` | `const { BrainOS, tool } = require('@open1s/jsbos/brainos')` |
+| 导入 | `from brainos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
 | 创建 brain | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
 | 创建代理 | `brain.agent("name")` | `brain.agent("name")` |
-| 链式配置 | `.with_model("gpt-4")` | `.withModel("gpt-4")` |
-| 注册工具 | `.register(tool)` | `.withTools(toolDef)` |
-| 运行 | `await agent.ask("...")` | `await agent.ask("...")` |
+| 链式配置 | `.with_model("gpt-4")` | `.model("gpt-4")` |
+| 注册工具 | `.register(tool)` | `.register(toolDef)` |
+| 运行 | `await agent.ask("...")` | `await agent.runSimple("...")` |
 | 总线工厂 | `BusManager()` | `BusManager.create()` |
 
 ### 底层绑定
@@ -198,7 +197,7 @@ cd crates/jsbos && npm install && npm run build
 | 语言 | 包 | 导入 |
 |------|-----|------|
 | Python | `pybrainos` | `from pybrainos import Agent, Bus, McpClient, ...` |
-| JavaScript | `@open1s/jsbos` | `const { Agent, Bus, McpClient } = require('@open1s/jsbos')` |
+| JavaScript | `@open1s/jsbos` | `import { Agent, Bus, McpClient } from '@open1s/jsbos'` |
 
 ---
 
@@ -227,7 +226,7 @@ result = await client.call_tool("echo", '{"text": "hello"}')
 ### JavaScript
 
 ```javascript
-const { McpClient } = require('@open1s/jsbos');
+import { McpClient } from '@open1s/jsbos';
 
 // 基于进程的服务器
 const client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]);
@@ -289,7 +288,7 @@ listen = ["127.0.0.1:7890"]
 
 ```bash
 # JavaScript MCP HTTP 演示
-node crates/jsbos/examples/mcp_http_agent_demo.cjs
+node crates/jsbos/examples/mcp_http_agent_demo.js
 
 # Python MCP HTTP 演示（先启动服务器，然后使用）
 python3 crates/examples/mcp_http_server.py
