@@ -1,19 +1,30 @@
 English | [中文版本](./README-ZH.md)
-# BrainOS (BOS)
 
-A modular Rust-based operating system and runtime framework for building intelligent AI-powered applications with support for multi-agent coordination, event streaming, and extensible tool systems.
+<p align="center"> BrainOS — Multi-language AI agent runtime. One framework — Rust core, Python & JS bindings.
+</p>
 
-## Key Features
+<p align="center">
+  <a href="https://pypi.org/project/nbos"><img src="https://img.shields.io/pypi/v/nbos?label=python&logo=pypi&color=3776AB" alt="PyPI"></a>
+  <a href="https://www.npmjs.com/package/@open1s/jsbos"><img src="https://img.shields.io/npm/v/@open1s/jsbos?label=javascript&logo=npm&color=CB3837" alt="npm"></a>
+  <a href="https://github.com/open1s/bos/actions/workflows/jsbos.yml"><img src="https://github.com/open1s/bos/actions/workflows/jsbos.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/open1s/bos/wiki"><img src="https://img.shields.io/badge/docs-wiki-blue?logo=github" alt="Wiki"></a>
+  <a href="https://github.com/open1s/bos/blob/main/LICENSE"><img src="https://img.shields.io/github/license/open1s/bos?color=blue" alt="License"></a>
+</p>
 
-- **🤖 Agent Framework**: Multi-agent coordination with LLM integration and skill management
-- **🚌 Event Bus**: High-performance pub/sub messaging with query/response, RPC patterns
-- **⚙️ Configuration**: Flexible config loading from TOML, YAML, and environment variables
-- **🧠 ReAct Engine**: Reasoning + Acting loop scaffold for AI agent workflows
-- **🐍 Python Bindings**: `pip install nbos` - unified high-level Python API
-- **📦 Node.js Bindings**: `npm install @open1s/jsbos` - unified high-level JavaScript API
-- **🔄 Memory Persistence**: Cross-session memory support for agents
-- **🔌 MCP Client**: Connect to Model Context Protocol servers (stdio & HTTP)
-- **📚 Skills System**: Load agent capabilities from directory-based skill definitions
+---
+
+**You have an LLM. You want it to use tools, talk to other agents, remember conversations, and connect to MCP servers — in Python, JavaScript, or Rust.**
+
+BOS is the runtime that makes this work out of the box. One `pip install nbos` or `npm install @open1s/jsbos` gets you agents with tools, a pub/sub event bus for multi-agent coordination, MCP client for external tools, skill loading for domain-specific capabilities, and cross-session memory — all backed by a performant Rust core.
+
+```bash
+# 30-second win — copy, paste, run
+pip install nbos && python -c "
+from nbos import BrainOS
+import asyncio
+print(asyncio.run(BrainOS().agent('assistant').ask('say hi')))
+"
+```
 
 ---
 
@@ -66,6 +77,25 @@ let result = agent.run_simple("Hello").await?;
 ```
 
 ---
+
+## Why BOS?
+
+BOS is not another LangChain wrapper or Python-only framework. It's a **multi-language runtime** built from the ground up for production AI agents.
+
+| Need | BOS | Typical alternative |
+|------|-----|-------------------|
+| **Language choice** | Rust core + Python `nbos` + JavaScript `@open1s/jsbos` | Python-only |
+| **Multi-agent** | Built-in event bus (pub/sub, query/RPC, caller/callable) | Ad-hoc or single-process |
+| **External tools** | Native MCP client (stdio + HTTP) | Roll your own |
+| **Agent capabilities** | Directory-based skills system — load domain expertise on demand | Hardcoded prompts |
+| **Memory** | Cross-session persistence built in | Plugin or DIY |
+| **Production** | Circuit breaker, rate limiter, configurable resilience | Often absent |
+| **Performance** | Rust zero-cost abstractions, async Tokio runtime | GIL-bound Python |
+
+**If you want an agent that speaks more than one language, talks to other agents, and works in production — not just a notebook — BOS is the runtime.**
+
+---
+
 
 ## Skills System
 
