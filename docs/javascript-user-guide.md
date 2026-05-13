@@ -40,7 +40,7 @@ npm run build
 ## Quick Start
 
 ```javascript
-const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos');
+import { BrainOS, ToolDef } from '@open1s/jsbos';
 
 // Create a tool definition
 const addTool = new ToolDef(
@@ -59,7 +59,7 @@ async function main() {
     .register(addTool)
     .start();
 
-  const result = await agent.ask('What is 2+2?');
+  const result = await agent.runSimple('What is 2+2?');
   console.log(result);
 
   await brain.stop();
@@ -128,28 +128,24 @@ Use chainable methods to configure the agent:
 
 ```javascript
 const agent = brain.agent('assistant')
-  .withModel('nvidia/meta/llama-3.1-8b-instruct')
-  .withTemperature(0.3)
-  .withPrompt('You are a math tutor.')
-  .withTimeout(300);
+  .model('nvidia/meta/llama-3.1-8b-instruct')
+  .temperature(0.3)
+  .prompt('You are a math tutor.')
+  .timeout(300);
 
 // Add a Bash tool for shell execution
 const agentWithBash = brain.agent('assistant')
-  .withBashTool('bash', '/path/to/workspace');  // name, workspaceRoot
+  .bash('bash', '/path/to/workspace');  // name, workspaceRoot
 ```
 
 ### Running the Agent
 
 ```javascript
 // Simple Q&A (no tool use)
-const result = await agent.ask('What is Python?');
+const result = await agent.runSimple('What is Python?');
 
 // Run with tool use enabled
 const result = await agent.react('Calculate 2 + 2');
-
-// Simple conversation
-const result = await agent.chat('Hello!');
-const result = await agent.runSimple('Hello!');
 
 // Streaming response
 const result = await agent.stream('Tell me a story', (token) => {
@@ -185,7 +181,7 @@ Hooks allow you to intercept and react to events during agent execution. Use `.h
 ### Using Hooks with BrainOS Agent
 
 ```javascript
-const { BrainOS, HookEvent } = require('@open1s/jsbos/brainos');
+import { BrainOS, HookEvent } from '@open1s/jsbos';
 
 async function main() {
   const brain = new BrainOS();
@@ -215,7 +211,7 @@ async function main() {
     })
     .start();
 
-  const result = await agent.ask('What is 2+2?');
+  const result = await agent.runSimple('What is 2+2?');
   console.log(result);
 
   await brain.stop();
@@ -227,7 +223,7 @@ main().catch(console.error);
 ### Using Hooks with Raw Agent (Low-level API)
 
 ```javascript
-const { Agent, HookEvent } = require('@open1s/jsbos');
+import { Agent, HookEvent } from '@open1s/jsbos';
 
 async function main() {
   const agent = await Agent.create({
@@ -303,7 +299,7 @@ The callback receives a `HookContextData` object:
 Create tool definitions using the `ToolDef` class:
 
 ```javascript
-const { ToolDef } = require('@open1s/jsbos/brainos');
+import { ToolDef } from '@open1s/jsbos';
 
 // Simple function tool
 function add(args) {
@@ -369,7 +365,7 @@ The Bus provides pub/sub messaging between components.
 ### Using BusManager
 
 ```javascript
-const { BusManager } = require('@open1s/jsbos/brainos');
+import { BusManager } from '@open1s/jsbos';
 
 const bus = await BusManager.create();
 await bus.start();
@@ -419,7 +415,7 @@ Request-response pattern with timeout support. Uses `BusManager` factory methods
 ### Server Side (Queryable)
 
 ```javascript
-const { BusManager } = require('@open1s/jsbos/brainos');
+import { BusManager } from '@open1s/jsbos';
 
 const bus = await BusManager.create();
 await bus.start();
@@ -469,7 +465,7 @@ RPC-style request-response pattern. Uses `BusManager` factory methods.
 ### Server Side (Callable)
 
 ```javascript
-const { BusManager } = require('@open1s/jsbos/brainos');
+import { BusManager } from '@open1s/jsbos';
 
 const bus = await BusManager.create();
 await bus.start();
@@ -530,7 +526,7 @@ model = "gpt-4"
 ### Using ConfigLoader Class
 
 ```javascript
-const { ConfigLoader } = require('@open1s/jsbos/brainos');
+import { ConfigLoader } from '@open1s/jsbos';
 
 const loader = new ConfigLoader();
 loader.discover();
@@ -556,7 +552,7 @@ BrainOS supports MCP (Model Context Protocol) for connecting to external tools a
 ### Using MCP Client
 
 ```javascript
-const { McpClient } = require('@open1s/jsbos/brainos');
+import { McpClient } from '@open1s/jsbos';
 
 async function main() {
   // Spawn an MCP server process
@@ -590,7 +586,7 @@ main().catch(console.error);
 ### Connect via HTTP
 
 ```javascript
-const { McpClient } = require('@open1s/jsbos/brainos');
+import { McpClient } from '@open1s/jsbos';
 
 const client = McpClient.connectHttp('http://localhost:3000');
 await client.initialize();
@@ -617,7 +613,7 @@ const tools = await client.listTools();
 ### Performance Metrics
 
 ```javascript
-const { BrainOS } = require('@open1s/jsbos/brainos');
+import { BrainOS } from '@open1s/jsbos';
 
 async function main() {
   const brain = new BrainOS({ apiKey: 'sk-...' });
@@ -641,13 +637,13 @@ main().catch(console.error);
 ### Tracing
 
 ```javascript
-const { initTracing } = require('@open1s/jsbos/brainos');
+import { initTracing } from '@open1s/jsbos';
 
 // Initialize tracing (usually called once at app start)
 initTracing();
 
 // Log a test message
-const { logTestMessage } = require('@open1s/jsbos/brainos');
+import { logTestMessage } from '@open1s/jsbos';
 logTestMessage('Test trace message');
 ```
 
@@ -710,7 +706,7 @@ new Agent(bus, options = {})
 The Agent supports configuring circuit breaker and rate limiter for resilience:
 
 ```javascript
-const { Agent } = require('@open1s/jsbos/brainos');
+import { Agent } from '@open1s/jsbos';
 
 const agent = await Agent.create({
   name: "assistant",
@@ -904,7 +900,7 @@ MCP (Model Context Protocol) client for connecting to external tools and service
 ### Complete Example with Tools
 
 ```javascript
-const { BrainOS, ToolDef } = require('@open1s/jsbos/brainos');
+import { BrainOS, ToolDef } from '@open1s/jsbos';
 
 function add(args) {
   return args.a + args.b;
@@ -951,7 +947,7 @@ main().catch(console.error);
 ### Pub/Sub Example
 
 ```javascript
-const { BusManager } = require('@open1s/jsbos/brainos');
+import { BusManager } from '@open1s/jsbos';
 
 async function publisher() {
   const bus = await BusManager.create();
@@ -978,7 +974,7 @@ async function subscriber() {
 ### Query/Response Example
 
 ```javascript
-const { BusManager } = require('@open1s/jsbos/brainos');
+import { BusManager } from '@open1s/jsbos';
 
 function uppercase(text) {
   return text.toUpperCase();
@@ -1016,7 +1012,7 @@ Hooks allow you to intercept and react to events during agent execution.
 #### Using Hooks with Low-level API
 
 ```javascript
-const { Agent, HookEvent } = require('@open1s/jsbos');
+import { Agent, HookEvent } from '@open1s/jsbos';
 
 async function main() {
   const agent = await Agent.create({
@@ -1091,7 +1087,7 @@ Plugins allow you to preprocess and postprocess LLM requests and responses.
 #### Using Plugins with brainos.js (High-level API)
 
 ```javascript
-const { BrainOS } = require('@open1s/jsbos/brainos');
+import { BrainOS } from '@open1s/jsbos';
 
 async function main() {
   const brain = new BrainOS();
@@ -1119,7 +1115,7 @@ async function main() {
     })
     .start();
 
-  const result = await agent.ask('Hello');
+  const result = await agent.runSimple('Hello');
   console.log(result);
 
   await brain.stop();
@@ -1131,7 +1127,7 @@ main().catch(console.error);
 #### Using Plugins with Low-level API (jsbos)
 
 ```javascript
-const { Agent } = require('@open1s/jsbos');
+import { Agent } from '@open1s/jsbos';
 
 async function main() {
   const agent = await Agent.create({
@@ -1176,13 +1172,14 @@ BrainOS provides session management for persisting agent state across restarts.
 #### Session Operations
 
 ```javascript
-const { BrainOS } = require('@open1s/jsbos/brainos');
+import { BrainOS } from '@open1s/jsbos';
 
 async function main() {
   const brain = new BrainOS();
   await brain.start();
   
-  const agent = brain.agent('assistant');
+  const agent = await brain.agent('assistant')
+    .start();
   
   // Save session
   agent.saveMessageLog('/tmp/session.json');
@@ -1190,7 +1187,7 @@ async function main() {
   // Later, restore session
   // agent.restoreMessageLog('/tmp/session.json');
   
-  const result = await agent.ask('Hello');
+  const result = await agent.runSimple('Hello');
   console.log(result);
   
   await brain.stop();

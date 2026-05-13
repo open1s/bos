@@ -52,7 +52,7 @@ await brain.start();
 const agent = await brain.agent('assistant')
   .register(addTool)
   .start();
-const result = await agent.ask('What is 2+2?');
+const result = await agent.runSimple('What is 2+2?');
 ```
 
 ### Rust (agent crate)
@@ -179,16 +179,16 @@ cd crates/jsbos && npm install && npm run build
 
 ## Unified API
 
-The `brainos` package (Python) and `@open1s/jsbos/brainos.js` (JavaScript) provide consistent high-level APIs:
+The `brainos` package (Python) and `@open1s/jsbos` (JavaScript) provide consistent high-level APIs:
 
 | Feature | Python | JavaScript |
 |---------|--------|------------|
 | Import | `from brainos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
 | Create brain | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
 | Create agent | `brain.agent("name")` | `brain.agent("name")` |
-| Fluent config | `.with_model("gpt-4")` | `.withModel("gpt-4")` |
+| Fluent config | `.with_model("gpt-4")` | `.model("gpt-4")` |
 | Register tools | `.with_tools(tool)` | `.register(toolDef)` |
-| Run | `await agent.ask("...")` | `await agent.ask("...")` |
+| Run | `await agent.ask("...")` | `await agent.runSimple("...")` |
 | Bus factory | `BusManager()` | `BusManager.create()` |
 
 ### Low-level Bindings

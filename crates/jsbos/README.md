@@ -233,7 +233,7 @@ const prompts = await agent.listMcpPrompts();
 Intercept agent events and optionally modify behavior.
 
 ```javascript
-agent.registerHook('BeforeToolCall', (err, ctx) => {
+agent.registerHook('BeforeToolCall', (ctx) => {
   console.log('About to call:', ctx.data.toolName);
   return 'continue'; // or 'abort' to block
 });
@@ -255,10 +255,10 @@ Add a plugin to intercept LLM requests/responses and tool calls.
 ```javascript
 agent.registerPlugin(
   'my-plugin',
-  (err, req) => { /* modify LLM request */ return req; },
-  (err, resp) => { /* modify LLM response */ return resp; },
-  (err, call) => { /* intercept tool call */ return call; },
-  (err, result) => { /* modify tool result */ return result; }
+  (req) => { /* modify LLM request */ return req; },
+  (resp) => { /* modify LLM response */ return resp; },
+  (call) => { /* intercept tool call */ return call; },
+  (result) => { /* modify tool result */ return result; }
 );
 ```
 
@@ -380,7 +380,7 @@ Standalone hook registry for external use.
 ```javascript
 const registry = new HookRegistry();
 
-await registry.register('BeforeToolCall', (err, ctx) => {
+await registry.register('BeforeToolCall', (ctx) => {
   console.log('Tool call:', ctx.agentId, ctx.data);
   return 'continue';
 });
