@@ -1,11 +1,14 @@
 # Changelog
 
-## v2.1.1 (Unreleased)
+## v2.1.1 (2026-05-13)
 
-- README rewritten with badges, problem-first hook, "Why BOS?" comparison table
-- GitHub Discussions enabled
-- Wiki documentation published (12 pages covering Python, JS, Rust, architecture, etc.)
-- Repository topics updated for discoverability
+- **Discoverability**: Rewrote README with problem-first hook, badge row, "Why BOS?" comparison table, hero image
+- **Discoverability**: GitHub Discussions enabled, topics updated (8 tags added)
+- **Discoverability**: Wiki published (12 pages — Python, JS, Rust guides, architecture, config, MCP, skills, API ref)
+- **Discoverability**: PyPI metadata updated (keywords, author, classifiers, project URLs)
+- **Discoverability**: npm keywords updated (agent-framework, multi-agent, llm, mcp, brainos, tools, skills)
+- **Feature**: Custom OG social card image for GitHub sharing
+- **Release**: v2.1.0 release notes published
 
 ## v2.1.0 (2026-05-10)
 
