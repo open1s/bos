@@ -5,13 +5,26 @@ build-backend = "maturin"
 [project]
 name = "nbos"
 version = "2.1.1"
-description = "Python bindings for BrainOS (agent/config/bus)"
+description = "Multi-language AI agent framework. Agents, tools, event bus, MCP, skills, memory — in Python."
 requires-python = ">=3.9"
+authors = [{name = "BrainOS Team", email = "oss@open1s.com"}]
+keywords = ["ai", "agent", "llm", "multi-agent", "mcp", "brainos", "react", "agent-framework", "rust", "tools"]
 classifiers = [
   "Programming Language :: Python",
   "Programming Language :: Rust",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Development Status :: 4 - Beta",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Intended Audience :: Developers",
 ]
+
+[project.urls]
+Homepage = "https://github.com/open1s/bos"
+Documentation = "https://github.com/open1s/bos/wiki"
+Repository = "https://github.com/open1s/bos"
+"Bug Tracker" = "https://github.com/open1s/bos/issues"
+Changelog = "https://github.com/open1s/bos/releases"
 
 [tool.maturin]
 module-name = "nbos_native"
