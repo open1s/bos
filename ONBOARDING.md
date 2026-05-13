@@ -11,7 +11,7 @@ You consume BrainOS as a developer tool -- install it via pip or npm, then write
 **Python**:
 
 ```python
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 @tool("Add two numbers")
 def add(a: int, b: int) -> int:

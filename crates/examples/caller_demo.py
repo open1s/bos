@@ -11,8 +11,8 @@ Demonstrates:
 import asyncio
 import json
 
-from brainos.bus import BusManager
-from brainos.caller import Caller, Callable
+from nbos.bus import BusManager
+from nbos.caller import Caller, Callable
 
 
 async def demo_inline_handler():

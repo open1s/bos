@@ -1,8 +1,7 @@
-"""
-brainos - Elegant Python API for BrainOS Agent Framework
+"""nbos - Python API for BrainOS Agent Framework
 
 Usage:
-    from brainos import BrainOS, tool
+    from nbos import BrainOS, tool
 
     @tool("Add two numbers")
     def add(a: int, b: int) -> int:
@@ -17,19 +16,19 @@ Usage:
         result = await agent.ask("What is 2+2?")
 """
 
-from brainos.core import (
+from nbos.core import (
     BrainOS,
     Agent,
     AgentBuilder,
     ToolRegistry,
     SessionManager,
 )
-from brainos.tool import tool, ToolDef, ToolResult
-from brainos.bus import BusManager, Publisher, Subscriber
-from brainos.query import Query, Queryable
-from brainos.caller import Caller, Callable
-from brainos.config import Config
-from nbos import (
+from nbos.tool import tool, ToolDef, ToolResult
+from nbos.bus import BusManager, Publisher, Subscriber
+from nbos.query import Query, Queryable
+from nbos.caller import Caller, Callable
+from nbos.config import Config
+from nbos_native import (
     AgentConfig,
     AgentPlugin,
     PluginRegistry,

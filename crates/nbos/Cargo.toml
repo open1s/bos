@@ -10,7 +10,7 @@ homepage = "https://github.com/open1s/bos"
 repository = "https://github.com/open1s/bos"
 
 [lib]
-name = "nbos"
+name = "nbos_native"
 crate-type = ["cdylib"]
 
 [dev-dependencies]

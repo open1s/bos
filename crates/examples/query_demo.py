@@ -11,8 +11,8 @@ Demonstrates:
 import asyncio
 import json
 
-from brainos.bus import BusManager
-from brainos.query import Query, Queryable
+from nbos.bus import BusManager
+from nbos.query import Query, Queryable
 
 
 async def demo_inline_handler():

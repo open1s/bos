@@ -36,7 +36,7 @@ pip install -e .
 
 ```python
 import asyncio
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 @tool("Add two numbers together")
 def add(a: int, b: int) -> int:
@@ -173,7 +173,7 @@ When `start()` is called, all skills in the directory are automatically register
 ### Using the `@tool()` Decorator
 
 ```python
-from brainos import tool
+from nbos import tool
 
 @tool("Calculate a math expression")
 def calc(expression: str) -> str:
@@ -205,7 +205,7 @@ def calc(expression: str) -> str:
 ### Manual ToolDef
 
 ```python
-from brainos.tool import ToolDef
+from nbos.tool import ToolDef
 
 def my_handler(args: dict) -> str:
     return f"Processed: {args}"
@@ -230,7 +230,7 @@ The Bus provides pub/sub messaging between components.
 ### Using BusManager
 
 ```python
-from brainos import BusManager
+from nbos import BusManager
 
 async with BusManager() as bus:
     # Publish
@@ -382,7 +382,7 @@ model = "gpt-4"
 ### Using Config Class
 
 ```python
-from brainos import Config
+from nbos import Config
 
 config = Config() \
     .discover() \
@@ -409,7 +409,7 @@ Hooks allow you to intercept and react to events during agent execution.
 #### Using Hooks
 
 ```python
-from brainos import BrainOS, HookEvent
+from nbos import BrainOS, HookEvent
 import asyncio
 
 async def main():
@@ -478,8 +478,8 @@ Plugins allow you to preprocess and postprocess LLM requests and responses.
 #### Using Plugins
 
 ```python
-from brainos import BrainOS
-from brainos.plugin import AgentPlugin
+from nbos import BrainOS
+from nbos.plugin import AgentPlugin
 import asyncio
 
 class MyPlugin(AgentPlugin):
@@ -516,7 +516,7 @@ BrainOS provides session management for persisting agent state across restarts.
 #### Session Operations
 
 ```python
-from brainos import BrainOS
+from nbos import BrainOS
 import asyncio
 
 async def main():
@@ -602,7 +602,7 @@ The Agent supports configuring circuit breaker and rate limiter for resilience v
 
 **Method 1: Fluent API (`with_resilience()`)**
 ```python
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 @tool("Add two numbers")
 def add(a: int, b: int) -> int:
@@ -814,7 +814,7 @@ Configuration loader.
 
 ```python
 import asyncio
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 @tool("Add two numbers")
 def add(a: int, b: int) -> int:
@@ -847,7 +847,7 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from brainos import BusManager
+from nbos import BusManager
 
 async def publisher():
     async with BusManager() as bus:
@@ -866,7 +866,7 @@ async def subscriber():
 
 ```python
 import asyncio
-from brainos import BusManager
+from nbos import BusManager
 
 def uppercase(text: str) -> str:
     return text.upper()
@@ -891,7 +891,7 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from brainos import BrainOS
+from nbos import BrainOS
 
 async def main():
     try:

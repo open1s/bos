@@ -7,8 +7,8 @@ Run with: python examples/demo_all_in_one.py
 import asyncio
 import json
 
-from brainos import BrainOS, tool, ToolDef, HookEvent, HookDecision, HookContext
-from brainos.bus import BusManager, Publisher, Subscriber
+from nbos import BrainOS, tool, ToolDef, HookEvent, HookDecision, HookContext
+from nbos.bus import BusManager, Publisher, Subscriber
 
 
 # ── Tools ────────────────────────────────────────────────────────────────────

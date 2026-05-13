@@ -1,5 +1,5 @@
 import asyncio
-from brainos import BrainOS
+from nbos import BrainOS
 
 async def main():
     print("🤖 BrainOS Agent Plugin Demo")

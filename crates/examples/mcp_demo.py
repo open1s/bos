@@ -41,7 +41,7 @@ async def demo_mcp_hello_world():
 
         if tools:
             tool_name = tools[0]["name"]
-            args = json.dumps({"message": "from brainos"}) if tool_name == "echo" else "{}"
+            args = json.dumps({"message": "from nbos"}) if tool_name == "echo" else "{}"
             result = await client.call_tool(tool_name, args)
             print(f"  📤 Called: {tool_name}({args})")
             print(f"  📥 Result: {json.dumps(result, indent=2)[:200]}")

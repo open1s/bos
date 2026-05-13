@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from nbos import ConfigLoader as PyConfigLoader
+from nbos_native import ConfigLoader as PyConfigLoader
 
 
 class Config:

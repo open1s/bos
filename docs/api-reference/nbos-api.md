@@ -35,7 +35,7 @@ Parameters:
 #### Example
 
 ```python
-from brainos import BrainOS
+from nbos import BrainOS
 
 brain = BrainOS(
     api_key="sk-...",
@@ -166,7 +166,7 @@ agent = Agent(cfg)  # Pass config directly to constructor
 #### Example
 
 ```python
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 import asyncio
 
 @tool("Add two numbers")
@@ -211,7 +211,7 @@ Parameters:
 #### Usage
 
 ```python
-from brainos import tool
+from nbos import tool
 
 @tool("Calculate a math expression")
 def calc(expression: str) -> str:
@@ -242,7 +242,7 @@ def calc(expression: str) -> str:
 For more control, create a `ToolDef` manually:
 
 ```python
-from brainos.tool import ToolDef
+from nbos.tool import ToolDef
 
 def my_handler(args: dict) -> str:
     return f"Processed: {args}"
@@ -292,7 +292,7 @@ Parameters:
 #### Example
 
 ```python
-from brainos import BusManager
+from nbos import BusManager
 import asyncio
 
 async def main():
@@ -355,7 +355,7 @@ Message subscriber with receive methods.
 #### Example
 
 ```python
-from brainos import BusManager
+from nbos import BusManager
 import asyncio
 
 async def main():
@@ -391,7 +391,7 @@ Request-response pattern.
 #### Example
 
 ```python
-from brainos import BusManager
+from nbos import BusManager
 import asyncio
 
 def uppercase_handler(text: str) -> str:
@@ -435,7 +435,7 @@ RPC pattern.
 #### Example
 
 ```python
-from brainos import BusManager
+from nbos import BusManager
 import asyncio
 
 def echo_handler(text: str) -> str:
@@ -577,7 +577,7 @@ print(text)
 
 ```python
 import asyncio
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 @tool("Add two numbers")
 def add(a: int, b: int) -> int:
@@ -610,7 +610,7 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from brainos import BusManager
+from nbos import BusManager
 
 async def publisher():
     async with BusManager() as bus:
@@ -629,7 +629,7 @@ async def subscriber():
 
 ```python
 import asyncio
-from brainos import BusManager
+from nbos import BusManager
 
 def uppercase(text: str) -> str:
     return text.upper()

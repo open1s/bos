@@ -13,7 +13,7 @@ Demonstrates:
 import asyncio
 import json
 
-from brainos.bus import BusManager
+from nbos.bus import BusManager
 
 
 async def demo_direct_publish():

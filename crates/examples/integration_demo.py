@@ -14,10 +14,10 @@ Demonstrates:
 import asyncio
 import json
 
-from brainos.bus import BusManager
-from brainos.config import Config
-from brainos.query import Query, Queryable
-from brainos.caller import Caller, Callable
+from nbos.bus import BusManager
+from nbos.config import Config
+from nbos.query import Query, Queryable
+from nbos.caller import Caller, Callable
 
 
 async def demo_config_and_bus():
@@ -86,9 +86,9 @@ async def demo_query():
         await q.start()
 
         query = await Query.create(bus.bus, "svc/wordcount")
-        resp = await query.query_text("hello world from brainos")
+        resp = await query.query_text("hello world from nbos")
         result = json.loads(resp)
-        print(f"  📤 Query: 'hello world from brainos'")
+        print(f"  📤 Query: 'hello world from nbos'")
         print(f"  📥 Response: words={result['word_count']}, chars={result['text_length']}")
 
     print("  ✅ Query done\n")

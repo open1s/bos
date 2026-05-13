@@ -20,8 +20,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from nbos import Query as PyQuery
-from nbos import Queryable as PyQueryable
+from nbos_native import Query as PyQuery
+from nbos_native import Queryable as PyQueryable
 
 
 class Query:

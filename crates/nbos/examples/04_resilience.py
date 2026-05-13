@@ -17,7 +17,7 @@ Run with:
 
 import asyncio
 import logging
-from brainos import BrainOS, tool, InitTracing, ConfigLoader
+from nbos import BrainOS, tool, InitTracing, ConfigLoader
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s: %(message)s")
 _LOG = logging.getLogger("resilience_demo")

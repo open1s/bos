@@ -17,14 +17,14 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from nbos import Bus as PyBus
-from nbos import BusConfig as PyBusConfig
-from nbos import Publisher as PyPublisher
-from nbos import Subscriber as PySubscriber
-from nbos import Query as PyQuery
-from nbos import Queryable as PyQueryable
-from nbos import Caller as PyCaller
-from nbos import Callable as PyCallable
+from nbos_native import Bus as PyBus
+from nbos_native import BusConfig as PyBusConfig
+from nbos_native import Publisher as PyPublisher
+from nbos_native import Subscriber as PySubscriber
+from nbos_native import Query as PyQuery
+from nbos_native import Queryable as PyQueryable
+from nbos_native import Caller as PyCaller
+from nbos_native import Callable as PyCallable
 
 
 # ── BusManager ──────────────────────────────────────────────────────
@@ -91,28 +91,28 @@ class BusManager:
         return Subscriber(raw)
 
     async def create_query(self, topic: str):
-        from brainos.query import Query
+        from nbos.query import Query
         if self._bus is None:
             raise RuntimeError("Bus not started. Use 'async with' context.")
         raw = await PyQuery.create(self._bus, topic)
         return Query(raw)
 
     async def create_queryable(self, topic: str, handler=None):
-        from brainos.query import Queryable
+        from nbos.query import Queryable
         if self._bus is None:
             raise RuntimeError("Bus not started. Use 'async with' context.")
         raw = await PyQueryable.create(self._bus, topic, handler)
         return Queryable(raw)
 
     async def create_caller(self, name: str):
-        from brainos.caller import Caller
+        from nbos.caller import Caller
         if self._bus is None:
             raise RuntimeError("Bus not started. Use 'async with' context.")
         raw = await PyCaller.create(self._bus, name)
         return Caller(raw)
 
     async def create_callable(self, uri: str, handler=None):
-        from brainos.caller import Callable
+        from nbos.caller import Callable
         if self._bus is None:
             raise RuntimeError("Bus not started. Use 'async with' context.")
         raw = await PyCallable.create(self._bus, uri, handler)

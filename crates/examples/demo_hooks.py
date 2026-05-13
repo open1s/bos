@@ -1,5 +1,5 @@
 import asyncio
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 def log_hook(event, ctx):
     print(f"  [HOOK] {event.value} fired")

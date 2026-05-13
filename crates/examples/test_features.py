@@ -11,7 +11,7 @@ from nbos import (
     McpClient,
     ConfigLoader
 )
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 
 async def test_mcp():

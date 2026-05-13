@@ -102,7 +102,7 @@ Python and JavaScript APIs are designed to be consistent:
 
 ```python
 # Python
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 @tool("Add")
 def add(a, b): return a + b

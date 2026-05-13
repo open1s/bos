@@ -20,8 +20,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from nbos import Caller as PyCaller
-from nbos import Callable as PyCallable
+from nbos_native import Caller as PyCaller
+from nbos_native import Callable as PyCallable
 
 
 class Caller:

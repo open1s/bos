@@ -2,9 +2,9 @@
 import pytest
 import asyncio
 import json
-from brainos import BrainOS, tool, ToolDef, ToolResult, ToolRegistry
-from brainos.tool import _extract_params, _build_schema
-from brainos.config import Config
+from nbos import BrainOS, tool, ToolDef, ToolResult, ToolRegistry
+from nbos.tool import _extract_params, _build_schema
+from nbos.config import Config
 
 
 class TestToolDecorator:
@@ -180,13 +180,13 @@ class TestBusManager:
 
     @pytest.mark.asyncio
     async def test_bus_manager_create(self):
-        from brainos.bus import BusManager
+        from nbos.bus import BusManager
         async with BusManager() as bus:
             assert bus is not None
 
     @pytest.mark.asyncio
     async def test_bus_manager_publish_text(self):
-        from brainos.bus import BusManager
+        from nbos.bus import BusManager
         async with BusManager() as bus:
             sub = await bus.create_subscriber("test/topic")
             await bus.publish_text("test/topic", "hello")
@@ -195,7 +195,7 @@ class TestBusManager:
 
     @pytest.mark.asyncio
     async def test_bus_manager_publish_json(self):
-        from brainos.bus import BusManager
+        from nbos.bus import BusManager
         async with BusManager() as bus:
             sub = await bus.create_subscriber("test/json")
             await bus.publish_json("test/json", {"key": "value"})
@@ -204,7 +204,7 @@ class TestBusManager:
 
     @pytest.mark.asyncio
     async def test_publisher_subscriber(self):
-        from brainos.bus import BusManager
+        from nbos.bus import BusManager
         async with BusManager() as bus:
             pub = await bus.create_publisher("test/ps")
             sub = await bus.create_subscriber("test/ps")
@@ -214,7 +214,7 @@ class TestBusManager:
 
     @pytest.mark.asyncio
     async def test_subscriber_recv_json(self):
-        from brainos.bus import BusManager
+        from nbos.bus import BusManager
         async with BusManager() as bus:
             pub = await bus.create_publisher("test/json2")
             sub = await bus.create_subscriber("test/json2")
@@ -230,7 +230,7 @@ class TestQueryCallableHighLevel:
 
     @pytest.mark.asyncio
     async def test_queryable_via_bus_manager(self):
-        from brainos.bus import BusManager
+        from nbos.bus import BusManager
         async with BusManager() as bus:
             def upper(text: str) -> str:
                 return text.upper()
@@ -244,7 +244,7 @@ class TestQueryCallableHighLevel:
 
     @pytest.mark.asyncio
     async def test_callable_via_bus_manager(self):
-        from brainos.bus import BusManager
+        from nbos.bus import BusManager
         async with BusManager() as bus:
             def echo(text: str) -> str:
                 return f"echo:{text}"
@@ -262,8 +262,8 @@ class TestSessionManager:
 
     @pytest.mark.asyncio
     async def test_session_manager_save_and_restore(self, tmp_path):
-        from brainos import BrainOS
-        from brainos import tool as _tool
+        from nbos import BrainOS
+        from nbos import tool as _tool
 
         @_tool("Add numbers")
         def add(a: int, b: int) -> int:
@@ -282,7 +282,7 @@ class TestSessionManager:
 
     @pytest.mark.asyncio
     async def test_session_get_messages(self):
-        from brainos import BrainOS
+        from nbos import BrainOS
         async with BrainOS() as brain:
             agent = await brain.agent("test-agent").start()
             msgs = agent.session.get_messages()
@@ -290,7 +290,7 @@ class TestSessionManager:
 
     @pytest.mark.asyncio
     async def test_session_add_message(self):
-        from brainos import BrainOS
+        from nbos import BrainOS
         async with BrainOS() as brain:
             agent = await brain.agent("test-agent").start()
             agent.session.add_message("user", "Hello")

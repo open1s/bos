@@ -8,7 +8,7 @@ Demonstrates:
 3. Loading and reloading config
 """
 
-from brainos.config import Config
+from nbos.config import Config
 
 
 def demo_discover():

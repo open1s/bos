@@ -30,7 +30,7 @@ from pathlib import Path
 
 from nbos import Agent as PyAgent, AgentConfig as PyAgentConfig, Bus as PyBus, BusConfig as PyBusConfig, ConfigLoader,init_tracing
 
-# from brainos import Agent
+# from nbos import Agent
 
 init_tracing()
 loader = ConfigLoader()

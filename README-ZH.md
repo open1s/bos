@@ -22,7 +22,7 @@
 ### Python (brainos)
 
 ```python
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 @tool("两数相加")
 def add(a: int, b: int) -> int:
@@ -182,7 +182,7 @@ cd crates/jsbos && npm install && npm run build
 
 | 功能 | Python | JavaScript |
 |------|--------|------------|
-| 导入 | `from brainos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
+| 导入 | `from nbos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
 | 创建 brain | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
 | 创建代理 | `brain.agent("name")` | `brain.agent("name")` |
 | 链式配置 | `.with_model("gpt-4")` | `.model("gpt-4")` |

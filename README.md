@@ -22,7 +22,7 @@ A modular Rust-based operating system and runtime framework for building intelli
 ### Python (brainos)
 
 ```python
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 @tool("Add two numbers")
 def add(a: int, b: int) -> int:
@@ -182,7 +182,7 @@ The `brainos` package (Python) and `@open1s/jsbos` (JavaScript) provide consiste
 
 | Feature | Python | JavaScript |
 |---------|--------|------------|
-| Import | `from brainos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
+| Import | `from nbos import BrainOS, tool` | `import { BrainOS, ToolDef } from '@open1s/jsbos'` |
 | Create brain | `async with BrainOS() as brain:` | `const brain = new BrainOS(); await brain.start()` |
 | Create agent | `brain.agent("name")` | `brain.agent("name")` |
 | Fluent config | `.with_model("gpt-4")` | `.model("gpt-4")` |

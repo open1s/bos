@@ -13,7 +13,7 @@ import json
 from datetime import datetime, timezone
 from nbos import ConfigLoader as PyConfigLoader
 
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 
 
 @tool("Get current UTC time")

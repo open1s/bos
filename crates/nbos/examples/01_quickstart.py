@@ -9,7 +9,7 @@ Demonstrates:
 """
 
 import asyncio
-from brainos import BrainOS, tool
+from nbos import BrainOS, tool
 from nbos import ConfigLoader as PyConfigLoader
 
 @tool("Add two numbers together")

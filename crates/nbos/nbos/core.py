@@ -1,6 +1,6 @@
-"""Elegant Python API for BrainOS Agent Framework.
+"""Fluent builder API for nbos Agent Framework.
 
-Based on jsbos brainos.js patterns with fluent builder API.
+Based on jsbos patterns with fluent builder API.
 """
 
 from __future__ import annotations
@@ -11,18 +11,18 @@ from typing import Any, Callable
 from contextlib import AbstractAsyncContextManager
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(name)s: %(message)s')
-_LOG = logging.getLogger("brainos.core")
+_LOG = logging.getLogger("nbos.core")
 
-from nbos import Agent as PyAgent
-from nbos import AgentConfig as PyAgentConfig
-from nbos import AgentPlugin as PyAgentPlugin
-from nbos import Bus as PyBus
-from nbos import BusConfig as PyBusConfig
-from nbos import ConfigLoader as PyConfigLoader
-from nbos import PythonTool
-from nbos import HookEvent, HookDecision, HookContext
+from nbos_native import Agent as PyAgent
+from nbos_native import AgentConfig as PyAgentConfig
+from nbos_native import AgentPlugin as PyAgentPlugin
+from nbos_native import Bus as PyBus
+from nbos_native import BusConfig as PyBusConfig
+from nbos_native import ConfigLoader as PyConfigLoader
+from nbos_native import PythonTool
+from nbos_native import HookEvent, HookDecision, HookContext
 
-from brainos.tool import ToolDef
+from nbos.tool import ToolDef
 
 
 DEFAULT_MODEL = "nvidia/meta/llama-3.1-8b-instruct"
@@ -310,23 +310,19 @@ class AgentBuilder:
         return Agent(self._inner, self._tools)
 
     async def ask(self, prompt: str) -> str:
-        """Run an LLM query with tool calling. Lazy-starts the agent."""
         if not self._inner:
             await self.start()
         return await self._inner.run_simple(prompt)
 
     async def chat(self, message: str) -> str:
-        """Alias for ask(). Lazy-starts the agent."""
         return await self.ask(message)
 
     async def react(self, task: str) -> str:
-        """Run with explicit ReAct reasoning loop. Lazy-starts the agent."""
         if not self._inner:
             await self.start()
         return await self._inner.react(task)
 
     async def stream(self, task: str):
-        """Stream response tokens. Lazy-starts the agent."""
         if not self._inner:
             await self.start()
         return await self._inner.stream(task)
@@ -335,7 +331,7 @@ class AgentBuilder:
 class Agent:
     """High-level agent wrapper with fluent API.
 
-    Created via BrainOS.agent() or AgentBuilder.
+    Created via nbos.agent() or AgentBuilder.
     """
 
     def __init__(self, inner: PyAgent, tools: ToolRegistry) -> None:
@@ -343,34 +339,27 @@ class Agent:
         self._tools = tools
 
     async def ask(self, prompt: str) -> str:
-        """Run an LLM query with tool calling (primary method)."""
         return await self._inner.run_simple(prompt)
 
     async def chat(self, message: str) -> str:
-        """Alias for ask()."""
         return await self.ask(message)
 
     async def react(self, task: str) -> str:
-        """Run with explicit ReAct reasoning loop."""
         return await self._inner.react(task)
 
     async def stream(self, task: str):
-        """Stream response tokens via async iterator."""
         return await self._inner.stream(task)
 
     @property
     def session(self) -> SessionManager:
-        """Session manager for conversation history."""
         return SessionManager(self._inner)
 
     @property
     def tools(self) -> list[str]:
-        """List registered tool names."""
         return self._inner.list_tools()
 
     @property
     def config(self) -> dict[str, Any]:
-        """Agent configuration dict."""
         return self._inner.config()
 
 
@@ -423,26 +412,6 @@ class BrainOS(AbstractAsyncContextManager):
         timeout_secs: int = 120,
         tools: list[ToolDef] | None = None,
     ) -> AgentBuilder:
-        """Create a new agent builder.
-
-        Usage:
-            # Minimal
-            agent = brain.agent("assistant")
-
-            # With tools directly
-            agent = brain.agent("assistant", tools=[add, multiply])
-
-            # Fluent chain
-            agent = (
-                brain.agent("assistant", model="gpt-4")
-                .with_tools(add, multiply)
-                .with_prompt("You are a math expert.")
-                .with_temperature(0.5)
-            )
-
-            # Build and run
-            result = await agent.ask("What is 2+2?")
-        """
         return AgentBuilder(
             self._bus,
             {
