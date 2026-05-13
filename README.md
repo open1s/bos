@@ -18,7 +18,7 @@ English | [中文版本](./README-ZH.md)
 BOS is the runtime that makes this work out of the box. One `pip install nbos` or `npm install @open1s/jsbos` gets you agents with tools, a pub/sub event bus for multi-agent coordination, MCP client for external tools, skill loading for domain-specific capabilities, and cross-session memory — all backed by a performant Rust core.
 
 <p align="center">
-  <img src="docs/assets/bos-hero.png" alt="BrainOS demo" width="700">
+  <img src="https://github.com/open1s/bos/blob/main/docs/assets/bos-hero.png" alt="BrainOS demo" width="700">
 </p>
 
 ```bash
