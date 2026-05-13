@@ -1,23 +1,46 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync } from 'fs'
-import { execSync } from 'child_process'
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import { tmpdir } from 'os'
+import { createRequire } from 'module'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+const require = createRequire(import.meta.url)
+const ts = require('typescript')
 
 const rootDir = join(__dirname, '..')
 const tmpOutDir = join(tmpdir(), 'jsbos-dts')
 const jsbosDts = readFileSync(join(rootDir, 'jsbos.d.ts'), 'utf8')
 
-execSync(
-  `npx tsc index.js --declaration --allowJs --emitDeclarationOnly --outDir "${tmpOutDir}" --skipLibCheck --ignoreConfig 2>/dev/null || true`,
-  { cwd: rootDir }
-)
-
 let indexDts = ''
 try {
+  if (!existsSync(tmpOutDir)) mkdirSync(tmpOutDir, { recursive: true })
+
+  const options = {
+    declaration: true,
+    allowJs: true,
+    emitDeclarationOnly: true,
+    outDir: tmpOutDir,
+    skipLibCheck: true,
+    noEmit: false,
+    esModuleInterop: true,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+  }
+
+  const program = ts.createProgram([join(rootDir, 'index.js')], options)
+  const diagnostics = ts.getPreEmitDiagnostics(program)
+  if (diagnostics.length > 0) {
+    const host = ts.createCompilerHost(options)
+    const formatHost = {
+      getCanonicalFileName: (p) => p,
+      getCurrentDirectory: ts.sys.getCurrentDirectory,
+      getNewLine: () => ts.sys.newLine,
+    }
+    console.warn(ts.formatDiagnosticsWithColorAndContext(diagnostics, formatHost))
+  }
+  program.emit()
   indexDts = readFileSync(join(tmpOutDir, 'index.d.ts'), 'utf8')
 } catch {
   console.warn('tsc failed to generate index.d.ts')
