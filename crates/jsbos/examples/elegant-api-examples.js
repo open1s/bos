@@ -168,7 +168,7 @@ Use type hints, snake_case, docstrings.`)
 
   console.log('Skills loaded from:', skillsDir)
 
-  const r4 = await agent.ask('Write a python function with type hints')
+  const r4 = await agent.runSimple('Write a python function with type hints')
   console.log('Result:', r4.substring(0, 200), '...\n')
 
   fs.rmSync(skillsDir, { recursive: true })

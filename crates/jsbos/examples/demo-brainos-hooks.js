@@ -43,7 +43,7 @@ async function demo() {
 
   console.log('3. Running agent (hooks will fire during execution)...')
   try {
-    const result = await agent.ask('Say "test" in one word')
+    const result = await agent.runSimple('Say "test" in one word')
     console.log('   Result:', result?.substring?.(0, 100) + '...' || result)
   } catch (e) {
     console.log('   Error (may be expected with rate limiting):', e.message?.substring(0, 100))
