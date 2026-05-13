@@ -67,6 +67,18 @@ jobs:
       - name: Build
         run: ${{ matrix.build }}
 
+      - name: Fix binary name for cross-compiled builds
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-apple-darwin)
+              mv -f jsbos.darwin-arm64.node jsbos.darwin-x64.node 2>/dev/null || true
+              ;;
+            aarch64-apple-darwin)
+              # Already correct: jsbos.darwin-arm64.node
+              ;;
+          esac
+        shell: bash
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
