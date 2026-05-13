@@ -341,6 +341,9 @@ class Agent:
     async def ask(self, prompt: str) -> str:
         return await self._inner.run_simple(prompt)
 
+    async def run_simple(self, message: str) -> str:
+        return await self.ask(message)
+
     async def chat(self, message: str) -> str:
         return await self.ask(message)
 
@@ -411,19 +414,22 @@ class BrainOS(AbstractAsyncContextManager):
         max_tokens: int | None = None,
         timeout_secs: int = 120,
         tools: list[ToolDef] | None = None,
+        **kwargs,
     ) -> AgentBuilder:
+        opts = {
+            "name": name,
+            "model": model or self._model,
+            "base_url": self._base_url,
+            "api_key": self._api_key,
+            "system_prompt": system_prompt,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "timeout_secs": timeout_secs,
+        }
+        opts.update(kwargs)
         return AgentBuilder(
             self._bus,
-            {
-                "name": name,
-                "model": model or self._model,
-                "base_url": self._base_url,
-                "api_key": self._api_key,
-                "system_prompt": system_prompt,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "timeout_secs": timeout_secs,
-            },
+            opts,
         ).with_tools(*self._registry.list_tools(), *(tools or []))
 
     def register_global(self, *tools: ToolDef) -> "BrainOS":

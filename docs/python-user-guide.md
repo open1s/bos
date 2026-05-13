@@ -20,7 +20,7 @@ This guide provides a unified, consistent API for using BrainOS in Python. The A
 ## Installation
 
 ```bash
-pip install brainos
+pip install nbos
 ```
 
 Or install from source:
@@ -142,26 +142,28 @@ async for chunk in await agent.stream("Tell me a story"):
 agent.register(add)
 
 # Multiple tools
-agent.register_many(tool1, tool2, tool3)
+agent.with_tools(tool1, tool2, tool3)
 
 # Or chain them
-agent.register(tool1).register(tool2)
+agent.with_tools(tool1).with_tools(tool2)
 
 # Register skills from a directory
-agent.register_skills("/path/to/skills_directory")
+agent.with_skills_dir("/path/to/skills_directory")
 ```
 
 ### Loading Skills from Directory
 
-Skills are Python modules containing `@tool` decorated functions. Use `register_skills()` to load all skills from a directory:
+Skills are loaded from `SKILL.md` files in skill directories. Use `with_skills_dir()` to load skills from a directory:
 
 ```python
 # Directory structure:
 # /path/to/skills/
-#   ├── math.py        # contains @tool decorated functions
-#   └── search.py      # contains @tool decorated functions
+#   ├── my-skill/
+#   │   └── SKILL.md        # YAML frontmatter + markdown instructions
+#   └── another-skill/
+#       └── SKILL.md
 
-agent.register_skills("/path/to/skills")
+agent.with_skills_dir("/path/to/skills")
 ```
 
 When `start()` is called, all skills in the directory are automatically registered.
@@ -409,41 +411,30 @@ Hooks allow you to intercept and react to events during agent execution.
 #### Using Hooks
 
 ```python
-from nbos import BrainOS, HookEvent
+from nbos import BrainOS, HookEvent, HookDecision, HookContext
 import asyncio
+
+def before_tool_hook(event: HookEvent, ctx: HookContext) -> HookDecision:
+    tool_name = ctx.data.get("tool_name", "unknown")
+    print(f"[HOOK] About to call tool: {tool_name}")
+    return HookDecision("Continue", None)
+
+def after_llm_hook(event: HookEvent, ctx: HookContext) -> HookDecision:
+    print(f"[HOOK] LLM call completed")
+    return HookDecision("Continue", None)
 
 async def main():
     async with BrainOS() as brain:
-        agent = brain.agent("assistant")
+        agent = await (
+            brain.agent("assistant")
+            .with_hooks({
+                "BeforeToolCall": before_tool_hook,
+                "AfterLlmCall": after_llm_hook,
+            })
+            .start()
+        )
         
-        # Register hooks
-        agent.hooks().register(HookEvent.BeforeToolCall, lambda ctx: {
-            "tool_name": ctx.get("tool_name"),
-            "decision": "continue"  # or "abort" or {"error": "message"}
-        })
-        
-        agent.hooks().register(HookEvent.AfterToolCall, lambda ctx: {
-            "tool_name": ctx.get("tool_name"),
-            "tool_result": ctx.get("tool_result"),
-            "decision": "continue"
-        })
-        
-        agent.hooks().register(HookEvent.BeforeLlmCall, lambda ctx: {
-            "prompt": ctx.get("prompt"),
-            "decision": "continue"
-        })
-        
-        agent.hooks().register(HookEvent.AfterLlmCall, lambda ctx: {
-            "response": ctx.get("response"),
-            "decision": "continue"
-        })
-        
-        agent.hooks().register(HookEvent.OnError, lambda ctx: {
-            "error": ctx.get("error"),
-            "decision": "continue"
-        })
-        
-        result = await agent.react("Say hello!")
+        result = await agent.ask("What is 5 + 3?")
         print(result)
 
 asyncio.run(main())
@@ -479,31 +470,31 @@ Plugins allow you to preprocess and postprocess LLM requests and responses.
 
 ```python
 from nbos import BrainOS
-from nbos.plugin import AgentPlugin
 import asyncio
 
-class MyPlugin(AgentPlugin):
-    async def process_llm_request(self, wrapper):
-        # Modify request before sending to LLM
-        # Example: add system prompt prefix
-        request = wrapper.into_request()
-        # Modify request here
-        return wrapper.__class__(request)
-    
-    async def process_llm_response(self, wrapper):
-        # Modify response after receiving from LLM
-        response = wrapper.into_response()
-        # Modify response here
-        return wrapper.__class__(response)
-
 async def main():
+    def on_llm_request(wrapped):
+        print(f"[PLUGIN] LLM Request: model={wrapped.model}")
+        return wrapped
+
+    def on_tool_call(wrapped):
+        print(f"[PLUGIN] Tool call: {wrapped.name}")
+        return wrapped
+
+    plugin = {
+        "name": "logging-plugin",
+        "on_llm_request": on_llm_request,
+        "on_tool_call": on_tool_call,
+    }
+
     async with BrainOS() as brain:
-        agent = brain.agent("assistant")
+        agent = await (
+            brain.agent("assistant")
+            .with_plugins(plugin)
+            .start()
+        )
         
-        # Register plugin
-        agent.plugins().register_blocking(MyPlugin())
-        
-        result = await agent.react("Say hello!")
+        result = await agent.ask("Say hello!")
         print(result)
 
 asyncio.run(main())
@@ -521,15 +512,18 @@ import asyncio
 
 async def main():
     async with BrainOS() as brain:
-        agent = brain.agent("assistant")
+        agent = await brain.agent("assistant").start()
         
         # Save session
-        agent.save_message_log("/tmp/session.json")
+        agent.session.save("/tmp/session.json")
         
-        # Later, restore session
-        # agent.restore_message_log("/tmp/session.json")
+        # Get messages
+        messages = agent.session.get_messages()
         
-        result = await agent.react("Say hello!")
+        # Compact long conversations
+        agent.session.compact()
+        
+        result = await agent.ask("Say hello!")
         print(result)
 
 asyncio.run(main())
@@ -539,10 +533,11 @@ asyncio.run(main())
 
 | Method | Description |
 |--------|-------------|
-| `add_message(message)` | Add message to conversation log |
+| `save(path)` | Save conversation messages to file |
+| `restore(path)` | Restore conversation messages from file |
+| `add_message(role, content)` | Add message to conversation |
 | `get_messages()` | Get conversation messages |
-| `save_message_log(path)` | Save message log to file |
-| `restore_message_log(path)` | Restore message log from file |
+| `compact()` | Compact long conversation logs |
 
 ---
 
@@ -562,7 +557,7 @@ BrainOS(api_key=None, base_url=None, model=None)
 **Attributes:**
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `__version__` | `str` | BrainOS package version (e.g., "1.2.0") |
+| `__version__` | `str` | BrainOS package version (e.g., "2.1.1") |
 
 **Methods:**
 | Method | Description |
@@ -572,29 +567,40 @@ BrainOS(api_key=None, base_url=None, model=None)
 
 ### `Agent`
 
-LLM-powered agent with tool support.
+LLM-powered agent with tool support. Created via `AgentBuilder` (`.with_X()` chain + `.start()`).
 
-**Constructor:**
-```python
-Agent(bus, name="assistant", model=..., base_url=..., api_key=..., system_prompt=..., temperature=0.7, timeout_secs=120)
-```
-
-**Methods:**
+**AgentBuilder Methods (chainable until `.start()`):**
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `with_model(model)` | Set model | `Agent` |
-| `with_prompt(prompt)` | Set system prompt | `Agent` |
-| `with_temperature(temp)` | Set temperature | `Agent` |
-| `with_timeout(secs)` | Set timeout | `Agent` |
-| `with_resilience(**opts)` | Set resilience config | `Agent` |
-| `register(tool)` | Register a tool | `Agent` |
-| `register_many(*tools)` | Register multiple tools | `Agent` |
+| `with_model(model)` | Set model | `AgentBuilder` |
+| `with_prompt(prompt)` | Set system prompt | `AgentBuilder` |
+| `with_temperature(temp)` | Set temperature | `AgentBuilder` |
+| `with_timeout(secs)` | Set timeout | `AgentBuilder` |
+| `with_resilience(**opts)` | Set resilience config | `AgentBuilder` |
+| `with_tools(*tools)` | Register one or more tools | `AgentBuilder` |
+| `register(*tools)` | Alias for with_tools | `AgentBuilder` |
+| `with_hooks(hooks)` | Register lifecycle hooks | `AgentBuilder` |
+| `with_plugins(*plugins)` | Register plugins | `AgentBuilder` |
+| `with_mcp(namespace, cmd, args)` | Add MCP server | `AgentBuilder` |
+| `with_mcp_http(namespace, url)` | Add MCP HTTP server | `AgentBuilder` |
+| `with_skills_dir(path)` | Load skills from directory | `AgentBuilder` |
 | `start()` | Initialize agent | `Agent` |
+| `ask(question)` | Lazy-init + run agent | `str` |
+| `chat(message)` | Lazy-init + chat | `str` |
+| `react(task)` | Lazy-init + ReAct | `str` |
+| `stream(task)` | Lazy-init + stream | `AsyncIterator` |
+
+**Agent Methods (after `.start()`):**
+| Method | Description | Returns |
+|--------|-------------|---------|
 | `ask(question)` | Run agent | `str` |
 | `chat(message)` | Simple chat | `str` |
 | `run_simple(message)` | Simple run | `str` |
-| `react(task)` | Run with ReAct | `str` | 
+| `react(task)` | Run with ReAct | `str` |
 | `stream(task)` | Stream response | `AsyncIterator` |
+| `session` | Session manager | `SessionManager` |
+| `tools` | Registered tool names | `list[str]` |
+| `config` | Agent configuration | `dict` |
 
 ### Resilience Configuration
 
@@ -614,8 +620,6 @@ async with BrainOS(api_key="sk-...") as brain:
         rate_limit_capacity=40,           # max requests per window
         rate_limit_window_secs=60,         # window duration in seconds
         rate_limit_max_retries=3,          # retry attempts on 429 errors
-        rate_limit_retry_backoff_secs=1,      # backoff between retries
-        rate_limit_auto_wait=True,            # auto-wait when rate limited
         circuit_breaker_max_failures=5,       # failures before opening circuit
         circuit_breaker_cooldown_secs=30,     # seconds before attempting recovery
     )
@@ -630,7 +634,6 @@ async with BrainOS(api_key="sk-...") as brain:
         rate_limit_capacity=40,
         rate_limit_window_secs=60,
         rate_limit_max_retries=3,
-        rate_limit_auto_wait=True,
         circuit_breaker_max_failures=5,
         circuit_breaker_cooldown_secs=30,
     )
@@ -651,7 +654,7 @@ async with BrainOS(api_key="sk-...") as brain:
 **Method 4: Using nbos directly with AgentConfig**
 
 ```python
-from nbos import Agent, AgentConfig
+from nbos import PyAgent, AgentConfig, Bus, BusConfig
 
 cfg = AgentConfig(
     name="assistant",
@@ -665,12 +668,10 @@ cfg = AgentConfig(
     rate_limit_capacity=40,               # max requests per window
     rate_limit_window_secs=60,             # window duration in seconds
     rate_limit_max_retries=3,            # retry attempts on rate limit
-    rate_limit_retry_backoff_secs=1,    # backoff between retries
-    rate_limit_auto_wait=True,             # auto-wait when rate limited
 )
 
-# Create agent from config
-agent = Agent(cfg)
+async with BrainOS() as brain:
+    agent = await PyAgent.create(cfg, brain.bus)
 ```
 
 **Circuit Breaker Options:**
@@ -685,8 +686,6 @@ agent = Agent(cfg)
 | `rate_limit_capacity` | 40 | Max requests per window |
 | `rate_limit_window_secs` | 60 | Window duration in seconds |
 | `rate_limit_max_retries` | 3 | Retry attempts on 429 errors |
-| `rate_limit_retry_backoff_secs` | 1 | Initial backoff duration |
-| `rate_limit_auto_wait` | true | Auto-wait when rate limited |
 
 **Properties:**
 | Property | Type | Description |
@@ -717,12 +716,12 @@ BusManager(mode="peer", connect=None, listen=None, peer=None)
 |--------|-------------|
 | `publish_text(topic, payload)` | Publish text message |
 | `publish_json(topic, data)` | Publish JSON message |
-| `createPublisher(topic)` | Create a publisher |
-| `createSubscriber(topic)` | Create a subscriber |
-| `createQuery(topic)` | Create a query client |
-| `createQueryable(topic, handler)` | Create a queryable server |
-| `createCaller(name)` | Create a caller client |
-| `createCallable(uri, handler)` | Create a callable server |
+| `create_publisher(topic)` | Create a publisher |
+| `create_subscriber(topic)` | Create a subscriber |
+| `create_query(topic)` | Create a query client |
+| `create_queryable(topic, handler)` | Create a queryable server |
+| `create_caller(name)` | Create a caller client |
+| `create_callable(uri, handler)` | Create a callable server |
 
 ### `Publisher`
 
@@ -826,15 +825,16 @@ def multiply(a: int, b: int) -> int:
 
 @tool("Get current time")
 def get_time() -> dict:
-    from datetime import datetime
-    return {"utc": datetime.utcnow().isoformat()}
+    from datetime import datetime, timezone
+    return {"utc": datetime.now(timezone.utc).isoformat()}
 
 async def main():
     async with BrainOS() as brain:
-        agent = brain.agent("assistant") \
-            .register(add) \
-            .register(multiply) \
-            .register(get_time)
+        agent = await (
+            brain.agent("assistant")
+            .with_tools(add, multiply, get_time)
+            .start()
+        )
         
         # Ask with tool use
         result = await agent.react("What is 5 + 3? What is 4 * 7?")

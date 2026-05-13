@@ -28,7 +28,7 @@ import tempfile
 import shutil
 from pathlib import Path
 
-from nbos import Agent as PyAgent, AgentConfig as PyAgentConfig, Bus as PyBus, BusConfig as PyBusConfig, ConfigLoader,init_tracing
+from nbos import PyAgent, AgentConfig as PyAgentConfig, Bus as PyBus, BusConfig as PyBusConfig, ConfigLoader, init_tracing
 
 # from nbos import Agent
 

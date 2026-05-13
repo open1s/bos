@@ -9,7 +9,7 @@ A modular Rust-based operating system and runtime framework for building intelli
 - **🚌 Event Bus**: High-performance pub/sub messaging with query/response, RPC patterns
 - **⚙️ Configuration**: Flexible config loading from TOML, YAML, and environment variables
 - **🧠 ReAct Engine**: Reasoning + Acting loop scaffold for AI agent workflows
-- **🐍 Python Bindings**: `pip install brainos` - unified high-level Python API
+- **🐍 Python Bindings**: `pip install nbos` - unified high-level Python API
 - **📦 Node.js Bindings**: `npm install @open1s/jsbos` - unified high-level JavaScript API
 - **🔄 Memory Persistence**: Cross-session memory support for agents
 - **🔌 MCP Client**: Connect to Model Context Protocol servers (stdio & HTTP)
@@ -119,8 +119,7 @@ bos/
 │   ├── config/         # TOML/YAML config loading
 │   ├── logging/        # Tracing and instrumentation
 │   ├── react/          # ReAct reasoning engine
-│   ├── pybos/          # Python bindings (brainos package)
-│   │   └── brainos/    # High-level Python wrapper
+│   ├── nbos/           # Python bindings (nbos package)
 │   └── jsbos/          # Node.js bindings (@open1s/jsbos)
 ├── docs/               # User guides
 │   ├── python-user-guide.md
@@ -140,7 +139,7 @@ bos/
 | `config` | Config loading from TOML, YAML, env vars | `cargo add config` |
 | `logging` | Tracing and observability | `cargo add logging` |
 | `react` | ReAct reasoning + acting engine | `cargo add react` |
-| `pybos` | Python bindings | `pip install brainos` |
+| `nbos` | Python bindings | `pip install nbos` |
 | `jsbos` | Node.js bindings | `npm install @open1s/jsbos` |
 
 ---
@@ -158,10 +157,10 @@ cargo test --all
 cargo clippy --all
 cargo fmt --all
 
-# Python bindings (low-level nbos)
+# Python bindings (nbos)
 cd crates/nbos && maturin develop
 
-# Node.js bindings (low-level jsbos)
+# Node.js bindings (jsbos)
 cd crates/jsbos && npm install && npm run build
 ```
 
@@ -178,7 +177,7 @@ cd crates/jsbos && npm install && npm run build
 
 ## Unified API
 
-The `brainos` package (Python) and `@open1s/jsbos` (JavaScript) provide consistent high-level APIs:
+The `nbos` package (Python) and `@open1s/jsbos` (JavaScript) provide consistent high-level APIs:
 
 | Feature | Python | JavaScript |
 |---------|--------|------------|

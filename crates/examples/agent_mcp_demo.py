@@ -20,7 +20,7 @@ import os
 import sys
 import threading
 
-from nbos import Agent, AgentConfig, Bus, BusConfig, ConfigLoader,init_tracing
+from nbos import PyAgent as Agent, AgentConfig, Bus, BusConfig, ConfigLoader, init_tracing
 
 init_tracing()
 

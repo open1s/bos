@@ -13,7 +13,7 @@ import json
 import os
 from datetime import datetime, timezone
 
-from nbos import Agent, AgentConfig, Bus, BusConfig, PythonTool, ConfigLoader, init_tracing
+from nbos import PyAgent as Agent, AgentConfig, Bus, BusConfig, PythonTool, ConfigLoader, init_tracing
 
 init_tracing()
 loader = ConfigLoader()
