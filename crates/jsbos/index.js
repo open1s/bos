@@ -799,36 +799,36 @@ class BusManager {
 
   async publisher(topic) {
     if (!this._bus) throw new Error('Bus not started');
-    return new PublisherWrapperImpl(await this._bus.createPublisher(topic));
+    return new PublisherWrapper(await this._bus.createPublisher(topic));
   }
 
   async subscriber(topic) {
     if (!this._bus) throw new Error('Bus not started');
-    return new SubscriberWrapperImpl(await this._bus.createSubscriber(topic));
+    return new SubscriberWrapper(await this._bus.createSubscriber(topic));
   }
 
   async query(topic) {
     if (!this._bus) throw new Error('Bus not started');
-    return new QueryClientImpl(await this._bus.createQuery(topic));
+    return new QueryClient(await this._bus.createQuery(topic));
   }
 
   async queryable(topic, handler) {
     if (!this._bus) throw new Error('Bus not started');
     const q = await this._bus.createQueryable(topic);
     if (handler) q.setHandler(handler);
-    return new QueryableServerImpl(q);
+    return new QueryableServer(q);
   }
 
   async caller(name) {
     if (!this._bus) throw new Error('Bus not started');
-    return new CallerClientImpl(await this._bus.createCaller(name));
+    return new CallerClient(await this._bus.createCaller(name));
   }
 
   async callable(uri, handler) {
     if (!this._bus) throw new Error('Bus not started');
     const c = await this._bus.createCallable(uri);
     if (handler) c.setHandler(handler);
-    return new CallableServerImpl(c);
+    return new CallableServer(c);
   }
 
   get bus() {
@@ -837,7 +837,7 @@ class BusManager {
   }
 }
 
-class PublisherWrapperImpl {
+class PublisherWrapper {
   constructor(inner) {
     this._inner = inner;
   }
@@ -861,7 +861,7 @@ class PublisherWrapperImpl {
   }
 }
 
-class SubscriberWrapperImpl {
+class SubscriberWrapper {
   constructor(inner) {
     this._inner = inner;
   }
@@ -900,7 +900,7 @@ class SubscriberWrapperImpl {
   }
 }
 
-class QueryClientImpl {
+class QueryClient {
   constructor(inner) {
     this._inner = inner;
   }
@@ -925,7 +925,7 @@ class QueryClientImpl {
   }
 }
 
-class QueryableServerImpl {
+class QueryableServer {
   constructor(inner) {
     this._inner = inner;
   }
@@ -949,7 +949,7 @@ class QueryableServerImpl {
   }
 }
 
-class CallerClientImpl {
+class CallerClient {
   constructor(inner) {
     this._inner = inner;
   }
@@ -963,7 +963,7 @@ class CallerClientImpl {
   }
 }
 
-class CallableServerImpl {
+class CallableServer {
   constructor(inner) {
     this._inner = inner;
   }
@@ -1221,12 +1221,12 @@ export {
   FunctionTool,
   ToolRegistry,
   BusManager,
-  PublisherWrapperImpl,
-  SubscriberWrapperImpl,
-  QueryClientImpl,
-  QueryableServerImpl,
-  CallerClientImpl,
-  CallableServerImpl,
+  PublisherWrapper,
+  SubscriberWrapper,
+  QueryClient,
+  QueryableServer,
+  CallerClient,
+  CallableServer,
   SessionManager,
   Config,
   extractTools,

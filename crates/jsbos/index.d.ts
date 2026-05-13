@@ -447,15 +447,15 @@ export class BusManager {
     listen(addresses: any): this;
     peer(id: any): this;
     publish(topic: any, payload: any, isJson?: boolean): Promise<void>;
-    publisher(topic: any): Promise<PublisherWrapperImpl>;
-    subscriber(topic: any): Promise<SubscriberWrapperImpl>;
-    query(topic: any): Promise<QueryClientImpl>;
-    queryable(topic: any, handler: any): Promise<QueryableServerImpl>;
-    caller(name: any): Promise<CallerClientImpl>;
-    callable(uri: any, handler: any): Promise<CallableServerImpl>;
+    publisher(topic: any): Promise<PublisherWrapper>;
+    subscriber(topic: any): Promise<SubscriberWrapper>;
+    query(topic: any): Promise<QueryClient>;
+    queryable(topic: any, handler: any): Promise<QueryableServer>;
+    caller(name: any): Promise<CallerClient>;
+    callable(uri: any, handler: any): Promise<CallableServer>;
     get bus(): jsbos.Bus;
 }
-export class PublisherWrapperImpl {
+export class PublisherWrapper {
     constructor(inner: any);
     _inner: any;
     get topic(): any;
@@ -463,7 +463,7 @@ export class PublisherWrapperImpl {
     text(payload: any): Promise<any>;
     json(data: any): Promise<any>;
 }
-export class SubscriberWrapperImpl {
+export class SubscriberWrapper {
     constructor(inner: any);
     _inner: any;
     get topic(): any;
@@ -480,14 +480,14 @@ export class SubscriberWrapperImpl {
     }>;
     [Symbol.asyncIterator](): this;
 }
-export class QueryClientImpl {
+export class QueryClient {
     constructor(inner: any);
     _inner: any;
     get topic(): any;
     ask(payload: any, timeoutMs: any): Promise<any>;
     askJson(payload: any, timeoutMs: any): Promise<any>;
 }
-export class QueryableServerImpl {
+export class QueryableServer {
     constructor(inner: any);
     _inner: any;
     handle(handler: any): this;
@@ -495,13 +495,13 @@ export class QueryableServerImpl {
     run(handler: any): Promise<void>;
     runJson(handler: any): Promise<void>;
 }
-export class CallerClientImpl {
+export class CallerClient {
     constructor(inner: any);
     _inner: any;
     call(payload: any): Promise<any>;
     callJson(payload: any): Promise<any>;
 }
-export class CallableServerImpl {
+export class CallableServer {
     constructor(inner: any);
     _inner: any;
     handle(handler: any): this;
