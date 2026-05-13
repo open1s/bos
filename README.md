@@ -335,4 +335,4 @@ MIT OR Apache-2.0
 
 ---
 
-**Version**: 2.1.2 | **Last Updated**: 2026-05-13
+**Version**: 2.1.3 | **Last Updated**: 2026-05-13

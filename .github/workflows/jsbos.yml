@@ -32,9 +32,6 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             build: yarn build --target aarch64-apple-darwin
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            build: yarn build --target x86_64-apple-darwin
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             build: yarn build --target x86_64-unknown-linux-gnu
@@ -88,10 +85,6 @@ jobs:
           - target: aarch64-pc-windows-msvc
             host: windows-11-arm
             architecture: arm64
-            node: '20'
-          - target: x86_64-apple-darwin
-            host: macos-latest
-            architecture: x64
             node: '20'
           - target: aarch64-apple-darwin
             host: macos-latest

@@ -26,7 +26,7 @@ yarn add @open1s/jsbos
 
 - Node.js >= 12.22.0 (or Node.js >= 14.17.0)
 - Prebuilt binaries available for:
-  - macOS (x86_64, arm64)
+  - macOS (arm64)
   - Linux (x86_64, aarch64)
   - Windows (x86_64)
 
