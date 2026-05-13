@@ -124,13 +124,5 @@
     "singleQuote": true,
     "arrowParens": "always"
   },
-  "packageManager": "yarn@4.13.0",
-  "optionalDependencies": {
-    "@open1s/jsbos-darwin-x64": "2.1.1",
-    "@open1s/jsbos-linux-x64-gnu": "2.1.1",
-    "@open1s/jsbos-win32-x64-msvc": "2.1.1",
-    "@open1s/jsbos-darwin-arm64": "2.1.1",
-    "@open1s/jsbos-linux-arm64-gnu": "2.1.1",
-    "@open1s/jsbos-win32-arm64-msvc": "2.1.1"
-  }
+  "packageManager": "yarn@4.13.0"
 }
