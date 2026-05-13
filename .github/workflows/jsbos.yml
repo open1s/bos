@@ -120,10 +120,10 @@ jobs:
         uses: actions/download-artifact@v6
         with:
           name: bindings-${{ matrix.target }}
-          path: .
+          path: crates/jsbos
 
       - name: List artifacts
-        run: ls -la *.node
+        run: ls -la
         shell: bash
 
       - name: Run smoke test
@@ -167,7 +167,7 @@ jobs:
         uses: actions/download-artifact@v6
         with:
           name: bindings-${{ matrix.target }}
-          path: .
+          path: crates/jsbos
 
       - name: List artifacts
         run: ls -la *.node
