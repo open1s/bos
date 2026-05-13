@@ -1,7 +1,7 @@
 """Tests for Query stream_text streaming"""
 import pytest
 import asyncio
-from pybrainos import Bus, BusConfig, Query, Queryable
+from nbos import Bus, BusConfig, Query, Queryable
 
 
 class TestQueryStream:

@@ -158,8 +158,8 @@ cargo test --all
 cargo clippy --all
 cargo fmt --all
 
-# Python 绑定（底层 pybrainos）
-cd crates/pybrainos && maturin develop
+# Python 绑定（底层 nbos）
+cd crates/nbos && maturin develop
 
 # Node.js 绑定（底层 jsbos）
 cd crates/jsbos && npm install && npm run build
@@ -196,7 +196,7 @@ cd crates/jsbos && npm install && npm run build
 
 | 语言 | 包 | 导入 |
 |------|-----|------|
-| Python | `pybrainos` | `from pybrainos import Agent, Bus, McpClient, ...` |
+| Python | `nbos` | `from nbos import Agent, Bus, McpClient, ...` |
 | JavaScript | `@open1s/jsbos` | `import { Agent, Bus, McpClient } from '@open1s/jsbos'` |
 
 ---
@@ -208,7 +208,7 @@ cd crates/jsbos && npm install && npm run build
 ### Python
 
 ```python
-from pybrainos import McpClient
+from nbos import McpClient
 
 # 基于进程的服务器
 client = await McpClient.spawn("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
@@ -280,7 +280,7 @@ listen = ["127.0.0.1:7890"]
 
 查看示例目录：
 
-- Python: `crates/pybrainos/examples/`
+- Python: `crates/nbos/examples/`
 - JavaScript: `crates/jsbos/examples/`
 - Rust: `crates/examples/` (包含 `agent_skill_demo.rs`)
 

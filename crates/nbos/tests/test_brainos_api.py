@@ -176,7 +176,7 @@ class TestConfig:
 
 
 class TestBusManager:
-    """BusManager lifecycle tests (requires pybrainos extension)"""
+    """BusManager lifecycle tests (requires nbos extension)"""
 
     @pytest.mark.asyncio
     async def test_bus_manager_create(self):

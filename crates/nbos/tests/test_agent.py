@@ -1,7 +1,7 @@
 """Tests for Agent binding"""
 import pytest
 import asyncio
-from pybrainos import Agent, AgentConfig, Bus, BusConfig
+from nbos import Agent, AgentConfig, Bus, BusConfig
 
 
 class TestAgentConfig:

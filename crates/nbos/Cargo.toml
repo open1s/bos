@@ -1,5 +1,5 @@
 [package]
-name = "pybrainos"
+name = "nbos"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -10,7 +10,7 @@ homepage = "https://github.com/open1s/bos"
 repository = "https://github.com/open1s/bos"
 
 [lib]
-name = "pybrainos"
+name = "nbos"
 crate-type = ["cdylib"]
 
 [dev-dependencies]

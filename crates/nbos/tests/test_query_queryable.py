@@ -1,7 +1,7 @@
 """Tests for Query and Queryable binding"""
 import pytest
 import asyncio
-from pybrainos import Bus, BusConfig, Caller, Callable
+from nbos import Bus, BusConfig, Caller, Callable
 
 
 class TestCallable:

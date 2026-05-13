@@ -1,10 +1,10 @@
 import asyncio
 import json
-from pybrainos import Bus, BusConfig
+from nbos import Bus, BusConfig
 
 async def test_callable_run_text_handler():
     """Test Callable.run() with text handler"""
-    from pybrainos import Queryable, Query
+    from nbos import Queryable, Query
     
     bus = await Bus.create(BusConfig())
     

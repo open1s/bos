@@ -1,7 +1,7 @@
 """Tests for pybos logging module."""
 
 import pytest
-from pybrainos import init_tracing
+from nbos import init_tracing
 
 
 def test_init_tracing():

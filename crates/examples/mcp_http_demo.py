@@ -22,7 +22,7 @@ import threading
 sys.path.insert(0, os.path.dirname(__file__))
 from mcp_http_server import run_server
 
-from pybrainos import McpClient
+from nbos import McpClient
 
 
 async def demo_http_local_server():

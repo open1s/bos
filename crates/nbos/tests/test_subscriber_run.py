@@ -6,7 +6,7 @@ import asyncio
 import sys
 sys.path.insert(0, '/Users/gaosg/Projects/bos/crates/pybos')
 
-from pybrainos import Bus, BusConfig, Publisher, Subscriber
+from nbos import Bus, BusConfig, Publisher, Subscriber
 
 
 async def test_subscriber_run_text():

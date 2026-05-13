@@ -1,4 +1,4 @@
-# pybrainos
+# nbos
 
 > Python bindings for BrainOS — AI agent framework with ReAct engine
 
@@ -19,19 +19,19 @@ High-performance Python bindings for [BrainOS](https://github.com/open1s/bos), a
 ### From PyPI (when published)
 
 ```bash
-pip install pybrainos
-# or
-poetry add pybrainos
+pip install nbos
+
+poetry add nbos
 ```
 
 ### Development
 
 ```bash
 # Build and install in development mode
-maturin develop -m crates/pybrainos/Cargo.toml
+maturin develop -m crates/nbos/Cargo.toml
 
 # Or with specific Python environment
-maturin develop -m crates/pybrainos/Cargo.toml --venv .venv
+maturin develop -m crates/nbos/Cargo.toml --venv .venv
 ```
 
 ### Requirements
@@ -43,7 +43,7 @@ maturin develop -m crates/pybrainos/Cargo.toml --venv .venv
 
 ```python
 import asyncio
-from pybrainos import Agent, AgentConfig
+from nbos import Agent, AgentConfig
 
 async def main():
     # Create agent configuration
@@ -93,7 +93,7 @@ asyncio.run(main())
 Configuration for creating an agent.
 
 ```python
-from pybrainos import AgentConfig
+from nbos import AgentConfig
 
 config = AgentConfig(
     name="my-agent",           # Agent name
@@ -125,7 +125,7 @@ agent = Agent.from_config(config)
 #### `Agent.create(config, bus)` — Create with a message bus
 
 ```python
-from pybrainos import Bus, BusConfig
+from nbos import Bus, BusConfig
 
 bus = await Bus.create(BusConfig())
 agent = await Agent.create(config, bus)
@@ -167,7 +167,7 @@ async for token in agent.stream("Write a story"):
 #### `agent.add_tool(tool)` — Register a Python tool
 
 ```python
-from pybrainos import PythonTool
+from nbos import PythonTool
 
 def weather(args: dict) -> str:
     return '{"temperature": 22, "condition": "sunny"}'
@@ -248,7 +248,7 @@ agent.compact_message_log()
 A Python function wrapped as an agent tool.
 
 ```python
-from pybrainos import PythonTool
+from nbos import PythonTool
 
 tool = PythonTool(
     name="tool_name",
@@ -266,7 +266,7 @@ Distributed message bus for inter-agent communication.
 #### `Bus.create(config?)` — Create a bus
 
 ```python
-from pybrainos import Bus, BusConfig
+from nbos import Bus, BusConfig
 
 bus = await Bus.create(BusConfig(mode="peer"))
 ```
@@ -308,7 +308,7 @@ await sub.stop()
 Request/response pattern.
 
 ```python
-from pybrainos import Query, Queryable
+from nbos import Query, Queryable
 
 # Server side
 def handler(text: str) -> str:
@@ -328,7 +328,7 @@ result = await query.query_text_timeout_ms("hello", 5000)
 RPC pattern.
 
 ```python
-from pybrainos import Caller, Callable
+from nbos import Caller, Callable
 
 # Server side
 def echo_handler(text: str) -> str:
@@ -347,7 +347,7 @@ result = await caller.call_text("ping")  # "echo:ping"
 Lifecycle hook system.
 
 ```python
-from pybrainos import HookEvent, HookContext
+from nbos import HookEvent, HookContext
 
 # Hook events
 HookEvent.BeforeToolCall
@@ -367,7 +367,7 @@ context.data       # Dict[str, str] with event data
 
 ```python
 import asyncio
-from pybrainos import Agent, AgentConfig, PythonTool, HookEvent, HookDecision, HookContext
+from nbos import Agent, AgentConfig, PythonTool, HookEvent, HookDecision, HookContext
 
 async def main():
     config = AgentConfig(
@@ -431,7 +431,7 @@ agent.register_hook(HookEvent("BeforeToolCall"), security_hook)
 Plugin system for intercepting LLM requests/responses and tool execution.
 
 ```python
-from pybrainos import AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, ToolCallWrapper, ToolResultWrapper
+from nbos import AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, ToolCallWrapper, ToolResultWrapper
 
 # Create a plugin with callbacks
 plugin = AgentPlugin(
@@ -450,7 +450,7 @@ agent.register_plugin(plugin)
 
 ```python
 import asyncio
-from pybrainos import (
+from nbos import (
     Agent, AgentConfig, PythonTool, AgentPlugin,
     LlmRequestWrapper, LlmResponseWrapper, ToolCallWrapper, ToolResultWrapper
 )
@@ -541,7 +541,7 @@ agent.register_plugin(plugin)
 Standalone MCP client.
 
 ```python
-from pybrainos import McpClient
+from nbos import McpClient
 
 # From command
 client = await McpClient.spawn("npx", ["-y", "server-filesystem", "/tmp"])
@@ -568,7 +568,7 @@ resource = await client.read_resource("resource-uri")
 Load configuration from files.
 
 ```python
-from pybrainos import ConfigLoader
+from nbos import ConfigLoader
 
 loader = ConfigLoader(strategy="deep_merge")
 loader.add_file("app.toml")
@@ -581,7 +581,7 @@ config = loader.load_sync()  # Returns JSON string
 Message types for conversation history.
 
 ```python
-from pybrainos import LlmMessage
+from nbos import LlmMessage
 
 msg = LlmMessage.system("System prompt")
 msg = LlmMessage.user("User message")
@@ -599,7 +599,7 @@ msg = LlmMessage.from_py({"role": "user", "content": "Hello"})
 ### Logging
 
 ```python
-from pybrainos import init_tracing, log_test_message
+from nbos import init_tracing, log_test_message
 
 init_tracing()
 log_test_message("Debug message")
@@ -635,7 +635,7 @@ python examples/01_quickstart.py
 ┌─────────────────────────────────────────────────────────────┐
 │                         Python                               │
 ├─────────────────────────────────────────────────────────────┤
-│  pybrainos (PyO3 bindings)                                  │
+│  nbos (PyO3 bindings)                                  │
 │  ┌─────────┐ ┌──────┐ ┌───────┐ ┌───────┐ ┌─────────────┐  │
 │  │  Agent  │ │ Bus  │ │ Hooks │ │Plugins│ │   MCP Client│  │
 │  └────┬────┘ └──┬───┘ └───┬───┘ └───┬───┘ └──────┬──────┘  │

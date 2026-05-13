@@ -1,7 +1,7 @@
 """Tests for Publisher and Subscriber binding"""
 import pytest
 import asyncio
-from pybrainos import Bus, BusConfig, Publisher, Subscriber
+from nbos import Bus, BusConfig, Publisher, Subscriber
 
 
 class TestPublisher:

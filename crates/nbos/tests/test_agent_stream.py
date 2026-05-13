@@ -1,7 +1,7 @@
 """Tests for Agent stream API"""
 import pytest
 import asyncio
-from pybrainos import Agent, AgentConfig, Bus, BusConfig
+from nbos import Agent, AgentConfig, Bus, BusConfig
 
 
 class TestAgentStream:

@@ -1,7 +1,7 @@
 """Integration tests for pybos components working together"""
 import pytest
 import asyncio
-from pybrainos import (
+from nbos import (
     Bus, BusConfig, Publisher, Subscriber,
     Query, Queryable, Caller, Callable,
     Agent, AgentConfig, ConfigLoader

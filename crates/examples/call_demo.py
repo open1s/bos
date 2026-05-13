@@ -1,5 +1,5 @@
 import asyncio
-from pybrainos import Bus, BusConfig, Callable, Caller
+from nbos import Bus, BusConfig, Callable, Caller
 
 async def main():
     bus = await Bus.create(BusConfig())

@@ -3,7 +3,7 @@ import pytest
 import tempfile
 import os
 from pathlib import Path
-from pybrainos import ConfigLoader
+from nbos import ConfigLoader
 
 
 class TestConfigLoader:

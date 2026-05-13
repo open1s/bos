@@ -123,7 +123,7 @@ The Agent provides methods to monitor token consumption:
 The Agent supports configuring circuit breaker and rate limiter for resilience:
 
 ```python
-from pybrainos import Agent, AgentConfig
+from nbos import Agent, AgentConfig
 from react import CircuitBreakerConfig, RateLimiterConfig
 
 cfg = AgentConfig(
@@ -485,7 +485,7 @@ Parameters:
 #### Example
 
 ```python
-from pybrainos import ConfigLoader
+from nbos import ConfigLoader
 
 loader = ConfigLoader()
 loader.discover()
@@ -506,7 +506,7 @@ Configuration and agent creation utilities.
 Create agent configuration:
 
 ```python
-from pybrainos import AgentConfig
+from nbos import AgentConfig
 
 cfg = AgentConfig(
     name="assistant",
@@ -521,7 +521,7 @@ cfg = AgentConfig(
 Create agent from configuration:
 
 ```python
-from pybrainos import Agent, AgentConfig
+from nbos import Agent, AgentConfig
 
 cfg = AgentConfig(
     name="assistant",

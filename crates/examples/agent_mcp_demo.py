@@ -20,7 +20,7 @@ import os
 import sys
 import threading
 
-from pybrainos import Agent, AgentConfig, Bus, BusConfig, ConfigLoader,init_tracing
+from nbos import Agent, AgentConfig, Bus, BusConfig, ConfigLoader,init_tracing
 
 init_tracing()
 

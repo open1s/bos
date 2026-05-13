@@ -12,7 +12,7 @@ crates/
 ├── bus/        # Pub/sub, queryable, caller/callable
 ├── config/    # TOML/YAML config loading
 ├── logging/   # Tracing, instrumentation
-├── pybrainos/     # Python bindings (cdylib, maturin)
+├── nbos/     # Python bindings (cdylib, maturin)
 ├── jsbos/     # Node.js bindings (NAPI-RS)
 └── react/     # ReAct engine, LLM integration
 ```
@@ -66,8 +66,8 @@ cargo test -p <crate>
 cargo clippy --all
 cargo fmt --all
 
-# Python binding (crates/pybrainos)
-cd crates/pybrainos && maturin develop
+# Python binding (crates/nbos)
+cd crates/nbos && maturin develop
 
 # Node.js binding (crates/jsbos)
 cd crates/jsbos && npm install && npm run build
@@ -78,7 +78,7 @@ cd crates/jsbos && npm install && npm run build
 ## Crate Dependencies
 
 - `agent` depends on: `bus`, `config`, `logging`, `react`
-- `pybrainos` depends on: `agent`, `bus`, `config`
+- `nbos` depends on: `agent`, `bus`, `config`
 - `jsbos` depends on: `agent`, `bus`, `config`
 
 **Key**: All cross-crate communication flows through `bus`.

@@ -17,14 +17,14 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from pybrainos import Bus as PyBus
-from pybrainos import BusConfig as PyBusConfig
-from pybrainos import Publisher as PyPublisher
-from pybrainos import Subscriber as PySubscriber
-from pybrainos import Query as PyQuery
-from pybrainos import Queryable as PyQueryable
-from pybrainos import Caller as PyCaller
-from pybrainos import Callable as PyCallable
+from nbos import Bus as PyBus
+from nbos import BusConfig as PyBusConfig
+from nbos import Publisher as PyPublisher
+from nbos import Subscriber as PySubscriber
+from nbos import Query as PyQuery
+from nbos import Queryable as PyQueryable
+from nbos import Caller as PyCaller
+from nbos import Callable as PyCallable
 
 
 # ── BusManager ──────────────────────────────────────────────────────
