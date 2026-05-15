@@ -1,6 +1,6 @@
 {
   "name": "@open1s/jsbos",
-  "version": "2.1.3",
+  "version": "2.1.4",
   "type": "module",
   "description": "BrainOS — multi-language AI agent framework. Agents, tools, event bus, MCP, skills, memory — for Node.js.",
   "main": "./index.js",

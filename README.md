@@ -335,4 +335,20 @@ MIT OR Apache-2.0
 
 ---
 
-**Version**: 2.1.3 | **Last Updated**: 2026-05-13
+## Changelog
+
+### v2.1.4 (2026-05-15)
+
+- **Fixed**: `getPerfMetrics()` now correctly updates after `stream()` calls
+- **Added**: Token usage tracking — `totalInputTokens` and `totalOutputTokens` are now recorded from LLM responses for `react()`, `runSimple()`, and `stream()`
+- **Added**: Tool invocation tracking — `toolInvocationCount` records actual tool calls made by the agent
+- **Renamed**: Metrics fields for clarity: `callCount` → `llmCallCount`, `toolCallCount` → `toolInvocationCount`
+- **Added**: `agent_metrics_demo.js` example to verify metrics recording
+
+### v2.1.3 (2026-05-13)
+
+- Previous release
+
+---
+
+**Version**: 2.1.4 | **Last Updated**: 2026-05-15

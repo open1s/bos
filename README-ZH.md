@@ -302,4 +302,20 @@ MIT OR Apache-2.0
 
 ---
 
-**版本**: 2.1.2 | **更新日期**: 2026-05-13
+## 更新日志
+
+### v2.1.4 (2026-05-15)
+
+- **修复**: `getPerfMetrics()` 现在在 `stream()` 调用后正确更新
+- **新增**: Token 用量追踪 — `react()`、`runSimple()` 和 `stream()` 的 `totalInputTokens` 和 `totalOutputTokens` 现在会从 LLM 响应中记录
+- **新增**: 工具调用追踪 — `toolInvocationCount` 记录代理实际调用的工具次数
+- **重命名**: 指标字段更清晰：`callCount` → `llmCallCount`，`toolCallCount` → `toolInvocationCount`
+- **新增**: `agent_metrics_demo.js` 示例，用于验证指标记录
+
+### v2.1.3 (2026-05-13)
+
+- 上一个版本
+
+---
+
+**版本**: 2.1.4 | **更新日期**: 2026-05-15
