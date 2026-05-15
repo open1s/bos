@@ -1,0 +1,21 @@
+{
+  "name": "ddbos",
+  "version": "1.0.0",
+  "description": "TRIZ methodology library with AI-powered domain analysis and EZBOS support",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "dev": "tsc --watch",
+    "test": "bunx tsx src/test/search.test.ts"
+  },
+  "dependencies": {
+    "@open1s/ezbos": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.8.0",
+    "typescript": "^5.0.0"
+  }
+}
