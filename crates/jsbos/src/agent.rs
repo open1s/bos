@@ -646,7 +646,12 @@ impl Agent {
     if had_error {
       guard.record_llm_error();
     }
-    guard.record_stream_call(elapsed, elapsed, std::time::Duration::ZERO, 0, 0);
+    let tokens = guard.last_token_usage().unwrap_or((0, 0));
+    guard.record_stream_call(elapsed, elapsed, std::time::Duration::ZERO, tokens.0, tokens.1);
+    let tool_calls = guard.last_stream_tool_calls();
+    if tool_calls > 0 {
+      guard.record_tool_calls(tool_calls, std::time::Duration::ZERO);
+    }
     Ok(())
   }
 
@@ -709,10 +714,10 @@ impl Agent {
     let guard = self.inner.blocking_lock();
     let cm = guard.metrics();
     crate::perf::PerfSnapshot {
-      call_count: cm.call_count as i64,
+      llm_call_count: cm.llm_call_count as i64,
       total_wall_time_us: cm.total_wall_time.as_micros() as i64,
-      avg_wall_time_us: if cm.call_count > 0 {
-        cm.total_wall_time.as_micros() as i64 / cm.call_count as i64
+      avg_wall_time_us: if cm.llm_call_count > 0 {
+        cm.total_wall_time.as_micros() as i64 / cm.llm_call_count as i64
       } else {
         0
       },
@@ -724,7 +729,7 @@ impl Agent {
       total_rate_limit_wait_us: cm.total_rate_limit_wait.as_micros() as i64,
       circuit_trips: cm.circuit_trips as i64,
       llm_errors: cm.llm_errors as i64,
-      tool_call_count: cm.tool_call_count as i64,
+      tool_invocation_count: cm.tool_invocation_count as i64,
       total_tool_time_us: cm.total_tool_time.as_micros() as i64,
       total_input_tokens: cm.total_input_tokens as i64,
       total_output_tokens: cm.total_output_tokens as i64,

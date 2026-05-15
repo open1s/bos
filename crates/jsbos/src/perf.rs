@@ -6,8 +6,8 @@ use std::sync::Mutex;
 #[derive(Debug, Clone)]
 #[napi(object)]
 pub struct PerfSnapshot {
-  /// Number of LLM calls completed
-  pub call_count: i64,
+  /// Number of LLM API calls completed
+  pub llm_call_count: i64,
   pub total_wall_time_us: i64,
   pub avg_wall_time_us: i64,
   pub min_wall_time_us: i64,
@@ -18,7 +18,8 @@ pub struct PerfSnapshot {
   pub total_rate_limit_wait_us: i64,
   pub circuit_trips: i64,
   pub llm_errors: i64,
-  pub tool_call_count: i64,
+  /// Number of tool invocations (not LLM calls)
+  pub tool_invocation_count: i64,
   pub total_tool_time_us: i64,
   pub total_input_tokens: i64,
   pub total_output_tokens: i64,
@@ -27,7 +28,7 @@ pub struct PerfSnapshot {
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 struct MetricsInner {
-  call_count: i64,
+  llm_call_count: i64,
   wall_times_us: Vec<i64>,
   total_engine_time_us: i64,
   total_resilience_time_us: i64,
@@ -35,7 +36,7 @@ struct MetricsInner {
   total_rate_limit_wait_us: i64,
   circuit_trips: i64,
   llm_errors: i64,
-  tool_call_count: i64,
+  tool_invocation_count: i64,
   total_tool_time_us: i64,
   total_input_tokens: i64,
   total_output_tokens: i64,
@@ -66,7 +67,7 @@ impl PerformanceMetrics {
     output_tokens: i64,
   ) {
     let mut inner = self.inner.lock().unwrap();
-    inner.call_count += 1;
+    inner.llm_call_count += 1;
     inner.wall_times_us.push(wall_time_us);
     inner.total_engine_time_us += engine_time_us;
     inner.total_resilience_time_us += resilience_time_us;
@@ -98,7 +99,7 @@ impl PerformanceMetrics {
   #[allow(dead_code)]
   pub fn record_tool_call(&self, time_us: i64) {
     let mut inner = self.inner.lock().unwrap();
-    inner.tool_call_count += 1;
+    inner.tool_invocation_count += 1;
     inner.total_tool_time_us += time_us;
   }
 
@@ -107,10 +108,10 @@ impl PerformanceMetrics {
     let inner = self.inner.lock().unwrap();
     let total_wall: i64 = inner.wall_times_us.iter().sum();
     PerfSnapshot {
-      call_count: inner.call_count,
+      llm_call_count: inner.llm_call_count,
       total_wall_time_us: total_wall,
-      avg_wall_time_us: if inner.call_count > 0 {
-        total_wall / inner.call_count
+      avg_wall_time_us: if inner.llm_call_count > 0 {
+        total_wall / inner.llm_call_count
       } else {
         0
       },
@@ -122,7 +123,7 @@ impl PerformanceMetrics {
       total_rate_limit_wait_us: inner.total_rate_limit_wait_us,
       circuit_trips: inner.circuit_trips,
       llm_errors: inner.llm_errors,
-      tool_call_count: inner.tool_call_count,
+      tool_invocation_count: inner.tool_invocation_count,
       total_tool_time_us: inner.total_tool_time_us,
       total_input_tokens: inner.total_input_tokens,
       total_output_tokens: inner.total_output_tokens,

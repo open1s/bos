@@ -11,6 +11,7 @@ use futures::{Stream, StreamExt};
 use log::info;
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -117,6 +118,7 @@ pub struct ReActEngine<A: ReActApp> {
     react_app: A,
     resilience: Option<ReActResilience>,
     skill_cache: SkillCache,
+    tool_call_count: AtomicU64,
 }
 
 pub struct ReActEngineBuilder<A: ReActApp> {
@@ -226,6 +228,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             react_app: self.react_app.unwrap_or_default(),
             resilience: self.resilience,
             skill_cache: self.skill_cache,
+            tool_call_count: AtomicU64::new(0),
         })
     }
 }
@@ -259,6 +262,7 @@ impl<A: ReActApp> ReActEngine<A> {
             react_app: app,
             resilience: None,
             skill_cache: SkillCache::new(Duration::from_secs(300)),
+            tool_call_count: AtomicU64::new(0),
         }
     }
 
@@ -502,6 +506,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 }
 
                                 let mut result = self.call_tool(&name, &mut args).await;
+                                self.tool_call_count.fetch_add(1, Ordering::Relaxed);
                                 self.react_app
                                     .after_tool_result(&name, &mut result, session, context)
                                     .await;
@@ -702,6 +707,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             } else {
                                 self.call_tool(&name, &mut args).await
                             };
+                            self.tool_call_count.fetch_add(1, Ordering::Relaxed);
 
                             let result_text = match result {
                                 Ok(ret) => {
@@ -762,5 +768,15 @@ impl<A: ReActApp> ReActEngine<A> {
     /// Reset the token counter for a new session
     pub fn reset_token_counter(&mut self) {
         self.token_counter = TokenCounter::with_default();
+    }
+
+    /// Get the number of tool calls made during this session.
+    pub fn tool_call_count(&self) -> u64 {
+        self.tool_call_count.load(Ordering::Relaxed)
+    }
+
+    /// Reset the tool call counter.
+    pub fn reset_tool_call_count(&self) {
+        self.tool_call_count.store(0, Ordering::Relaxed);
     }
 }

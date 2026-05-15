@@ -226,8 +226,8 @@ export declare function logTestMessage(message: string): void
  * All timing values are in microseconds.
  */
 export interface PerfSnapshot {
-  /** Number of LLM calls completed */
-  callCount: number
+  /** Number of LLM API calls completed */
+  llmCallCount: number
   totalWallTimeUs: number
   avgWallTimeUs: number
   minWallTimeUs: number
@@ -238,7 +238,8 @@ export interface PerfSnapshot {
   totalRateLimitWaitUs: number
   circuitTrips: number
   llmErrors: number
-  toolCallCount: number
+  /** Number of tool invocations (not LLM calls) */
+  toolInvocationCount: number
   totalToolTimeUs: number
   totalInputTokens: number
   totalOutputTokens: number

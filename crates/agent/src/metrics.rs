@@ -3,7 +3,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
 pub struct CallMetrics {
-    pub call_count: u64,
+    pub llm_call_count: u64,
     pub total_wall_time: Duration,
     pub total_engine_time: Duration,
     pub total_resilience_time: Duration,
@@ -11,7 +11,7 @@ pub struct CallMetrics {
     pub total_rate_limit_wait: Duration,
     pub circuit_trips: u64,
     pub llm_errors: u64,
-    pub tool_call_count: u64,
+    pub tool_invocation_count: u64,
     pub total_tool_time: Duration,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
@@ -38,7 +38,7 @@ impl MetricsCollector {
         output_tokens: u64,
     ) {
         let mut m = self.inner.lock().unwrap();
-        m.call_count += 1;
+        m.llm_call_count += 1;
         m.total_wall_time += wall_time;
         m.total_engine_time += engine_time;
         m.total_resilience_time += resilience_time;
@@ -64,8 +64,14 @@ impl MetricsCollector {
 
     pub fn record_tool_call(&self, time: Duration) {
         let mut m = self.inner.lock().unwrap();
-        m.tool_call_count += 1;
+        m.tool_invocation_count += 1;
         m.total_tool_time += time;
+    }
+
+    pub fn record_tool_calls(&self, count: u64, total_time: Duration) {
+        let mut m = self.inner.lock().unwrap();
+        m.tool_invocation_count += count;
+        m.total_tool_time += total_time;
     }
 
     pub fn record_tokens(&self, input: u64, output: u64) {

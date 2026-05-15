@@ -308,6 +308,10 @@ pub struct Agent {
     engine_cache: std::sync::Mutex<Option<ReActEngine<AgentReActApp>>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     context_cache: std::sync::Mutex<Option<AgentReactContext>>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    last_stream_tokens: std::sync::Mutex<Option<(u64, u64)>>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    last_stream_tool_calls: std::sync::Mutex<u64>,
 }
 
 impl Agent {
@@ -330,6 +334,8 @@ impl Agent {
             plugins: PluginRegistry::new(),
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
+            last_stream_tokens: std::sync::Mutex::new(None),
+            last_stream_tool_calls: std::sync::Mutex::new(0),
         }
     }
 
@@ -403,6 +409,23 @@ impl Agent {
 
     pub fn record_llm_error(&self) {
         self.metrics.record_llm_error();
+    }
+
+    pub fn record_tool_calls(&self, count: u64, time: std::time::Duration) {
+        self.metrics.record_tool_calls(count, time);
+    }
+
+    pub fn last_token_usage(&self) -> Option<(u64, u64)> {
+        self.last_stream_tokens.lock().unwrap().clone()
+    }
+
+    pub fn last_stream_tool_calls(&self) -> u64 {
+        *self.last_stream_tool_calls.lock().unwrap()
+    }
+
+    pub fn tool_invocation_count(&self) -> u64 {
+        let cache = self.engine_cache.lock().unwrap();
+        cache.as_ref().map(|e| e.tool_call_count()).unwrap_or(0)
     }
 
     pub fn reset_metrics(&self) {
@@ -681,6 +704,8 @@ impl Agent {
 
         match result {
             Ok(answer) => {
+                let tokens = engine.as_ref().map(|e| e.token_usage());
+                let tool_calls = engine.as_ref().map(|e| e.tool_call_count()).unwrap_or(0);
                 {
                     let mut ec = self.engine_cache.lock().unwrap();
                     *ec = engine.take();
@@ -688,8 +713,20 @@ impl Agent {
                     *cc = context.take();
                 }
                 let wall_time = wall_start.elapsed();
-                self.metrics
-                    .record_call(wall_time, engine_time, std::time::Duration::ZERO, 0, 0);
+                if let Some(usage) = tokens {
+                    self.metrics.record_call(
+                        wall_time,
+                        engine_time,
+                        std::time::Duration::ZERO,
+                        usage.prompt_tokens as u64,
+                        usage.completion_tokens as u64,
+                    );
+                } else {
+                    self.metrics.record_call(wall_time, engine_time, std::time::Duration::ZERO, 0, 0);
+                }
+                if tool_calls > 0 {
+                    self.metrics.record_tool_calls(tool_calls, std::time::Duration::ZERO);
+                }
                 self.hooks
                     .trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name))
                     .await;
@@ -789,6 +826,15 @@ impl Agent {
                 session.restore_messages(agent_session.take_messages());
             }
 
+            {
+                let usage = engine.token_usage();
+                let tokens = (usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                let tool_calls = engine.tool_call_count();
+                let mut ts = self.last_stream_tokens.lock().unwrap();
+                *ts = Some(tokens);
+                let mut tc = self.last_stream_tool_calls.lock().unwrap();
+                *tc = tool_calls;
+            }
             {
                 let mut cache = self.engine_cache.lock().unwrap();
                 *cache = Some(engine);
@@ -991,6 +1037,8 @@ impl Clone for Agent {
             plugins: self.plugins.clone(),
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
+            last_stream_tokens: std::sync::Mutex::new(None),
+            last_stream_tool_calls: std::sync::Mutex::new(0),
         }
     }
 }
@@ -1009,6 +1057,7 @@ mod tests {
     use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
     use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, StreamToken};
     use std::sync::Arc;
+    use std::time::Duration;
 
     /// Mock LLM for testing
     struct MockLlm;
@@ -1377,6 +1426,176 @@ mod tests {
     #[test]
     fn test_llm_provider_default() {
         let _provider = LlmProvider::default();
+    }
+
+    // =========================================================================
+    // Metrics Recording Tests
+    // =========================================================================
+
+    #[test]
+    fn test_metrics_record_call() {
+        let config = AgentConfig::default();
+        let provider = make_llm_provider();
+        let agent = Agent::new(config, Arc::new(provider));
+
+        let before = agent.metrics();
+        assert_eq!(before.llm_call_count, 0);
+        assert_eq!(before.total_input_tokens, 0);
+        assert_eq!(before.total_output_tokens, 0);
+
+        agent.record_stream_call(
+            Duration::from_millis(100),
+            Duration::from_millis(90),
+            Duration::ZERO,
+            500,
+            300,
+        );
+
+        let after = agent.metrics();
+        assert_eq!(after.llm_call_count, 1);
+        assert_eq!(after.total_input_tokens, 500);
+        assert_eq!(after.total_output_tokens, 300);
+    }
+
+    #[test]
+    fn test_metrics_record_call_accumulates() {
+        let config = AgentConfig::default();
+        let provider = make_llm_provider();
+        let agent = Agent::new(config, Arc::new(provider));
+
+        agent.record_stream_call(
+            Duration::from_millis(100),
+            Duration::from_millis(90),
+            Duration::ZERO,
+            500,
+            300,
+        );
+        agent.record_stream_call(
+            Duration::from_millis(200),
+            Duration::from_millis(180),
+            Duration::ZERO,
+            1000,
+            600,
+        );
+
+        let m = agent.metrics();
+        assert_eq!(m.llm_call_count, 2);
+        assert_eq!(m.total_input_tokens, 1500);
+        assert_eq!(m.total_output_tokens, 900);
+    }
+
+    #[test]
+    fn test_metrics_record_llm_error() {
+        let config = AgentConfig::default();
+        let provider = make_llm_provider();
+        let agent = Agent::new(config, Arc::new(provider));
+
+        let before = agent.metrics();
+        assert_eq!(before.llm_errors, 0);
+
+        agent.record_llm_error();
+        agent.record_llm_error();
+
+        let after = agent.metrics();
+        assert_eq!(after.llm_errors, 2);
+    }
+
+    #[test]
+    fn test_metrics_record_call_and_error_together() {
+        let config = AgentConfig::default();
+        let provider = make_llm_provider();
+        let agent = Agent::new(config, Arc::new(provider));
+
+        agent.record_stream_call(
+            Duration::from_millis(100),
+            Duration::from_millis(90),
+            Duration::ZERO,
+            500,
+            300,
+        );
+        agent.record_llm_error();
+
+        let m = agent.metrics();
+        assert_eq!(m.llm_call_count, 1);
+        assert_eq!(m.llm_errors, 1);
+        assert_eq!(m.total_input_tokens, 500);
+        assert_eq!(m.total_output_tokens, 300);
+    }
+
+    #[test]
+    fn test_last_token_usage_initial() {
+        let config = AgentConfig::default();
+        let provider = make_llm_provider();
+        let agent = Agent::new(config, Arc::new(provider));
+
+        assert!(agent.last_token_usage().is_none());
+    }
+
+    #[test]
+    fn test_metrics_reset() {
+        let config = AgentConfig::default();
+        let provider = make_llm_provider();
+        let agent = Agent::new(config, Arc::new(provider));
+
+        agent.record_stream_call(
+            Duration::from_millis(100),
+            Duration::from_millis(90),
+            Duration::ZERO,
+            500,
+            300,
+        );
+        agent.record_llm_error();
+
+        let before = agent.metrics();
+        assert_eq!(before.llm_call_count, 1);
+        assert_eq!(before.llm_errors, 1);
+
+        agent.reset_metrics();
+
+        let after = agent.metrics();
+        assert_eq!(after.llm_call_count, 0);
+        assert_eq!(after.llm_errors, 0);
+        assert_eq!(after.total_input_tokens, 0);
+        assert_eq!(after.total_output_tokens, 0);
+    }
+
+    #[test]
+    fn test_metrics_record_tool_calls() {
+        let config = AgentConfig::default();
+        let provider = make_llm_provider();
+        let agent = Agent::new(config, Arc::new(provider));
+
+        let before = agent.metrics();
+        assert_eq!(before.tool_invocation_count, 0);
+
+        agent.record_tool_calls(3, Duration::from_millis(150));
+
+        let after = agent.metrics();
+        assert_eq!(after.tool_invocation_count, 3);
+        assert_eq!(after.total_tool_time.as_millis(), 150);
+    }
+
+    #[test]
+    fn test_metrics_record_tool_calls_accumulates() {
+        let config = AgentConfig::default();
+        let provider = make_llm_provider();
+        let agent = Agent::new(config, Arc::new(provider));
+
+        agent.record_tool_calls(2, Duration::from_millis(100));
+        agent.record_tool_calls(3, Duration::from_millis(200));
+
+        let m = agent.metrics();
+        assert_eq!(m.tool_invocation_count, 5);
+        assert_eq!(m.total_tool_time.as_millis(), 300);
+    }
+
+    #[test]
+    fn test_last_stream_tool_calls_initial() {
+        let config = AgentConfig::default();
+        let provider = make_llm_provider();
+        let agent = Agent::new(config, Arc::new(provider));
+
+        assert_eq!(agent.last_stream_tool_calls(), 0);
     }
 }
 
