@@ -4,7 +4,9 @@
 
 use agent::agent::agentic::{Agent, AgentConfig, LlmProvider};
 use agent::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent};
-use agent::agent::plugin::{AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, ToolCallWrapper, ToolResultWrapper};
+use agent::agent::plugin::{
+    AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, ToolCallWrapper, ToolResultWrapper,
+};
 use async_trait::async_trait;
 use config::ConfigLoader;
 use react::llm::vendor::{NvidiaVendor, OpenRouterVendor};
@@ -64,7 +66,10 @@ impl AgentPlugin for TestPlugin {
         let mut calls = self.calls.lock().unwrap();
         calls.push("on_llm_request".to_string());
         println!("  [Plugin:on_llm_request] model={}", request.model);
-        println!("    input: {}", &request.input[..request.input.len().min(100)]);
+        println!(
+            "    input: {}",
+            &request.input[..request.input.len().min(100)]
+        );
         // Return Some to indicate we want to pass the request through
         // Return None to intercept (but we want to pass through for demo)
         Some(request)
@@ -150,8 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let provider = build_llm_provider(&config);
 
-    let nvidia_cfg = VendorConfig::from_nvidia(&config)
-        .ok_or("no llm.nvidia config")?;
+    let nvidia_cfg = VendorConfig::from_nvidia(&config).ok_or("no llm.nvidia config")?;
 
     // Create agent config
     let mut agent_config = AgentConfig::default();
@@ -163,11 +167,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create and register test hook
     let test_hook = Arc::new(TestHook::new());
-    println!("Registering test hook for BeforeLlmCall, AfterLlmCall, BeforeToolCall, AfterToolCall...");
-    agent.hooks().register_blocking(HookEvent::BeforeLlmCall, test_hook.clone());
-    agent.hooks().register_blocking(HookEvent::AfterLlmCall, test_hook.clone());
-    agent.hooks().register_blocking(HookEvent::BeforeToolCall, test_hook.clone());
-    agent.hooks().register_blocking(HookEvent::AfterToolCall, test_hook.clone());
+    println!(
+        "Registering test hook for BeforeLlmCall, AfterLlmCall, BeforeToolCall, AfterToolCall..."
+    );
+    agent
+        .hooks()
+        .register_blocking(HookEvent::BeforeLlmCall, test_hook.clone());
+    agent
+        .hooks()
+        .register_blocking(HookEvent::AfterLlmCall, test_hook.clone());
+    agent
+        .hooks()
+        .register_blocking(HookEvent::BeforeToolCall, test_hook.clone());
+    agent
+        .hooks()
+        .register_blocking(HookEvent::AfterToolCall, test_hook.clone());
     println!("Hook registered.\n");
 
     // Create and register test plugin
@@ -188,8 +202,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plugin_calls = test_plugin.calls.lock().unwrap();
 
     println!("=== Summary ===");
-    println!("Hook events fired ({}): {:?}", hook_events.len(), *hook_events);
-    println!("Plugin methods called ({}): {:?}", plugin_calls.len(), *plugin_calls);
+    println!(
+        "Hook events fired ({}): {:?}",
+        hook_events.len(),
+        *hook_events
+    );
+    println!(
+        "Plugin methods called ({}): {:?}",
+        plugin_calls.len(),
+        *plugin_calls
+    );
 
     if hook_events.is_empty() {
         println!("\n[WARNING] No hooks were fired! Something is wrong.");
@@ -199,7 +221,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if plugin_calls.is_empty() {
         println!("[BUG] No plugin methods were called!");
-        println!("       The PluginRegistry exists but plugins.on_llm_request etc. are NEVER INVOKED.");
+        println!(
+            "       The PluginRegistry exists but plugins.on_llm_request etc. are NEVER INVOKED."
+        );
         println!("       This is the bug - plugins need to be called from the agent/reactor code.");
     } else {
         println!("[OK] Plugins are working correctly.");

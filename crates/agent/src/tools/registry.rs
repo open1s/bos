@@ -134,7 +134,9 @@ impl ToolRegistry {
                 let _ = tx.send(result);
             });
 
-            return rx.recv().map_err(|e| ToolError::Failed(format!("Channel error: {}", e)))?;
+            return rx
+                .recv()
+                .map_err(|e| ToolError::Failed(format!("Channel error: {}", e)))?;
         }
 
         let tool = self

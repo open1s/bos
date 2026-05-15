@@ -150,7 +150,10 @@ impl TomlAgentBuilder {
         let mut llm = LlmProvider::new();
 
         let (vendor_name, model_for_vendor) = if let Some(pos) = self.config.model.find('/') {
-            (self.config.model[..pos].to_string(), self.config.model[pos + 1..].to_string())
+            (
+                self.config.model[..pos].to_string(),
+                self.config.model[pos + 1..].to_string(),
+            )
         } else {
             ("openai".to_string(), self.config.model.clone())
         };

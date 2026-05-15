@@ -211,7 +211,8 @@ impl AgentSession {
     }
 
     pub fn clear(&mut self) {
-        self.messages.retain(|msg| matches!(msg, Message::System { .. }));
+        self.messages
+            .retain(|msg| matches!(msg, Message::System { .. }));
         self.context = JsonValue::Null;
         self.metadata.updated_at = current_timestamp();
     }
@@ -389,12 +390,12 @@ pub struct AgentReActApp {
 }
 
 impl AgentReActApp {
-    pub fn new(
-        hooks: Arc<HookRegistry>,
-        plugins: Arc<PluginRegistry>,
-        agent_name: String,
-    ) -> Self {
-        Self { hooks, plugins, agent_name }
+    pub fn new(hooks: Arc<HookRegistry>, plugins: Arc<PluginRegistry>, agent_name: String) -> Self {
+        Self {
+            hooks,
+            plugins,
+            agent_name,
+        }
     }
 }
 
@@ -498,9 +499,8 @@ impl ReActApp for AgentReActApp {
         let plugins = self.plugins.clone();
         async move {
             if plugins.has_plugins() {
-                let wrapper = crate::agent::plugin::ToolCallWrapper::new(
-                    &tool_name, args.clone(), None,
-                );
+                let wrapper =
+                    crate::agent::plugin::ToolCallWrapper::new(&tool_name, args.clone(), None);
                 if let Some(modified) = plugins.on_tool_call(wrapper).await {
                     *args = modified.args;
                 }

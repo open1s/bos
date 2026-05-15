@@ -258,7 +258,10 @@ impl PluginRegistry {
 
     /// Run all plugins' on_llm_request in order. Each plugin's output feeds the next.
     /// Returns Some(request) if the chain completes, None if any plugin vetoes.
-    pub async fn on_llm_request(&self, mut request: LlmRequestWrapper) -> Option<LlmRequestWrapper> {
+    pub async fn on_llm_request(
+        &self,
+        mut request: LlmRequestWrapper,
+    ) -> Option<LlmRequestWrapper> {
         let plugins = self.plugins();
         for plugin in &plugins {
             match plugin.on_llm_request(request).await {
@@ -270,7 +273,10 @@ impl PluginRegistry {
     }
 
     /// Run all plugins' on_llm_response in order.
-    pub async fn on_llm_response(&self, mut response: LlmResponseWrapper) -> Option<LlmResponseWrapper> {
+    pub async fn on_llm_response(
+        &self,
+        mut response: LlmResponseWrapper,
+    ) -> Option<LlmResponseWrapper> {
         let plugins = self.plugins();
         for plugin in &plugins {
             match plugin.on_llm_response(response).await {
@@ -294,7 +300,10 @@ impl PluginRegistry {
     }
 
     /// Run all plugins' on_tool_result in order.
-    pub async fn on_tool_result(&self, mut tool_result: ToolResultWrapper) -> Option<ToolResultWrapper> {
+    pub async fn on_tool_result(
+        &self,
+        mut tool_result: ToolResultWrapper,
+    ) -> Option<ToolResultWrapper> {
         let plugins = self.plugins();
         for plugin in &plugins {
             match plugin.on_tool_result(tool_result).await {
@@ -306,7 +315,10 @@ impl PluginRegistry {
     }
 
     /// Run all plugins' on_stream_token in order.
-    pub async fn on_stream_token(&self, mut token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
+    pub async fn on_stream_token(
+        &self,
+        mut token: StreamTokenWrapper,
+    ) -> Option<StreamTokenWrapper> {
         let plugins = self.plugins();
         for plugin in &plugins {
             match plugin.on_stream_token(token).await {

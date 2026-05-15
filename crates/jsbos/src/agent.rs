@@ -51,12 +51,10 @@ impl agent::Tool for JSTool {
             -> napi::Result<()> {
         match result {
           Ok(val) => {
-            let utf8 = val
-              .coerce_to_string()?
-              .into_utf8()?;
+            let utf8 = val.coerce_to_string()?.into_utf8()?;
             let string_val = utf8.as_str()?;
-            let json_val: serde_json::Value = serde_json::from_str(string_val)
-              .unwrap_or_else(|_| serde_json::json!(string_val));
+            let json_val: serde_json::Value =
+              serde_json::from_str(string_val).unwrap_or_else(|_| serde_json::json!(string_val));
             let _ = tx_clone.send(Ok(json_val));
           }
           Err(e) => {
@@ -164,7 +162,7 @@ impl From<AgentConfig> for agent::AgentConfig {
       None
     };
 
-let max_tokens_converted = value.max_tokens.map(|v| v as u32);
+    let max_tokens_converted = value.max_tokens.map(|v| v as u32);
 
     Self {
       name: value.name,
@@ -204,7 +202,7 @@ pub struct Agent {
 }
 
 #[napi]
-  impl Agent {
+impl Agent {
   #[napi(factory)]
   pub async fn create(config: AgentConfig) -> Result<Self> {
     let cfg: agent::AgentConfig = config.into();
@@ -213,7 +211,10 @@ pub struct Agent {
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
 
     let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
-      (cfg.model[..pos].to_string(), cfg.model[pos + 1..].to_string())
+      (
+        cfg.model[..pos].to_string(),
+        cfg.model[pos + 1..].to_string(),
+      )
     } else {
       ("openai".to_string(), cfg.model.clone())
     };
@@ -258,7 +259,10 @@ pub struct Agent {
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
 
     let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
-      (cfg.model[..pos].to_string(), cfg.model[pos + 1..].to_string())
+      (
+        cfg.model[..pos].to_string(),
+        cfg.model[pos + 1..].to_string(),
+      )
     } else {
       ("openai".to_string(), cfg.model.clone())
     };
@@ -295,14 +299,18 @@ pub struct Agent {
   #[napi]
   pub async fn run_simple(&self, task: String) -> Result<String> {
     let guard = self.inner.lock().await;
-    guard.run_simple(&task).await
+    guard
+      .run_simple(&task)
+      .await
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
   #[napi]
   pub async fn react(&self, task: String) -> Result<String> {
     let guard = self.inner.lock().await;
-    guard.react(&task).await
+    guard
+      .react(&task)
+      .await
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
@@ -593,10 +601,12 @@ pub struct Agent {
     callback: ThreadsafeFunction<serde_json::Value>,
   ) -> Result<()> {
     let guard = self.inner.lock().await;
+    let start = std::time::Instant::now();
 
     let stream = guard.stream(&task);
     use futures::StreamExt;
     futures::pin_mut!(stream);
+    let mut had_error = false;
     while let Some(token_result) = stream.next().await {
       match token_result {
         Ok(token) => {
@@ -621,15 +631,22 @@ pub struct Agent {
           };
           callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
         }
-        Err(e) => {
+        Err(_e) => {
+          had_error = true;
           let json = serde_json::json!({
               "type": "Error",
-              "error": e.to_string()
+              "error": "Stream error"
           });
           callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
         }
       }
     }
+
+    let elapsed = start.elapsed();
+    if had_error {
+      guard.record_llm_error();
+    }
+    guard.record_stream_call(elapsed, elapsed, std::time::Duration::ZERO, 0, 0);
     Ok(())
   }
 
@@ -654,15 +671,14 @@ pub struct Agent {
     let result = guard.session_mut().restore_from_json(&json);
     match result {
       Ok(()) => Ok(()),
-      Err(e) => Err(Error::new(napi::Status::GenericFailure, e.to_string()))
+      Err(e) => Err(Error::new(napi::Status::GenericFailure, e.to_string())),
     }
   }
 
   #[napi]
   pub fn save_session(&self, path: String) -> Result<()> {
     let json = self.get_session_json()?;
-    std::fs::write(&path, json)
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+    std::fs::write(&path, json).map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
   #[napi]
@@ -682,7 +698,9 @@ pub struct Agent {
   #[napi]
   pub fn compact_session(&self, keep_recent: u32, max_summary_chars: u32) -> Result<()> {
     let mut guard = self.inner.blocking_lock();
-    guard.session_mut().compact(keep_recent as usize, max_summary_chars as usize);
+    guard
+      .session_mut()
+      .compact(keep_recent as usize, max_summary_chars as usize);
     Ok(())
   }
 
@@ -693,7 +711,11 @@ pub struct Agent {
     crate::perf::PerfSnapshot {
       call_count: cm.call_count as i64,
       total_wall_time_us: cm.total_wall_time.as_micros() as i64,
-      avg_wall_time_us: if cm.call_count > 0 { cm.total_wall_time.as_micros() as i64 / cm.call_count as i64 } else { 0 },
+      avg_wall_time_us: if cm.call_count > 0 {
+        cm.total_wall_time.as_micros() as i64 / cm.call_count as i64
+      } else {
+        0
+      },
       min_wall_time_us: 0,
       max_wall_time_us: 0,
       total_engine_time_us: cm.total_engine_time.as_micros() as i64,

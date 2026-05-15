@@ -384,6 +384,27 @@ impl Agent {
         self.metrics.snapshot()
     }
 
+    pub fn record_stream_call(
+        &self,
+        wall_time: std::time::Duration,
+        engine_time: std::time::Duration,
+        resilience_time: std::time::Duration,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        self.metrics.record_call(
+            wall_time,
+            engine_time,
+            resilience_time,
+            input_tokens,
+            output_tokens,
+        );
+    }
+
+    pub fn record_llm_error(&self) {
+        self.metrics.record_llm_error();
+    }
+
     pub fn reset_metrics(&self) {
         self.metrics.reset()
     }
@@ -941,14 +962,12 @@ impl Agent {
                     tool.description.clone(),
                     schema,
                 ));
-            reg_mut
-                .register_async(mcp_tool)
-                .map_err(|e| {
-                    crate::mcp::McpError::Protocol(format!(
-                        "Failed to register MCP tool '{}': {}",
-                        namespaced_name, e
-                    ))
-                })?;
+            reg_mut.register_async(mcp_tool).map_err(|e| {
+                crate::mcp::McpError::Protocol(format!(
+                    "Failed to register MCP tool '{}': {}",
+                    namespaced_name, e
+                ))
+            })?;
         }
         self.engine_cache.lock().unwrap().take();
         self.context_cache.lock().unwrap().take();

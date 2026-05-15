@@ -16,11 +16,7 @@ fn call_string_handler(
     move |result: std::result::Result<napi::Unknown<'_>, napi::Error>, _env| -> Result<()> {
       match result {
         Ok(value) => {
-          let string_value = value
-            .coerce_to_string()?
-            .into_utf8()?
-            .as_str()?
-            .to_string();
+          let string_value = value.coerce_to_string()?.into_utf8()?.as_str()?.to_string();
           let _ = tx_clone.send(Ok(string_value));
         }
         Err(e) => {
@@ -130,10 +126,7 @@ impl Queryable {
       guard
         .set_handler(move |input: String| {
           let tsfn_clone = Arc::clone(&tsfn);
-          async move {
-            call_string_handler(&tsfn_clone, input)
-              .map_err(bus::ZenohError::Query)
-          }
+          async move { call_string_handler(&tsfn_clone, input).map_err(bus::ZenohError::Query) }
         })
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
     }
@@ -155,10 +148,7 @@ impl Queryable {
     guard
       .set_handler(move |input: String| {
         let tsfn_clone = Arc::clone(&tsfn);
-        async move {
-          call_string_handler(&tsfn_clone, input)
-            .map_err(bus::ZenohError::Query)
-        }
+        async move { call_string_handler(&tsfn_clone, input).map_err(bus::ZenohError::Query) }
       })
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
 
@@ -188,10 +178,7 @@ impl Queryable {
       .set_stream_handler(move |input: String, tx| {
         let tsfn_clone = Arc::clone(&tsfn);
         async move {
-          let _ = tx.send(
-            call_string_handler(&tsfn_clone, input)
-              .map_err(bus::ZenohError::Query),
-          );
+          let _ = tx.send(call_string_handler(&tsfn_clone, input).map_err(bus::ZenohError::Query));
         }
       })
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;

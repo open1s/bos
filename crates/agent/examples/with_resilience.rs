@@ -62,8 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let provider = build_llm_provider(&config);
 
-    let nvidia_cfg = VendorConfig::from_nvidia(&config)
-        .ok_or("no llm.nvidia config")?;
+    let nvidia_cfg = VendorConfig::from_nvidia(&config).ok_or("no llm.nvidia config")?;
     let model = nvidia_cfg.model;
 
     let config = AgentConfig {
@@ -109,7 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 1..=3 {
         println!("--- Request {} ---", i);
-        match agent.run_simple(&format!("Say hello (request {})", i)).await {
+        match agent
+            .run_simple(&format!("Say hello (request {})", i))
+            .await
+        {
             Ok(response) => println!("Response: {}\n", response),
             Err(e) => println!("Error: {}\n", e),
         }

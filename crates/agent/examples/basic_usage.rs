@@ -61,8 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let provider = build_llm_provider(&config);
 
-    let nvidia_cfg = VendorConfig::from_nvidia(&config)
-        .ok_or("no llm.nvidia config")?;
+    let nvidia_cfg = VendorConfig::from_nvidia(&config).ok_or("no llm.nvidia config")?;
 
     let mut config = AgentConfig::default();
     config.model = nvidia_cfg.model;

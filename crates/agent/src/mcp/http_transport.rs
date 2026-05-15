@@ -46,7 +46,8 @@ impl HttpTransport {
                 req = req.header("Mcp-Session-Id", sid);
             }
 
-            req.send(body.as_bytes()).map_err(|e| format!("Request error: {e}"))
+            req.send(body.as_bytes())
+                .map_err(|e| format!("Request error: {e}"))
         })
         .await
         .map_err(|e| HttpTransportError::Http(format!("Join error: {e}")))?;
@@ -69,13 +70,17 @@ impl HttpTransport {
             .unwrap_or("");
 
         if content_type.contains("text/event-stream") {
-            let text = response.into_body().read_to_string()
+            let text = response
+                .into_body()
+                .read_to_string()
                 .map_err(|e| HttpTransportError::Http(format!("Read error: {e}")))?;
             return self.parse_sse_response(&text);
         }
 
         if !(200..=299).contains(&status) && status != 202 {
-            let body_text = response.into_body().read_to_string()
+            let body_text = response
+                .into_body()
+                .read_to_string()
                 .unwrap_or_else(|_| String::new());
             if body_text.is_empty() {
                 return Err(HttpTransportError::Http(format!(
@@ -86,7 +91,9 @@ impl HttpTransport {
             return Err(HttpTransportError::Http(body_text));
         }
 
-        let body_str = response.into_body().read_to_string()
+        let body_str = response
+            .into_body()
+            .read_to_string()
             .map_err(|e| HttpTransportError::Http(format!("Read body error: {e}")))?;
 
         Ok(body_str)

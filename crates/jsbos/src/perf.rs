@@ -7,7 +7,7 @@ use std::sync::Mutex;
 #[napi(object)]
 pub struct PerfSnapshot {
   /// Number of LLM calls completed
-pub call_count: i64,
+  pub call_count: i64,
   pub total_wall_time_us: i64,
   pub avg_wall_time_us: i64,
   pub min_wall_time_us: i64,
