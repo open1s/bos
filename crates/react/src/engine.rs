@@ -11,7 +11,7 @@ use futures::{Stream, StreamExt};
 use log::info;
 use serde_json::Value;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -119,6 +119,7 @@ pub struct ReActEngine<A: ReActApp> {
     resilience: Option<ReActResilience>,
     skill_cache: SkillCache,
     tool_call_count: AtomicU64,
+    stop_flag: Option<Arc<AtomicBool>>,
 }
 
 pub struct ReActEngineBuilder<A: ReActApp> {
@@ -132,6 +133,7 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     token_counter: TokenCounter,
     skill_cache: SkillCache,
     react_app: Option<A>,
+    stop_flag: Option<Arc<AtomicBool>>,
     _phantom: std::marker::PhantomData<A>,
 }
 
@@ -148,6 +150,7 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             token_counter: TokenCounter::with_default(),
             skill_cache: SkillCache::new(Duration::from_secs(300)), // 5 min TTL
             react_app: None,
+            stop_flag: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -212,6 +215,11 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         self.react_app = Some(app);
         self
     }
+
+    pub fn stop_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.stop_flag = Some(flag);
+        self
+    }
 }
 
 impl<A: ReActApp + Default> ReActEngineBuilder<A> {
@@ -229,6 +237,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             resilience: self.resilience,
             skill_cache: self.skill_cache,
             tool_call_count: AtomicU64::new(0),
+            stop_flag: self.stop_flag,
         })
     }
 }
@@ -263,6 +272,7 @@ impl<A: ReActApp> ReActEngine<A> {
             resilience: None,
             skill_cache: SkillCache::new(Duration::from_secs(300)),
             tool_call_count: AtomicU64::new(0),
+            stop_flag: None,
         }
     }
 
@@ -425,6 +435,12 @@ impl<A: ReActApp> ReActEngine<A> {
         session.push(LlmMessage::user(request.input.clone()));
 
         for _ in 0..self.max_steps {
+            if let Some(ref flag) = self.stop_flag {
+                if flag.load(Ordering::SeqCst) {
+                    return Err(ReactError::HookAbort("Execution stopped by user".to_string()));
+                }
+            }
+
             // ReActApp hook: before_llm_call
             match self
                 .react_app
@@ -647,6 +663,13 @@ impl<A: ReActApp> ReActEngine<A> {
 
             while step_count < max_steps {
                 step_count += 1;
+
+                if let Some(ref flag) = self.stop_flag {
+                    if flag.load(Ordering::SeqCst) {
+                        yield Err(ReactError::HookAbort("Execution stopped by user".to_string()));
+                        break;
+                    }
+                }
 
                 match self.react_app
                     .before_llm_call(&mut request, session, context)
