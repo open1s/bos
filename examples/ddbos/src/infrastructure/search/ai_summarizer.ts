@@ -31,8 +31,12 @@ export class AISummarizer {
       await this.brain.start();
     }
 
+    const langPrefix = this.locale.language === 'zh'
+      ? '【中文模式】你必须用中文进行所有思考、推理和输出。\n\n'
+      : '';
+
     const builder = this.brain.agent('triz-summarizer')
-      .with_systemPrompt(`You are a technical research summarizer specializing in TRIZ and engineering solutions.
+      .with_systemPrompt(`${langPrefix}You are a technical research summarizer specializing in TRIZ and engineering solutions.
 
 For each document (patent, paper, or technical article), provide:
 1. A concise summary (2-3 sentences)
@@ -40,9 +44,7 @@ For each document (patent, paper, or technical article), provide:
 3. How it relates to the user's problem
 4. Which TRIZ inventive principles it demonstrates (if any)
 
-Be precise, technical, and actionable.
-
-${getLanguagePrompt(this.locale.language)}`)
+Be precise, technical, and actionable.`)
       .with_temperature(0.3);
 
     this.agent = await builder.start();

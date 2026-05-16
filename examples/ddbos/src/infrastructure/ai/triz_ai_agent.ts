@@ -50,8 +50,12 @@ export class AiTrizAgent {
       await this.brain.start();
     }
 
+    const langPrefix = this.locale.language === 'zh'
+      ? '【中文模式】你必须用中文进行所有思考、推理和输出。\n\n'
+      : '';
+
     const builder = this.brain.agent(this.agentName)
-      .with_systemPrompt(TRIZ_SYSTEM_PROMPT + '\n\n' + getLanguagePrompt(this.locale.language))
+      .with_systemPrompt(`${langPrefix}${TRIZ_SYSTEM_PROMPT}`)
       .with_temperature(0.7);
 
     this.agent = await builder.start();

@@ -26,8 +26,12 @@ export class AiSCurveEstimator {
       await this.brain.start();
     }
 
+    const langPrefix = this.locale.language === 'zh'
+      ? '【中文模式】你必须用中文进行所有思考、推理和输出。\n\n'
+      : '';
+
     const builder = this.brain.agent('triz-scurve-estimator')
-      .with_systemPrompt(`You are a TRIZ S-Curve analysis expert. You estimate S-curve parameters for technologies based on domain knowledge.
+      .with_systemPrompt(`${langPrefix}You are a TRIZ S-Curve analysis expert. You estimate S-curve parameters for technologies based on domain knowledge.
 
 Given a technology name and optional performance metric, estimate:
 1. L (carrying capacity / max performance)
@@ -36,9 +40,7 @@ Given a technology name and optional performance metric, estimate:
 4. Current S-curve stage (infancy, growth, maturity, decline)
 5. S2 offset (years until next-gen technology inflection)
 
-Return ONLY a JSON object with these fields. No explanation.
-
-${getLanguagePrompt(this.locale.language)}`)
+Return ONLY a JSON object with these fields. No explanation.`)
       .with_temperature(0.3);
 
     this.agent = await builder.start();

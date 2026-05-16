@@ -36,8 +36,12 @@ export class AiSCurveDataExtractor {
       await this.brain.start();
     }
 
+    const langPrefix = this.locale.language === 'zh'
+      ? '【中文模式】你必须用中文进行所有思考、推理和输出。\n\n'
+      : '';
+
     const builder = this.brain.agent('triz-scurve-data-extractor')
-      .with_systemPrompt(`You are a TRIZ S-Curve data extraction expert. Your task is to provide historical performance data that covers the FULL technology lifecycle.
+      .with_systemPrompt(`${langPrefix}You are a TRIZ S-Curve data extraction expert. Your task is to provide historical performance data that covers the FULL technology lifecycle.
 
 Given a technology name and performance metric, provide realistic historical data points that span from the technology's INCEPTION to the PRESENT DAY.
 
@@ -61,9 +65,7 @@ Return ONLY a JSON object with:
   }
 }
 
-Provide 8-12 data points and 4-8 key milestones spanning the FULL lifecycle from invention to present. Be realistic with numbers. The data should show a clear S-shaped curve pattern.
-
-${getLanguagePrompt(this.locale.language)}`)
+Provide 8-12 data points and 4-8 key milestones spanning the FULL lifecycle from invention to present. Be realistic with numbers. The data should show a clear S-shaped curve pattern.`)
       .with_temperature(0.1);
 
     this.agent = await builder.start();

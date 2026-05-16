@@ -296,29 +296,30 @@ export class UnifiedResearchService {
     technologyMaturity?: { trl: { level: number }; sCurveStage: string };
     problemDescription: string;
   }): string[] {
+    const lang = this.locale.language;
     const recs: string[] = [];
 
     if (result.contradictionAnalysis) {
       const principles = result.contradictionAnalysis.principles.slice(0, 3);
-      recs.push(`Apply TRIZ principles: ${principles.map(p => `#${p.index} ${p.name}`).join(', ')}`);
+      recs.push(`${t('applyTrizPrinciples', lang)}: ${principles.map(p => `#${p.index} ${p.name}`).join(', ')}`);
     }
 
     if (result.priorArt.patents.length > 0) {
-      recs.push(`Review ${result.priorArt.patents.length} relevant patents for prior art insights`);
+      recs.push(`${t('reviewRelevantPatents', lang)} ${result.priorArt.patents.length} ${t('relevantPatents', lang)}`);
     }
 
     if (result.priorArt.papers.length > 0) {
-      recs.push(`Study ${result.priorArt.papers.length} academic papers for research foundations`);
+      recs.push(`${t('studyRelevantPapers', lang)} ${result.priorArt.papers.length} ${t('relevantPapers', lang)}`);
     }
 
     if (result.technologyMaturity) {
       const { trl, sCurveStage } = result.technologyMaturity;
       if (trl.level >= 7) {
-        recs.push(`Technology is mature (TRL ${trl.level}, ${sCurveStage}). Focus on optimization and cost reduction`);
+        recs.push(`${t('techMature', lang)}（TRL ${trl.level}，${sCurveStage}）`);
       } else if (trl.level >= 4) {
-        recs.push(`Technology is developing (TRL ${trl.level}). Accelerate prototyping and validation`);
+        recs.push(`${t('techDeveloping', lang)}（TRL ${trl.level}）。${t('acceleratePrototyping', lang) || 'Accelerate prototyping and validation'}`);
       } else {
-        recs.push(`Technology is early-stage (TRL ${trl.level}). Invest in fundamental research`);
+        recs.push(`${t('techEarly', lang)}（TRL ${trl.level}）。${t('investResearch', lang) || 'Invest in fundamental research'}`);
       }
     }
 

@@ -11,7 +11,7 @@ import {
   PriorArtItem,
 } from './types.js';
 import { UnifiedResearchService } from './service.js';
-import { LocaleConfig, DEFAULT_LOCALE, t, stageLabel, trlTitle, svgLabel, getLanguagePrompt } from '../../domain/shared/i18n.js';
+import { LocaleConfig, DEFAULT_LOCALE, t, stageLabel, trlTitle, svgLabel, getLanguagePrompt, progressMsg } from '../../domain/shared/i18n.js';
 
 export interface AIResearchConfig {
   maxSearchResults?: number;
@@ -30,9 +30,12 @@ interface ExtractedParameters {
 }
 
 interface ExtractedSearchKeywords {
-  patentQuery: string;
-  paperQuery: string;
-  techQuery: string;
+  patentQueryEn: string;
+  patentQueryZh: string;
+  paperQueryEn: string;
+  paperQueryZh: string;
+  techQueryEn: string;
+  techQueryZh: string;
   reasoning: string;
 }
 
@@ -61,9 +64,11 @@ export class AIResearchOrchestrator {
   }
 
   async initialize(): Promise<void> {
-    const langPrompt = getLanguagePrompt(this.locale.language);
+    const langPrefix = this.locale.language === 'zh'
+      ? '【中文模式】你必须用中文进行所有思考、推理和输出。包括内部推理过程、分析、总结都用中文。\n\n'
+      : '';
     const builder = this.brain.agent('triz-research-orchestrator')
-      .with_systemPrompt(`You are a TRIZ research expert. You analyze problems, search for prior art, summarize findings, and generate comprehensive research reports.
+      .with_systemPrompt(`${langPrefix}You are a TRIZ research expert. You analyze problems, search for prior art, summarize findings, and generate comprehensive research reports.
 
 Your workflow:
 1. Analyze the problem description
@@ -76,9 +81,7 @@ Your workflow:
    - Technology maturity assessment (TRL + S-curve)
    - Actionable recommendations
 
-Return ONLY a JSON object with the report structure. No markdown, no explanation.
-
-${langPrompt}`)
+Return ONLY a JSON object with the report structure. No markdown, no explanation.`)
       .with_temperature(0.3);
 
     this.agent = await builder.start();
@@ -88,6 +91,7 @@ ${langPrompt}`)
     problemDescription: string,
     config: AIResearchConfig = {},
   ): Promise<UnifiedResearchResult> {
+    const lang = this.locale.language;
     this.errors = [];
     this.metadata = {
       startedAt: Date.now(),
@@ -111,7 +115,7 @@ ${langPrompt}`)
     const showThinking = config.showThinking ?? true;
 
     // Step 1: Extract search keywords from problem description
-    onProgress('keywords', 'AI is extracting optimized search keywords...');
+    onProgress('keywords', progressMsg('extractingKeywords', lang));
     let searchKeywords: ExtractedSearchKeywords | null = null;
     if (this.agent) {
       try {
@@ -138,34 +142,63 @@ ${langPrompt}`)
       }
     }
 
-    const patentQuery = searchKeywords?.patentQuery || problemDescription;
-    const paperQuery = searchKeywords?.paperQuery || problemDescription;
-    const techQuery = searchKeywords?.techQuery || problemDescription;
+    const patentQueryEn = searchKeywords?.patentQueryEn || problemDescription;
+    const patentQueryZh = searchKeywords?.patentQueryZh || '';
+    const paperQueryEn = searchKeywords?.paperQueryEn || problemDescription;
+    const paperQueryZh = searchKeywords?.paperQueryZh || '';
+    const techQueryEn = searchKeywords?.techQueryEn || problemDescription;
+    const techQueryZh = searchKeywords?.techQueryZh || '';
 
-    if (searchKeywords && searchKeywords.patentQuery && searchKeywords.paperQuery && searchKeywords.techQuery) {
-      onProgress('keywords', `Patent: "${patentQuery}" | Paper: "${paperQuery}" | Tech: "${techQuery}"`);
+    if (searchKeywords) {
+      onProgress('keywords', `Patent EN: "${patentQueryEn}"`);
+      if (patentQueryZh) onProgress('keywords', `Patent ZH: "${patentQueryZh}"`);
+      onProgress('keywords', `Paper EN: "${paperQueryEn}"`);
+      if (paperQueryZh) onProgress('keywords', `Paper ZH: "${paperQueryZh}"`);
+      onProgress('keywords', `Tech EN: "${techQueryEn}"`);
+      if (techQueryZh) onProgress('keywords', `Tech ZH: "${techQueryZh}"`);
     }
 
-    // Step 2: Search prior art with optimized keywords
-    onProgress('search', 'Searching patents, papers, and technical solutions...');
-    const [patents, papers, techSolutions] = await this.searchWithTracking(
-      { patentQuery, paperQuery, techQuery },
-      maxResults,
+    // Step 2: Search prior art with English and Chinese queries separately
+    onProgress('search', progressMsg('searching', lang));
+    const halfResults = Math.max(1, Math.floor(maxResults / 2));
+
+    const [patentsEn, papersEn, techSolutionsEn] = await this.searchWithTracking(
+      { patentQuery: patentQueryEn, paperQuery: paperQueryEn, techQuery: techQueryEn },
+      halfResults,
     );
-    onProgress('search', `Found ${patents.length} patents, ${papers.length} papers, ${techSolutions.length} tech solutions`);
+
+    let patentsZh: SearchResult[] = [];
+    let papersZh: SearchResult[] = [];
+    let techSolutionsZh: SearchResult[] = [];
+
+    if (patentQueryZh || paperQueryZh || techQueryZh) {
+      const zhResults = await this.searchWithTracking(
+        { patentQuery: patentQueryZh, paperQuery: paperQueryZh, techQuery: techQueryZh },
+        halfResults,
+      );
+      patentsZh = zhResults[0];
+      papersZh = zhResults[1];
+      techSolutionsZh = zhResults[2];
+    }
+
+    const patents = this.mergeResults(patentsEn, patentsZh);
+    const papers = this.mergeResults(papersEn, papersZh);
+    const techSolutions = this.mergeResults(techSolutionsEn, techSolutionsZh);
+
+    onProgress('search', `${progressMsg('foundResults', lang)} ${patents.length} ${progressMsg('patents', lang)}，${papers.length} ${progressMsg('papers', lang)}，${techSolutions.length} ${progressMsg('techSolutions', lang)}`);
 
     if (patents.length === 0 && papers.length === 0 && techSolutions.length === 0) {
-      this.addError('search', 'No prior art found. Results may be less reliable.', 'warning');
+      this.addError('search', progressMsg('failedSearch', lang), 'warning');
     }
 
     // Step 2: Summarize each result using AI (parallel)
-    onProgress('summarize', 'AI is analyzing and summarizing each result...');
+    onProgress('summarize', progressMsg('analyzingSummarizing', lang));
     const summarizedResults = await this.summarizeAllResultsParallel(
       { patents, papers, techSolutions },
       problemDescription,
       onProgress,
     );
-    onProgress('summarize', 'Summarization complete');
+    onProgress('summarize', progressMsg('summarizationComplete', lang));
 
     // Step 3: Build comprehensive prompt for AI analysis
     const analysisPrompt = this.buildAnalysisPrompt(
@@ -174,7 +207,7 @@ ${langPrompt}`)
     );
 
     // Step 4: Get AI analysis and report (streaming with thinking)
-    onProgress('analyze', 'AI is extracting TRIZ parameters and analyzing contradictions...');
+    onProgress('analyze', progressMsg('extractingTRIZ', lang));
     let aiAnalysis: ExtractedParameters = {};
     if (this.agent) {
       try {
@@ -197,7 +230,7 @@ ${langPrompt}`)
             }
           },
           onToolCall: (name) => {
-            onProgress('tool', `Calling tool: ${name}`);
+            onProgress('tool', `${progressMsg('callingTool', lang)}: ${name}`);
           },
         });
         // Flush remaining thinking
@@ -207,7 +240,7 @@ ${langPrompt}`)
         this.metadata.aiCallsMade = (this.metadata.aiCallsMade || 0) + 1;
         aiAnalysis = this.parseAIAnalysisWithSchema(response);
       } catch (err) {
-        this.addError('analyze', `AI analysis failed: ${err instanceof Error ? err.message : String(err)}`, 'warning');
+        this.addError('analyze', `${progressMsg('failedAnalyze', lang)}: ${err instanceof Error ? err.message : String(err)}`, 'warning');
       }
     }
 
@@ -217,10 +250,10 @@ ${langPrompt}`)
     aiAnalysis.worseningParameter = aiAnalysis.worseningParameter || fallbackParams.worseningParameter;
     aiAnalysis.technologyName = aiAnalysis.technologyName || fallbackParams.technologyName;
     aiAnalysis.performanceMetric = aiAnalysis.performanceMetric || fallbackParams.performanceMetric;
-    onProgress('analyze', `Extracted: improving="${aiAnalysis.improvingParameter}", worsening="${aiAnalysis.worseningParameter}"`);
+    onProgress('analyze', `${progressMsg('extracted', lang)}: improving="${aiAnalysis.improvingParameter}", worsening="${aiAnalysis.worseningParameter}"`);
 
     // Step 5: Run TRIZ analysis (contradiction, S-curve, TRL)
-    onProgress('triz', 'Running TRIZ contradiction matrix lookup, S-curve analysis, and TRL assessment...');
+    onProgress('triz', progressMsg('runningTRIZ', lang));
     let trizResult: UnifiedResearchResult | null = null;
     try {
       trizResult = await this.researchService.research({
@@ -236,9 +269,9 @@ ${langPrompt}`)
         },
       });
     } catch (err) {
-      this.addError('triz', `TRIZ analysis failed: ${err instanceof Error ? err.message : String(err)}`, 'warning');
+      this.addError('triz', `${progressMsg('failedTRIZ', lang)}: ${err instanceof Error ? err.message : String(err)}`, 'warning');
     }
-    onProgress('triz', `TRIZ analysis complete: ${trizResult?.contradictionAnalysis?.principles.length || 0} principles, TRL ${trizResult?.technologyMaturity?.trl.level || 'N/A'}`);
+    onProgress('triz', `${progressMsg('trizComplete', lang)}: ${trizResult?.contradictionAnalysis?.principles.length || 0} ${progressMsg('principles', lang)}，TRL ${trizResult?.technologyMaturity?.trl.level || 'N/A'}`);
 
     // Collect errors from sub-service
     if (trizResult?.errors) {
@@ -304,6 +337,19 @@ ${langPrompt}`)
     ].filter(Boolean);
 
     return [patents, papers, techSolutions];
+  }
+
+  private mergeResults(en: SearchResult[], zh: SearchResult[]): SearchResult[] {
+    const seen = new Set<string>();
+    const merged: SearchResult[] = [];
+    for (const r of [...en, ...zh]) {
+      const key = r.title.toLowerCase().trim();
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(r);
+      }
+    }
+    return merged;
   }
 
   private async summarizeAllResultsParallel(
@@ -401,7 +447,11 @@ ${langPrompt}`)
       return `Title: ${r.title}\nDate: ${r.publishedDate || 'N/A'}\nAuthors: ${r.authors?.join(', ') || 'N/A'}\n${summaryText}`;
     };
 
-    return `Analyze this problem and prior art:
+    const langPrefix = this.locale.language === 'zh'
+      ? '【中文模式】你必须用中文进行所有思考、推理和输出。包括内部推理过程、分析、总结都用中文。\n\n'
+      : '';
+
+    return `${langPrefix}Analyze this problem and prior art:
 
 PROBLEM: ${problemDescription}
 
@@ -488,30 +538,33 @@ Return ONLY valid JSON matching this schema:
 
 Problem: "${problemDescription}"
 
-Generate THREE sets of search keywords optimized for different databases. For EACH database, provide:
-- A primary query (5-10 core keywords)
-- Alternative/synonym keywords (broader terms, related concepts, abbreviations)
+Generate SIX sets of search keywords — THREE in English and THREE in Chinese — optimized for different databases.
 
 Target databases:
-1. patentQuery: For patent databases (Google Patents, USPTO, etc.) - use technical terms, mechanism-focused language
-2. paperQuery: For academic databases (CrossRef, OpenAlex, etc.) - use academic terminology, research-focused language
-3. techQuery: For technical articles and solutions - use industry terms, product names, practical language
+1. English patentQuery: For patent databases (Google Patents, USPTO, EPO, etc.) - English technical terms
+2. Chinese patentQuery: For patent databases (CNIPA, Google Patents CN, etc.) - Chinese technical terms
+3. English paperQuery: For academic databases (CrossRef, OpenAlex, etc.) - English academic terminology
+4. Chinese paperQuery: For academic databases (CNKI, WanFang, etc.) - Chinese academic terminology
+5. English techQuery: For technical articles and solutions - English industry terms
+6. Chinese techQuery: For technical articles and solutions - Chinese industry terms
 
 Rules:
-- Include synonyms, abbreviations, and related terms (e.g., "EV" + "electric vehicle" + "battery electric")
-- Include broader terms that might capture relevant but not exact matches
-- Use English terms even for non-English problems
+- Include synonyms, abbreviations, and related terms
+- DO NOT mix English and Chinese in the same query — keep them strictly separated
 - Separate keywords with spaces (for OR-style search)
 - Don't use overly specific phrases - keep it broad enough to catch relevant results
 
-Example format for each query:
+Example format:
 "electric vehicle EV battery energy density range lightweight cost optimization materials solid-state lithium-ion"
 
 Return ONLY valid JSON:
 {
-  "patentQuery": "keyword1 keyword2 synonym1 synonym2 ...",
-  "paperQuery": "keyword1 keyword2 synonym1 synonym2 ...",
-  "techQuery": "keyword1 keyword2 synonym1 synonym2 ...",
+  "patentQueryEn": "english keywords for patent search",
+  "patentQueryZh": "中文关键词用于专利搜索",
+  "paperQueryEn": "english keywords for paper search",
+  "paperQueryZh": "中文关键词用于论文搜索",
+  "techQueryEn": "english keywords for tech solutions search",
+  "techQueryZh": "中文关键词用于技术方案搜索",
   "reasoning": "brief explanation of keyword choices"
 }`;
   }
@@ -539,17 +592,25 @@ Return ONLY valid JSON:
     if (typeof parsed !== 'object' || parsed === null) return null;
     const obj = parsed as Record<string, unknown>;
 
-    const patentQuery = typeof obj.patentQuery === 'string' ? obj.patentQuery.trim() : '';
-    const paperQuery = typeof obj.paperQuery === 'string' ? obj.paperQuery.trim() : '';
-    const techQuery = typeof obj.techQuery === 'string' ? obj.techQuery.trim() : '';
+    const patentQueryEn = typeof obj.patentQueryEn === 'string' ? obj.patentQueryEn.trim() : '';
+    const patentQueryZh = typeof obj.patentQueryZh === 'string' ? obj.patentQueryZh.trim() : '';
+    const paperQueryEn = typeof obj.paperQueryEn === 'string' ? obj.paperQueryEn.trim() : '';
+    const paperQueryZh = typeof obj.paperQueryZh === 'string' ? obj.paperQueryZh.trim() : '';
+    const techQueryEn = typeof obj.techQueryEn === 'string' ? obj.techQueryEn.trim() : '';
+    const techQueryZh = typeof obj.techQueryZh === 'string' ? obj.techQueryZh.trim() : '';
     const reasoning = typeof obj.reasoning === 'string' ? obj.reasoning : '';
 
-    if (!patentQuery || !paperQuery || !techQuery) return null;
+    if (!patentQueryEn && !patentQueryZh) return null;
+    if (!paperQueryEn && !paperQueryZh) return null;
+    if (!techQueryEn && !techQueryZh) return null;
 
     return {
-      patentQuery: patentQuery || '',
-      paperQuery: paperQuery || '',
-      techQuery: techQuery || '',
+      patentQueryEn,
+      patentQueryZh,
+      paperQueryEn,
+      paperQueryZh,
+      techQueryEn,
+      techQueryZh,
       reasoning,
     };
   }
@@ -614,9 +675,18 @@ Return ONLY valid JSON:
       lines.push('');
       lines.push(`| ${t('source', lang) || 'Source'} | Query |`);
       lines.push(`|--------|-------|`);
-      lines.push(`| 🔍 ${t('patents', lang)} | \`${searchKeywords.patentQuery}\` |`);
-      lines.push(`| 📚 ${t('academicPapersTitle', lang)} | \`${searchKeywords.paperQuery}\` |`);
-      lines.push(`| 🔧 ${t('technicalSolutions', lang)} | \`${searchKeywords.techQuery}\` |`);
+      lines.push(`| 🔍 ${t('patents', lang)} (EN) | \`${searchKeywords.patentQueryEn}\` |`);
+      if (searchKeywords.patentQueryZh) {
+        lines.push(`| 🔍 ${t('patents', lang)} (ZH) | \`${searchKeywords.patentQueryZh}\` |`);
+      }
+      lines.push(`| 📚 ${t('academicPapersTitle', lang)} (EN) | \`${searchKeywords.paperQueryEn}\` |`);
+      if (searchKeywords.paperQueryZh) {
+        lines.push(`| 📚 ${t('academicPapersTitle', lang)} (ZH) | \`${searchKeywords.paperQueryZh}\` |`);
+      }
+      lines.push(`| 🔧 ${t('technicalSolutions', lang)} (EN) | \`${searchKeywords.techQueryEn}\` |`);
+      if (searchKeywords.techQueryZh) {
+        lines.push(`| 🔧 ${t('technicalSolutions', lang)} (ZH) | \`${searchKeywords.techQueryZh}\` |`);
+      }
       if (searchKeywords.reasoning) {
         lines.push('');
         lines.push(`**${t('reasoning', lang) || 'Reasoning'}:** ${searchKeywords.reasoning}`);

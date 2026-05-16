@@ -280,6 +280,8 @@ export const REPORT_LABELS: Readonly<Record<string, Record<Language, string>>> =
   relevance: { zh: '相关性', en: 'Relevance' },
   keyFindings: { zh: '关键发现', en: 'Key Findings' },
   principles: { zh: '原理', en: 'Principles' },
+  acceleratePrototyping: { zh: '加速原型设计和验证', en: 'Accelerate prototyping and validation' },
+  investResearch: { zh: '投资基础研究', en: 'Invest in fundamental research' },
 };
 
 export function t(key: string, lang: Language): string {
@@ -327,4 +329,40 @@ export function getLanguagePrompt(lang: Language): string {
   return lang === 'zh'
     ? '请用中文回答。'
     : 'Please respond in English.';
+}
+
+export const PROGRESS_MESSAGES: Readonly<Record<string, Record<Language, string>>> = {
+  extractingKeywords: { zh: 'AI 正在提取优化搜索关键词...', en: 'AI is extracting optimized search keywords...' },
+  searching: { zh: '正在搜索专利、论文和技术方案...', en: 'Searching patents, papers, and technical solutions...' },
+  foundResults: { zh: '找到', en: 'Found' },
+  patents: { zh: '项专利', en: 'patents' },
+  papers: { zh: '篇论文', en: 'papers' },
+  techSolutions: { zh: '个技术方案', en: 'tech solutions' },
+  analyzingSummarizing: { zh: 'AI 正在分析和总结每个结果...', en: 'AI is analyzing and summarizing each result...' },
+  summarizationComplete: { zh: '总结完成', en: 'Summarization complete' },
+  extractingTRIZ: { zh: 'AI 正在提取TRIZ参数并分析矛盾...', en: 'AI is extracting TRIZ parameters and analyzing contradictions...' },
+  extracted: { zh: '已提取', en: 'Extracted' },
+  runningTRIZ: { zh: '正在运行TRIZ矛盾矩阵查找、S曲线分析和TRL评估...', en: 'Running TRIZ contradiction matrix lookup, S-curve analysis, and TRL assessment...' },
+  trizComplete: { zh: 'TRIZ分析完成', en: 'TRIZ analysis complete' },
+  principles: { zh: '个原理', en: 'principles' },
+  callingTool: { zh: '调用工具', en: 'Calling tool' },
+  extractingSCurve: { zh: '正在提取S曲线数据', en: 'Extracting S-curve data' },
+  dataPoints: { zh: '数据点', en: 'Data points' },
+  fittingCurve: { zh: '正在拟合逻辑曲线并检测阶段...', en: 'Fitting logistic curve and detecting stage...' },
+  stage: { zh: '阶段', en: 'stage' },
+  crossover: { zh: '交叉点', en: 'crossover' },
+  svgSaved: { zh: 'SVG已保存到', en: 'SVG saved to' },
+  contradictionFailed: { zh: '矛盾分析失败', en: 'Contradiction analysis failed' },
+  sCurveFailed: { zh: 'S曲线/TRL分析失败', en: 'S-curve/TRL analysis failed' },
+  noRealData: { zh: '未找到真实S曲线数据。使用AI估计数据点。结果为近似值。', en: 'No real S-curve data found. Using AI-estimated data points. Results are approximate.' },
+  failedInit: { zh: '初始化AI代理失败', en: 'Failed to initialize AI agent' },
+  failedParse: { zh: '解析AI分析响应为JSON失败', en: 'Failed to parse AI analysis response as JSON' },
+  failedSearch: { zh: '未找到现有技术。结果可能不太可靠。', en: 'No prior art found. Results may be less reliable.' },
+  failedAnalyze: { zh: 'AI分析失败', en: 'AI analysis failed' },
+  failedTRIZ: { zh: 'TRIZ分析失败', en: 'TRIZ analysis failed' },
+};
+
+export function progressMsg(key: string, lang: Language): string {
+  const map = PROGRESS_MESSAGES[key];
+  return map?.[lang] || map?.en || key;
 }
