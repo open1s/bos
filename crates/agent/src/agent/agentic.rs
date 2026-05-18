@@ -10,7 +10,6 @@ use log::warn;
 use react::LlmMessage;
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use react::engine::{ReActEngine, ReActEngineBuilder};

@@ -337,6 +337,16 @@ MIT OR Apache-2.0
 
 ## Changelog
 
+### v2.2.0 (2026-05-18)
+
+- **Added**: `agent.stop()` — stop a running agent/react/stream via ESC key
+- **Added**: `agent.is_running()` — check if agent is currently running
+- **Added**: Stop flag and running state in NAPI Agent layer
+- **Added**: `StreamToken::Stopped` variant for stream cancellation
+- **Added**: Concurrent call prevention with error "Agent is already running"
+- **Added**: Stream returns `{status: "stopped"|"completed"}` JSON string
+- **Breaking**: `stream()` now returns `String` (JSON status object) instead of `()`
+
 ### v2.1.4 (2026-05-15)
 
 - **Fixed**: `getPerfMetrics()` now correctly updates after `stream()` calls
@@ -351,4 +361,4 @@ MIT OR Apache-2.0
 
 ---
 
-**Version**: 2.1.4 | **Last Updated**: 2026-05-15
+**Version**: 2.2.0 | **Last Updated**: 2026-05-18

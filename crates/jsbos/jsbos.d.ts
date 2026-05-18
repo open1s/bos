@@ -17,6 +17,8 @@ export declare class Agent {
   registerHook(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => any)): void
   registerPlugin(name: string, onLlmRequest?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onLlmResponse?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolCall?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolResult?: (((err: Error | null, arg: JSAny) => any)) | undefined | null): void
   close(): void
+  stop(options?: StopOptions | undefined | null): any
+  isRunning(): boolean
   addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => any)): Promise<string>
   addBashTool(name: string, workspaceRoot?: string | undefined | null): Promise<void>
   registerSkillsFromDir(dirPath: string): Promise<void>
@@ -27,7 +29,7 @@ export declare class Agent {
   listMcpPrompts(): Promise<Array<any>>
   rpcClient(endpoint: string, bus: ExternalObject<Session>): Promise<AgentRpcClient>
   asCallableServer(endpoint: string, bus: ExternalObject<Session>): Promise<AgentCallableServer>
-  stream(task: string, callback: ((err: Error | null, arg: any) => any)): Promise<void>
+  stream(task: string, callback: ((err: Error | null, arg: any) => any)): Promise<string>
   getSessionJson(): string
   exportSession(): string
   restoreSessionJson(json: string): void
@@ -284,6 +286,10 @@ export interface PluginToolResult {
 export interface PromptTokensDetails {
   audioTokens?: number
   cachedTokens?: number
+}
+
+export interface StopOptions {
+  clearSession?: boolean
 }
 
 export interface TokenBudgetReport {

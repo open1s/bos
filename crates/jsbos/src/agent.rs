@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -204,6 +205,8 @@ pub struct Agent {
   #[allow(dead_code)]
   hooks: std::sync::Arc<std::sync::Mutex<HookRegistry>>,
   perf: std::sync::Arc<crate::perf::PerformanceMetrics>,
+  stop_flag: std::sync::Arc<AtomicBool>,
+  is_running: std::sync::Arc<AtomicBool>,
 }
 
 #[napi]
@@ -250,6 +253,8 @@ impl Agent {
       bus_session: None,
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
       perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
+      stop_flag: std::sync::Arc::new(AtomicBool::new(false)),
+      is_running: std::sync::Arc::new(AtomicBool::new(false)),
     })
   }
 
@@ -298,25 +303,51 @@ impl Agent {
       bus_session: Some(_bus.as_ref().clone()),
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
       perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
+      stop_flag: std::sync::Arc::new(AtomicBool::new(false)),
+      is_running: std::sync::Arc::new(AtomicBool::new(false)),
     })
   }
 
   #[napi]
   pub async fn run_simple(&self, task: String) -> Result<String> {
-    let guard = self.inner.lock().await;
-    guard
-      .run_simple(&task)
-      .await
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+    if self.is_running.load(Ordering::SeqCst) {
+      return Err(Error::new(napi::Status::GenericFailure, "Agent is already running".to_string()));
+    }
+    if self.stop_flag.load(Ordering::SeqCst) {
+      self.stop_flag.store(false, Ordering::SeqCst);
+      return Ok(String::new());
+    }
+
+    self.is_running.store(true, Ordering::SeqCst);
+    let result = {
+      let guard = self.inner.lock().await;
+      guard.run_simple(&task).await
+    };
+    self.is_running.store(false, Ordering::SeqCst);
+
+    result.map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
   #[napi]
   pub async fn react(&self, task: String) -> Result<String> {
-    let guard = self.inner.lock().await;
-    guard
-      .react(&task)
-      .await
-      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+    if self.is_running.load(Ordering::SeqCst) {
+      return Err(Error::new(napi::Status::GenericFailure, "Agent is already running".to_string()));
+    }
+    if self.stop_flag.load(Ordering::SeqCst) {
+      self.stop_flag.store(false, Ordering::SeqCst);
+      return Ok(String::new());
+    }
+
+    self.is_running.store(true, Ordering::SeqCst);
+    let result = {
+      let guard = self.inner.lock().await;
+      guard
+        .react(&task)
+        .await
+    };
+    self.is_running.store(false, Ordering::SeqCst);
+
+    result.map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
   #[napi]
@@ -396,19 +427,22 @@ impl Agent {
   pub fn close(&self) -> Result<()> {
     let mut guard = self.inner.blocking_lock();
     guard.clear_runtime_extensions();
-
+    guard.stop();
+    self.stop_flag.store(true, Ordering::SeqCst);
+    self.is_running.store(false, Ordering::SeqCst);
     Ok(())
   }
 
   #[napi]
   pub fn stop(&self, options: Option<StopOptions>) -> Result<serde_json::Value> {
-    let guard = self.inner.blocking_lock();
-    let was_running = guard.stop();
+    let was_running = self.is_running.load(Ordering::SeqCst);
+    self.stop_flag.store(true, Ordering::SeqCst);
+    self.is_running.store(false, Ordering::SeqCst);
 
     if let Some(opts) = options {
       if opts.clear_session.unwrap_or(false) {
-        drop(guard);
         let mut guard = self.inner.blocking_lock();
+        guard.stop();
         guard.session_mut().clear();
       }
     }
@@ -418,8 +452,7 @@ impl Agent {
 
   #[napi]
   pub fn is_running(&self) -> Result<bool> {
-    let guard = self.inner.blocking_lock();
-    Ok(guard.is_running())
+    Ok(self.is_running.load(Ordering::SeqCst))
   }
 
   #[napi]
@@ -627,75 +660,94 @@ impl Agent {
     task: String,
     callback: ThreadsafeFunction<serde_json::Value>,
   ) -> Result<String> {
-    let guard = self.inner.lock().await;
-    let start = std::time::Instant::now();
+    if self.is_running.load(Ordering::SeqCst) {
+      return Err(Error::new(napi::Status::GenericFailure, "Agent is already running".to_string()));
+    }
+    if self.stop_flag.load(Ordering::SeqCst) {
+      self.stop_flag.store(false, Ordering::SeqCst);
+      return Ok(serde_json::json!({ "status": "stopped" }).to_string());
+    }
 
-    let stream = guard.stream(&task);
-    use futures::StreamExt;
-    futures::pin_mut!(stream);
-    let mut had_error = false;
-    let mut was_stopped = false;
-    while let Some(token_result) = stream.next().await {
-      match token_result {
-        Ok(token) => {
-          let json = match token {
-            agent::StreamToken::Text(text) => {
-              serde_json::json!({ "type": "Text", "text": text })
+    self.is_running.store(true, Ordering::SeqCst);
+
+    let result = async {
+      let guard = self.inner.lock().await;
+      let start = std::time::Instant::now();
+
+      let stream = guard.stream(&task);
+      use futures::StreamExt;
+      futures::pin_mut!(stream);
+      let mut had_error = false;
+      let mut was_stopped = false;
+      while let Some(token_result) = stream.next().await {
+        if self.stop_flag.load(Ordering::SeqCst) {
+          was_stopped = true;
+          break;
+        }
+        match token_result {
+          Ok(token) => {
+            let json = match token {
+              agent::StreamToken::Text(text) => {
+                serde_json::json!({ "type": "Text", "text": text })
+              }
+              agent::StreamToken::ReasoningContent(text) => {
+                serde_json::json!({ "type": "ReasoningContent", "text": text })
+              }
+              agent::StreamToken::ToolCall { name, args, id } => {
+                serde_json::json!({
+                    "type": "ToolCall",
+                    "name": name,
+                    "args": args,
+                    "id": id
+                })
+              }
+              agent::StreamToken::Done => {
+                serde_json::json!({ "type": "Done" })
+              }
+              agent::StreamToken::Stopped => {
+                was_stopped = true;
+                serde_json::json!({ "type": "Stopped" })
+              }
+            };
+            callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+            if was_stopped {
+              break;
             }
-            agent::StreamToken::ReasoningContent(text) => {
-              serde_json::json!({ "type": "ReasoningContent", "text": text })
-            }
-            agent::StreamToken::ToolCall { name, args, id } => {
-              serde_json::json!({
-                  "type": "ToolCall",
-                  "name": name,
-                  "args": args,
-                  "id": id
-              })
-            }
-            agent::StreamToken::Done => {
-              serde_json::json!({ "type": "Done" })
-            }
-            agent::StreamToken::Stopped => {
-              was_stopped = true;
-              serde_json::json!({ "type": "Stopped" })
-            }
-          };
-          callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
-          if was_stopped {
-            break;
+          }
+          Err(_e) => {
+            had_error = true;
+            let json = serde_json::json!({
+                "type": "Error",
+                "error": "Stream error"
+            });
+            callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
           }
         }
-        Err(_e) => {
-          had_error = true;
-          let json = serde_json::json!({
-              "type": "Error",
-              "error": "Stream error"
-          });
-          callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
-        }
       }
-    }
 
-    let elapsed = start.elapsed();
-    if had_error {
-      guard.record_llm_error();
-    }
-    let tokens = guard.last_token_usage().unwrap_or((0, 0));
-    guard.record_stream_call(
-      elapsed,
-      elapsed,
-      std::time::Duration::ZERO,
-      tokens.0,
-      tokens.1,
-    );
-    let tool_calls = guard.last_stream_tool_calls();
-    if tool_calls > 0 {
-      guard.record_tool_calls(tool_calls, std::time::Duration::ZERO);
-    }
+      let elapsed = start.elapsed();
+      if had_error {
+        guard.record_llm_error();
+      }
+      let tokens = guard.last_token_usage().unwrap_or((0, 0));
+      guard.record_stream_call(
+        elapsed,
+        elapsed,
+        std::time::Duration::ZERO,
+        tokens.0,
+        tokens.1,
+      );
+      let tool_calls = guard.last_stream_tool_calls();
+      if tool_calls > 0 {
+        guard.record_tool_calls(tool_calls, std::time::Duration::ZERO);
+      }
 
-    let status = if was_stopped { "stopped" } else { "completed" };
-    Ok(serde_json::json!({ "status": status }).to_string())
+      let status = if was_stopped { "stopped" } else { "completed" };
+      Ok(serde_json::json!({ "status": status }).to_string())
+    }.await;
+
+    self.is_running.store(false, Ordering::SeqCst);
+    result
   }
 
   #[napi]
