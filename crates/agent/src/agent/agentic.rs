@@ -312,11 +312,7 @@ pub struct Agent {
     #[rkyv(with = qserde::rkyv::with::Skip)]
     last_stream_tokens: std::sync::Mutex<Option<(u64, u64)>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
-    last_stream_tool_calls: std::sync::Mutex<u64>,
-    #[rkyv(with = qserde::rkyv::with::Skip)]
-    stop_flag: Arc<AtomicBool>,
-    #[rkyv(with = qserde::rkyv::with::Skip)]
-    is_running: Arc<AtomicBool>,
+    last_stream_tool_calls: std::sync::Mutex<u64>
 }
 
 impl Agent {
@@ -340,9 +336,7 @@ impl Agent {
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
-            last_stream_tool_calls: std::sync::Mutex::new(0),
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            is_running: Arc::new(AtomicBool::new(false)),
+            last_stream_tool_calls: std::sync::Mutex::new(0)
         }
     }
 
@@ -546,8 +540,7 @@ impl Agent {
             .llm_timeout(self.config.timeout_secs)
             .max_steps(self.config.max_steps)
             .model(self.config.model.clone())
-            .app(app)
-            .stop_flag(self.stop_flag.clone());
+            .app(app);
 
         if let Some(ref registry) = self.registry {
             for (_name, tool) in registry.iter() {
@@ -660,12 +653,6 @@ impl Agent {
     pub async fn react(&self, task: &str) -> Result<String, AgentError> {
         let wall_start = std::time::Instant::now();
 
-        if self.is_running.load(Ordering::SeqCst) {
-            return Err(AgentError::Session("Agent is already running".to_string()));
-        }
-        self.is_running.store(true, Ordering::SeqCst);
-        self.stop_flag.store(false, Ordering::SeqCst);
-
         let (mut engine, mut context) = {
             let mut engine_cache = self.engine_cache.lock().unwrap();
             let mut context_cache = self.context_cache.lock().unwrap();
@@ -725,7 +712,6 @@ impl Agent {
                     let mut cc = self.context_cache.lock().unwrap();
                     *cc = context.take();
                 }
-                self.is_running.store(false, Ordering::SeqCst);
                 let wall_time = wall_start.elapsed();
                 if let Some(usage) = tokens {
                     self.metrics.record_call(
@@ -759,7 +745,6 @@ impl Agent {
             Err(e) => {
                 drop(engine);
                 drop(context);
-                self.is_running.store(false, Ordering::SeqCst);
                 if matches!(e, react::engine::ReactError::HookAbort(ref msg) if msg == "Execution stopped by user")
                 {
                     let partial = {
@@ -808,14 +793,6 @@ impl Agent {
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send + '_>> {
         let task_str = task.to_string();
 
-        if self.is_running.load(Ordering::SeqCst) {
-            return Box::pin(async_stream::stream! {
-                yield Err(AgentError::Session("Agent is already running".to_string()));
-            });
-        }
-        self.is_running.store(true, Ordering::SeqCst);
-        self.stop_flag.store(false, Ordering::SeqCst);
-
         let cached_engine = {
             let mut cache = self.engine_cache.lock().unwrap();
             cache.take()
@@ -849,7 +826,7 @@ impl Agent {
         agent_session.restore_messages(messages);
 
         let stream = async_stream::stream! {
-            let engine = engine;
+            let mut engine = engine;
             let mut context = context;
 
             let request = LlmRequest {
@@ -875,8 +852,6 @@ impl Agent {
                 let mut session = self.session.lock().unwrap();
                 session.restore_messages(agent_session.take_messages());
             }
-
-            self.is_running.store(false, Ordering::SeqCst);
 
             {
                 let usage = engine.token_usage();
@@ -927,35 +902,18 @@ impl Agent {
 
     /// Signal the agent to stop the current execution.
     /// Returns true if there was a running execution to stop.
-    pub fn stop(&self) -> bool {
-        let was_running = self.is_running.load(Ordering::SeqCst);
-        self.stop_flag.store(true, Ordering::SeqCst);
-        was_running
-    }
-
-    /// Check if the stop flag has been set.
-    pub fn is_stopped(&self) -> bool {
-        self.stop_flag.load(Ordering::SeqCst)
-    }
-
-    /// Clear the stop flag (called at the start of a new execution).
-    pub fn clear_stop(&self) {
-        self.stop_flag.store(false, Ordering::SeqCst);
-    }
-
-    /// Mark the agent as running.
-    pub fn mark_running(&self) {
-        self.is_running.store(true, Ordering::SeqCst);
-    }
-
-    /// Mark the agent as not running.
-    pub fn mark_not_running(&self) {
-        self.is_running.store(false, Ordering::SeqCst);
-    }
-
-    /// Check if the agent is currently running.
-    pub fn is_running(&self) -> bool {
-        self.is_running.load(Ordering::SeqCst)
+    pub fn stop(&self) {
+        let cached_engine = {
+            let mut cache = self.engine_cache.lock().unwrap();
+            cache.take()
+        };
+        
+        match cached_engine {
+            Some(mut e) =>{
+                e.stop();
+            }
+            None => {}
+        };
     }
 
     /// Register a tool and return explicit error on failure.
@@ -1123,9 +1081,7 @@ impl Clone for Agent {
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
-            last_stream_tool_calls: std::sync::Mutex::new(0),
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            is_running: Arc::new(AtomicBool::new(false)),
+            last_stream_tool_calls: std::sync::Mutex::new(0)
         }
     }
 }

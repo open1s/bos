@@ -119,7 +119,7 @@ pub struct ReActEngine<A: ReActApp> {
     resilience: Option<ReActResilience>,
     skill_cache: SkillCache,
     tool_call_count: AtomicU64,
-    stop_flag: Option<Arc<AtomicBool>>,
+    stop_flag: Arc<AtomicBool>,
 }
 
 pub struct ReActEngineBuilder<A: ReActApp> {
@@ -133,7 +133,6 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     token_counter: TokenCounter,
     skill_cache: SkillCache,
     react_app: Option<A>,
-    stop_flag: Option<Arc<AtomicBool>>,
     _phantom: std::marker::PhantomData<A>,
 }
 
@@ -150,7 +149,6 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             token_counter: TokenCounter::with_default(),
             skill_cache: SkillCache::new(Duration::from_secs(300)), // 5 min TTL
             react_app: None,
-            stop_flag: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -215,11 +213,6 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         self.react_app = Some(app);
         self
     }
-
-    pub fn stop_flag(mut self, flag: Arc<AtomicBool>) -> Self {
-        self.stop_flag = Some(flag);
-        self
-    }
 }
 
 impl<A: ReActApp + Default> ReActEngineBuilder<A> {
@@ -237,7 +230,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             resilience: self.resilience,
             skill_cache: self.skill_cache,
             tool_call_count: AtomicU64::new(0),
-            stop_flag: self.stop_flag,
+            stop_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -272,7 +265,7 @@ impl<A: ReActApp> ReActEngine<A> {
             resilience: None,
             skill_cache: SkillCache::new(Duration::from_secs(300)),
             tool_call_count: AtomicU64::new(0),
-            stop_flag: None,
+            stop_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -440,18 +433,17 @@ impl<A: ReActApp> ReActEngine<A> {
     where
         A::Session: ReactSession,
     {
+        self.set_stop_flag(false);
         let mut thought = String::new();
 
         //build request
         session.push(LlmMessage::user(request.input.clone()));
 
         for _ in 0..self.max_steps {
-            if let Some(ref flag) = self.stop_flag {
-                if flag.load(Ordering::SeqCst) {
-                    return Err(ReactError::HookAbort(
-                        "Execution stopped by user".to_string(),
-                    ));
-                }
+            if self.stop_flag.load(Ordering::SeqCst) {
+                return Err(ReactError::HookAbort(
+                    "Execution stopped by user".to_string(),
+                ));
             }
 
             // ReActApp hook: before_llm_call
@@ -657,7 +649,7 @@ impl<A: ReActApp> ReActEngine<A> {
     }
 
     pub fn react_stream<'a>(
-        &'a self,
+        &'a mut self,
         request: LlmRequest,
         session: &'a mut A::Session,
         context: &'a mut A::Context,
@@ -666,6 +658,8 @@ impl<A: ReActApp> ReActEngine<A> {
         A::Session: ReactSession,
         A::Context: ReactContext,
     {
+        self.set_stop_flag(false);
+
         let stream = stream! {
             let mut step_count = 0;
             let max_steps = self.max_steps;
@@ -677,11 +671,9 @@ impl<A: ReActApp> ReActEngine<A> {
             while step_count < max_steps {
                 step_count += 1;
 
-                if let Some(ref flag) = self.stop_flag {
-                    if flag.load(Ordering::SeqCst) {
-                        yield Err(ReactError::HookAbort("Execution stopped by user".to_string()));
-                        break;
-                    }
+                if self.stop_flag.load(Ordering::SeqCst) {
+                    yield Err(ReactError::HookAbort("Execution stopped by user".to_string()));
+                    break;
                 }
 
                 match self.react_app
@@ -818,5 +810,21 @@ impl<A: ReActApp> ReActEngine<A> {
     /// Reset the tool call counter.
     pub fn reset_tool_call_count(&self) {
         self.tool_call_count.store(0, Ordering::Relaxed);
+    }
+
+    pub fn get_stop_flag(&self) -> Arc<AtomicBool>{
+        return self.stop_flag.clone();
+    }
+
+    pub fn set_stop_flag(&mut self,flag: bool) {
+        self.stop_flag.store(flag, Ordering::SeqCst);
+    }
+
+    pub fn stop(&mut self){
+        self.set_stop_flag(true);
+    }
+
+    pub fn close(&mut self){
+        self.set_stop_flag(true);
     }
 }
