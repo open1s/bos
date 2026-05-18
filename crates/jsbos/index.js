@@ -667,12 +667,24 @@ class AgentBuilder {
     await new Promise((resolve, reject) => {
       this.stream(task, token => {
         tokens.push(token);
-        if (token.type === 'Done' || token.type === 'Error') {
-          token.type === 'Error' ? reject(new Error(token.error)) : resolve();
+        if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
+          if (token.type === 'Error') reject(new Error(token.error));
+          else resolve();
         }
       });
     });
     return tokens;
+  }
+
+  stop(options = {}) {
+    if (!this._inner) throw new Error('Agent not started');
+    const result = this._inner.stop(options);
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  }
+
+  isRunning() {
+    if (!this._inner) return false;
+    return this._inner.isRunning();
   }
 }
 
@@ -690,6 +702,15 @@ class AgentWrapperClass {
     return this._inner.react(task);
   }
 
+  stop(options = {}) {
+    const result = this._inner.stop(options);
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  }
+
+  isRunning() {
+    return this._inner.isRunning();
+  }
+
   stream(task, onToken) {
     return this._inner.stream(task, (err, token) => {
       if (err) {
@@ -705,8 +726,9 @@ class AgentWrapperClass {
     await new Promise((resolve, reject) => {
       this.stream(task, token => {
         tokens.push(token);
-        if (token.type === 'Done' || token.type === 'Error') {
-          token.type === 'Error' ? reject(new Error(token.error)) : resolve();
+        if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
+          if (token.type === 'Error') reject(new Error(token.error));
+          else resolve();
         }
       });
     });

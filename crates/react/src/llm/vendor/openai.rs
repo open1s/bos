@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use log::info;
 use crate::{
     llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor},
     utils::{JsonExtractor, StreamExtractor},
 };
 use async_trait::async_trait;
 use futures::StreamExt;
+use log::info;
 use reqwest::Client;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -285,7 +285,11 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let url = format!("{}/chat/completions", endpoint);
 
-        info!("Req: {}", serde_json::to_string(&openai_req).unwrap_or_else(|_| "Failed to serialize request".into()));
+        info!(
+            "Req: {}",
+            serde_json::to_string(&openai_req)
+                .unwrap_or_else(|_| "Failed to serialize request".into())
+        );
 
         let t1 = std::time::Instant::now();
         let response = client
@@ -321,7 +325,10 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let resp = LlmResponse::OpenAI(body);
 
-        info!("Resp: {}", serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into()));
+        info!(
+            "Resp: {}",
+            serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into())
+        );
 
         context.notify_response(&resp);
         Ok(resp)
@@ -347,8 +354,11 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let url = format!("{}/chat/completions", endpoint);
 
-        info!("Req: {}", serde_json::to_string(&openai_req).unwrap_or_else(|_| "Failed to serialize request".into()));
-
+        info!(
+            "Req: {}",
+            serde_json::to_string(&openai_req)
+                .unwrap_or_else(|_| "Failed to serialize request".into())
+        );
 
         let response = client
             .post(&url)

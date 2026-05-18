@@ -248,8 +248,8 @@ impl Tool for PyPythonTool {
     }
 
     fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, react::ToolError> {
-        let arg_json = serde_json::to_string(args)
-            .map_err(|e| react::ToolError::Failed(e.to_string()))?;
+        let arg_json =
+            serde_json::to_string(args).map_err(|e| react::ToolError::Failed(e.to_string()))?;
 
         Python::attach(|py| -> Result<serde_json::Value, react::ToolError> {
             let json_mod = py
@@ -317,8 +317,7 @@ impl Tool for PyPythonToolWrapper {
             let result_str = result
                 .extract::<String>(py)
                 .map_err(|e| react::ToolError::Failed(e.to_string()))?;
-            serde_json::from_str(&result_str)
-                .map_err(|e| react::ToolError::Failed(e.to_string()))
+            serde_json::from_str(&result_str).map_err(|e| react::ToolError::Failed(e.to_string()))
         })
     }
 }
@@ -651,7 +650,10 @@ impl PyAgent {
         let mut llm = LlmProvider::new();
 
         let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
-            (cfg.model[..pos].to_string(), cfg.model[pos + 1..].to_string())
+            (
+                cfg.model[..pos].to_string(),
+                cfg.model[pos + 1..].to_string(),
+            )
         } else {
             ("openai".to_string(), cfg.model.clone())
         };
@@ -700,7 +702,10 @@ impl PyAgent {
             let mut llm = LlmProvider::new();
 
             let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
-                (cfg.model[..pos].to_string(), cfg.model[pos + 1..].to_string())
+                (
+                    cfg.model[..pos].to_string(),
+                    cfg.model[pos + 1..].to_string(),
+                )
             } else {
                 ("openai".to_string(), cfg.model.clone())
             };
@@ -839,11 +844,7 @@ impl PyAgent {
         })
     }
 
-    fn stream<'py>(
-        &self,
-        py: Python<'py>,
-        task: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn stream<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
         let agent = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
 
@@ -873,6 +874,7 @@ impl PyAgent {
                         })
                         .to_string()),
                         Ok(StreamToken::Done) => break,
+                        Ok(StreamToken::Stopped) => break,
                         Err(e) => Err(e.to_string()),
                     };
                     if tx.send(item).await.is_err() {
@@ -1154,9 +1156,9 @@ impl PyAgent {
             } else {
                 agent::BashTool::new(&name)
             };
-            let mut guard = agent.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
-            })?;
+            let mut guard = agent
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
             guard
                 .try_add_tool(Arc::new(tool))
                 .map_err(to_py_runtime_error)?;

@@ -331,7 +331,11 @@ impl<A: ReActApp> ReActEngine<A> {
             } else {
                 self.llm.complete(request.clone(), session, context).await
             };
-            info!("[TIMING] call_llm attempt {}: {:?}", attempt, t_iter.elapsed());
+            info!(
+                "[TIMING] call_llm attempt {}: {:?}",
+                attempt,
+                t_iter.elapsed()
+            );
 
             // Record outcome in circuit breaker so it learns from actual LLM results
             if let Some(ref resilience) = self.resilience {
@@ -347,7 +351,11 @@ impl<A: ReActApp> ReActEngine<A> {
 
             // If successful, return
             if result.is_ok() {
-                info!("[TIMING] call_llm total (attempt {}): {:?}", attempt, t0.elapsed());
+                info!(
+                    "[TIMING] call_llm total (attempt {}): {:?}",
+                    attempt,
+                    t0.elapsed()
+                );
                 return result.map_err(ReactError::from);
             }
 
@@ -359,7 +367,10 @@ impl<A: ReActApp> ReActEngine<A> {
             };
 
             if !should_retry {
-                info!("[TIMING] call_llm total (non-retry error): {:?}", t0.elapsed());
+                info!(
+                    "[TIMING] call_llm total (non-retry error): {:?}",
+                    t0.elapsed()
+                );
                 return result.map_err(ReactError::from);
             }
 
@@ -437,7 +448,9 @@ impl<A: ReActApp> ReActEngine<A> {
         for _ in 0..self.max_steps {
             if let Some(ref flag) = self.stop_flag {
                 if flag.load(Ordering::SeqCst) {
-                    return Err(ReactError::HookAbort("Execution stopped by user".to_string()));
+                    return Err(ReactError::HookAbort(
+                        "Execution stopped by user".to_string(),
+                    ));
                 }
             }
 
@@ -751,6 +764,10 @@ impl<A: ReActApp> ReActEngine<A> {
                         }
                         Err(e) => {
                             yield Err(ReactError::Llm(e));
+                            break;
+                        }
+                        Ok(StreamToken::Stopped) => {
+                            yield Ok(StreamToken::Stopped);
                             break;
                         }
                     }

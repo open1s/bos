@@ -335,6 +335,7 @@ impl AgentRpcClient {
                     args
                 )),
                 crate::StreamToken::Done => break,
+                crate::StreamToken::Stopped => break,
             }
         }
         Ok(serde_json::json!({ "text": text, "chunks": chunks }))
@@ -381,6 +382,7 @@ async fn handle_rpc_request(agent: Arc<Agent>, req: AgentRpcRequest) -> AgentRpc
                         ));
                     }
                     Some(Ok(crate::StreamToken::Done)) => break,
+                    Some(Ok(crate::StreamToken::Stopped)) => break,
                     Some(Err(e)) => {
                         return AgentRpcResponse {
                             ok: false,
@@ -731,6 +733,24 @@ async fn handle_incoming_query(
                             result: Some(serde_json::json!({
                                 "event": {
                                     "type": "done",
+                                    "text": full_text
+                                }
+                            })),
+                            error: None,
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Ok(crate::StreamToken::Stopped) => {
+                    reply_response(
+                        &query,
+                        endpoint,
+                        AgentRpcResponse {
+                            ok: true,
+                            result: Some(serde_json::json!({
+                                "event": {
+                                    "type": "stopped",
                                     "text": full_text
                                 }
                             })),
@@ -1125,6 +1145,7 @@ mod tests {
                 crate::StreamToken::Done => break,
                 crate::StreamToken::ToolCall { .. } => {}
                 crate::StreamToken::ReasoningContent(_) => {}
+                crate::StreamToken::Stopped => break,
             }
         }
         assert_eq!(out, "s1s2");

@@ -115,8 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = loader.load().await?;
     let router = build_router(config);
 
-    let nvidia_cfg = VendorConfig::from_nvidia(config)
-        .ok_or("no llm.nvidia config")?;
+    let nvidia_cfg = VendorConfig::from_nvidia(config).ok_or("no llm.nvidia config")?;
     let model = nvidia_cfg.model;
 
     let req = LlmRequest {

@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use log::info;
 use crate::{
     llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor},
     utils::{JsonExtractor, StreamExtractor},
 };
 use async_trait::async_trait;
 use futures::StreamExt;
+use log::info;
 use reqwest::Client;
 use serde::Serialize;
 
@@ -252,7 +252,7 @@ impl OpenRouterVendor {
 impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
     for OpenRouterVendor
 {
-async fn complete(
+    async fn complete(
         &self,
         mut request: LlmRequest,
         session: &mut S,
@@ -274,8 +274,11 @@ async fn complete(
 
         let url = format!("{}/chat/completions", endpoint);
 
-        info!("Req: {}", serde_json::to_string(&openrouter_req).unwrap_or_else(|_| "Failed to serialize request".into()));
-
+        info!(
+            "Req: {}",
+            serde_json::to_string(&openrouter_req)
+                .unwrap_or_else(|_| "Failed to serialize request".into())
+        );
 
         let t1 = std::time::Instant::now();
         let response = client
@@ -310,7 +313,10 @@ async fn complete(
         info!("[TIMING] complete total: {:?}", t0.elapsed());
         let resp = LlmResponse::OpenAI(body);
 
-        info!("Resp: {}", serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into()));
+        info!(
+            "Resp: {}",
+            serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into())
+        );
 
         context.notify_response(&resp);
         Ok(resp)

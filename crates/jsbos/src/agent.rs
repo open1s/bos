@@ -76,6 +76,11 @@ impl agent::Tool for JSTool {
 }
 
 #[napi(object)]
+pub struct StopOptions {
+  pub clear_session: Option<bool>,
+}
+
+#[napi(object)]
 pub struct AgentConfig {
   pub name: String,
   pub model: String,
@@ -396,6 +401,28 @@ impl Agent {
   }
 
   #[napi]
+  pub fn stop(&self, options: Option<StopOptions>) -> Result<serde_json::Value> {
+    let guard = self.inner.blocking_lock();
+    let was_running = guard.stop();
+
+    if let Some(opts) = options {
+      if opts.clear_session.unwrap_or(false) {
+        drop(guard);
+        let mut guard = self.inner.blocking_lock();
+        guard.session_mut().clear();
+      }
+    }
+
+    Ok(serde_json::json!({ "stopped": was_running }))
+  }
+
+  #[napi]
+  pub fn is_running(&self) -> Result<bool> {
+    let guard = self.inner.blocking_lock();
+    Ok(guard.is_running())
+  }
+
+  #[napi]
   pub async fn add_tool(
     &self,
     name: String,
@@ -599,7 +626,7 @@ impl Agent {
     &self,
     task: String,
     callback: ThreadsafeFunction<serde_json::Value>,
-  ) -> Result<()> {
+  ) -> Result<String> {
     let guard = self.inner.lock().await;
     let start = std::time::Instant::now();
 
@@ -607,6 +634,7 @@ impl Agent {
     use futures::StreamExt;
     futures::pin_mut!(stream);
     let mut had_error = false;
+    let mut was_stopped = false;
     while let Some(token_result) = stream.next().await {
       match token_result {
         Ok(token) => {
@@ -628,8 +656,15 @@ impl Agent {
             agent::StreamToken::Done => {
               serde_json::json!({ "type": "Done" })
             }
+            agent::StreamToken::Stopped => {
+              was_stopped = true;
+              serde_json::json!({ "type": "Stopped" })
+            }
           };
           callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+          if was_stopped {
+            break;
+          }
         }
         Err(_e) => {
           had_error = true;
@@ -647,12 +682,20 @@ impl Agent {
       guard.record_llm_error();
     }
     let tokens = guard.last_token_usage().unwrap_or((0, 0));
-    guard.record_stream_call(elapsed, elapsed, std::time::Duration::ZERO, tokens.0, tokens.1);
+    guard.record_stream_call(
+      elapsed,
+      elapsed,
+      std::time::Duration::ZERO,
+      tokens.0,
+      tokens.1,
+    );
     let tool_calls = guard.last_stream_tool_calls();
     if tool_calls > 0 {
       guard.record_tool_calls(tool_calls, std::time::Duration::ZERO);
     }
-    Ok(())
+
+    let status = if was_stopped { "stopped" } else { "completed" };
+    Ok(serde_json::json!({ "status": status }).to_string())
   }
 
   #[napi]

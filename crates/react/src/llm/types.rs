@@ -40,19 +40,15 @@ impl ReactContext for () {
         None
     }
     fn add_tool(&mut self, _tool: LlmTool) {}
-    
-    fn notify_request(&self, __req: &LlmRequest) {     
-    }
-    
-    fn notify_response(&self, __resp: &super::LlmResponse) {
-    }
-    
-    fn notify_error(&self, __err: &LlmError) {
-    }
-    
-    fn on_chunk(&self, __chunk: &str) {
-    }
-    
+
+    fn notify_request(&self, __req: &LlmRequest) {}
+
+    fn notify_response(&self, __resp: &super::LlmResponse) {}
+
+    fn notify_error(&self, __err: &LlmError) {}
+
+    fn on_chunk(&self, __chunk: &str) {}
+
     fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
         None
     }
@@ -278,23 +274,15 @@ impl ReactContext for LlmContext {
     fn add_tool(&mut self, tool: LlmTool) {
         self.tools.push(tool);
     }
-    
-    fn notify_request(&self, _req: &LlmRequest) {
-       
-    }
-    
-    fn notify_response(&self, _resp: &super::LlmResponse) {
-       
-    }
-    
-    fn notify_error(&self, _err: &LlmError) {
-        
-    }
-    
-    fn on_chunk(&self, _chunk: &str) {
-        
-    }
-    
+
+    fn notify_request(&self, _req: &LlmRequest) {}
+
+    fn notify_response(&self, _resp: &super::LlmResponse) {}
+
+    fn notify_error(&self, _err: &LlmError) {}
+
+    fn on_chunk(&self, _chunk: &str) {}
+
     fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
         None
     }

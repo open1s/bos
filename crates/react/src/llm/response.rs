@@ -35,6 +35,7 @@ pub enum StreamToken {
         id: Option<String>,
     },
     Done,
+    Stopped,
 }
 
 pub struct StreamResponseAccumulator<F, T = StreamToken> {

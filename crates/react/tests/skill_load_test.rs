@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use react::engine::ReActEngineBuilder;
 use react::llm::vendor::ChatCompletionResponse;
-use react::llm::{LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession, TokenStream, Skill, ReactContext};
+use react::llm::{
+    LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    ReactContext, Skill, TokenStream,
+};
 use react::runtime::ReActApp;
 
 #[derive(Default)]
@@ -119,7 +122,9 @@ fn test_load_skill_added_to_tools_when_skills_exist() {
     });
 
     rt.block_on(async {
-        engine.react(LlmRequest::new("test"), &mut session, &mut context).await
+        engine
+            .react(LlmRequest::new("test"), &mut session, &mut context)
+            .await
     })
     .unwrap();
 
@@ -136,7 +141,11 @@ fn test_load_skill_added_to_tools_when_skills_exist() {
             .unwrap_or(false)
     });
 
-    assert!(has_load_skill, "load_skill tool should be included when skills exist, but tools were: {:?}", tools);
+    assert!(
+        has_load_skill,
+        "load_skill tool should be included when skills exist, but tools were: {:?}",
+        tools
+    );
 }
 
 #[test]
@@ -192,7 +201,9 @@ fn test_no_load_skill_when_no_skills() {
     let context = LlmContext::default();
 
     rt.block_on(async {
-        engine.react(LlmRequest::new("test"), &mut session, &mut context.clone()).await
+        engine
+            .react(LlmRequest::new("test"), &mut session, &mut context.clone())
+            .await
     })
     .unwrap();
 

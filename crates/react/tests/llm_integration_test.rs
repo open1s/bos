@@ -502,6 +502,7 @@ async fn test_nvidia_tool_calls_stream_with_config() {
                                 );
                             }
                             StreamToken::Done => break,
+                            StreamToken::Stopped => break,
                         }
                     }
                     Err(e) => {

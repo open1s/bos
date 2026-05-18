@@ -4,10 +4,13 @@ use std::sync::{Arc, Mutex};
 
 use react::engine::{BuilderError, ReActEngineBuilder};
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
-use react::llm::{LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession, TokenStream};
-use react::tool::FnTool;
-use react::tool::registry::ToolVariant;
+use react::llm::{
+    LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    TokenStream,
+};
 use react::runtime::ReActApp;
+use react::tool::registry::ToolVariant;
+use react::tool::FnTool;
 
 #[derive(Default)]
 struct TestApp;
@@ -92,9 +95,14 @@ fn test_builder_pattern() {
         }
     }
 
-#[async_trait]
-impl LlmClient<LlmSession, LlmContext> for MockLlm {
-    async fn complete(&self, _request: LlmRequest, _session: &mut LlmSession, _context: &mut LlmContext) -> LlmResponseResult {
+    #[async_trait]
+    impl LlmClient<LlmSession, LlmContext> for MockLlm {
+        async fn complete(
+            &self,
+            _request: LlmRequest,
+            _session: &mut LlmSession,
+            _context: &mut LlmContext,
+        ) -> LlmResponseResult {
             let responses = self.responses.clone();
             let mut lock = responses.lock().unwrap();
             if lock.is_empty() {
@@ -114,7 +122,12 @@ impl LlmClient<LlmSession, LlmContext> for MockLlm {
             }
         }
 
-        async fn stream_complete(&self, _request: LlmRequest, _session: &mut LlmSession, _context: &mut LlmContext) -> Result<TokenStream, LlmError> {
+        async fn stream_complete(
+            &self,
+            _request: LlmRequest,
+            _session: &mut LlmSession,
+            _context: &mut LlmContext,
+        ) -> Result<TokenStream, LlmError> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -155,7 +168,11 @@ impl LlmClient<LlmSession, LlmContext> for MockLlm {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut session = LlmSession::default();
     let mut context = LlmContext::default();
-    let result = rt.block_on(async { engine.react(LlmRequest::new("test-model"), &mut session, &mut context).await });
+    let result = rt.block_on(async {
+        engine
+            .react(LlmRequest::new("test-model"), &mut session, &mut context)
+            .await
+    });
     assert_eq!(result.unwrap(), "5");
 }
 
@@ -192,8 +209,12 @@ fn test_message_log_input() {
 
     #[async_trait]
     impl LlmClient<LlmSession, LlmContext> for MockLlmWithHistory {
-
-        async fn complete(&self, request: LlmRequest, _session: &mut LlmSession, _context: &mut LlmContext) -> LlmResponseResult {
+        async fn complete(
+            &self,
+            request: LlmRequest,
+            _session: &mut LlmSession,
+            _context: &mut LlmContext,
+        ) -> LlmResponseResult {
             self.received_inputs
                 .lock()
                 .unwrap()
@@ -201,7 +222,12 @@ fn test_message_log_input() {
             Ok(make_text_response("Hello back!".to_string(), true))
         }
 
-        async fn stream_complete(&self, _request: LlmRequest, _session: &mut LlmSession, _context: &mut LlmContext) -> Result<TokenStream, LlmError> {
+        async fn stream_complete(
+            &self,
+            _request: LlmRequest,
+            _session: &mut LlmSession,
+            _context: &mut LlmContext,
+        ) -> Result<TokenStream, LlmError> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -254,8 +280,12 @@ fn test_react_with_request() {
 
     #[async_trait]
     impl LlmClient<LlmSession, LlmContext> for MockLlmFullRequest {
-
-        async fn complete(&self, request: LlmRequest, _session: &mut LlmSession, _context: &mut LlmContext) -> LlmResponseResult {
+        async fn complete(
+            &self,
+            request: LlmRequest,
+            _session: &mut LlmSession,
+            _context: &mut LlmContext,
+        ) -> LlmResponseResult {
             *self.received_model.lock().unwrap() = Some(request.model.clone());
             Ok(make_text_response(
                 "Answer from custom request".to_string(),
@@ -263,7 +293,12 @@ fn test_react_with_request() {
             ))
         }
 
-        async fn stream_complete(&self, _request: LlmRequest, _session: &mut LlmSession, _context: &mut LlmContext) -> Result<TokenStream, LlmError> {
+        async fn stream_complete(
+            &self,
+            _request: LlmRequest,
+            _session: &mut LlmSession,
+            _context: &mut LlmContext,
+        ) -> Result<TokenStream, LlmError> {
             Ok(Box::pin(futures::stream::empty()))
         }
 

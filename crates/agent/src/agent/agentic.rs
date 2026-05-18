@@ -736,10 +736,17 @@ impl Agent {
                         usage.completion_tokens as u64,
                     );
                 } else {
-                    self.metrics.record_call(wall_time, engine_time, std::time::Duration::ZERO, 0, 0);
+                    self.metrics.record_call(
+                        wall_time,
+                        engine_time,
+                        std::time::Duration::ZERO,
+                        0,
+                        0,
+                    );
                 }
                 if tool_calls > 0 {
-                    self.metrics.record_tool_calls(tool_calls, std::time::Duration::ZERO);
+                    self.metrics
+                        .record_tool_calls(tool_calls, std::time::Duration::ZERO);
                 }
                 self.hooks
                     .trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name))
@@ -753,13 +760,19 @@ impl Agent {
                 drop(engine);
                 drop(context);
                 self.is_running.store(false, Ordering::SeqCst);
-                if matches!(e, react::engine::ReactError::HookAbort(ref msg) if msg == "Execution stopped by user") {
+                if matches!(e, react::engine::ReactError::HookAbort(ref msg) if msg == "Execution stopped by user")
+                {
                     let partial = {
                         let session = self.session.lock().unwrap();
-                        session.messages().iter().rev()
+                        session
+                            .messages()
+                            .iter()
+                            .rev()
                             .filter_map(|m| match m {
                                 LlmMessage::Assistant { content } => Some(content.clone()),
-                                LlmMessage::AssistantToolCall { args, .. } => Some(serde_json::to_string(args).unwrap_or_default()),
+                                LlmMessage::AssistantToolCall { args, .. } => {
+                                    Some(serde_json::to_string(args).unwrap_or_default())
+                                }
                                 _ => None,
                             })
                             .next()
@@ -794,6 +807,14 @@ impl Agent {
         task: &str,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send + '_>> {
         let task_str = task.to_string();
+
+        if self.is_running.load(Ordering::SeqCst) {
+            return Box::pin(async_stream::stream! {
+                yield Err(AgentError::Session("Agent is already running".to_string()));
+            });
+        }
+        self.is_running.store(true, Ordering::SeqCst);
+        self.stop_flag.store(false, Ordering::SeqCst);
 
         let cached_engine = {
             let mut cache = self.engine_cache.lock().unwrap();
@@ -854,6 +875,8 @@ impl Agent {
                 let mut session = self.session.lock().unwrap();
                 session.restore_messages(agent_session.take_messages());
             }
+
+            self.is_running.store(false, Ordering::SeqCst);
 
             {
                 let usage = engine.token_usage();

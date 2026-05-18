@@ -308,7 +308,7 @@ async fn test_metrics_accumulate_across_multiple_calls() {
 
     let after = agent.metrics();
     // Total calls + errors should have increased by at least 3
-    let total_increase = (after.call_count + after.llm_errors)
-        - (initial_call_count + before.llm_errors);
+    let total_increase =
+        (after.call_count + after.llm_errors) - (initial_call_count + before.llm_errors);
     assert!(total_increase >= 3);
 }

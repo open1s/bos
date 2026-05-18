@@ -283,7 +283,11 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let url = format!("{}/chat/completions", endpoint);
 
-        info!("Req: {}", serde_json::to_string(&nvidia_req).unwrap_or_else(|_| "Failed to serialize request".into()));
+        info!(
+            "Req: {}",
+            serde_json::to_string(&nvidia_req)
+                .unwrap_or_else(|_| "Failed to serialize request".into())
+        );
 
         let t1 = std::time::Instant::now();
         let response = client
@@ -318,7 +322,10 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         info!("[TIMING] complete total: {:?}", t0.elapsed());
         let resp = LlmResponse::OpenAI(value);
 
-        info!("Resp: {}", serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into()));
+        info!(
+            "Resp: {}",
+            serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into())
+        );
 
         context.notify_response(&resp);
         Ok(resp)
@@ -342,8 +349,11 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let nvidia_req = self.build_stream_request(request, session, context);
 
-        info!("Req: {}", serde_json::to_string(&nvidia_req).unwrap_or_else(|_| "Failed to serialize request".into()));
-
+        info!(
+            "Req: {}",
+            serde_json::to_string(&nvidia_req)
+                .unwrap_or_else(|_| "Failed to serialize request".into())
+        );
 
         let url = format!("{}/chat/completions", endpoint);
 

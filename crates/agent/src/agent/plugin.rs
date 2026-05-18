@@ -65,6 +65,7 @@ pub enum StreamTokenWrapper {
         id: Option<String>,
     },
     Done,
+    Stopped,
 }
 
 impl StreamTokenWrapper {
@@ -80,6 +81,7 @@ impl StreamTokenWrapper {
                 StreamTokenWrapper::ReasoningContent(s.clone())
             }
             react::llm::StreamToken::Done => StreamTokenWrapper::Done,
+            react::llm::StreamToken::Stopped => StreamTokenWrapper::Stopped,
         }
     }
 
@@ -91,6 +93,7 @@ impl StreamTokenWrapper {
             }
             StreamTokenWrapper::ReasoningContent(s) => react::llm::StreamToken::ReasoningContent(s),
             StreamTokenWrapper::Done => react::llm::StreamToken::Done,
+            StreamTokenWrapper::Stopped => react::llm::StreamToken::Stopped,
         }
     }
 }
