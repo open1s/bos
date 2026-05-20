@@ -1,6 +1,6 @@
 use crate::agent::context::{AgentReActApp, AgentReactContext, AgentSession};
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
-use crate::agent::plugin::{AgentPlugin, PluginRegistry};
+use crate::agent::plugin::{AgentPlugin, PluginRegistry, StreamTokenWrapper};
 use crate::session::AgentState;
 use crate::tools::FunctionTool;
 use crate::{AgentError, LlmClient, StreamToken, Tool, ToolRegistry};
@@ -842,8 +842,39 @@ impl Agent {
             {
                 let react_stream = engine.react_stream(request, &mut agent_session, &mut context);
                 futures::pin_mut!(react_stream);
+                let plugins = self.plugins.clone();
+                let hooks = self.hooks.clone();
+                let agent_name = self.config.name.clone();
+
                 while let Some(item) = react_stream.next().await {
-                    yield item.map_err(|e| AgentError::Session(e.to_string()));
+                    match item {
+                        Ok(token) => {
+                            let final_token = if plugins.has_plugins() {
+                                let wrapped = StreamTokenWrapper::new(&token);
+                                match plugins.on_stream_token(wrapped).await {
+                                    Some(modified) => modified.into_token(),
+                                    None => continue,
+                                }
+                            } else {
+                                token
+                            };
+                            yield Ok(final_token);
+                        }
+                        Err(e) => {
+                            let mut ctx = HookContext::new(&agent_name);
+                            ctx.set("error", e.to_string());
+                            let decision = hooks.trigger(HookEvent::OnError, ctx).await;
+                            match decision {
+                                HookDecision::Error(msg) => log::warn!("OnError hook error: {}", msg),
+                                HookDecision::Abort => {
+                                    yield Ok(StreamToken::Done);
+                                    return;
+                                }
+                                HookDecision::Continue => {}
+                            }
+                            yield Err(AgentError::Session(e.to_string()));
+                        }
+                    }
                 }
             }
 
@@ -861,6 +892,13 @@ impl Agent {
                 let mut tc = self.last_stream_tool_calls.lock().unwrap();
                 *tc = tool_calls;
             }
+
+            {
+                let mut ctx = HookContext::new(&self.config.name);
+                ctx.set("total_tokens", "0");
+                self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
+            }
+
             {
                 let mut cache = self.engine_cache.lock().unwrap();
                 *cache = Some(engine);

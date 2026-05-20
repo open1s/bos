@@ -323,14 +323,18 @@ impl ReActApp for HookRegistry {
         result: &mut Result<Value, react::engine::ReactError>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) {
+    ) -> HookDecision {
         let mut ctx = HookContext::new("");
         ctx.set("tool_name", tool_name);
         ctx.set(
             "tool_result",
             &result.as_ref().map(|v| v.to_string()).unwrap_or_default(),
         );
-        let _ = self.trigger(HookEvent::AfterToolCall, ctx).await;
+        match self.trigger(HookEvent::AfterToolCall, ctx).await {
+            HookDecision::Continue => HookDecision::Continue,
+            HookDecision::Abort => HookDecision::Abort,
+            HookDecision::Error(msg) => HookDecision::Error(msg),
+        }
     }
 
     async fn on_thought(

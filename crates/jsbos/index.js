@@ -656,7 +656,7 @@ class AgentBuilder {
     return this._inner.stream(task, (err, token) => {
       if (err) {
         onToken({ type: 'Error', error: err.message || String(err) });
-      } else {
+      } else if (token) {
         onToken(token);
       }
     });

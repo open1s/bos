@@ -82,8 +82,8 @@ pub trait ReActApp: Send + Sync {
         _result: &mut Result<serde_json::Value, crate::engine::ReactError>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) -> impl Future<Output = ()> + Send {
-        async {}
+    ) -> impl Future<Output = HookDecision> + Send {
+        async { HookDecision::Continue }
     }
 
     /// Called when the assistant emits a thought.
@@ -153,7 +153,7 @@ impl<T: ReActApp + ?Sized> ReActApp for Box<T> {
         result: &mut Result<serde_json::Value, crate::engine::ReactError>,
         session: &mut Self::Session,
         context: &mut Self::Context,
-    ) -> impl Future<Output = ()> + Send {
+    ) -> impl Future<Output = HookDecision> + Send {
         (**self).after_tool_result(tool_name, result, session, context)
     }
     fn on_thought(

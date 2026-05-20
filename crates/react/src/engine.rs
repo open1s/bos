@@ -528,9 +528,22 @@ impl<A: ReActApp> ReActEngine<A> {
 
                                 let mut result = self.call_tool(&name, &mut args).await;
                                 self.tool_call_count.fetch_add(1, Ordering::Relaxed);
-                                self.react_app
+                                
+                                match self.react_app
                                     .after_tool_result(&name, &mut result, session, context)
-                                    .await;
+                                    .await 
+                                {
+                                    HookDecision::Continue => {}
+                                    HookDecision::Abort => {
+                                        return Err(ReactError::HookAbort(
+                                            "after_tool_call aborted".to_string(),
+                                        ));
+                                    }
+                                    HookDecision::Error(msg) => {
+                                        return Err(ReactError::HookAbort(msg));
+                                    }
+                                }
+                                
 
                                 if let Ok(ret) = &result {
                                     if name == "load_skill" {
@@ -721,7 +734,24 @@ impl<A: ReActApp> ReActEngine<A> {
 
                             let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
 
-                            let result = if name == "load_skill" {
+                            match self.react_app
+                                .before_tool_call(&name, &mut args, session, context)
+                                .await
+                            {
+                                HookDecision::Continue => {}
+                                HookDecision::Abort => {
+                                    yield Err(ReactError::HookAbort(
+                                        "before_tool_call aborted".to_string(),
+                                    ));
+                                    break;
+                                }
+                                HookDecision::Error(msg) => {
+                                    yield Err(ReactError::HookAbort(msg));
+                                    break;
+                                }
+                            }
+
+                            let mut result = if name == "load_skill" {
                                 let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                 if let Some(cached) = loaded_skills.get(skill_name) {
                                     Ok(serde_json::json!({
@@ -737,8 +767,25 @@ impl<A: ReActApp> ReActEngine<A> {
                             };
                             self.tool_call_count.fetch_add(1, Ordering::Relaxed);
 
+                            match self.react_app
+                                .after_tool_result(&name, &mut result, session, context)
+                                .await 
+                                {
+                                HookDecision::Continue => {}
+                                HookDecision::Abort => {
+                                    yield Err(ReactError::HookAbort(
+                                        "after_tool_call aborted".to_string(),
+                                    ));
+                                    break;
+                                }
+                                HookDecision::Error(msg) => {
+                                    yield Err(ReactError::HookAbort(msg));
+                                    break;
+                                }
+                            }
+
                             let result_text = match result {
-                                Ok(ret) => {
+                                Ok(ref ret) => {
                                     if name == "load_skill" {
                                         let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                         let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
@@ -746,9 +793,14 @@ impl<A: ReActApp> ReActEngine<A> {
                                             loaded_skills.insert(skill_name.to_string(), instructions.to_string());
                                         }
                                     }
+                                    self.telemetry.emit(&TelemetryEvent::ToolInvocation {
+                                        tool: name.clone(),
+                                        input: args.clone(),
+                                        output: ret.clone(),
+                                    });
                                     ret.to_string()
                                 }
-                                Err(e) => format!("Error: {}", e),
+                                Err(ref e) => format!("Error: {}", e),
                             };
 
                             session.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), args.clone()));
@@ -778,6 +830,9 @@ impl<A: ReActApp> ReActEngine<A> {
 
                 if !saw_tool_call {
                     self.react_app.on_final_answer(&full_response, session, context).await;
+                    self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                        answer: full_response.clone(),
+                    });
                     yield Ok(StreamToken::Done);
                     break;
                 }

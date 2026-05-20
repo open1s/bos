@@ -521,7 +521,7 @@ impl ReActApp for AgentReActApp {
         result: &mut Result<JsonValue, ReactError>,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
-    ) -> impl Future<Output = ()> + Send {
+    ) -> impl Future<Output = react::runtime::HookDecision> + Send {
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
         let tool_name = tool_name.to_string();
@@ -551,9 +551,9 @@ impl ReActApp for AgentReActApp {
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("tool_name", &tool_name);
             ctx.set("tool_result", &result_text);
-            let _ = hooks
+            hooks
                 .trigger(crate::agent::hooks::HookEvent::AfterToolCall, ctx)
-                .await;
+                .await
         }
     }
 

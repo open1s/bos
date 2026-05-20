@@ -709,18 +709,18 @@ impl Agent {
                 serde_json::json!({ "type": "Stopped" })
               }
             };
-            callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+callback.call(Ok(json), ThreadsafeFunctionCallMode::Blocking);
             if was_stopped {
               break;
             }
-          }
-          Err(_e) => {
-            had_error = true;
-            let json = serde_json::json!({
-                "type": "Error",
-                "error": "Stream error"
-            });
-            callback.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+            Err(_e) => {
+              had_error = true;
+              let json = serde_json::json!({
+                  "type": "Error",
+                  "error": "Stream error"
+              });
+              callback.call(Ok(json), ThreadsafeFunctionCallMode::Blocking);
           }
         }
       }
