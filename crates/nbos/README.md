@@ -1,4 +1,4 @@
-# nbos
+# nbos — v2.2.4
 
 > Python bindings for BrainOS — AI agent framework with ReAct engine
 
@@ -41,12 +41,36 @@ maturin develop -m crates/nbos/Cargo.toml --venv .venv
 
 ## Quick Start
 
+### Using BrainOS (recommended)
+
 ```python
 import asyncio
-from nbos import Agent, AgentConfig
+from nbos import BrainOS, tool
+
+@tool("Add two numbers")
+def add(a: int, b: int) -> int:
+    return a + b
 
 async def main():
-    # Create agent configuration
+    async with BrainOS() as brain:
+        agent = (
+            brain.agent("assistant")
+            .register(add)
+            .with_prompt("You are a helpful math assistant.")
+        )
+        result = await agent.ask("What is 15 + 23?")
+        print(result)
+
+asyncio.run(main())
+```
+
+### Using Agent directly (low-level)
+
+```python
+import asyncio
+from nbos import Agent, AgentConfig, PythonTool
+
+async def main():
     config = AgentConfig(
         name="assistant",
         model="gpt-4",
@@ -56,20 +80,11 @@ async def main():
         temperature=0.7,
     )
 
-    # Create the agent
     agent = Agent.from_config(config)
 
-    # Define a Python tool
     def calculator(args: dict) -> str:
-        """Evaluate a mathematical expression."""
-        expr = args.get("expression", "")
-        try:
-            result = eval(expr)
-            return str(result)
-        except Exception as e:
-            return f"Error: {e}"
+        return str(eval(args.get("expression", "0")))
 
-    # Register the tool
     tool = PythonTool(
         name="calculator",
         description="Evaluate a mathematical expression",
@@ -79,7 +94,6 @@ async def main():
     )
     await agent.add_tool(tool)
 
-    # Run a task
     result = await agent.run_simple("What is 15 * 23?")
     print(result)
 
@@ -87,6 +101,81 @@ asyncio.run(main())
 ```
 
 ## API Reference
+
+### BrainOS (High-level API)
+
+The recommended way to use nbos — manages bus lifecycle, config loading, and tool registry.
+
+#### `BrainOS()` — Create a BrainOS instance
+
+```python
+from nbos import BrainOS
+
+async with BrainOS() as brain:
+    # brain is ready — config auto-discovered from ~/.bos/conf/config.toml
+    pass
+```
+
+#### `brain.agent(name, **options)` — Create an agent builder
+
+```python
+agent = (
+    brain.agent("assistant", model="gpt-4", system_prompt="Be helpful.")
+    .register(add_tool)           # Register a ToolDef
+    .hook("BeforeLlmCall", my_hook)
+    .plugin("my-plugin", on_llm_request=my_handler)
+    .with_skills_dir("./skills")
+)
+result = await agent.ask("What is 2+2?")
+```
+
+#### `brain.register_global(*tools)` — Register global tools
+
+Tools registered here are available to all agents created from this BrainOS instance.
+
+```python
+brain.register_global(add_tool, multiply_tool)
+```
+
+#### Agent methods (from builder or started agent)
+
+| Method | Description |
+|--------|-------------|
+| `agent.ask(prompt)` | Ask a question (alias: `run_simple`, `chat`) |
+| `agent.react(task)` | Run with ReAct reasoning |
+| `agent.stream(task)` | Stream responses (async iterator) |
+
+#### `agent.session` — Session management
+
+```python
+session = agent.session
+session.save_full("./session.json")
+session.restore_full("./session.json")
+session.compact(2, 500)  # keep 2 messages, max 500 chars summary
+session.clear()
+messages = session.get_messages()
+```
+
+### ToolDef / @tool decorator
+
+Define tools with a clean declarative API.
+
+```python
+from nbos import tool, ToolDef
+
+# Using decorator (recommended)
+@tool("Add two numbers")
+def add(a: int, b: int) -> int:
+    return a + b
+
+# Using ToolDef class
+multiply = ToolDef(
+    name="multiply",
+    description="Multiply two numbers",
+    callback=lambda args: args["a"] * args["b"],
+    parameters={"a": {"type": "number"}, "b": {"type": "number"}},
+)
+```
 
 ### AgentConfig
 
@@ -606,14 +695,16 @@ See the [examples](./examples/) directory:
 
 | Example | Description |
 |---------|-------------|
-| `01_quickstart.py` | Basic agent setup |
-| `02_multi_tool.py` | Multiple tools |
-| `03_conversation.py` | Conversation history |
-| `03_three_modes.py` | Different execution modes |
+| `01_quickstart.py` | Basic agent with BrainOS |
+| `02_multi_tool.py` | Multiple tools with agent |
+| `03_conversation.py` | Conversation history management |
+| `03_three_modes.py` | ask, react, stream modes |
+| `04_resilience.py` | Rate limiting + circuit breaker |
+| `demo_all_in_one.py` | Full feature demo |
 
 Run an example:
 ```bash
-python examples/01_quickstart.py
+python crates/nbos/examples/01_quickstart.py
 ```
 
 ## Best Practices
@@ -630,16 +721,19 @@ python examples/01_quickstart.py
 ┌─────────────────────────────────────────────────────────────┐
 │                         Python                               │
 ├─────────────────────────────────────────────────────────────┤
-│  nbos (PyO3 bindings)                                  │
-│  ┌─────────┐ ┌──────┐ ┌───────┐ ┌───────┐ ┌─────────────┐  │
-│  │  Agent  │ │ Bus  │ │ Hooks │ │Plugins│ │   MCP Client│  │
-│  └────┬────┘ └──┬───┘ └───┬───┘ └───┬───┘ └──────┬──────┘  │
-└───────┼────────┼─────────┼─────────┼────────────┼──────────┘
-        │        │         │         │            │
-        ▼        ▼         ▼         ▼            ▼
+│  nbos (PyO3 bindings)                                       │
+│  ┌──────────┐ ┌──────────┐ ┌──────┐ ┌───────┐ ┌──────────┐ │
+│  │ BrainOS  │ │ToolDef   │ │ Bus  │ │ Hooks │ │McpClient │ │
+│  └────┬─────┘ └────┬─────┘ └──┬───┘ └───┬───┘ └────┬─────┘ │
+│       │            │           │         │            │       │
+│  ┌────┴────────────┴───────────┴─────────┴────────────┴────┐ │
+│  │                    Agent                                │ │
+│  └────────────────────┬────────────────────────────────────┘ │
+└───────────────────────┼─────────────────────────────────────┘
+                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    BrainOS (Rust Core)                       │
-│  agent/ │ bus/ │ hooks/ │ mcp/ │ plugin/ │ config/          │
+│  agent/ │ bus/ │ config/ │ logging/ │ react/ │ qserde/      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -647,4 +741,4 @@ python examples/01_quickstart.py
 
 - [@open1s/jsbos](../jsbos/) — JavaScript/Node.js bindings
 - [BrainOS](https://github.com/open1s/bos) — Core Rust framework
-- Maturin publis: export MATURIN_PYPI_TOKEN=...
+- Maturin publish: `export MATURIN_PYPI_TOKEN=...`

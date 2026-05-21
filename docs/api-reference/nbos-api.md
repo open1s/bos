@@ -1,488 +1,430 @@
 # BrainOS Python API Reference
 
-This document provides the complete API reference for the BrainOS Python bindings (`brainos` package).
+This document provides the complete API reference for the BrainOS Python bindings (`nbos` package).
 
 ## Main Entry Point
 
 ### BrainOS
 
-Main entry point for BrainOS functionality.
+Main entry point — manages Bus lifecycle, config auto-discovery, and global tool registry.
 
 #### Constructor
 
 ```python
-BrainOS(api_key=None, base_url=None, model=None)
+BrainOS(*, config=None, api_key=None, base_url=None, model=None)
 ```
 
 Parameters:
+- `config` (dict, optional): Inline configuration overrides
 - `api_key` (str, optional): API key for LLM provider
 - `base_url` (str, optional): Base URL for LLM API
 - `model` (str, optional): Model name to use
+
+Config is auto-discovered from `~/.bos/conf/config.toml` and environment variables.
+
+#### Context Manager
+
+```python
+async with BrainOS() as brain:
+    # brain.bus is available
+    agent = brain.agent("assistant")
+```
 
 #### Methods
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `agent(name, **options)` | Create a new agent | `Agent` |
-| `bus` | Get the underlying Bus | `Bus` |
+| `agent(name, **options)` | Create an AgentBuilder | `AgentBuilder` |
+| `register_global(*tools)` | Register tools available to all agents | `BrainOS` |
+| `tools(*tools)` | Alias for `register_global` | `BrainOS` |
 
 #### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `bus` | `Bus` | The underlying Bus instance |
+| `registry` | `ToolRegistry` | Global tool registry |
 
 #### Example
 
 ```python
-from nbos import BrainOS
+from nbos import BrainOS, tool
 
-brain = BrainOS(
-    api_key="sk-...",
-    base_url="https://api.openai.com/v1",
-    model="gpt-4"
+@tool("Add two numbers")
+def add(a: int, b: int) -> int:
+    return a + b
+
+async def main():
+    async with BrainOS() as brain:
+        agent = (
+            brain.agent("assistant")
+            .register(add)
+            .with_prompt("You are a helpful math assistant.")
+        )
+        result = await agent.ask("What is 2+2?")
+        print(result)
+
+import asyncio
+asyncio.run(main())
+```
+
+---
+
+## AgentBuilder
+
+Fluent builder for creating agents with chainable configuration.
+
+#### Constructor
+
+```python
+AgentBuilder(bus, options=None)
+```
+
+#### Fluent Configuration Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `name(name)` | Set agent name | `AgentBuilder` |
+| `with_model(model)` | Set model name | `AgentBuilder` |
+| `with_base_url(url)` | Set base URL | `AgentBuilder` |
+| `with_api_key(key)` | Set API key | `AgentBuilder` |
+| `with_prompt(prompt)` | Set system prompt | `AgentBuilder` |
+| `with_temperature(temp)` | Set temperature | `AgentBuilder` |
+| `with_max_tokens(tokens)` | Set max tokens | `AgentBuilder` |
+| `with_timeout(secs)` | Set timeout | `AgentBuilder` |
+| `with_tools(*tools)` | Register tools | `AgentBuilder` |
+| `register(*tools)` | Alias for `with_tools` | `AgentBuilder` |
+| `with_resilience(...)` | Configure circuit breaker + rate limiter | `AgentBuilder` |
+| `hook(event, callback)` | Register a lifecycle hook | `AgentBuilder` |
+| `with_hooks(hooks)` | Register multiple hooks | `AgentBuilder` |
+| `plugin(name, **handlers)` | Register a plugin | `AgentBuilder` |
+| `with_plugins(*plugins)` | Register multiple plugins | `AgentBuilder` |
+| `with_skills_dir(path)` | Load skills from directory | `AgentBuilder` |
+| `skill(name, content)` | Add inline skill | `AgentBuilder` |
+| `with_mcp(ns, cmd, args)` | Add MCP server (process) | `AgentBuilder` |
+| `with_mcp_http(ns, url)` | Add MCP server (HTTP) | `AgentBuilder` |
+| `with_bash(name, workspace_root)` | Add bash tool | `AgentBuilder` |
+
+#### Execution Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `start()` | Build and initialize the agent | `Agent` |
+| `ask(prompt)` | Auto-start + run simple | `str` |
+| `chat(message)` | Alias for `ask` | `str` |
+| `react(task)` | Auto-start + run ReAct | `str` |
+| `stream(task)` | Auto-start + stream tokens | `AsyncIterator` |
+
+#### Example
+
+```python
+agent = (
+    AgentBuilder(brain.bus)
+    .name("assistant")
+    .with_tools(add, multiply)
+    .with_prompt("You are a math expert.")
+    .with_temperature(0.5)
+    .with_hooks({"BeforeToolCall": my_hook})
+    .with_bash("bash")
+    .start()
 )
-
-async with brain:
-    # ... use brain ...
-    pass
+result = await agent.ask("What is 15 + 23?")
 ```
 
 ---
 
 ## Agent
 
-LLM-powered agent with tool support.
+High-level agent wrapper with fluent API. Created via `BrainOS.agent()` or `AgentBuilder.start()`.
 
-#### Constructor
-
-```python
-Agent(bus, name="assistant", model=..., base_url=..., api_key=..., system_prompt=..., temperature=0.7, timeout_secs=120)
-```
-
-Parameters:
-- `bus` (Bus): The bus instance
-- `name` (str): Agent name
-- `model` (str): Model name (default: "gpt-4")
-- `base_url` (str): Base URL for LLM API
-- `api_key` (str): API key for LLM
-- `system_prompt` (str): System prompt for the agent
-- `temperature` (float): Temperature for sampling (default: 0.7)
-- `timeout_secs` (int): Timeout in seconds (default: 120)
-
-#### Fluent Configuration Methods
-
-Use chainable methods to configure the agent:
+#### Methods
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `with_model(model)` | Set model | `Agent` |
-| `with_prompt(prompt)` | Set system prompt | `Agent` |
-| `with_temperature(temp)` | Set temperature | `Agent` |
-| `with_timeout(secs)` | Set timeout | `Agent` |
-| `register(tool)` | Register a tool | `Agent` |
-| `register_many(*tools)` | Register multiple tools | `Agent` |
-
-#### Agent Methods
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `start()` | Initialize agent | `Agent` |
-| `ask(question)` | Run agent with ReAct reasoning | `str` |
-| `chat(message)` | Simple chat | `str` |
-| `run_simple(message)` | Simple run (no tool use) | `str` |
+| `ask(prompt)` | Run simple task | `str` |
+| `run_simple(message)` | Alias for `ask` | `str` |
+| `chat(message)` | Alias for `ask` | `str` |
 | `react(task)` | Run with ReAct reasoning | `str` |
-| `stream(task)` | Stream response tokens | `AsyncIterator[str]` |
+| `stream(task)` | Stream response tokens | `AsyncIterator` |
 
 #### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
+| `session` | `SessionManager` | Session management |
 | `tools` | `list[str]` | Registered tool names |
 | `config` | `dict` | Agent configuration |
-
-#### Token Usage
-
-The Agent provides methods to monitor token consumption:
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `token_usage()` | Get current token usage statistics | `TokenUsage` |
-| `token_budget_report()` | Get detailed token budget report with status | `TokenBudgetReport` |
-
-#### Classes
-
-| Class | Description |
-|-------|-------------|
-| `TokenUsage` | Token usage statistics (prompt, completion, total) |
-| `TokenBudgetReport` | Budget report with status and usage percentage |
-| `BudgetStatus` | Enum: Normal, Warning, Exceeded, Critical |
-
-#### Resilience Configuration
-
-The Agent supports configuring circuit breaker and rate limiter for resilience:
-
-```python
-from nbos import Agent, AgentConfig
-from react import CircuitBreakerConfig, RateLimiterConfig
-
-cfg = AgentConfig(
-    name="assistant",
-    model="gpt-4",
-    api_key="sk-...",
-    base_url="https://api.openai.com/v1",
-    circuit_breaker=CircuitBreakerConfig(
-        max_failures=5,
-        cooldown_secs=30,
-    ),
-    rate_limit=RateLimiterConfig(
-        capacity=40,
-        window_secs=60,
-        max_retries=3,
-        retry_backoff_secs=1,
-        auto_wait=True,
-    )
-)
-agent = Agent(cfg)  # Pass config directly to constructor
-```
-
-#### Circuit Breaker Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `circuit_breaker_max_failures` | 5 | Failures before opening circuit |
-| `circuit_breaker_cooldown_secs` | 30 | Seconds before half-open state |
-
-#### Rate Limiter Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `rate_limit_capacity` | 40 | Max requests per window |
-| `rate_limit_window_secs` | 60 | Window duration in seconds |
-| `rate_limit_max_retries` | 3 | Retry attempts on 429 errors |
-| `rate_limit_retry_backoff_secs` | 1 | Initial backoff duration |
-| `rate_limit_auto_wait` | true | Auto-wait when rate limited |
 
 #### Example
 
 ```python
-from nbos import BrainOS, tool
-import asyncio
+agent = brain.agent("assistant").register(add_tool)
+result = await agent.ask("What is 2+2?")
+
+# Session management
+session = agent.session
+session.save_full("./session.json")
+session.restore_full("./session.json")
+session.compact(2, 500)
+messages = session.get_messages()
+```
+
+---
+
+## SessionManager
+
+Session management for an agent.
+
+#### Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `save(path)` | Save message log | `SessionManager` |
+| `restore(path)` | Restore message log | `SessionManager` |
+| `save_full(path)` | Save full session | `SessionManager` |
+| `restore_full(path)` | Restore full session | `SessionManager` |
+| `compact(keep_recent, max_summary_chars)` | Compact conversation | `SessionManager` |
+| `clear()` | Clear session context | `SessionManager` |
+| `get_messages()` | Get all messages | `list[dict]` |
+| `add_message(role, content)` | Add a message | `SessionManager` |
+| `export()` | Export session state | `dict` |
+
+#### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `context` | `dict` | Session context |
+
+---
+
+## @tool() / ToolDef
+
+#### `@tool(description, *, name=None, schema=None)`
+
+Decorator to create a tool from a function.
+
+```python
+from nbos import tool
 
 @tool("Add two numbers")
 def add(a: int, b: int) -> int:
     return a + b
 
-@tool("Get current time")
-def get_time() -> dict:
-    from datetime import datetime
-    return {"utc": datetime.utcnow().isoformat()}
-
-async def main():
-    async with BrainOS() as brain:
-        agent = brain.agent("assistant") \
-            .register(add) \
-            .register(get_time)
-        
-        # Ask with tool use
-        result = await agent.react("What is 5 + 3? What is the current time?")
-        print(result)
-
-asyncio.run(main())
-```
-
----
-
-## @tool()
-
-Decorator to create a tool from a function.
-
-#### Signature
-
-```python
-@tool(description: str, *, name: str = None, schema: dict = None)
-```
-
-Parameters:
-- `description` (str): Description of what the tool does
-- `name` (str, optional): Tool name (defaults to function name)
-- `schema` (dict, optional): JSON Schema for tool parameters
-
-#### Usage
-
-```python
-from nbos import tool
-
-@tool("Calculate a math expression")
-def calc(expression: str) -> str:
-    result = eval(expression)  # In practice, use a safe evaluator
-    return str(result)
-
-@tool("Get weather information", name="weather")
+@tool("Get weather", name="weather")
 def get_weather(city: str) -> dict:
-    return {"city": city, "temperature": 22, "unit": "celsius"}
-
-# With custom schema
-@tool("Calculate", schema={
-    "type": "object",
-    "properties": {
-        "expression": {
-            "type": "string",
-            "description": "Math expression to evaluate"
-        }
-    },
-    "required": ["expression"]
-})
-def calc(expression: str) -> str:
-    return str(eval(expression))
+    return {"city": city, "temperature": 22}
 ```
 
-#### Manual Tool Creation
+#### ToolDef
 
-For more control, create a `ToolDef` manually:
+Manual tool creation.
 
 ```python
-from nbos.tool import ToolDef
+from nbos import ToolDef
 
-def my_handler(args: dict) -> str:
-    return f"Processed: {args}"
-
-tool_def = ToolDef(
-    name="my_tool",
-    description="A custom tool",
-    callback=my_handler,
-    parameters={"arg1": {"type": "string"}},
-    schema={"type": "object", "properties": {"arg1": {"type": "string"}}}
+multiply = ToolDef(
+    name="multiply",
+    description="Multiply two numbers",
+    callback=lambda args: args["a"] * args["b"],
+    parameters={"a": {"type": "number"}, "b": {"type": "number"}},
+    schema={"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}},
 )
+```
 
-agent.register(tool_def)
+#### ToolResult
+
+```python
+from nbos import ToolResult
+
+# Success
+result = ToolResult.success(data, metadata={"key": "value"})
+
+# Error
+result = ToolResult.error("Something went wrong")
 ```
 
 ---
 
-## BusManager
+## ToolRegistry
 
-Async context manager for Bus lifecycle.
-
-#### Constructor
-
-```python
-BusManager(mode="peer", connect=None, listen=None, peer=None)
-```
-
-Parameters:
-- `mode` (str): Bus mode ('peer', 'client', 'server')
-- `connect` (str, optional): Connection address for client mode
-- `listen` (str, optional): Listen address for server mode
-- `peer` (str, optional): Peer address for peer-to-peer mode
+Registry for managing multiple tools.
 
 #### Methods
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `publish_text(topic, payload)` | Publish text message | `None` |
-| `publish_json(topic, data)` | Publish JSON message | `None` |
-| `create_publisher(topic)` | Create a publisher | `Publisher` |
-| `create_subscriber(topic)` | Create a subscriber | `Subscriber` |
-| `create_query(topic)` | Create a query client | `Query` |
-| `create_queryable(topic, handler)` | Create a queryable server | `Queryable` |
-| `create_caller(name)` | Create a caller client | `Caller` |
-| `create_callable(uri, handler)` | Create a callable server | `Callable` |
-
-#### Example
-
-```python
-from nbos import BusManager
-import asyncio
-
-async def main():
-    async with BusManager() as bus:
-        # Publish messages
-        await bus.publish_text("my/topic", "hello")
-        await bus.publish_json("my/topic", {"data": 123})
-        
-        # Create publisher/subscriber
-        pub = await bus.create_publisher("output/topic")
-        sub = await bus.create_subscriber("input/topic")
-        
-        msg = await sub.recv()
-        print(f"Received: {msg}")
-
-asyncio.run(main())
-```
+| `add(tool)` | Add a tool | `ToolRegistry` |
+| `register(tool)` | Alias for `add` | `ToolRegistry` |
+| `remove(name)` | Remove a tool | `ToolRegistry` |
+| `get(name)` | Get tool by name | `ToolDef \| None` |
+| `has(name)` | Check if tool exists | `bool` |
+| `list()` | List tool names | `list[str]` |
+| `list_tools()` | List tool definitions | `list[ToolDef]` |
+| `size()` | Count tools | `int` |
+| `clear()` | Clear all tools | `ToolRegistry` |
+| `merge(other)` | Merge another registry | `ToolRegistry` |
 
 ---
 
-## Publisher
+## AgentConfig
 
-Message publisher for a specific topic.
+Configuration for creating an agent (low-level).
 
-#### Properties
+```python
+from nbos import AgentConfig
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `topic` | `str` | Topic name |
+config = AgentConfig()
+config.name = "assistant"
+config.model = "gpt-4"
+config.base_url = "https://api.openai.com/v1"
+config.api_key = "sk-..."
+config.system_prompt = "You are helpful."
+config.temperature = 0.7
+config.timeout_secs = 120
+```
 
-#### Methods
+#### Resilience Fields
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `publish_text(payload)` | Publish text message | `None` |
-| `publish_json(data)` | Publish JSON message | `None` |
+| Field | Default | Description |
+|-------|---------|-------------|
+| `rate_limit_capacity` | 40 | Max requests per window |
+| `rate_limit_window_secs` | 60 | Window duration |
+| `rate_limit_max_retries` | 3 | Retry attempts on 429 |
+| `circuit_breaker_max_failures` | 5 | Failures before open circuit |
+| `circuit_breaker_cooldown_secs` | 30 | Seconds before half-open |
 
 ---
 
-## Subscriber
+## PyAgent (Native Agent)
 
-Message subscriber with receive methods.
-
-#### Properties
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `topic` | `str` | Topic name |
+The native Rust-backed agent class from `nbos_native`.
 
 #### Methods
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `recv()` | Receive message (blocking) | `str` |
-| `recv_with_timeout_ms(ms)` | Receive with timeout | `str | None` |
-| `recv_json_with_timeout_ms(ms)` | Receive JSON with timeout | `Any | None` |
-| `run(callback)` | Run callback loop for messages | `None` |
-| `run_json(callback)` | Run JSON callback loop for messages | `None` |
+| Method | Description |
+|--------|-------------|
+| `create(config, bus)` | Create agent (async class method) |
+| `run_simple(task)` | Run simple task |
+| `react(task)` | Run ReAct reasoning |
+| `stream(task)` | Stream tokens |
+| `add_tool(tool)` | Register PythonTool |
+| `add_bash_tool(name, workspace_root)` | Add bash tool |
+| `add_mcp_server(ns, cmd, args)` | Add MCP server (process) |
+| `add_mcp_server_http(ns, url)` | Add MCP server (HTTP) |
+| `register_hook(event, callback)` | Register lifecycle hook |
+| `register_plugin(plugin)` | Register plugin |
+| `register_skills_from_dir(path)` | Load skills from dir |
+| `list_tools()` | List tool names |
+| `config()` | Get config as dict |
+| `save_message_log(path)` | Save messages |
+| `restore_message_log(path)` | Restore messages |
+| `save_session(path)` | Save full session |
+| `restore_session(path)` | Restore full session |
+| `compact_message_log()` | Compact messages |
+| `clear_session_context()` | Clear session |
+| `get_messages()` | Get messages |
+| `session_context()` | Get session context |
+| `session_state()` | Export session state |
+| `token_usage()` | Get token usage |
+| `token_budget_report()` | Get budget report |
 
-#### Example
+---
+
+## Bus / BusConfig
+
+#### Bus
 
 ```python
-from nbos import BusManager
-import asyncio
+from nbos import Bus, BusConfig
 
-async def main():
-    async with BusManager() as bus:
-        sub = await bus.create_subscriber("my/topic")
-        msg = await sub.recv_with_timeout_ms(5000)
-        print(f"Received: {msg}")
-
-asyncio.run(main())
+bus = await Bus.create(BusConfig())
 ```
+
+#### BusConfig
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `mode` | `"peer"` | Bus mode: peer, client, server |
+| `connect` | `None` | Connection addresses |
+| `listen` | `None` | Listen addresses |
+| `peer` | `None` | Peer ID |
+
+#### Bus Methods
+
+| Method | Description |
+|--------|-------------|
+| `create(config)` | Create bus (async class method) |
+| `publish_text(topic, payload)` | Publish text |
+| `publish_json(topic, data)` | Publish JSON |
+| `create_publisher(topic)` | Create publisher |
+| `create_subscriber(topic)` | Create subscriber |
+| `create_query(topic)` | Create query client |
+| `create_queryable(topic)` | Create queryable server |
+| `create_caller(name)` | Create caller client |
+| `create_callable(uri)` | Create callable server |
+
+---
+
+## Publisher / Subscriber
+
+#### Publisher
+
+| Method | Description |
+|--------|-------------|
+| `publish_text(payload)` | Publish text |
+| `publish_json(data)` | Publish JSON |
+
+#### Subscriber
+
+| Method | Description |
+|--------|-------------|
+| `recv()` | Receive message (blocking) |
+| `recv_with_timeout_ms(ms)` | Receive with timeout |
+| `recv_json_with_timeout_ms(ms)` | Receive JSON with timeout |
+| `run(callback)` | Run callback loop |
+| `run_json(callback)` | Run JSON callback loop |
 
 ---
 
 ## Query / Queryable
 
-Request-response pattern.
+#### Query
 
-#### Query Methods
+| Method | Description |
+|--------|-------------|
+| `query_text(payload)` | Send text query |
+| `query_text_timeout_ms(payload, ms)` | Query with timeout |
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `query_text(payload)` | Send text query | `str` |
-| `query_text_timeout_ms(payload, ms)` | Send text query with timeout | `str | None` |
+#### Queryable
 
-#### Queryable Methods
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `start()` | Start server | `None` |
-| `run(handler)` | Run with handler function | `None` |
-| `run_json(handler)` | Run with JSON handler function | `None` |
-
-#### Example
-
-```python
-from nbos import BusManager
-import asyncio
-
-def uppercase_handler(text: str) -> str:
-    return text.upper()
-
-async def main():
-    async with BusManager() as bus:
-        # Server
-        queryable = await bus.create_queryable("svc/upper", uppercase_handler)
-        await queryable.start()
-        
-        # Client
-        query = await bus.create_query("svc/upper")
-        result = await query.query_text("hello")  # "HELLO"
-        print(result)
-
-asyncio.run(main())
-```
+| Method | Description |
+|--------|-------------|
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `run_json(handler)` | Run with JSON handler |
 
 ---
 
 ## Caller / Callable
 
-RPC pattern.
+#### Caller
 
-#### Caller Methods
+| Method | Description |
+|--------|-------------|
+| `call_text(payload)` | Call remote service |
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `call_text(payload)` | Call remote service | `str` |
+#### Callable
 
-#### Callable Methods
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `start()` | Start server | `None` |
-| `run(handler)` | Run with handler function | `None` |
-| `run_json(handler)` | Run with JSON handler function | `None` |
-| `is_started()` | Check if server is running | `bool` |
-
-#### Example
-
-```python
-from nbos import BusManager
-import asyncio
-
-def echo_handler(text: str) -> str:
-    return f"echo:{text}"
-
-async def main():
-    async with BusManager() as bus:
-        # Server
-        callable_srv = await bus.create_callable("svc/echo", echo_handler)
-        await callable_srv.start()
-        
-        # Client
-        caller = await bus.create_caller("svc/echo")
-        result = await caller.call_text("ping")  # "echo:ping"
-        print(result)
-
-asyncio.run(main())
-```
+| Method | Description |
+|--------|-------------|
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `run_json(handler)` | Run with JSON handler |
+| `is_started()` | Check if running |
 
 ---
 
 ## ConfigLoader
-
-Configuration loader for loading settings from various sources.
-
-#### Constructor
-
-```python
-ConfigLoader(strategy="deep_merge")
-```
-
-Parameters:
-- `strategy` (str): Merge strategy ('deep_merge', 'replace')
-
-#### Methods
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `discover()` | Auto-discover config files | `ConfigLoader` |
-| `add_file(path)` | Add config file | `ConfigLoader` |
-| `add_directory(path)` | Add config directory | `ConfigLoader` |
-| `add_inline(data)` | Add inline configuration | `ConfigLoader` |
-| `reset()` | Reset configuration | `ConfigLoader` |
-| `load_sync()` | Load configuration synchronously | `dict` |
-| `reload_sync()` | Reload configuration synchronously | `dict` |
-
-#### Example
 
 ```python
 from nbos import ConfigLoader
@@ -490,51 +432,11 @@ from nbos import ConfigLoader
 loader = ConfigLoader()
 loader.discover()
 loader.add_file("app.toml")
-loader.add_inline({"agent": {"model": "gpt-4.1"}})
-cfg = loader.load_sync()
-print(cfg)
+loader.add_inline({"agent": {"model": "gpt-4"}})
+config = loader.load_sync()
 ```
 
----
-
-## AgentConfig / Agent
-
-Configuration and agent creation utilities.
-
-### AgentConfig
-
-Create agent configuration:
-
-```python
-from nbos import AgentConfig
-
-cfg = AgentConfig(
-    name="assistant",
-    model="gpt-4.1",
-    api_key="sk-...",
-    base_url="https://api.openai.com/v1",
-)
-```
-
-### Agent
-
-Create agent from configuration:
-
-```python
-from nbos import Agent, AgentConfig
-
-cfg = AgentConfig(
-    name="assistant",
-    model="gpt-4.1",
-    api_key="sk-...",
-    base_url="https://api.openai.com/v1",
-)
-agent = Agent(cfg)
-text = await agent.react("Say hello in one sentence")
-print(text)
-```
-
-#### AgentConfig Methods
+#### Methods
 
 | Method | Description |
 |--------|-------------|
@@ -542,108 +444,187 @@ print(text)
 | `add_file(path)` | Add config file |
 | `add_directory(path)` | Add config directory |
 | `add_inline(data)` | Add inline config |
-| `reset()` | Reset config |
-| `load_sync()` | Load configuration |
-| `reload_sync()` | Reload configuration |
+| `reset()` | Reset configuration |
+| `load_sync()` | Load config (returns dict) |
+| `reload_sync()` | Reload config |
 
-### Agent Methods
+---
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `from_config(config)` | Create agent from config | `Agent` |
-| `register(tool)` | Register a tool | `Agent` |
-| `register_many(*tools)` | Register multiple tools | `Agent` |
-| `ask(question)` | Run agent with ReAct reasoning | `str` |
-| `chat(message)` | Simple chat | `str` |
-| `run_simple(message)` | Simple run | `str` |
-| `react(task)` | Run with ReAct reasoning | `str` |
-| `stream(task)` | Stream response tokens | `AsyncIterator[str]` |
+## McpClient
+
+```python
+from nbos import McpClient
+
+# Process-based
+client = await McpClient.spawn("npx", ["-y", "server-filesystem", "/tmp"])
+await client.initialize()
+
+# HTTP
+client = McpClient.connect_http("http://127.0.0.1:8000/mcp")
+await client.initialize()
+```
+
+#### Methods
+
+| Method | Description |
+|--------|-------------|
+| `spawn(command, args)` | Spawn MCP server (static) |
+| `connect_http(url)` | Connect via HTTP (static) |
+| `initialize()` | Initialize connection |
+| `list_tools()` | List available tools |
+| `call_tool(name, args_json)` | Call a tool |
+| `list_prompts()` | List prompts |
+| `list_resources()` | List resources |
+| `read_resource(uri)` | Read resource by URI |
+
+---
+
+## Hooks
+
+#### HookEvent
+
+| Event | Description |
+|-------|-------------|
+| `BeforeToolCall` | Before tool execution |
+| `AfterToolCall` | After tool execution |
+| `BeforeLlmCall` | Before LLM API call |
+| `AfterLlmCall` | After LLM API call |
+| `OnMessage` | For each message |
+| `OnComplete` | When agent completes |
+| `OnError` | When error occurs |
+
+#### HookDecision
+
+| Decision | Description |
+|----------|-------------|
+| `HookDecision("Continue", None)` | Proceed normally |
+| `HookDecision("Abort", None)` | Abort operation |
+| `HookDecision("Error", "message")` | Return error |
+
+#### HookContext
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `agent_id` | `str` | Agent identifier |
+| `data` | `dict[str, str]` | Event data |
+
+#### Example
+
+```python
+from nbos import HookEvent, HookDecision
+
+def my_hook(event, ctx):
+    print(f"[{event.value}] agent={ctx.agent_id}")
+    return HookDecision("Continue", None)
+
+agent = brain.agent("assistant").hook("BeforeToolCall", my_hook)
+```
+
+---
+
+## Plugins
+
+#### AgentPlugin
+
+```python
+from nbos import AgentPlugin
+
+plugin = AgentPlugin(
+    name="my-plugin",
+    on_llm_request=handle_request,
+    on_llm_response=handle_response,
+    on_tool_call=handle_tool_call,
+    on_tool_result=handle_tool_result,
+)
+agent._inner.register_plugin(plugin)
+```
+
+#### Wrapper Classes
+
+| Class | Description |
+|-------|-------------|
+| `LlmRequestWrapper` | LLM request interceptor |
+| `LlmResponseWrapper` | LLM response interceptor |
+| `ToolCallWrapper` | Tool call interceptor |
+| `ToolResultWrapper` | Tool result interceptor |
+
+---
+
+## Token Usage
+
+#### TokenUsage
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `prompt_tokens` | `int` | Prompt token count |
+| `completion_tokens` | `int` | Completion token count |
+| `total_tokens` | `int` | Total token count |
+
+#### TokenBudgetReport
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `status` | `BudgetStatus` | Budget status |
+| `usage_percentage` | `float` | Usage percentage |
+| `token_usage` | `TokenUsage` | Current usage |
+
+#### BudgetStatus
+
+| Status | Description |
+|--------|-------------|
+| `Normal` | Within budget |
+| `Warning` | Approaching limit |
+| `Exceeded` | Over budget |
+| `Critical` | Critically over budget |
+
+---
+
+## LlmMessage
+
+```python
+from nbos import LlmMessage
+
+msg = LlmMessage.system("System prompt")
+msg = LlmMessage.user("User message")
+msg = LlmMessage.assistant("Assistant response")
+msg = LlmMessage.assistant_tool_call("tool_name", "tool_call_id", {"arg": "value"})
+msg = LlmMessage.tool_result("tool_call_id", "result")
+```
+
+#### Methods
+
+| Method | Description |
+|--------|-------------|
+| `to_py()` | Convert to Python dict |
+| `from_py(dict)` | Create from dict (static) |
+
+---
+
+## PythonTool
+
+Low-level tool wrapper for Python functions.
+
+```python
+from nbos_native import PythonTool
+
+tool = PythonTool(
+    name="weather",
+    description="Get weather for a city",
+    parameters='{"city": {"type": "string"}}',
+    schema='{"type": "object", "properties": {"city": {"type": "string"}}}',
+    callback=lambda args: '{"temp": 22}',
+)
+await agent._inner.add_tool(tool)
+```
 
 ---
 
 ## Best Practices
 
-- Use `asyncio.run(...)` at process entry and `await` all async API calls.
-- Keep `AgentConfig` immutable after creation for reproducibility.
-- Prefer `ConfigLoader` + inline overrides for environment-specific setup.
-- Reuse one `Bus` instance per process, not per call.
-- Keep query/call handlers fast and side-effect-light; move heavy IO to async tasks.
-
----
-
-## Examples
-
-### Complete Example with Tools
-
-```python
-import asyncio
-from nbos import BrainOS, tool
-
-@tool("Add two numbers")
-def add(a: int, b: int) -> int:
-    return a + b
-
-@tool("Multiply two numbers")
-def multiply(a: int, b: int) -> int:
-    return a * b
-
-@tool("Get current time")
-def get_time() -> dict:
-    from datetime import datetime
-    return {"utc": datetime.utcnow().isoformat()}
-
-async def main():
-    async with BrainOS() as brain:
-        agent = brain.agent("assistant") \
-            .register(add) \
-            .register(multiply) \
-            .register(get_time)
-        
-        # Ask with tool use
-        result = await agent.react("What is 5 + 3? What is 4 * 7?")
-        print(result)
-
-asyncio.run(main())
-```
-
-### Pub/Sub Example
-
-```python
-import asyncio
-from nbos import BusManager
-
-async def publisher():
-    async with BusManager() as bus:
-        await bus.publish_text("events/start", "Hello subscribers!")
-
-async def subscriber():
-    async with BusManager() as bus:
-        sub = await bus.create_subscriber("events/start")
-        msg = await sub.recv_with_timeout_ms(5000)
-        print(f"Received: {msg}")
-
-# Run both in separate processes or tasks
-```
-
-### Query/Response Example
-
-```python
-import asyncio
-from nbos import BusManager
-
-def uppercase(text: str) -> str:
-    return text.upper()
-
-async def main():
-    async with BusManager() as bus:
-        # Server
-        q = await bus.create_queryable("svc/uppercase", uppercase)
-        await q.start()
-        
-        # Client
-        query = await bus.create_query("svc/uppercase")
-        result = await query.query_text("hello world")
-        print(result)  # "HELLO WORLD"
-
-asyncio.run(main())
-```
+- Use `async with BrainOS()` for automatic bus lifecycle management
+- Use `AgentBuilder` fluent API for agent configuration
+- Prefer `@tool` decorator for tool definitions
+- Register global tools via `brain.register_global()` for reuse across agents
+- Use `ConfigLoader.discover()` for environment-specific configuration
+- Keep one `Bus` instance per process
+- Use `session.save_full()` / `session.restore_full()` for conversation persistence

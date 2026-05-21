@@ -1,4 +1,4 @@
-# @open1s/jsbos
+# @open1s/jsbos — v2.2.4
 
 > BrainOS JavaScript/Node.js bindings — AI agent framework with ReAct engine
 
@@ -32,14 +32,47 @@ yarn add @open1s/jsbos
 
 ## Quick Start
 
+### Using BrainOS (recommended)
+
+```javascript
+import { BrainOS, ToolDef } from '@open1s/jsbos';
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+
+  // Define a tool
+  const addTool = new ToolDef(
+    'add',
+    'Add two numbers',
+    (args) => args.a + args.b,
+    { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }
+  );
+
+  // Create and configure an agent
+  const agent = brain
+    .agent('assistant')
+    .register(addTool)
+    .start();
+
+  // Run the agent
+  const response = await agent.ask('What is 15 + 23?');
+  console.log(response);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+### Using Agent directly (low-level)
+
 ```javascript
 import { Agent, Bus } from '@open1s/jsbos';
 
 async function main() {
-  // Create a message bus for inter-agent communication
   const bus = await Bus.create();
 
-  // Create an agent with LLM configuration
   const agent = await Agent.create({
     name: 'assistant',
     model: 'gpt-4',
@@ -50,26 +83,14 @@ async function main() {
     timeoutSecs: 120,
   }, bus);
 
-  // Register a custom tool
   await agent.addTool(
     'calculator',
     'Evaluate a mathematical expression',
-    JSON.stringify({
-      expression: { type: 'string', description: 'Math expression like 2 + 2' }
-    }),
-    JSON.stringify({
-      type: 'object',
-      properties: { expression: { type: 'string' } },
-      required: ['expression']
-    }),
-    (err, args) => {
-      // Tool implementation
-      const result = eval(args.expression);
-      return JSON.stringify({ result });
-    }
+    JSON.stringify({ expression: { type: 'string', description: 'Math expression' } }),
+    JSON.stringify({ type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] }),
+    (err, args) => JSON.stringify({ result: eval(args.expression) })
   );
 
-  // Run the agent with a task
   const response = await agent.runSimple('What is 15 * 23?');
   console.log(response);
 }
@@ -79,7 +100,103 @@ main().catch(console.error);
 
 ## API Reference
 
-### Agent
+### BrainOS (High-level API)
+
+The recommended way to use jsbos — manages bus lifecycle, config loading, and tool registry.
+
+#### `new BrainOS()` — Create a BrainOS instance
+
+```javascript
+const brain = new BrainOS();
+await brain.start();  // Loads config, starts bus, registers global tools
+```
+
+#### `brain.agent(name, options)` — Create an agent builder
+
+```javascript
+const agent = brain
+  .agent('assistant', { model: 'gpt-4', systemPrompt: 'Be helpful.' })
+  .register(myTool)           // Register a ToolDef
+  .hook(HookEvent.BeforeLlmCall, (err, ctx) => 'continue')
+  .plugin('my-plugin', { onLlmRequest: (req) => req })
+  .skillsFromDir('./skills')
+  .start();                   // Returns an AgentWrapper
+```
+
+#### `agent.ask(prompt)` — Ask a question
+
+```javascript
+const response = await agent.ask('What is 2+2?');
+```
+
+#### `agent.react(task)` — Run with ReAct reasoning
+
+```javascript
+const response = await agent.react('Find files modified in the last hour');
+```
+
+#### `agent.stream(task, onToken)` — Stream responses
+
+```javascript
+await agent.stream('Write a story', (token) => {
+  if (token.type === 'Text') process.stdout.write(token.text);
+  if (token.type === 'Done') console.log('\n[Done]');
+});
+```
+
+#### `agent.streamCollect(task)` — Collect all streaming tokens
+
+```javascript
+const tokens = await agent.streamCollect('List 3 colors');
+const text = tokens.filter(t => t.type === 'Text').map(t => t.text).join('');
+```
+
+#### `agent.runSimple(prompt)` — Simple task execution
+
+```javascript
+const response = await agent.runSimple('What is 100 * 100?');
+```
+
+#### `agent.stop()` — Stop the agent
+
+```javascript
+agent.stop();
+```
+
+#### `agent.metrics()` — Get performance metrics
+
+```javascript
+const m = agent.metrics();
+console.log(m.llmCallCount, m.totalInputTokens, m.totalOutputTokens);
+```
+
+#### `agent.session` — Session management
+
+```javascript
+const session = agent.session;
+const json = session.export();
+await session.saveFull('./session.json');
+await session.restoreFull('./session.json');
+session.compact(2, 500);  // keep 2 messages, max 500 chars summary
+session.clear();
+```
+
+### ToolDef
+
+Define tools with a clean declarative API.
+
+```javascript
+import { ToolDef } from '@open1s/jsbos';
+
+const addTool = new ToolDef(
+  'add',                                    // name
+  'Add two numbers',                        // description
+  (args) => args.a + args.b,                // handler
+  { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }  // schema
+);
+```
+
+### Agent (Low-level API)
 
 The core AI agent class with tool-calling and ReAct reasoning capabilities.
 
@@ -103,11 +220,6 @@ const agent = await Agent.create({
   // Circuit breaker
   circuitBreakerMaxFailures: 5,
   circuitBreakerCooldownSecs: 30,
-  // Context compaction (for long conversations)
-  contextCompactionThresholdTokens: 100000,
-  contextCompactionTriggerRatio: 0.8,
-  contextCompactionKeepRecentMessages: 10,
-  contextCompactionSummaryMaxTokens: 2000,
 }, bus);  // Optional: bus for RPC communication
 ```
 
@@ -284,9 +396,11 @@ agent.clearSessionContext();
 agent.saveSession('./session.json');
 agent.restoreSession('./session.json');
 
-// Compact message log for long conversations
+// Compact-message log for long conversations
 agent.compactMessageLog();
 ```
+
+### AgentWrapper (from BrainOS)
 
 ### Bus (Message Bus)
 
@@ -463,17 +577,22 @@ See the [examples](./examples/) directory for complete examples:
 
 | Example | Description |
 |---------|-------------|
-| `agent_demo.js` | Basic agent with tools |
+| `brainos_demo.js` | High-level BrainOS API |
+| `agent_demo.js` | Agent with tools |
 | `agent_mcp_demo.js` | Agent with MCP servers |
+| `agent_stream_demo.js` | Streaming responses |
+| `agent_metrics_demo.js` | Performance metrics |
+| `agent_skill_demo.js` | Agent skills from directory |
+| `agent_resilience_demo.js` | Rate limiting + circuit breaker |
 | `bus_demo.js` | Pub/sub messaging |
 | `caller_demo.js` | RPC pattern |
 | `query_demo.js` | Request/response queries |
 | `mcp_demo.js` | Standalone MCP client |
 | `mcp_http_demo.js` | HTTP MCP connections |
-| `agent_stream_demo.js` | Streaming responses |
 | `demo-hooks.js` | Lifecycle hooks |
 | `demo-plugins.js` | Plugin system |
 | `config_demo.js` | Configuration loading |
+| `elegant-api-examples.js` | Tools, plugins, hooks, streaming, session, skills |
 
 Run an example:
 ```bash
@@ -506,15 +625,18 @@ yarn format
 │                        JavaScript/Node.js                    │
 ├─────────────────────────────────────────────────────────────┤
 │  @open1s/jsbos (NAPI-RS bindings)                           │
-│  ┌─────────┐ ┌──────┐ ┌───────┐ ┌───────┐ ┌─────────────┐  │
-│  │  Agent  │ │ Bus  │ │ Hooks │ │Plugins│ │   MCP Client│  │
-│  └────┬────┘ └──┬───┘ └───┬───┘ └───┬───┘ └──────┬──────┘  │
-└───────┼────────┼─────────┼─────────┼────────────┼──────────┘
-        │        │         │         │            │
-        ▼        ▼         ▼         ▼            ▼
+│  ┌──────────┐ ┌──────────┐ ┌──────┐ ┌───────┐ ┌──────────┐ │
+│  │ BrainOS  │ │ToolDef   │ │ Bus  │ │ Hooks │ │McpClient │ │
+│  └────┬─────┘ └────┬─────┘ └──┬───┘ └───┬───┘ └────┬─────┘ │
+│       │            │           │         │            │       │
+│  ┌────┴────────────┴───────────┴─────────┴────────────┴────┐ │
+│  │                    Agent                                │ │
+│  └────────────────────┬────────────────────────────────────┘ │
+└───────────────────────┼─────────────────────────────────────┘
+                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    BrainOS (Rust Core)                       │
-│  agent/ │ bus/ │ hooks/ │ mcp/ │ plugin/ │ config/          │
+│  agent/ │ bus/ │ config/ │ logging/ │ react/ │ qserde/      │
 └─────────────────────────────────────────────────────────────┘
 ```
 

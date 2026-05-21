@@ -6,7 +6,7 @@ This document provides the complete API reference for the BrainOS JavaScript/Nod
 
 ### BrainOS
 
-Main entry point for BrainOS functionality.
+Main entry point — manages Bus lifecycle, config auto-discovery, and global tool registry.
 
 #### Constructor
 
@@ -23,149 +23,194 @@ Options:
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `start()` | Initialize BrainOS | `Promise<void>` |
+| `start()` | Initialize BrainOS (auto-discovers config) | `Promise<BrainOS>` |
 | `stop()` | Shutdown BrainOS | `Promise<void>` |
-| `agent(name, options)` | Create a new agent | `Agent` |
+| `agent(name, options)` | Create an AgentBuilder | `AgentBuilder` |
+| `registerGlobal(...tools)` | Register global tools | `BrainOS` |
+| `tools(...tools)` | Alias for `registerGlobal` | `BrainOS` |
+| `createBus(options)` | Create a BusManager | `Promise<BusManager>` |
+
+#### Static Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `BrainOS.create(options)` | Create and start instance | `Promise<BrainOS>` |
 
 #### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `bus` | `Bus` | The underlying Bus instance |
+| `bus` | `BusManager` | The BusManager instance |
+| `config` | `Config` | Loaded configuration |
+| `registry` | `ToolRegistry` | Global tool registry |
+| `isStarted` | `boolean` | Whether BrainOS is started |
 
 #### Example
 
 ```javascript
 import { BrainOS } from 'brainos';
 
-const brain = new BrainOS({
-  apiKey: 'sk-...',
-  baseUrl: 'https://api.openai.com/v1',
-  model: 'gpt-4'
-});
-
+const brain = new BrainOS();
 await brain.start();
-// ... use brain ...
+
+const agent = brain.agent('assistant')
+  .register(addTool)
+  .prompt('You are helpful.');
+
 await brain.stop();
 ```
 
 ---
 
-## Agent
+## AgentBuilder
 
-LLM-powered agent with tool support.
+Fluent builder for creating agents with chainable configuration.
 
-### Constructor
+#### Constructor
 
 ```javascript
-new Agent(bus, options = {})
+new AgentBuilder(bus, options = {})
 ```
 
-Options:
-- `name` (string): Agent name
-- `model` (string): Model name (default: 'nvidia/meta/llama-3.1-8b-instruct')
-- `baseUrl` (string): Base URL for LLM API
-- `apiKey` (string): API key for LLM
-- `systemPrompt` (string): System prompt for the agent
-- `temperature` (number): Temperature for sampling (default: 0.7)
-- `timeoutSecs` (number): Timeout in seconds (default: 120)
-
-### Methods
+#### Fluent Configuration Methods
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `withModel(model)` | Set model | `Agent` |
-| `withPrompt(prompt)` | Set system prompt | `Agent` |
-| `withTemperature(temp)` | Set temperature | `Agent` |
-| `withTimeout(secs)` | Set timeout | `Agent` |
-| `withTools(...toolDefs)` | Register tools to be wired at start | `Agent` |
-| `withBashTool(name, workspaceRoot)` | Add a Bash tool | `Agent` |
-| `onHook(event, callback)` | Register a lifecycle hook | `Agent` |
-| `register(toolDef)` | Register a tool | `Agent` |
-| `registerMany(...toolDefs)` | Register multiple tools | `Agent` |
-| `start()` | Initialize agent | `Promise<Agent>` |
-| `ask(question)` | Run agent with ReAct reasoning | `Promise<string>` |
-| `chat(message)` | Simple chat | `Promise<string>` |
-| `runSimple(message)` | Simple run (no tool use) | `Promise<string>` |
-| `react(task)` | Run with ReAct reasoning | `Promise<string>` |
-| `stream(task, onToken)` | Stream response tokens | `Promise<string>` |
-| `streamCollect(task)` | Collect all streaming tokens | `Promise<string>` |
-| `tokenUsage()` | Get current token usage | `TokenUsage` |
-| `tokenBudgetReport()` | Get token budget report | `TokenBudgetReport` |
-| `getPerfMetrics()` | Get performance metrics | `object` |
-| `resetPerfMetrics()` | Reset performance metrics | `void` |
+| `name(name)` | Set agent name | `AgentBuilder` |
+| `model(model)` | Set model name | `AgentBuilder` |
+| `baseUrl(url)` | Set base URL | `AgentBuilder` |
+| `apiKey(key)` | Set API key | `AgentBuilder` |
+| `system(prompt)` / `prompt(prompt)` | Set system prompt | `AgentBuilder` |
+| `temperature(temp)` | Set temperature | `AgentBuilder` |
+| `timeout(secs)` | Set timeout | `AgentBuilder` |
+| `maxTokens(tokens)` | Set max tokens | `AgentBuilder` |
+| `withConfig(config)` | Apply config object | `AgentBuilder` |
+| `tools(...tools)` / `register(...tools)` / `withTools(...tools)` | Register tools | `AgentBuilder` |
+| `bash(name, workspaceRoot)` | Add bash tool | `AgentBuilder` |
+| `circuitBreaker(maxFailures, cooldownSecs)` | Configure circuit breaker | `AgentBuilder` |
+| `rateLimit(capacity, windowSecs, maxRetries)` | Configure rate limiter | `AgentBuilder` |
+| `resilience(config)` | Configure both resilience features | `AgentBuilder` |
+| `hook(event, callback)` | Register a lifecycle hook | `AgentBuilder` |
+| `hooks(hooks)` | Register multiple hooks | `AgentBuilder` |
+| `plugin(nameOrObj, handlers)` | Register a plugin | `AgentBuilder` |
+| `skill(name, content)` | Add inline skill | `AgentBuilder` |
+| `skillsFromDir(dirPath)` | Load skills from directory | `AgentBuilder` |
+| `mcp(ns, cmd, args)` | Add MCP server (process) | `AgentBuilder` |
+| `mcpHttp(ns, url)` | Add MCP server (HTTP) | `AgentBuilder` |
+
+#### Execution Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `start()` | Build and initialize the agent | `Promise<AgentBuilder>` |
+| `ask(prompt)` | Auto-start + run simple | `Promise<string>` |
+| `runSimple(prompt)` | Auto-start + run simple | `Promise<string>` |
+| `react(task)` | Auto-start + run ReAct | `Promise<string>` |
+| `stream(task, onToken)` | Stream response tokens | `void` |
+| `streamCollect(task)` | Collect all streaming tokens | `Promise<Array>` |
+| `stop(options)` | Stop the agent | `object` |
+| `isRunning()` | Check if agent is running | `boolean` |
 
 #### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `tools` | `string[]` | Registered tool names |
-| `config` | `object` | Agent configuration |
-
-#### Token Usage
-
-The Agent provides methods to monitor token consumption:
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `tokenUsage()` | Get current token usage statistics | `TokenUsage` |
-| `tokenBudgetReport()` | Get detailed token budget report with status | `TokenBudgetReport` |
-
-#### Classes
-
-| Class | Description |
-|-------|-------------|
-| `TokenUsage` | Token usage statistics (prompt, completion, total) |
-| `TokenBudgetReport` | Budget report with status and usage percentage |
-| `BudgetStatus` | Enum: Normal, Warning, Exceeded, Critical |
-
-#### Resilience Configuration
-
-The Agent supports configuring circuit breaker and rate limiter for resilience:
-
-```javascript
-const agent = await Agent.create({
-  name: "assistant",
-  model: "gpt-4",
-  apiKey: "sk-...",
-  // Circuit Breaker - prevents cascading failures
-  circuitBreakerMaxFailures: 5,      // failures before opening circuit
-  circuitBreakerCooldownSecs: 30,      // seconds before attempting recovery
-  // Rate Limiter - prevents 429 errors
-  rateLimitCapacity: 40,            // max requests per window
-  rateLimitWindowSecs: 60,          // window duration in seconds
-  rateLimitMaxRetries: 3,             // retry attempts on rate limit
-  rateLimitRetryBackoffSecs: 1,        // backoff between retries
-  rateLimitAutoWait: true,            // auto-wait when rate limited
-});
-```
+| `session` | `SessionManager` | Session management |
 
 #### Example
 
 ```javascript
-import { BrainOS, ToolDef } from 'brainos';
+const agent = await brain.agent('assistant')
+  .name('math-bot')
+  .tools(addTool, multiplyTool)
+  .prompt('You are a math expert.')
+  .temperature(0.5)
+  .hook(HookEvent.BeforeToolCall, myHook)
+  .bash('bash')
+  .start();
 
-const brain = new BrainOS();
-await brain.start();
+const result = await agent.ask('What is 15 + 23?');
+```
 
-const agent = brain.agent('assistant')
-  .register(new ToolDef(
-    'add', 'Add two numbers', 
-    (args) => args.a + args.b,
-    { a: { type: 'integer' }, b: { type: 'integer' } },
-    { type: 'object', properties: { a: { type: 'integer' }, b: { type: 'integer' } }, required: ['a', 'b'] }
-  ))
-  .register(new ToolDef(
-    'get_time', 'Get current time', 
-    () => JSON.stringify({ utc: new Date().toISOString() }),
-    {}, { type: 'object', properties: {} }
-  ));
+---
 
-// Ask with tool use
-const result = await agent.react('What is 5 + 3? What is the current time?');
-console.log(result);
+## AgentWrapperClass
 
-await brain.stop();
+High-level agent wrapper. Created via `AgentBuilder.start()`.
+
+#### Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `ask(prompt)` | Run simple task | `Promise<string>` |
+| `react(task)` | Run with ReAct reasoning | `Promise<string>` |
+| `stream(task, onToken)` | Stream response tokens | `void` |
+| `streamCollect(task)` | Collect all streaming tokens | `Promise<Array>` |
+| `stop(options)` | Stop the agent | `object` |
+| `isRunning()` | Check if running | `boolean` |
+| `listMcpTools()` | List MCP tools | `Promise<Array>` |
+| `resetMetrics()` | Reset performance metrics | `void` |
+
+#### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `session` | `SessionManager` | Session management |
+| `tools` | `string[]` | Registered tool names |
+| `config` | `object` | Agent configuration |
+| `metrics` | `object` | Performance metrics |
+| `inner` | `Agent` | Native agent reference |
+
+---
+
+## SessionManager
+
+Session management for an agent.
+
+#### Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `save(path)` | Save message log | `Promise<SessionManager>` |
+| `restore(path)` | Restore message log | `Promise<SessionManager>` |
+| `saveFull(path)` | Save full session | `Promise<SessionManager>` |
+| `restoreFull(path)` | Restore full session | `Promise<SessionManager>` |
+| `compact(keepRecent, maxSummaryChars)` | Compact conversation | `SessionManager` |
+| `clear()` | Clear session | `SessionManager` |
+| `getMessages()` | Get all messages | `Array` |
+| `addMessage(role, content)` | Add a message | `SessionManager` |
+| `export()` | Export session state | `string` (JSON) |
+| `import(json)` | Import session state | `SessionManager` |
+
+---
+
+## ToolDef
+
+Tool definition class for creating tools.
+
+#### Constructor
+
+```javascript
+new ToolDef(name, description, callback, parameters = {}, schema = {})
+```
+
+Parameters:
+- `name` (string): Tool name
+- `description` (string): Tool description
+- `callback` (Function): `(args) => result`
+- `parameters` (object): Parameter definitions
+- `schema` (object): JSON Schema
+
+#### Example
+
+```javascript
+const weatherTool = new ToolDef(
+  'get_weather',
+  'Get weather for a city',
+  (args) => JSON.stringify({ city: args.city, temp: 22 }),
+  { city: { type: 'string' } },
+  { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] }
+);
 ```
 
 ---
@@ -173,8 +218,6 @@ await brain.stop();
 ## @tool() Decorator
 
 Decorator factory for creating tools from class methods.
-
-### Usage
 
 ```javascript
 import { tool } from 'brainos';
@@ -185,79 +228,89 @@ class MyTools {
     return args.a + args.b;
   }
 
-  @tool('Multiply two numbers', { name: 'multiply' })
+  @tool('Multiply', { name: 'multiply' })
   multiply(args) {
     return args.a * args.b;
   }
 }
 
-// Create instance and extract tool definitions
 const instance = new MyTools();
-const addTool = instance.add.toolDef;  // Access via .toolDef property
+const addTool = instance.add.toolDef;
 ```
-
-### Parameters
-
-- `description` (string): Description of what the tool does
-- `options` (object, optional): Additional options
-  - `name` (string): Override the function name as tool name
 
 ---
 
-## ToolDef
+## ToolRegistry
 
-Tool definition class for creating tools that agents can use.
-
-### Constructor
-
-```javascript
-new ToolDef(name, description, callback, parameters, schema)
-```
-
-Parameters:
-- `name` (string): Tool name
-- `description` (string): Tool description
-- `callback` (Function): Function that executes when tool is called
-- `parameters` (object): Parameter definitions for validation
-- `schema` (object): JSON Schema for the tool parameters
+Registry for managing multiple tools.
 
 #### Methods
 
-All properties are accessible directly:
-- `name`: Tool name
-- `description`: Tool description
-- `callback`: Tool callback function
-- `parameters`: Parameter definitions
-- `schema`: JSON Schema
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `add(tool)` | Add a tool | `ToolRegistry` |
+| `register(tool)` | Alias for `add` | `ToolRegistry` |
+| `remove(name)` | Remove a tool | `ToolRegistry` |
+| `unregister(name)` | Alias for `remove` | `ToolRegistry` |
+| `get(name)` | Get tool by name | `ToolDef \| BaseTool` |
+| `has(name)` | Check if tool exists | `boolean` |
+| `list()` | List tool names | `string[]` |
+| `listTools()` | List tool objects | `Array` |
+| `listToolDefs()` | List as ToolDef[] | `ToolDef[]` |
+| `listByCategory(category)` | Filter by category | `Array` |
+| `filter(predicate)` | Filter tools | `ToolRegistry` |
+| `merge(other)` | Merge another registry | `ToolRegistry` |
+| `size()` | Count tools | `number` |
+| `clear()` | Clear all tools | `ToolRegistry` |
+| `toJSON()` | Serialize to JSON | `Array` |
 
-#### Example
+---
+
+## ToolResult
 
 ```javascript
-import { ToolDef } from 'brainos';
+import { ToolResult } from 'brainos';
 
-const weatherTool = new ToolDef(
-  'get_weather',
-  'Get weather information for a city',
-  (args) => {
-    // Simulated weather data
-    return JSON.stringify({
-      city: args.city,
-      temperature: 22,
-      unit: 'celsius',
-      condition: 'sunny'
+// Success
+const result = ToolResult.success(data, { key: 'value' });
+
+// Error
+const result = ToolResult.error('Something went wrong');
+```
+
+---
+
+## BaseTool / FunctionTool
+
+Base class for creating custom tools.
+
+```javascript
+import { BaseTool, ToolCategory } from 'brainos';
+
+class MyTool extends BaseTool {
+  constructor() {
+    super({
+      name: 'my-tool',
+      description: 'Does something',
+      category: ToolCategory.CUSTOM,
     });
-  },
-  { city: { type: 'string' } },  // parameters
-  {                               // schema
-    type: 'object',
-    properties: {
-      city: {
-        type: 'string',
-        description: 'City name, e.g., "Beijing", "San Francisco"'
-      }
-    },
-    required: ['city']
   }
+
+  async execute(args) {
+    return this.success({ result: 'done' });
+  }
+}
+```
+
+#### FunctionTool
+
+```javascript
+import { FunctionTool } from 'brainos';
+
+const tool = FunctionTool.fromFunction(
+  (args) => args.a + args.b,
+  'add',
+  'Add two numbers'
 );
 ```
 
@@ -265,9 +318,9 @@ const weatherTool = new ToolDef(
 
 ## BusManager
 
-Async context manager for Bus lifecycle.
+Async manager for Bus lifecycle.
 
-### Constructor
+#### Constructor
 
 ```javascript
 new BusManager(options = {})
@@ -275,340 +328,291 @@ new BusManager(options = {})
 
 Options:
 - `mode` (string): Bus mode ('peer', 'client', 'server')
-- `connect` (string): Connection address for client mode
-- `listen` (string): Listen address for server mode
-- `peer` (string): Peer address for peer-to-peer mode
+- `connect` (string): Connection address
+- `listen` (string): Listen address
+- `peer` (string): Peer address
 
-### Static Methods
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `BusManager.create(options)` | Create and start BusManager | `Promise<BusManager>` |
-
-### Methods
+#### Static Methods
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `start()` | Initialize bus | `Promise<void>` |
+| `BusManager.create(options)` | Create and start | `Promise<BusManager>` |
+
+#### Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `start()` | Initialize bus | `Promise<BusManager>` |
 | `stop()` | Shutdown bus | `Promise<void>` |
-| `publishText(topic, payload)` | Publish text message | `Promise<void>` |
-| `publishJson(topic, data)` | Publish JSON message | `Promise<void>` |
-| `createPublisher(topic)` | Create a publisher | `Promise<Publisher>` |
-| `createSubscriber(topic)` | Create a subscriber | `Promise<Subscriber>` |
-| `createQuery(topic)` | Create a query client | `Promise<Query>` |
-| `createQueryable(topic, handler)` | Create a queryable server | `Promise<Queryable>` |
-| `createCaller(name)` | Create a caller client | `Promise<Caller>` |
-| `createCallable(uri, handler)` | Create a callable server | `Promise<Callable>` |
+| `mode(mode)` | Set mode | `BusManager` |
+| `connect(addresses)` | Set connect addresses | `BusManager` |
+| `listen(addresses)` | Set listen addresses | `BusManager` |
+| `peer(id)` | Set peer ID | `BusManager` |
+| `publish(topic, payload, isJson)` | Publish message | `Promise<void>` |
+| `publisher(topic)` | Create publisher | `Promise<PublisherWrapper>` |
+| `subscriber(topic)` | Create subscriber | `Promise<SubscriberWrapper>` |
+| `query(topic)` | Create query client | `Promise<QueryClient>` |
+| `queryable(topic, handler)` | Create queryable server | `Promise<QueryableServer>` |
+| `caller(name)` | Create caller client | `Promise<CallerClient>` |
+| `callable(uri, handler)` | Create callable server | `Promise<CallableServer>` |
 
-#### Example
+#### Properties
 
-```javascript
-import { BusManager } from 'brainos';
-
-const bus = await BusManager.create();
-await bus.start();
-
-// Publish messages
-await bus.publishText('my/topic', 'hello');
-await bus.publishJson('my/topic', { data: 123 });
-
-// Create publisher/subscriber
-const pub = await bus.createPublisher('output/topic');
-const sub = await bus.createSubscriber('input/topic');
-
-await bus.stop();
-```
+| Property | Type | Description |
+|----------|------|-------------|
+| `bus` | `Bus` | The native Bus instance |
 
 ---
 
 ## PublisherWrapper
 
-Message publisher for a specific topic.
+#### Methods
 
-### Properties
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `publish(payload, isJson)` | Publish message | `Promise<void>` |
+| `text(payload)` | Publish text | `Promise<void>` |
+| `json(data)` | Publish JSON | `Promise<void>` |
+
+#### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `topic` | `string` | Topic name |
-
-### Methods
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `publishText(payload)` | Publish text message | `Promise<void>` |
-| `publishJson(data)` | Publish JSON message | `Promise<void>` |
 
 ---
 
 ## SubscriberWrapper
 
-Message subscriber with receive methods.
-
-### Properties
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `topic` | `string` | Topic name |
-
-### Methods
+#### Methods
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `recv()` | Receive message (blocking) | `Promise<string>` |
-| `recvWithTimeoutMs(ms)` | Receive with timeout | `Promise<string | null>` |
-| `recvJsonWithTimeoutMs(ms)` | Receive JSON with timeout | `Promise<any | null>` |
-| `run(callback)` | Run callback loop for messages | `Promise<void>` |
-| `runJson(callback)` | Run JSON callback loop for messages | `Promise<void>` |
+| `recv(timeoutMs)` | Receive message | `Promise<string>` |
+| `recvJson(timeoutMs)` | Receive JSON | `Promise<any>` |
+| `run(callback)` | Run callback loop | `Promise<void>` |
+| `runJson(callback)` | Run JSON callback loop | `Promise<void>` |
 
-#### Example
+#### Async Iterator
 
 ```javascript
-import { BusManager } from 'brainos';
-
-const bus = await BusManager.create();
-await bus.start();
-
-const sub = await bus.createSubscriber('my/topic');
-const msg = await sub.recvWithTimeoutMs(5000);
-console.log('Received:', msg);
-
-await bus.stop();
+const sub = await bus.subscriber('my/topic');
+for await (const msg of sub) {
+  console.log(msg);
+}
 ```
 
 ---
 
 ## QueryClient / QueryableServer
 
-Request-response pattern implementation.
-
-### QueryClient Methods
+#### QueryClient
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `queryText(payload)` | Send text query | `Promise<string>` |
-| `queryTextTimeoutMs(payload, ms)` | Send text query with timeout | `Promise<string | null>` |
+| `ask(payload, timeoutMs)` | Send query | `Promise<string>` |
+| `askJson(payload, timeoutMs)` | Send JSON query | `Promise<any>` |
 
-### QueryableServer Methods
+#### QueryableServer
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `setHandler(handler)` | Set handler function | `QueryableServer` |
+| `handle(handler)` | Set handler | `QueryableServer` |
 | `start()` | Start server | `Promise<void>` |
-| `run(handler)` | Run with handler function | `Promise<void>` |
-| `runJson(handler)` | Run with JSON handler function | `Promise<void>` |
-
-#### Example
-
-```javascript
-import { BusManager } from 'brainos';
-
-const bus = await BusManager.create();
-await bus.start();
-
-// Server
-const q = await bus.createQueryable('svc/uppercase', (text) => text.toUpperCase());
-await q.start();
-
-// Client
-const query = await bus.createQuery('svc/uppercase');
-const result = await query.queryText('hello world');  // "HELLO WORLD"
-console.log(result);
-
-await bus.stop();
-```
+| `run(handler)` | Run with handler | `Promise<void>` |
+| `runJson(handler)` | Run with JSON handler | `Promise<void>` |
 
 ---
 
 ## CallerClient / CallableServer
 
-RPC pattern implementation.
-
-### CallerClient Methods
+#### CallerClient
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `callText(payload)` | Call remote service | `Promise<string>` |
+| `call(payload)` | Call remote service | `Promise<string>` |
+| `callJson(payload)` | Call with JSON | `Promise<string>` |
 
-### CallableServer Methods
+#### CallableServer
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `setHandler(handler)` | Set handler function | `CallableServer` |
+| `handle(handler)` | Set handler | `CallableServer` |
 | `start()` | Start server | `Promise<void>` |
-| `run(handler)` | Run with handler function | `Promise<void>` |
-| `runJson(handler)` | Run with JSON handler function | `Promise<void>` |
-| `isStarted()` | Check if server is running | `boolean` |
+| `run(handler)` | Run with handler | `Promise<void>` |
+| `runJson(handler)` | Run with JSON handler | `Promise<void>` |
 
-#### Example
+#### Properties
 
-```javascript
-import { BusManager } from 'brainos';
-
-const bus = await BusManager.create();
-await bus.start();
-
-// Server
-const srv = await bus.createCallable('svc/echo', (text) => `echo: ${text}`);
-await srv.start();
-
-// Client
-const caller = await bus.createCaller('svc/echo');
-const result = await caller.callText('ping');  // "echo: ping"
-console.log(result);
-
-await bus.stop();
-```
+| Property | Type | Description |
+|----------|------|-------------|
+| `isStarted` | `boolean` | Whether server is running |
 
 ---
 
-## ConfigLoader
+## Config
 
-Configuration loader for loading settings from various sources.
-
-### Constructor
+Configuration loader with fluent API.
 
 ```javascript
-new ConfigLoader()
+import { Config } from 'brainos';
+
+const config = Config.load();
+console.log(config.model);       // from global_model
+console.log(config.baseUrl);     // from global_model.base_url
+console.log(config.apiKey);      // from global_model.api_key
 ```
 
-### Methods
+#### Static Methods
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `discover()` | Auto-discover config files | `ConfigLoader` |
-| `addFile(path)` | Add config file | `ConfigLoader` |
-| `addDirectory(path)` | Add config directory | `ConfigLoader` |
-| `addInline(data)` | Add inline configuration | `ConfigLoader` |
-| `reset()` | Reset configuration | `ConfigLoader` |
-| `loadSync()` | Load configuration synchronously | `string` (JSON) |
-| `reloadSync()` | Reload configuration synchronously | `string` (JSON) |
+| `Config.load(options)` | Discover and load config | `Config` |
+| `Config.fromFile(path)` | Load from file | `Config` |
+| `Config.fromDirectory(path)` | Load from directory | `Config` |
+| `Config.fromInline(data)` | Load from inline data | `Config` |
 
-#### Example
+#### Methods
 
-```javascript
-import { ConfigLoader } from 'brainos';
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `discover()` | Auto-discover config | `Config` |
+| `file(path)` | Add config file | `Config` |
+| `directory(path)` | Add config directory | `Config` |
+| `inline(data)` | Add inline config | `Config` |
+| `reset()` | Reset configuration | `Config` |
+| `load()` | Load configuration | `Config` |
+| `reload()` | Reload configuration | `Config` |
+| `get(key, default)` | Get nested value | `any` |
+| `isLoaded()` | Check if loaded | `boolean` |
+| `toJSON()` | Get config object | `object` |
 
-const loader = new ConfigLoader();
-loader.discover();
-loader.addFile('/path/to/config.toml');
-loader.addInline({ key: 'value' });
+#### Properties
 
-const config = JSON.parse(loader.loadSync());
-console.log(config);
-```
+| Property | Type | Description |
+|----------|------|-------------|
+| `globalModel` | `object` | Global model config |
+| `model` | `string` | Model name |
+| `baseUrl` | `string` | Base URL |
+| `apiKey` | `string` | API key |
+| `bus` | `object` | Bus config |
 
 ---
 
 ## McpClient
 
-MCP (Model Context Protocol) client for connecting to external tools and services.
-
-### Static Factory Methods
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `McpClient.spawn(command, args)` | Spawn an MCP server process | `Promise<McpClient>` |
-| `McpClient.connectHttp(url)` | Connect via HTTP URL | `McpClient` |
-
-### Methods
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `initialize()` | Initialize MCP connection | `Promise<void>` |
-| `listTools()` | List available tools | `Promise<Array>` |
-| `callTool(name, argsJson)` | Call a tool with JSON args | `Promise<string>` |
-| `listPrompts()` | List available prompts | `Promise<Array>` |
-| `listResources()` | List available resources | `Promise<Array>` |
-| `readResource(uri)` | Read a resource by URI | `Promise<string>` |
-
-#### Example
-
 ```javascript
 import { McpClient } from 'brainos';
 
-async function main() {
-  // Spawn an MCP server process
-  const client = await McpClient.spawn('npx', ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']);
-  await client.initialize();
+// Process-based
+const client = await McpClient.spawn('npx', ['-y', 'server-filesystem', '/tmp']);
+await client.initialize();
 
-  // List available tools
-  const tools = await client.listTools();
-  console.log('Available tools:', tools);
-
-  // Call a tool
-  const result = await client.callTool('read_file', JSON.stringify({ path: '/tmp/test.txt' }));
-  console.log(result);
-
-  // List resources
-  const resources = await client.listResources();
-  console.log(resources);
-
-  // Read a resource
-  const resource = await client.readResource('resource://file:///tmp/test.txt');
-  console.log(resource);
-}
-
-main().catch(console.error);
+// HTTP
+const client = McpClient.connectHttp('http://127.0.0.1:8000/mcp');
+await client.initialize();
 ```
+
+#### Static Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `McpClient.spawn(command, args)` | Spawn MCP server | `Promise<McpClient>` |
+| `McpClient.connectHttp(url)` | Connect via HTTP | `McpClient` |
+
+#### Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `initialize()` | Initialize connection | `Promise<void>` |
+| `listTools()` | List available tools | `Promise<Array>` |
+| `callTool(name, argsJson)` | Call a tool | `Promise<string>` |
+| `listPrompts()` | List prompts | `Promise<Array>` |
+| `listResources()` | List resources | `Promise<Array>` |
+| `readResource(uri)` | Read resource by URI | `Promise<string>` |
 
 ---
 
-## Hook Events
+## Hooks
 
-BrainOS supports hooks to intercept and react to events during agent execution.
-
-### Hook Events
+#### HookEvent
 
 | Event | Description |
 |-------|-------------|
-| `BeforeToolCall` | Fired before a tool is called |
-| `AfterToolCall` | Fired after a tool completes |
-| `BeforeLlmCall` | Fired before LLM API call |
-| `AfterLlmCall` | Fired after LLM API call |
-| `OnMessage` | Fired for each message |
-| `OnComplete` | Fired when agent completes |
-| `OnError` | Fired when an error occurs |
+| `BeforeToolCall` | Before tool execution |
+| `AfterToolCall` | After tool execution |
+| `BeforeLlmCall` | Before LLM API call |
+| `AfterLlmCall` | After LLM API call |
+| `OnMessage` | For each message |
+| `OnComplete` | When agent completes |
+| `OnError` | When error occurs |
 
-### Hook Decisions
+#### Hook Decisions
 
-Return a string to control execution:
+Return a string from hook callback:
 
 | Decision | Description |
 |----------|-------------|
-| `'continue'` | Proceed normally (default) |
-| `'abort'` | Abort current operation |
-| `'error:message'` | Return an error with message |
+| `'continue'` | Proceed normally |
+| `'abort'` | Abort operation |
+| `'error:message'` | Return error with message |
 
 #### Example
 
 ```javascript
 import { BrainOS, HookEvent } from 'brainos';
 
-const brain = new BrainOS({ apiKey: 'sk-...' });
-await brain.start();
+const brain = await BrainOS.create();
 
-// Register hooks
 brain.agent('assistant')
-  .onHook(HookEvent.BeforeToolCall, (ctx) => {
+  .hook(HookEvent.BeforeToolCall, (ctx) => {
     console.log('[BeforeToolCall]', ctx.data.tool_name);
-    return 'continue';  // proceed normally
+    return 'continue';
   })
-  .onHook(HookEvent.AfterToolCall, (ctx) => {
+  .hook(HookEvent.AfterToolCall, (ctx) => {
     console.log('[AfterToolCall]', ctx.data.tool_name);
     return 'continue';
-  })
-  .onHook(HookEvent.BeforeLlmCall, (ctx) => {
-    console.log('[BeforeLlmCall] Starting LLM call');
-    return 'continue';
-  })
-  .onHook(HookEvent.AfterLlmCall, (ctx) => {
-    console.log('[AfterLlmCall] LLM call completed');
-    return 'continue';
-  })
-  .onHook(HookEvent.OnError, (ctx) => {
-    console.log('[OnError]', ctx.data.error);
-    return 'continue';
   });
-
-await brain.stop();
 ```
+
+---
+
+## Token Usage
+
+#### TokenUsage
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `promptTokens` | `number` | Prompt token count |
+| `completionTokens` | `number` | Completion token count |
+| `totalTokens` | `number` | Total token count |
+
+#### TokenBudgetReport
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `status` | `BudgetStatus` | Budget status |
+| `usagePercentage` | `number` | Usage percentage |
+| `tokenUsage` | `TokenUsage` | Current usage |
+
+#### BudgetStatus
+
+| Status | Description |
+|--------|-------------|
+| `Normal` | Within budget |
+| `Warning` | Approaching limit |
+| `Exceeded` | Over budget |
+| `Critical` | Critically over budget |
+
+---
+
+## Best Practices
+
+- Use `BrainOS.create()` for one-line initialization
+- Use `AgentBuilder` fluent API for agent configuration
+- Use `ToolDef` or `@tool` decorator for tool definitions
+- Register global tools via `brain.registerGlobal()` for reuse across agents
+- Use `Config.load()` for environment-specific configuration
+- Keep one `BusManager` instance per process
+- Use `session.saveFull()` / `session.restoreFull()` for conversation persistence
+- Use `streamCollect()` for simple token collection without manual iteration
