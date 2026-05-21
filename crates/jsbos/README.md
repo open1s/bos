@@ -1,4 +1,4 @@
-# @open1s/jsbos — v2.2.4
+# @open1s/jsbos — v2.2.5
 
 > BrainOS JavaScript/Node.js bindings — AI agent framework with ReAct engine
 
