@@ -143,37 +143,52 @@ impl AgentHook for PythonHook {
             data: context.data.clone(),
         };
         let py_event: PyHookEvent = event.into();
+        let callback = self.callback.clone();
+
+        let result = Python::attach(|py| {
+            callback.call1(py, (py_event, py_hook_context))
+        });
+
+        let result = match result {
+            Ok(val) => val,
+            Err(_) => return InnerDecision::Continue,
+        };
+
+        let is_coroutine = Python::attach(|py| result.bind(py).hasattr("__await__"))
+            .unwrap_or(false);
+
+        let final_result = if is_coroutine {
+            match crate::utils::await_python_coroutine(result).await {
+                Ok(v) => v,
+                Err(_) => return InnerDecision::Continue,
+            }
+        } else {
+            result
+        };
 
         Python::attach(|py| {
-            let callback = self.callback.clone();
-            let result = callback.call1(py, (py_event, py_hook_context));
-
-            match result {
-                Ok(val) => {
-                    if let Ok(decision) = val.extract::<PyHookDecision>(py) {
-                        match decision.0.as_str() {
-                            "Continue" => InnerDecision::Continue,
-                            "Abort" => InnerDecision::Abort,
-                            "Error" => InnerDecision::Error(decision.1.clone().unwrap_or_default()),
-                            _ => InnerDecision::Continue,
-                        }
-                    } else if let Ok(decision_str) = val.extract::<String>(py) {
-                        match decision_str.as_str() {
-                            "Continue" => InnerDecision::Continue,
-                            "Abort" => InnerDecision::Abort,
-                            _ if decision_str.starts_with("Error(") => {
-                                let msg = decision_str
-                                    .trim_start_matches("Error(")
-                                    .trim_end_matches(')');
-                                InnerDecision::Error(msg.to_string())
-                            }
-                            _ => InnerDecision::Continue,
-                        }
-                    } else {
-                        InnerDecision::Continue
-                    }
+            let val = final_result.bind(py);
+            if let Ok(decision) = val.extract::<PyHookDecision>() {
+                match decision.0.as_str() {
+                    "Continue" => InnerDecision::Continue,
+                    "Abort" => InnerDecision::Abort,
+                    "Error" => InnerDecision::Error(decision.1.clone().unwrap_or_default()),
+                    _ => InnerDecision::Continue,
                 }
-                Err(_) => InnerDecision::Continue,
+            } else if let Ok(decision_str) = val.extract::<String>() {
+                match decision_str.as_str() {
+                    "Continue" => InnerDecision::Continue,
+                    "Abort" => InnerDecision::Abort,
+                    _ if decision_str.starts_with("Error(") => {
+                        let msg = decision_str
+                            .trim_start_matches("Error(")
+                            .trim_end_matches(')');
+                        InnerDecision::Error(msg.to_string())
+                    }
+                    _ => InnerDecision::Continue,
+                }
+            } else {
+                InnerDecision::Continue
             }
         })
     }

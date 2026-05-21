@@ -16,18 +16,56 @@ pub async fn session_from_bus(inner: Arc<tokio::sync::Mutex<Bus>>) -> Arc<bus::S
     bus_copy.session()
 }
 
+/// Call a Python callback, check if it returns a coroutine, and await it if so.
+/// Returns the final result as a Py<PyAny>.
+pub async fn call_python_callback_maybe_async(
+    callback: &Py<PyAny>,
+    arg: Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let (result, is_coroutine) = Python::attach(|py| -> PyResult<(Py<PyAny>, bool)> {
+        let result = callback.bind(py).call1((arg.bind(py),))?;
+        let is_coroutine = result.hasattr("__await__").unwrap_or(false);
+        Ok((result.unbind(), is_coroutine))
+    })?;
+
+    if is_coroutine {
+        await_python_coroutine(result).await
+    } else {
+        Ok(result)
+    }
+}
+
+/// Await a Python coroutine by running it with asyncio.run() on a blocking thread.
+/// This avoids holding the GIL while the event loop runs, preventing deadlocks.
+pub async fn await_python_coroutine(coroutine: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    tokio::task::spawn_blocking(move || {
+        // On a separate std thread, we can safely acquire the GIL and run the coroutine
+        Python::attach(|py| {
+            let asyncio = py.import("asyncio")?;
+            let result = asyncio.call_method1("run", (coroutine.bind(py),))?;
+            Ok::<_, PyErr>(result.unbind())
+        })
+    })
+    .await
+    .map_err(|e: tokio::task::JoinError| PyRuntimeError::new_err(e.to_string()))?
+}
+
+/// Check if a Python object is a coroutine (awaitable).
+pub fn is_coroutine(obj: &Py<PyAny>) -> bool {
+    Python::attach(|py| {
+        let bound = obj.bind(py);
+        // Check for __await__ attribute (coroutine protocol)
+        bound.hasattr("__await__").unwrap_or(false)
+    })
+}
+
 pub async fn invoke_python_handler_to_pyany(
     callback: &Py<PyAny>,
     arg: Py<PyAny>,
 ) -> Result<Py<PyAny>, bus::ZenohError> {
-    // Call the Python callback (sync for now)
-    let result: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
-        let raw_out = callback.bind(py).call1((arg.as_ref(),))?;
-        raw_out.into_py_any(py)
-    })
-    .map_err(|e: PyErr| bus::ZenohError::Query(e.to_string()))?;
-
-    Ok(result)
+    call_python_callback_maybe_async(callback, arg)
+        .await
+        .map_err(|e: PyErr| bus::ZenohError::Query(e.to_string()))
 }
 
 pub async fn invoke_python_string_handler(

@@ -5,6 +5,7 @@ use agent::agent::plugin::{
 };
 use async_trait::async_trait;
 use pyo3::prelude::*;
+use pyo3::IntoPyObjectExt;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
 use std::sync::Arc;
 
@@ -248,6 +249,29 @@ struct PythonPlugin {
     on_tool_result: Option<Arc<Py<PyAny>>>,
 }
 
+/// Helper: call callback, await if coroutine, return Option<T>
+async fn call_plugin_callback<T, F>(
+    callback: &Py<PyAny>,
+    py_arg: impl FnOnce(Python<'_>) -> PyResult<Py<PyAny>>,
+    extract: F,
+) -> Option<T>
+where
+    F: Fn(&Bound<'_, PyAny>) -> Option<T>,
+{
+    let result = Python::attach(|py| callback.call1(py, (py_arg(py)?,))).ok()?;
+
+    let is_coroutine = Python::attach(|py| result.bind(py).hasattr("__await__"))
+        .unwrap_or(false);
+
+    let final_result = if is_coroutine {
+        crate::utils::await_python_coroutine(result).await.ok()?
+    } else {
+        result
+    };
+
+    Python::attach(|py| extract(final_result.bind(py)))
+}
+
 #[async_trait]
 impl InnerPlugin for PythonPlugin {
     fn name(&self) -> &str {
@@ -256,72 +280,80 @@ impl InnerPlugin for PythonPlugin {
 
     async fn on_llm_request(&self, request: InnerLlmRequest) -> Option<InnerLlmRequest> {
         let callback = self.on_llm_request.as_ref()?;
-        let py_request = PyLlmRequestWrapper::from(&request);
-        Python::attach(|py| -> Option<InnerLlmRequest> {
-            let result = callback.call1(py, (py_request,));
-            match result {
-                Ok(val) if val.is_none(py) => None,
-                Ok(val) => {
-                    val.extract::<PyLlmRequestWrapper>(py)
-                        .ok()
-                        .map(|wrapped| InnerLlmRequest {
-                            model: wrapped.model,
-                            input: wrapped.input,
-                            temperature: wrapped.temperature,
-                            max_tokens: wrapped.max_tokens,
-                            top_p: wrapped.top_p,
-                            top_k: wrapped.top_k,
-                            metadata: request.metadata.clone(),
-                        })
+        let request_clone = request.clone();
+
+        call_plugin_callback(
+            callback,
+            |py| Ok(PyLlmRequestWrapper::from(&request_clone).into_py_any(py)?),
+            |val| {
+                if val.is_none() {
+                    return None;
                 }
-                Err(_) => None,
-            }
-        })
+                val.extract::<PyLlmRequestWrapper>()
+                    .ok()
+                    .map(|wrapped| InnerLlmRequest {
+                        model: wrapped.model,
+                        input: wrapped.input,
+                        temperature: wrapped.temperature,
+                        max_tokens: wrapped.max_tokens,
+                        top_p: wrapped.top_p,
+                        top_k: wrapped.top_k,
+                        metadata: request.metadata.clone(),
+                    })
+            },
+        )
+        .await
     }
 
     async fn on_llm_response(&self, response: InnerLlmResponse) -> Option<InnerLlmResponse> {
         let callback = self.on_llm_response.as_ref()?;
-        let py_response = PyLlmResponseWrapper::from(&response);
-        Python::attach(|py| -> Option<InnerLlmResponse> {
-            let result = callback.call1(py, (py_response,));
-            match result {
-                Ok(val) if val.is_none(py) => None,
-                Ok(val) => val
-                    .extract::<PyLlmResponseWrapper>(py)
-                    .ok()
-                    .map(|r| r.into()),
-                Err(_) => None,
-            }
-        })
+        let response_clone = response.clone();
+
+        call_plugin_callback(
+            callback,
+            |py| Ok(PyLlmResponseWrapper::from(&response_clone).into_py_any(py)?),
+            |val| {
+                if val.is_none() {
+                    return None;
+                }
+                val.extract::<PyLlmResponseWrapper>().ok().map(|r| r.into())
+            },
+        )
+        .await
     }
 
     async fn on_tool_call(&self, tool_call: InnerToolCall) -> Option<InnerToolCall> {
         let callback = self.on_tool_call.as_ref()?;
-        let py_tool_call = PyToolCallWrapper::from(&tool_call);
-        Python::attach(|py| -> Option<InnerToolCall> {
-            let result = callback.call1(py, (py_tool_call,));
-            match result {
-                Ok(val) if val.is_none(py) => None,
-                Ok(val) => val.extract::<PyToolCallWrapper>(py).ok().map(|r| r.into()),
-                Err(_) => None,
-            }
-        })
+        let tool_call_clone = tool_call.clone();
+
+        call_plugin_callback(
+            callback,
+            |py| Ok(PyToolCallWrapper::from(&tool_call_clone).into_py_any(py)?),
+            |val| {
+                if val.is_none() {
+                    return None;
+                }
+                val.extract::<PyToolCallWrapper>().ok().map(|r| r.into())
+            },
+        )
+        .await
     }
 
     async fn on_tool_result(&self, tool_result: InnerToolResult) -> Option<InnerToolResult> {
         let callback = self.on_tool_result.as_ref()?;
-        let py_tool_result = PyToolResultWrapper::from(&tool_result);
-        Python::attach(|py| -> Option<InnerToolResult> {
-            let result = callback.call1(py, (py_tool_result,));
-            match result {
-                Ok(val) if val.is_none(py) => None,
-                Ok(val) => val
-                    .extract::<PyToolResultWrapper>(py)
-                    .ok()
-                    .map(|r| r.into()),
-                Err(_) => None,
-            }
-        })
+        let tool_result_clone = tool_result.clone();
+
+        call_plugin_callback(
+            callback,
+            |py| Ok(PyToolResultWrapper::from(&tool_result_clone).into_py_any(py)?),
+            |val| {
+                if val.is_none() {
+                    return None;
+                }
+                val.extract::<PyToolResultWrapper>().ok().map(|r| r.into())
+            },
+        )
+        .await
     }
 }
 

@@ -4,12 +4,14 @@ use agent::agent::agentic::LlmProvider;
 use agent::agent::hooks::HookEvent;
 use agent::{
     Agent, AgentCallableServer, AgentConfig, AgentRpcClient, CircuitBreakerConfig, LlmMessage,
-    RateLimiterConfig, StreamToken, Tool,
+    RateLimiterConfig, StreamToken,
 };
+use async_trait::async_trait;
 use futures::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
+use react::tool::registry::AsyncTool;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -197,7 +199,7 @@ impl PyStreamIterator {
     }
 }
 
-/// A Python tool that wraps a Python callback function
+/// A Python tool that wraps a Python callback function (supports both sync and async callbacks)
 #[pyclass(name = "PythonTool", skip_from_py_object)]
 pub struct PyPythonTool {
     name: String,
@@ -232,50 +234,14 @@ impl PyPythonTool {
     fn description(&self) -> &str {
         &self.description
     }
-}
 
-impl Tool for PyPythonTool {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> String {
-        self.description.clone()
-    }
-
-    fn json_schema(&self) -> serde_json::Value {
-        self.schema.clone()
-    }
-
-    fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, react::ToolError> {
-        let arg_json =
-            serde_json::to_string(args).map_err(|e| react::ToolError::Failed(e.to_string()))?;
-
-        Python::attach(|py| -> Result<serde_json::Value, react::ToolError> {
-            let json_mod = py
-                .import("json")
-                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
-            let args_dict = json_mod
-                .call_method1("loads", (arg_json,))
-                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
-            self.callback
-                .call1(py, (args_dict,))
-                .map_err(|e: PyErr| react::ToolError::Failed(e.to_string()))
-                .and_then(|result| {
-                    result
-                        .extract::<String>(py)
-                        .map_err(|e| react::ToolError::Failed(e.to_string()))
-                })
-                .and_then(|result_str| {
-                    serde_json::from_str(&result_str)
-                        .map_err(|e| react::ToolError::Failed(e.to_string()))
-                })
-        })
+    fn schema_json(&self) -> String {
+        serde_json::to_string(&self.schema).unwrap_or_default()
     }
 }
 
-/// A wrapper for PyPythonTool that can be used as a Tool
-/// Caches name/description/schema at construction to avoid Python GIL borrowing in sync trait methods
+/// A wrapper for PyPythonTool that implements AsyncTool
+/// Caches name/description/schema at construction to avoid Python GIL borrowing in trait methods
 struct PyPythonToolWrapper {
     inner: Py<PyPythonTool>,
     name: String,
@@ -283,7 +249,8 @@ struct PyPythonToolWrapper {
     schema: serde_json::Value,
 }
 
-impl Tool for PyPythonToolWrapper {
+#[async_trait]
+impl AsyncTool for PyPythonToolWrapper {
     fn name(&self) -> &str {
         &self.name
     }
@@ -296,26 +263,35 @@ impl Tool for PyPythonToolWrapper {
         self.schema.clone()
     }
 
-    fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, react::ToolError> {
+    async fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, react::ToolError> {
         let args_clone = args.clone();
-        Python::attach(|py| {
+        let result = Python::attach(|py| {
             let inner = self.inner.clone_ref(py);
             let tool = inner.borrow(py);
+            let json_mod = py.import("json")?;
             let arg_json = serde_json::to_string(&args_clone)
-                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
-            let json_mod = py
-                .import("json")
-                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
-            let args_dict = json_mod
-                .call_method1("loads", (arg_json,))
-                .map_err(|e| react::ToolError::Failed(e.to_string()))?;
-            let result = tool
-                .callback
-                .clone_ref(py)
-                .call1(py, (args_dict,))
-                .map_err(|e: PyErr| react::ToolError::Failed(e.to_string()))?;
-            let result_str = result
-                .extract::<String>(py)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let args_dict = json_mod.call_method1("loads", (arg_json,))?;
+            let callback = tool.callback.clone_ref(py);
+            callback.call1(py, (args_dict,))
+        })
+        .map_err(|e: PyErr| react::ToolError::Failed(e.to_string()))?;
+
+        let is_coroutine = Python::attach(|py| result.bind(py).hasattr("__await__"))
+            .unwrap_or(false);
+
+        let final_result = if is_coroutine {
+            crate::utils::await_python_coroutine(result)
+                .await
+                .map_err(|e| react::ToolError::Failed(e.to_string()))?
+        } else {
+            result
+        };
+
+        Python::attach(|py| {
+            let result_str = final_result
+                .bind(py)
+                .extract::<String>()
                 .map_err(|e| react::ToolError::Failed(e.to_string()))?;
             serde_json::from_str(&result_str).map_err(|e| react::ToolError::Failed(e.to_string()))
         })
@@ -997,13 +973,14 @@ impl PyAgent {
         let py_tool = tool.borrow(py);
         let tool_name = py_tool.name().to_string();
         let tool_description = py_tool.description().to_string();
-        let tool_schema = py_tool.json_schema();
+        let tool_schema = py_tool.schema_json();
+        let tool_schema: serde_json::Value = serde_json::from_str(&tool_schema).unwrap_or(serde_json::Value::Null);
         drop(py_tool);
 
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         let tool_name_for_return = tool_name.clone();
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let tool_box: Arc<dyn Tool> = Arc::new(PyPythonToolWrapper {
+            let tool_box: Arc<dyn AsyncTool> = Arc::new(PyPythonToolWrapper {
                 inner: tool,
                 name: tool_name,
                 description: tool_description,
@@ -1013,7 +990,9 @@ impl PyAgent {
             let mut guard = agent
                 .lock()
                 .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-            guard.add_tool(tool_box);
+            guard
+                .try_add_async_tool(tool_box)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             Ok(tool_name_for_return)
         })
     }
