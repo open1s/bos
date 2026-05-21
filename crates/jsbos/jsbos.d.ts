@@ -14,6 +14,7 @@ export declare class Agent {
   react(task: string): Promise<string>
   config(): any
   listTools(): Array<string>
+  listAsyncTools(): Array<string>
   registerHook(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => any)): void
   registerPlugin(name: string, onLlmRequest?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onLlmResponse?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolCall?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolResult?: (((err: Error | null, arg: JSAny) => any)) | undefined | null): void
   close(): void

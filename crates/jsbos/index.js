@@ -609,7 +609,11 @@ class AgentBuilder {
     this._inner = await jsbos.Agent.create(this._config);
 
     for (const td of this._tools.listToolDefs()) {
-      await this._inner.addTool(td.name, td.description, JSON.stringify(td.parameters), JSON.stringify(td.schema), (err, args) => td.callback(args));
+      const callbackWrapper = async (err, args) => {
+        const result = await td.callback(args);
+        return result;
+      };
+      await this._inner.addTool(td.name, td.description, JSON.stringify(td.parameters), JSON.stringify(td.schema), callbackWrapper);
     }
 
     if (this._config._bashTool) {

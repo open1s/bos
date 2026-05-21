@@ -12,6 +12,7 @@ export declare class Agent {
   react(task: string): Promise<string>
   config(): any
   listTools(): Array<string>
+  listAsyncTools(): Array<string>
   registerHook(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => any)): void
   registerPlugin(name: string, onLlmRequest?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onLlmResponse?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolCall?: (((err: Error | null, arg: JSAny) => any)) | undefined | null, onToolResult?: (((err: Error | null, arg: JSAny) => any)) | undefined | null): void
   close(): void
@@ -370,6 +371,7 @@ export class AgentBuilder {
     mcpHttp(namespace: any, url: any): this;
     start(): Promise<this>;
     ask(prompt: any): Promise<string>;
+    runSimple(prompt: any): Promise<string>;
     react(task: any): Promise<string>;
     stream(task: any, onToken: any): Promise<string>;
     streamCollect(task: any): Promise<any[]>;

@@ -957,6 +957,23 @@ impl Agent {
         Ok(())
     }
 
+    /// Register an async tool and return explicit error on failure.
+    pub fn try_add_async_tool(
+        &mut self,
+        tool: Arc<dyn react::tool::registry::AsyncTool>,
+    ) -> Result<(), crate::ToolError> {
+        if let Some(ref mut reg) = self.registry {
+            Arc::make_mut(reg).register_async(tool)?;
+        } else {
+            let mut reg = ToolRegistry::new();
+            reg.register_async(tool)?;
+            self.registry = Some(Arc::new(reg));
+        }
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        Ok(())
+    }
+
     /// Get skills schemas for LLM.
     pub fn get_skills_schemas(&self) -> Vec<serde_json::Value> {
         self.skills

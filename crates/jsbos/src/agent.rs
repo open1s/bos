@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::Unknown;
 use napi_derive::napi;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use tokio::sync::Mutex;
 use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
 use agent::BashTool;
+use react::tool::registry::AsyncTool;
 use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
 
 struct JSTool {
@@ -21,7 +23,7 @@ struct JSTool {
 }
 
 #[async_trait]
-impl agent::Tool for JSTool {
+impl AsyncTool for JSTool {
   fn name(&self) -> &str {
     &self.name
   }
@@ -34,39 +36,62 @@ impl agent::Tool for JSTool {
     self.schema.clone()
   }
 
-  fn run(
+  async fn run(
     &self,
     args: &serde_json::Value,
   ) -> std::result::Result<serde_json::Value, react::ToolError> {
     let args_json = args.clone();
     let callback = self.callback.clone();
 
-    let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<serde_json::Value, String>>();
-    let tx_clone = tx.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<serde_json::Value, String>>();
 
-    callback.call_with_return_value(
-      Ok(JSAny(args_json)),
-      ThreadsafeFunctionCallMode::NonBlocking,
-      move |result: std::result::Result<napi::Unknown<'_>, napi::Error>,
-            _env|
-            -> napi::Result<()> {
-        match result {
-          Ok(val) => {
-            let utf8 = val.coerce_to_string()?.into_utf8()?;
-            let string_val = utf8.as_str()?;
-            let json_val: serde_json::Value =
-              serde_json::from_str(string_val).unwrap_or_else(|_| serde_json::json!(string_val));
-            let _ = tx_clone.send(Ok(json_val));
+    tokio::task::spawn_blocking(move || {
+      callback.call_with_return_value(
+        Ok(JSAny(args_json)),
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |result: std::result::Result<Unknown<'_>, napi::Error>,
+              env|
+              -> napi::Result<()> {
+          match result {
+            Ok(val) => {
+              let is_promise = val.is_promise().unwrap_or(false);
+              if is_promise {
+                let raw_env = env.raw();
+                let raw_val = val.value().value;
+                let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
+                let tx_inner = Arc::new(Mutex::new(Some(tx)));
+                let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
+                  let string_val = ctx.value.coerce_to_string()
+                    .and_then(|s| s.into_utf8())
+                    .and_then(|u| u.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|e| format!("Error: {}", e));
+                  let json_val: serde_json::Value =
+                    serde_json::from_str(&string_val).unwrap_or_else(|_| serde_json::json!(string_val));
+                  if let Some(tx) = tx_inner.blocking_lock().take() {
+                    let _ = tx.send(Ok(json_val));
+                  }
+                  Ok(())
+                });
+              } else {
+                let string_val = val.coerce_to_string()
+                  .and_then(|s| s.into_utf8())
+                  .and_then(|u| u.as_str().map(|s| s.to_string()))
+                  .unwrap_or_else(|e| format!("Error: {}", e));
+                let json_val: serde_json::Value =
+                  serde_json::from_str(&string_val).unwrap_or_else(|_| serde_json::json!(string_val));
+                let _ = tx.send(Ok(json_val));
+              }
+            }
+            Err(e) => {
+              let _ = tx.send(Err(e.to_string()));
+            }
           }
-          Err(e) => {
-            let _ = tx_clone.send(Err(e.to_string()));
-          }
-        }
-        Ok(())
-      },
-    );
+          Ok(())
+        },
+      );
+    });
 
-    match rx.recv() {
+    match rx.await {
       Ok(Ok(result)) => std::result::Result::Ok(result),
       Ok(Err(e)) => std::result::Result::Err(react::ToolError::Failed(e.to_string())),
       Err(_) => std::result::Result::Err(react::ToolError::Failed(
@@ -354,6 +379,16 @@ impl Agent {
   }
 
   #[napi]
+  pub fn list_async_tools(&self) -> Result<Vec<String>> {
+    let guard = self.inner.blocking_lock();
+    if let Some(registry) = guard.registry() {
+      Ok(registry.async_tool_names())
+    } else {
+      Ok(Vec::new())
+    }
+  }
+
+  #[napi]
   pub fn register_hook(
     &self,
     event: HookEvent,
@@ -450,7 +485,7 @@ impl Agent {
     };
     let mut guard = self.inner.lock().await;
     guard
-      .try_add_tool(std::sync::Arc::new(tool))
+      .try_add_async_tool(std::sync::Arc::new(tool))
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
     Ok(name)
   }
@@ -867,5 +902,60 @@ impl AgentCallableServer {
   #[napi]
   pub fn is_started(&self) -> bool {
     true
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use agent::tools::registry::ToolRegistry;
+
+  struct MockAsyncTool {
+    name: String,
+    description: String,
+  }
+
+  #[async_trait]
+  impl AsyncTool for MockAsyncTool {
+    fn name(&self) -> &str {
+      &self.name
+    }
+
+    fn description(&self) -> String {
+      self.description.clone()
+    }
+
+    async fn run(
+      &self,
+      _args: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, react::ToolError> {
+      Ok(serde_json::json!({ "result": "async_executed" }))
+    }
+  }
+
+  #[tokio::test]
+  async fn test_async_tool_registration() {
+    let mut registry = ToolRegistry::new();
+    let tool = Arc::new(MockAsyncTool {
+      name: "test_async".to_string(),
+      description: "Test async tool".to_string(),
+    });
+    registry.register_async(tool).unwrap();
+
+    assert!(registry.async_tool_names().contains(&"test_async".to_string()));
+    assert_eq!(registry.list().len(), 1);
+  }
+
+  #[tokio::test]
+  async fn test_async_tool_execution() {
+    let mut registry = ToolRegistry::new();
+    let tool = Arc::new(MockAsyncTool {
+      name: "test_exec".to_string(),
+      description: "Test execution".to_string(),
+    });
+    registry.register_async(tool).unwrap();
+
+    let result = registry.execute("test_exec", &serde_json::json!({})).unwrap();
+    assert_eq!(result["result"], "async_executed");
   }
 }
