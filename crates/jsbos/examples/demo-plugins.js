@@ -42,7 +42,7 @@ async function main() {
       return JSON.stringify(request)
     },
     (err, response) => {
-      console.log(`  [Plugin:on_llm_response] type=${response.type}, content=${response.content || '(none)'}`)
+      console.log(`  [Plugin:on_llm_response] type=${response.response_type}, content=${response.content || '(none)'}`)
       return JSON.stringify(response)
     },
     (err, toolCall) => {

@@ -351,13 +351,13 @@ impl AgentPlugin for JSPlugin {
 
     let input = if let Some(ref tc) = tool_calls {
       serde_json::json!({
-          "type": "ToolCall",
+          "response_type": "ToolCall",
           "name": tc.first().and_then(|t| t.function.name.clone()).unwrap_or_default(),
           "args": tc.first().and_then(|t| t.function.arguments.clone()).unwrap_or_default(),
           "id": tc.first().map(|t| t.id.clone())
       })
     } else {
-      serde_json::json!({"type": "Text", "content": content})
+      serde_json::json!({"response_type": "Text", "content": content})
     };
 
     let result = match Self::call_js_callback(callback, input).await {

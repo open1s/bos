@@ -146,11 +146,12 @@ async function main() {
     },
     async (err, response) => {
       if (err) return JSON.stringify(response)
-      const respType = response.response_type || response.type || 'Text'
+      const respType = response.response_type || 'Text'
       console.log(`  ⏳ [Async Plugin:on_llm_response] Analyzing response type=${respType}`)
-      await analyzeResponse(response)
+      const analyzed = await analyzeResponse(response)
       console.log(`  ✅ Analyzed with sentiment: positive`)
-      return JSON.stringify(response)
+      // Return modified response (plugin can modify content)
+      return JSON.stringify(analyzed)
     },
     null,
     null,
