@@ -186,7 +186,7 @@ Session management for an agent.
 
 ## ToolDef
 
-Tool definition class for creating tools.
+Tool definition class for creating tools. Supports both sync and async callbacks (auto-detected via `isPromise`).
 
 #### Constructor
 
@@ -197,17 +197,34 @@ new ToolDef(name, description, callback, parameters = {}, schema = {})
 Parameters:
 - `name` (string): Tool name
 - `description` (string): Tool description
-- `callback` (Function): `(args) => result`
+- `callback` (Function): `(args) => result` — can be sync or return a Promise
 - `parameters` (object): Parameter definitions
 - `schema` (object): JSON Schema
 
-#### Example
+#### Example - Sync Tool
 
 ```javascript
 const weatherTool = new ToolDef(
   'get_weather',
   'Get weather for a city',
   (args) => JSON.stringify({ city: args.city, temp: 22 }),
+  { city: { type: 'string' } },
+  { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] }
+);
+```
+
+#### Example - Async Tool (Promise)
+
+Async callbacks are automatically detected and awaited.
+
+```javascript
+const asyncWeatherTool = new ToolDef(
+  'get_weather_async',
+  'Get weather from async API',
+  async (args) => {
+    const response = await fetch(`/api/weather?city=${args.city}`);
+    return JSON.stringify(await response.json());
+  },
   { city: { type: 'string' } },
   { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] }
 );
@@ -535,6 +552,8 @@ await client.initialize();
 
 ## Hooks
 
+Hooks support both sync and async callbacks (auto-detected). Register multiple hooks for the same event.
+
 #### HookEvent
 
 | Event | Description |
@@ -557,7 +576,7 @@ Return a string from hook callback:
 | `'abort'` | Abort operation |
 | `'error:message'` | Return error with message |
 
-#### Example
+#### Example - Sync Hook
 
 ```javascript
 import { BrainOS, HookEvent } from 'brainos';
@@ -573,6 +592,31 @@ brain.agent('assistant')
     console.log('[AfterToolCall]', ctx.data.tool_name);
     return 'continue';
   });
+```
+
+#### Example - Async Hook
+
+Async hooks are automatically detected and awaited.
+
+```javascript
+const asyncBeforeLlmHook = async (ctx) => {
+  console.log('[Async Hook:BeforeLlmCall] Checking rate limit...');
+  await new Promise(r => setTimeout(r, 10));  // Simulate async check
+  console.log('[Async Hook:BeforeLlmCall] Rate limit passed');
+  return 'continue';
+};
+
+const asyncAfterLlmHook = async (ctx) => {
+  console.log('[Async Hook:AfterLlmCall] Logging response...');
+  await new Promise(r => setTimeout(r, 10));  // Simulate async logging
+  console.log('[Async Hook:AfterLlmCall] Response logged');
+  return 'continue';
+};
+
+brain.agent('assistant').with_hooks({
+  [HookEvent.BeforeLlmCall]: asyncBeforeLlmHook,
+  [HookEvent.AfterLlmCall]: asyncAfterLlmHook,
+});
 ```
 
 ---
@@ -611,8 +655,11 @@ brain.agent('assistant')
 - Use `BrainOS.create()` for one-line initialization
 - Use `AgentBuilder` fluent API for agent configuration
 - Use `ToolDef` or `@tool` decorator for tool definitions
+- Both sync and async callbacks are supported — use async for I/O-bound operations (API calls, database queries)
+- Async callbacks are auto-detected via `isPromise()` — no special registration needed
 - Register global tools via `brain.registerGlobal()` for reuse across agents
 - Use `Config.load()` for environment-specific configuration
+- Hooks can also be async — use for rate limiting, logging, request/response enrichment
 - Keep one `BusManager` instance per process
 - Use `session.saveFull()` / `session.restoreFull()` for conversation persistence
 - Use `streamCollect()` for simple token collection without manual iteration

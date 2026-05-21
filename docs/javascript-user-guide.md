@@ -221,6 +221,45 @@ async function main() {
 main().catch(console.error);
 ```
 
+### Async Hook
+
+Hooks can also be async — automatically detected and awaited:
+
+```javascript
+import { BrainOS, HookEvent } from '@open1s/jsbos';
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+
+  const asyncRateLimitHook = async (event, ctx) => {
+    await new Promise(r => setTimeout(r, 10));  // Simulate async check
+    console.log(`[Async Hook:${event}] Rate limit check passed`);
+    return 'continue';
+  };
+
+  const asyncLoggingHook = async (event, ctx) => {
+    await new Promise(r => setTimeout(r, 10));  // Simulate async logging
+    console.log(`[Async Hook:${event}] Response logged`);
+    return 'continue';
+  };
+
+  const agent = await brain.agent('assistant')
+    .with_hooks({
+      [HookEvent.BeforeLlmCall]: asyncRateLimitHook,
+      [HookEvent.AfterLlmCall]: asyncLoggingHook,
+    })
+    .start();
+
+  const result = await agent.runSimple('What is 2+2?');
+  console.log(result);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
 ### Using Hooks with Raw Agent (Low-level API)
 
 ```javascript
@@ -324,6 +363,29 @@ const addTool = new ToolDef(
 
 // Register with agent
 agent.register(addTool);
+```
+
+### Async Tool
+
+Tools can return Promises — automatically detected and awaited:
+
+```javascript
+import { ToolDef } from '@open1s/jsbos';
+
+const fetchWeatherTool = new ToolDef(
+  'fetch_weather',
+  'Fetch weather from async API',
+  async (args) => {
+    const response = await fetch(`/api/weather?city=${args.city}`);
+    const data = await response.json();
+    return JSON.stringify(data);
+  },
+  { city: { type: 'string' } },
+  { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] }
+);
+
+// Register with agent
+agent.register(fetchWeatherTool);
 ```
 
 ### Tool with JSON Schema
@@ -1114,6 +1176,45 @@ async function main() {
         return result;
       }
     })
+    .start();
+
+  const result = await agent.runSimple('Hello');
+  console.log(result);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+#### Async Plugin
+
+Plugins can also be async — automatically detected and awaited:
+
+```javascript
+import { BrainOS } from '@open1s/jsbos';
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+
+  const asyncPlugin = {
+    name: 'AsyncEnricher',
+    onLlmRequest: async (req) => {
+      await new Promise(r => setTimeout(r, 10));  // Simulate async enrichment
+      console.log('[Async Plugin] LLM Request:', req.model);
+      req.temperature = 0.7;
+      return req;
+    },
+    onLlmResponse: async (resp) => {
+      await new Promise(r => setTimeout(r, 10));  // Simulate async analysis
+      console.log('[Async Plugin] LLM Response:', resp.response_type);
+      return resp;
+    },
+  };
+
+  const agent = await brain.agent('assistant')
+    .plugin(asyncPlugin.name, asyncPlugin)
     .start();
 
   const result = await agent.runSimple('Hello');

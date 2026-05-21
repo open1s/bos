@@ -51,6 +51,7 @@ pub async fn await_python_coroutine(coroutine: Py<PyAny>) -> PyResult<Py<PyAny>>
 }
 
 /// Check if a Python object is a coroutine (awaitable).
+#[allow(dead_code)]
 pub fn is_coroutine(obj: &Py<PyAny>) -> bool {
     Python::attach(|py| {
         let bound = obj.bind(py);

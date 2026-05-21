@@ -1,4 +1,4 @@
-# nbos — v2.2.5
+# nbos — v2.2.6
 
 > Python bindings for BrainOS — AI agent framework with ReAct engine
 

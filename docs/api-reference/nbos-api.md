@@ -201,33 +201,52 @@ Session management for an agent.
 
 #### `@tool(description, *, name=None, schema=None)`
 
-Decorator to create a tool from a function.
+Decorator to create a tool from a function. Supports both sync and async callbacks (auto-detected).
 
 ```python
 from nbos import tool
 
+# Sync tool
 @tool("Add two numbers")
 def add(a: int, b: int) -> int:
     return a + b
 
-@tool("Get weather", name="weather")
-def get_weather(city: str) -> dict:
+# Async tool (automatically detected and awaited)
+@tool("Fetch weather data")
+async def get_weather(city: str) -> dict:
+    import asyncio
+    await asyncio.sleep(0.1)  # Simulate API call
     return {"city": city, "temperature": 22}
 ```
 
 #### ToolDef
 
-Manual tool creation.
+Manual tool creation with async callback support.
 
 ```python
 from nbos import ToolDef
 
+# Sync callback
 multiply = ToolDef(
     name="multiply",
     description="Multiply two numbers",
     callback=lambda args: args["a"] * args["b"],
     parameters={"a": {"type": "number"}, "b": {"type": "number"}},
     schema={"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}},
+)
+
+# Async callback (auto-detected via inspect.iscoroutinefunction)
+async def async_weather_callback(args):
+    import asyncio
+    await asyncio.sleep(0.1)
+    return {"city": args.get("city", "Unknown"), "temp": 68}
+
+weather = ToolDef(
+    name="weather_async",
+    description="Get weather from async API",
+    callback=async_weather_callback,
+    parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+    schema={"type": "object", "properties": {"city": {"type": "string"}}},
 )
 ```
 
@@ -481,6 +500,8 @@ await client.initialize()
 
 ## Hooks
 
+Hooks support both sync and async callbacks (auto-detected).
+
 #### HookEvent
 
 | Event | Description |
@@ -508,7 +529,7 @@ await client.initialize()
 | `agent_id` | `str` | Agent identifier |
 | `data` | `dict[str, str]` | Event data |
 
-#### Example
+#### Example - Sync Hook
 
 ```python
 from nbos import HookEvent, HookDecision
@@ -520,33 +541,75 @@ def my_hook(event, ctx):
 agent = brain.agent("assistant").hook("BeforeToolCall", my_hook)
 ```
 
+#### Example - Async Hook
+
+Async hooks are automatically detected and awaited.
+
+```python
+import asyncio
+
+async def async_rate_limit_hook(event, ctx):
+    await asyncio.sleep(0.01)  # Simulate async check
+    print(f"[Async Hook:{event}] Rate limit check passed")
+    return "Continue"
+
+async def async_logging_hook(event, ctx):
+    await asyncio.sleep(0.01)  # Simulate async logging
+    print(f"[Async Hook:{event}] Logged response")
+    return "Continue"
+
+agent = brain.agent("assistant").with_hooks({
+    "BeforeLlmCall": async_rate_limit_hook,
+    "AfterLlmCall": async_logging_hook,
+})
+```
+
 ---
 
 ## Plugins
 
+Plugins support both sync and async callbacks (auto-detected). They intercept LLM requests/responses and tool calls/results.
+
 #### AgentPlugin
+
+Plugins are registered as dictionaries with handler functions:
 
 ```python
 from nbos import AgentPlugin
 
-plugin = AgentPlugin(
-    name="my-plugin",
-    on_llm_request=handle_request,
-    on_llm_response=handle_response,
-    on_tool_call=handle_tool_call,
-    on_tool_result=handle_tool_result,
-)
-agent._inner.register_plugin(plugin)
+# Sync plugin
+def sync_on_llm_request(request):
+    print(f"[Plugin] LLM Request: model={request.model}")
+    return request
+
+async def async_on_llm_request(request):
+    await asyncio.sleep(0.01)  # Simulate async enrichment
+    print(f"[Async Plugin] LLM Request: model={request.model}")
+    request.temperature = 0.7
+    return request
+
+async def async_on_llm_response(response):
+    await asyncio.sleep(0.01)  # Simulate async analysis
+    print(f"[Async Plugin] LLM Response: type={response.response_type}")
+    return response
+
+# Register as dictionary (supports async handlers)
+plugin = {
+    "name": "AsyncEnricher",
+    "on_llm_request": async_on_llm_request,
+    "on_llm_response": async_on_llm_response,
+}
+agent = brain.agent("assistant").with_plugins(plugin)
 ```
 
 #### Wrapper Classes
 
 | Class | Description |
 |-------|-------------|
-| `LlmRequestWrapper` | LLM request interceptor |
-| `LlmResponseWrapper` | LLM response interceptor |
-| `ToolCallWrapper` | Tool call interceptor |
-| `ToolResultWrapper` | Tool result interceptor |
+| `LlmRequestWrapper` | LLM request interceptor - fields: `model`, `temperature`, `max_tokens`, `top_p`, `top_k`, `input` |
+| `LlmResponseWrapper` | LLM response interceptor - fields: `response_type`, `content`, `tool_name`, `tool_args`, `tool_id` |
+| `ToolCallWrapper` | Tool call interceptor - fields: `name`, `args`, `id` |
+| `ToolResultWrapper` | Tool result interceptor - fields: `result`, `success`, `error` |
 
 ---
 
@@ -624,7 +687,10 @@ await agent._inner.add_tool(tool)
 - Use `async with BrainOS()` for automatic bus lifecycle management
 - Use `AgentBuilder` fluent API for agent configuration
 - Prefer `@tool` decorator for tool definitions
+- Both sync and async callbacks are supported — use async for I/O-bound operations (API calls, database queries)
+- Async callbacks are auto-detected via `inspect.iscoroutinefunction()` — no special registration needed
 - Register global tools via `brain.register_global()` for reuse across agents
 - Use `ConfigLoader.discover()` for environment-specific configuration
 - Keep one `Bus` instance per process
 - Use `session.save_full()` / `session.restore_full()` for conversation persistence
+- Hooks and plugins can also be async — use for rate limiting, logging, request/response enrichment

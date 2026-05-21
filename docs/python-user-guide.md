@@ -223,6 +223,25 @@ tool_def = ToolDef(
 agent.register(tool_def)
 ```
 
+### Async Tool
+
+Tools can be async — auto-detected and awaited automatically:
+
+```python
+from nbos import tool
+
+@tool("Fetch data from API")
+async def fetch_data(endpoint: str) -> dict:
+    import asyncio
+    await asyncio.sleep(0.1)  # Simulate API call
+    return {"endpoint": endpoint, "status": "ok", "data": [1, 2, 3]}
+
+# Usage with agent
+async with BrainOS() as brain:
+    agent = brain.agent("assistant").register(fetch_data)
+    result = await agent.ask("Fetch data from /users endpoint")
+```
+
 ---
 
 ## Bus Communication
@@ -440,6 +459,40 @@ async def main():
 asyncio.run(main())
 ```
 
+#### Async Hook
+
+Hooks can also be async — auto-detected and awaited automatically:
+
+```python
+from nbos import BrainOS, HookEvent, HookDecision, HookContext
+import asyncio
+
+async def async_rate_limit_hook(event: HookEvent, ctx: HookContext) -> str:
+    await asyncio.sleep(0.01)  # Simulate async rate limit check
+    print(f"[Async Hook:{event}] Rate limit check passed")
+    return "continue"
+
+async def async_logging_hook(event: HookEvent, ctx: HookContext) -> str:
+    await asyncio.sleep(0.01)  # Simulate async logging
+    print(f"[Async Hook:{event}] Logged response")
+    return "continue"
+
+async def main():
+    async with BrainOS() as brain:
+        agent = (
+            brain.agent("assistant")
+            .with_hooks({
+                "BeforeLlmCall": async_rate_limit_hook,
+                "AfterLlmCall": async_logging_hook,
+            })
+        )
+        
+        result = await agent.ask("What is 5 + 3?")
+        print(result)
+
+asyncio.run(main())
+```
+
 #### Hook Events
 
 | Event | Description |
@@ -492,6 +545,42 @@ async def main():
             brain.agent("assistant")
             .with_plugins(plugin)
             .start()
+        )
+        
+        result = await agent.ask("Say hello!")
+        print(result)
+
+asyncio.run(main())
+```
+
+#### Async Plugin
+
+Plugins can also be async — auto-detected via `inspect.iscoroutinefunction()`:
+
+```python
+import asyncio
+
+async def main():
+    async def async_on_llm_request(wrapped):
+        await asyncio.sleep(0.01)  # Simulate async enrichment
+        print(f"[Async Plugin] LLM Request: model={wrapped.model}")
+        return wrapped
+
+    async def async_on_llm_response(wrapped):
+        await asyncio.sleep(0.01)  # Simulate async analysis
+        print(f"[Async Plugin] LLM Response: type={wrapped.response_type}")
+        return wrapped
+
+    plugin = {
+        "name": "async-logging-plugin",
+        "on_llm_request": async_on_llm_request,
+        "on_llm_response": async_on_llm_response,
+    }
+
+    async with BrainOS() as brain:
+        agent = (
+            brain.agent("assistant")
+            .with_plugins(plugin)
         )
         
         result = await agent.ask("Say hello!")
