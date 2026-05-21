@@ -6,7 +6,7 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::Unknown;
 use napi_derive::napi;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
 use crate::hooks::{HookContextData, HookEvent, HookRegistry};
@@ -20,6 +20,13 @@ struct JSTool {
   description: String,
   schema: serde_json::Value,
   callback: Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>>>,
+}
+
+fn extract_json_value(val: Unknown<'_>) -> napi::Result<serde_json::Value> {
+  let js_string = val.coerce_to_string()?;
+  let utf8 = js_string.into_utf8()?;
+  let string_val = utf8.as_str()?;
+  Ok(serde_json::from_str(string_val).unwrap_or_else(|_| serde_json::json!(string_val)))
 }
 
 #[async_trait]
@@ -45,51 +52,41 @@ impl AsyncTool for JSTool {
 
     let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<serde_json::Value, String>>();
 
-    tokio::task::spawn_blocking(move || {
-      callback.call_with_return_value(
-        Ok(JSAny(args_json)),
-        ThreadsafeFunctionCallMode::NonBlocking,
-        move |result: std::result::Result<Unknown<'_>, napi::Error>,
-              env|
-              -> napi::Result<()> {
-          match result {
-            Ok(val) => {
-              let is_promise = val.is_promise().unwrap_or(false);
-              if is_promise {
-                let raw_env = env.raw();
-                let raw_val = val.value().value;
-                let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
-                let tx_inner = Arc::new(Mutex::new(Some(tx)));
-                let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
-                  let string_val = ctx.value.coerce_to_string()
-                    .and_then(|s| s.into_utf8())
-                    .and_then(|u| u.as_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|e| format!("Error: {}", e));
-                  let json_val: serde_json::Value =
-                    serde_json::from_str(&string_val).unwrap_or_else(|_| serde_json::json!(string_val));
-                  if let Some(tx) = tx_inner.blocking_lock().take() {
-                    let _ = tx.send(Ok(json_val));
-                  }
-                  Ok(())
-                });
-              } else {
-                let string_val = val.coerce_to_string()
-                  .and_then(|s| s.into_utf8())
-                  .and_then(|u| u.as_str().map(|s| s.to_string()))
-                  .unwrap_or_else(|e| format!("Error: {}", e));
-                let json_val: serde_json::Value =
-                  serde_json::from_str(&string_val).unwrap_or_else(|_| serde_json::json!(string_val));
-                let _ = tx.send(Ok(json_val));
-              }
-            }
-            Err(e) => {
-              let _ = tx.send(Err(e.to_string()));
+    // call_with_return_value already runs on a NAPI worker thread,
+    // so no need for spawn_blocking.
+    callback.call_with_return_value(
+      Ok(JSAny(args_json)),
+      ThreadsafeFunctionCallMode::NonBlocking,
+      move |result: std::result::Result<Unknown<'_>, napi::Error>,
+            env|
+            -> napi::Result<()> {
+        match result {
+          Ok(val) => {
+            let is_promise = val.is_promise().unwrap_or(false);
+            if is_promise {
+              let raw_env = env.raw();
+              let raw_val = val.value().value;
+              let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
+              let tx = Arc::new(StdMutex::new(Some(tx)));
+              let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
+                let json_val = extract_json_value(ctx.value).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+                if let Some(tx) = tx.lock().unwrap().take() {
+                  let _ = tx.send(Ok(json_val));
+                }
+                Ok(())
+              });
+            } else {
+              let json_val = extract_json_value(val).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+              let _ = tx.send(Ok(json_val));
             }
           }
-          Ok(())
-        },
-      );
-    });
+          Err(e) => {
+            let _ = tx.send(Err(e.to_string()));
+          }
+        }
+        Ok(())
+      },
+    );
 
     match rx.await {
       Ok(Ok(result)) => std::result::Result::Ok(result),
