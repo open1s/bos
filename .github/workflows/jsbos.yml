@@ -218,24 +218,10 @@ jobs:
         run: |
           if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$"; then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
-            # Publish platform-specific packages first
-            for pkg in npm/*/; do
-              if [ -f "$pkg/package.json" ]; then
-                echo "Publishing $pkg"
-                npm publish "$pkg" --access public --provenance false
-              fi
-            done
-            # Publish main package (skip prepublishOnly to avoid re-publishing platform packages)
-            npm publish --ignore-scripts --access public --provenance false
+            napi publish
           elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+"; then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
-            for pkg in npm/*/; do
-              if [ -f "$pkg/package.json" ]; then
-                echo "Publishing $pkg"
-                npm publish "$pkg" --tag next --access public --provenance false
-              fi
-            done
-            npm publish --ignore-scripts --tag next --access public --provenance false
+            napi publish --tag next
           else
             echo "Not a release, skipping publish"
           fi
