@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use napi::Unknown;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,6 +68,7 @@ pub enum PluginLlmResponse {
     id: String,
     model: String,
     content: Option<String>,
+    response_type: Option<String>,
   },
 }
 
@@ -80,13 +82,18 @@ pub struct PluginToolCallInfo {
 impl From<PluginLlmResponse> for LlmResponseWrapper {
   fn from(resp: PluginLlmResponse) -> Self {
     match resp {
-      PluginLlmResponse::OpenAI { id, model, content } => {
+      PluginLlmResponse::OpenAI { id, model, content, response_type } => {
+        let has_tool_calls = response_type.as_deref() == Some("ToolCall");
         let choices = vec![Choice {
           index: 0,
           message: ChatMessage {
             role: "assistant".to_string(),
             content: content.clone(),
-            tool_calls: None,
+            tool_calls: if has_tool_calls {
+              Some(vec![])
+            } else {
+              None
+            },
             function_call: None,
             reasoning_content: None,
             extra: serde_json::Value::Object(serde_json::Map::new()),
@@ -115,10 +122,18 @@ impl From<LlmResponseWrapper> for PluginLlmResponse {
     match wrapper {
       LlmResponseWrapper::OpenAI(rsp) => {
         let choice = rsp.choices.first();
+        let content = choice.and_then(|c| c.message.content.clone());
+        let has_tool_calls = choice.and_then(|c| c.message.tool_calls.as_ref()).map(|tc| !tc.is_empty()).unwrap_or(false);
+        let response_type = if has_tool_calls {
+          Some("ToolCall".to_string())
+        } else {
+          Some("Text".to_string())
+        };
         PluginLlmResponse::OpenAI {
           id: rsp.id,
           model: rsp.model,
-          content: choice.and_then(|c| c.message.content.clone()),
+          content,
+          response_type,
         }
       }
     }
@@ -212,45 +227,69 @@ impl JSPlugin {
     }
   }
 
-  fn call_js_callback(
+  async fn call_js_callback(
     callback: &Arc<ThreadsafeFunction<JSAny>>,
     input: serde_json::Value,
   ) -> Option<serde_json::Value> {
-    let (tx, rx) = std::sync::mpsc::channel::<Option<serde_json::Value>>();
-    let tx_clone = tx.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<serde_json::Value>>();
+    let callback = callback.clone();
 
+    // call_with_return_value already runs on a NAPI worker thread
     callback.call_with_return_value(
       Ok(JSAny(input)),
       ThreadsafeFunctionCallMode::NonBlocking,
-      move |result: std::result::Result<napi::Unknown<'_>, napi::Error>,
-            _env|
+      move |result: std::result::Result<Unknown<'_>, napi::Error>,
+            env|
             -> napi::Result<()> {
         match result {
           Ok(val) => {
-            let json_str = val
-              .coerce_to_string()
-              .ok()
-              .and_then(|s| s.into_utf8().ok())
-              .and_then(|s| s.as_str().ok().map(|s| s.to_string()));
-
-            let json_val = json_str.and_then(|s| {
-              if s == "null" || s == "undefined" || s.is_empty() {
-                None
-              } else {
-                serde_json::from_str(&s).ok()
-              }
-            });
-            let _ = tx_clone.send(json_val);
+            let is_promise = val.is_promise().unwrap_or(false);
+            if is_promise {
+              let raw_env = env.raw();
+              let raw_val = val.value().value;
+              let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
+              let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+              let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
+                let json_val = ctx.value.coerce_to_string()
+                  .and_then(|s| s.into_utf8())
+                  .and_then(|u| u.as_str().map(|s| s.to_string()))
+                  .ok()
+                  .and_then(|s| {
+                    if s == "null" || s == "undefined" || s.is_empty() {
+                      None
+                    } else {
+                      serde_json::from_str(&s).ok()
+                    }
+                  });
+                if let Some(tx) = tx.lock().unwrap().take() {
+                  let _ = tx.send(json_val);
+                }
+                Ok(())
+              });
+            } else {
+              let json_val = val.coerce_to_string()
+                .and_then(|s| s.into_utf8())
+                .and_then(|u| u.as_str().map(|s| s.to_string()))
+                .ok()
+                .and_then(|s| {
+                  if s == "null" || s == "undefined" || s.is_empty() {
+                    None
+                  } else {
+                    serde_json::from_str(&s).ok()
+                  }
+                });
+              let _ = tx.send(json_val);
+            }
           }
           Err(_) => {
-            let _ = tx_clone.send(None);
+            let _ = tx.send(None);
           }
         }
         Ok(())
       },
     );
 
-    rx.recv().unwrap_or(None)
+    rx.await.ok().flatten()
   }
 }
 
@@ -277,7 +316,7 @@ impl AgentPlugin for JSPlugin {
         "metadata": request.metadata,
     });
 
-    let result = match Self::call_js_callback(callback, input) {
+    let result = match Self::call_js_callback(callback, input).await {
       Some(r) => r,
       None => return Some(request),
     };
@@ -321,12 +360,12 @@ impl AgentPlugin for JSPlugin {
       serde_json::json!({"type": "Text", "content": content})
     };
 
-    let result = match Self::call_js_callback(callback, input) {
+    let result = match Self::call_js_callback(callback, input).await {
       Some(r) => r,
       None => return Some(response),
     };
 
-    if result.get("type").and_then(|v| v.as_str()).is_some() {
+    if result.get("response_type").and_then(|v| v.as_str()).is_some() {
       let LlmResponseWrapper::OpenAI(mut rsp) = response;
       if let Some(choice) = rsp.choices.first_mut() {
         if let Some(c) = result.get("content").and_then(|v| v.as_str()) {
@@ -364,7 +403,7 @@ impl AgentPlugin for JSPlugin {
         "metadata": tool_call.metadata,
     });
 
-    let result = match Self::call_js_callback(callback, input) {
+    let result = match Self::call_js_callback(callback, input).await {
       Some(r) => r,
       None => return Some(tool_call),
     };
@@ -391,7 +430,7 @@ impl AgentPlugin for JSPlugin {
         "metadata": tool_result.metadata,
     });
 
-    let result = Self::call_js_callback(callback, input)?;
+    let result = Self::call_js_callback(callback, input).await?;
 
     let mut modified = tool_result;
     if let Some(res) = result.get("result") {

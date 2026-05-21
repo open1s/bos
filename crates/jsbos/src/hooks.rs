@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use napi::Unknown;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 
 #[napi]
 pub enum HookEvent {
@@ -60,25 +60,48 @@ impl AgentHook for JSHook {
     };
     let callback = self.callback.clone();
 
-    let (tx, rx) = oneshot::channel::<String>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
 
-    let handle = tokio::runtime::Handle::current();
-    handle.spawn_blocking(move || {
-      callback.call_with_return_value(
-        Ok(ctx_data),
-        ThreadsafeFunctionCallMode::Blocking,
-        move |result: std::result::Result<napi::Unknown<'_>, napi::Error>,
-              _env|
-              -> napi::Result<()> {
-          let decision = match result {
-            Ok(_val) => "continue".to_string(),
-            Err(e) => format!("error:{}", e),
-          };
-          let _ = tx.send(decision);
-          Ok(())
-        },
-      );
-    });
+    // call_with_return_value already runs on a NAPI worker thread
+    callback.call_with_return_value(
+      Ok(ctx_data),
+      ThreadsafeFunctionCallMode::NonBlocking,
+      move |result: std::result::Result<Unknown<'_>, napi::Error>,
+            env|
+            -> napi::Result<()> {
+        match result {
+          Ok(val) => {
+            let is_promise = val.is_promise().unwrap_or(false);
+            if is_promise {
+              let raw_env = env.raw();
+              let raw_val = val.value().value;
+              let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
+              let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+              let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
+                let decision = ctx.value.coerce_to_string()
+                  .and_then(|s| s.into_utf8())
+                  .and_then(|u| u.as_str().map(|s| s.to_string()))
+                  .unwrap_or_else(|e| format!("error:{}", e));
+                if let Some(tx) = tx.lock().unwrap().take() {
+                  let _ = tx.send(decision);
+                }
+                Ok(())
+              });
+            } else {
+              let decision = val.coerce_to_string()
+                .and_then(|s| s.into_utf8())
+                .and_then(|u| u.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|e| format!("error:{}", e));
+              let _ = tx.send(decision);
+            }
+          }
+          Err(e) => {
+            let _ = tx.send(format!("error:{}", e));
+          }
+        }
+        Ok(())
+      },
+    );
 
     let decision_str = rx.await.unwrap_or_default();
     if decision_str.starts_with("error") {

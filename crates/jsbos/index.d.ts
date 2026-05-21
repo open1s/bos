@@ -254,7 +254,7 @@ export interface PluginLlmRequest {
 }
 
 export type PluginLlmResponse =
-  | { type: 'OpenAI', id: string, model: string, content?: string }
+  | { type: 'OpenAI', id: string, model: string, content?: string, responseType?: string }
 
 export declare const enum PluginStage {
   PreRequest = 0,
