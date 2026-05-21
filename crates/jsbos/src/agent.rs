@@ -99,11 +99,6 @@ pub struct AgentConfig {
   pub rate_limit_max_retries: Option<i32>,
   pub rate_limit_retry_backoff_secs: Option<i64>,
   pub rate_limit_auto_wait: Option<bool>,
-  pub context_compaction_threshold_tokens: Option<i32>,
-  pub context_compaction_trigger_ratio: Option<f64>,
-  pub context_compaction_keep_recent_messages: Option<i32>,
-  pub context_compaction_max_summary_chars: Option<i32>,
-  pub context_compaction_summary_max_tokens: Option<i32>,
 }
 
 impl Default for AgentConfig {
@@ -126,11 +121,6 @@ impl Default for AgentConfig {
       rate_limit_max_retries: None,
       rate_limit_retry_backoff_secs: None,
       rate_limit_auto_wait: None,
-      context_compaction_threshold_tokens: None,
-      context_compaction_trigger_ratio: None,
-      context_compaction_keep_recent_messages: None,
-      context_compaction_max_summary_chars: None,
-      context_compaction_summary_max_tokens: None,
     }
   }
 }
@@ -182,18 +172,6 @@ impl From<AgentConfig> for agent::AgentConfig {
       max_steps: value.max_steps.unwrap_or(10) as usize,
       circuit_breaker,
       rate_limit,
-      context_compaction_threshold_tokens: value.context_compaction_threshold_tokens.unwrap_or(0)
-        as usize,
-      context_compaction_trigger_ratio: value.context_compaction_trigger_ratio.unwrap_or(0.0)
-        as f32,
-      context_compaction_keep_recent_messages: value
-        .context_compaction_keep_recent_messages
-        .unwrap_or(0) as usize,
-      context_compaction_max_summary_chars: value.context_compaction_max_summary_chars.unwrap_or(0)
-        as usize,
-      context_compaction_summary_max_tokens: value
-        .context_compaction_summary_max_tokens
-        .unwrap_or(0) as u32,
     }
   }
 }
@@ -714,11 +692,11 @@ callback.call(Ok(json), ThreadsafeFunctionCallMode::Blocking);
               break;
             }
             }
-            Err(_e) => {
+            Err(e) => {
               had_error = true;
               let json = serde_json::json!({
                   "type": "Error",
-                  "error": "Stream error"
+                  "error": e.to_string()
               });
               callback.call(Ok(json), ThreadsafeFunctionCallMode::Blocking);
           }

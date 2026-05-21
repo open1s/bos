@@ -638,10 +638,15 @@ class AgentBuilder {
       }
     }
 
-    return this._inner;
+    return this;
   }
 
   async ask(prompt) {
+    if (!this._inner) await this.start();
+    return this._inner.runSimple(prompt);
+  }
+
+  async runSimple(prompt) {
     if (!this._inner) await this.start();
     return this._inner.runSimple(prompt);
   }
@@ -664,15 +669,20 @@ class AgentBuilder {
 
   async streamCollect(task) {
     const tokens = [];
-    await new Promise((resolve, reject) => {
-      this.stream(task, token => {
-        tokens.push(token);
-        if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
-          if (token.type === 'Error') reject(new Error(token.error));
-          else resolve();
-        }
+    try {
+      await new Promise((resolve, reject) => {
+        this.stream(task, token => {
+          if (!token) return;
+          tokens.push(token);
+          if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
+            if (token.type === 'Error') reject(new Error(token.error));
+            else resolve();
+          }
+        });
       });
-    });
+    } catch {
+      // Return whatever was collected before the error
+    }
     return tokens;
   }
 
@@ -685,6 +695,11 @@ class AgentBuilder {
   isRunning() {
     if (!this._inner) return false;
     return this._inner.isRunning();
+  }
+
+  get session() {
+    if (!this._inner) throw new Error('Agent not started');
+    return new SessionManager(this._inner);
   }
 }
 
@@ -723,15 +738,20 @@ class AgentWrapperClass {
 
   async streamCollect(task) {
     const tokens = [];
-    await new Promise((resolve, reject) => {
-      this.stream(task, token => {
-        tokens.push(token);
-        if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
-          if (token.type === 'Error') reject(new Error(token.error));
-          else resolve();
-        }
+    try {
+      await new Promise((resolve, reject) => {
+        this.stream(task, token => {
+          if (!token) return;
+          tokens.push(token);
+          if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
+            if (token.type === 'Error') reject(new Error(token.error));
+            else resolve();
+          }
+        });
       });
-    });
+    } catch {
+      // Return whatever was collected before the error
+    }
     return tokens;
   }
 

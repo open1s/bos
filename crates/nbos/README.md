@@ -104,11 +104,6 @@ config = AgentConfig(
     temperature=0.7,           # Sampling temperature (0-2)
     max_tokens=4096,           # Max tokens in response
     timeout_secs=120,          # Request timeout
-    # Context compaction (for long conversations)
-    context_compaction_threshold_tokens=100000,
-    context_compaction_trigger_ratio=0.8,
-    context_compaction_keep_recent_messages=10,
-    context_compaction_summary_max_tokens=2000,
 )
 ```
 

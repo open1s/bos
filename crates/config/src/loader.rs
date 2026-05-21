@@ -861,7 +861,7 @@ y = 1"#,
                 .get("general")
                 .and_then(|v| v.get("name"))
                 .and_then(|v| v.as_str()),
-            Some("brainos")
+            Some("BrianOS")
         );
     }
 }

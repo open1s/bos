@@ -170,11 +170,6 @@ export interface AgentConfig {
   rateLimitMaxRetries?: number
   rateLimitRetryBackoffSecs?: number
   rateLimitAutoWait?: boolean
-  contextCompactionThresholdTokens?: number
-  contextCompactionTriggerRatio?: number
-  contextCompactionKeepRecentMessages?: number
-  contextCompactionMaxSummaryChars?: number
-  contextCompactionSummaryMaxTokens?: number
 }
 
 export declare const enum BudgetStatus {
@@ -373,13 +368,14 @@ export class AgentBuilder {
     skillsFromDir(dirPath: any): this;
     mcp(namespace: any, command: any, args: any): this;
     mcpHttp(namespace: any, url: any): this;
-    start(): Promise<jsbos.Agent>;
+    start(): Promise<this>;
     ask(prompt: any): Promise<string>;
     react(task: any): Promise<string>;
     stream(task: any, onToken: any): Promise<string>;
     streamCollect(task: any): Promise<any[]>;
     stop(options?: {}): any;
     isRunning(): boolean;
+    get session(): SessionManager;
 }
 export function tool(descriptionOrOptions: any, maybeOptions?: {}): (target: any, propertyKey: any, descriptor: any) => any;
 export class ToolDef {

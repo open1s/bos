@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     print!("[ Tool: {} args: {} ]", name, args)
                 }
                 agent::StreamToken::Done => println!("\n[ Done ]"),
+                agent::StreamToken::Stopped => println!("\n[ Stopped ]"),
             },
             Err(e) => println!("Error: {}", e),
         }

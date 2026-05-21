@@ -117,8 +117,9 @@ Use type hints, snake_case, docstrings.`)
   console.log('Streaming (callback): "Count from 1 to 3"\n')
   let tokenCount = 0
   await agent.stream('Count from 1 to 3', (token) => {
+    if (!token) return
     tokenCount++
-    if (token.type === 'Error' || token.type === 'Done') return
+    if (token.type === 'Error' || token.type === 'Done' || token.type === 'Stopped') return
     if (token.type === 'Text') process.stdout.write(token.text)
     if (token.type === 'ReasoningContent') process.stdout.write(`[${token.text}]`)
   })
@@ -167,6 +168,9 @@ Use type hints, snake_case, docstrings.`)
   console.log('───────────────────────────────────────────────────────────\n')
 
   console.log('Skills loaded from:', skillsDir)
+
+  // Delay to avoid rate limiting after previous stream calls
+  await new Promise(r => setTimeout(r, 2000))
 
   const r4 = await agent.runSimple('Write a python function with type hints')
   console.log('Result:', r4.substring(0, 200), '...\n')

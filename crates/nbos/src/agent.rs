@@ -357,16 +357,6 @@ pub struct PyAgentConfig {
     pub rate_limit_retry_backoff_secs: Option<u64>,
     #[pyo3(get, set)]
     pub rate_limit_auto_wait: Option<bool>,
-    #[pyo3(get, set)]
-    pub context_compaction_threshold_tokens: usize,
-    #[pyo3(get, set)]
-    pub context_compaction_trigger_ratio: f32,
-    #[pyo3(get, set)]
-    pub context_compaction_keep_recent_messages: usize,
-    #[pyo3(get, set)]
-    pub context_compaction_max_summary_chars: usize,
-    #[pyo3(get, set)]
-    pub context_compaction_summary_max_tokens: u32,
 }
 
 impl Default for PyAgentConfig {
@@ -389,11 +379,6 @@ impl Default for PyAgentConfig {
             rate_limit_max_retries: None,
             rate_limit_retry_backoff_secs: None,
             rate_limit_auto_wait: None,
-            context_compaction_threshold_tokens: c.context_compaction_threshold_tokens,
-            context_compaction_trigger_ratio: c.context_compaction_trigger_ratio,
-            context_compaction_keep_recent_messages: c.context_compaction_keep_recent_messages,
-            context_compaction_max_summary_chars: c.context_compaction_max_summary_chars,
-            context_compaction_summary_max_tokens: c.context_compaction_summary_max_tokens,
         }
     }
 }
@@ -442,11 +427,6 @@ impl From<PyAgentConfig> for AgentConfig {
             max_steps: value.max_steps,
             circuit_breaker,
             rate_limit,
-            context_compaction_threshold_tokens: value.context_compaction_threshold_tokens,
-            context_compaction_trigger_ratio: value.context_compaction_trigger_ratio,
-            context_compaction_keep_recent_messages: value.context_compaction_keep_recent_messages,
-            context_compaction_max_summary_chars: value.context_compaction_max_summary_chars,
-            context_compaction_summary_max_tokens: value.context_compaction_summary_max_tokens,
         }
     }
 }
@@ -464,11 +444,6 @@ impl PyAgentConfig {
         temperature = None,
         max_tokens = None,
         timeout_secs = None,
-        context_compaction_threshold_tokens = None,
-        context_compaction_trigger_ratio = None,
-        context_compaction_keep_recent_messages = None,
-        context_compaction_max_summary_chars = None,
-        context_compaction_summary_max_tokens = None
     ))]
     fn new(
         name: Option<String>,
@@ -479,11 +454,6 @@ impl PyAgentConfig {
         temperature: Option<f32>,
         max_tokens: Option<u32>,
         timeout_secs: Option<u64>,
-        context_compaction_threshold_tokens: Option<usize>,
-        context_compaction_trigger_ratio: Option<f32>,
-        context_compaction_keep_recent_messages: Option<usize>,
-        context_compaction_max_summary_chars: Option<usize>,
-        context_compaction_summary_max_tokens: Option<u32>,
     ) -> Self {
         let mut cfg = Self::default();
         if let Some(v) = name {
@@ -509,21 +479,6 @@ impl PyAgentConfig {
         }
         if let Some(v) = timeout_secs {
             cfg.timeout_secs = v;
-        }
-        if let Some(v) = context_compaction_threshold_tokens {
-            cfg.context_compaction_threshold_tokens = v;
-        }
-        if let Some(v) = context_compaction_trigger_ratio {
-            cfg.context_compaction_trigger_ratio = v;
-        }
-        if let Some(v) = context_compaction_keep_recent_messages {
-            cfg.context_compaction_keep_recent_messages = v;
-        }
-        if let Some(v) = context_compaction_max_summary_chars {
-            cfg.context_compaction_max_summary_chars = v;
-        }
-        if let Some(v) = context_compaction_summary_max_tokens {
-            cfg.context_compaction_summary_max_tokens = v;
         }
         cfg
     }

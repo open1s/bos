@@ -172,11 +172,6 @@ export interface AgentConfig {
   rateLimitMaxRetries?: number
   rateLimitRetryBackoffSecs?: number
   rateLimitAutoWait?: boolean
-  contextCompactionThresholdTokens?: number
-  contextCompactionTriggerRatio?: number
-  contextCompactionKeepRecentMessages?: number
-  contextCompactionMaxSummaryChars?: number
-  contextCompactionSummaryMaxTokens?: number
 }
 
 export declare const enum BudgetStatus {

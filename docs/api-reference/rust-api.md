@@ -63,11 +63,6 @@ let agent = Agent::new(config, llm_provider);
 | `timeout_secs(secs: u64)` | Set timeout in seconds |
 | `rate_limit(config: RateLimiterConfig)` | Set rate limiter configuration |
 | `circuit_breaker(config: CircuitBreakerConfig)` | Set circuit breaker configuration |
-| `context_compaction_threshold_tokens(tokens: usize)` | Set context compaction threshold |
-| `context_compaction_trigger_ratio(ratio: f32)` | Set compaction trigger ratio |
-| `context_compaction_keep_recent_messages(count: usize)` | Set recent messages to keep |
-| `context_compaction_max_summary_chars(chars: usize)` | Set max chars for summary |
-| `context_compaction_summary_max_tokens(tokens: u32)` | Set max tokens for LLM-generated summary |
 | `tool(tool: Arc<dyn Tool>)` | Add a single tool |
 | `tools<T>(tools: T)` | Add multiple tools from iterable |
 | `skills_dir(dir: PathBuf)` | Set skills directory |

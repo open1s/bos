@@ -252,11 +252,6 @@ pub struct AgentConfig {
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Rate limiter configuration for resilience
     pub rate_limit: Option<RateLimiterConfig>,
-    pub context_compaction_threshold_tokens: usize,
-    pub context_compaction_trigger_ratio: f32,
-    pub context_compaction_keep_recent_messages: usize,
-    pub context_compaction_max_summary_chars: usize,
-    pub context_compaction_summary_max_tokens: u32,
 }
 
 impl Default for AgentConfig {
@@ -273,11 +268,6 @@ impl Default for AgentConfig {
             max_steps: 10,
             circuit_breaker: None,
             rate_limit: None,
-            context_compaction_threshold_tokens: 24_000,
-            context_compaction_trigger_ratio: 0.85,
-            context_compaction_keep_recent_messages: 12,
-            context_compaction_max_summary_chars: 4_000,
-            context_compaction_summary_max_tokens: 600,
         }
     }
 }
@@ -1234,15 +1224,7 @@ mod tests {
         assert!(config.rate_limit.is_none());
     }
 
-    #[test]
-    fn test_agent_config_context_compaction_defaults() {
-        let config = AgentConfig::default();
-        assert_eq!(config.context_compaction_threshold_tokens, 24_000);
-        assert_eq!(config.context_compaction_trigger_ratio, 0.85);
-        assert_eq!(config.context_compaction_keep_recent_messages, 12);
-        assert_eq!(config.context_compaction_max_summary_chars, 4_000);
-        assert_eq!(config.context_compaction_summary_max_tokens, 600);
-    }
+    
 
     // =========================================================================
     // LlmProvider Tests

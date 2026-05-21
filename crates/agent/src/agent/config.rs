@@ -44,16 +44,6 @@ pub struct TomlAgentConfig {
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     pub max_steps: Option<usize>,
-    #[serde(default = "default_context_compaction_threshold_tokens")]
-    pub context_compaction_threshold_tokens: usize,
-    #[serde(default = "default_context_compaction_trigger_ratio")]
-    pub context_compaction_trigger_ratio: f32,
-    #[serde(default = "default_context_compaction_keep_recent_messages")]
-    pub context_compaction_keep_recent_messages: usize,
-    #[serde(default = "default_context_compaction_max_summary_chars")]
-    pub context_compaction_max_summary_chars: usize,
-    #[serde(default = "default_context_compaction_summary_max_tokens")]
-    pub context_compaction_summary_max_tokens: u32,
     #[serde(default)]
     pub tools: Option<Vec<TomlToolRef>>,
 }
@@ -70,26 +60,6 @@ fn default_timeout() -> u64 {
     60
 }
 
-fn default_context_compaction_threshold_tokens() -> usize {
-    24_000
-}
-
-fn default_context_compaction_trigger_ratio() -> f32 {
-    0.85
-}
-
-fn default_context_compaction_keep_recent_messages() -> usize {
-    12
-}
-
-fn default_context_compaction_max_summary_chars() -> usize {
-    4_000
-}
-
-fn default_context_compaction_summary_max_tokens() -> u32 {
-    600
-}
-
 impl From<TomlAgentConfig> for AgentConfig {
     fn from(t: TomlAgentConfig) -> Self {
         Self {
@@ -104,11 +74,6 @@ impl From<TomlAgentConfig> for AgentConfig {
             max_steps: t.max_steps.unwrap_or(10),
             circuit_breaker: None,
             rate_limit: None,
-            context_compaction_threshold_tokens: t.context_compaction_threshold_tokens,
-            context_compaction_trigger_ratio: t.context_compaction_trigger_ratio,
-            context_compaction_keep_recent_messages: t.context_compaction_keep_recent_messages,
-            context_compaction_max_summary_chars: t.context_compaction_max_summary_chars,
-            context_compaction_summary_max_tokens: t.context_compaction_summary_max_tokens,
         }
     }
 }

@@ -537,11 +537,6 @@ Agent configuration.
 | `max_steps` | `10` | Maximum ReAct steps |
 | `circuit_breaker` | `None` | Circuit breaker config |
 | `rate_limit` | `None` | Rate limiter config |
-| `context_compaction_threshold_tokens` | `24000` | Tokens before compaction |
-| `context_compaction_trigger_ratio` | `0.85` | Trigger ratio for compaction |
-| `context_compaction_keep_recent_messages` | `12` | Messages to keep during compaction |
-| `context_compaction_max_summary_chars` | `4000` | Max summary length |
-| `context_compaction_summary_max_tokens` | `600` | Max summary tokens |
 | `name(name)` | Set agent name |
 | `model(model)` | Set model |
 | `system_prompt(prompt)` | Set system prompt |

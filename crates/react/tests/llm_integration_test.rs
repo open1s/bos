@@ -26,6 +26,7 @@ impl LlmConfig {
         })
     }
 
+    #[allow(dead_code)]
     fn from_openrouter(config: &serde_json::Value) -> Option<Self> {
         let openrouter = config.get("llm")?.get("openrouter")?;
         let model = openrouter.get("model")?.as_str()?.to_string();
