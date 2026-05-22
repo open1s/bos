@@ -7,6 +7,10 @@ on:
   workflow_dispatch:
   pull_request:
 
+permissions:
+  contents: read
+  id-token: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -63,5 +67,34 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/*.whl
+          path: target/${{ matrix.target }}/release/wheels/*.whl
           retention-days: 7
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.event.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Prepare distribution
+        run: |
+          mkdir -p dist
+          for dir in artifacts/wheels-*; do
+            cp "$dir"/*.whl dist/ 2>/dev/null || true
+          done
+          ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
