@@ -83,6 +83,8 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,5 +210,40 @@ mod tests {
             Some(" result is 100.")
         );
         assert_eq!(chunks[2].choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn extracts_usage_from_final_chunk() {
+        let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
+        let usage_chunk = serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 320,
+                "completion_tokens": 58,
+                "total_tokens": 378,
+                "prompt_tokens_details": { "cached_tokens": 16 }
+            }
+        })
+        .to_string();
+        let payload = format!("data: {}\n\n", usage_chunk);
+
+        let chunks = extractor.push(&payload).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        let usage = chunks[0].usage.as_ref().expect("usage should be present");
+        assert_eq!(usage.prompt_tokens, 320);
+        assert_eq!(usage.completion_tokens, 58);
+        assert_eq!(usage.total_tokens, 378);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens),
+            Some(16)
+        );
     }
 }

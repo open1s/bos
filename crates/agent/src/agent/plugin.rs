@@ -64,6 +64,7 @@ pub enum StreamTokenWrapper {
         args: serde_json::Value,
         id: Option<String>,
     },
+    Usage(react::llm::vendor::openaicompatible::Usage),
     Done,
     Stopped,
 }
@@ -80,6 +81,7 @@ impl StreamTokenWrapper {
             react::llm::StreamToken::ReasoningContent(s) => {
                 StreamTokenWrapper::ReasoningContent(s.clone())
             }
+            react::llm::StreamToken::Usage(u) => StreamTokenWrapper::Usage(u.clone()),
             react::llm::StreamToken::Done => StreamTokenWrapper::Done,
             react::llm::StreamToken::Stopped => StreamTokenWrapper::Stopped,
         }
@@ -92,6 +94,7 @@ impl StreamTokenWrapper {
                 react::llm::StreamToken::ToolCall { name, args, id }
             }
             StreamTokenWrapper::ReasoningContent(s) => react::llm::StreamToken::ReasoningContent(s),
+            StreamTokenWrapper::Usage(u) => react::llm::StreamToken::Usage(u),
             StreamTokenWrapper::Done => react::llm::StreamToken::Done,
             StreamTokenWrapper::Stopped => react::llm::StreamToken::Stopped,
         }

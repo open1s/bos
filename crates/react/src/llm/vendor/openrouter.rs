@@ -447,13 +447,11 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                             }))
                                             .await;
                                     }
-
-                                    if let Some(reason) = &choice.finish_reason {
-                                        if !reason.is_empty() {
-                                            let _ = tx.send(Ok(StreamToken::Done)).await;
-                                            return;
-                                        }
-                                    }
+                                }
+                                if let Some(usage) = &chat.usage {
+                                    let _ = tx
+                                        .send(Ok(StreamToken::Usage(usage.clone())))
+                                        .await;
                                 }
                             }
                         }
@@ -465,6 +463,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                     }
                 }
             }
+            let _ = tx.send(Ok(StreamToken::Done)).await;
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))

@@ -804,6 +804,13 @@ impl PyAgent {
                             "id": id
                         })
                         .to_string()),
+                        Ok(StreamToken::Usage(usage)) => Ok(serde_json::json!({
+                            "type": "usage",
+                            "promptTokens": usage.prompt_tokens,
+                            "completionTokens": usage.completion_tokens,
+                            "totalTokens": usage.total_tokens,
+                        })
+                        .to_string()),
                         Ok(StreamToken::Done) => break,
                         Ok(StreamToken::Stopped) => break,
                         Err(e) => Err(e.to_string()),

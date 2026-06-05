@@ -128,6 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     print!("[Tool: {} args: {}] ", name, args)
                 }
                 react::llm::StreamToken::Done => println!("\n[Done]"),
+                react::llm::StreamToken::Usage(u) => println!(
+                    "\n[Usage] prompt={} completion={} total={}",
+                    u.prompt_tokens, u.completion_tokens, u.total_tokens
+                ),
                 react::llm::StreamToken::Stopped => println!("\n[Stopped]"),
             },
             Err(e) => println!("Error: {:?}", e),

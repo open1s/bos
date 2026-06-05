@@ -328,6 +328,9 @@ impl AgentRpcClient {
                 crate::StreamToken::ReasoningContent(_t) => {
                     //SKIP
                 }
+                crate::StreamToken::Usage(_) => {
+                    //SKIP
+                }
                 crate::StreamToken::ToolCall { name, args, id } => chunks.push(format!(
                     "[tool_call] name={} id={} args={}",
                     name,
@@ -371,6 +374,9 @@ async fn handle_rpc_request(agent: Arc<Agent>, req: AgentRpcRequest) -> AgentRpc
                         chunks.push(t);
                     }
                     Some(Ok(crate::StreamToken::ReasoningContent(_t))) => {
+                        //SKIP
+                    }
+                    Some(Ok(crate::StreamToken::Usage(_))) => {
                         //SKIP
                     }
                     Some(Ok(crate::StreamToken::ToolCall { name, args, id })) => {
@@ -703,6 +709,9 @@ async fn handle_incoming_query(
                     .await?;
                 }
                 Ok(crate::StreamToken::ReasoningContent(_t)) => {
+                    //SKIP
+                }
+                Ok(crate::StreamToken::Usage(_)) => {
                     //SKIP
                 }
                 Ok(crate::StreamToken::ToolCall { name, args, id }) => {
@@ -1145,6 +1154,7 @@ mod tests {
                 crate::StreamToken::Done => break,
                 crate::StreamToken::ToolCall { .. } => {}
                 crate::StreamToken::ReasoningContent(_) => {}
+                crate::StreamToken::Usage(_) => {}
                 crate::StreamToken::Stopped => break,
             }
         }

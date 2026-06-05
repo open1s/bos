@@ -711,6 +711,18 @@ impl Agent {
                     "id": id
                 })
               }
+              agent::StreamToken::Usage(usage) => {
+                serde_json::json!({
+                    "type": "Usage",
+                    "promptTokens": usage.prompt_tokens,
+                    "completionTokens": usage.completion_tokens,
+                    "totalTokens": usage.total_tokens,
+                    "promptTokensDetails": usage.prompt_tokens_details.as_ref().map(|d| serde_json::json!({
+                        "audioTokens": d.audio_tokens,
+                        "cachedTokens": d.cached_tokens,
+                    })),
+                })
+              }
               agent::StreamToken::Done => {
                 serde_json::json!({ "type": "Done" })
               }

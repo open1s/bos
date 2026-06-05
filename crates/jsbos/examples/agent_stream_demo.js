@@ -41,6 +41,7 @@ async function streamTask(agent, task) {
   await new Promise((resolve, reject) => {
     let tokenCount = 0
     let reasoningCount = 0
+    let lastUsage = null
 
     agent.stream(task, (err, token) => {
       if (err) { reject(err); return }
@@ -60,10 +61,19 @@ async function streamTask(agent, task) {
         case 'ToolCall':
           console.log('\n[ToolCall]', token.name, JSON.stringify(token.args))
           break
+        case 'Usage':
+          lastUsage = token
+          console.log('\n[USAGE] prompt=' + token.promptTokens + ' completion=' + token.completionTokens + ' total=' + token.totalTokens)
+          break
         case 'Done':
           console.log('\n[DONE] (' + tokenCount + ' tokens)')
           if (reasoningCount === 0) {
             console.log('[NO THINKING] Model did not emit reasoning_content chunks')
+          }
+          if (lastUsage) {
+            console.log('[USAGE] prompt=' + lastUsage.promptTokens + ' completion=' + lastUsage.completionTokens + ' total=' + lastUsage.totalTokens)
+          } else {
+            console.log('[NO USAGE] Model did not emit usage chunk')
           }
           resolve()
           break
@@ -106,7 +116,7 @@ async function main() {
     (_err, args) => addTool(args))
   console.log('Tools registered')
 
-  await streamTask(agent, 'What is 2 + 3?')
+  await streamTask(agent, 'What is 2 + 3?,use tool')
   await streamTask(agent, 'What is 99 + 1?')
 
   console.log('\n=== Complete ===\n')

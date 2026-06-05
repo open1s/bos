@@ -34,6 +34,7 @@ pub enum StreamToken {
         args: Value,
         id: Option<String>,
     },
+    Usage(super::vendor::openaicompatible::Usage),
     Done,
     Stopped,
 }

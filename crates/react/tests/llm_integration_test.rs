@@ -502,6 +502,12 @@ async fn test_nvidia_tool_calls_stream_with_config() {
                                     tool_call_name, tool_call_id, tool_call_args
                                 );
                             }
+                            StreamToken::Usage(u) => {
+                                println!(
+                                    "Usage received: prompt={} completion={} total={}",
+                                    u.prompt_tokens, u.completion_tokens, u.total_tokens
+                                );
+                            }
                             StreamToken::Done => break,
                             StreamToken::Stopped => break,
                         }

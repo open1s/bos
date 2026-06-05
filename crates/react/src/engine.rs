@@ -725,6 +725,14 @@ impl<A: ReActApp> ReActEngine<A> {
                         Ok(StreamToken::ReasoningContent(text)) => {
                             yield Ok(StreamToken::ReasoningContent(text));
                         }
+                        Ok(StreamToken::Usage(usage)) => {
+                            let token_usage = TokenUsage::new(
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                            );
+                            self.token_counter.update_from_response(token_usage);
+                            yield Ok(StreamToken::Usage(usage));
+                        }
                         Ok(StreamToken::Done) => {
                             break;
                         }
