@@ -12,8 +12,8 @@ use tokio::sync::Mutex;
 use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
 use agent::BashTool;
-use react::tool::registry::AsyncTool;
 use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
+use react::tool::registry::AsyncTool;
 
 struct JSTool {
   name: String,
@@ -50,16 +50,15 @@ impl AsyncTool for JSTool {
     let args_json = args.clone();
     let callback = self.callback.clone();
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<serde_json::Value, String>>();
+    let (tx, rx) =
+      tokio::sync::oneshot::channel::<std::result::Result<serde_json::Value, String>>();
 
     // call_with_return_value already runs on a NAPI worker thread,
     // so no need for spawn_blocking.
     callback.call_with_return_value(
       Ok(JSAny(args_json)),
       ThreadsafeFunctionCallMode::NonBlocking,
-      move |result: std::result::Result<Unknown<'_>, napi::Error>,
-            env|
-            -> napi::Result<()> {
+      move |result: std::result::Result<Unknown<'_>, napi::Error>, env| -> napi::Result<()> {
         match result {
           Ok(val) => {
             let is_promise = val.is_promise().unwrap_or(false);
@@ -69,14 +68,16 @@ impl AsyncTool for JSTool {
               let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
               let tx = Arc::new(StdMutex::new(Some(tx)));
               let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
-                let json_val = extract_json_value(ctx.value).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+                let json_val = extract_json_value(ctx.value)
+                  .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
                 if let Some(tx) = tx.lock().unwrap().take() {
                   let _ = tx.send(Ok(json_val));
                 }
                 Ok(())
               });
             } else {
-              let json_val = extract_json_value(val).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+              let json_val = extract_json_value(val)
+                .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
               let _ = tx.send(Ok(json_val));
             }
           }
@@ -311,7 +312,10 @@ impl Agent {
   #[napi]
   pub async fn run_simple(&self, task: String) -> Result<String> {
     if self.is_running.load(Ordering::SeqCst) {
-      return Err(Error::new(napi::Status::GenericFailure, "Agent is already running".to_string()));
+      return Err(Error::new(
+        napi::Status::GenericFailure,
+        "Agent is already running".to_string(),
+      ));
     }
     if self.stop_flag.load(Ordering::SeqCst) {
       self.stop_flag.store(false, Ordering::SeqCst);
@@ -331,7 +335,10 @@ impl Agent {
   #[napi]
   pub async fn react(&self, task: String) -> Result<String> {
     if self.is_running.load(Ordering::SeqCst) {
-      return Err(Error::new(napi::Status::GenericFailure, "Agent is already running".to_string()));
+      return Err(Error::new(
+        napi::Status::GenericFailure,
+        "Agent is already running".to_string(),
+      ));
     }
     if self.stop_flag.load(Ordering::SeqCst) {
       self.stop_flag.store(false, Ordering::SeqCst);
@@ -341,9 +348,7 @@ impl Agent {
     self.is_running.store(true, Ordering::SeqCst);
     let result = {
       let guard = self.inner.lock().await;
-      guard
-        .react(&task)
-        .await
+      guard.react(&task).await
     };
     self.is_running.store(false, Ordering::SeqCst);
 
@@ -671,7 +676,10 @@ impl Agent {
     callback: ThreadsafeFunction<serde_json::Value>,
   ) -> Result<String> {
     if self.is_running.load(Ordering::SeqCst) {
-      return Err(Error::new(napi::Status::GenericFailure, "Agent is already running".to_string()));
+      return Err(Error::new(
+        napi::Status::GenericFailure,
+        "Agent is already running".to_string(),
+      ));
     }
     if self.stop_flag.load(Ordering::SeqCst) {
       self.stop_flag.store(false, Ordering::SeqCst);
@@ -731,7 +739,7 @@ impl Agent {
                 serde_json::json!({ "type": "Stopped" })
               }
             };
-callback.call(Ok(json), ThreadsafeFunctionCallMode::Blocking);
+            callback.call(Ok(json), ThreadsafeFunctionCallMode::Blocking);
             if was_stopped {
               break;
             }
@@ -951,7 +959,9 @@ mod tests {
     });
     registry.register_async(tool).unwrap();
 
-    assert!(registry.async_tool_names().contains(&"test_async".to_string()));
+    assert!(registry
+      .async_tool_names()
+      .contains(&"test_async".to_string()));
     assert_eq!(registry.list().len(), 1);
   }
 
@@ -964,7 +974,9 @@ mod tests {
     });
     registry.register_async(tool).unwrap();
 
-    let result = registry.execute("test_exec", &serde_json::json!({})).unwrap();
+    let result = registry
+      .execute("test_exec", &serde_json::json!({}))
+      .unwrap();
     assert_eq!(result["result"], "async_executed");
   }
 }

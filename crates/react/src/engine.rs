@@ -674,16 +674,12 @@ impl<A: ReActApp> ReActEngine<A> {
         self.set_stop_flag(false);
 
         let stream = stream! {
-            let mut step_count = 0;
-            let max_steps = self.max_steps;
             let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             let mut request = request;
 
             context.add_tool(load_skill_tool());
 
-            while step_count < max_steps {
-                step_count += 1;
-
+            loop {
                 if self.stop_flag.load(Ordering::SeqCst) {
                     yield Err(ReactError::HookAbort("Execution stopped by user".to_string()));
                     break;
@@ -734,7 +730,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             yield Ok(StreamToken::Usage(usage));
                         }
                         Ok(StreamToken::Done) => {
-                            break;
+                            break;// End of LLM response stream
                         }
                         Ok(StreamToken::ToolCall { name, mut args, id }) => {
                             saw_tool_call = true;
