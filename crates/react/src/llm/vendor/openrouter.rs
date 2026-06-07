@@ -88,7 +88,7 @@ impl OpenRouterVendor {
     ) -> OpenRouterRequest {
         let mut messages = Vec::new();
         if let Some(history) = session.history() {
-            for message in history.iter().cloned() {
+            for message in history {
                 let json_msg = match message {
                     crate::llm::LlmMessage::System { content } => OpenRouterMessageJson {
                         role: "system",
@@ -152,7 +152,7 @@ impl OpenRouterVendor {
             .tools()
             .map(|tools| {
                 tools
-                    .into_iter()
+                    .iter()
                     .map(|t| {
                         serde_json::json!({
                             "type": "function",

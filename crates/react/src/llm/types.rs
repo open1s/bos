@@ -1,19 +1,20 @@
 //! Data types for LLM interactions.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use thiserror::Error;
 
 pub trait ReactSession {
     fn push(&mut self, msg: LlmMessage);
-    fn history(&self) -> Option<Vec<LlmMessage>>;
+    fn history(&self) -> Option<&[LlmMessage]>;
 }
 
 pub trait ReactContext {
     fn session_id(&self) -> String;
-    fn skills(&self) -> Option<Vec<Skill>>;
-    fn tools(&self) -> Option<Vec<LlmTool>>;
-    fn rules(&self) -> Option<Vec<Rule>>;
-    fn instructions(&self) -> Option<Vec<Instruction>>;
+    fn skills(&self) -> Option<&[Skill]>;
+    fn tools(&self) -> Option<&[LlmTool]>;
+    fn rules(&self) -> Option<&[Rule]>;
+    fn instructions(&self) -> Option<&[Instruction]>;
     fn add_tool(&mut self, tool: LlmTool);
 
     fn notify_request(&self, _req: &LlmRequest);
@@ -27,16 +28,16 @@ impl ReactContext for () {
     fn session_id(&self) -> String {
         "unit_session".to_string()
     }
-    fn skills(&self) -> Option<Vec<Skill>> {
+    fn skills(&self) -> Option<&[Skill]> {
         None
     }
-    fn tools(&self) -> Option<Vec<LlmTool>> {
+    fn tools(&self) -> Option<&[LlmTool]> {
         None
     }
-    fn rules(&self) -> Option<Vec<Rule>> {
+    fn rules(&self) -> Option<&[Rule]> {
         None
     }
-    fn instructions(&self) -> Option<Vec<Instruction>> {
+    fn instructions(&self) -> Option<&[Instruction]> {
         None
     }
     fn add_tool(&mut self, _tool: LlmTool) {}
@@ -56,7 +57,7 @@ impl ReactContext for () {
 
 impl ReactSession for () {
     fn push(&mut self, _msg: LlmMessage) {}
-    fn history(&self) -> Option<Vec<LlmMessage>> {
+    fn history(&self) -> Option<&[LlmMessage]> {
         None
     }
 }
@@ -259,17 +260,33 @@ impl ReactContext for LlmContext {
     fn session_id(&self) -> String {
         "llm_context_session".to_string()
     }
-    fn skills(&self) -> Option<Vec<Skill>> {
-        Some(self.skills.clone())
+    fn skills(&self) -> Option<&[Skill]> {
+        if self.skills.is_empty() {
+            None
+        } else {
+            Some(&self.skills)
+        }
     }
-    fn tools(&self) -> Option<Vec<LlmTool>> {
-        Some(self.tools.clone())
+    fn tools(&self) -> Option<&[LlmTool]> {
+        if self.tools.is_empty() {
+            None
+        } else {
+            Some(&self.tools)
+        }
     }
-    fn rules(&self) -> Option<Vec<Rule>> {
-        Some(self.rules.clone())
+    fn rules(&self) -> Option<&[Rule]> {
+        if self.rules.is_empty() {
+            None
+        } else {
+            Some(&self.rules)
+        }
     }
-    fn instructions(&self) -> Option<Vec<Instruction>> {
-        Some(self.instructions.clone())
+    fn instructions(&self) -> Option<&[Instruction]> {
+        if self.instructions.is_empty() {
+            None
+        } else {
+            Some(&self.instructions)
+        }
     }
     fn add_tool(&mut self, tool: LlmTool) {
         self.tools.push(tool);
@@ -350,31 +367,40 @@ impl Default for LlmRequest {
 pub struct LlmSession {
     /// Accumulated message history from prior LLM calls.
     /// Vendors append to this and/or read it to build requests.
-    pub history: Vec<LlmMessage>,
+    /// Arc enables O(1) clone for sharing across async boundaries.
+    pub history: Arc<Vec<LlmMessage>>,
 }
 
 impl LlmSession {
     pub fn new() -> Self {
         Self {
-            history: Vec::new(),
+            history: Arc::new(Vec::new()),
         }
     }
 
     pub fn push(&mut self, msg: LlmMessage) {
-        self.history.push(msg);
+        Arc::make_mut(&mut self.history).push(msg);
     }
 
     pub fn merge(&mut self, other: LlmSession) {
-        self.history.extend(other.history);
+        Arc::make_mut(&mut self.history).extend_from_slice(&other.history);
+    }
+
+    pub fn len(&self) -> usize {
+        self.history.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.history.is_empty()
     }
 }
 
 impl ReactSession for LlmSession {
     fn push(&mut self, msg: LlmMessage) {
-        self.history.push(msg);
+        Arc::make_mut(&mut self.history).push(msg);
     }
 
-    fn history(&self) -> Option<Vec<LlmMessage>> {
-        Some(self.history.clone())
+    fn history(&self) -> Option<&[LlmMessage]> {
+        Some(&*self.history)
     }
 }

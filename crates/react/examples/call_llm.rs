@@ -7,7 +7,7 @@ struct DummySession;
 
 impl ReactSession for DummySession {
     fn push(&mut self, _msg: LlmMessage) {}
-    fn history(&self) -> Option<Vec<LlmMessage>> {
+    fn history(&self) -> Option<&[LlmMessage]> {
         None
     }
 }
@@ -19,16 +19,16 @@ impl ReactContext for DummyContext {
     fn session_id(&self) -> String {
         "dummy".to_string()
     }
-    fn skills(&self) -> Option<Vec<react::llm::Skill>> {
+    fn skills(&self) -> Option<&[react::llm::Skill]> {
         None
     }
-    fn tools(&self) -> Option<Vec<react::llm::LlmTool>> {
+    fn tools(&self) -> Option<&[react::llm::LlmTool]> {
         None
     }
-    fn rules(&self) -> Option<Vec<react::llm::Rule>> {
+    fn rules(&self) -> Option<&[react::llm::Rule]> {
         None
     }
-    fn instructions(&self) -> Option<Vec<react::llm::Instruction>> {
+    fn instructions(&self) -> Option<&[react::llm::Instruction]> {
         None
     }
     fn add_tool(&mut self, _tool: react::llm::LlmTool) {}

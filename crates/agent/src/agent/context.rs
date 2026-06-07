@@ -285,8 +285,8 @@ impl ReactSession for AgentSession {
         self.update_metadata();
     }
 
-    fn history(&self) -> Option<Vec<Message>> {
-        Some(self.messages.clone())
+    fn history(&self) -> Option<&[Message]> {
+        Some(&self.messages)
     }
 }
 
@@ -335,35 +335,35 @@ impl ReactContext for AgentReactContext {
         self.session_id.clone()
     }
 
-    fn skills(&self) -> Option<Vec<Skill>> {
+    fn skills(&self) -> Option<&[Skill]> {
         if self.skills.is_empty() {
             None
         } else {
-            Some(self.skills.clone())
+            Some(&self.skills)
         }
     }
 
-    fn tools(&self) -> Option<Vec<LlmTool>> {
+    fn tools(&self) -> Option<&[LlmTool]> {
         if self.tools.is_empty() {
             None
         } else {
-            Some(self.tools.clone())
+            Some(&self.tools)
         }
     }
 
-    fn rules(&self) -> Option<Vec<Rule>> {
+    fn rules(&self) -> Option<&[Rule]> {
         if self.rules.is_empty() {
             None
         } else {
-            Some(self.rules.clone())
+            Some(&self.rules)
         }
     }
 
-    fn instructions(&self) -> Option<Vec<Instruction>> {
+    fn instructions(&self) -> Option<&[Instruction]> {
         if self.instructions.is_empty() {
             None
         } else {
-            Some(self.instructions.clone())
+            Some(&self.instructions)
         }
     }
 

@@ -93,7 +93,7 @@ impl NvidiaVendor {
     ) -> NvidiaRequest {
         let mut messages = Vec::new();
         if let Some(history) = session.history() {
-            for message in history.iter().cloned() {
+            for message in history.iter() {
                 let json_msg = match message {
                     crate::llm::LlmMessage::System { content } => NvidiaMessageJson {
                         role: "system",
@@ -157,7 +157,7 @@ impl NvidiaVendor {
             .tools()
             .map(|tools| {
                 tools
-                    .into_iter()
+                    .iter()
                     .map(|t| {
                         serde_json::json!({
                             "type": "function",
