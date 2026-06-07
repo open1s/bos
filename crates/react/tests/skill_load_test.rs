@@ -125,7 +125,7 @@ fn test_load_skill_added_to_tools_when_skills_exist() {
 
     rt.block_on(async {
         engine
-            .react(LlmRequest::new("test"), &mut session, &mut context)
+            .react(None, LlmRequest::new("test"), &mut session, &mut context)
             .await
     })
     .unwrap();
@@ -206,7 +206,7 @@ fn test_no_load_skill_when_no_skills() {
 
     rt.block_on(async {
         engine
-            .react(LlmRequest::new("test"), &mut session, &mut context.clone())
+            .react(None, LlmRequest::new("test"), &mut session, &mut context.clone())
             .await
     })
     .unwrap();

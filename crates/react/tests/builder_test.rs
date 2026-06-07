@@ -172,7 +172,7 @@ fn test_builder_pattern() {
     let mut context = LlmContext::default();
     let result = rt.block_on(async {
         engine
-            .react(LlmRequest::new("test-model"), &mut session, &mut context)
+            .react(None, LlmRequest::new("test-model"), &mut session, &mut context)
             .await
     });
     assert_eq!(result.unwrap(), "5");
@@ -259,7 +259,7 @@ fn test_message_log_input() {
     let mut request = LlmRequest::new("test");
     request.input = "New message".to_string();
     let _result = rt
-        .block_on(async { engine.react(request, &mut session, &mut context).await })
+        .block_on(async { engine.react(None, request, &mut session, &mut context).await })
         .unwrap();
 
     let inputs = received.lock().unwrap();
@@ -339,7 +339,7 @@ fn test_react_with_request() {
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async { engine.react(request, &mut session, &mut context).await })
+    rt.block_on(async { engine.react(None, request, &mut session, &mut context).await })
         .unwrap();
 
     let model = received_model.lock().unwrap();
