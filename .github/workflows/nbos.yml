@@ -61,6 +61,7 @@ jobs:
         run: pip install maturin
 
       - name: Build
+        shell: bash
         run: |
           mkdir -p dist
           maturin build -m crates/nbos/Cargo.toml --target ${{ matrix.target }} --release --out dist
