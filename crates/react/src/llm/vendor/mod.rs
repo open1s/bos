@@ -12,3 +12,13 @@ pub use openaicompatible::{
 };
 pub use openrouter::OpenRouterVendor;
 pub use router::LlmRouter;
+
+pub fn merge_system_prompt(extra: String, leading_system: Option<&str>) -> Option<String> {
+    if extra.is_empty() {
+        return None;
+    }
+    Some(match leading_system {
+        Some(existing) if !existing.is_empty() => format!("{}\n{}", existing, extra),
+        _ => extra,
+    })
+}

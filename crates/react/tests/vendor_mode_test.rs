@@ -1,5 +1,6 @@
 use react::llm::vendor::{
-    ChatCompletionResponse, ChatMessage, Choice, FunctionCall, OpenAiVendorBuilder, ToolCall,
+    merge_system_prompt, ChatCompletionResponse, ChatMessage, Choice, FunctionCall,
+    OpenAiVendorBuilder, ToolCall,
 };
 use react::llm::{LlmClient, LlmContext, LlmResponse, LlmSession};
 
@@ -193,4 +194,28 @@ async fn test_vendor_clonable() {
         LlmClient::<LlmSession, LlmContext>::provider_name(&cloned),
         LlmClient::<LlmSession, LlmContext>::provider_name(&vendor)
     );
+}
+
+#[test]
+fn test_merge_system_prompt_appends_to_leading() {
+    let merged = merge_system_prompt("skills: math".to_string(), Some("you are a tutor"));
+    assert_eq!(merged.as_deref(), Some("you are a tutor\nskills: math"));
+}
+
+#[test]
+fn test_merge_system_prompt_uses_extra_when_no_leading() {
+    let merged = merge_system_prompt("skills: math".to_string(), None);
+    assert_eq!(merged.as_deref(), Some("skills: math"));
+}
+
+#[test]
+fn test_merge_system_prompt_uses_extra_when_leading_empty() {
+    let merged = merge_system_prompt("skills: math".to_string(), Some(""));
+    assert_eq!(merged.as_deref(), Some("skills: math"));
+}
+
+#[test]
+fn test_merge_system_prompt_returns_none_for_empty_extra() {
+    assert_eq!(merge_system_prompt(String::new(), Some("persona")), None);
+    assert_eq!(merge_system_prompt(String::new(), None), None);
 }

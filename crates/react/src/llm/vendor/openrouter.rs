@@ -210,14 +210,22 @@ impl OpenRouterVendor {
             }
         }
 
-        if !extra_system_prompt.is_empty() {
+        let leading_system = messages
+            .first()
+            .filter(|m| m.role == "system")
+            .and_then(|m| m.content.as_deref());
+        if let Some(content) = super::merge_system_prompt(extra_system_prompt, leading_system) {
             let meta = OpenRouterMessageJson {
                 role: "system",
-                content: Some(extra_system_prompt),
+                content: Some(content),
                 tool_call_id: None,
                 tool_calls: None,
             };
-            messages.insert(0, meta);
+            if leading_system.is_some() {
+                messages[0] = meta;
+            } else {
+                messages.insert(0, meta);
+            }
         }
 
         let max_tokens = req.max_tokens.unwrap_or(12800);
