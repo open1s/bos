@@ -678,6 +678,8 @@ impl<A: ReActApp> ReActEngine<A> {
     {
         self.set_stop_flag(false);
 
+        session.push(LlmMessage::user(request.input.clone()));
+
         let stream = stream! {
             let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             let mut request = request;

@@ -673,7 +673,6 @@ impl Agent {
         };
         let mut agent_session = AgentSession::new();
         agent_session.restore_messages(messages);
-        ensure_system_prompt(&mut agent_session, &self.config.system_prompt);
 
         let request = LlmRequest {
             model: self.config.model.clone(),
@@ -687,7 +686,7 @@ impl Agent {
         let result = engine
             .as_mut()
             .unwrap()
-            .react(request, &mut agent_session, &mut *context.as_mut().unwrap())
+            .react(Some(self.config.system_prompt.clone()), request, &mut agent_session, &mut *context.as_mut().unwrap())
             .await;
         let engine_time = engine_start.elapsed();
 
@@ -818,7 +817,6 @@ impl Agent {
         };
         let mut agent_session = AgentSession::new();
         agent_session.restore_messages(messages);
-        ensure_system_prompt(&mut agent_session, &self.config.system_prompt);
 
         let stream = async_stream::stream! {
             let mut engine = engine;
@@ -832,11 +830,8 @@ impl Agent {
                 ..Default::default()
             };
 
-            // Push user message to session (must be done before calling engine)
-            agent_session.push(LlmMessage::user(task_str.clone()));
-
             {
-                let react_stream = engine.react_stream(request, &mut agent_session, &mut context);
+                let react_stream = engine.react_stream(Some(self.config.system_prompt.clone()), request, &mut agent_session, &mut context);
                 futures::pin_mut!(react_stream);
                 let plugins = self.plugins.clone();
                 let hooks = self.hooks.clone();
@@ -890,8 +885,9 @@ impl Agent {
             }
 
             {
+                let usage = engine.token_usage();
                 let mut ctx = HookContext::new(&self.config.name);
-                ctx.set("total_tokens", "0");
+                ctx.set("total_tokens", (usage.prompt_tokens as u64).to_string());
                 self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
             }
 
@@ -1140,23 +1136,6 @@ impl Clone for Agent {
 // Unit Tests
 // ============================================================================
 
-fn ensure_system_prompt(session: &mut AgentSession, system_prompt: &str) {
-    if system_prompt.is_empty() {
-        return;
-    }
-    if let Some(LlmMessage::System { content }) = session.history_ref().first() {
-        if content == system_prompt {
-            return;
-        }
-    }
-    let mut prefixed = Vec::with_capacity(session.history_ref().len() + 1);
-    prefixed.push(LlmMessage::System {
-        content: system_prompt.to_string(),
-    });
-    prefixed.extend_from_slice(session.history_ref());
-    session.restore_messages(prefixed);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1302,49 +1281,6 @@ mod tests {
 
         assert_eq!(agent.config().name, "agent");
         assert_eq!(agent.config().model, "gpt-4");
-    }
-
-    #[test]
-    fn test_ensure_system_prompt_prepends_when_empty() {
-        let mut session = AgentSession::new();
-        ensure_system_prompt(&mut session, "you are a math tutor");
-        assert!(matches!(
-            session.history_ref().first(),
-            Some(LlmMessage::System { content }) if content == "you are a math tutor"
-        ));
-    }
-
-    #[test]
-    fn test_ensure_system_prompt_idempotent() {
-        let mut session = AgentSession::new();
-        ensure_system_prompt(&mut session, "you are a math tutor");
-        session.add_user("2+2?".to_string());
-        let len_before = session.history_ref().len();
-        ensure_system_prompt(&mut session, "you are a math tutor");
-        assert_eq!(session.history_ref().len(), len_before);
-        assert!(matches!(
-            session.history_ref().first(),
-            Some(LlmMessage::System { content }) if content == "you are a math tutor"
-        ));
-    }
-
-    #[test]
-    fn test_ensure_system_prompt_replaces_changed_prompt() {
-        let mut session = AgentSession::new();
-        ensure_system_prompt(&mut session, "old prompt");
-        session.add_user("hi".to_string());
-        ensure_system_prompt(&mut session, "new prompt");
-        assert!(matches!(
-            session.history_ref().first(),
-            Some(LlmMessage::System { content }) if content == "new prompt"
-        ));
-    }
-
-    #[test]
-    fn test_ensure_system_prompt_skips_empty() {
-        let mut session = AgentSession::new();
-        ensure_system_prompt(&mut session, "");
-        assert!(session.history_ref().is_empty());
     }
 
     #[test]

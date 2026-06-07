@@ -154,12 +154,15 @@ impl OpenAiVendor {
             }
         }
 
-        messages.push(OpenAiMessageJson {
+        if messages.is_empty() {
+            messages.push(OpenAiMessageJson {
                 role: "user",
                 content: Some(req.input.clone()),
                 tool_call_id: None,
                 tool_calls: None,
             });
+        }
+
 
         let tools: Vec<serde_json::Value> = context
             .tools()
@@ -225,11 +228,6 @@ impl OpenAiVendor {
             }
         }
 
-        let leading_system = messages
-            .first()
-            .filter(|m| m.role == "system")
-            .and_then(|m| m.content.as_deref());
-        
         messages.insert(
                 0,
                 OpenAiMessageJson {

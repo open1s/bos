@@ -139,12 +139,14 @@ impl OpenRouterVendor {
             }
         };
 
-        messages.push(OpenRouterMessageJson {
-                role: "user",
-                content: Some(req.input.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
+        if messages.is_empty() {
+            messages.push(OpenRouterMessageJson {
+                    role: "user",
+                    content: Some(req.input.clone()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+        }
 
         let tools: Vec<serde_json::Value> = context
             .tools()
