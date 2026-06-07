@@ -669,6 +669,7 @@ impl Agent {
         };
         let mut agent_session = AgentSession::new();
         agent_session.restore_messages(messages);
+        ensure_system_prompt(&mut agent_session, &self.config.system_prompt);
 
         let request = LlmRequest {
             model: self.config.model.clone(),
@@ -813,6 +814,7 @@ impl Agent {
         };
         let mut agent_session = AgentSession::new();
         agent_session.restore_messages(messages);
+        ensure_system_prompt(&mut agent_session, &self.config.system_prompt);
 
         let stream = async_stream::stream! {
             let mut engine = engine;
@@ -1134,6 +1136,23 @@ impl Clone for Agent {
 // Unit Tests
 // ============================================================================
 
+fn ensure_system_prompt(session: &mut AgentSession, system_prompt: &str) {
+    if system_prompt.is_empty() {
+        return;
+    }
+    if let Some(LlmMessage::System { content }) = session.history_ref().first() {
+        if content == system_prompt {
+            return;
+        }
+    }
+    let mut prefixed = Vec::with_capacity(session.history_ref().len() + 1);
+    prefixed.push(LlmMessage::System {
+        content: system_prompt.to_string(),
+    });
+    prefixed.extend_from_slice(session.history_ref());
+    session.restore_messages(prefixed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,6 +1296,49 @@ mod tests {
 
         assert_eq!(agent.config().name, "agent");
         assert_eq!(agent.config().model, "gpt-4");
+    }
+
+    #[test]
+    fn test_ensure_system_prompt_prepends_when_empty() {
+        let mut session = AgentSession::new();
+        ensure_system_prompt(&mut session, "you are a math tutor");
+        assert!(matches!(
+            session.history_ref().first(),
+            Some(LlmMessage::System { content }) if content == "you are a math tutor"
+        ));
+    }
+
+    #[test]
+    fn test_ensure_system_prompt_idempotent() {
+        let mut session = AgentSession::new();
+        ensure_system_prompt(&mut session, "you are a math tutor");
+        session.add_user("2+2?".to_string());
+        let len_before = session.history_ref().len();
+        ensure_system_prompt(&mut session, "you are a math tutor");
+        assert_eq!(session.history_ref().len(), len_before);
+        assert!(matches!(
+            session.history_ref().first(),
+            Some(LlmMessage::System { content }) if content == "you are a math tutor"
+        ));
+    }
+
+    #[test]
+    fn test_ensure_system_prompt_replaces_changed_prompt() {
+        let mut session = AgentSession::new();
+        ensure_system_prompt(&mut session, "old prompt");
+        session.add_user("hi".to_string());
+        ensure_system_prompt(&mut session, "new prompt");
+        assert!(matches!(
+            session.history_ref().first(),
+            Some(LlmMessage::System { content }) if content == "new prompt"
+        ));
+    }
+
+    #[test]
+    fn test_ensure_system_prompt_skips_empty() {
+        let mut session = AgentSession::new();
+        ensure_system_prompt(&mut session, "");
+        assert!(session.history_ref().is_empty());
     }
 
     #[test]

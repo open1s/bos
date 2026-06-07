@@ -108,19 +108,32 @@ pub struct StopOptions {
 pub struct AgentConfig {
   pub name: String,
   pub model: String,
+  #[napi(js_name = "baseUrl")]
   pub base_url: String,
+  #[napi(js_name = "apiKey")]
   pub api_key: String,
+  #[napi(js_name = "systemPrompt")]
   pub system_prompt: String,
   pub temperature: f64,
+  #[napi(js_name = "maxTokens")]
   pub max_tokens: Option<i32>,
+  #[napi(js_name = "timeoutSecs")]
   pub timeout_secs: i64,
+  #[napi(js_name = "maxSteps")]
   pub max_steps: Option<i64>,
+  #[napi(js_name = "circuitBreakerMaxFailures")]
   pub circuit_breaker_max_failures: Option<i32>,
+  #[napi(js_name = "circuitBreakerCooldownSecs")]
   pub circuit_breaker_cooldown_secs: Option<i64>,
+  #[napi(js_name = "rateLimitCapacity")]
   pub rate_limit_capacity: Option<i32>,
+  #[napi(js_name = "rateLimitWindowSecs")]
   pub rate_limit_window_secs: Option<i64>,
+  #[napi(js_name = "rateLimitMaxRetries")]
   pub rate_limit_max_retries: Option<i32>,
+  #[napi(js_name = "rateLimitRetryBackoffSecs")]
   pub rate_limit_retry_backoff_secs: Option<i64>,
+  #[napi(js_name = "rateLimitAutoWait")]
   pub rate_limit_auto_wait: Option<bool>,
 }
 
