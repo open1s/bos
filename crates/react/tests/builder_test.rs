@@ -99,6 +99,7 @@ fn test_builder_pattern() {
     impl LlmClient<LlmSession, LlmContext> for MockLlm {
         async fn complete(
             &self,
+            _persona: Option<String>,
             _request: LlmRequest,
             _session: &mut LlmSession,
             _context: &mut LlmContext,
@@ -124,6 +125,7 @@ fn test_builder_pattern() {
 
         async fn stream_complete(
             &self,
+            _persona: Option<String>,
             _request: LlmRequest,
             _session: &mut LlmSession,
             _context: &mut LlmContext,
@@ -211,6 +213,7 @@ fn test_message_log_input() {
     impl LlmClient<LlmSession, LlmContext> for MockLlmWithHistory {
         async fn complete(
             &self,
+            _persona: Option<String>,
             request: LlmRequest,
             _session: &mut LlmSession,
             _context: &mut LlmContext,
@@ -224,6 +227,7 @@ fn test_message_log_input() {
 
         async fn stream_complete(
             &self,
+            _persona: Option<String>,
             _request: LlmRequest,
             _session: &mut LlmSession,
             _context: &mut LlmContext,
@@ -282,6 +286,7 @@ fn test_react_with_request() {
     impl LlmClient<LlmSession, LlmContext> for MockLlmFullRequest {
         async fn complete(
             &self,
+            _persona: Option<String>,
             request: LlmRequest,
             _session: &mut LlmSession,
             _context: &mut LlmContext,
@@ -295,6 +300,7 @@ fn test_react_with_request() {
 
         async fn stream_complete(
             &self,
+            _persona: Option<String>,
             _request: LlmRequest,
             _session: &mut LlmSession,
             _context: &mut LlmContext,

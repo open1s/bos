@@ -851,6 +851,7 @@ mod tests {
     impl LlmClient<AgentSession, AgentReactContext> for MockLlm {
         async fn complete(
             &self,
+            _persona: Option<String>,
             _req: LlmRequest,
             _session: &mut AgentSession,
             _context: &mut AgentReactContext,
@@ -860,6 +861,7 @@ mod tests {
 
         async fn stream_complete(
             &self,
+            _persona: Option<String>,
             _req: LlmRequest,
             _session: &mut AgentSession,
             _context: &mut AgentReactContext,

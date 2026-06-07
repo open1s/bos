@@ -299,6 +299,7 @@ impl<A: ReActApp> ReActEngine<A> {
     /// Call LLM with optional resilience wrapper and retry on transient errors.
     pub async fn call_llm(
         &mut self,
+        persona: Option<String>,
         request: LlmRequest,
         session: &mut A::Session,
         context: &mut A::Context,
@@ -320,9 +321,9 @@ impl<A: ReActApp> ReActEngine<A> {
             let result = if let Some(resilience) = &self.resilience {
                 resilience.acquire().await.map_err(ReactError::from)?;
                 resilience.check_circuit().map_err(ReactError::from)?;
-                self.llm.complete(request.clone(), session, context).await
+                self.llm.complete(persona.clone(), request.clone(), session, context).await
             } else {
-                self.llm.complete(request.clone(), session, context).await
+                self.llm.complete(persona.clone(), request.clone(), session, context).await
             };
             info!(
                 "[TIMING] call_llm attempt {}: {:?}",
@@ -386,6 +387,7 @@ impl<A: ReActApp> ReActEngine<A> {
     /// to be executed immediately within the stream loop.
     pub async fn call_llm_stream(
         &self,
+        persona: Option<String>,
         request: LlmRequest,
         session: &mut A::Session,
         context: &mut A::Context,
@@ -397,9 +399,9 @@ impl<A: ReActApp> ReActEngine<A> {
             resilience.acquire().await.map_err(ReactError::from)?;
             resilience.check_circuit().map_err(ReactError::from)?;
 
-            self.llm.stream_complete(request, session, context).await
+            self.llm.stream_complete(persona.clone(), request, session, context).await
         } else {
-            self.llm.stream_complete(request, session, context).await
+            self.llm.stream_complete(persona.clone(), request, session, context).await
         };
 
         // Record outcome in circuit breaker so it learns from actual LLM results
@@ -426,6 +428,7 @@ impl<A: ReActApp> ReActEngine<A> {
     /// Returns the final thought text.
     async fn react_loop(
         &mut self,
+        persona: Option<String>,
         mut request: LlmRequest,
         session: &mut A::Session,
         context: &mut A::Context,
@@ -461,7 +464,7 @@ impl<A: ReActApp> ReActEngine<A> {
 
             let mut llm_response = match timeout(
                 Duration::from_secs(self.llm_timeout_secs),
-                self.call_llm(request.clone(), session, context),
+                self.call_llm(persona.clone(),request.clone(), session, context),
             )
             .await
             {
@@ -643,6 +646,7 @@ impl<A: ReActApp> ReActEngine<A> {
 
     pub async fn react(
         &mut self,
+        persona: Option<String>,
         request: LlmRequest,
         session: &mut A::Session,
         context: &mut A::Context,
@@ -656,13 +660,14 @@ impl<A: ReActApp> ReActEngine<A> {
 
         context.add_tool(load_skill_tool());
 
-        let result = self.react_loop(request, session, context).await?;
+        let result = self.react_loop(persona,request, session, context).await?;
 
         Ok(result)
     }
 
     pub fn react_stream<'a>(
         &'a mut self,
+        persona: Option<String>,
         request: LlmRequest,
         session: &'a mut A::Session,
         context: &'a mut A::Context,
@@ -700,7 +705,7 @@ impl<A: ReActApp> ReActEngine<A> {
                     }
                 }
 
-                let llm_stream = match self.call_llm_stream(request.clone(), session, context).await {
+                let llm_stream = match self.call_llm_stream(persona.clone(),request.clone(), session, context).await {
                     Ok(s) => s,
                     Err(e) => {
                         yield Err(ReactError::from(e));

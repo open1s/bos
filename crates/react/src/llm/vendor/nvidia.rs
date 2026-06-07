@@ -86,12 +86,13 @@ impl NvidiaVendor {
 
     fn convert_request(
         &self,
+        persona: Option<String>,
         req: &LlmRequest,
         session: &impl ReactSession,
         context: &impl crate::llm::types::ReactContext,
     ) -> NvidiaRequest {
         let mut messages = Vec::new();
-        let has_history = if let Some(history) = session.history() {
+        if let Some(history) = session.history() {
             for message in history.iter().cloned() {
                 let json_msg = match message {
                     crate::llm::LlmMessage::System { content } => NvidiaMessageJson {
@@ -141,19 +142,14 @@ impl NvidiaVendor {
                 };
                 messages.push(json_msg);
             }
-            !history.is_empty()
-        } else {
-            false
-        };
+        }
 
-        if !has_history {
-            messages.push(NvidiaMessageJson {
+        messages.push(NvidiaMessageJson {
                 role: "user",
                 content: Some(req.input.clone()),
                 tool_call_id: None,
                 tool_calls: None,
             });
-        }
 
         let tools: Vec<serde_json::Value> = context
             .tools()
@@ -178,6 +174,10 @@ impl NvidiaVendor {
 
         // Add skills, rules, instructions as system prompt
         let mut extra_system_prompt = String::new();
+
+        if let Some(p) = &persona {
+            extra_system_prompt.push_str(&format!("Persona: {}\n", p));
+        }
 
         if let Some(skills) = context.skills() {
             if !skills.is_empty() {
@@ -216,24 +216,15 @@ impl NvidiaVendor {
             }
         }
 
-        // Prepend extra system prompt to messages
-        let leading_system = messages
-            .first()
-            .filter(|m| m.role == "system")
-            .and_then(|m| m.content.as_deref());
-        if let Some(content) = super::merge_system_prompt(extra_system_prompt, leading_system) {
-            let meta = NvidiaMessageJson {
-                role: "system",
-                content: Some(content),
-                tool_call_id: None,
-                tool_calls: None,
-            };
-            if leading_system.is_some() {
-                messages[0] = meta;
-            } else {
-                messages.insert(0, meta);
-            }
-        }
+        messages.insert(
+                    0,
+                    NvidiaMessageJson {
+                        role: "system",
+                        content: Some(extra_system_prompt),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    },
+                );
 
         let max_tokens = req.max_tokens.unwrap_or(12800);
 
@@ -251,6 +242,7 @@ impl NvidiaVendor {
 
     fn build_stream_request(
         &self,
+        persona: Option<String>,
         mut req: LlmRequest,
         session: &impl ReactSession,
         context: &impl crate::llm::types::ReactContext,
@@ -259,7 +251,7 @@ impl NvidiaVendor {
             req.model = self.model.clone();
         }
 
-        let mut nvidia_req = self.convert_request(&req, session, context);
+        let mut nvidia_req = self.convert_request(persona, &req, session, context);
         nvidia_req.stream = Some(true);
         nvidia_req
     }
@@ -271,6 +263,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 {
     async fn complete(
         &self,
+        persona: Option<String>,
         mut request: LlmRequest,
         session: &mut S,
         context: &mut C,
@@ -286,7 +279,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         context.notify_request(&request);
 
         let t0 = std::time::Instant::now();
-        let nvidia_req = self.convert_request(&request, session, context);
+        let nvidia_req = self.convert_request(persona, &request, session, context);
         info!("[TIMING] convert_request: {:?}", t0.elapsed());
 
         let url = format!("{}/chat/completions", endpoint);
@@ -341,6 +334,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
     async fn stream_complete(
         &self,
+        persona: Option<String>,
         mut request: LlmRequest,
         session: &mut S,
         context: &mut C,
@@ -355,7 +349,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         context.notify_request(&request);
 
-        let nvidia_req = self.build_stream_request(request, session, context);
+        let nvidia_req = self.build_stream_request(persona, request, session, context);
 
         info!(
             "Req: {}",
@@ -625,7 +619,7 @@ mod tests {
             top_k: None,
         };
         let result = match vendor
-            .complete(request, &mut LlmSession::new(), &mut ())
+            .complete(None, request, &mut LlmSession::new(), &mut ())
             .await
         {
             Ok(r) => r,

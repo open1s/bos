@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ctx = DummyContext::default();
 
     println!("Calling LLM with model: {}", req.model);
-    let result = router.complete(req, &mut session, &mut ctx).await;
+    let result = router.complete(None, req, &mut session, &mut ctx).await;
     match result {
         Ok(resp) => println!("Response: {:?}", resp),
         Err(e) => eprintln!("Error: {:?}", e),

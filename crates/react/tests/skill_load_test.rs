@@ -73,6 +73,7 @@ fn test_load_skill_added_to_tools_when_skills_exist() {
     impl LlmClient<LlmSession, LlmContext> for ToolCapturingLlm {
         async fn complete(
             &self,
+            _persona: Option<String>,
             _request: LlmRequest,
             _session: &mut LlmSession,
             context: &mut LlmContext,
@@ -85,6 +86,7 @@ fn test_load_skill_added_to_tools_when_skills_exist() {
 
         async fn stream_complete(
             &self,
+            _persona: Option<String>,
             _request: LlmRequest,
             _session: &mut LlmSession,
             _context: &mut LlmContext,
@@ -158,6 +160,7 @@ fn test_no_load_skill_when_no_skills() {
     impl LlmClient<LlmSession, LlmContext> for ToolCapturingLlm {
         async fn complete(
             &self,
+            _persona: Option<String>,
             _request: LlmRequest,
             _session: &mut LlmSession,
             context: &mut LlmContext,
@@ -170,6 +173,7 @@ fn test_no_load_skill_when_no_skills() {
 
         async fn stream_complete(
             &self,
+            _persona: Option<String>,
             _request: LlmRequest,
             _session: &mut LlmSession,
             _context: &mut LlmContext,

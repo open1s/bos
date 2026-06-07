@@ -138,7 +138,7 @@ async fn test_nvidia_vendor_with_config() {
     // Make a simple request
     let request = make_simple_request(&llm_config.model);
     let result = vendor
-        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
         .await;
 
     match result {
@@ -192,7 +192,7 @@ async fn test_nvidia_vendor_stream_with_config() {
     // Make a streaming request
     let request = make_simple_request(&llm_config.model);
     let stream_result = vendor
-        .stream_complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .stream_complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
         .await;
 
     match stream_result {
@@ -257,7 +257,7 @@ async fn test_nvidia_vendor_invalid_api_key() {
 
     let request = make_simple_request("nvidia/z-ai/glm4-9b");
     let result = vendor
-        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
         .await;
 
     // Should return an error (not panic)
@@ -278,7 +278,7 @@ async fn test_openrouter_vendor_invalid_api_key() {
 
     let request = make_simple_request("openrouter/meta-llama/llama-3.2-3b-instruct");
     let result = vendor
-        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
         .await;
 
     // Should return an error (not panic)
@@ -323,7 +323,7 @@ async fn test_nvidia_response_parsing() {
         top_k: None,
     };
     let result = match vendor
-        .complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
         .await
     {
         Ok(r) => r,
@@ -469,7 +469,7 @@ async fn test_nvidia_tool_calls_stream_with_config() {
     };
 
     let stream_result = vendor
-        .stream_complete(request, &mut LlmSession::new(), &mut LlmContext::default())
+        .stream_complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
         .await;
 
     match stream_result {

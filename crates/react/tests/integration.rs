@@ -95,6 +95,7 @@ fn make_text_response(content: String, is_final: bool) -> LlmResponse {
 impl LlmClient<LlmSession, LlmContext> for MockLlm {
     async fn complete(
         &self,
+        _persona: Option<String>,
         _request: LlmRequest,
         _session: &mut LlmSession,
         _context: &mut LlmContext,
@@ -113,6 +114,7 @@ impl LlmClient<LlmSession, LlmContext> for MockLlm {
 
     async fn stream_complete(
         &self,
+        _persona: Option<String>,
         _request: LlmRequest,
         _session: &mut LlmSession,
         _context: &mut LlmContext,

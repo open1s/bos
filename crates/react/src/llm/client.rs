@@ -14,6 +14,7 @@ pub trait LlmClient<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext
 {
     async fn complete(
         &self,
+        persona: Option<String>,
         req: LlmRequest,
         session: &mut S,
         context: &mut C,
@@ -21,6 +22,7 @@ pub trait LlmClient<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext
 
     async fn stream_complete(
         &self,
+        persona: Option<String>,
         req: LlmRequest,
         session: &mut S,
         context: &mut C,

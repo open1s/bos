@@ -86,20 +86,22 @@ struct ArcLlmClient(Arc<LlmProvider>);
 impl LlmClient<AgentSession, AgentReactContext> for ArcLlmClient {
     async fn complete(
         &self,
+        persona: Option<String>,
         req: LlmRequest,
         session: &mut AgentSession,
         context: &mut AgentReactContext,
     ) -> Result<ReactLlmResponse, ReactLlmError> {
-        self.0.complete(req, session, context).await
+        self.0.complete(persona, req, session, context).await
     }
 
     async fn stream_complete(
         &self,
+        persona: Option<String>,
         req: LlmRequest,
         session: &mut AgentSession,
         context: &mut AgentReactContext,
     ) -> Result<TokenStream, ReactLlmError> {
-        self.0.stream_complete(req, session, context).await
+        self.0.stream_complete(persona, req, session, context).await
     }
 
     fn supports_tools(&self) -> bool {
@@ -121,20 +123,22 @@ impl Default for LlmProvider {
 impl LlmClient<AgentSession, AgentReactContext> for LlmProvider {
     async fn complete(
         &self,
+        persona: Option<String>,
         req: LlmRequest,
         session: &mut AgentSession,
         context: &mut AgentReactContext,
     ) -> Result<ReactLlmResponse, ReactLlmError> {
-        self.inner.complete(req, session, context).await
+        self.inner.complete(persona, req, session, context).await
     }
 
     async fn stream_complete(
         &self,
+        persona: Option<String>,
         req: LlmRequest,
         session: &mut AgentSession,
         context: &mut AgentReactContext,
     ) -> Result<ReactTokenStream, ReactLlmError> {
-        self.inner.stream_complete(req, session, context).await
+        self.inner.stream_complete(persona, req, session, context).await
     }
 
     fn supports_tools(&self) -> bool {
@@ -1204,6 +1208,7 @@ mod tests {
     impl LlmClient<AgentSession, AgentReactContext> for MockLlm {
         async fn complete(
             &self,
+            _persona: Option<String>,
             _req: LlmRequest,
             _session: &mut AgentSession,
             _context: &mut AgentReactContext,
@@ -1213,6 +1218,7 @@ mod tests {
 
         async fn stream_complete(
             &self,
+            _persona: Option<String>,
             _req: LlmRequest,
             _session: &mut AgentSession,
             _context: &mut AgentReactContext,

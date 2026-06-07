@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Streaming: {} with model {}", req.input, req.model);
     println!();
 
-    let mut stream = router.stream_complete(req, &mut session, &mut ctx).await?;
+    let mut stream = router.stream_complete(None, req, &mut session, &mut ctx).await?;
 
     while let Some(token) = stream.next().await {
         match token {
