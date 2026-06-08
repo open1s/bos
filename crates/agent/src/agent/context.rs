@@ -5,7 +5,7 @@ use react::engine::ReactError;
 use react::llm::types::{ReactContext, ReactSession};
 use react::llm::vendor::ToolCall;
 use react::llm::{
-    Instruction, LlmMessage as Message, LlmRequest as ReactLlmRequest,
+    Content, ContentPart, Instruction, LlmMessage as Message, LlmRequest as ReactLlmRequest,
     LlmResponse as ReactLlmResponse, LlmTool, Rule, Skill,
 };
 use react::runtime::app::ReActApp;
@@ -13,6 +13,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::future::Future;
 use std::sync::Arc;
+
+fn content_to_string(content: &Content) -> String {
+    match content {
+        Content::Text(s) => s.clone(),
+        Content::Parts(parts) => serde_json::to_string(parts).unwrap_or_default(),
+    }
+}
+
+fn content_to_summary_string(content: &Content) -> String {
+    match content {
+        Content::Text(s) => s.clone(),
+        Content::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if let ContentPart::Text { text } = part {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
 
 /// AgentSession stores conversation history and session state for the ReAct engine.
 /// Implements ReactSession trait for integration with the react crate.
@@ -44,7 +68,7 @@ impl AgentSession {
     }
 
     pub fn add_user(&mut self, content: String) {
-        self.messages.push(Message::User { content });
+        self.messages.push(Message::User { content: Content::Text(content) });
         self.update_metadata();
     }
 
@@ -91,7 +115,7 @@ impl AgentSession {
                 Message::User { content } => {
                     target.push(OpenAiMessage {
                         role: "user".to_string(),
-                        content: Some(content.clone()),
+                        content: Some(content_to_string(content)),
                         tool_calls: None,
                         function_call: None,
                         reasoning_content: None,
@@ -229,9 +253,9 @@ impl AgentSession {
         let summary_input: String = removed
             .iter()
             .filter_map(|msg| match msg {
-                Message::System { content }
-                | Message::User { content }
-                | Message::Assistant { content } => Some(content.clone()),
+                Message::System { content } => Some(content.clone()),
+                Message::User { content } => Some(content_to_summary_string(content)),
+                Message::Assistant { content } => Some(content.clone()),
                 Message::AssistantToolCall { name, args, .. } => {
                     Some(format!("Tool call {}: {}", name, args))
                 }
@@ -609,7 +633,7 @@ impl MessageContext {
     }
 
     pub fn add_user(&mut self, content: String) {
-        self.messages.push(Message::User { content });
+        self.messages.push(Message::User { content: Content::Text(content) });
     }
 
     pub fn add_system(&mut self, profile: String) {
@@ -657,7 +681,7 @@ impl MessageContext {
                 Message::User { content } => {
                     target.push(OpenAiMessage {
                         role: "user".to_string(),
-                        content: Some(content.clone()),
+                        content: Some(content_to_string(content)),
                         tool_calls: None,
                         function_call: None,
                         reasoning_content: None,

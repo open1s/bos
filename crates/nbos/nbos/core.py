@@ -23,6 +23,10 @@ from nbos_native import PythonTool
 from nbos_native import HookEvent, HookDecision, HookContext
 
 from nbos.tool import ToolDef
+from nbos.content import Content as NbosContent
+
+# Import ContentPart for convenience
+from nbos.content import ContentPart, Binary
 
 
 DEFAULT_MODEL = "nvidia/meta/llama-3.1-8b-instruct"
@@ -309,23 +313,36 @@ class AgentBuilder:
 
         return Agent(self._inner, self._tools)
 
-    async def ask(self, prompt: str) -> str:
+    def _resolve_content(self, input_val: str | NbosContent) -> str:
+        """Convert input to string for Rust backend.
+
+        If input is a NbosContent, convert to JSON.
+        Otherwise return as-is.
+        """
+        if isinstance(input_val, NbosContent):
+            return input_val.to_json()
+        return input_val
+
+    async def ask(self, prompt: str | NbosContent) -> str:
         if not self._inner:
             await self.start()
-        return await self._inner.run_simple(prompt)
+        content = self._resolve_content(prompt)
+        return await self._inner.run_simple(content)
 
-    async def chat(self, message: str) -> str:
+    async def chat(self, message: str | NbosContent) -> str:
         return await self.ask(message)
 
-    async def react(self, task: str) -> str:
+    async def react(self, task: str | NbosContent) -> str:
         if not self._inner:
             await self.start()
-        return await self._inner.react(task)
+        content = self._resolve_content(task)
+        return await self._inner.react(content)
 
-    async def stream(self, task: str):
+    async def stream(self, task: str | NbosContent):
         if not self._inner:
             await self.start()
-        return await self._inner.stream(task)
+        content = self._resolve_content(task)
+        return await self._inner.stream(content)
 
 
 class Agent:
@@ -338,20 +355,33 @@ class Agent:
         self._inner = inner
         self._tools = tools
 
-    async def ask(self, prompt: str) -> str:
-        return await self._inner.run_simple(prompt)
+    def _resolve_content(self, input_val: str | NbosContent) -> str:
+        """Convert input to string for Rust backend.
 
-    async def run_simple(self, message: str) -> str:
+        If input is a NbosContent, convert to JSON.
+        Otherwise return as-is.
+        """
+        if isinstance(input_val, NbosContent):
+            return input_val.to_json()
+        return input_val
+
+    async def ask(self, prompt: str | NbosContent) -> str:
+        content = self._resolve_content(prompt)
+        return await self._inner.run_simple(content)
+
+    async def run_simple(self, message: str | NbosContent) -> str:
         return await self.ask(message)
 
-    async def chat(self, message: str) -> str:
+    async def chat(self, message: str | NbosContent) -> str:
         return await self.ask(message)
 
-    async def react(self, task: str) -> str:
-        return await self._inner.react(task)
+    async def react(self, task: str | NbosContent) -> str:
+        content = self._resolve_content(task)
+        return await self._inner.react(content)
 
-    async def stream(self, task: str):
-        return await self._inner.stream(task)
+    async def stream(self, task: str | NbosContent):
+        content = self._resolve_content(task)
+        return await self._inner.stream(content)
 
     @property
     def session(self) -> SessionManager:

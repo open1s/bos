@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use react::llm::Content;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LlmStage {
     PreRequest,
@@ -17,7 +19,7 @@ pub enum ToolStage {
 #[derive(Debug, Clone)]
 pub struct LlmRequestWrapper {
     pub model: String,
-    pub input: String,
+    pub input: Content,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub top_p: Option<f32>,

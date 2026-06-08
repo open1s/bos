@@ -62,16 +62,18 @@ impl AgentPlugin for TestPlugin {
         "TestPlugin"
     }
 
-    async fn on_llm_request(&self, request: LlmRequestWrapper) -> Option<LlmRequestWrapper> {
+async fn on_llm_request(&self, request: LlmRequestWrapper) -> Option<LlmRequestWrapper> {
         let mut calls = self.calls.lock().unwrap();
         calls.push("on_llm_request".to_string());
         println!("  [Plugin:on_llm_request] model={}", request.model);
+        let input_str = match &request.input {
+            react::llm::Content::Text(s) => s.clone(),
+            react::llm::Content::Parts(parts) => serde_json::to_string(parts).unwrap_or_default(),
+        };
         println!(
             "    input: {}",
-            &request.input[..request.input.len().min(100)]
+            &input_str[..input_str.len().min(100)]
         );
-        // Return Some to indicate we want to pass the request through
-        // Return None to intercept (but we want to pass through for demo)
         Some(request)
     }
 

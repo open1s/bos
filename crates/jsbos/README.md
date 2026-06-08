@@ -7,6 +7,7 @@ High-performance JavaScript bindings for [BrainOS](https://github.com/open1s/bos
 ## Features
 
 - **ReAct Agent** — Async agent with tool-calling capabilities, streaming responses, and automatic reasoning
+- **Multimodal Content** — Support for images, audio, and other binary content via unified `Binary` type
 - **Message Bus** — Publish/subscribe message bus for inter-agent communication
 - **Lifecycle Hooks** — Intercept and modify agent behavior at key points
 - **Plugin System** — Extend LLM requests/responses and tool execution
@@ -195,6 +196,92 @@ const addTool = new ToolDef(
   { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }  // schema
 );
 ```
+
+### Multimodal Content
+
+BrainOS supports images, audio, and other binary content through `Content`, `ContentPart`, and `Binary` classes.
+
+#### Creating Content
+
+```javascript
+import { Content, ContentPart, Binary, BinarySource } from '@open1s/jsbos';
+
+// Text only
+const textContent = Content.text('What is Python?');
+
+// Single image (URL)
+const imageContent = Content.image('https://example.com/photo.jpg');
+
+// Audio from base64 data
+const audioContent = Content.audio(base64Data, 'mp3');
+
+// Audio from URL
+const audioUrlContent = Content.audioUrl('https://example.com/audio.mp3', 'mp3');
+
+// Multi-part content (text + image + audio)
+const multiContent = Content.parts([
+    ContentPart.text('Describe this image and audio'),
+    ContentPart.image('https://example.com/photo.jpg'),
+    ContentPart.audio(base64Data, 'mp3'),
+]);
+```
+
+#### Using Content with Agent
+
+```javascript
+// Text
+const result = await agent.ask('What is Python?');
+
+// Text with image
+const content = Content.parts([
+    ContentPart.text('What is in this image?'),
+    ContentPart.image('https://example.com/photo.jpg'),
+]);
+const result = await agent.ask(content);
+
+// Text with audio
+const audioContent = Content.parts([
+    ContentPart.text('Transcribe this audio'),
+    ContentPart.audio(base64Data, 'wav'),
+]);
+const result = await agent.ask(audioContent);
+```
+
+#### Content API
+
+| Method | Description |
+|--------|-------------|
+| `Content.text(text)` | Simple text content |
+| `Content.image(url)` | Single image (URL) |
+| `Content.audio(data, format)` | Single audio (base64) |
+| `Content.audioUrl(url, format)` | Single audio (URL) |
+| `Content.parts([...])` | Multi-part content |
+
+#### ContentPart API
+
+| Method | Description |
+|--------|-------------|
+| `ContentPart.text(text)` | Create text part |
+| `ContentPart.image(url)` | Create image part (URL) |
+| `ContentPart.audio(data, format)` | Create audio part (base64) |
+| `ContentPart.audioUrl(url, format)` | Create audio part (URL) |
+| `ContentPart.binary(type, data)` | Create binary part |
+
+#### Binary / BinarySource
+
+The `Binary` class represents binary data with `content_type` and `source`:
+
+```javascript
+const binary = new Binary('image/jpeg', BinarySource.url('https://example.com/photo.jpg'));
+```
+
+| Method | Description |
+|--------|-------------|
+| `binary.contentType()` | Get content type (e.g., "image/jpeg") |
+| `binary.isImage()` | Check if image type |
+| `binary.isAudio()` | Check if audio type |
+| `BinarySource.url(data)` | Create URL source |
+| `BinarySource.base64(data)` | Create base64 source |
 
 ### Agent (Low-level API)
 

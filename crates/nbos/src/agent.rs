@@ -11,10 +11,80 @@ use futures::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
+use react::llm::{Content, ContentPart};
 use react::tool::registry::AsyncTool;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+
+fn py_value_to_content(value: &Bound<'_, PyAny>) -> PyResult<Content> {
+    let json = py_to_json(value)?;
+    Ok(json_to_content(&json))
+}
+
+fn json_to_content(json: &serde_json::Value) -> Content {
+    match json {
+        serde_json::Value::String(s) => Content::Text(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let parts: Vec<ContentPart> = arr
+                .iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect();
+            if parts.is_empty() {
+                Content::Text(json.to_string())
+            } else {
+                Content::Parts(parts)
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(part) = serde_json::from_value(serde_json::Value::Object(obj.clone())).ok() {
+                Content::Parts(vec![part])
+            } else {
+                Content::Text(json.to_string())
+            }
+        }
+        _ => Content::Text(json.to_string()),
+    }
+}
+
+fn content_to_json(content: &Content) -> serde_json::Value {
+    match content {
+        Content::Text(s) => serde_json::Value::String(s.clone()),
+        Content::Parts(parts) => {
+            let arr: Vec<serde_json::Value> = parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => serde_json::json!({"type": "text", "text": text}),
+                    ContentPart::Binary { binary } => {
+                        let url = binary.url();
+                        if binary.is_image() {
+                            serde_json::json!({
+                                "type": "image_url",
+                                "image_url": { "url": url }
+                            })
+                        } else if binary.is_audio() {
+                            serde_json::json!({
+                                "type": "audio_url",
+                                "audio_url": { "url": url }
+                            })
+                        } else {
+                            serde_json::json!({
+                                "type": "binary",
+                                "binary": { "url": url }
+                            })
+                        }
+                    }
+                })
+                .collect();
+            serde_json::Value::Array(arr)
+        }
+    }
+}
+
+fn content_to_py(py: Python<'_>, content: &Content) -> PyResult<Py<PyAny>> {
+    let json_value = content_to_json(content);
+    json_to_py(py, &json_value)
+}
 
 /// Python wrapper for LlmMessage
 #[pyclass(name = "LlmMessage", skip_from_py_object)]
@@ -56,7 +126,7 @@ impl PyLlmMessage {
             LlmMessage::User { content } => {
                 let dict = PyDict::new(py);
                 dict.set_item("role", "user")?;
-                dict.set_item("content", content)?;
+                let _ = dict.set_item("content", content_to_py(py, content)?);
                 Ok(dict.into_any())
             }
             LlmMessage::Assistant { content } => {
@@ -745,7 +815,8 @@ impl PyAgent {
         })
     }
 
-    fn react<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
+    fn react<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let task_content = py_value_to_content(&task.bind(py))?;
         let agent = {
             let guard = self
                 .inner
@@ -755,12 +826,13 @@ impl PyAgent {
         };
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let out = agent.react(&task).await.map_err(to_py_runtime_error)?;
+            let out = agent.react(task_content).await.map_err(to_py_runtime_error)?;
             Ok(out)
         })
     }
 
-    fn run_simple<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
+    fn run_simple<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let task_content = py_value_to_content(&task.bind(py))?;
         let agent = {
             let guard = self
                 .inner
@@ -770,12 +842,13 @@ impl PyAgent {
         };
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let out = agent.run_simple(&task).await.map_err(to_py_runtime_error)?;
+            let out = agent.run_simple(task_content).await.map_err(to_py_runtime_error)?;
             Ok(out)
         })
     }
 
-    fn stream<'py>(&self, py: Python<'py>, task: String) -> PyResult<Bound<'py, PyAny>> {
+    fn stream<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let task_content = py_value_to_content(&task.bind(py))?;
         let agent = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
 
@@ -788,7 +861,7 @@ impl PyAgent {
             let (tx, rx) = mpsc::channel::<Result<String, String>>(32);
 
             tokio::spawn(async move {
-                let mut _stream_placeholder_ = agent_clone.stream(&task);
+                let mut _stream_placeholder_ = agent_clone.stream(task_content);
                 while let Some(token_result) = _stream_placeholder_.next().await {
                     let item = match token_result {
                         Ok(StreamToken::Text(text)) => Ok(text),

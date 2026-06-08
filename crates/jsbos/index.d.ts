@@ -8,8 +8,8 @@ export declare class ExternalObject<T> {
 export declare class Agent {
   static create(config: AgentConfig): Promise<Agent>
   static createWithBus(config: AgentConfig, bus: ExternalObject<Session>): Promise<Agent>
-  runSimple(task: string): Promise<string>
-  react(task: string): Promise<string>
+  runSimple(task: string | Array<JsContent>): Promise<string>
+  react(task: string | Array<JsContent>): Promise<string>
   config(): any
   listTools(): Array<string>
   listAsyncTools(): Array<string>
@@ -28,7 +28,7 @@ export declare class Agent {
   listMcpPrompts(): Promise<Array<any>>
   rpcClient(endpoint: string, bus: ExternalObject<Session>): Promise<AgentRpcClient>
   asCallableServer(endpoint: string, bus: ExternalObject<Session>): Promise<AgentCallableServer>
-  stream(task: string, callback: ((err: Error | null, arg: any) => any)): Promise<string>
+  stream(task: string | Array<JsContent>, callback: ((err: Error | null, arg: any) => any)): Promise<string>
   getSessionJson(): string
   exportSession(): string
   restoreSessionJson(json: string): void
@@ -210,6 +210,15 @@ export declare const enum HookEvent {
 
 export declare function initTracing(): void
 
+export interface JsContent {
+  type: string
+  text?: string
+  contentType?: string
+  url?: string
+  base64?: string
+  name?: string
+}
+
 export interface LlmUsage {
   promptTokens: number
   completionTokens: number
@@ -370,6 +379,8 @@ export class AgentBuilder {
     mcp(namespace: any, command: any, args: any): this;
     mcpHttp(namespace: any, url: any): this;
     start(): Promise<this>;
+    _contentPartsToJsContentArray(input: any): any;
+    _resolveContent(input: any): any;
     ask(prompt: any): Promise<string>;
     runSimple(prompt: any): Promise<string>;
     react(task: any): Promise<string>;
@@ -567,4 +578,49 @@ export function createTool(name: any, description: any): (paramSchema: any) => {
     (callback: any): ToolDef;
     returns(returnSchema: any): (callback: any) => ToolDef;
 };
+export class Binary {
+    static fromBase64(contentType: any, data: any, name?: null): Binary;
+    static fromUrl(contentType: any, url: any, name?: null): Binary;
+    constructor(contentType: any, source: any, name?: null);
+    contentType: any;
+    source: any;
+    name: any;
+    isImage(): any;
+    isAudio(): any;
+    url(): any;
+    toJSON(): {
+        content_type: any;
+        source: {
+            url: any;
+            base64: any;
+        };
+    };
+}
+export class Content {
+    static text(text: any): Content;
+    static parts(parts: any): Content;
+    static image(url: any, name?: null): Content;
+    static audio(data: any, format?: string): Content;
+    static audioUrl(url: any, format?: string): Content;
+    constructor(parts?: null, text?: null);
+    _parts: any;
+    _text: any;
+    toJSON(): any;
+    toString(): string;
+}
+export class ContentPart {
+    static text(text: any): ContentPart;
+    static binary(contentType: any, data: any, name?: null): ContentPart;
+    static binaryUrl(contentType: any, url: any, name?: null): ContentPart;
+    static image(url: any, name?: null): ContentPart;
+    static audio(data: any, format?: string): ContentPart;
+    static audioUrl(url: any, format?: string): ContentPart;
+    constructor(type: any, data?: {});
+    type: any;
+    text: any;
+    binary: any;
+    toJSON(): {
+        type: any;
+    };
+}
 export { jsbos };

@@ -28,6 +28,7 @@ from nbos.bus import BusManager, Publisher, Subscriber
 from nbos.query import Query, Queryable
 from nbos.caller import Caller, Callable
 from nbos.config import Config
+from nbos.content import Content, ContentPart, Binary
 from nbos_native import (
     Agent as PyAgent,
     AgentCallableServer,
@@ -118,5 +119,9 @@ __all__ = [
     "BudgetStatus",
     "InitTracing",
     "init_tracing",
+    "Content",
+    "ContentPart",
+    "ImageUrlContent",
+    "InputAudioContent",
 ]
 __version__ = "2.1.1"

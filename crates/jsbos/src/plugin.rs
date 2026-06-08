@@ -10,6 +10,7 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use napi::Unknown;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
+use react::llm::Content;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,6 +22,26 @@ pub enum PluginStage {
   PostResponse,
   PreExecute,
   PostExecute,
+}
+
+fn json_to_content(json: &serde_json::Value) -> Content {
+    match json {
+        serde_json::Value::String(s) => Content::Text(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let parts: Vec<react::llm::ContentPart> = arr
+                .iter()
+                .filter_map(|v| {
+                    if let Ok(part) = serde_json::from_value(v.clone()) {
+                        Some(part)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Content::Parts(parts)
+        }
+        _ => Content::Text(json.to_string()),
+    }
 }
 
 #[napi(object)]
@@ -36,9 +57,10 @@ pub struct PluginLlmRequest {
 
 impl From<PluginLlmRequest> for LlmRequestWrapper {
   fn from(req: PluginLlmRequest) -> Self {
+    let json: serde_json::Value = serde_json::from_str(&req.input).unwrap_or_else(|_| serde_json::Value::String(req.input));
     LlmRequestWrapper {
       model: req.model,
-      input: req.input,
+      input: json_to_content(&json),
       temperature: req.temperature.map(|t| t as f32),
       max_tokens: req.max_tokens,
       top_p: req.top_p.map(|p| p as f32),
@@ -50,8 +72,14 @@ impl From<PluginLlmRequest> for LlmRequestWrapper {
 
 impl From<LlmRequestWrapper> for PluginLlmRequest {
   fn from(wrapper: LlmRequestWrapper) -> Self {
+    let input_json = match &wrapper.input {
+        Content::Text(s) => serde_json::Value::String(s.clone()),
+        Content::Parts(parts) => serde_json::Value::Array(
+            parts.iter().map(|p| serde_json::to_value(p).unwrap_or_default()).collect()
+        ),
+    };
     PluginLlmRequest {
-      input: wrapper.input,
+      input: input_json.to_string(),
       model: wrapper.model,
       temperature: wrapper.temperature.map(|t| t as f64),
       max_tokens: wrapper.max_tokens,

@@ -7,6 +7,7 @@ This guide provides a unified, consistent API for using BrainOS in Rust. The API
 1. [Installation](#installation)
 2. [Quick Start](#quick-start)
 3. [Core Concepts](#core-concepts)
+   - [Multimodal Content](#multimodal-content)
 4. [Agent API](#agent-api)
 5. [Tool Registration](#tool-registration)
 6. [Bus Communication](#bus-communication)
@@ -171,6 +172,105 @@ impl Tool for Calculator {
     }
 }
 ```
+
+### Multimodal Content
+
+BrainOS supports multimodal content (images, audio) through the `Content`, `ContentPart`, and `Binary` types.
+
+#### Creating Content
+
+```rust
+use agent::llm::content::{Content, ContentPart, Binary, BinarySource};
+
+// Simple text content
+let text_content = Content::text("What is Rust?");
+
+// Single image content (URL)
+let image_content = Content::image("https://example.com/photo.jpg");
+
+// Audio from base64 data
+let audio_content = Content::audio(base64_data, "mp3");
+
+// Audio from URL
+let audio_url_content = Content::audio_url("https://example.com/audio.mp3", "mp3");
+
+// Multi-part content (text + image + audio)
+let multi_content = Content::parts(vec![
+    ContentPart::text("Describe this image and audio"),
+    ContentPart::image("https://example.com/photo.jpg"),
+    ContentPart::audio(base64_data, "mp3"),
+]);
+```
+
+#### Using Content with Agent
+
+```rust
+// Send text
+let result = agent.ask("What is Rust?").await?;
+
+// Send text with image
+let image_content = Content::parts(vec![
+    ContentPart::text("What is in this image?"),
+    ContentPart::image("https://example.com/photo.jpg"),
+]);
+let result = agent.ask(image_content).await?;
+
+// Send text with audio
+let audio_content = Content::parts(vec![
+    ContentPart::text("Transcribe this audio"),
+    ContentPart::audio(base64_data, "wav"),
+]);
+let result = agent.ask(audio_content).await?;
+```
+
+#### Streaming Response
+
+Stream responses return structured tokens:
+
+```rust
+let stream = agent.stream("Tell me a story").await?;
+let mut stream = Arc::new(stream);
+
+while let Some(token) = stream.next().await {
+    match token {
+        StreamToken::Text { text } => print!("{}", text),
+        StreamToken::Reasoning { text } => eprint!("[thinking] {}", text),
+        StreamToken::ToolCall { name, args } => println!("Tool: {} - {:?}", name, args),
+        StreamToken::Done => println!("\n[Stream complete]"),
+        _ => {}
+    }
+}
+```
+
+#### Content Types
+
+| Type | Description |
+|------|-------------|
+| `Content` | Single or multi-part content for agent requests |
+| `ContentPart` | Individual part: Text, Binary (unified for images/audio) |
+| `Binary` | Binary data with `content_type` and `source` fields |
+| `BinarySource` | Source of binary: `Url(url)` or `Base64(data)` |
+
+#### ContentPart Variants
+
+| Variant | Description |
+|---------|-------------|
+| `ContentPart::text(text)` | Text part |
+| `ContentPart::image(url)` | Image part (URL) |
+| `ContentPart::audio(data, format)` | Audio part (base64) |
+| `ContentPart::audio_url(url, format)` | Audio part (URL) |
+| `ContentPart::binary(content_type, data)` | Generic binary part |
+
+#### Binary Serialization
+
+The `content_type` field determines how Binary is serialized for LLM APIs:
+
+| content_type prefix | Serialization |
+|---------------------|---------------|
+| `image/*` | `image_url` format (OpenAI-compatible) |
+| `audio/*` | `audio_url` or `audio` format (vendor-specific) |
+
+---
 
 ---
 

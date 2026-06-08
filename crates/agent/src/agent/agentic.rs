@@ -15,8 +15,8 @@ use std::sync::Arc;
 use react::engine::{ReActEngine, ReActEngineBuilder};
 use react::llm::vendor::{LlmRouter, NvidiaVendor, OpenRouterVendor};
 use react::llm::{
-    LlmError as ReactLlmError, LlmResponse as ReactLlmResponse, TokenStream as ReactTokenStream,
-    TokenStream,
+    Content, LlmError as ReactLlmError, LlmResponse as ReactLlmResponse,
+    TokenStream as ReactTokenStream, TokenStream,
 };
 use react::tool::registry::{AsyncTool, ToolVariant};
 use react::tool::{Tool as ReactToolTrait, ToolError as ReactToolError};
@@ -643,7 +643,12 @@ impl Agent {
     /// Run the agent using ReAct engine. Uses the agent's existing session
     /// and writes results back after completion. Session is not locked during
     /// engine execution to avoid deadlocks with hooks.
-    pub async fn react(&self, task: &str) -> Result<String, AgentError> {
+    ///
+    /// Supports multimodal input via `Content`:
+    /// - `Content::text("string")` for simple text
+    /// - `Content::parts([ContentPart::text(...), ContentPart::image(...)])` for multimodal
+    pub async fn react(&self, task: impl Into<Content>) -> Result<String, AgentError> {
+        let task_content = task.into();
         let wall_start = std::time::Instant::now();
 
         let (mut engine, mut context) = {
@@ -676,7 +681,7 @@ impl Agent {
 
         let request = LlmRequest {
             model: self.config.model.clone(),
-            input: task.to_string(),
+            input: task_content,
             temperature: Some(self.config.temperature),
             max_tokens: self.config.max_tokens,
             ..Default::default()
@@ -773,7 +778,7 @@ impl Agent {
     }
 
     /// Run the agent (delegates to react with session + hooks via AgentReActApp).
-    pub async fn run_simple(&self, task: &str) -> Result<String, AgentError> {
+    pub async fn run_simple(&self, task: impl Into<Content>) -> Result<String, AgentError> {
         self.react(task).await
     }
 
@@ -782,9 +787,9 @@ impl Agent {
     /// until final response from LLM.
     pub fn stream(
         &self,
-        task: &str,
+        task: impl Into<Content>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send + '_>> {
-        let task_str = task.to_string();
+        let task_content = task.into();
 
         let cached_engine = {
             let mut cache = self.engine_cache.lock().unwrap();
@@ -824,7 +829,7 @@ impl Agent {
 
             let request = LlmRequest {
                 model: self.config.model.clone(),
-                input: task_str.clone(),
+                input: task_content,
                 temperature: Some(self.config.temperature),
                 max_tokens: self.config.max_tokens,
                 ..Default::default()
@@ -1427,7 +1432,7 @@ mod tests {
         let mut agent = Agent::new(config, Arc::new(provider));
 
         agent.add_message(react::llm::LlmMessage::User {
-            content: "Hello".to_string(),
+            content: react::llm::Content::text("Hello"),
         });
 
         let state = agent.session_state();
@@ -1442,7 +1447,7 @@ mod tests {
         let mut agent = Agent::new(config, Arc::new(provider));
 
         agent.add_message(react::llm::LlmMessage::User {
-            content: "Hello".to_string(),
+            content: react::llm::Content::text("Hello"),
         });
         agent.add_message(react::llm::LlmMessage::assistant("Hi there!"));
 

@@ -7,6 +7,7 @@ High-performance Python bindings for [BrainOS](https://github.com/open1s/bos), a
 ## Features
 
 - **ReAct Agent** — Async agent with tool-calling capabilities, streaming responses, and automatic reasoning
+- **Multimodal Content** — Support for images, audio, and other binary content via unified `Binary` type
 - **Message Bus** — Publish/subscribe message bus for inter-agent communication
 - **Lifecycle Hooks** — Intercept and modify agent behavior at key points
 - **Plugin System** — Extend LLM requests/responses and tool execution
@@ -176,6 +177,76 @@ multiply = ToolDef(
     parameters={"a": {"type": "number"}, "b": {"type": "number"}},
 )
 ```
+
+### Multimodal Content
+
+BrainOS supports images, audio, and other binary content through `Content`, `ContentPart`, and `Binary` classes.
+
+#### Creating Content
+
+```python
+from nbos.content import Content, ContentPart
+
+# Text only
+text_content = Content.text("What is Python?")
+
+# Single image (URL)
+image_content = Content.image("https://example.com/photo.jpg")
+
+# Audio from base64 data or bytes
+audio_content = Content.audio(base64_data, "mp3")
+audio_content = Content.audio(b"raw_bytes", "wav")
+
+# Audio from URL
+audio_url_content = Content.audio_url("https://example.com/audio.mp3", "mp3")
+
+# Multi-part content (text + image + audio)
+multi_content = Content.parts([
+    ContentPart.text("Describe this image and audio"),
+    ContentPart.image("https://example.com/photo.jpg"),
+    ContentPart.audio(base64_data, "mp3"),
+])
+```
+
+#### Using Content with Agent
+
+```python
+# Text
+result = await agent.ask("What is Python?")
+
+# Text with image
+content = Content.parts([
+    ContentPart.text("What is in this image?"),
+    ContentPart.image("https://example.com/photo.jpg"),
+])
+result = await agent.ask(content)
+
+# Text with audio
+audio_content = Content.parts([
+    ContentPart.text("Transcribe this audio"),
+    ContentPart.audio(base64_data, "wav"),
+])
+result = await agent.ask(audio_content)
+```
+
+#### Content API
+
+| Method | Description |
+|--------|-------------|
+| `Content.text(text)` | Simple text content |
+| `Content.image(url)` | Single image (URL) |
+| `Content.audio(data, format)` | Single audio (base64 or bytes) |
+| `Content.audio_url(url, format)` | Single audio (URL) |
+| `Content.parts([...])` | Multi-part content |
+
+#### ContentPart API
+
+| Method | Description |
+|--------|-------------|
+| `ContentPart.text(text)` | Create text part |
+| `ContentPart.image(url)` | Create image part (URL) |
+| `ContentPart.audio(data, format)` | Create audio part (base64 or bytes) |
+| `ContentPart.audio_url(url, format)` | Create audio part (URL) |
 
 ### AgentConfig
 

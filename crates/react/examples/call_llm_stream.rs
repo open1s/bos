@@ -1,7 +1,7 @@
 use config::ConfigLoader;
 use futures::StreamExt;
 use react::llm::vendor::{LlmRouter, NvidiaVendor, OpenRouterVendor};
-use react::llm::{LlmClient, LlmMessage, LlmRequest, ReactContext, ReactSession};
+use react::llm::{Content, LlmClient, LlmMessage, LlmRequest, ReactContext, ReactSession};
 
 #[derive(Default)]
 struct DummySession;
@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let req = LlmRequest {
         model: model.clone(),
-        input: "Count from 1 to 5, one number per line".into(),
+        input: Content::text("Count from 1 to 5, one number per line"),
         temperature: Some(0.7),
         max_tokens: Some(100),
         top_p: None,
@@ -114,7 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session = DummySession::default();
     let mut ctx = DummyContext::default();
 
-    println!("Streaming: {} with model {}", req.input, req.model);
+    let input_str = match &req.input {
+        react::llm::Content::Text(s) => s.clone(),
+        react::llm::Content::Parts(parts) => serde_json::to_string(parts).unwrap_or_default(),
+    };
+    println!("Streaming: {} with model {}", input_str, req.model);
     println!();
 
     let mut stream = router.stream_complete(None, req, &mut session, &mut ctx).await?;

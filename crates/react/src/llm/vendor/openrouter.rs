@@ -11,8 +11,8 @@ use reqwest::Client;
 use serde::Serialize;
 
 use crate::llm::{
-    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, ReactContext, ReactSession,
-    StreamToken, TokenStream, VendorBuilderError,
+    Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse,
+    LlmResponseResult, ReactContext, ReactSession, StreamToken, TokenStream, VendorBuilderError,
 };
 
 pub struct OpenRouterVendor {
@@ -39,11 +39,56 @@ struct OpenRouterRequest {
 struct OpenRouterMessageJson {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCallJson>>,
+}
+
+fn serialize_content(content: &Content) -> serde_json::Value {
+    fn serialize_part(part: &ContentPart) -> serde_json::Value {
+        match part {
+            ContentPart::Text { text } => serde_json::json!({
+                "type": "text",
+                "text": text
+            }),
+            ContentPart::Binary { binary } => {
+                let url = binary.url();
+                if binary.is_image() {
+                    serde_json::json!({
+                        "type": "image_url",
+                        "image_url": { "url": url }
+                    })
+                } else if binary.is_audio() {
+                    serde_json::json!({
+                        "type": "audio_url",
+                        "audio_url": { "url": url }
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "binary",
+                        "binary": { "url": url }
+                    })
+                }
+            }
+        }
+    }
+
+    match content {
+        Content::Text(s) => {
+            if let Ok(parts) = serde_json::from_str::<Vec<ContentPart>>(s) {
+                serde_json::Value::Array(parts.iter().map(serialize_part).collect())
+            } else if let Ok(part) = serde_json::from_str::<ContentPart>(s) {
+                serde_json::Value::Array(vec![serialize_part(&part)])
+            } else {
+                serde_json::Value::String(s.clone())
+            }
+        }
+        Content::Parts(parts) => {
+            serde_json::Value::Array(parts.iter().map(serialize_part).collect())
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -92,19 +137,19 @@ impl OpenRouterVendor {
                 let json_msg = match message {
                     crate::llm::LlmMessage::System { content } => OpenRouterMessageJson {
                         role: "system",
-                        content: Some(content.clone()),
+                        content: Some(serde_json::Value::String(content.clone())),
                         tool_call_id: None,
                         tool_calls: None,
                     },
                     crate::llm::LlmMessage::User { content } => OpenRouterMessageJson {
                         role: "user",
-                        content: Some(content.clone()),
+                        content: Some(serialize_content(content)),
                         tool_call_id: None,
                         tool_calls: None,
                     },
                     crate::llm::LlmMessage::Assistant { content } => OpenRouterMessageJson {
                         role: "assistant",
-                        content: Some(content.clone()),
+                        content: Some(serde_json::Value::String(content.clone())),
                         tool_call_id: None,
                         tool_calls: None,
                     },
@@ -130,7 +175,7 @@ impl OpenRouterVendor {
                         content,
                     } => OpenRouterMessageJson {
                         role: "tool",
-                        content: Some(content.clone()),
+                        content: Some(serde_json::Value::String(content.clone())),
                         tool_call_id: Some(tool_call_id.clone()),
                         tool_calls: None,
                     },
@@ -142,7 +187,7 @@ impl OpenRouterVendor {
         if messages.is_empty() {
             messages.push(OpenRouterMessageJson {
                     role: "user",
-                    content: Some(req.input.clone()),
+                    content: Some(serialize_content(&req.input)),
                     tool_call_id: None,
                     tool_calls: None,
                 });
@@ -216,7 +261,7 @@ impl OpenRouterVendor {
             0,
             OpenRouterMessageJson {
                 role: "system",
-                content: Some(extra_system_prompt),
+                content: Some(serde_json::Value::String(extra_system_prompt)),
                 tool_call_id: None,
                 tool_calls: None,
             },
@@ -530,7 +575,7 @@ mod tests {
     use serde::Deserialize;
 
     use crate::llm::vendor::OpenRouterVendor;
-    use crate::llm::{LlmClient, LlmContext, LlmRequest, LlmSession};
+    use crate::llm::{Content, LlmClient, LlmContext, LlmRequest, LlmSession};
 
     #[tokio::test]
     async fn test_openrouter_vendor() {
@@ -581,7 +626,7 @@ mod tests {
 
         let request = LlmRequest {
             model: llm_config.model.clone(),
-            input: "What is 2+2?".to_string(),
+            input: Content::text("What is 2+2?"),
             temperature: None,
             max_tokens: None,
             top_p: None,

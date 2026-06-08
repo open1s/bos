@@ -83,7 +83,10 @@ const TIME_SCHEMA = {
 }
 
 async function chatWithTools(agent, userInput) {
-  return await agent.runSimple(userInput)
+  const content = typeof userInput === 'string'
+    ? [{ type: 'text', text: userInput }]
+    : userInput
+  return await agent.runSimple(content)
 }
 
 async function main() {

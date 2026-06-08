@@ -211,17 +211,21 @@ fn test_message_log_input() {
 
     #[async_trait]
     impl LlmClient<LlmSession, LlmContext> for MockLlmWithHistory {
-        async fn complete(
+async fn complete(
             &self,
             _persona: Option<String>,
             request: LlmRequest,
             _session: &mut LlmSession,
             _context: &mut LlmContext,
         ) -> LlmResponseResult {
+            let input_str = match &request.input {
+                react::llm::Content::Text(s) => s.clone(),
+                react::llm::Content::Parts(parts) => serde_json::to_string(parts).unwrap_or_default(),
+            };
             self.received_inputs
                 .lock()
                 .unwrap()
-                .push(request.input.clone());
+                .push(input_str);
             Ok(make_text_response("Hello back!".to_string(), true))
         }
 
@@ -257,7 +261,7 @@ fn test_message_log_input() {
     let mut session = LlmSession::default();
     let mut context = LlmContext::default();
     let mut request = LlmRequest::new("test");
-    request.input = "New message".to_string();
+    request.input = react::llm::Content::text("New message");
     let _result = rt
         .block_on(async { engine.react(None, request, &mut session, &mut context).await })
         .unwrap();
@@ -332,7 +336,7 @@ fn test_react_with_request() {
     let request = LlmRequest {
         model: "custom-model".to_string(),
         temperature: Some(0.9),
-        input: String::new(),
+        input: react::llm::Content::text(String::new()),
         top_p: None,
         top_k: None,
         max_tokens: None,

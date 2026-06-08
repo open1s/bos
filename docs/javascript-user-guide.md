@@ -7,6 +7,7 @@ This guide provides a unified, consistent API for using BrainOS in JavaScript/No
 1. [Installation](#installation)
 2. [Quick Start](#quick-start)
 3. [Core Concepts](#core-concepts)
+   - [Multimodal Content](#multimodal-content)
 4. [Agent API](#agent-api)
 5. [Tool Registration](#tool-registration)
 6. [Hooks](#hooks)
@@ -101,6 +102,100 @@ Tools are functions that the LLM can call. Use the `tool()` decorator:
 // Note: Due to JavaScript's nature, tools work slightly differently
 // See Tool Registration section for details
 ```
+
+### Multimodal Content
+
+BrainOS supports multimodal content (images, audio) through the `Content`, `ContentPart`, and `Binary` classes.
+
+#### Creating Content
+
+```javascript
+import { Content, ContentPart } from '@open1s/jsbos';
+
+// Simple text content
+const textContent = Content.text('What is Python?');
+
+// Single image content
+const imageContent = Content.image('https://example.com/photo.jpg');
+
+// Audio from base64 data
+const audioContent = Content.audio(base64Data, 'mp3');
+
+// Audio from URL
+const audioUrlContent = Content.audioUrl('https://example.com/audio.mp3', 'mp3');
+
+// Multi-part content (text + image + audio)
+const multiContent = Content.parts([
+    ContentPart.text('Describe this image and audio'),
+    ContentPart.image('https://example.com/photo.jpg'),
+    ContentPart.audio(base64Data, 'mp3'),
+]);
+```
+
+#### Using Content with Agent
+
+```javascript
+// Send text
+const result = await agent.ask('What is Python?');
+
+// Send text with image
+const imageContent = Content.parts([
+    ContentPart.text('What is in this image?'),
+    ContentPart.image('https://example.com/photo.jpg'),
+]);
+const result = await agent.ask(imageContent);
+
+// Send text with audio
+const audioContent = Content.parts([
+    ContentPart.text('Transcribe this audio'),
+    ContentPart.audio(base64Data, 'wav'),
+]);
+const result = await agent.ask(audioContent);
+```
+
+#### Streaming Response
+
+Stream responses with a callback that receives structured tokens:
+
+```javascript
+const result = await agent.stream('Tell me a story', (err, token) => {
+    if (err) { console.log('Error:', err.error || err); return; }
+    if (!token) return;
+    
+    // token can be a string or structured object
+    if (typeof token === 'string') {
+        process.stdout.write(token);
+    } else if (token.type === 'Text' && token.text) {
+        process.stdout.write(token.text);
+    } else if (token.type === 'ReasoningContent' && token.text) {
+        process.stderr.write('[thinking] ' + token.text);
+    } else if (token.type === 'ToolCall') {
+        console.log('Tool:', token.name, token.args);
+    } else if (token.type === 'Done') {
+        console.log('\n[Stream complete]');
+    }
+});
+```
+
+#### ContentPart API
+
+| Method | Description |
+|--------|-------------|
+| `ContentPart.text(text)` | Create text part |
+| `ContentPart.image(url)` | Create image part (URL) |
+| `ContentPart.audio(data, format)` | Create audio part (base64) |
+| `ContentPart.audioUrl(url, format)` | Create audio part (URL) |
+| `ContentPart.binary(type, data)` | Create binary part |
+
+#### Content API
+
+| Method | Description |
+|--------|-------------|
+| `Content.text(text)` | Simple text content |
+| `Content.image(url)` | Single image (URL) |
+| `Content.audio(data, format)` | Single audio (base64) |
+| `Content.audioUrl(url, format)` | Single audio (URL) |
+| `Content.parts([...])` | Multi-part content |
 
 ---
 

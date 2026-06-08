@@ -5,7 +5,7 @@
 
 use config::ConfigLoader;
 use react::llm::vendor::{NvidiaVendor, OpenRouterVendor};
-use react::llm::{LlmClient, LlmContext, LlmRequest, LlmResponse, LlmSession};
+use react::llm::{Content, LlmClient, LlmContext, LlmRequest, LlmResponse, LlmSession};
 
 /// Configuration extracted from config file for LLM providers.
 #[derive(Debug, Clone)]
@@ -61,7 +61,7 @@ async fn load_config() -> Result<serde_json::Value, String> {
 fn make_simple_request(model: &str) -> LlmRequest {
     LlmRequest {
         model: model.to_string(),
-        input: "Say 'Hello, World!' in exactly those words.".to_string(),
+        input: Content::text("Say 'Hello, World!' in exactly those words."),
         temperature: Some(0.7),
         max_tokens: Some(50),
         top_p: None,
@@ -316,7 +316,7 @@ async fn test_nvidia_response_parsing() {
 
     let request = LlmRequest {
         model: llm_config.model.clone(),
-        input: "What is 2+2?".to_string(),
+        input: Content::text("What is 2+2?"),
         temperature: None,
         max_tokens: None,
         top_p: None,
@@ -457,11 +457,10 @@ async fn test_nvidia_tool_calls_stream_with_config() {
     // System prompt that encourages the model to use a tool
     let request = LlmRequest {
         model: llm_config.model.clone(),
-        input: "You have access to a tool called 'get_weather'. \
+        input: Content::text("You have access to a tool called 'get_weather'. \
         When the user asks about weather, you MUST call get_weather \
         with {\"location\": \"San Francisco, CA\"}. \
-        User question: What is the weather in San Francisco?"
-            .to_string(),
+        User question: What is the weather in San Francisco?"),
         temperature: Some(0.7),
         max_tokens: Some(256),
         top_p: None,

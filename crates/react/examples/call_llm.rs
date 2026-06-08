@@ -1,6 +1,6 @@
 use config::ConfigLoader;
 use react::llm::vendor::{LlmRouter, NvidiaVendor, OpenAiClient, OpenRouterVendor};
-use react::llm::{LlmClient, LlmMessage, LlmRequest, ReactContext, ReactSession};
+use react::llm::{Content, LlmClient, LlmMessage, LlmRequest, ReactContext, ReactSession};
 
 #[derive(Default)]
 struct DummySession;
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let req = LlmRequest {
         model: model.clone(),
-        input: "Say hello in 3 words".into(),
+        input: Content::text("Say hello in 3 words"),
         temperature: Some(0.7),
         max_tokens: Some(50),
         top_p: None,

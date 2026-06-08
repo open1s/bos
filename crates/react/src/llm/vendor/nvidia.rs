@@ -11,8 +11,8 @@ use reqwest::Client;
 use serde::Serialize;
 
 use crate::llm::{
-    LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult, ReactContext, ReactSession,
-    StreamToken, TokenStream, VendorBuilderError,
+    Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse,
+    LlmResponseResult, ReactContext, ReactSession, StreamToken, TokenStream, VendorBuilderError,
 };
 
 pub struct NvidiaVendor {
@@ -44,11 +44,56 @@ struct NvidiaRequest {
 struct NvidiaMessageJson {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCallJson>>,
+}
+
+fn serialize_content(content: &Content) -> serde_json::Value {
+    fn serialize_part(part: &ContentPart) -> serde_json::Value {
+        match part {
+            ContentPart::Text { text } => serde_json::json!({
+                "type": "text",
+                "text": text
+            }),
+            ContentPart::Binary { binary } => {
+                let url = binary.url();
+                if binary.is_image() {
+                    serde_json::json!({
+                        "type": "image_url",
+                        "image_url": { "url": url }
+                    })
+                } else if binary.is_audio() {
+                    serde_json::json!({
+                        "type": "audio_url",
+                        "audio_url": { "url": url }
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "binary",
+                        "binary": { "url": url }
+                    })
+                }
+            }
+        }
+    }
+
+    match content {
+        Content::Text(s) => {
+            if let Ok(parts) = serde_json::from_str::<Vec<ContentPart>>(s) {
+                serde_json::Value::Array(parts.iter().map(serialize_part).collect())
+            } else if let Ok(part) = serde_json::from_str::<ContentPart>(s) {
+                serde_json::Value::Array(vec![serialize_part(&part)])
+            } else {
+                serde_json::Value::String(s.clone())
+            }
+        }
+        Content::Parts(parts) => {
+            serde_json::Value::Array(parts.iter().map(serialize_part).collect())
+        }
+    }
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -97,19 +142,19 @@ impl NvidiaVendor {
                 let json_msg = match message {
                     crate::llm::LlmMessage::System { content } => NvidiaMessageJson {
                         role: "system",
-                        content: Some(content.clone()),
+                        content: Some(serde_json::Value::String(content.clone())),
                         tool_call_id: None,
                         tool_calls: None,
                     },
                     crate::llm::LlmMessage::User { content } => NvidiaMessageJson {
                         role: "user",
-                        content: Some(content.clone()),
+                        content: Some(serialize_content(content)),
                         tool_call_id: None,
                         tool_calls: None,
                     },
                     crate::llm::LlmMessage::Assistant { content } => NvidiaMessageJson {
                         role: "assistant",
-                        content: Some(content.clone()),
+                        content: Some(serde_json::Value::String(content.clone())),
                         tool_call_id: None,
                         tool_calls: None,
                     },
@@ -135,7 +180,7 @@ impl NvidiaVendor {
                         content,
                     } => NvidiaMessageJson {
                         role: "tool",
-                        content: Some(content.clone()),
+                        content: Some(serde_json::Value::String(content.clone())),
                         tool_call_id: Some(tool_call_id.clone()),
                         tool_calls: None,
                     },
@@ -147,7 +192,7 @@ impl NvidiaVendor {
         if messages.is_empty() {
             messages.push(NvidiaMessageJson {
                 role: "user",
-                content: Some(req.input.clone()),
+                content: Some(serialize_content(&req.input)),
                 tool_call_id: None,
                 tool_calls: None,
             });
@@ -222,7 +267,7 @@ impl NvidiaVendor {
                     0,
                     NvidiaMessageJson {
                         role: "system",
-                        content: Some(extra_system_prompt),
+                        content: Some(serde_json::Value::String(extra_system_prompt)),
                         tool_call_id: None,
                         tool_calls: None,
                     },
@@ -543,7 +588,7 @@ mod tests {
     use config::Section;
     use serde::Deserialize;
 
-    use crate::llm::{LlmClient, LlmRequest, LlmSession};
+    use crate::llm::{Content, LlmClient, LlmRequest, LlmSession};
     use crate::{
         llm::vendor::{NvidiaVendor, OpenAIExtractor},
         JsonExtractor, StreamExtractor,
@@ -614,7 +659,7 @@ mod tests {
 
         let request = LlmRequest {
             model: llm_config.model.clone(),
-            input: "What is 2+2?, must use add tool".to_string(),
+            input: Content::text("What is 2+2?, must use add tool"),
             temperature: None,
             max_tokens: None,
             top_p: None,

@@ -7,6 +7,7 @@ This guide provides a unified, consistent API for using BrainOS in Python. The A
 1. [Installation](#installation)
 2. [Quick Start](#quick-start)
 3. [Core Concepts](#core-concepts)
+   - [Multimodal Content](#multimodal-content)
 4. [Agent API](#agent-api)
 5. [Tool Registration](#tool-registration)
 6. [Bus Communication](#bus-communication)
@@ -84,6 +85,96 @@ Tools are functions that the LLM can call. Use the `@tool()` decorator:
 def function_name(param1: type, param2: type) -> return_type:
     return result
 ```
+
+### Multimodal Content
+
+BrainOS supports multimodal content (images, audio) through the `Content`, `ContentPart`, and `Binary` classes.
+
+#### Creating Content
+
+```python
+from nbos.content import Content, ContentPart
+
+# Simple text content
+text_content = Content.text("What is Python?")
+
+# Single image content
+image_content = Content.image("https://example.com/photo.jpg")
+
+# Audio from base64 data or bytes
+audio_content = Content.audio(base64_data, "mp3")
+audio_content = Content.audio(b"raw_bytes", "wav")
+
+# Audio from URL
+audio_url_content = Content.audio_url("https://example.com/audio.mp3", "mp3")
+
+# Multi-part content (text + image + audio)
+multi_content = Content.parts([
+    ContentPart.text("Describe this image and audio"),
+    ContentPart.image("https://example.com/photo.jpg"),
+    ContentPart.audio(base64_data, "mp3"),
+])
+```
+
+#### Using Content with Agent
+
+```python
+# Send text
+result = await agent.ask("What is Python?")
+
+# Send text with image
+image_content = Content.parts([
+    ContentPart.text("What is in this image?"),
+    ContentPart.image("https://example.com/photo.jpg"),
+])
+result = await agent.ask(image_content)
+
+# Send text with audio
+audio_content = Content.parts([
+    ContentPart.text("Transcribe this audio"),
+    ContentPart.audio(base64_data, "wav"),
+])
+result = await agent.ask(audio_content)
+```
+
+#### Streaming Response
+
+Stream responses return structured tokens:
+
+```python
+async for token in await agent.stream("Tell me a story"):
+    if token is None:
+        continue
+    # token is a dict with type field
+    if token.get("type") == "Text":
+        print(token.get("text", ""), end="", flush=True)
+    elif token.get("type") == "ReasoningContent":
+        print(f"[thinking] {token.get('text')}", end="", flush=True)
+    elif token.get("type") == "ToolCall":
+        print(f"Tool: {token.get('name')} - {token.get('args')}")
+    elif token.get("type") == "Done":
+        print("\n[Stream complete]")
+```
+
+#### ContentPart API
+
+| Method | Description |
+|--------|-------------|
+| `ContentPart.text(text)` | Create text part |
+| `ContentPart.image(url, detail=None, name=None)` | Create image part (URL) |
+| `ContentPart.audio(data, format="mp3")` | Create audio part (base64 or bytes) |
+| `ContentPart.audio_url(url, format="mp3")` | Create audio part (URL) |
+| `ContentPart.binary(content_type, data, name=None)` | Create binary part |
+
+#### Content API
+
+| Method | Description |
+|--------|-------------|
+| `Content.text(text)` | Simple text content |
+| `Content.image(url)` | Single image (URL) |
+| `Content.audio(data, format="mp3")` | Single audio (base64) |
+| `Content.audio_url(url, format="mp3")` | Single audio (URL) |
+| `Content.parts([...])` | Multi-part content |
 
 ---
 

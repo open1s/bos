@@ -55,6 +55,134 @@ class ToolResult {
   }
 }
 
+class Binary {
+  constructor(contentType, source, name = null) {
+    this.contentType = contentType;
+    this.source = source; // { type: 'url' | 'base64', data: string }
+    this.name = name;
+  }
+
+  static fromBase64(contentType, data, name = null) {
+    return new Binary(contentType, { type: 'base64', data }, name);
+  }
+
+  static fromUrl(contentType, url, name = null) {
+    return new Binary(contentType, { type: 'url', data: url }, name);
+  }
+
+  isImage() {
+    return this.contentType.startsWith('image/');
+  }
+
+  isAudio() {
+    return this.contentType.startsWith('audio/');
+  }
+
+  url() {
+    if (this.source.type === 'url') return this.source.data;
+    return `data:${this.contentType};base64,${this.source.data}`;
+  }
+
+  toJSON() {
+    const source = {};
+    if (this.source.type === 'url') {
+      source.url = this.source.data;
+    } else {
+      source.base64 = this.source.data;
+    }
+    const obj = { content_type: this.contentType, source };
+    if (this.name) obj.name = this.name;
+    return obj;
+  }
+}
+
+class ContentPart {
+  constructor(type, data = {}) {
+    this.type = type;
+    if (type === 'text') {
+      this.text = data.text || '';
+    } else if (type === 'binary') {
+      this.binary = data.binary instanceof Binary
+        ? data.binary
+        : new Binary(data.binary?.contentType || data.contentType || 'application/octet-stream',
+            data.binary?.source || { type: 'base64', data: data.binary?.source?.data || data.data || '' },
+            data.binary?.name || data.name);
+    }
+  }
+
+  static text(text) {
+    return new ContentPart('text', { text });
+  }
+
+  static binary(contentType, data, name = null) {
+    return new ContentPart('binary', { binary: Binary.fromBase64(contentType, data, name) });
+  }
+
+  static binaryUrl(contentType, url, name = null) {
+    return new ContentPart('binary', { binary: Binary.fromUrl(contentType, url, name) });
+  }
+
+  static image(url, name = null) {
+    return ContentPart.binaryUrl('image/jpeg', url, name);
+  }
+
+  static audio(data, format = 'mp3') {
+    return ContentPart.binary('audio/' + format, data);
+  }
+
+  static audioUrl(url, format = 'mp3') {
+    return ContentPart.binaryUrl('audio/' + format, url);
+  }
+
+  toJSON() {
+    const obj = { type: this.type };
+    if (this.type === 'text' && this.text !== undefined) obj.text = this.text;
+    if (this.type === 'binary' && this.binary) obj.binary = this.binary.toJSON();
+    return obj;
+  }
+}
+
+class Content {
+  constructor(parts = null, text = null) {
+    this._parts = parts;
+    this._text = text;
+  }
+
+  static text(text) {
+    return new Content(null, text);
+  }
+
+  static parts(parts) {
+    return new Content(parts);
+  }
+
+  static image(url, name = null) {
+    return Content.parts([ContentPart.binaryUrl('image/jpeg', url, name)]);
+  }
+
+  static audio(data, format = 'mp3') {
+    return Content.parts([ContentPart.binary('audio/' + format, data)]);
+  }
+
+  static audioUrl(url, format = 'mp3') {
+    return Content.parts([ContentPart.binaryUrl('audio/' + format, url)]);
+  }
+
+  toJSON() {
+    if (this._text !== null && this._text !== undefined) {
+      return { type: 'text', text: this._text };
+    }
+    if (this._parts !== null) {
+      return this._parts.map(p => p.toJSON ? p.toJSON() : p);
+    }
+    return '';
+  }
+
+  toString() {
+    return JSON.stringify(this.toJSON());
+  }
+}
+
 const ToolCategory = Object.freeze({
   FILE: 'file',
   SHELL: 'shell',
@@ -645,29 +773,55 @@ class AgentBuilder {
     return this;
   }
 
+  _contentPartsToJsContentArray(input) {
+    if (input instanceof Content) {
+      if (input._text !== null && input._text !== undefined) {
+        return [{ type: 'text', text: input._text }];
+      }
+      const parts = input.toJSON();
+      if (!Array.isArray(parts)) return [{ type: 'text', text: typeof parts === 'string' ? parts : JSON.stringify(parts) }];
+      return parts.map(p => {
+        if (p.type === 'text') {
+          return { type: 'text', text: p.text || '' };
+        }
+        const b = p.binary || {};
+        const source = b.source || {};
+        const result = { type: 'binary', contentType: b.content_type || 'image/jpeg', name: b.name };
+        if (source.type === 'url') result.url = source.data;
+        else if (source.type === 'base64') result.base64 = source.data;
+        else result.url = source.url || '';
+        return result;
+      });
+    }
+    if (typeof input === 'string') {
+      return [{ type: 'text', text: input }];
+    }
+    return input;
+  }
+
+  _resolveContent(input) {
+    return this._contentPartsToJsContentArray(input);
+  }
+
   async ask(prompt) {
     if (!this._inner) await this.start();
-    return this._inner.runSimple(prompt);
+    return this._inner.runSimple(this._resolveContent(prompt));
   }
 
   async runSimple(prompt) {
     if (!this._inner) await this.start();
-    return this._inner.runSimple(prompt);
+    return this._inner.runSimple(this._resolveContent(prompt));
   }
 
   async react(task) {
     if (!this._inner) await this.start();
-    return this._inner.react(task);
+    return this._inner.react(this._resolveContent(task));
   }
 
-  stream(task, onToken) {
-    if (!this._inner) throw new Error('Agent not started');
-    return this._inner.stream(task, (err, token) => {
-      if (err) {
-        onToken({ type: 'Error', error: err.message || String(err) });
-      } else if (token) {
-        onToken(token);
-      }
+  async stream(task, onToken) {
+    if (!this._inner) await this.start();
+    return this._inner.stream(this._resolveContent(task), (err, token) => {
+      onToken(err, token);
     });
   }
 
@@ -713,12 +867,40 @@ class AgentWrapperClass {
     this._tools = tools;
   }
 
+  _resolveContent(input) {
+    if (input instanceof Content) {
+      if (input._text !== null && input._text !== undefined) {
+        return [{ type: 'text', text: input._text }];
+      }
+      const parts = input.toJSON();
+      if (!Array.isArray(parts)) return [{ type: 'text', text: typeof parts === 'string' ? parts : JSON.stringify(parts) }];
+      return parts.map(p => {
+        if (p.type === 'text') {
+          return { type: 'text', text: p.text || '' };
+        }
+        const b = p.binary || {};
+        const source = b.source || {};
+        const result = { type: 'binary', contentType: b.content_type || 'image/jpeg', name: b.name };
+        if (source.type === 'url') result.url = source.data;
+        else if (source.type === 'base64') result.base64 = source.data;
+        else result.url = source.url || '';
+        return result;
+      });
+    }
+    if (typeof input === 'string') {
+      return [{ type: 'text', text: input }];
+    }
+    return input;
+  }
+
   async ask(prompt) {
-    return this._inner.runSimple(prompt);
+    const content = this._resolveContent(prompt);
+    return this._inner.runSimple(content);
   }
 
   async react(task) {
-    return this._inner.react(task);
+    const content = this._resolveContent(task);
+    return this._inner.react(content);
   }
 
   stop(options = {}) {
@@ -731,7 +913,8 @@ class AgentWrapperClass {
   }
 
   stream(task, onToken) {
-    return this._inner.stream(task, (err, token) => {
+    const content = this._resolveContent(task);
+    return this._inner.stream(content, (err, token) => {
       if (err) {
         onToken({ type: 'Error', error: err.message || String(err) });
       } else {
@@ -1279,4 +1462,7 @@ export {
   defineTool,
   defineTools,
   createTool,
+  Binary,
+  Content,
+  ContentPart,
 };

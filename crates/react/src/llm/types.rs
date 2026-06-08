@@ -9,6 +9,156 @@ pub trait ReactSession {
     fn history(&self) -> Option<&[LlmMessage]>;
 }
 
+// =============================================================================
+// Multimodal Content Types (for images, audio in chat messages)
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "binary")]
+    Binary { binary: Binary },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BinarySource {
+    #[serde(rename = "url")]
+    Url(String),
+    #[serde(rename = "base64")]
+    Base64(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Binary {
+    #[serde(rename = "content_type")]
+    pub content_type: String,
+    pub source: BinarySource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Binary {
+    pub fn from_base64(content_type: impl Into<String>, content: impl Into<String>, name: Option<String>) -> Self {
+        Self {
+            content_type: content_type.into(),
+            source: BinarySource::Base64(content.into()),
+            name,
+        }
+    }
+
+    pub fn from_url(content_type: impl Into<String>, url: impl Into<String>, name: Option<String>) -> Self {
+        Self {
+            content_type: content_type.into(),
+            source: BinarySource::Url(url.into()),
+            name,
+        }
+    }
+
+    pub fn is_image(&self) -> bool {
+        self.content_type.starts_with("image/")
+    }
+
+    pub fn is_audio(&self) -> bool {
+        self.content_type.starts_with("audio/")
+    }
+
+    pub fn url(&self) -> String {
+        match &self.source {
+            BinarySource::Url(url) => url.clone(),
+            BinarySource::Base64(b64_content) => {
+                format!("data:{};base64,{}", self.content_type, b64_content)
+            }
+        }
+    }
+
+    pub fn into_url(self) -> String {
+        match self.source {
+            BinarySource::Url(url) => url,
+            BinarySource::Base64(b64_content) => {
+                format!("data:{};base64,{}", self.content_type, b64_content)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl From<String> for Content {
+    fn from(s: String) -> Self {
+        if let Ok(parts) = serde_json::from_str::<Vec<ContentPart>>(&s) {
+            return Content::Parts(parts);
+        }
+        if let Ok(part) = serde_json::from_str::<ContentPart>(&s) {
+            return Content::Parts(vec![part]);
+        }
+        Content::Text(s)
+    }
+}
+
+impl<'a> From<&'a str> for Content {
+    fn from(s: &'a str) -> Self {
+        Content::from(s.to_string())
+    }
+}
+
+impl<'a> From<&'a String> for Content {
+    fn from(s: &'a String) -> Self {
+        Content::from(s.as_str())
+    }
+}
+
+impl Content {
+    pub fn text(text: impl Into<String>) -> Self {
+        Content::Text(text.into())
+    }
+
+    pub fn parts(parts: Vec<ContentPart>) -> Self {
+        Content::Parts(parts)
+    }
+
+    pub fn image(url: impl Into<String>) -> Self {
+        Content::binary("image url".to_string(), url.into())
+    }
+
+    pub fn audio(data: impl Into<String>, format: &str) -> Self {
+        Content::binary(format!("audio/{}", format), data)
+    }
+
+    pub fn audio_url(url: impl Into<String>, format: &str) -> Self {
+        Content::binary_url(format!("audio/{}", format), url)
+    }
+
+    pub fn binary(content_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Content::Parts(vec![ContentPart::Binary {
+            binary: Binary::from_base64(content_type, data, None),
+        }])
+    }
+
+    pub fn binary_url(content_type: impl Into<String>, url: impl Into<String>) -> Self {
+        Content::Parts(vec![ContentPart::Binary {
+            binary: Binary::from_url(content_type, url, None),
+        }])
+    }
+
+    pub fn is_text_only(&self) -> bool {
+        matches!(self, Content::Text(_))
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Content::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 pub trait ReactContext {
     fn session_id(&self) -> String;
     fn skills(&self) -> Option<&[Skill]>;
@@ -128,7 +278,7 @@ pub enum LlmMessage {
         content: String,
     },
     User {
-        content: String,
+        content: Content,
     },
     Assistant {
         content: String,
@@ -150,9 +300,24 @@ impl LlmMessage {
             content: content.into(),
         }
     }
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn user(content: impl Into<Content>) -> Self {
         Self::User {
             content: content.into(),
+        }
+    }
+    pub fn user_text(content: impl Into<String>) -> Self {
+        Self::User {
+            content: Content::Text(content.into()),
+        }
+    }
+    pub fn user_image(url: impl Into<String>) -> Self {
+        Self::User {
+            content: Content::image(url),
+        }
+    }
+    pub fn user_audio(data: impl Into<String>, format: &str) -> Self {
+        Self::User {
+            content: Content::audio(data, format),
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -179,9 +344,21 @@ impl LlmMessage {
     }
 }
 
-impl<T: Into<String>> From<T> for LlmMessage {
-    fn from(s: T) -> Self {
+impl From<String> for LlmMessage {
+    fn from(s: String) -> Self {
         Self::user(s)
+    }
+}
+
+impl<'a> From<&'a str> for LlmMessage {
+    fn from(s: &'a str) -> Self {
+        Self::user(s)
+    }
+}
+
+impl<'a> From<&'a String> for LlmMessage {
+    fn from(s: &'a String) -> Self {
+        Self::user(s.as_str())
     }
 }
 
@@ -308,7 +485,7 @@ impl ReactContext for LlmContext {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct LlmRequest {
     pub model: String,
-    pub input: String,
+    pub input: Content,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -323,7 +500,7 @@ impl LlmRequest {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
-            input: String::new(),
+            input: Content::Text(String::new()),
             temperature: Some(0.7),
             max_tokens: None,
             top_p: None,

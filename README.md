@@ -38,6 +38,7 @@ print(asyncio.run(BrainOS().agent('assistant').ask('say hi')))
 
 ```python
 from nbos import BrainOS, tool
+from nbos.content import Content, ContentPart
 
 @tool("Add two numbers")
 def add(a: int, b: int) -> int:
@@ -46,12 +47,19 @@ def add(a: int, b: int) -> int:
 async with BrainOS() as brain:
     agent = brain.agent("assistant").with_tools(add)
     result = await agent.ask("What is 2+2?")
+
+    # Multimodal: text + image
+    content = Content.parts([
+        ContentPart.text("What is in this image?"),
+        ContentPart.image("https://example.com/photo.jpg"),
+    ])
+    result = await agent.ask(content)
 ```
 
 ### JavaScript (@open1s/jsbos / brainos-js)
 
 ```javascript
-import { BrainOS, ToolDef } from '@open1s/jsbos';
+import { BrainOS, ToolDef, Content, ContentPart } from '@open1s/jsbos';
 
 // Create tool using ToolDef
 const addTool = new ToolDef(
@@ -68,6 +76,13 @@ const agent = await brain.agent('assistant')
   .register(addTool)
   .start();
 const result = await agent.runSimple('What is 2+2?');
+
+// Multimodal: text + image
+const content = Content.parts([
+    ContentPart.text('What is in this image?'),
+    ContentPart.image('https://example.com/photo.jpg'),
+]);
+const result2 = await agent.ask(content);
 ```
 
 ### Rust (agent crate)

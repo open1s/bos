@@ -10,8 +10,8 @@ export declare class ExternalObject<T> {
 export declare class Agent {
   static create(config: AgentConfig): Promise<Agent>
   static createWithBus(config: AgentConfig, bus: ExternalObject<Session>): Promise<Agent>
-  runSimple(task: string): Promise<string>
-  react(task: string): Promise<string>
+  runSimple(task: string | Array<JsContent>): Promise<string>
+  react(task: string | Array<JsContent>): Promise<string>
   config(): any
   listTools(): Array<string>
   listAsyncTools(): Array<string>
@@ -30,7 +30,7 @@ export declare class Agent {
   listMcpPrompts(): Promise<Array<any>>
   rpcClient(endpoint: string, bus: ExternalObject<Session>): Promise<AgentRpcClient>
   asCallableServer(endpoint: string, bus: ExternalObject<Session>): Promise<AgentCallableServer>
-  stream(task: string, callback: ((err: Error | null, arg: any) => any)): Promise<string>
+  stream(task: string | Array<JsContent>, callback: ((err: Error | null, arg: any) => any)): Promise<string>
   getSessionJson(): string
   exportSession(): string
   restoreSessionJson(json: string): void
@@ -211,6 +211,15 @@ export declare const enum HookEvent {
 }
 
 export declare function initTracing(): void
+
+export interface JsContent {
+  type: string
+  text?: string
+  contentType?: string
+  url?: string
+  base64?: string
+  name?: string
+}
 
 export interface LlmUsage {
   promptTokens: number

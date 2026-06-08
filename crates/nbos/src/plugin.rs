@@ -26,24 +26,51 @@ pub struct PyLlmRequestWrapper {
     pub input: String,
 }
 
+fn json_to_content(json: &serde_json::Value) -> react::llm::Content {
+    match json {
+        serde_json::Value::String(s) => react::llm::Content::Text(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let parts: Vec<react::llm::ContentPart> = arr
+                .iter()
+                .filter_map(|v| {
+                    if let Ok(part) = serde_json::from_value(v.clone()) {
+                        Some(part)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            react::llm::Content::Parts(parts)
+        }
+        _ => react::llm::Content::Text(json.to_string()),
+    }
+}
+
 impl From<&InnerLlmRequest> for PyLlmRequestWrapper {
     fn from(req: &InnerLlmRequest) -> Self {
+        let input_json = match &req.input {
+            react::llm::Content::Text(s) => serde_json::Value::String(s.clone()),
+            react::llm::Content::Parts(parts) => serde_json::Value::Array(
+                parts.iter().map(|p| serde_json::to_value(p).unwrap_or_default()).collect()
+            ),
+        };
         Self {
             model: req.model.clone(),
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             top_p: req.top_p,
             top_k: req.top_k,
-            input: req.input.clone(),
+            input: input_json.to_string(),
         }
     }
 }
 
 impl From<PyLlmRequestWrapper> for InnerLlmRequest {
     fn from(py_req: PyLlmRequestWrapper) -> Self {
+        let json: serde_json::Value = serde_json::from_str(&py_req.input).unwrap_or_else(|_| serde_json::Value::String(py_req.input));
         InnerLlmRequest {
             model: py_req.model,
-            input: py_req.input,
+            input: json_to_content(&json),
             temperature: py_req.temperature,
             max_tokens: py_req.max_tokens,
             top_p: py_req.top_p,
@@ -291,14 +318,17 @@ impl InnerPlugin for PythonPlugin {
                 }
                 val.extract::<PyLlmRequestWrapper>()
                     .ok()
-                    .map(|wrapped| InnerLlmRequest {
-                        model: wrapped.model,
-                        input: wrapped.input,
-                        temperature: wrapped.temperature,
-                        max_tokens: wrapped.max_tokens,
-                        top_p: wrapped.top_p,
-                        top_k: wrapped.top_k,
-                        metadata: request.metadata.clone(),
+                    .map(|wrapped| {
+                        let json: serde_json::Value = serde_json::from_str(&wrapped.input).unwrap_or_else(|_| serde_json::Value::String(wrapped.input.clone()));
+                        InnerLlmRequest {
+                            model: wrapped.model,
+                            input: json_to_content(&json),
+                            temperature: wrapped.temperature,
+                            max_tokens: wrapped.max_tokens,
+                            top_p: wrapped.top_p,
+                            top_k: wrapped.top_k,
+                            metadata: request.metadata.clone(),
+                        }
                     })
             },
         )

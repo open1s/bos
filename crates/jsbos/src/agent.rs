@@ -13,20 +13,69 @@ use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
 use agent::BashTool;
 use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
+use react::llm::{Content, ContentPart};
 use react::tool::registry::AsyncTool;
+
+fn js_value_to_json(value: &Unknown) -> napi::Result<serde_json::Value> {
+    let js_string = value.coerce_to_string()?;
+    let utf8 = js_string.into_utf8()?;
+    let string_val = utf8.as_str()?;
+    if let Ok(parsed) = serde_json::from_str(string_val) {
+        Ok(parsed)
+    } else {
+        Ok(serde_json::json!(string_val))
+    }
+}
+
+fn extract_json_value(val: Unknown<'_>) -> napi::Result<serde_json::Value> {
+    js_value_to_json(&val)
+}
+
+#[napi(object)]
+pub struct JsContent {
+    #[napi(js_name = "type")]
+    pub part_type: String,
+    pub text: Option<String>,
+    pub content_type: Option<String>,
+    pub url: Option<String>,
+    pub base64: Option<String>,
+    pub name: Option<String>,
+}
+
+impl From<JsContent> for ContentPart {
+    fn from(js: JsContent) -> Self {
+        match js.part_type.as_str() {
+            "text" => ContentPart::Text {
+                text: js.text.unwrap_or_default(),
+            },
+            _ => ContentPart::Binary {
+                binary: react::llm::Binary {
+                    content_type: js.content_type.unwrap_or_else(|| "image/jpeg".to_string()),
+                    source: if let Some(url) = js.url {
+                        react::llm::BinarySource::Url(url)
+                    } else {
+                        react::llm::BinarySource::Base64(js.base64.unwrap_or_default())
+                    },
+                    name: js.name,
+                },
+            },
+        }
+    }
+}
+
+fn vec_jscontent_to_content(parts: Vec<JsContent>) -> Content {
+    if parts.is_empty() {
+        Content::Text(String::new())
+    } else {
+        Content::Parts(parts.into_iter().map(Into::into).collect())
+    }
+}
 
 struct JSTool {
   name: String,
   description: String,
   schema: serde_json::Value,
   callback: Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>>>,
-}
-
-fn extract_json_value(val: Unknown<'_>) -> napi::Result<serde_json::Value> {
-  let js_string = val.coerce_to_string()?;
-  let utf8 = js_string.into_utf8()?;
-  let string_val = utf8.as_str()?;
-  Ok(serde_json::from_str(string_val).unwrap_or_else(|_| serde_json::json!(string_val)))
 }
 
 #[async_trait]
@@ -58,16 +107,16 @@ impl AsyncTool for JSTool {
     callback.call_with_return_value(
       Ok(JSAny(args_json)),
       ThreadsafeFunctionCallMode::NonBlocking,
-      move |result: std::result::Result<Unknown<'_>, napi::Error>, env| -> napi::Result<()> {
+      move |result: std::result::Result<Unknown<'static>, napi::Error>, env| -> napi::Result<()> {
         match result {
           Ok(val) => {
             let is_promise = val.is_promise().unwrap_or(false);
             if is_promise {
               let raw_env = env.raw();
               let raw_val = val.value().value;
-              let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
+              let promise_raw = PromiseRaw::<Unknown<'static>>::new(raw_env, raw_val);
               let tx = Arc::new(StdMutex::new(Some(tx)));
-              let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
+              let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'static>>| {
                 let json_val = extract_json_value(ctx.value)
                   .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
                 if let Some(tx) = tx.lock().unwrap().take() {
@@ -323,7 +372,7 @@ impl Agent {
   }
 
   #[napi]
-  pub async fn run_simple(&self, task: String) -> Result<String> {
+  pub async fn run_simple(&self, task: Either<String, Vec<JsContent>>) -> Result<String> {
     if self.is_running.load(Ordering::SeqCst) {
       return Err(Error::new(
         napi::Status::GenericFailure,
@@ -335,10 +384,14 @@ impl Agent {
       return Ok(String::new());
     }
 
+    let task_content = match task {
+      Either::A(s) => Content::Text(s),
+      Either::B(parts) => vec_jscontent_to_content(parts),
+    };
     self.is_running.store(true, Ordering::SeqCst);
     let result = {
       let guard = self.inner.lock().await;
-      guard.run_simple(&task).await
+      guard.run_simple(task_content).await
     };
     self.is_running.store(false, Ordering::SeqCst);
 
@@ -346,7 +399,7 @@ impl Agent {
   }
 
   #[napi]
-  pub async fn react(&self, task: String) -> Result<String> {
+  pub async fn react(&self, task: Either<String, Vec<JsContent>>) -> Result<String> {
     if self.is_running.load(Ordering::SeqCst) {
       return Err(Error::new(
         napi::Status::GenericFailure,
@@ -358,10 +411,14 @@ impl Agent {
       return Ok(String::new());
     }
 
+    let task_content = match task {
+      Either::A(s) => Content::Text(s),
+      Either::B(parts) => vec_jscontent_to_content(parts),
+    };
     self.is_running.store(true, Ordering::SeqCst);
     let result = {
       let guard = self.inner.lock().await;
-      guard.react(&task).await
+      guard.react(task_content).await
     };
     self.is_running.store(false, Ordering::SeqCst);
 
@@ -685,7 +742,7 @@ impl Agent {
   #[napi]
   pub async fn stream(
     &self,
-    task: String,
+    task: Either<String, Vec<JsContent>>,
     callback: ThreadsafeFunction<serde_json::Value>,
   ) -> Result<String> {
     if self.is_running.load(Ordering::SeqCst) {
@@ -699,13 +756,17 @@ impl Agent {
       return Ok(serde_json::json!({ "status": "stopped" }).to_string());
     }
 
+    let task_content = match task {
+      Either::A(s) => Content::Text(s),
+      Either::B(parts) => vec_jscontent_to_content(parts),
+    };
     self.is_running.store(true, Ordering::SeqCst);
 
     let result = async {
       let guard = self.inner.lock().await;
       let start = std::time::Instant::now();
 
-      let stream = guard.stream(&task);
+      let stream = guard.stream(task_content);
       use futures::StreamExt;
       futures::pin_mut!(stream);
       let mut had_error = false;
