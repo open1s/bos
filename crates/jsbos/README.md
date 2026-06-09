@@ -643,10 +643,29 @@ logTestMessage('Debug message');
 Create a config file at `~/.bos/conf/config.toml`:
 
 ```toml
+# OpenAI-compatible endpoint
 [global_model]
 api_key = "your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4"
+
+# NVIDIA NIM
+[llm.nvidia]
+api_key = "nv-..."
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "nvidia/llama-3.1-nemotron-70b-instruct"
+
+# Google AI (Gemini, etc.)
+[llm.google]
+api_key = "google-api-key"
+base_url = "https://generativelanguage.googleapis.com/v1"
+model = "gemini-pro"
+
+# OpenRouter
+[llm.openrouter]
+api_key = "or-..."
+base_url = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-3-haiku"
 
 [bus]
 mode = "peer"
@@ -665,12 +684,16 @@ See the [examples](./examples/) directory for complete examples:
 | Example | Description |
 |---------|-------------|
 | `brainos_demo.js` | High-level BrainOS API |
+| `demo_multimodal.js` | Multimodal (text, image, audio) content |
+| `demo_audio.js` | Audio content with LLM |
+| `demo_content_api.js` | Content API (text, images, audio) |
 | `agent_demo.js` | Agent with tools |
 | `agent_mcp_demo.js` | Agent with MCP servers |
 | `agent_stream_demo.js` | Streaming responses |
 | `agent_metrics_demo.js` | Performance metrics |
 | `agent_skill_demo.js` | Agent skills from directory |
 | `agent_resilience_demo.js` | Rate limiting + circuit breaker |
+| `session_demo.js` | Session save/restore/compact |
 | `bus_demo.js` | Pub/sub messaging |
 | `caller_demo.js` | RPC pattern |
 | `query_demo.js` | Request/response queries |

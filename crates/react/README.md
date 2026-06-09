@@ -1,13 +1,32 @@
-ReAct crate (Rust) - Reasoning + Acting loop scaffold
+# react — ReAct Reasoning + Acting Engine
 
-- Plan A: QA, tests, release readiness
-- Plan B: Production-ready scaffolding (robust prompts, persistent memory, multi-tool integration)
+> Core reasoning engine for the BrainOS agent framework. Implements the ReAct (Reason + Act) paradigm with multimodal content support, persistent memory, and pluggable LLM vendors.
 
-How to run tests
-- cargo test -p react --workspace
-- You can run the full workspace as a QA check: cargo test --workspace
+## Features
 
-Notes
-- This crate provides a minimal yet extensible ReAct-style engine with a pluggable tool registry.
-- Memory supports persistence to disk via save_to_file/load_from_file for cross-session memory.
-- Times out LLM calls to guard against long delays; timeout duration can be tuned in engine.rs.
+- **ReAct Loop** — Iterative reasoning + acting with tool integration
+- **Multimodal Content** — Text, images, and audio via `ContentPart::Text` / `ContentPart::Binary`
+- **Multiple LLM Vendors** — OpenAI, NVIDIA NIM, OpenRouter
+- **Streaming** — Token-level streaming for real-time responses
+- **Memory** — Persistent session memory with save/load via `save_to_file`/`load_from_file`
+- **Tool Registry** — Pluggable tool registry for LLM function calling
+- **Configurable Timeout** — LLM call timeout with tunable duration
+
+## Usage
+
+```rust
+use react::ReActEngine;
+
+let engine = ReActEngine::new(config);
+let response = engine.run("Hello").await?;
+```
+
+## Running Tests
+
+```bash
+# Test the react crate
+cargo test -p react
+
+# Full workspace tests
+cargo test --workspace
+```

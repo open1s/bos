@@ -41,6 +41,20 @@ Demonstrates:
 - Configuration of retry behavior
 - How circuit breaker opens after failures
 
+### demo_hooks_and_plugins
+
+Agent with lifecycle hooks and plugin system.
+
+```bash
+cargo run --example demo_hooks_and_plugins
+```
+
+Demonstrates:
+- Registering BeforeToolCall, AfterToolCall, BeforeLlmCall, AfterLlmCall hooks
+- Plugin system for intercepting LLM requests/responses and tool execution
+- Modifying LLM requests via plugins (temperature override)
+- Logging tool calls via hooks
+
 ## Key Concepts
 
 ### Without Resilience (basic_usage)

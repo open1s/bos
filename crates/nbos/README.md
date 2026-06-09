@@ -1,4 +1,4 @@
-# nbos — v2.2.8
+# nbos — v2.3.0
 
 > Python bindings for BrainOS — AI agent framework with ReAct engine
 
@@ -771,6 +771,7 @@ See the [examples](./examples/) directory:
 | `03_conversation.py` | Conversation history management |
 | `03_three_modes.py` | ask, react, stream modes |
 | `04_resilience.py` | Rate limiting + circuit breaker |
+| `demo_multimodal.py` | Multimodal (text, image, audio) content |
 | `demo_all_in_one.py` | Full feature demo |
 
 Run an example:

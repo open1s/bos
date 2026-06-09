@@ -54,6 +54,13 @@ async with BrainOS() as brain:
         ContentPart.image("https://example.com/photo.jpg"),
     ])
     result = await agent.ask(content)
+
+    # Multimodal: text + audio
+    audio_content = Content.parts([
+        ContentPart.text("Transcribe this audio"),
+        ContentPart.audio("/path/to/audio.wav", "wav"),
+    ])
+    result = await agent.ask(audio_content)
 ```
 
 ### JavaScript (@open1s/jsbos / brainos-js)
@@ -83,6 +90,13 @@ const content = Content.parts([
     ContentPart.image('https://example.com/photo.jpg'),
 ]);
 const result2 = await agent.ask(content);
+
+// Multimodal: text + audio
+const audioContent = Content.parts([
+    ContentPart.text('Transcribe this audio'),
+    ContentPart.audio('/path/to/audio.wav', 'wav'),
+]);
+const result3 = await agent.ask(audioContent);
 ```
 
 ### Rust (agent crate)
@@ -236,6 +250,9 @@ The `nbos` package (Python) and `@open1s/jsbos` (JavaScript) provide consistent 
 | Fluent config | `.with_model("gpt-4")` | `.model("gpt-4")` |
 | Register tools | `.with_tools(tool)` | `.register(toolDef)` |
 | Run | `await agent.ask("...")` | `await agent.runSimple("...")` |
+| Text content | `Content.text("...")` | `Content.text("...")` |
+| Image content | `ContentPart.image(url)` | `ContentPart.image(url)` |
+| Audio content | `ContentPart.audio(data, format)` | `ContentPart.audio(data, format)` |
 | Bus factory | `BusManager()` | `BusManager.create()` |
 
 ### Low-level Bindings
@@ -304,16 +321,29 @@ python3 crates/examples/mcp_http_server.py
 Create `~/.bos/conf/config.toml`:
 
 ```toml
+# OpenAI-compatible endpoint
 [global_model]
 api_key = "your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4"
 
-# Or use NVIDIA NIM
-[global_model]
+# NVIDIA NIM
+[llm.nvidia]
 api_key = "nv-..."
-base_url = "https://api.nvidia.com/v"
+base_url = "https://integrate.api.nvidia.com/v1"
 model = "nvidia/llama-3.1-nemotron-70b-instruct"
+
+# Google AI (Gemini, etc.)
+[llm.google]
+api_key = "google-api-key"
+base_url = "https://generativelanguage.googleapis.com/v1"
+model = "gemini-pro"
+
+# OpenRouter
+[llm.openrouter]
+api_key = "or-..."
+base_url = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-3-haiku"
 
 [bus]
 mode = "peer"
@@ -331,6 +361,19 @@ See the examples directories:
 - Python: `crates/nbos/examples/`
 - JavaScript: `crates/jsbos/examples/`
 - Rust: `crates/examples/` (includes `agent_skill_demo.rs`)
+
+### Multimodal Demos
+
+```bash
+# Python multimodal (text, image, audio)
+python crates/nbos/examples/demo_multimodal.py
+
+# JavaScript multimodal (text, image, audio)
+node crates/jsbos/examples/demo_multimodal.js
+
+# JavaScript audio demo
+node crates/jsbos/examples/demo_audio.js
+```
 
 ### MCP Demos
 
@@ -351,6 +394,15 @@ MIT OR Apache-2.0
 ---
 
 ## Changelog
+
+### v2.3.0 (2026-06-09)
+
+- **Added**: Audio support — `Content.audio()`, `ContentPart.audio()` for multimodal LLM calls
+- **Added**: LLM vendor configuration — `[llm.google]`, `[llm.nvidia]`, `[llm.openrouter]` in config
+- **Added**: `demo_audio.js` and `demo_multimodal.js` examples
+- **Added**: `demo_multimodal.py` Python example
+- **Improved**: Content API — unified `Content`/`ContentPart`/`Binary` classes for text, images, audio
+- **Fixed**: Content serialization for multimodal messages
 
 ### v2.2.0 (2026-05-18)
 
@@ -376,4 +428,4 @@ MIT OR Apache-2.0
 
 ---
 
-**Version**: 2.2.0 | **Last Updated**: 2026-05-18
+**Version**: 2.3.0 | **Last Updated**: 2026-06-09
