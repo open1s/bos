@@ -787,9 +787,10 @@ class AgentBuilder {
         const b = p.binary || {};
         const source = b.source || {};
         const result = { type: 'binary', contentType: b.content_type || 'image/jpeg', name: b.name };
-        if (source.type === 'url') result.url = source.data;
+        if (source.url !== undefined) result.url = source.url;
+        else if (source.base64 !== undefined) result.base64 = source.base64;
+        else if (source.type === 'url') result.url = source.data;
         else if (source.type === 'base64') result.base64 = source.data;
-        else result.url = source.url || '';
         return result;
       });
     }
@@ -881,9 +882,10 @@ class AgentWrapperClass {
         const b = p.binary || {};
         const source = b.source || {};
         const result = { type: 'binary', contentType: b.content_type || 'image/jpeg', name: b.name };
-        if (source.type === 'url') result.url = source.data;
+        if (source.url !== undefined) result.url = source.url;
+        else if (source.base64 !== undefined) result.base64 = source.base64;
+        else if (source.type === 'url') result.url = source.data;
         else if (source.type === 'base64') result.base64 = source.data;
-        else result.url = source.url || '';
         return result;
       });
     }

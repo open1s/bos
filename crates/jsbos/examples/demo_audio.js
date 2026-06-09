@@ -51,8 +51,6 @@ async function demoContentAudio() {
     console.log('='.repeat(60));
 
     const modelConfig = await getModelConfig();
-
-    console.log('Model Config:', modelConfig);
     const brain = new BrainOS({
         model: modelConfig.model,
         baseUrl: modelConfig.baseUrl,
@@ -78,7 +76,7 @@ async function demoContentAudio() {
     }
 
     content = Content.parts([
-        ContentPart.text('请准确识别下面中文语音内容'),
+        ContentPart.text('What does this audio say? Summarize briefly.'),
         ContentPart.audio(audioData, 'wav'),
     ]);
 
@@ -91,8 +89,6 @@ async function demoContentAudio() {
     } catch (err) {
         console.log('⚠️  Audio request failed:', err.message.slice(0, 150));
     }
-
-
 
     await brain.stop();
 }

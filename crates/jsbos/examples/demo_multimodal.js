@@ -300,14 +300,14 @@ async function main() {
     console.log('='.repeat(60));
 
 try {
-        await demoTextOnly();
-        await demoContentText();
-        await demoContentSingleImage();
-        await demoContentImageWithText();
-        await demoContentMultipleImages();
-        await demoContentCompareImages();
+        // await demoTextOnly();
+        // await demoContentText();
+        // await demoContentSingleImage();
+        // await demoContentImageWithText();
+        // await demoContentMultipleImages();
+        // await demoContentCompareImages();
         await demoContentAudio();
-        await demoStream();
+        // await demoStream();
 
         console.log('\n' + '='.repeat(60));
         console.log('✅ All demos completed!');
