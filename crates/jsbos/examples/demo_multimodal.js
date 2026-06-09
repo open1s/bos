@@ -306,7 +306,7 @@ try {
         // await demoContentImageWithText();
         // await demoContentMultipleImages();
         // await demoContentCompareImages();
-        await demoContentAudio();
+        // await demoContentAudio();
         // await demoStream();
 
         console.log('\n' + '='.repeat(60));
