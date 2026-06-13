@@ -124,10 +124,7 @@ impl McpClient {
     }
 
     pub async fn initialize(&self) -> Result<ServerCapabilities, McpError> {
-        if self
-            .initialized
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(McpError::InitFailed("Already initialized".into()));
         }
         let resp = self
@@ -145,7 +142,16 @@ impl McpClient {
                     }
                 })),
             )
-            .await?;
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                *self.state.lock().unwrap() = ConnectionState::Failed(e.to_string());
+                *self.last_error.lock().unwrap() = Some(e.to_string());
+                return Err(e);
+            }
+        };
 
         if let Some(error) = resp.error {
             return Err(McpError::InitFailed(error.message));
@@ -162,6 +168,8 @@ impl McpClient {
             serde_json::from_value(capabilities).map_err(|e| McpError::Protocol(e.to_string()))?;
 
         *self.capabilities.lock().unwrap() = Some(caps.clone());
+        self.initialized.store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.state.lock().unwrap() = ConnectionState::Connected;
 
         self.notify("notifications/initialized", None).await?;
 
@@ -229,6 +237,12 @@ impl McpClient {
                 Err(e)
             }
         }
+    }
+
+    pub fn mark_failed(&self, error: impl Into<String>) {
+        let msg = error.into();
+        *self.state.lock().unwrap() = ConnectionState::Failed(msg.clone());
+        *self.last_error.lock().unwrap() = Some(msg);
     }
 
     pub async fn health_check(&self) -> Result<bool, McpError> {
