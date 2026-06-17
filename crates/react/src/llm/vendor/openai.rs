@@ -122,7 +122,7 @@ impl OpenAiVendor {
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
         let client = Arc::new(
             Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                // .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("Failed to create HTTP client"),
         );
