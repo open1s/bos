@@ -46,6 +46,14 @@ struct OpenRouterMessageJson {
     tool_calls: Option<Vec<ToolCallJson>>,
 }
 
+fn serialize_args(args: &serde_json::Value) -> String {
+    if args.is_null() || !args.is_object() {
+        "{}".to_string()
+    } else {
+        args.to_string()
+    }
+}
+
 fn serialize_content(content: &Content) -> serde_json::Value {
     fn serialize_part(part: &ContentPart) -> serde_json::Value {
         match part {
@@ -166,7 +174,7 @@ impl OpenRouterVendor {
                             call_type: "function",
                             function: FunctionCallJson {
                                 name: name.clone(),
-                                arguments: args.to_string(),
+                                arguments: serialize_args(args),
                             },
                         }]),
                     },
@@ -421,6 +429,10 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
             let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
+            let mut pending_tool_calls: std::collections::HashMap<
+                u32,
+                (Option<String>, Option<String>, String),
+            > = std::collections::HashMap::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
@@ -449,28 +461,65 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }
                                     if let Some(calls) = &choice.delta.tool_calls {
                                         for call in calls {
+                                            let index = call.index.unwrap_or(0);
+                                            let id =
+                                                call.id.clone().filter(|s| !s.is_empty());
                                             let name = call
                                                 .function
                                                 .as_ref()
                                                 .and_then(|f| f.name.clone())
-                                                .unwrap_or_default();
-                                            let args_str = call
+                                                .filter(|s| !s.is_empty());
+                                            let args_delta = call
                                                 .function
                                                 .as_ref()
                                                 .and_then(|f| f.arguments.clone())
                                                 .unwrap_or_default();
+
+                                            let entry = pending_tool_calls
+                                                .entry(index)
+                                                .or_insert_with(|| (None, None, String::new()));
+                                            if let Some(n) = name {
+                                                entry.0 = Some(n);
+                                            }
+                                            if let Some(i) = id {
+                                                entry.1 = Some(i);
+                                            }
+                                            entry.2.push_str(&args_delta);
+
+                                            let args_str = entry.2.clone();
+                                            if let Ok(args_val) =
+                                                serde_json::from_str::<serde_json::Value>(
+                                                    &args_str,
+                                                )
+                                            {
+                                                let name = entry.0.clone();
+                                                let id = entry.1.clone();
+                                                if let (Some(ref n), Some(ref i)) = (name, id) {
+                                                    on_chunk.as_ref().map(|cb| cb(n));
+                                                    let _ = tx
+                                                        .send(Ok(StreamToken::ToolCall {
+                                                            name: n.clone(),
+                                                            args: args_val,
+                                                            id: Some(i.clone()),
+                                                        }))
+                                                        .await;
+                                                    pending_tool_calls.remove(&index);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if choice.finish_reason.as_deref() == Some("tool_calls") {
+                                        for (_, (name, id, args_str)) in
+                                            pending_tool_calls.drain()
+                                        {
+                                            let name = name.unwrap_or_default();
+                                            let id = id.unwrap_or_else(|| {
+                                                uuid::Uuid::new_v4().to_string()
+                                            });
                                             let args_val: serde_json::Value =
-                                                match serde_json::from_str(&args_str) {
-                                                    Ok(v) => v,
-                                                    Err(_) => serde_json::Value::Null,
-                                                };
-                                            let id = call
-                                                .id
-                                                .clone()
-                                                .filter(|s| !s.is_empty())
-                                                .unwrap_or_else(|| {
-                                                    uuid::Uuid::new_v4().to_string()
-                                                });
+                                                serde_json::from_str(&args_str)
+                                                    .unwrap_or(serde_json::json!({}));
                                             let _ = tx
                                                 .send(Ok(StreamToken::ToolCall {
                                                     name,
@@ -512,6 +561,19 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                         return;
                     }
                 }
+            }
+            for (_, (name, id, args_str)) in pending_tool_calls.drain() {
+                let name = name.unwrap_or_default();
+                let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let args_val: serde_json::Value =
+                    serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
+                let _ = tx
+                    .send(Ok(StreamToken::ToolCall {
+                        name,
+                        args: args_val,
+                        id: Some(id),
+                    }))
+                    .await;
             }
             let _ = tx.send(Ok(StreamToken::Done)).await;
         });

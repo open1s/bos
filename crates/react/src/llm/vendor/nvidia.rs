@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
@@ -86,13 +87,21 @@ fn serialize_content(content: &Content) -> serde_json::Value {
                 serde_json::Value::Array(parts.iter().map(serialize_part).collect())
             } else if let Ok(part) = serde_json::from_str::<ContentPart>(s) {
                 serde_json::Value::Array(vec![serialize_part(&part)])
-            } else {
-                serde_json::Value::String(s.clone())
-            }
-        }
-        Content::Parts(parts) => {
-            serde_json::Value::Array(parts.iter().map(serialize_part).collect())
-        }
+                                } else {
+                                    serde_json::Value::String(s.clone())
+                                }
+                            }
+                            Content::Parts(parts) => {
+                                serde_json::Value::Array(parts.iter().map(serialize_part).collect())
+                            }
+                        }
+                    }
+
+fn serialize_args(args: &serde_json::Value) -> String {
+    if args.is_null() || !args.is_object() {
+        "{}".to_string()
+    } else {
+        args.to_string()
     }
 }
 
@@ -171,7 +180,7 @@ impl NvidiaVendor {
                             call_type: "function",
                             function: FunctionCallJson {
                                 name: name.clone(),
-                                arguments: args.to_string(),
+                                arguments: serialize_args(args),
                             },
                         }]),
                     },
@@ -435,6 +444,11 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
             let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
+            // Accumulate streaming tool call deltas by index.
+            // OpenAI/NVIDIA streaming splits tool call arguments across chunks;
+            // we must accumulate until arguments form valid JSON.
+            let mut pending_tool_calls: HashMap<u32, (Option<String>, Option<String>, String)> =
+                HashMap::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
@@ -463,28 +477,74 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }
                                     if let Some(calls) = &choice.delta.tool_calls {
                                         for call in calls {
+                                            let index = call.index;
+                                            let id = call.id.clone().filter(|s| !s.is_empty());
                                             let name = call
                                                 .function
                                                 .as_ref()
                                                 .and_then(|f| f.name.clone())
-                                                .unwrap_or_default();
-                                            let args_str = call
+                                                .filter(|s| !s.is_empty());
+                                            let args_delta = call
                                                 .function
                                                 .as_ref()
                                                 .and_then(|f| f.arguments.clone())
                                                 .unwrap_or_default();
+
+                                            let entry = pending_tool_calls
+                                                .entry(index.unwrap_or(0))
+                                                .or_insert_with(|| (None, None, String::new()));
+                                            if let Some(n) = name {
+                                                entry.0 = Some(n);
+                                            }
+                                            if let Some(i) = id {
+                                                entry.1 = Some(i);
+                                            }
+                                            entry.2.push_str(&args_delta);
+
+                                            // Accumulated arguments form valid JSON → emit
+                                            let args_str = entry.2.clone();
+                                            if let Ok(args_val) = serde_json::from_str::<
+                                                serde_json::Value,
+                                            >(
+                                                &args_str
+                                            ) {
+                                                let name = entry.0.clone();
+                                                let id = entry.1.clone();
+                                                if let (
+                                                    Some(ref n),
+                                                    Some(ref i),
+                                                ) = (name, id)
+                                                {
+                                                    on_chunk
+                                                        .as_ref()
+                                                        .map(|cb| cb(n));
+                                                    let _ = tx
+                                                        .send(Ok(StreamToken::ToolCall {
+                                                            name: n.clone(),
+                                                            args: args_val,
+                                                            id: Some(i.clone()),
+                                                        }))
+                                                        .await;
+                                                    pending_tool_calls.remove(&index.unwrap_or(0));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Finish reason "tool_calls" → flush any pending
+                                    if choice.finish_reason.as_deref()
+                                        == Some("tool_calls")
+                                    {
+                                        for (_, (name, id, args_str)) in
+                                            pending_tool_calls.drain()
+                                        {
+                                            let name = name.unwrap_or_default();
+                                            let id = id.unwrap_or_else(|| {
+                                                uuid::Uuid::new_v4().to_string()
+                                            });
                                             let args_val: serde_json::Value =
-                                                match serde_json::from_str(&args_str) {
-                                                    Ok(v) => v,
-                                                    Err(_) => serde_json::Value::Null,
-                                                };
-                                            let id = call
-                                                .id
-                                                .clone()
-                                                .filter(|s| !s.is_empty())
-                                                .unwrap_or_else(|| {
-                                                    uuid::Uuid::new_v4().to_string()
-                                                });
+                                                serde_json::from_str(&args_str)
+                                                    .unwrap_or(serde_json::json!({}));
                                             let _ = tx
                                                 .send(Ok(StreamToken::ToolCall {
                                                     name,
@@ -526,6 +586,20 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                         return;
                     }
                 }
+            }
+            // Stream ended — flush any remaining pending tool calls
+            for (_, (name, id, args_str)) in pending_tool_calls.drain() {
+                let name = name.unwrap_or_default();
+                let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let args_val: serde_json::Value =
+                    serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
+                let _ = tx
+                    .send(Ok(StreamToken::ToolCall {
+                        name,
+                        args: args_val,
+                        id: Some(id),
+                    }))
+                    .await;
             }
             let _ = tx.send(Ok(StreamToken::Done)).await;
         });
@@ -593,6 +667,104 @@ mod tests {
         llm::vendor::{NvidiaVendor, OpenAIExtractor},
         JsonExtractor, StreamExtractor,
     };
+
+    #[test]
+    fn serialize_args_converts_null_to_empty_object() {
+        assert_eq!(super::serialize_args(&serde_json::Value::Null), "{}");
+    }
+
+    #[test]
+    fn serialize_args_passes_through_valid_object() {
+        let args = serde_json::json!({"location": "NYC"});
+        assert_eq!(super::serialize_args(&args), "{\"location\":\"NYC\"}");
+    }
+
+    #[test]
+    fn serialize_args_converts_non_object_to_empty() {
+        assert_eq!(super::serialize_args(&serde_json::Value::String("foo".into())), "{}");
+        assert_eq!(super::serialize_args(&serde_json::Value::Bool(true)), "{}");
+        assert_eq!(super::serialize_args(&serde_json::Value::Number(42.into())), "{}");
+    }
+
+    fn accumulate_tool_call(
+        pending: &mut std::collections::HashMap<
+            u32,
+            (Option<String>, Option<String>, String),
+        >,
+        emitted: &mut Vec<String>,
+        index: u32,
+        id: Option<String>,
+        name: Option<String>,
+        args_delta: &str,
+    ) {
+        let entry = pending.entry(index).or_insert_with(|| (None, None, String::new()));
+        if let Some(n) = name { entry.0 = Some(n); }
+        if let Some(i) = id { entry.1 = Some(i); }
+        entry.2.push_str(args_delta);
+
+        let args_str = entry.2.clone();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&args_str) {
+            if let (Some(ref n), Some(ref i)) = (entry.0.clone(), entry.1.clone()) {
+                emitted.push(format!("{}|{}|{}", n, i, v.to_string()));
+                pending.remove(&index);
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_accumulation_multiple_chunks_produce_single_tool_call() {
+        let mut pending: std::collections::HashMap<
+            u32,
+            (Option<String>, Option<String>, String),
+        > = std::collections::HashMap::new();
+        let mut emitted: Vec<String> = Vec::new();
+
+        accumulate_tool_call(&mut pending, &mut emitted, 0,
+            Some("call_abc".into()), Some("get_weather".into()), "");
+        assert!(emitted.is_empty());
+        assert_eq!(pending.len(), 1);
+
+        accumulate_tool_call(&mut pending, &mut emitted, 0,
+            None, None, "{\"loc");
+        assert!(emitted.is_empty());
+        assert_eq!(pending.len(), 1);
+
+        accumulate_tool_call(&mut pending, &mut emitted, 0,
+            None, None, "ation\": \"NYC\"}");
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].contains("get_weather"));
+        assert!(emitted[0].contains("NYC"));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn streaming_accumulation_flushes_on_finish_reason() {
+        // When finish_reason is tool_calls but args never complete,
+        // pending tool calls should still be flushed
+
+        let mut pending: std::collections::HashMap<
+            u32,
+            (Option<String>, Option<String>, String),
+        > = std::collections::HashMap::new();
+
+        // Accumulate a partial tool call
+        pending.insert(0, (Some("get_weather".into()), Some("call_abc".into()), "{\"loc".into()));
+
+        // Simulate finish_reason flush
+        let mut flushed: Vec<String> = Vec::new();
+        for (_, (name, id, args_str)) in pending.drain() {
+            let name = name.unwrap_or_default();
+            let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let args_val: serde_json::Value =
+                serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
+            flushed.push(format!("{}|{}|{}", name, id, args_val.to_string()));
+        }
+
+        assert_eq!(flushed.len(), 1, "flush on finish_reason");
+        assert!(flushed[0].contains("get_weather"), "name preserved on flush");
+        assert!(flushed[0].contains("{}"), "args fallback to empty object");
+        assert!(pending.is_empty(), "pending cleared after flush");
+    }
 
     #[test]
     fn test() {
