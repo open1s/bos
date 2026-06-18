@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-    llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor, StreamToolCallAccumulator},
+    llm::vendor::openaicompatible::{
+        ChatCompletionResponse, OpenAIExtractor, StreamToolCallAccumulator, sse_has_done_signal,
+    },
     utils::{JsonExtractor, StreamExtractor},
 };
 use async_trait::async_trait;
@@ -453,6 +455,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 match chunk_result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes).to_string();
+
                         if let Some(chats) = extractor.push(&text) {
                             for chat in chats {
                                 for choice in chat.choices {
@@ -540,6 +543,20 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                         .await;
                                 }
                             }
+                        }
+
+                        if sse_has_done_signal(&text) {
+                            for (name, args_val, id) in acc.drain() {
+                                let _ = tx
+                                    .send(Ok(StreamToken::ToolCall {
+                                        name,
+                                        args: args_val,
+                                        id,
+                                    }))
+                                    .await;
+                            }
+                            let _ = tx.send(Ok(StreamToken::Done)).await;
+                            return;
                         }
                     }
                     Err(e) => {

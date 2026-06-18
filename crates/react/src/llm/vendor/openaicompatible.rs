@@ -172,6 +172,18 @@ impl StreamExtractor for OpenAIExtractor {
     }
 }
 
+/// Check if raw SSE text contains the `[DONE]` stream termination signal.
+///
+/// The SSE protocol defines `[DONE]` as a standalone line: `data: [DONE]`.
+/// We check that after stripping `data:` and trimming, the payload is exactly `[DONE]`.
+pub fn sse_has_done_signal(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        let payload = trimmed.strip_prefix("data:").unwrap_or(trimmed).trim();
+        payload == "[DONE]"
+    })
+}
+
 /// Accumulates streaming tool call arguments that arrive as partial JSON fragments.
 ///
 /// OpenAI-compatible streaming splits `tool_calls[N].function.arguments` across
@@ -225,7 +237,7 @@ impl StreamToolCallAccumulator {
         entry.arguments.push_str(args_delta);
 
         if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&entry.arguments) {
-            if let (Some(ref n), Some(ref i)) = (entry.name.clone(), entry.id.clone()) {
+            if let (Some(n), Some(i)) = (entry.name.as_ref(), entry.id.as_ref()) {
                 let result = (n.clone(), args_val, Some(i.clone()));
                 self.pending.remove(&index);
                 return Some(result);
