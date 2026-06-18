@@ -1,5 +1,6 @@
 use crate::{JsonExtractor, StreamExtractor, StreamSpan};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -171,6 +172,93 @@ impl StreamExtractor for OpenAIExtractor {
     }
 }
 
+/// Accumulates streaming tool call arguments that arrive as partial JSON fragments.
+///
+/// OpenAI-compatible streaming splits `tool_calls[N].function.arguments` across
+/// multiple SSE chunks. This accumulator concatenates the fragments by tool call
+/// index and emits the completed call once arguments form valid JSON.
+#[derive(Debug, Default)]
+pub struct StreamToolCallAccumulator {
+    pending: HashMap<u32, PendingToolCall>,
+}
+
+/// A single pending (incomplete) streaming tool call.
+#[derive(Debug)]
+pub struct PendingToolCall {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub arguments: String,
+}
+
+impl StreamToolCallAccumulator {
+    pub fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+        }
+    }
+
+    /// Push one delta fragment for a tool call.
+    ///
+    /// Returns `Some((name, args_json, id))` when the accumulated arguments
+    /// parse as valid JSON. Once emitted, the entry is removed from pending.
+    pub fn push_delta(
+        &mut self,
+        index: u32,
+        id: Option<String>,
+        name: Option<String>,
+        args_delta: &str,
+    ) -> Option<(String, serde_json::Value, Option<String>)> {
+        let entry = self
+            .pending
+            .entry(index)
+            .or_insert_with(|| PendingToolCall {
+                name: None,
+                id: None,
+                arguments: String::new(),
+            });
+        if let Some(n) = name {
+            entry.name = Some(n);
+        }
+        if let Some(i) = id {
+            entry.id = Some(i);
+        }
+        entry.arguments.push_str(args_delta);
+
+        if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&entry.arguments) {
+            if let (Some(ref n), Some(ref i)) = (entry.name.clone(), entry.id.clone()) {
+                let result = (n.clone(), args_val, Some(i.clone()));
+                self.pending.remove(&index);
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Drain all pending tool calls (finish_reason or stream end).
+    /// Incomplete arguments fall back to `{}`.
+    pub fn drain(&mut self) -> Vec<(String, serde_json::Value, Option<String>)> {
+        let mut results = Vec::new();
+        for (_, entry) in self.pending.drain() {
+            let name = entry.name.unwrap_or_default();
+            let id = entry
+                .id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let args_val =
+                serde_json::from_str(&entry.arguments).unwrap_or(serde_json::json!({}));
+            results.push((name, args_val, Some(id)));
+        }
+        results
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +298,89 @@ mod tests {
             Some(" result is 100.")
         );
         assert_eq!(chunks[2].choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn accumulator_single_chunk_completes_tool_call() {
+        let mut acc = StreamToolCallAccumulator::new();
+        let result = acc.push_delta(
+            0,
+            Some("call_abc".into()),
+            Some("get_weather".into()),
+            r#"{"location": "NYC"}"#,
+        );
+        assert!(result.is_some());
+        let (name, args, id) = result.unwrap();
+        assert_eq!(name, "get_weather");
+        assert_eq!(args, serde_json::json!({"location": "NYC"}));
+        assert_eq!(id, Some("call_abc".into()));
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn accumulator_multiple_chunks_accumulate_until_complete() {
+        let mut acc = StreamToolCallAccumulator::new();
+
+        let r1 = acc.push_delta(0, Some("call_abc".into()), Some("get_weather".into()), "");
+        assert!(r1.is_none());
+        assert_eq!(acc.len(), 1);
+
+        let r2 = acc.push_delta(0, None, None, r#"{"loc"#);
+        assert!(r2.is_none());
+        assert_eq!(acc.len(), 1);
+
+        let r3 = acc.push_delta(0, None, None, r#"ation": "NYC"}"#);
+        assert!(r3.is_some());
+        let (name, args, _) = r3.unwrap();
+        assert_eq!(name, "get_weather");
+        assert_eq!(args, serde_json::json!({"location": "NYC"}));
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn accumulator_drain_flushes_incomplete_calls() {
+        let mut acc = StreamToolCallAccumulator::new();
+        acc.push_delta(0, Some("call_abc".into()), Some("get_weather".into()), r#"{"loc"#);
+        assert_eq!(acc.len(), 1);
+
+        let drained = acc.drain();
+        assert_eq!(drained.len(), 1);
+        let (name, args, id) = &drained[0];
+        assert_eq!(name, "get_weather");
+        assert_eq!(id.as_deref(), Some("call_abc"));
+        // Incomplete args fall back to {}
+        assert_eq!(args, &serde_json::json!({}));
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn accumulator_multiple_parallel_tool_calls() {
+        let mut acc = StreamToolCallAccumulator::new();
+
+        // Two tool calls interleaved at different indices
+        acc.push_delta(0, Some("call_0".into()), Some("get_weather".into()), r#"{"loc"#);
+        acc.push_delta(1, Some("call_1".into()), Some("search".into()), r#"{"q"#);
+        assert_eq!(acc.len(), 2);
+
+        let r0 = acc.push_delta(0, None, None, r#"ation": "NYC"}"#);
+        assert!(r0.is_some());
+        assert_eq!(acc.len(), 1);
+
+        let r1 = acc.push_delta(1, None, None, r#"uery": "rust"}"#);
+        assert!(r1.is_some());
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn accumulator_drain_assigns_uuid_when_id_missing() {
+        let mut acc = StreamToolCallAccumulator::new();
+        acc.push_delta(0, None, Some("no_id_tool".into()), r#"{}"#);
+        let drained = acc.drain();
+        assert_eq!(drained.len(), 1);
+        let (name, _, id) = &drained[0];
+        assert_eq!(name, "no_id_tool");
+        assert!(id.is_some());
+        assert!(!id.as_deref().unwrap().is_empty());
     }
 
     #[test]

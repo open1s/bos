@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor},
+    llm::vendor::openaicompatible::{ChatCompletionResponse, OpenAIExtractor, StreamToolCallAccumulator},
     utils::{JsonExtractor, StreamExtractor},
 };
 use async_trait::async_trait;
@@ -447,10 +447,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
             let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
-            let mut pending_tool_calls: std::collections::HashMap<
-                u32,
-                (Option<String>, Option<String>, String),
-            > = std::collections::HashMap::new();
+            let mut acc = StreamToolCallAccumulator::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
@@ -493,56 +490,28 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                                 .and_then(|f| f.arguments.clone())
                                                 .unwrap_or_default();
 
-                                            let entry = pending_tool_calls
-                                                .entry(index)
-                                                .or_insert_with(|| (None, None, String::new()));
-                                            if let Some(n) = name {
-                                                entry.0 = Some(n);
-                                            }
-                                            if let Some(i) = id {
-                                                entry.1 = Some(i);
-                                            }
-                                            entry.2.push_str(&args_delta);
-
-                                            let args_str = entry.2.clone();
-                                            if let Ok(args_val) =
-                                                serde_json::from_str::<serde_json::Value>(
-                                                    &args_str,
-                                                )
+                                            if let Some((n, args_val, id)) =
+                                                acc.push_delta(index, id, name, &args_delta)
                                             {
-                                                let name = entry.0.clone();
-                                                let id = entry.1.clone();
-                                                if let (Some(ref n), Some(ref i)) = (name, id) {
-                                                    on_chunk.as_ref().map(|cb| cb(n));
-                                                    let _ = tx
-                                                        .send(Ok(StreamToken::ToolCall {
-                                                            name: n.clone(),
-                                                            args: args_val,
-                                                            id: Some(i.clone()),
-                                                        }))
-                                                        .await;
-                                                    pending_tool_calls.remove(&index);
-                                                }
+                                                on_chunk.as_ref().map(|cb| cb(&n));
+                                                let _ = tx
+                                                    .send(Ok(StreamToken::ToolCall {
+                                                        name: n,
+                                                        args: args_val,
+                                                        id,
+                                                    }))
+                                                    .await;
                                             }
                                         }
                                     }
 
                                     if choice.finish_reason.as_deref() == Some("tool_calls") {
-                                        for (_, (name, id, args_str)) in
-                                            pending_tool_calls.drain()
-                                        {
-                                            let name = name.unwrap_or_default();
-                                            let id = id.unwrap_or_else(|| {
-                                                uuid::Uuid::new_v4().to_string()
-                                            });
-                                            let args_val: serde_json::Value =
-                                                serde_json::from_str(&args_str)
-                                                    .unwrap_or(serde_json::json!({}));
+                                        for (name, args_val, id) in acc.drain() {
                                             let _ = tx
                                                 .send(Ok(StreamToken::ToolCall {
                                                     name,
                                                     args: args_val,
-                                                    id: Some(id),
+                                                    id,
                                                 }))
                                                 .await;
                                         }
@@ -580,16 +549,12 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                     }
                 }
             }
-            for (_, (name, id, args_str)) in pending_tool_calls.drain() {
-                let name = name.unwrap_or_default();
-                let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let args_val: serde_json::Value =
-                    serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
+            for (name, args_val, id) in acc.drain() {
                 let _ = tx
                     .send(Ok(StreamToken::ToolCall {
                         name,
                         args: args_val,
-                        id: Some(id),
+                        id,
                     }))
                     .await;
             }
