@@ -97,6 +97,8 @@ impl SkillMetadata {
 pub struct SkillContent {
     pub metadata: SkillMetadata,
     pub instructions: String,
+    #[rkyv(with = qserde::rkyv::with::AsString)]
+    pub skill_dir: PathBuf,
 }
 
 /// Skill loader - discovers and loads skills from filesystem
@@ -142,9 +144,11 @@ impl SkillLoader {
         let meta = self.discovered.get(name)?.clone();
         let content = std::fs::read_to_string(&meta.path).ok()?;
         let instructions = Self::extract_body(&content);
+        let skill_dir = meta.path.parent()?.to_path_buf();
         Some(SkillContent {
             metadata: meta,
             instructions,
+            skill_dir,
         })
     }
 

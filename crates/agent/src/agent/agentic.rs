@@ -617,7 +617,8 @@ impl Agent {
                             Ok(serde_json::json!({
                                 "name": skill.metadata.name,
                                 "description": skill.metadata.description,
-                                "instructions": skill.instructions
+                                "instructions": skill.instructions,
+                                "skill_dir": skill.skill_dir.to_string_lossy()
                             }))
                         } else {
                             Ok(serde_json::json!({

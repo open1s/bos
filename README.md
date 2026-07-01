@@ -395,6 +395,17 @@ MIT OR Apache-2.0
 
 ## Changelog
 
+### v2.3.6 (2026-07-01)
+
+- **Added**: `skill_dir` to `load_skill` tool result — LLM receives the parent path of `SKILL.md` for accessing bundled resources
+
+### v2.3.5
+
+- **Added**: Skills system: directory-based skill loading with `SKILL.md` files
+- **Added**: `load_skill` tool — LLM can load skill instructions on demand
+- **Added**: Skill caching with TTL in ReAct engine
+- **Fixed**: Skill load performance — avoid redundant filesystem reads
+
 ### v2.3.0 (2026-06-09)
 
 - **Added**: Audio support — `Content.audio()`, `ContentPart.audio()` for multimodal LLM calls
@@ -428,4 +439,4 @@ MIT OR Apache-2.0
 
 ---
 
-**Version**: 2.3.0 | **Last Updated**: 2026-06-09
+**Version**: 2.3.6 | **Last Updated**: 2026-07-01

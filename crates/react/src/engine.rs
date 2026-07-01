@@ -57,6 +57,7 @@ impl From<ResilienceError<()>> for ReactError {
 #[derive(Clone)]
 pub struct CachedSkill {
     pub instructions: String,
+    pub skill_dir: String,
     pub loaded_at: Instant,
 }
 
@@ -73,7 +74,7 @@ impl SkillCache {
         }
     }
 
-    pub fn get_or_insert(&self, skill_name: &str, instructions: String) -> Arc<CachedSkill> {
+    pub fn get_or_insert(&self, skill_name: &str, instructions: String, skill_dir: String) -> Arc<CachedSkill> {
         if let Some(entry) = self.cache.get(skill_name) {
             if entry.loaded_at.elapsed() < self.ttl {
                 return Arc::new(entry.clone());
@@ -83,6 +84,7 @@ impl SkillCache {
         }
         let skill = CachedSkill {
             instructions,
+            skill_dir,
             loaded_at: Instant::now(),
         };
         self.cache.insert(skill_name.to_string(), skill.clone());
@@ -505,8 +507,8 @@ impl<A: ReActApp> ReActEngine<A> {
                                         session.push(LlmMessage::ToolResult {
                                             tool_call_id: call_id,
                                             content: format!(
-                                                "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.\n\n{}",
-                                                skill_name, cached_skill.instructions
+                                                "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.\n\nskill_dir: {}\n\n{}",
+                                                skill_name, cached_skill.skill_dir, cached_skill.instructions
                                             ),
                                         });
                                         continue;
@@ -556,10 +558,15 @@ impl<A: ReActApp> ReActEngine<A> {
                                             .get("instructions")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
+                                        let skill_dir = ret
+                                            .get("skill_dir")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
                                         if !instructions.is_empty() {
                                             self.skill_cache.get_or_insert(
                                                 skill_name,
                                                 instructions.to_string(),
+                                                skill_dir.to_string(),
                                             );
                                         }
                                     }
@@ -681,7 +688,7 @@ impl<A: ReActApp> ReActEngine<A> {
         session.push(LlmMessage::user(request.input.clone()));
 
         let stream = stream! {
-            let mut loaded_skills: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut loaded_skills: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
             let mut request = request;
 
             context.add_tool(load_skill_tool());
@@ -764,10 +771,11 @@ impl<A: ReActApp> ReActEngine<A> {
 
                             let mut result = if name == "load_skill" {
                                 let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                if let Some(cached) = loaded_skills.get(skill_name) {
+                                if let Some((instructions, skill_dir)) = loaded_skills.get(skill_name) {
                                     Ok(serde_json::json!({
                                         "name": skill_name,
-                                        "instructions": cached,
+                                        "instructions": instructions,
+                                        "skill_dir": skill_dir,
                                         "cached": true
                                     }))
                                 } else {
@@ -800,8 +808,9 @@ impl<A: ReActApp> ReActEngine<A> {
                                     if name == "load_skill" {
                                         let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                         let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
+                                        let skill_dir = ret.get("skill_dir").and_then(|v| v.as_str()).unwrap_or("");
                                         if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                            loaded_skills.insert(skill_name.to_string(), instructions.to_string());
+                                            loaded_skills.insert(skill_name.to_string(), (instructions.to_string(), skill_dir.to_string()));
                                         }
                                     }
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {

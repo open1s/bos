@@ -304,6 +304,36 @@ MIT OR Apache-2.0
 
 ## 更新日志
 
+### v2.3.6 (2026-07-01)
+
+- **新增**: `load_skill` 工具返回 `skill_dir` 字段 — LLM 可获取 `SKILL.md` 父目录路径以访问打包资源
+
+### v2.3.5
+
+- **新增**: 技能系统：基于目录的技能加载，使用 `SKILL.md` 文件
+- **新增**: `load_skill` 工具 — LLM 可按需加载技能指令
+- **新增**: ReAct 引擎中的技能缓存（TTL）
+- **修复**: 技能加载性能 — 避免重复文件系统读取
+
+### v2.3.0 (2026-06-09)
+
+- **新增**: 音频支持 — `Content.audio()`、`ContentPart.audio()` 多模态 LLM 调用
+- **新增**: LLM 供应商配置 — `[llm.google]`、`[llm.nvidia]`、`[llm.openrouter]` 配置项
+- **新增**: `demo_audio.js` 和 `demo_multimodal.js` 示例
+- **新增**: `demo_multimodal.py` Python 示例
+- **改进**: Content API — 统一的 `Content`/`ContentPart`/`Binary` 类，支持文本、图片、音频
+- **修复**: 多模态消息的 Content 序列化
+
+### v2.2.0 (2026-05-18)
+
+- **新增**: `agent.stop()` — 通过 ESC 键停止运行中的 agent/react/stream
+- **新增**: `agent.is_running()` — 检查 agent 是否正在运行
+- **新增**: NAPI Agent 层的停止标志和运行状态
+- **新增**: `StreamToken::Stopped` 变体用于流取消
+- **新增**: 并发调用阻止，错误提示 "Agent is already running"
+- **新增**: Stream 返回 `{status: "stopped"|"completed"}` JSON 字符串
+- **Breaking**: `stream()` 现在返回 `String`（JSON 状态对象）而非 `()`
+
 ### v2.1.4 (2026-05-15)
 
 - **修复**: `getPerfMetrics()` 现在在 `stream()` 调用后正确更新
@@ -318,4 +348,4 @@ MIT OR Apache-2.0
 
 ---
 
-**版本**: 2.1.4 | **更新日期**: 2026-05-15
+**版本**: 2.3.6 | **更新日期**: 2026-07-01
