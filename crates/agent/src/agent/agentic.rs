@@ -951,6 +951,13 @@ impl Agent {
         };
     }
 
+    /// Mark a tool name as an MCP-registered tool.
+    pub fn mark_mcp_tool(&mut self, name: &str) {
+        if let Some(ref mut reg) = self.registry {
+            Arc::make_mut(reg).mark_mcp_tool(name);
+        }
+    }
+
     /// Register a tool and return explicit error on failure.
     pub fn try_add_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), crate::ToolError> {
         if let Some(ref mut reg) = self.registry {
@@ -1081,7 +1088,7 @@ impl Agent {
                 )));
             }
 
-            let namespaced_name = format!("{}/{}", namespace, tool.name);
+            let namespaced_name = format!("{}_{}", namespace, tool.name);
             if registry.get(&namespaced_name).is_some() {
                 return Err(crate::mcp::McpError::Protocol(format!(
                     "Failed to register MCP tool '{}': duplicate tool '{}'",
@@ -1094,7 +1101,8 @@ impl Agent {
         for tool in tools {
             let schema = tool.input_schema.clone();
             let tool_name = tool.name.clone();
-            let namespaced_name = format!("{}/{}", namespace, tool_name);
+            let namespaced_name = format!("{}_{}", namespace, tool_name);
+            reg_mut.mark_mcp_tool(&namespaced_name);
             let mcp_tool: std::sync::Arc<dyn react::tool::registry::AsyncTool> =
                 std::sync::Arc::new(McpToolAdapter::new(
                     client.clone(),

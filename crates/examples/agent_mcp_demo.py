@@ -49,7 +49,7 @@ async def demo_mcp_hello_world_tools():
         api_key=API_KEY,
         system_prompt=(
             "You are a tool-calling assistant. "
-            "When asked to use a tool, output ONLY the tool call like: hello/echo(message=\"test\")\n"
+            "When asked to use a tool, output ONLY the tool call like: hello_echo(message=\"test\")\n"
             "After calling the tool, you will receive the result. "
             "Then provide your final answer based on the tool result."
         ),
@@ -71,7 +71,7 @@ async def demo_mcp_hello_world_tools():
     print(f"  📋 Total tools available: {all_tools}")
 
     prompts = [
-        ("Echo", "Say hello to the world using the hello/echo tool"),
+        ("Echo", "Say hello to the world using the hello_echo tool"),
         ("Math", "What is 3 plus 4? Use the add tool."),
     ]
 

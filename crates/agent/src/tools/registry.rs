@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{Tool, ToolError};
@@ -9,6 +9,7 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     async_tools: HashMap<String, Arc<dyn AsyncTool>>,
     schema_cache: DashMap<String, serde_json::Value>,
+    mcp_tool_names: HashSet<String>,
 }
 
 impl Clone for ToolRegistry {
@@ -17,6 +18,7 @@ impl Clone for ToolRegistry {
             tools: self.tools.clone(),
             async_tools: self.async_tools.clone(),
             schema_cache: DashMap::new(),
+            mcp_tool_names: self.mcp_tool_names.clone(),
         }
     }
 }
@@ -27,6 +29,7 @@ impl ToolRegistry {
             tools: HashMap::new(),
             async_tools: HashMap::new(),
             schema_cache: DashMap::new(),
+            mcp_tool_names: HashSet::new(),
         }
     }
 
@@ -69,7 +72,7 @@ impl ToolRegistry {
         tool: Arc<dyn AsyncTool>,
         namespace: &str,
     ) -> Result<(), ToolError> {
-        let namespaced_name = format!("{}/{}", namespace, tool.name());
+        let namespaced_name = format!("{}_{}", namespace, tool.name());
         let schema = tool.json_schema();
         self.schema_cache.insert(namespaced_name.clone(), schema);
         self.async_tools.insert(namespaced_name, tool);
@@ -98,13 +101,21 @@ impl ToolRegistry {
         self.tools.iter()
     }
 
+    pub fn mark_mcp_tool(&mut self, name: &str) {
+        self.mcp_tool_names.insert(name.to_string());
+    }
+
+    pub fn is_mcp_tool(&self, name: &str) -> bool {
+        self.mcp_tool_names.contains(name)
+    }
+
     /// Find an async tool by exact name or suffix match
     fn find_async_tool(&self, name: &str) -> Option<Arc<dyn AsyncTool>> {
         // Try exact match first
         if let Some(tool) = self.async_tools.get(name) {
             return Some(tool.clone());
         }
-        // Try suffix match - key might be "mcp_hello/add" when name is "hello/add"
+        // Try suffix match - key might be "mcp_hello_add" when name is "hello_add"
         // Check if key ends with name directly or with "_name"
         for (async_name, async_tool) in self.async_tools.iter() {
             if async_name.ends_with(name) || async_name.ends_with(&format!("_{}", name)) {

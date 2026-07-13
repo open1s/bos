@@ -633,7 +633,7 @@ impl Agent {
     if let Some(registry) = guard.registry() {
       let mut tools: Vec<serde_json::Value> = registry
         .iter()
-        .filter(|(name, _)| name.contains('/'))
+        .filter(|(name, _)| registry.is_mcp_tool(name))
         .map(|(name, tool)| {
           serde_json::json!({
               "name": name,
@@ -642,7 +642,7 @@ impl Agent {
         })
         .collect();
       for name in registry.async_tool_names() {
-        if name.contains('/') {
+        if registry.is_mcp_tool(&name) {
           if let Some(async_tool) = registry.get_async(&name) {
             tools.push(serde_json::json!({
               "name": name,
@@ -663,7 +663,7 @@ impl Agent {
     if let Some(registry) = guard.registry() {
       let resources: Vec<serde_json::Value> = registry
         .iter()
-        .filter(|(name, _)| name.starts_with(&format!("{}/", namespace)))
+        .filter(|(name, _)| name.starts_with(&format!("{}_", namespace)))
         .map(|(name, tool)| {
           serde_json::json!({
               "name": name,

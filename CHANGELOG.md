@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.3.7 (2026-07-13)
+
+- **Fix**: MCP tool namespaces now use `_` separator instead of `/` to comply with OpenAI function naming restrictions (only `[a-zA-Z0-9_-]` allowed)
+
 ## v2.1.1 (2026-05-13)
 
 - **Discoverability**: Rewrote README with problem-first hook, badge row, "Why BOS?" comparison table, hero image

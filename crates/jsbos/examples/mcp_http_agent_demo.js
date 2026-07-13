@@ -34,7 +34,7 @@ async function demoAgentHttpMcp() {
     systemPrompt:
       'You are a helpful assistant. ' +
       'When asked to use a tool, output ONLY the tool call. ' +
-      'Use format: namespace/tool_name(args)',
+      'Use format: namespace_tool_name(args)',
     temperature: 0.7,
     timeoutSecs: 120,
   }, bus)

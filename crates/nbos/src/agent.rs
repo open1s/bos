@@ -1106,15 +1106,16 @@ impl PyAgent {
                     pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
                 })?;
                 for tool_def in &mcp_tools {
-                    let namespaced = format!("{}/{}", namespace, tool_def.name);
+                    let namespaced = format!("{}_{}", namespace, tool_def.name);
                     let adapter = agent::McpToolAdapter::new(
                         client.clone(),
-                        namespaced,
+                        namespaced.clone(),
                         tool_def.name.clone(),
                         tool_def.description.clone(),
                         tool_def.input_schema.clone(),
                     );
                     guard.add_tool(Arc::new(adapter));
+                    guard.mark_mcp_tool(&namespaced);
                 }
             }
             Ok(())
@@ -1141,15 +1142,16 @@ impl PyAgent {
                     pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
                 })?;
                 for tool_def in &mcp_tools {
-                    let namespaced = format!("{}/{}", namespace, tool_def.name);
+                    let namespaced = format!("{}_{}", namespace, tool_def.name);
                     let adapter = agent::McpToolAdapter::new(
                         client.clone(),
-                        namespaced,
+                        namespaced.clone(),
                         tool_def.name.clone(),
                         tool_def.description.clone(),
                         tool_def.input_schema.clone(),
                     );
                     guard.add_tool(Arc::new(adapter));
+                    guard.mark_mcp_tool(&namespaced);
                 }
             }
             Ok(())
@@ -1191,7 +1193,7 @@ impl PyAgent {
                 .registry()
                 .map(|r| {
                     r.iter()
-                        .filter(|(name, _)| name.contains('/'))
+                        .filter(|(name, _)| r.is_mcp_tool(name))
                         .map(|(name, tool)| {
                             serde_json::json!({
                                 "name": name,
@@ -1225,7 +1227,7 @@ impl PyAgent {
                 .registry()
                 .map(|r| {
                     r.iter()
-                        .filter(|(name, _)| name.starts_with(&format!("{}/", namespace)))
+                        .filter(|(name, _)| name.starts_with(&format!("{}_", namespace)))
                         .map(|(name, tool)| {
                             serde_json::json!({
                                 "name": name,
@@ -1252,7 +1254,7 @@ impl PyAgent {
             .registry()
             .map(|r| {
                 r.iter()
-                    .filter(|(name, _)| name.contains('/'))
+                    .filter(|(name, _)| r.is_mcp_tool(name))
                     .map(|(name, _)| name.clone())
                     .collect()
             })

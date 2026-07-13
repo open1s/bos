@@ -43,7 +43,7 @@ async function demoMcpHelloWorldTools() {
     apiKey: API_KEY,
     systemPrompt:
       'You are a tool-calling assistant. ' +
-      'When asked to use a tool, output ONLY the tool call like: hello/echo(message="test")\n' +
+      'When asked to use a tool, output ONLY the tool call like: hello_echo(message="test")\n' +
       'After calling the tool, you will receive the result. ' +
       'Then provide your final answer based on the tool result.',
     temperature: 0.7,
@@ -66,7 +66,7 @@ async function demoMcpHelloWorldTools() {
   console.log(`  📋 Total tools available: ${allTools}`)
 
   const prompts = [
-    ['Echo', 'Say hello to the world using the hello/echo tool'],
+    ['Echo', 'Say hello to the world using the hello_echo tool'],
     ['Math', 'What is 3 plus 4? Use the add tool.'],
   ]
 
