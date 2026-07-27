@@ -58,7 +58,7 @@ async function demoContentAudio() {
     });
 
     await brain.start();
-    const agent = brain.agent('assistant');
+    const agent = brain.agent('assistant').timeout(300);
 
     const audioPath = process.env.AUDIO_FILE_PATH || AUDIO_FILE;
 
@@ -85,9 +85,20 @@ async function demoContentAudio() {
 
     try {
         const result = await agent.ask(content);
-        console.log('📥 Agent:', result.slice(0, 300) + (result.length > 300 ? '...' : ''));
+        if (result && result.trim()) {
+            console.log('📥 Agent:', result.slice(0, 300) + (result.length > 300 ? '...' : ''));
+        } else {
+            console.log('⚠️  Model returned empty response — it may not support audio input.');
+            console.log('   This is expected for text-only models like Gemma/Llama.');
+        }
     } catch (err) {
-        console.log('⚠️  Audio request failed:', err.message.slice(0, 150));
+        const msg = err.message || '';
+        if (msg.includes('timeout')) {
+            console.log('⚠️  Audio request timed out — model may not support audio input.');
+            console.log('   This is expected for text-only models like Gemma/Llama.');
+        } else {
+            console.log('⚠️  Audio request failed:', msg.slice(0, 150));
+        }
     }
 
     await brain.stop();

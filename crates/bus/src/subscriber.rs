@@ -37,6 +37,7 @@ where
     pub async fn init(&mut self, session: Arc<Session>) -> Result<(), ZenohError> {
         let subscriber = session
             .declare_subscriber(&self.topic)
+            .allowed_origin(zenoh::sample::Locality::Any)
             .await
             .map_err(|e| ZenohError::Subscriber(e.to_string()))?;
 
@@ -113,6 +114,15 @@ where
         tokio::time::timeout(timeout, self.recv())
             .await
             .unwrap_or_default()
+    }
+
+    /// Stop the subscriber by dropping the underlying Zenoh subscription.
+    /// Any pending `recv` will return `None`.
+    pub fn stop(&mut self) {
+        self.subscriber = None;
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 
     /// Create a stream of messages (requires subscriber to be initialized)

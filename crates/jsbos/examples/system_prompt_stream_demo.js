@@ -10,7 +10,7 @@
  * Usage: node system_prompt_stream_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, initTracing } from '../index.js'
+import { Agent, ConfigLoader, initTracing } from '../index.js'
 
 initTracing()
 
@@ -53,8 +53,6 @@ async function main() {
   console.log('\n=== BrainOS Streaming System Prompt Demo ===\n')
   console.log('Model:', MODEL)
 
-  const bus = await Bus.create()
-
   if (!API_KEY) {
     console.log('No API key - set OPENAI_API_KEY or config.toml')
     process.exit(1)
@@ -68,7 +66,7 @@ async function main() {
     systemPrompt: PIRATE_PROMPT,
     temperature: 0.7,
     timeoutSecs: 60,
-  }, bus)
+  })
 
   const concise = await Agent.create({
     name: 'concise',
@@ -78,7 +76,7 @@ async function main() {
     systemPrompt: CONCISE_PROMPT,
     temperature: 0.7,
     timeoutSecs: 60,
-  }, bus)
+  })
 
   const question = 'What is the capital of France?'
 

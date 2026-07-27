@@ -7,7 +7,7 @@
  *     # Requires an MCP HTTP server running at http://127.0.0.1:8000/mcp
  */
 
-import { Agent, Bus, ConfigLoader, McpClient, version, initTracing } from '../index.js'
+import { Agent, ConfigLoader, McpClient, version, initTracing } from '../index.js'
 
 initTracing()
 
@@ -25,7 +25,6 @@ async function demoAgentHttpMcp() {
   console.log('  Demo — Agent + MCP HTTP Server')
   console.log('═'.repeat(60))
 
-  const bus = await Bus.create()
   const agent = await Agent.create({
     name: 'http-mcp-agent',
     model: MODEL,
@@ -37,7 +36,7 @@ async function demoAgentHttpMcp() {
       'Use format: namespace_tool_name(args)',
     temperature: 0.7,
     timeoutSecs: 120,
-  }, bus)
+  })
   console.log('  🤖 Agent created')
 
   const MCP_URL = 'http://127.0.0.1:8000/mcp'

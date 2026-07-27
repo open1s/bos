@@ -150,4 +150,15 @@ impl Callable {
   ) -> Result<()> {
     self.run(handler).await
   }
+
+  /// Stop the callable, aborting the handler task and dropping the subscription.
+  #[napi]
+  pub async fn stop(&self) -> Result<()> {
+    let mut guard = self.inner.lock().await;
+    if let Some(ref mut callable) = *guard {
+      callable.stop();
+    }
+    self.is_started.store(false, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+  }
 }

@@ -33,6 +33,21 @@ impl Bus {
         self.session.clone()
     }
 
+    fn abort_handles(&mut self) {
+        if let Ok(mut handles) = self.handles.try_lock() {
+            for handle in handles.drain(..) {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Close the bus, aborting all running tasks and releasing resources.
+    /// After close(), the Bus is still usable but may require re-init.
+    pub async fn close(&mut self) {
+        self.abort_handles();
+        let _ = self.session.close().await;
+    }
+
     ///load from config
     pub async fn from(config: BusConfig) -> Self {
         let zenoh_config: Config = config.into();
@@ -82,11 +97,7 @@ impl Bus {
 
 impl Drop for Bus {
     fn drop(&mut self) {
-        if let Ok(mut handles) = self.handles.try_lock() {
-            for handle in handles.drain(..) {
-                handle.abort();
-            }
-        }
+        self.abort_handles();
     }
 }
 

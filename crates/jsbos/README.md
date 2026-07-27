@@ -1,4 +1,4 @@
-# @open1s/jsbos — v2.3.0
+# @open1s/jsbos — v2.3.8
 
 > BrainOS JavaScript/Node.js bindings — AI agent framework with ReAct engine
 
@@ -196,6 +196,61 @@ const addTool = new ToolDef(
   { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }  // schema
 );
 ```
+
+### Tool Cancellation
+
+Cancelable tools can be interrupted mid-execution — useful for long-running operations (HTTP servers, file processing, batch jobs).
+
+#### Making a tool cancelable
+
+Pass a cancel callback as the 6th argument to `ToolDef`:
+
+```javascript
+const bashOp = new ToolDef(
+  'bashOp',
+  'A slow ~7s operation. Cancelable.',
+  (args) => runBashHttpServer(args),     // handler
+  { type: 'object', properties: {} },    // schema
+  null,                                  // unused
+  (callId) => killChildProcess(callId)   // cancel callback
+);
+```
+
+When a cancel signal is received, the engine calls the cancel callback with the tool's `call_id`. The callback terminates the running operation (e.g., kill background process, abort HTTP request).
+
+#### How cancellation works end-to-end
+
+1. Agent publishes `tool_call_started` events on bus topic `agent/{name}/tool/events`
+2. External watcher subscribes to events, observes a running tool
+3. Watcher publishes cancel on bus topic `agent/{name}/tool/cancel` with `{ call_id }`
+4. Engine receives the cancel signal and calls the cancel callback
+5. Cancel callback terminates the operation (e.g., `process.kill(-child.pid, 'SIGTERM')`)
+
+#### Cancelable tools in the low-level API
+
+The 6th parameter of `agent.addTool()` is `cancelable: boolean`, and the 7th is the cancel callback:
+
+```javascript
+await agent.addTool(
+  'bashOp',
+  'A slow operation. Cancelable.',
+  '{}',
+  '{"type": "object", "properties": {}}',
+  (err, args) => runBashHttpServer(args),
+  true,                          // cancelable
+  (err, callId) => killChildProcess(callId)  // cancel callback
+);
+```
+
+#### Timeout
+
+Agents have a per-LLM-call timeout. If the timeout fires while a tool is running, the tool execution is interrupted:
+
+```javascript
+const agent = brain.agent('assistant').timeout(300);  // 300s per LLM call
+```
+
+See the [full cancel demo](./examples/agent_cancel_demo.js) for two complete scenarios (external watcher + controller-worker).
 
 ### Multimodal Content
 
@@ -687,6 +742,7 @@ See the [examples](./examples/) directory for complete examples:
 | `demo_multimodal.js` | Multimodal (text, image, audio) content |
 | `demo_audio.js` | Audio content with LLM |
 | `demo_content_api.js` | Content API (text, images, audio) |
+| `agent_cancel_demo.js` | Tool cancellation: external watcher + controller cancel background HTTP server via bus |
 | `agent_demo.js` | Agent with tools |
 | `agent_mcp_demo.js` | Agent with MCP servers |
 | `agent_stream_demo.js` | Streaming responses |

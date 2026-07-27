@@ -432,7 +432,9 @@ class BrainOS(AbstractAsyncContextManager):
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        pass
+        if self._bus is not None:
+            await self._bus.close()
+            self._bus = None
 
     def agent(
         self,

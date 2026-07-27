@@ -12,6 +12,14 @@ pub struct PySubscriber {
     pub inner: Arc<tokio::sync::Mutex<Subscriber<String>>>,
 }
 
+impl Drop for PySubscriber {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.inner.try_lock() {
+            guard.stop();
+        }
+    }
+}
+
 #[pymethods]
 impl PySubscriber {
     #[classmethod]
@@ -63,6 +71,18 @@ impl PySubscriber {
                 .recv_with_timeout(std::time::Duration::from_millis(timeout_ms))
                 .await;
             Ok(out)
+        })
+    }
+
+    /// Stop the subscriber, dropping the underlying subscription.
+    /// Any pending `recv` calls will return `None`.
+    fn stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let mut guard = inner.lock().await;
+            guard.stop();
+            Ok(())
         })
     }
 

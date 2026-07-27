@@ -175,7 +175,7 @@ async def main():
         ("Math", "What is 1234 * 5678?"),
         ("Weather", "What's the weather like in Tokyo right now?"),
         ("Time", "What time is it now in UTC?"),
-        ("Mixed", "Calculate 99 * 99 and tell me the weather in Paris."),
+        ("Calc", "Calculate 99 * 99"),
     ]
 
 

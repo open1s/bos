@@ -12,7 +12,7 @@
  *     RUST_LOG=debug node examples/agent_resilience_demo.js    # With Rust logs
  */
 
-import { Bus, Agent, ConfigLoader, initTracing } from '../index.js'
+import { Agent, ConfigLoader, initTracing } from '../index.js'
 
 const loader = new ConfigLoader()
 loader.discover()
@@ -50,9 +50,6 @@ const CALCULATOR_SCHEMA = {
 async function main() {
   console.log('\n=== BrainOS Resilience Configuration Demo ===\n')
 
-  const bus = await Bus.create()
-  console.log('[OK] Bus created')
-
   if (!API_KEY) {
     console.log('[SKIP] No API key — set OPENAI_API_KEY or ~/.bos/conf/config.toml')
     console.log('This demo requires an LLM API key.\n')
@@ -76,13 +73,14 @@ async function main() {
     rateLimitMaxRetries: 3,
     circuitBreakerMaxFailures: 5,
     circuitBreakerCooldownSecs: 30,
-  }, bus)
+  })
   await agent1.addTool(
     'calculator',
     'Evaluate a math expression.',
     JSON.stringify(CALCULATOR_SCHEMA.properties),
     JSON.stringify(CALCULATOR_SCHEMA),
     (err, args) => calculatorTool(args),
+    false,
   )
   console.log('[OK] Agent1: rateLimitCapacity=40, circuitBreakerMaxFailures=5')
   const r1 = await agent1.runSimple('What is 5 + 3?')
@@ -102,13 +100,14 @@ async function main() {
     rateLimitMaxRetries: 1,
     circuitBreakerMaxFailures: 2,
     circuitBreakerCooldownSecs: 30,
-  }, bus)
+  })
   await agent2.addTool(
     'calculator',
     'Evaluate a math expression.',
     JSON.stringify(CALCULATOR_SCHEMA.properties),
     JSON.stringify(CALCULATOR_SCHEMA),
     (err, args) => calculatorTool(args),
+    false,
   )
   console.log('[OK] Agent2: rateLimitCapacity=2, circuitBreakerMaxFailures=2')
   const r2 = await agent2.runSimple('What is 10 + 20?')
@@ -126,13 +125,14 @@ async function main() {
     rateLimitCapacity: 100,
     rateLimitWindowSecs: 60,
     circuitBreakerMaxFailures: 1000,
-  }, bus)
+  })
   await agent3.addTool(
     'calculator',
     'Evaluate a math expression.',
     JSON.stringify(CALCULATOR_SCHEMA.properties),
     JSON.stringify(CALCULATOR_SCHEMA),
     (err, args) => calculatorTool(args),
+    false,
   )
   console.log('[OK] Agent3: rateLimitCapacity=100, circuitBreakerMaxFailures=1000')
   const r3 = await agent3.runSimple('What is 100 - 50?')

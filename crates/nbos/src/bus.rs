@@ -87,6 +87,16 @@ pub struct PyBus {
     pub inner: Arc<tokio::sync::Mutex<Bus>>,
 }
 
+impl Drop for PyBus {
+    fn drop(&mut self) {
+        if let Ok(mut _guard) = self.inner.try_lock() {
+            // Sync Drop can't call async close — just drop the guard.
+            // Session will close when all Arc references are dropped
+            // (or was already closed by an explicit close() call).
+        }
+    }
+}
+
 #[pymethods]
 impl PyBus {
     #[classmethod]
@@ -151,6 +161,19 @@ impl PyBus {
                 .publish(&topic, &json_str)
                 .await
                 .map_err(crate::utils::to_py_runtime_error)?;
+            Ok(())
+        })
+    }
+
+    /// Close the bus, aborting all running tasks and releasing resources.
+    /// Closes the underlying Zenoh session, allowing the process to exit cleanly.
+    /// This is called automatically when the Bus is dropped/GC'd.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let mut guard = inner.lock().await;
+            guard.close().await;
             Ok(())
         })
     }

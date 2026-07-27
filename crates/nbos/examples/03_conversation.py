@@ -37,6 +37,7 @@ async def main():
         agent = (
             brain.agent("chatbot", system_prompt="You are a friendly conversational assistant.")
             .with_tools(current_time, weather)
+            .with_timeout(180)
         )
 
         # Natural conversation (no tool use)

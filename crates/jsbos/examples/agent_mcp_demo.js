@@ -12,7 +12,7 @@
  *     node crates/jsbos/examples/agent_mcp_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, version, initTracing } from '../index.js'
+import { Agent, ConfigLoader, version, initTracing } from '../index.js'
 import os from 'os'
 
 initTracing()
@@ -35,7 +35,6 @@ async function demoMcpHelloWorldTools() {
   console.log('  Demo 1 — Agent with MCP Hello World tools')
   console.log('═'.repeat(60))
 
-  const bus = await Bus.create()
   const agent = await Agent.create({
     name: 'mcp-assistant',
     model: MODEL,
@@ -48,7 +47,7 @@ async function demoMcpHelloWorldTools() {
       'Then provide your final answer based on the tool result.',
     temperature: 0.7,
     timeoutSecs: 120,
-  }, bus)
+  })
   console.log('  🤖 Agent created')
 
   await agent.addMcpServer('hello', 'npx', ['-y', 'mcp-hello-world@latest'])
@@ -90,7 +89,6 @@ async function demoMcpFilesystemTools() {
 
   const home = os.homedir()
 
-  const bus = await Bus.create()
   const agent = await Agent.create({
     name: 'fs-assistant',
     model: MODEL,
@@ -102,7 +100,7 @@ async function demoMcpFilesystemTools() {
       'Always show your reasoning before calling tools.',
     temperature: 0.7,
     timeoutSecs: 120,
-  }, bus)
+  })
   console.log('  🤖 Agent created')
 
   await agent.addMcpServer('fs', 'npx', ['-y', '@modelcontextprotocol/server-filesystem@latest', home])

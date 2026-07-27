@@ -5,6 +5,7 @@ use crate::session::AgentState;
 use crate::tools::FunctionTool;
 use crate::{AgentError, LlmClient, StreamToken, Tool, ToolRegistry};
 use async_trait::async_trait;
+use bus::Bus;
 use futures::{Stream, StreamExt};
 use log::warn;
 use react::LlmMessage;
@@ -189,6 +190,14 @@ impl ReactToolTrait for ExtensibleToolAdapter {
     fn is_skill(&self) -> bool {
         self.inner.is_skill()
     }
+
+    fn is_cancelable(&self) -> bool {
+        self.inner.is_cancelable()
+    }
+
+    fn cancel(&self, call_id: &str) {
+        self.inner.cancel(call_id);
+    }
 }
 
 struct AsyncExtensibleToolAdapter {
@@ -232,6 +241,14 @@ impl AsyncTool for AsyncExtensibleToolAdapter {
 
     fn is_skill(&self) -> bool {
         self.inner.is_skill()
+    }
+
+    fn is_cancelable(&self) -> bool {
+        self.inner.is_cancelable()
+    }
+
+    fn cancel(&self, call_id: &str) {
+        self.inner.cancel(call_id);
     }
 }
 
@@ -299,6 +316,8 @@ pub struct Agent {
     #[rkyv(with = qserde::rkyv::with::Skip)]
     plugins: PluginRegistry,
     #[rkyv(with = qserde::rkyv::with::Skip)]
+    bus: Option<Bus>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     engine_cache: std::sync::Mutex<Option<ReActEngine<AgentReActApp>>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     context_cache: std::sync::Mutex<Option<AgentReactContext>>,
@@ -326,11 +345,18 @@ impl Agent {
             metrics: std::sync::Arc::new(crate::metrics::MetricsCollector::new()),
             hooks: HookRegistry::new(),
             plugins: PluginRegistry::new(),
+            bus: None,
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0)
         }
+    }
+
+    /// Set the bus for tool event publishing.
+    pub fn with_bus(mut self, bus: Bus) -> Self {
+        self.bus = Some(bus);
+        self
     }
 
     /// Get the config.
@@ -534,6 +560,10 @@ impl Agent {
             .max_steps(self.config.max_steps)
             .model(self.config.model.clone())
             .app(app);
+
+        if let Some(ref bus) = self.bus {
+            builder = builder.bus(bus.clone()).agent_name(self.config.name.clone());
+        }
 
         if let Some(ref registry) = self.registry {
             for (_name, tool) in registry.iter() {
@@ -1138,6 +1168,7 @@ impl Clone for Agent {
             metrics: self.metrics.clone(),
             hooks: self.hooks.clone(),
             plugins: self.plugins.clone(),
+            bus: self.bus.clone(),
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),

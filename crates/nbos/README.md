@@ -1,4 +1,4 @@
-# nbos — v2.3.0
+# nbos — v2.3.8
 
 > Python bindings for BrainOS — AI agent framework with ReAct engine
 
@@ -177,6 +177,58 @@ multiply = ToolDef(
     parameters={"a": {"type": "number"}, "b": {"type": "number"}},
 )
 ```
+
+### Tool Cancellation
+
+Cancelable tools can be interrupted mid-execution — useful for long-running operations (HTTP servers, file processing, batch jobs).
+
+#### Making a tool cancelable
+
+Use `PythonTool.cancelable()` and `.set_cancel_callback()`:
+
+```python
+from nbos import PythonTool
+
+def cancel_handler(call_id: str):
+    """Terminate the running background operation."""
+    print(f"Cancelling tool call: {call_id}")
+
+tool = (
+    PythonTool(
+        name="bash_op",
+        description="A slow operation. Cancelable.",
+        parameters='{}',
+        schema='{"type": "object", "properties": {}}',
+        callback=run_background_op,
+    )
+    .cancelable()                         # Mark as cancelable
+    .set_cancel_callback(cancel_handler)  # Register cancel handler
+)
+```
+
+> **Note:** The `@tool` decorator does not support cancel callbacks directly. Use the `PythonTool` class for cancelable tools.
+
+#### How cancellation works end-to-end
+
+1. Agent publishes `tool_call_started` events on bus topic `agent/{name}/tool/events`
+2. External watcher subscribes to events, observes a running tool
+3. Watcher publishes cancel on bus topic `agent/{name}/tool/cancel` with `{ "call_id": "..." }`
+4. Engine receives the cancel signal and calls the cancel callback
+5. Cancel callback terminates the operation
+
+#### Timeout
+
+Agents have a per-LLM-call timeout. If the timeout fires while a tool is running, the tool execution is interrupted:
+
+```python
+agent = (
+    brain.agent("assistant")
+    .with_tools(my_tool)
+    .with_timeout(180)  # 180s per LLM call
+)
+```
+
+See the [full cancel demo](./examples/05_cancel_demo.py) for two complete scenarios (external watcher + controller-worker).
 
 ### Multimodal Content
 
@@ -771,6 +823,7 @@ See the [examples](./examples/) directory:
 | `03_conversation.py` | Conversation history management |
 | `03_three_modes.py` | ask, react, stream modes |
 | `04_resilience.py` | Rate limiting + circuit breaker |
+| `05_cancel_demo.py` | Tool cancellation: external watcher + controller cancel long-running tool via bus |
 | `demo_multimodal.py` | Multimodal (text, image, audio) content |
 | `demo_all_in_one.py` | Full feature demo |
 

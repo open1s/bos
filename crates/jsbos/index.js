@@ -23,12 +23,17 @@ const DEFAULT_MODEL = 'nvidia/meta/llama-3.1-8b-instruct';
 const DEFAULT_BASE_URL = 'https://integrate.api.nvidia.com/v1';
 
 class ToolDef {
-  constructor(name, description, callback, parameters = {}, schema = {}) {
+  constructor(name, description, callback, parameters = {}, schema = {}, cancelCallback = null) {
+    if (typeof schema === 'function') {
+      cancelCallback = schema;
+      schema = {};
+    }
     this.name = name;
     this.description = description;
     this.callback = callback;
     this.parameters = parameters;
     this.schema = schema;
+    this.cancelCallback = cancelCallback;
   }
 }
 
@@ -741,7 +746,20 @@ class AgentBuilder {
         const result = await td.callback(args);
         return result;
       };
-      await this._inner.addTool(td.name, td.description, JSON.stringify(td.parameters), JSON.stringify(td.schema), callbackWrapper);
+      const cancelWrapper = td.cancelCallback
+        ? (err, callId) => {
+            td.cancelCallback(callId);
+          }
+        : null;
+      await this._inner.addTool(
+        td.name,
+        td.description,
+        JSON.stringify(td.parameters),
+        JSON.stringify(td.schema),
+        callbackWrapper,
+        !!td.cancelCallback,
+        cancelWrapper,
+      );
     }
 
     if (this._config._bashTool) {

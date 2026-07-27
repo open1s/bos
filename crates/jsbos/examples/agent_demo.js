@@ -11,7 +11,7 @@
  *     node crates/jsbos/examples/agent_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, version as versio, initTracing } from '../index.js'
+import { Agent, ConfigLoader, version as versio, initTracing } from '../index.js'
 
 initTracing()
 
@@ -94,9 +94,6 @@ async function main() {
   console.log('  BrainOS — Agent Tool Calling & Conversation Demo')
   console.log('🧠'.repeat(30))
 
-  const bus = await Bus.create()
-  console.log('  🚌 Bus created')
-
   if (!API_KEY) {
     console.log('  ⚠️  No API key found — set OPENAI_API_KEY or create ~/.bos/conf/config.toml')
     console.log('  Skipping LLM demo\n')
@@ -114,7 +111,7 @@ async function main() {
       'Format: Thought: <reasoning>\nFinal Answer: <response or tool call>',
     temperature: 0.7,
     timeoutSecs: 120,
-  }, bus)
+  })
 
   console.log('\n' + '═'.repeat(60))
   console.log('  Step 1 — Registering Tools')
@@ -126,6 +123,7 @@ async function main() {
     JSON.stringify(CALCULATOR_SCHEMA.properties),
     JSON.stringify(CALCULATOR_SCHEMA),
     (err, args) => calculatorTool(args),
+    false,
   )
   console.log('  ✅ Registered tool: calculator')
 
@@ -135,6 +133,7 @@ async function main() {
     JSON.stringify(WEATHER_SCHEMA.properties),
     JSON.stringify(WEATHER_SCHEMA),
     (err, args) => weatherTool(args),
+    false,
   )
   console.log('  ✅ Registered tool: weather')
 
@@ -144,6 +143,7 @@ async function main() {
     JSON.stringify(TIME_SCHEMA.properties),
     JSON.stringify(TIME_SCHEMA),
     (err, args) => timeTool(args),
+    false,
   )
   console.log('  ✅ Registered tool: current_time')
 

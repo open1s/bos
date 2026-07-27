@@ -12,7 +12,7 @@
  * Usage: node session_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, version, initTracing } from '../index.js'
+import { Agent, ConfigLoader, version, initTracing } from '../index.js'
 import fs from 'fs'
 
 initTracing()
@@ -31,9 +31,6 @@ async function main() {
   console.log('  BrainOS — Session Management Demo')
   console.log('📋'.repeat(30) + '\n')
 
-  const bus = await Bus.create()
-  console.log('  🚌 Bus created')
-
   if (!API_KEY) {
     console.log('  ⚠️  No API key — set OPENAI_API_KEY or config.toml')
     process.exit(1)
@@ -47,7 +44,7 @@ async function main() {
     systemPrompt: 'You are a helpful assistant with a quirky personality.',
     temperature: 0.7,
     timeoutSecs: 60,
-  }, bus)
+  })
   console.log('  🤖 Agent created\n')
 
   console.log('═'.repeat(60))

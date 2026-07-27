@@ -108,6 +108,7 @@ async function main() {
       const result = (args.a || 0) + (args.b || 0)
       return JSON.stringify(result)
     },
+    false,
   )
   console.log('Tool "add" registered\n')
 

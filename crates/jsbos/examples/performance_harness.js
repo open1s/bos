@@ -9,7 +9,7 @@
  *   --quick: reduces test iterations for rapid feedback
  */
 
-import { Agent, Bus, ConfigLoader, version } from '../index.js'
+import { Agent, ConfigLoader, version } from '../index.js'
 
 const loader = new ConfigLoader()
 loader.discover()
@@ -25,7 +25,7 @@ const WARMUP = QUICK ? 1 : 2
 const ITERATIONS = QUICK ? 3 : 10
 const CONCURRENCY_LEVELS = QUICK ? [1] : [1, 2, 4]
 
-async function createAgent(bus) {
+async function createAgent() {
   return Agent.create({
     name: 'perf-test',
     model: MODEL,
@@ -34,7 +34,7 @@ async function createAgent(bus) {
     systemPrompt: 'Answer briefly in 1-2 sentences.',
     temperature: 0,
     timeoutSecs: 60,
-  }, bus)
+  })
 }
 
 async function warmup(agent) {
@@ -237,35 +237,34 @@ async function main() {
     process.exit(1)
   }
 
-  const bus = await Bus.create()
   const results = {}
 
   try {
-    const agentA = await createAgent(bus)
+    const agentA = await createAgent()
     await warmup(agentA)
     results.e2e = await benchmarkE2E(agentA)
   } catch (e) { console.log(`  ⚠️  E2E test failed: ${e.message?.substring(0, 80)}`) }
 
   try {
-    const agentB = await createAgent(bus)
+    const agentB = await createAgent()
     await warmup(agentB)
     results.throughput = await benchmarkThroughput(agentB)
   } catch (e) { console.log(`  ⚠️  Throughput test failed: ${e.message?.substring(0, 80)}`) }
 
   try {
-    const agentC = await createAgent(bus)
+    const agentC = await createAgent()
     await warmup(agentC)
     results.overhead = await benchmarkOverhead(agentC)
   } catch (e) { console.log(`  ⚠️  Overhead test failed: ${e.message?.substring(0, 80)}`) }
 
   try {
-    const agentD = await createAgent(bus)
+    const agentD = await createAgent()
     await warmup(agentD)
     await benchmarkStreaming(agentD)
   } catch (e) { console.log(`  ⚠️  Streaming test failed: ${e.message?.substring(0, 80)}`) }
 
   try {
-    const agentE = await createAgent(bus)
+    const agentE = await createAgent()
     await benchmarkResilience(agentE)
   } catch (e) { console.log(`  ⚠️  Resilience test failed: ${e.message?.substring(0, 80)}`) }
 

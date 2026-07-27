@@ -95,7 +95,9 @@ impl Subscriber {
 
         let message = {
           let mut guard = inner.lock().await;
-          guard.recv().await
+          guard
+            .recv_with_timeout(std::time::Duration::from_millis(500))
+            .await
         };
 
         match message {
@@ -107,7 +109,7 @@ impl Subscriber {
               |_result, _env| Ok(()),
             );
           }
-          None => break,
+            None => {}
         }
       }
       running.store(false, Ordering::SeqCst);
@@ -118,12 +120,63 @@ impl Subscriber {
 
   #[napi]
   pub async fn run_json(&self, handler: ThreadsafeFunction<JSAny>) -> Result<()> {
-    self.run(handler).await
+    let inner = self.inner.clone();
+    let tsfn = Arc::new(handler);
+    let running = self.running.clone();
+
+    if running.swap(true, Ordering::SeqCst) {
+      return Err(napi::Error::new(
+        napi::Status::GenericFailure,
+        "already running",
+      ));
+    }
+
+    tokio::spawn(async move {
+      loop {
+        if !running.load(Ordering::SeqCst) {
+          break;
+        }
+
+        let message = {
+          let mut guard = inner.lock().await;
+          guard
+            .recv_with_timeout(std::time::Duration::from_millis(500))
+            .await
+        };
+
+        match message {
+          Some(msg) => {
+            let value: serde_json::Value = serde_json::from_str(&msg).unwrap_or(serde_json::Value::String(msg));
+            let tsfn_clone = Arc::clone(&tsfn);
+            tsfn_clone.call_with_return_value(
+              Ok(JSAny(value)),
+              ThreadsafeFunctionCallMode::NonBlocking,
+              |_result, _env| Ok(()),
+            );
+          }
+          None => {}
+        }
+      }
+      running.store(false, Ordering::SeqCst);
+    });
+
+    Ok(())
   }
 
   #[napi]
   pub async fn stop(&self) -> Result<()> {
     self.running.store(false, Ordering::SeqCst);
+    let mut guard = self.inner.lock().await;
+    guard.stop();
     Ok(())
+  }
+}
+
+impl Drop for Subscriber {
+  fn drop(&mut self) {
+    self.running.store(false, Ordering::SeqCst);
+    if let Ok(mut guard) = self.inner.try_lock() {
+      guard.stop();
+    }
   }
 }

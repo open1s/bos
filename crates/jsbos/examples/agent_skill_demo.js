@@ -12,7 +12,7 @@
  *     node crates/jsbos/examples/agent_skill_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, version, initTracing } from '../index.js'
+import { Agent, ConfigLoader, version, initTracing } from '../index.js'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
@@ -137,7 +137,6 @@ async function demoSkills() {
   console.log(`\n  📁 Creating skills in: ${skillsDir}`)
   createSampleSkills(skillsDir)
 
-  const bus = await Bus.create()
   const agent = await Agent.create({
     name: 'skill-agent',
     model: MODEL,
@@ -150,7 +149,7 @@ async function demoSkills() {
       'Format: Thought: <reasoning>\nFinal Answer: <response>',
     temperature: 0.7,
     timeoutSecs: 120,
-  }, bus)
+  })
   console.log('  🤖 Agent created')
 
   await agent.registerSkillsFromDir(skillsDir)

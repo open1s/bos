@@ -87,6 +87,14 @@ where
         inner.set_handler(handler)
     }
 
+    /// Stop the callable, aborting the handler task and dropping the subscription.
+    pub fn stop(&mut self) {
+        self.started.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ref mut inner) = self.inner {
+            inner.stop();
+        }
+    }
+
     pub async fn init_and_run(&mut self) -> Result<(), ZenohError> {
         if self.started.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(ZenohError::AlreadyStarted);

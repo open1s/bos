@@ -7,7 +7,7 @@
  * Usage: node agent_stream_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, initTracing } from '../index.js'
+import { Agent, ConfigLoader, initTracing } from '../index.js'
 
 initTracing()
 
@@ -90,9 +90,6 @@ async function main() {
   console.log('\n=== BrainOS Streaming Demo ===\n')
   console.log('Model:', MODEL)
 
-  const bus = await Bus.create()
-  console.log('Bus created')
-
   if (!API_KEY) {
     console.log('No API key - set OPENAI_API_KEY or config.toml')
     process.exit(1)
@@ -106,14 +103,14 @@ async function main() {
     systemPrompt: 'You are a helpful assistant.',
     temperature: 0.3,
     timeoutSecs: 60,
-  }, bus)
+  })
 
   console.log('Agent created')
 
   await agent.addTool('add', 'Add numbers',
     JSON.stringify(ADD_SCHEMA.properties),
     JSON.stringify(ADD_SCHEMA),
-    (_err, args) => addTool(args))
+    (_err, args) => addTool(args), false)
   console.log('Tools registered')
 
   await streamTask(agent, 'What is 2 + 3?,use tool')

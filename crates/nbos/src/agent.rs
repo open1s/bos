@@ -270,31 +270,54 @@ impl PyStreamIterator {
 }
 
 /// A Python tool that wraps a Python callback function (supports both sync and async callbacks)
-#[pyclass(name = "PythonTool", skip_from_py_object)]
+#[pyclass(name = "PythonTool", module = "nbos")]
 pub struct PyPythonTool {
     name: String,
     description: String,
     schema: serde_json::Value,
+    cancelable: bool,
     callback: Py<PyAny>,
+    cancel_callback: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PyPythonTool {
     #[new]
+    #[pyo3(signature = (name, description, parameters, schema, callback, cancel_callback=None))]
     fn new(
         name: String,
         description: String,
         parameters: String,
         schema: String,
         callback: Py<PyAny>,
+        cancel_callback: Option<Py<PyAny>>,
     ) -> Self {
         let _ = parameters;
         Self {
             name,
             description,
             schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
+            cancelable: false,
             callback,
+            cancel_callback,
         }
+    }
+
+    fn cancelable(&mut self) {
+        self.cancelable = true;
+    }
+
+    /// Set a Python callable invoked when `cancel(call_id)` is called on this
+    /// tool. The tool author owns the cancel logic — the binding just passes
+    /// the `call_id` through. The callable receives a single positional
+    /// argument: the `call_id` string.
+    ///
+    /// Setting a cancel callback automatically marks the tool as cancelable
+    /// so no separate `.cancelable()` call is needed.
+    #[pyo3(signature = (callback))]
+    fn set_cancel_callback(&mut self, callback: Py<PyAny>) {
+        self.cancelable = true;
+        self.cancel_callback = Some(callback);
     }
 
     fn name(&self) -> &str {
@@ -331,6 +354,31 @@ impl AsyncTool for PyPythonToolWrapper {
 
     fn json_schema(&self) -> serde_json::Value {
         self.schema.clone()
+    }
+
+    fn is_cancelable(&self) -> bool {
+        Python::attach(|py| {
+            let inner = self.inner.clone_ref(py);
+            let tool = inner.borrow(py);
+            Ok::<bool, PyErr>(tool.cancelable)
+        })
+        .unwrap_or(false)
+    }
+
+    fn cancel(&self, call_id: &str) {
+        let _ = Python::attach(|py| {
+            let inner = self.inner.clone_ref(py);
+            let tool = inner.borrow(py);
+            if let Some(cb) = &tool.cancel_callback {
+                let cb = cb.clone_ref(py);
+                // Pass the call_id through to the Python-side cancel
+                // handler. The Python tool author owns the real abort
+                // logic (kill a process, set an event, close a socket,
+                // etc.).
+                let _ = cb.call1(py, (call_id.to_string(),));
+            }
+            Ok::<(), PyErr>(())
+        });
     }
 
     async fn run(&self, args: &serde_json::Value) -> Result<serde_json::Value, react::ToolError> {
@@ -696,6 +744,8 @@ impl PyAgent {
         _bus: PyRef<'py, PyBus>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let cfg: AgentConfig = config.clone().into();
+        let bus_inner = _bus.inner.clone();
+        drop(_bus);
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let py_hooks = crate::hooks::PyHookRegistry::create();
@@ -731,7 +781,9 @@ impl PyAgent {
             llm.register_vendor(vendor_name, vendor);
             let llm = std::sync::Arc::new(llm);
 
-            let agent = Agent::new(cfg, llm);
+            let session = crate::utils::session_from_bus(bus_inner).await;
+            let bus = bus::Bus::new(session);
+            let agent = Agent::new(cfg, llm).with_bus(bus);
 
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let py_agent = Py::new(

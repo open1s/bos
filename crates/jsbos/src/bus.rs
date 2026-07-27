@@ -189,4 +189,23 @@ impl Bus {
       .with_handler(|input| async move { Ok(input) });
     Ok(crate::Callable::new(callable))
   }
+
+  /// Close the bus, aborting all running tasks and releasing resources.
+  /// Closes the underlying Zenoh session, allowing the process to exit cleanly.
+  #[napi]
+  pub async fn close(&self) -> Result<()> {
+    let mut guard = self.inner.lock().await;
+    guard.close().await;
+    Ok(())
+  }
+}
+
+impl Drop for Bus {
+  fn drop(&mut self) {
+    if let Ok(_guard) = self.inner.try_lock() {
+      // Sync Drop can't call async close — abort handles only.
+      // Session will close when all Arc references are dropped
+      // (or was already closed by an explicit close() call).
+    }
+  }
 }

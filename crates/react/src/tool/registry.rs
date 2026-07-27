@@ -20,6 +20,10 @@ pub trait Tool: Send + Sync {
     fn is_skill(&self) -> bool {
         false
     }
+    fn is_cancelable(&self) -> bool {
+        false
+    }
+    fn cancel(&self, _call_id: &str) {}
 }
 
 #[async_trait]
@@ -42,6 +46,10 @@ pub trait AsyncTool: Send + Sync {
     fn supports_streaming(&self) -> bool {
         false
     }
+    fn is_cancelable(&self) -> bool {
+        false
+    }
+    fn cancel(&self, _call_id: &str) {}
     async fn run_streaming(
         &self,
         input: &Value,
@@ -85,6 +93,20 @@ impl ToolVariant {
         match self {
             Self::Sync(tool) => tool.to_openai_definition(),
             Self::Async(tool) => tool.to_openai_definition(),
+        }
+    }
+
+    pub fn cancel(&self, call_id: &str) {
+        match self {
+            Self::Sync(tool) => tool.cancel(call_id),
+            Self::Async(tool) => tool.cancel(call_id),
+        }
+    }
+
+    pub fn is_cancelable(&self) -> bool {
+        match self {
+            Self::Sync(tool) => tool.is_cancelable(),
+            Self::Async(tool) => tool.is_cancelable(),
         }
     }
 }

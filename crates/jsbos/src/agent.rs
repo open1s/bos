@@ -16,19 +16,13 @@ use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
 use react::llm::{Content, ContentPart};
 use react::tool::registry::AsyncTool;
 
-fn js_value_to_json(value: &Unknown) -> napi::Result<serde_json::Value> {
-    let js_string = value.coerce_to_string()?;
-    let utf8 = js_string.into_utf8()?;
-    let string_val = utf8.as_str()?;
-    if let Ok(parsed) = serde_json::from_str(string_val) {
-        Ok(parsed)
-    } else {
-        Ok(serde_json::json!(string_val))
-    }
-}
-
 fn extract_json_value(val: Unknown<'_>) -> napi::Result<serde_json::Value> {
-    js_value_to_json(&val)
+    let raw = val.value();
+    unsafe {
+        let env = raw.env;
+        let napi_val = raw.value;
+        <serde_json::Value as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, napi_val)
+    }
 }
 
 #[napi(object)]
@@ -75,7 +69,9 @@ struct JSTool {
   name: String,
   description: String,
   schema: serde_json::Value,
+  cancelable: bool,
   callback: Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>>>,
+  cancel_callback: Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>>>>,
 }
 
 #[async_trait]
@@ -90,6 +86,19 @@ impl AsyncTool for JSTool {
 
   fn json_schema(&self) -> serde_json::Value {
     self.schema.clone()
+  }
+
+  fn is_cancelable(&self) -> bool {
+    self.cancelable
+  }
+
+  fn cancel(&self, call_id: &str) {
+    if let Some(cb) = &self.cancel_callback {
+      let _ = cb.call(
+        Ok(call_id.to_string()),
+        ThreadsafeFunctionCallMode::NonBlocking,
+      );
+    }
   }
 
   async fn run(
@@ -359,7 +368,9 @@ impl Agent {
     };
     llm_provider.register_vendor(vendor_name, vendor);
 
-    let agent = agent::Agent::new(cfg, Arc::new(llm_provider));
+    let session = _bus.as_ref().clone();
+    let bus = bus::Bus::new(session);
+    let agent = agent::Agent::new(cfg, Arc::new(llm_provider)).with_bus(bus);
 
     Ok(Agent {
       inner: Arc::new(Mutex::new(agent)),
@@ -548,12 +559,16 @@ impl Agent {
     _parameters: String,
     schema: String,
     callback: ThreadsafeFunction<JSAny>,
+    cancelable: bool,
+    cancel_callback: Option<ThreadsafeFunction<String>>,
   ) -> Result<String> {
     let tool = JSTool {
       name: name.clone(),
       description,
       schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
+      cancelable,
       callback: callback.into(),
+      cancel_callback: cancel_callback.map(|c| Arc::new(c)),
     };
     let mut guard = self.inner.lock().await;
     guard
@@ -993,6 +1008,17 @@ impl AgentCallableServer {
   #[napi]
   pub fn is_started(&self) -> bool {
     true
+  }
+}
+
+impl Drop for Agent {
+  fn drop(&mut self) {
+    if let Ok(mut guard) = self.inner.try_lock() {
+      guard.clear_runtime_extensions();
+      guard.stop();
+    }
+    self.stop_flag.store(true, Ordering::SeqCst);
+    self.is_running.store(false, Ordering::SeqCst);
   }
 }
 

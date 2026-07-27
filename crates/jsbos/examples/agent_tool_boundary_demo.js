@@ -15,7 +15,7 @@
  *     node crates/jsbos/examples/agent_tool_boundary_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, version } from '../index.js'
+import { Agent, ConfigLoader, version } from '../index.js'
 
 const loader = new ConfigLoader()
 loader.discover()
@@ -69,7 +69,6 @@ const GREET_SCHEMA = {
 }
 
 async function createAgentWithTools(systemPrompt) {
-  const bus = await Bus.create()
   const agent = await Agent.create({
     name: 'boundary-test',
     model: MODEL,
@@ -84,9 +83,9 @@ async function createAgentWithTools(systemPrompt) {
     ),
     temperature: 0.7,
     timeoutSecs: 120,
-  }, bus)
-  await agent.addTool('calc', 'Math calculator', JSON.stringify(CALC_SCHEMA.properties), JSON.stringify(CALC_SCHEMA), (err, args) => calcCallback(args))
-  await agent.addTool('greet', 'Greet someone', JSON.stringify(GREET_SCHEMA.properties), JSON.stringify(GREET_SCHEMA), (err, args) => greetCallback(args))
+  })
+  await agent.addTool('calc', 'Math calculator', JSON.stringify(CALC_SCHEMA.properties), JSON.stringify(CALC_SCHEMA), (err, args) => calcCallback(args), false)
+  await agent.addTool('greet', 'Greet someone', JSON.stringify(GREET_SCHEMA.properties), JSON.stringify(GREET_SCHEMA), (err, args) => greetCallback(args), false)
   return agent
 }
 

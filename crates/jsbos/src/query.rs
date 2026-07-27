@@ -166,6 +166,14 @@ impl Queryable {
     self.run(handler).await
   }
 
+  /// Stop the queryable, aborting the handler task and dropping the subscription.
+  #[napi]
+  pub async fn stop(&self) -> Result<()> {
+    let mut guard = self.inner.lock().await;
+    guard.stop();
+    Ok(())
+  }
+
   #[napi]
   pub async fn run_stream(
     &self,

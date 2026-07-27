@@ -16,7 +16,7 @@
  * node crates/jsbos/examples/agent_rpc_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, version, initTracing } from '../index.js'
+import { Agent, ConfigLoader, version, initTracing } from '../index.js'
 
 initTracing()
 
@@ -34,9 +34,6 @@ async function demoAgentMcp() {
   console.log(' Demo — Agent with MCP tools')
   console.log('═'.repeat(60))
 
-  const bus = await Bus.create()
-  console.log(' 🚌 Bus created')
-
   console.log('\n ── Setting up Agent with MCP tools ──')
 
   const configA = {
@@ -48,7 +45,7 @@ async function demoAgentMcp() {
     temperature: 0.7,
     timeoutSecs: 120,
   }
-  const agent = await Agent.create(configA, bus)
+  const agent = await Agent.create(configA)
   console.log(' 🤖 Agent created')
 
   await agent.addMcpServer('hello', 'npx', ['-y', 'mcp-hello-world@latest'])

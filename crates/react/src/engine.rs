@@ -3,9 +3,10 @@ use crate::llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, Strea
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::runtime::{HookDecision, ReActApp};
 use crate::telemetry::{Telemetry, TelemetryEvent, TokenBudgetReport, TokenCounter, TokenUsage};
-use crate::tool::registry::{AsyncTool, ToolVariant};
+use crate::tool::registry::{AsyncTool, FnTool, ToolVariant};
 use crate::tool::{Tool, ToolRegistry};
 use async_stream::stream;
+use bus::Bus;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use log::info;
@@ -17,6 +18,18 @@ use std::time::Instant;
 use thiserror::Error;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
+
+#[derive(serde::Serialize)]
+#[qserde::Archive]
+#[rkyv(crate = qserde::rkyv)]
+/// Lifecycle event for a tool call published on the bus.
+pub struct ToolCallEvent {
+    pub call_id: String,
+    pub tool: String,
+    /// "started" | "completed" | "cancelled" | "failed"
+    pub status: String,
+    pub timestamp_ms: u64,
+}
 
 #[derive(Debug, Error)]
 pub enum ReactError {
@@ -51,6 +64,126 @@ impl From<ResilienceError<()>> for ReactError {
             ResilienceError::RateLimited => ReactError::Resilience(ResilienceError::RateLimited),
             ResilienceError::CircuitOpen => ReactError::Resilience(ResilienceError::CircuitOpen),
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct ToolRunManager {
+    running: Arc<DashMap<String, String>>,
+    bus: Option<Bus>,
+    agent_name: String,
+}
+
+impl ToolRunManager {
+    pub fn new() -> Self {
+        Self {
+            running: Arc::new(DashMap::new()),
+            bus: None,
+            agent_name: String::new(),
+        }
+    }
+
+    pub fn with_bus(mut self, bus: Bus, agent_name: String) -> Self {
+        self.bus = Some(bus);
+        self.agent_name = agent_name;
+        self
+    }
+
+    fn events_topic(&self) -> String {
+        format!("agent/{}/tool/events", self.agent_name)
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn publish_event(&self, call_id: &str, tool: &str, status: &str) {
+        if let Some(bus) = &self.bus {
+            let event = ToolCallEvent {
+                call_id: call_id.to_string(),
+                tool: tool.to_string(),
+                status: status.to_string(),
+                timestamp_ms: Self::now_ms(),
+            };
+            let topic = self.events_topic();
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                let payload = serde_json::to_string(&event).unwrap_or_default();
+                let mut bus = bus;
+                let _ = bus.publish(&topic, &payload).await;
+            });
+        }
+    }
+
+    pub fn register(&self, call_id: &str, name: &str) {
+        self.running.insert(call_id.to_string(), name.to_string());
+        self.publish_event(call_id, name, "started");
+    }
+
+    pub fn is_running(&self, call_id: &str) -> bool {
+        self.running.contains_key(call_id)
+    }
+
+    pub fn cancel(&self, call_id: &str) -> Option<String> {
+        let name = self.running.remove(call_id).map(|(_, n)| n);
+        if let Some(ref n) = name {
+            self.publish_event(call_id, n, "cancelled");
+        }
+        name
+    }
+
+    pub fn complete(&self, call_id: &str) {
+        if let Some((_, name)) = self.running.remove(call_id) {
+            self.publish_event(call_id, &name, "completed");
+        }
+    }
+
+    pub fn fail(&self, call_id: &str) {
+        if let Some((_, name)) = self.running.remove(call_id) {
+            self.publish_event(call_id, &name, "failed");
+        }
+    }
+
+    pub fn cancel_all_running(&self) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        for entry in self.running.iter() {
+            result.push((entry.key().clone(), entry.value().clone()));
+        }
+        for (id, name) in &result {
+            self.running.remove(id);
+            self.publish_event(id, name, "cancelled");
+        }
+        result
+    }
+
+    pub fn start_listener(&self, tools: Arc<ToolRegistry>) {
+        let bus = match self.bus.as_ref() {
+            Some(b) => b.clone(),
+            None => return,
+        };
+        let topic = format!("agent/{}/tool/cancel", self.agent_name);
+        let run_mgr = Arc::new(self.clone());
+        tokio::spawn(async move {
+            let session = bus.session();
+            let mut sub = bus::Subscriber::<String>::new(&topic)
+                .with_session(session)
+                .await
+                .expect("failed to subscribe to cancellation topic");
+            while let Some(msg) = sub.recv().await {
+                let call_id = serde_json::from_str::<serde_json::Value>(&msg)
+                    .ok()
+                    .and_then(|v| v.get("call_id").and_then(|s| s.as_str()).map(String::from))
+                    .unwrap_or(msg);
+                if let Some(name) = run_mgr.cancel(&call_id) {
+                    if let Some(tool) = tools.get(&name) {
+                        tool.cancel(&call_id);
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -111,7 +244,7 @@ pub enum BuilderError {
 
 pub struct ReActEngine<A: ReActApp> {
     llm: Box<dyn LlmClient<A::Session, A::Context> + Send + Sync>,
-    tools: ToolRegistry,
+    tools: Arc<ToolRegistry>,
     max_steps: usize,
     telemetry: Telemetry,
     llm_timeout_secs: u64,
@@ -122,6 +255,7 @@ pub struct ReActEngine<A: ReActApp> {
     skill_cache: SkillCache,
     tool_call_count: AtomicU64,
     stop_flag: Arc<AtomicBool>,
+    run_manager: Arc<ToolRunManager>,
 }
 
 pub struct ReActEngineBuilder<A: ReActApp> {
@@ -135,6 +269,8 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     token_counter: TokenCounter,
     skill_cache: SkillCache,
     react_app: Option<A>,
+    bus: Option<Bus>,
+    agent_name: String,
     _phantom: std::marker::PhantomData<A>,
 }
 
@@ -151,6 +287,8 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             token_counter: TokenCounter::with_default(),
             skill_cache: SkillCache::new(Duration::from_secs(300)), // 5 min TTL
             react_app: None,
+            bus: None,
+            agent_name: String::new(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -215,14 +353,53 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         self.react_app = Some(app);
         self
     }
+
+    pub fn bus(mut self, bus: Bus) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    pub fn agent_name(mut self, name: String) -> Self {
+        self.agent_name = name;
+        self
+    }
 }
 
 impl<A: ReActApp + Default> ReActEngineBuilder<A> {
     pub fn build(self) -> Result<ReActEngine<A>, BuilderError> {
         let llm = self.llm.ok_or(BuilderError::MissingLlm)?;
+        let tools = Arc::new(self.tools);
+        let bus = self.bus.clone();
+        let agent_name = self.agent_name.clone();
+        let has_bus = bus.is_some() && !agent_name.is_empty();
+        let run_manager = Arc::new(if has_bus {
+            ToolRunManager::new().with_bus(bus.unwrap(), agent_name)
+        } else {
+            ToolRunManager::new()
+        });
+        let mgr = run_manager.clone();
+        let cancel_tools = tools.clone();
+        if has_bus {
+            run_manager.start_listener(tools.clone());
+        }
+        tools.register(ToolVariant::Sync(Box::new(FnTool {
+            name: "cancel_tool".to_string(),
+            description: "Cancel a running tool by its call_id. Pass the exact call_id from the tool call you want to cancel.".to_string(),
+            f: Box::new(move |input: &Value| {
+                let call_id = input.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(name) = mgr.cancel(call_id) {
+                    if let Some(tool) = cancel_tools.get(&name) {
+                        tool.cancel(call_id);
+                    }
+                    serde_json::json!({"status": "cancelled", "call_id": call_id})
+                } else {
+                    serde_json::json!({"status": "not_found", "call_id": call_id, "message": "No running tool found with this call_id"})
+                }
+            }),
+        })));
         Ok(ReActEngine {
             llm,
-            tools: self.tools,
+            tools,
             max_steps: self.max_steps,
             telemetry: self.telemetry,
             llm_timeout_secs: self.llm_timeout_secs,
@@ -233,6 +410,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             skill_cache: self.skill_cache,
             tool_call_count: AtomicU64::new(0),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            run_manager,
         })
     }
 }
@@ -244,35 +422,12 @@ impl<A: ReActApp + Default> Default for ReActEngineBuilder<A> {
 }
 
 impl<A: ReActApp> ReActEngine<A> {
-    pub fn new<
-        S: Send + Sync + Clone + Default + 'static,
-        C: Send + Sync + Clone + Default + 'static,
-    >(
-        llm: Box<dyn LlmClient<S, C>>,
-        max_steps: usize,
-        app: A,
-    ) -> Self
-    where
-        A: ReActApp<Session = S, Context = C>,
-    {
-        Self {
-            llm,
-            tools: ToolRegistry::new(),
-            max_steps,
-            telemetry: Telemetry::new(),
-            llm_timeout_secs: 120,
-            model: String::new(),
-            token_counter: TokenCounter::with_default(),
-            react_app: app,
-            resilience: None,
-            skill_cache: SkillCache::new(Duration::from_secs(300)),
-            tool_call_count: AtomicU64::new(0),
-            stop_flag: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
     pub fn builder() -> ReActEngineBuilder<A> {
         ReActEngineBuilder::new()
+    }
+
+    pub fn tool_run_manager(&self) -> &ToolRunManager {
+        &self.run_manager
     }
 
     pub fn register_tool(&self, t: Box<dyn Tool>) {
@@ -418,11 +573,50 @@ impl<A: ReActApp> ReActEngine<A> {
     }
 
     /// Call tool - no resilience wrapper (only LLM calls need rate limiting)
-    pub async fn call_tool(&self, name: &str, input: &mut Value) -> Result<Value, ReactError> {
-        self.tools
-            .call(name, input)
-            .await
-            .map_err(|e| ReactError::ToolError(format!("{:?}", e)))
+    ///
+    /// Injects `__call_id__` into the input JSON so the tool can observe its
+    /// own call_id. The call_id is the engine's id for this invocation; tools
+    /// use it together with the abort mechanism exposed by the binding layer
+    /// (AbortSignal for JS, a Python-side signal object for nbos).
+    pub async fn call_tool(&self, name: &str, input: &mut Value, call_id: &str) -> Result<Value, ReactError> {
+        if let Value::Object(map) = input {
+            map.insert("__call_id__".to_string(), Value::String(call_id.to_string()));
+        } else {
+            // Non-object inputs (string/number) are still allowed by some
+            // tools. Re-wrap as an object so we can attach the call_id.
+            let original = std::mem::replace(input, Value::Null);
+            *input = serde_json::json!({
+                "__call_id__": call_id,
+                "input": original,
+            });
+        }
+
+        let cancelable = self.tools.get(name).map(|t| t.is_cancelable()).unwrap_or(false);
+        if cancelable {
+            let cid = call_id.to_string();
+            self.run_manager.register(&cid, name);
+            // If cancel was requested between register and tool execution,
+            // skip running the tool entirely.
+            if !self.run_manager.is_running(&cid) {
+                return Ok(serde_json::json!({
+                    "status": "cancelled",
+                    "call_id": cid,
+                    "elapsed_ms": 0,
+                }));
+            }
+            let result = self.tools.call(name, input).await;
+            if result.is_ok() {
+                self.run_manager.complete(&cid);
+            } else {
+                self.run_manager.fail(&cid);
+            }
+            result.map_err(|e| ReactError::ToolError(format!("{:?}", e)))
+        } else {
+            self.tools
+                .call(name, input)
+                .await
+                .map_err(|e| ReactError::ToolError(format!("{:?}", e)))
+        }
     }
 
     /// Core ReAct step loop. Runs up to max_steps iterations of:
@@ -531,7 +725,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     }
                                 }
 
-                                let mut result = self.call_tool(&name, &mut args).await;
+                                let mut result = self.call_tool(&name, &mut args, &call_id).await;
                                 self.tool_call_count.fetch_add(1, Ordering::Relaxed);
                                 
                                 match self.react_app
@@ -779,10 +973,10 @@ impl<A: ReActApp> ReActEngine<A> {
                                         "cached": true
                                     }))
                                 } else {
-                                    self.call_tool(&name, &mut args).await
+                                    self.call_tool(&name, &mut args, &call_id).await
                                 }
                             } else {
-                                self.call_tool(&name, &mut args).await
+                                self.call_tool(&name, &mut args, &call_id).await
                             };
                             self.tool_call_count.fetch_add(1, Ordering::Relaxed);
 
@@ -896,6 +1090,12 @@ impl<A: ReActApp> ReActEngine<A> {
     }
 
     pub fn stop(&mut self){
+        let running = self.run_manager.cancel_all_running();
+        for (call_id, name) in running {
+            if let Some(tool) = self.tools.get(&name) {
+                tool.cancel(&call_id);
+            }
+        }
         self.set_stop_flag(true);
     }
 

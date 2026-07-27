@@ -8,7 +8,7 @@
  * Usage: node agent_metrics_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, initTracing } from '../index.js'
+import { Agent, ConfigLoader, initTracing } from '../index.js'
 
 initTracing()
 
@@ -43,8 +43,6 @@ async function main() {
     process.exit(1)
   }
 
-  const bus = await Bus.create()
-
   const agent = await Agent.create({
     name: 'metrics-demo',
     model: MODEL,
@@ -53,7 +51,7 @@ async function main() {
     systemPrompt: 'You are a helpful assistant. Keep answers brief.',
     temperature: 0.3,
     timeoutSecs: 60,
-  }, bus)
+  })
 
   // Initial metrics - all zeros
   printMetrics('Initial (before any calls)', agent.getPerfMetrics())

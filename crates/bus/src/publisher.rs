@@ -55,7 +55,10 @@ impl Publisher {
 
     /// Publish raw bytes to the topic
     async fn publish_raw(&self, session: &Session, data: Vec<u8>) -> Result<(), ZenohError> {
-        let publisher = session.declare_publisher(&self.topic).await?;
+        let publisher = session
+            .declare_publisher(&self.topic)
+            .allowed_destination(zenoh::sample::Locality::Any)
+            .await?;
         publisher.put(data).await.map_err(ZenohError::from)
     }
 
@@ -89,6 +92,11 @@ mod tests {
         let config = BusConfig::default();
         let bus = Bus::from(config).await;
 
+        let publisher = Publisher::new("test/topic")
+            .with_session(bus.clone().into())
+            .unwrap();
+        assert_eq!(publisher.topic(), "test/topic");
+
         let mut subscriber = Subscriber::<String>::new("test/topic")
             .with_session(bus.clone().into())
             .await
@@ -100,17 +108,10 @@ mod tests {
             .await
             .expect("TODO: panic message");
 
-        let publisher = Publisher::new("test/topic")
-            .with_session(bus.clone().into())
-            .unwrap();
-        assert_eq!(publisher.topic(), "test/topic");
-
         let _a = publisher
             .publish(&String::from("This is from publisher"))
             .await;
 
-        //sleep
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        // h.abort()
     }
 }

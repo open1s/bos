@@ -18,7 +18,7 @@ export declare class Agent {
   close(): void
   stop(options?: StopOptions | undefined | null): any
   isRunning(): boolean
-  addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => any)): Promise<string>
+  addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => any), cancelable: boolean, cancelCallback?: (((err: Error | null, arg: string) => any)) | undefined | null): Promise<string>
   addBashTool(name: string, workspaceRoot?: string | undefined | null): Promise<void>
   registerSkillsFromDir(dirPath: string): Promise<void>
   addMcpServer(namespace: string, command: string, args: Array<string>): Promise<void>
@@ -63,6 +63,11 @@ export declare class Bus {
   createQueryable(topic: string): Promise<Queryable>
   createCaller(name: string): Promise<Caller>
   createCallable(uri: string): Promise<Callable>
+  /**
+   * Close the bus, aborting all running tasks and releasing resources.
+   * Closes the underlying Zenoh session, allowing the process to exit cleanly.
+   */
+  close(): Promise<void>
 }
 
 export declare class Callable {
@@ -71,6 +76,8 @@ export declare class Callable {
   start(): Promise<void>
   run(handler: ((err: Error | null, arg: string) => unknown)): Promise<void>
   runJson(handler: ((err: Error | null, arg: string) => unknown)): Promise<void>
+  /** Stop the callable, aborting the handler task and dropping the subscription. */
+  stop(): Promise<void>
 }
 
 export declare class Caller {
@@ -139,6 +146,8 @@ export declare class Queryable {
   start(): Promise<void>
   run(handler: ((err: Error | null, arg: string) => unknown)): Promise<void>
   runJson(handler: ((err: Error | null, arg: string) => unknown)): Promise<void>
+  /** Stop the queryable, aborting the handler task and dropping the subscription. */
+  stop(): Promise<void>
   runStream(handler: ((err: Error | null, arg: string) => unknown)): Promise<void>
 }
 
@@ -392,12 +401,13 @@ export class AgentBuilder {
 }
 export function tool(descriptionOrOptions: any, maybeOptions?: {}): (target: any, propertyKey: any, descriptor: any) => any;
 export class ToolDef {
-    constructor(name: any, description: any, callback: any, parameters?: {}, schema?: {});
+    constructor(name: any, description: any, callback: any, parameters?: {}, schema?: {}, cancelCallback?: null);
     name: any;
     description: any;
     callback: any;
     parameters: {};
     schema: {};
+    cancelCallback: any;
 }
 export class ToolResult {
     static success(data: any, metadata?: {}): ToolResult;

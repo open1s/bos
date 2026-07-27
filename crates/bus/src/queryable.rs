@@ -130,6 +130,15 @@ where
         Ok(())
     }
 
+    /// Stop the queryable, aborting the handler task and dropping the subscription.
+    pub fn stop(&mut self) {
+        self.queryable = None;
+        self.started.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+
     async fn handle_query(
         query: &Query,
         handler: &Handler<Q, R>,

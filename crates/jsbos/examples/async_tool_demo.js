@@ -17,7 +17,7 @@
  *     node crates/jsbos/examples/async_tool_demo.js
  */
 
-import { Bus, Agent, ConfigLoader, initTracing } from '../index.js'
+import { Agent, ConfigLoader, initTracing } from '../index.js'
 
 initTracing()
 
@@ -154,9 +154,6 @@ async function main() {
   console.log('  BrainOS — Async Tool Calling Demo')
   console.log('═'.repeat(60))
 
-  const bus = await Bus.create()
-  console.log('  🚌 Bus created')
-
   if (!API_KEY) {
     console.log('  ⚠️  No API key found — set OPENAI_API_KEY or create ~/.bos/conf/config.toml')
     console.log('  Skipping LLM demo\n')
@@ -174,7 +171,7 @@ async function main() {
       'Format: Thought: <reasoning>\nFinal Answer: <response or tool call>',
     temperature: 0.7,
     timeoutSecs: 120,
-  }, bus)
+  })
 
   console.log('\n' + '─'.repeat(60))
   console.log('  Step 1 — Registering Sync Tools (addTool)')
@@ -186,6 +183,7 @@ async function main() {
     JSON.stringify(CALCULATOR_SCHEMA.properties),
     JSON.stringify(CALCULATOR_SCHEMA),
     (err, args) => calculatorTool(args),
+    false,
   )
   console.log('  ✅ Registered sync tool: calculator')
 
@@ -199,6 +197,7 @@ async function main() {
     JSON.stringify(WEATHER_SCHEMA.properties),
     JSON.stringify(WEATHER_SCHEMA),
     async (err, args) => fetchWeather(args),
+    false,
   )
   console.log('  ✅ Registered async tool: weather')
 
@@ -208,6 +207,7 @@ async function main() {
     JSON.stringify(USER_SCHEMA.properties),
     JSON.stringify(USER_SCHEMA),
     async (err, args) => fetchUser(args),
+    false,
   )
   console.log('  ✅ Registered async tool: lookup_user')
 
@@ -217,6 +217,7 @@ async function main() {
     JSON.stringify(NOTIFY_SCHEMA.properties),
     JSON.stringify(NOTIFY_SCHEMA),
     async (err, args) => sendNotification(args),
+    false,
   )
   console.log('  ✅ Registered async tool: send_notification')
 

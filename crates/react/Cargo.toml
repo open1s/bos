@@ -25,6 +25,7 @@ async-stream = { workspace = true }
 dashmap = {workspace = true}
 uuid = {workspace = true}
 qserde = { path = "../qserde" }
+bus = { workspace = true }
 surfing = "0.1"
 quick-xml = "0.39"
 

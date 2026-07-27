@@ -40,9 +40,10 @@ rkyv_derive = "0.8.16"
 async-channel = "2.5"
 criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
 pprof = { version = "0.15", features = ["criterion", "flamegraph"] }
+bus = { path = "crates/bus" }
 
 [workspace.package]
-version = "2.3.7"
+version = "2.3.8"
 edition = "2021"
 authors = ["BrickOS Team"]
 license = "MIT OR Apache-2.0"
