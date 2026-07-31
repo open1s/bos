@@ -572,13 +572,11 @@ impl<A: ReActApp> ReActEngine<A> {
         result.map_err(ReactError::from)
     }
 
-    /// Call tool - no resilience wrapper (only LLM calls need rate limiting)
-    ///
-    /// Injects `__call_id__` into the input JSON so the tool can observe its
+    /// Inject `__call_id__` into the input JSON so the tool can observe its
     /// own call_id. The call_id is the engine's id for this invocation; tools
     /// use it together with the abort mechanism exposed by the binding layer
     /// (AbortSignal for JS, a Python-side signal object for nbos).
-    pub async fn call_tool(&self, name: &str, input: &mut Value, call_id: &str) -> Result<Value, ReactError> {
+    fn inject_call_id(&self, input: &mut Value, call_id: &str) {
         if let Value::Object(map) = input {
             map.insert("__call_id__".to_string(), Value::String(call_id.to_string()));
         } else {
@@ -590,7 +588,10 @@ impl<A: ReActApp> ReActEngine<A> {
                 "input": original,
             });
         }
+    }
 
+    /// Call tool - no resilience wrapper (only LLM calls need rate limiting)
+    pub async fn call_tool(&self, name: &str, input: &mut Value, call_id: &str) -> Result<Value, ReactError> {
         let cancelable = self.tools.get(name).map(|t| t.is_cancelable()).unwrap_or(false);
         if cancelable {
             let cid = call_id.to_string();
@@ -708,6 +709,8 @@ impl<A: ReActApp> ReActEngine<A> {
                                         continue;
                                     }
                                 }
+
+                                self.inject_call_id(&mut args, &call_id);
 
                                 match self
                                     .react_app
@@ -945,6 +948,8 @@ impl<A: ReActApp> ReActEngine<A> {
                             yield Ok(StreamToken::ToolCall { name: name.clone(), args: args.clone(), id: id.clone() });
 
                             let call_id = id.unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+
+                            self.inject_call_id(&mut args, &call_id);
 
                             match self.react_app
                                 .before_tool_call(&name, &mut args, session, context)

@@ -1,5 +1,6 @@
 //! Tests for the cancellation design:
-//! 1. `call_tool()` injects `__call_id__` into the tool's args.
+//! 1. The engine injects `__call_id__` into the tool's args before invoking
+//!    the `before_tool_call` hook.
 //! 2. `tool.cancel(call_id)` (on the AsyncTool trait) is invoked with the
 //!    matching call_id when the engine's cancel listener receives a cancel
 //!    message on the bus topic.
@@ -9,21 +10,38 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use react::engine::ReActEngineBuilder;
-use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
+use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
 use react::llm::{
     LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession, TokenStream,
 };
-use react::runtime::ReActApp;
+use react::runtime::{HookDecision, ReActApp};
 use react::tool::registry::{AsyncTool, ToolVariant};
 use react::tool::ToolError;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// App whose `before_tool_call` hook records the args it received, so the test
+/// can verify `__call_id__` was injected before the hook fired.
 #[derive(Default)]
-struct TestApp;
+struct RecordingApp {
+    hook_args: Arc<DashMap<String, Value>>,
+}
 
-impl ReActApp for TestApp {
+impl ReActApp for RecordingApp {
     type Session = LlmSession;
     type Context = LlmContext;
+
+    fn before_tool_call(
+        &self,
+        tool_name: &str,
+        args: &mut Value,
+        _session: &mut Self::Session,
+        _context: &mut Self::Context,
+    ) -> impl std::future::Future<Output = HookDecision> + Send {
+        let key = format!("{}::{}", tool_name, args.get("__call_id__").map(|v| v.to_string()).unwrap_or_default());
+        self.hook_args.insert(key, args.clone());
+        async { HookDecision::Continue }
+    }
 }
 
 /// Async test tool that records what it received.
@@ -89,30 +107,53 @@ impl AsyncTool for CapturingTool {
 #[tokio::test]
 async fn call_tool_injects_call_id_into_args() {
     let (tool, received_args, _cancel_calls) = CapturingTool::new("capturing", true);
+    let hook_args = Arc::new(DashMap::new());
 
-    // Build an engine with the tool. No bus needed for this test.
-    let llm = Box::new(NoopLlm);
+    // The first LLM response asks to call `capturing`; the second is a final answer.
+    let llm = Box::new(ToolCallingLlm {
+        responses: vec![
+            make_tool_call_response("call-123"),
+            make_text_response("Final Answer: done".to_string(), true),
+        ],
+        index: Arc::new(AtomicUsize::new(0)),
+    });
+
     let tool_box: Box<dyn AsyncTool> = Box::new(tool);
-    let engine = ReActEngineBuilder::<TestApp>::new()
+    let mut engine = ReActEngineBuilder::<RecordingApp>::new()
         .llm(llm)
         .with_tool(ToolVariant::Async(tool_box))
         .agent_name("test-agent".to_string())
-        .max_steps(1)
+        .app(RecordingApp {
+            hook_args: hook_args.clone(),
+        })
+        .max_steps(2)
         .build()
         .unwrap();
 
-    // Drive the engine manually via `call_tool` to verify injection.
-    let mut input = json!({"user_key": "abc"});
-    let result = engine.call_tool("capturing", &mut input, "test-call-1").await;
-    assert!(result.is_ok(), "call_tool failed: {:?}", result.err());
+    let mut session = LlmSession::default();
+    let mut context = LlmContext::default();
+    let mut request = LlmRequest::new("test");
+    request.input = react::llm::Content::text("Call the capturing tool");
+    let result = engine.react(None, request, &mut session, &mut context).await;
+    assert!(result.is_ok(), "react failed: {:?}", result.err());
 
-    let captured = received_args.get("test-call-1").expect("tool did not run");
+    // The tool should have received __call_id__ in its args.
+    let captured = received_args.get("call-123").expect("tool did not run");
     assert_eq!(
         captured.get("__call_id__").and_then(|v| v.as_str()),
-        Some("test-call-1"),
-        "engine did not inject __call_id__"
+        Some("call-123"),
+        "tool args did not contain __call_id__"
     );
-    assert_eq!(captured.get("user_key").and_then(|v| v.as_str()), Some("abc"));
+
+    // The before_tool_call hook should have seen __call_id__ injected into args.
+    let hook_entry = hook_args
+        .get("capturing::\"call-123\"")
+        .expect("before_tool_call hook did not run");
+    assert_eq!(
+        hook_entry.get("__call_id__").and_then(|v| v.as_str()),
+        Some("call-123"),
+        "before_tool_call hook did not see __call_id__"
+    );
 }
 
 #[tokio::test]
@@ -154,12 +195,15 @@ async fn tool_cancel_invokes_cancel_callback() {
 
 
 
-// ── No-op LLM (we drive the engine directly, not through `react()`) ───────
+// ── Mock LLM that first emits a tool call, then a final answer ─────────────
 
-struct NoopLlm;
+struct ToolCallingLlm {
+    responses: Vec<LlmResponse>,
+    index: Arc<AtomicUsize>,
+}
 
 #[async_trait]
-impl LlmClient<LlmSession, LlmContext> for NoopLlm {
+impl LlmClient<LlmSession, LlmContext> for ToolCallingLlm {
     async fn complete(
         &self,
         _persona: Option<String>,
@@ -167,10 +211,12 @@ impl LlmClient<LlmSession, LlmContext> for NoopLlm {
         _session: &mut LlmSession,
         _context: &mut LlmContext,
     ) -> LlmResponseResult {
-        Ok(LlmResponse::OpenAI(make_text_response(
-            "Final Answer: done".to_string(),
-            true,
-        )))
+        let i = self.index.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .responses
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| make_text_response("Final Answer: done".to_string(), true)))
     }
     async fn stream_complete(
         &self,
@@ -182,15 +228,48 @@ impl LlmClient<LlmSession, LlmContext> for NoopLlm {
         Ok(Box::pin(futures::stream::empty()))
     }
     fn supports_tools(&self) -> bool {
-        false
+        true
     }
     fn provider_name(&self) -> &'static str {
-        "noop"
+        "tool-calling-mock"
     }
 }
 
-fn make_text_response(content: String, is_final: bool) -> ChatCompletionResponse {
-    ChatCompletionResponse {
+fn make_tool_call_response(call_id: &str) -> LlmResponse {
+    LlmResponse::OpenAI(ChatCompletionResponse {
+        id: "test-123".to_string(),
+        object: "chat.completion".to_string(),
+        created: 1234567890,
+        model: "test-model".to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: call_id.to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: Some("capturing".to_string()),
+                        arguments: Some(r#"{"user_key": "abc"}"#.to_string()),
+                    },
+                }]),
+                function_call: None,
+                reasoning_content: None,
+                extra: serde_json::Value::Object(serde_json::Map::new()),
+            },
+            stop_reason: None,
+            finish_reason: Some("tool_calls".to_string()),
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        nvext: None,
+    })
+}
+
+fn make_text_response(content: String, is_final: bool) -> LlmResponse {
+    LlmResponse::OpenAI(ChatCompletionResponse {
         id: "test-123".to_string(),
         object: "chat.completion".to_string(),
         created: 1234567890,
@@ -216,5 +295,5 @@ fn make_text_response(content: String, is_final: bool) -> ChatCompletionResponse
         usage: None,
         system_fingerprint: None,
         nvext: None,
-    }
+    })
 }
