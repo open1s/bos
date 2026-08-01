@@ -714,7 +714,7 @@ impl<A: ReActApp> ReActEngine<A> {
 
                                 match self
                                     .react_app
-                                    .before_tool_call(&name, &mut args, session, context)
+                                    .before_tool_call(&name, &mut args, &call_id, session, context)
                                     .await
                                 {
                                     HookDecision::Continue => {}
@@ -730,9 +730,9 @@ impl<A: ReActApp> ReActEngine<A> {
 
                                 let mut result = self.call_tool(&name, &mut args, &call_id).await;
                                 self.tool_call_count.fetch_add(1, Ordering::Relaxed);
-                                
+
                                 match self.react_app
-                                    .after_tool_result(&name, &mut result, session, context)
+                                    .after_tool_result(&name, &mut result, &call_id, session, context)
                                     .await 
                                 {
                                     HookDecision::Continue => {}
@@ -952,7 +952,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             self.inject_call_id(&mut args, &call_id);
 
                             match self.react_app
-                                .before_tool_call(&name, &mut args, session, context)
+                                .before_tool_call(&name, &mut args, &call_id, session, context)
                                 .await
                             {
                                 HookDecision::Continue => {}
@@ -986,7 +986,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             self.tool_call_count.fetch_add(1, Ordering::Relaxed);
 
                             match self.react_app
-                                .after_tool_result(&name, &mut result, session, context)
+                                .after_tool_result(&name, &mut result, &call_id, session, context)
                                 .await 
                                 {
                                 HookDecision::Continue => {}

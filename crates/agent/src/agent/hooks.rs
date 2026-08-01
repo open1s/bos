@@ -304,11 +304,13 @@ impl ReActApp for HookRegistry {
         &self,
         tool_name: &str,
         args: &mut Value,
+        call_id: &str,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> HookDecision {
         let mut ctx = HookContext::new("");
         ctx.set("tool_name", tool_name);
+        ctx.set("call_id", call_id);
         ctx.set("tool_args", args.to_string());
         match self.trigger(HookEvent::BeforeToolCall, ctx).await {
             HookDecision::Continue => HookDecision::Continue,
@@ -321,11 +323,13 @@ impl ReActApp for HookRegistry {
         &self,
         tool_name: &str,
         result: &mut Result<Value, react::engine::ReactError>,
+        call_id: &str,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> HookDecision {
         let mut ctx = HookContext::new("");
         ctx.set("tool_name", tool_name);
+        ctx.set("call_id", call_id);
         ctx.set(
             "tool_result",
             &result.as_ref().map(|v| v.to_string()).unwrap_or_default(),

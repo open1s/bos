@@ -514,12 +514,14 @@ impl ReActApp for AgentReActApp {
         &self,
         tool_name: &str,
         args: &mut JsonValue,
+        call_id: &str,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl Future<Output = react::runtime::HookDecision> + Send {
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
         let tool_name = tool_name.to_string();
+        let call_id = call_id.to_string();
         let plugins = self.plugins.clone();
         async move {
             if plugins.has_plugins() {
@@ -531,6 +533,7 @@ impl ReActApp for AgentReActApp {
             }
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("tool_name", &tool_name);
+            ctx.set("call_id", &call_id);
             ctx.set("tool_args", &args.to_string());
             hooks
                 .trigger(crate::agent::hooks::HookEvent::BeforeToolCall, ctx)
@@ -543,12 +546,14 @@ impl ReActApp for AgentReActApp {
         &self,
         tool_name: &str,
         result: &mut Result<JsonValue, ReactError>,
+        call_id: &str,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl Future<Output = react::runtime::HookDecision> + Send {
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
         let tool_name = tool_name.to_string();
+        let call_id = call_id.to_string();
         let plugins = self.plugins.clone();
         let result_text = result.as_ref().map(|v| v.to_string()).unwrap_or_default();
         async move {
@@ -574,6 +579,7 @@ impl ReActApp for AgentReActApp {
             }
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("tool_name", &tool_name);
+            ctx.set("call_id", &call_id);
             ctx.set("tool_result", &result_text);
             hooks
                 .trigger(crate::agent::hooks::HookEvent::AfterToolCall, ctx)

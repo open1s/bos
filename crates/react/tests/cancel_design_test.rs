@@ -20,11 +20,13 @@ use react::tool::ToolError;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// App whose `before_tool_call` hook records the args it received, so the test
-/// can verify `__call_id__` was injected before the hook fired.
+/// App whose hooks record the args/result they received, so the test can
+/// verify `__call_id__` was injected before both the `before_tool_call` and
+/// `after_tool_result` hooks fired.
 #[derive(Default)]
 struct RecordingApp {
     hook_args: Arc<DashMap<String, Value>>,
+    hook_results: Arc<DashMap<String, Value>>,
 }
 
 impl ReActApp for RecordingApp {
@@ -35,11 +37,25 @@ impl ReActApp for RecordingApp {
         &self,
         tool_name: &str,
         args: &mut Value,
+        call_id: &str,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl std::future::Future<Output = HookDecision> + Send {
-        let key = format!("{}::{}", tool_name, args.get("__call_id__").map(|v| v.to_string()).unwrap_or_default());
+        let key = format!("{}::{}", tool_name, call_id);
         self.hook_args.insert(key, args.clone());
+        async { HookDecision::Continue }
+    }
+
+    fn after_tool_result(
+        &self,
+        tool_name: &str,
+        result: &mut Result<Value, react::engine::ReactError>,
+        call_id: &str,
+        _session: &mut Self::Session,
+        _context: &mut Self::Context,
+    ) -> impl std::future::Future<Output = HookDecision> + Send {
+        let key = format!("{}::{}", tool_name, call_id);
+        self.hook_results.insert(key, result.as_ref().map(|v| v.clone()).unwrap_or_default());
         async { HookDecision::Continue }
     }
 }
@@ -108,6 +124,7 @@ impl AsyncTool for CapturingTool {
 async fn call_tool_injects_call_id_into_args() {
     let (tool, received_args, _cancel_calls) = CapturingTool::new("capturing", true);
     let hook_args = Arc::new(DashMap::new());
+    let hook_results = Arc::new(DashMap::new());
 
     // The first LLM response asks to call `capturing`; the second is a final answer.
     let llm = Box::new(ToolCallingLlm {
@@ -125,6 +142,7 @@ async fn call_tool_injects_call_id_into_args() {
         .agent_name("test-agent".to_string())
         .app(RecordingApp {
             hook_args: hook_args.clone(),
+            hook_results: hook_results.clone(),
         })
         .max_steps(2)
         .build()
@@ -147,12 +165,22 @@ async fn call_tool_injects_call_id_into_args() {
 
     // The before_tool_call hook should have seen __call_id__ injected into args.
     let hook_entry = hook_args
-        .get("capturing::\"call-123\"")
+        .get("capturing::call-123")
         .expect("before_tool_call hook did not run");
     assert_eq!(
         hook_entry.get("__call_id__").and_then(|v| v.as_str()),
         Some("call-123"),
         "before_tool_call hook did not see __call_id__"
+    );
+
+    // The after_tool_result hook should have received the call_id as a param.
+    let hook_result_entry = hook_results
+        .get("capturing::call-123")
+        .expect("after_tool_result hook did not run");
+    assert_eq!(
+        hook_result_entry.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "after_tool_result hook did not receive the tool result"
     );
 }
 

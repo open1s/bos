@@ -69,6 +69,7 @@ pub trait ReActApp: Send + Sync {
         &self,
         _tool_name: &str,
         _args: &mut serde_json::Value,
+        _call_id: &str,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl Future<Output = HookDecision> + Send {
@@ -80,6 +81,7 @@ pub trait ReActApp: Send + Sync {
         &self,
         _tool_name: &str,
         _result: &mut Result<serde_json::Value, crate::engine::ReactError>,
+        _call_id: &str,
         _session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl Future<Output = HookDecision> + Send {
@@ -142,19 +144,21 @@ impl<T: ReActApp + ?Sized> ReActApp for Box<T> {
         &self,
         tool_name: &str,
         args: &mut serde_json::Value,
+        call_id: &str,
         session: &mut Self::Session,
         context: &mut Self::Context,
     ) -> impl Future<Output = HookDecision> + Send {
-        (**self).before_tool_call(tool_name, args, session, context)
+        (**self).before_tool_call(tool_name, args, call_id, session, context)
     }
     fn after_tool_result(
         &self,
         tool_name: &str,
         result: &mut Result<serde_json::Value, crate::engine::ReactError>,
+        call_id: &str,
         session: &mut Self::Session,
         context: &mut Self::Context,
     ) -> impl Future<Output = HookDecision> + Send {
-        (**self).after_tool_result(tool_name, result, session, context)
+        (**self).after_tool_result(tool_name, result, call_id, session, context)
     }
     fn on_thought(
         &self,
