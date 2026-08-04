@@ -66,6 +66,8 @@ async function demoCustomAgent() {
 
   const agent = brain.agent('coder', {
     systemPrompt: 'You are a helpful coding assistant.',
+    apiMode: 'responses',
+    reasoningEffort: 'high',
   })
 
   console.log('  📤 User: "Hello"')

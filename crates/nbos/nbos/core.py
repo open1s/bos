@@ -154,6 +154,10 @@ class AgentBuilder:
         self._config.timeout_secs = opts.get("timeout_secs", 120)
         if "max_tokens" in opts and opts["max_tokens"] is not None:
             self._config.max_tokens = opts["max_tokens"]
+        if "api_mode" in opts and opts["api_mode"] is not None:
+            self._config.api_mode = opts["api_mode"]
+        if "reasoning_effort" in opts and opts["reasoning_effort"] is not None:
+            self._config.reasoning_effort = opts["reasoning_effort"]
 
         if opts.get("rate_limit_capacity"):
             self._config.rate_limit_capacity = opts["rate_limit_capacity"]
@@ -196,6 +200,14 @@ class AgentBuilder:
 
     def with_timeout(self, secs: int) -> "AgentBuilder":
         self._config.timeout_secs = secs
+        return self
+
+    def with_api_mode(self, mode: str) -> "AgentBuilder":
+        self._config.api_mode = mode
+        return self
+
+    def with_reasoning_effort(self, effort: str) -> "AgentBuilder":
+        self._config.reasoning_effort = effort
         return self
 
     def with_tools(self, *tools: ToolDef) -> "AgentBuilder":

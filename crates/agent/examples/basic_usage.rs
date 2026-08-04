@@ -1,4 +1,5 @@
 use agent::agent::agentic::{Agent, AgentConfig, LlmProvider};
+use agent::tools::FunctionTool;
 use config::ConfigLoader;
 use react::llm::vendor::{NvidiaVendor, OpenRouterVendor};
 use std::sync::Arc;
@@ -64,9 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nvidia_cfg = VendorConfig::from_nvidia(&config).ok_or("no llm.nvidia config")?;
 
     let mut config = AgentConfig::default();
-    config.model = nvidia_cfg.model;
+    config.model = nvidia_cfg.model.clone();
 
-    let agent = Agent::new(config, Arc::new(provider));
+    let llm = Arc::new(provider);
+    let agent = Agent::new(config, llm.clone());
 
     println!("Agent created with model: {}\n", agent.config().model);
 
@@ -102,6 +104,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             Err(e) => println!("Error: {}", e),
         }
+    }
+
+    println!("\n--- Example 4: Responses API + reasoning_effort + tools ---");
+    // The Responses API (`/v1/responses`) sends `reasoning: {effort}` nested
+    // in the request body. Registering a tool lets the model delegate work to
+    // local functions during `react()`.
+    let mut responses_config = AgentConfig::default();
+    responses_config.model = nvidia_cfg.model.clone();
+    responses_config.api_mode = "responses".to_string();
+    responses_config.reasoning_effort = Some("high".to_string());
+
+    let mut responses_agent = Agent::new(responses_config, llm);
+    responses_agent.add_tool(Arc::new(FunctionTool::new(
+        "add",
+        "Add two integers",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"}
+            },
+            "required": ["a", "b"]
+        }),
+        |args| -> Result<serde_json::Value, react::tool::ToolError> {
+            let a = args["a"].as_i64().unwrap_or(0);
+            let b = args["b"].as_i64().unwrap_or(0);
+            Ok(serde_json::json!({"sum": a + b}))
+        },
+    )));
+    println!("api_mode={} reasoning_effort={:?}", "responses", "high");
+    match responses_agent.react("What is 3 + 4?").await {
+        Ok(response) => println!("Response: {}\n", response),
+        Err(e) => println!("Error: {}\n", e),
     }
 
     println!("\n=== Done ===");

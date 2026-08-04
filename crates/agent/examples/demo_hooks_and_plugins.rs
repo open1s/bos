@@ -62,7 +62,7 @@ impl AgentPlugin for TestPlugin {
         "TestPlugin"
     }
 
-async fn on_llm_request(&self, request: LlmRequestWrapper) -> Option<LlmRequestWrapper> {
+    async fn on_llm_request(&self, request: LlmRequestWrapper) -> Option<LlmRequestWrapper> {
         let mut calls = self.calls.lock().unwrap();
         calls.push("on_llm_request".to_string());
         println!("  [Plugin:on_llm_request] model={}", request.model);
@@ -70,10 +70,7 @@ async fn on_llm_request(&self, request: LlmRequestWrapper) -> Option<LlmRequestW
             react::llm::Content::Text(s) => s.clone(),
             react::llm::Content::Parts(parts) => serde_json::to_string(parts).unwrap_or_default(),
         };
-        println!(
-            "    input: {}",
-            &input_str[..input_str.len().min(100)]
-        );
+        println!("    input: {}", &input_str[..input_str.len().min(100)]);
         Some(request)
     }
 

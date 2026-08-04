@@ -89,7 +89,8 @@ where
 
     /// Stop the callable, aborting the handler task and dropping the subscription.
     pub fn stop(&mut self) {
-        self.started.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.started
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(ref mut inner) = self.inner {
             inner.stop();
         }

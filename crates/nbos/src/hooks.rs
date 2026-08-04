@@ -145,17 +145,15 @@ impl AgentHook for PythonHook {
         let py_event: PyHookEvent = event.into();
         let callback = self.callback.clone();
 
-        let result = Python::attach(|py| {
-            callback.call1(py, (py_event, py_hook_context))
-        });
+        let result = Python::attach(|py| callback.call1(py, (py_event, py_hook_context)));
 
         let result = match result {
             Ok(val) => val,
             Err(_) => return InnerDecision::Continue,
         };
 
-        let is_coroutine = Python::attach(|py| result.bind(py).hasattr("__await__"))
-            .unwrap_or(false);
+        let is_coroutine =
+            Python::attach(|py| result.bind(py).hasattr("__await__")).unwrap_or(false);
 
         let final_result = if is_coroutine {
             match crate::utils::await_python_coroutine(result).await {

@@ -80,6 +80,8 @@ async fn test_engine_with_llm() {
     let mut context = LlmContext::default();
     let mut request = LlmRequest::new("test");
     request.input = react::llm::Content::text("Hi");
-    let result = engine.react(None, request, &mut session, &mut context).await;
+    let result = engine
+        .react(None, request, &mut session, &mut context)
+        .await;
     assert!(result.is_ok());
 }

@@ -158,7 +158,9 @@ impl Callable {
     if let Some(ref mut callable) = *guard {
       callable.stop();
     }
-    self.is_started.store(false, std::sync::atomic::Ordering::SeqCst);
+    self
+      .is_started
+      .store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(())
   }
 }

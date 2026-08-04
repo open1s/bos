@@ -4,7 +4,7 @@
 //! LLM vendor clients and verify they can make real API requests.
 
 use config::ConfigLoader;
-use react::llm::vendor::{NvidiaVendor, OpenRouterVendor};
+use react::llm::vendor::{NvidiaVendor, OpenAiVendor, OpenRouterVendor};
 use react::llm::{Content, LlmClient, LlmContext, LlmRequest, LlmResponse, LlmSession};
 
 /// Configuration extracted from config file for LLM providers.
@@ -66,6 +66,7 @@ fn make_simple_request(model: &str) -> LlmRequest {
         max_tokens: Some(50),
         top_p: None,
         top_k: None,
+        reasoning_effort: None,
         api_mode: react::llm::ApiMode::Chat,
     }
 }
@@ -147,7 +148,12 @@ async fn test_nvidia_vendor_with_config() {
     // Make a simple request
     let request = make_simple_request(&llm_config.model);
     let result = vendor
-        .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
+        .complete(
+            None,
+            request,
+            &mut LlmSession::new(),
+            &mut LlmContext::default(),
+        )
         .await;
 
     match result {
@@ -201,7 +207,12 @@ async fn test_nvidia_vendor_stream_with_config() {
     // Make a streaming request
     let request = make_simple_request(&llm_config.model);
     let stream_result = vendor
-        .stream_complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
+        .stream_complete(
+            None,
+            request,
+            &mut LlmSession::new(),
+            &mut LlmContext::default(),
+        )
         .await;
 
     match stream_result {
@@ -266,7 +277,12 @@ async fn test_nvidia_vendor_invalid_api_key() {
 
     let request = make_simple_request("nvidia/z-ai/glm4-9b");
     let result = vendor
-        .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
+        .complete(
+            None,
+            request,
+            &mut LlmSession::new(),
+            &mut LlmContext::default(),
+        )
         .await;
 
     // Should return an error (not panic)
@@ -287,7 +303,12 @@ async fn test_openrouter_vendor_invalid_api_key() {
 
     let request = make_simple_request("openrouter/meta-llama/llama-3.2-3b-instruct");
     let result = vendor
-        .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
+        .complete(
+            None,
+            request,
+            &mut LlmSession::new(),
+            &mut LlmContext::default(),
+        )
         .await;
 
     // Should return an error (not panic)
@@ -330,10 +351,16 @@ async fn test_nvidia_response_parsing() {
         max_tokens: None,
         top_p: None,
         top_k: None,
+        reasoning_effort: None,
         api_mode: react::llm::ApiMode::Chat,
     };
     let result = match vendor
-        .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
+        .complete(
+            None,
+            request,
+            &mut LlmSession::new(),
+            &mut LlmContext::default(),
+        )
         .await
     {
         Ok(r) => r,
@@ -470,19 +497,27 @@ async fn test_nvidia_tool_calls_stream_with_config() {
     // System prompt that encourages the model to use a tool
     let request = LlmRequest {
         model: llm_config.model.clone(),
-        input: Content::text("You have access to a tool called 'get_weather'. \
+        input: Content::text(
+            "You have access to a tool called 'get_weather'. \
         When the user asks about weather, you MUST call get_weather \
         with {\"location\": \"San Francisco, CA\"}. \
-        User question: What is the weather in San Francisco?"),
+        User question: What is the weather in San Francisco?",
+        ),
         temperature: Some(0.7),
         max_tokens: Some(256),
         top_p: None,
         top_k: None,
+        reasoning_effort: None,
         api_mode: react::llm::ApiMode::Chat,
     };
 
     let stream_result = vendor
-        .stream_complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
+        .stream_complete(
+            None,
+            request,
+            &mut LlmSession::new(),
+            &mut LlmContext::default(),
+        )
         .await;
 
     match stream_result {
@@ -563,4 +598,184 @@ async fn test_nvidia_tool_calls_stream_with_config() {
             panic!("NVIDIA tool_calls stream request failed: {:?}", e);
         }
     }
+}
+
+// ============================================================================
+// Responses API Integration Tests
+// ============================================================================
+//
+// These exercise the OpenAI Responses API (`/v1/responses`) path through the
+// `api_mode` flag. They run against whatever endpoint is configured under
+// `global_model`; if that endpoint does not support the Responses API (404) or
+// is unreachable/rate-limited the test prints a note and skips.
+
+fn is_skippable_error(err_str: &str) -> bool {
+    err_str.contains("404")
+        || err_str.contains("not found")
+        || err_str.contains("429")
+        || err_str.contains("rate limit")
+        || err_str.contains("405")
+        || err_str.contains("connection")
+}
+
+async fn load_global_config() -> Option<LlmConfig> {
+    let config = load_config().await.ok()?;
+    LlmConfig::from_global_model(&config)
+}
+
+#[tokio::test]
+async fn test_responses_api_complete() {
+    let llm_config = match load_global_config().await {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping test (no global_model config)");
+            return;
+        }
+    };
+
+    let vendor = OpenAiVendor::new(
+        llm_config.base_url.clone(),
+        llm_config.model.clone(),
+        llm_config.api_key.clone(),
+    );
+
+    let mut request = LlmRequest {
+        model: llm_config.model.clone(),
+        input: Content::text("Say 'Hello, World!' in exactly those words."),
+        temperature: Some(0.7),
+        max_tokens: Some(50),
+        top_p: None,
+        top_k: None,
+        reasoning_effort: None,
+        api_mode: react::llm::ApiMode::Responses,
+    };
+    if request.model.is_empty() {
+        request.model = "gpt-4".to_string();
+    }
+
+    let result = match vendor
+        .complete(
+            None,
+            request,
+            &mut LlmSession::new(),
+            &mut LlmContext::default(),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let err_str = e.to_string();
+            if is_skippable_error(&err_str) {
+                eprintln!("Responses API not reachable, skipping: {}", err_str);
+                return;
+            }
+            panic!("Responses API request failed: {:?}", e);
+        }
+    };
+
+    match &result {
+        LlmResponse::Responses(resp) => {
+            assert!(!resp.id.is_empty(), "id should not be empty");
+            assert!(!resp.model.is_empty(), "model should not be empty");
+            assert!(
+                resp.status == "completed" || resp.status == "in_progress",
+                "unexpected status: {}",
+                resp.status
+            );
+            let text = resp.output_text();
+            assert!(
+                !text.is_empty(),
+                "Responses API returned no output text; output={:?}",
+                resp.output
+            );
+            if let Some(usage) = &resp.usage {
+                assert!(usage.total_tokens > 0, "total_tokens should be positive");
+            }
+            println!("✓ Responses API complete verified: {}", text);
+        }
+        LlmResponse::OpenAI(_) => {
+            panic!("expected Responses API response, got Chat Completions response")
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_responses_api_stream() {
+    let llm_config = match load_global_config().await {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping test (no global_model config)");
+            return;
+        }
+    };
+
+    let vendor = OpenAiVendor::new(
+        llm_config.base_url.clone(),
+        llm_config.model.clone(),
+        llm_config.api_key.clone(),
+    );
+
+    let mut request = LlmRequest {
+        model: llm_config.model.clone(),
+        input: Content::text("Count from 1 to 3."),
+        temperature: Some(0.7),
+        max_tokens: Some(50),
+        top_p: None,
+        top_k: None,
+        reasoning_effort: None,
+        api_mode: react::llm::ApiMode::Responses,
+    };
+    if request.model.is_empty() {
+        request.model = "gpt-4".to_string();
+    }
+
+    let stream = match vendor
+        .stream_complete(
+            None,
+            request,
+            &mut LlmSession::new(),
+            &mut LlmContext::default(),
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let err_str = e.to_string();
+            if is_skippable_error(&err_str) {
+                eprintln!(
+                    "Responses API streaming not reachable, skipping: {}",
+                    err_str
+                );
+                return;
+            }
+            panic!("Responses API stream request failed: {:?}", e);
+        }
+    };
+
+    let mut collected = String::new();
+    let mut saw_done = false;
+    let mut stream_result = stream;
+    use futures::StreamExt;
+    while let Some(token) = stream_result.next().await {
+        match token {
+            Ok(react::llm::StreamToken::Text(s)) => collected.push_str(&s),
+            Ok(react::llm::StreamToken::Done) => saw_done = true,
+            Ok(_) => {}
+            Err(e) => {
+                let err_str = e.to_string();
+                if is_skippable_error(&err_str) {
+                    eprintln!("Responses API stream error (skipping): {}", err_str);
+                    return;
+                }
+                panic!("Responses API stream token error: {:?}", e);
+            }
+        }
+    }
+
+    assert!(saw_done, "stream should terminate with Done");
+    assert!(
+        !collected.is_empty(),
+        "Responses API stream produced no text"
+    );
+    println!("✓ Responses API stream verified: {}", collected);
 }

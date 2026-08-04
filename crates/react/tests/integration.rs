@@ -148,7 +148,9 @@ async fn test_react_engine_basic() {
     let mut context = LlmContext::default();
     let mut request = LlmRequest::new("test");
     request.input = react::llm::Content::text("What is 2+2?");
-    let result = engine.react(None, request, &mut session, &mut context).await;
+    let result = engine
+        .react(None, request, &mut session, &mut context)
+        .await;
     if let Err(e) = &result {
         eprintln!("Error: {:?}", e);
     }
@@ -169,6 +171,8 @@ async fn test_react_engine_no_tool() {
     let mut context = LlmContext::default();
     let mut request = LlmRequest::new("test");
     request.input = react::llm::Content::text("What is the answer?");
-    let result = engine.react(None, request, &mut session, &mut context).await;
+    let result = engine
+        .react(None, request, &mut session, &mut context)
+        .await;
     assert!(result.is_ok());
 }

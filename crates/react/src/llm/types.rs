@@ -40,7 +40,11 @@ pub struct Binary {
 }
 
 impl Binary {
-    pub fn from_base64(content_type: impl Into<String>, content: impl Into<String>, name: Option<String>) -> Self {
+    pub fn from_base64(
+        content_type: impl Into<String>,
+        content: impl Into<String>,
+        name: Option<String>,
+    ) -> Self {
         Self {
             content_type: content_type.into(),
             source: BinarySource::Base64(content.into()),
@@ -48,7 +52,11 @@ impl Binary {
         }
     }
 
-    pub fn from_url(content_type: impl Into<String>, url: impl Into<String>, name: Option<String>) -> Self {
+    pub fn from_url(
+        content_type: impl Into<String>,
+        url: impl Into<String>,
+        name: Option<String>,
+    ) -> Self {
         Self {
             content_type: content_type.into(),
             source: BinarySource::Url(url.into()),
@@ -385,6 +393,17 @@ pub enum LlmToolKind {
     ComputerUse,
 }
 
+impl LlmToolKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LlmToolKind::Function => "function",
+            LlmToolKind::WebSearch => "web_search",
+            LlmToolKind::FileSearch => "file_search",
+            LlmToolKind::ComputerUse => "computer_use",
+        }
+    }
+}
+
 fn is_function_kind(kind: &LlmToolKind) -> bool {
     *kind == LlmToolKind::Function
 }
@@ -565,6 +584,9 @@ pub struct LlmRequest {
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Reasoning effort for supported reasoning models (`low`/`medium`/`high`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Which OpenAI API protocol to use. `Chat` (default) targets
     /// `/chat/completions`; `Responses` targets the newer `/v1/responses` API.
     #[serde(default)]
@@ -598,6 +620,33 @@ impl ApiMode {
     }
 }
 
+/// Reasoning effort for reasoning-capable models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => ReasoningEffort::Low,
+            "high" => ReasoningEffort::High,
+            _ => ReasoningEffort::Medium,
+        }
+    }
+}
+
 impl LlmRequest {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
@@ -607,6 +656,7 @@ impl LlmRequest {
             max_tokens: None,
             top_p: None,
             top_k: None,
+            reasoning_effort: None,
             api_mode: ApiMode::Chat,
         }
     }
@@ -628,6 +678,11 @@ impl LlmRequest {
 
     pub fn top_k(mut self, top_k: u32) -> Self {
         self.top_k = Some(top_k);
+        self
+    }
+
+    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
         self
     }
 

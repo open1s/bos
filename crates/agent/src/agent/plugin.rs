@@ -24,6 +24,7 @@ pub struct LlmRequestWrapper {
     pub max_tokens: Option<u32>,
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
+    pub reasoning_effort: Option<react::llm::ReasoningEffort>,
     pub api_mode: react::llm::ApiMode,
     pub metadata: std::collections::HashMap<String, String>,
 }
@@ -37,6 +38,7 @@ impl LlmRequestWrapper {
             max_tokens: request.max_tokens,
             top_p: request.top_p,
             top_k: request.top_k,
+            reasoning_effort: request.reasoning_effort,
             api_mode: request.api_mode,
             metadata: std::collections::HashMap::new(),
         }
@@ -50,6 +52,7 @@ impl LlmRequestWrapper {
             max_tokens: self.max_tokens,
             top_p: self.top_p,
             top_k: self.top_k,
+            reasoning_effort: self.reasoning_effort,
             api_mode: self.api_mode,
         }
     }

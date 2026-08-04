@@ -208,7 +208,12 @@ impl SkillCache {
         }
     }
 
-    pub fn get_or_insert(&self, skill_name: &str, instructions: String, skill_dir: String) -> Arc<CachedSkill> {
+    pub fn get_or_insert(
+        &self,
+        skill_name: &str,
+        instructions: String,
+        skill_dir: String,
+    ) -> Arc<CachedSkill> {
         if let Some(entry) = self.cache.get(skill_name) {
             if entry.loaded_at.elapsed() < self.ttl {
                 return Arc::new(entry.clone());
@@ -479,9 +484,13 @@ impl<A: ReActApp> ReActEngine<A> {
             let result = if let Some(resilience) = &self.resilience {
                 resilience.acquire().await.map_err(ReactError::from)?;
                 resilience.check_circuit().map_err(ReactError::from)?;
-                self.llm.complete(persona.clone(), request.clone(), session, context).await
+                self.llm
+                    .complete(persona.clone(), request.clone(), session, context)
+                    .await
             } else {
-                self.llm.complete(persona.clone(), request.clone(), session, context).await
+                self.llm
+                    .complete(persona.clone(), request.clone(), session, context)
+                    .await
             };
             info!(
                 "[TIMING] call_llm attempt {}: {:?}",
@@ -557,9 +566,13 @@ impl<A: ReActApp> ReActEngine<A> {
             resilience.acquire().await.map_err(ReactError::from)?;
             resilience.check_circuit().map_err(ReactError::from)?;
 
-            self.llm.stream_complete(persona.clone(), request, session, context).await
+            self.llm
+                .stream_complete(persona.clone(), request, session, context)
+                .await
         } else {
-            self.llm.stream_complete(persona.clone(), request, session, context).await
+            self.llm
+                .stream_complete(persona.clone(), request, session, context)
+                .await
         };
 
         // Record outcome in circuit breaker so it learns from actual LLM results
@@ -579,7 +592,10 @@ impl<A: ReActApp> ReActEngine<A> {
     /// (AbortSignal for JS, a Python-side signal object for nbos).
     fn inject_call_id(&self, input: &mut Value, call_id: &str) {
         if let Value::Object(map) = input {
-            map.insert("__call_id__".to_string(), Value::String(call_id.to_string()));
+            map.insert(
+                "__call_id__".to_string(),
+                Value::String(call_id.to_string()),
+            );
         } else {
             // Non-object inputs (string/number) are still allowed by some
             // tools. Re-wrap as an object so we can attach the call_id.
@@ -592,8 +608,17 @@ impl<A: ReActApp> ReActEngine<A> {
     }
 
     /// Call tool - no resilience wrapper (only LLM calls need rate limiting)
-    pub async fn call_tool(&self, name: &str, input: &mut Value, call_id: &str) -> Result<Value, ReactError> {
-        let cancelable = self.tools.get(name).map(|t| t.is_cancelable()).unwrap_or(false);
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        input: &mut Value,
+        call_id: &str,
+    ) -> Result<Value, ReactError> {
+        let cancelable = self
+            .tools
+            .get(name)
+            .map(|t| t.is_cancelable())
+            .unwrap_or(false);
         if cancelable {
             let cid = call_id.to_string();
             self.run_manager.register(&cid, name);
@@ -662,7 +687,7 @@ impl<A: ReActApp> ReActEngine<A> {
 
             let mut llm_response = match timeout(
                 Duration::from_secs(self.llm_timeout_secs),
-                self.call_llm(persona.clone(),request.clone(), session, context),
+                self.call_llm(persona.clone(), request.clone(), session, context),
             )
             .await
             {
@@ -732,9 +757,16 @@ impl<A: ReActApp> ReActEngine<A> {
                                 let mut result = self.call_tool(&name, &mut args, &call_id).await;
                                 self.tool_call_count.fetch_add(1, Ordering::Relaxed);
 
-                                match self.react_app
-                                    .after_tool_result(&name, &mut result, &call_id, session, context)
-                                    .await 
+                                match self
+                                    .react_app
+                                    .after_tool_result(
+                                        &name,
+                                        &mut result,
+                                        &call_id,
+                                        session,
+                                        context,
+                                    )
+                                    .await
                                 {
                                     HookDecision::Continue => {}
                                     HookDecision::Abort => {
@@ -746,7 +778,6 @@ impl<A: ReActApp> ReActEngine<A> {
                                         return Err(ReactError::HookAbort(msg));
                                     }
                                 }
-                                
 
                                 if let Ok(ret) = &result {
                                     if name == "load_skill" {
@@ -897,7 +928,13 @@ impl<A: ReActApp> ReActEngine<A> {
 
                                 match self
                                     .react_app
-                                    .after_tool_result(&name, &mut result, &call_id, session, context)
+                                    .after_tool_result(
+                                        &name,
+                                        &mut result,
+                                        &call_id,
+                                        session,
+                                        context,
+                                    )
                                     .await
                                 {
                                     HookDecision::Continue => {}
@@ -913,10 +950,8 @@ impl<A: ReActApp> ReActEngine<A> {
 
                                 if let Ok(ret) = &result {
                                     if name == "load_skill" {
-                                        let skill_name = args
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
+                                        let skill_name =
+                                            args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                         let instructions = ret
                                             .get("instructions")
                                             .and_then(|v| v.as_str())
@@ -976,9 +1011,8 @@ impl<A: ReActApp> ReActEngine<A> {
                         if !assistant_text.is_empty() {
                             thought = assistant_text.trim().to_string();
                             if let Some(pos) = thought.find("Final Answer:") {
-                                thought = thought[(pos + "Final Answer:".len())..]
-                                    .trim()
-                                    .to_string();
+                                thought =
+                                    thought[(pos + "Final Answer:".len())..].trim().to_string();
                             }
                             self.react_app.on_thought(&thought, session, context).await;
                             session.push(LlmMessage::assistant(thought.clone()));
@@ -1021,7 +1055,7 @@ impl<A: ReActApp> ReActEngine<A> {
 
         context.add_tool(load_skill_tool());
 
-        let result = self.react_loop(persona,request, session, context).await?;
+        let result = self.react_loop(persona, request, session, context).await?;
 
         Ok(result)
     }
@@ -1144,7 +1178,7 @@ impl<A: ReActApp> ReActEngine<A> {
 
                             match self.react_app
                                 .after_tool_result(&name, &mut result, &call_id, session, context)
-                                .await 
+                                .await
                                 {
                                 HookDecision::Continue => {}
                                 HookDecision::Abort => {
@@ -1243,15 +1277,15 @@ impl<A: ReActApp> ReActEngine<A> {
         self.tool_call_count.store(0, Ordering::Relaxed);
     }
 
-    pub fn get_stop_flag(&self) -> Arc<AtomicBool>{
+    pub fn get_stop_flag(&self) -> Arc<AtomicBool> {
         return self.stop_flag.clone();
     }
 
-    pub fn set_stop_flag(&mut self,flag: bool) {
+    pub fn set_stop_flag(&mut self, flag: bool) {
         self.stop_flag.store(flag, Ordering::SeqCst);
     }
 
-    pub fn stop(&mut self){
+    pub fn stop(&mut self) {
         let running = self.run_manager.cancel_all_running();
         for (call_id, name) in running {
             if let Some(tool) = self.tools.get(&name) {
@@ -1261,7 +1295,7 @@ impl<A: ReActApp> ReActEngine<A> {
         self.set_stop_flag(true);
     }
 
-    pub fn close(&mut self){
+    pub fn close(&mut self) {
         self.set_stop_flag(true);
     }
 }

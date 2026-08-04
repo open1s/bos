@@ -52,4 +52,4 @@ async function demo() {
   console.log('\n=== Done ===')
 }
 
-demo().catch(console.error)
+demo().catch(console.error).finally(() => process.exit(0))

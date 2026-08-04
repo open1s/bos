@@ -12,7 +12,8 @@ use dashmap::DashMap;
 use react::engine::ReActEngineBuilder;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
 use react::llm::{
-    LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession, TokenStream,
+    LlmClient, LlmContext, LlmError, LlmRequest, LlmResponse, LlmResponseResult, LlmSession,
+    TokenStream,
 };
 use react::runtime::{HookDecision, ReActApp};
 use react::tool::registry::{AsyncTool, ToolVariant};
@@ -55,7 +56,8 @@ impl ReActApp for RecordingApp {
         _context: &mut Self::Context,
     ) -> impl std::future::Future<Output = HookDecision> + Send {
         let key = format!("{}::{}", tool_name, call_id);
-        self.hook_results.insert(key, result.as_ref().map(|v| v.clone()).unwrap_or_default());
+        self.hook_results
+            .insert(key, result.as_ref().map(|v| v.clone()).unwrap_or_default());
         async { HookDecision::Continue }
     }
 }
@@ -104,7 +106,10 @@ impl AsyncTool for CapturingTool {
         self.cancelable
     }
     fn cancel(&self, call_id: &str) {
-        let mut entry = self.received_cancel_calls.entry(call_id.to_string()).or_insert(0);
+        let mut entry = self
+            .received_cancel_calls
+            .entry(call_id.to_string())
+            .or_insert(0);
         *entry += 1;
     }
     async fn run(&self, input: &Value) -> Result<Value, ToolError> {
@@ -114,8 +119,7 @@ impl AsyncTool for CapturingTool {
             .and_then(|v| v.as_str())
             .unwrap_or("<missing>")
             .to_string();
-        self.received_args
-            .insert(call_id.clone(), input.clone());
+        self.received_args.insert(call_id.clone(), input.clone());
         Ok(json!({"ok": true, "call_id": call_id}))
     }
 }
@@ -152,7 +156,9 @@ async fn call_tool_injects_call_id_into_args() {
     let mut context = LlmContext::default();
     let mut request = LlmRequest::new("test");
     request.input = react::llm::Content::text("Call the capturing tool");
-    let result = engine.react(None, request, &mut session, &mut context).await;
+    let result = engine
+        .react(None, request, &mut session, &mut context)
+        .await;
     assert!(result.is_ok(), "react failed: {:?}", result.err());
 
     // The tool should have received __call_id__ in its args.
@@ -191,37 +197,49 @@ async fn tool_cancel_invokes_cancel_callback() {
         (Box::new(t) as Box<dyn AsyncTool>, c)
     };
 
-    assert_eq!(
-        tool.is_cancelable(),
-        true,
-        "tool should be cancelable",
-    );
+    assert_eq!(tool.is_cancelable(), true, "tool should be cancelable",);
 
-    let count_before = cancel_calls.get("call-XYZ").map(|r| *r.value()).unwrap_or(0);
+    let count_before = cancel_calls
+        .get("call-XYZ")
+        .map(|r| *r.value())
+        .unwrap_or(0);
     assert_eq!(count_before, 0, "no cancel calls before test");
 
     tool.cancel("call-XYZ");
 
-    let count_after = cancel_calls.get("call-XYZ").map(|r| *r.value()).unwrap_or(0);
+    let count_after = cancel_calls
+        .get("call-XYZ")
+        .map(|r| *r.value())
+        .unwrap_or(0);
     assert_eq!(count_after, 1, "tool.cancel should have been invoked once");
 
     tool.cancel("call-XYZ");
-    let count_twice = cancel_calls.get("call-XYZ").map(|r| *r.value()).unwrap_or(0);
-    assert_eq!(count_twice, 2, "tool.cancel should be idempotent (count increments)");
+    let count_twice = cancel_calls
+        .get("call-XYZ")
+        .map(|r| *r.value())
+        .unwrap_or(0);
+    assert_eq!(
+        count_twice, 2,
+        "tool.cancel should be idempotent (count increments)"
+    );
 
     // Different call_id
     tool.cancel("other-call");
     assert_eq!(
-        cancel_calls.get("other-call").map(|r| *r.value()).unwrap_or(0),
+        cancel_calls
+            .get("other-call")
+            .map(|r| *r.value())
+            .unwrap_or(0),
         1,
     );
     assert_eq!(
-        cancel_calls.get("call-XYZ").map(|r| *r.value()).unwrap_or(0),
+        cancel_calls
+            .get("call-XYZ")
+            .map(|r| *r.value())
+            .unwrap_or(0),
         2,
     );
 }
-
-
 
 // ── Mock LLM that first emits a tool call, then a final answer ─────────────
 

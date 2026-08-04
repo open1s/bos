@@ -37,7 +37,8 @@ fn json_to_content(json: &serde_json::Value) -> Content {
             }
         }
         serde_json::Value::Object(obj) => {
-            if let Some(part) = serde_json::from_value(serde_json::Value::Object(obj.clone())).ok() {
+            if let Some(part) = serde_json::from_value(serde_json::Value::Object(obj.clone())).ok()
+            {
                 Content::Parts(vec![part])
             } else {
                 Content::Text(json.to_string())
@@ -395,8 +396,8 @@ impl AsyncTool for PyPythonToolWrapper {
         })
         .map_err(|e: PyErr| react::ToolError::Failed(e.to_string()))?;
 
-        let is_coroutine = Python::attach(|py| result.bind(py).hasattr("__await__"))
-            .unwrap_or(false);
+        let is_coroutine =
+            Python::attach(|py| result.bind(py).hasattr("__await__")).unwrap_or(false);
 
         let final_result = if is_coroutine {
             crate::utils::await_python_coroutine(result)
@@ -438,6 +439,10 @@ pub struct PyAgentConfig {
     #[pyo3(get, set)]
     pub max_steps: usize,
     #[pyo3(get, set)]
+    pub api_mode: String,
+    #[pyo3(get, set)]
+    pub reasoning_effort: Option<String>,
+    #[pyo3(get, set)]
     pub circuit_breaker_max_failures: Option<usize>,
     #[pyo3(get, set)]
     pub circuit_breaker_cooldown_secs: Option<u64>,
@@ -466,6 +471,8 @@ impl Default for PyAgentConfig {
             max_tokens: c.max_tokens,
             timeout_secs: c.timeout_secs,
             max_steps: 10,
+            api_mode: "chat".to_string(),
+            reasoning_effort: None,
             circuit_breaker_max_failures: None,
             circuit_breaker_cooldown_secs: None,
             rate_limit_capacity: None,
@@ -519,6 +526,8 @@ impl From<PyAgentConfig> for AgentConfig {
             max_tokens: value.max_tokens,
             timeout_secs: value.timeout_secs,
             max_steps: value.max_steps,
+            api_mode: value.api_mode,
+            reasoning_effort: value.reasoning_effort,
             circuit_breaker,
             rate_limit,
         }
@@ -538,6 +547,8 @@ impl PyAgentConfig {
         temperature = None,
         max_tokens = None,
         timeout_secs = None,
+        api_mode = None,
+        reasoning_effort = None,
     ))]
     fn new(
         name: Option<String>,
@@ -548,6 +559,8 @@ impl PyAgentConfig {
         temperature: Option<f32>,
         max_tokens: Option<u32>,
         timeout_secs: Option<u64>,
+        api_mode: Option<String>,
+        reasoning_effort: Option<String>,
     ) -> Self {
         let mut cfg = Self::default();
         if let Some(v) = name {
@@ -573,6 +586,12 @@ impl PyAgentConfig {
         }
         if let Some(v) = timeout_secs {
             cfg.timeout_secs = v;
+        }
+        if let Some(v) = api_mode {
+            cfg.api_mode = v;
+        }
+        if let Some(v) = reasoning_effort {
+            cfg.reasoning_effort = Some(v);
         }
         cfg
     }
@@ -693,7 +712,8 @@ impl PyAgent {
         _py: Python<'py>,
         config: PyRef<'py, PyAgentConfig>,
     ) -> PyResult<Self> {
-        let cfg: AgentConfig = config.clone().into();
+        let mut cfg: AgentConfig = config.clone().into();
+        agent::agent::config::apply_model_defaults(&mut cfg);
         let py_hooks = crate::hooks::PyHookRegistry::create();
 
         let mut llm = LlmProvider::new();
@@ -743,7 +763,8 @@ impl PyAgent {
         config: PyRef<'py, PyAgentConfig>,
         _bus: PyRef<'py, PyBus>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let cfg: AgentConfig = config.clone().into();
+        let mut cfg: AgentConfig = config.clone().into();
+        agent::agent::config::apply_model_defaults(&mut cfg);
         let bus_inner = _bus.inner.clone();
         drop(_bus);
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
@@ -878,7 +899,10 @@ impl PyAgent {
         };
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let out = agent.react(task_content).await.map_err(to_py_runtime_error)?;
+            let out = agent
+                .react(task_content)
+                .await
+                .map_err(to_py_runtime_error)?;
             Ok(out)
         })
     }
@@ -894,7 +918,10 @@ impl PyAgent {
         };
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let out = agent.run_simple(task_content).await.map_err(to_py_runtime_error)?;
+            let out = agent
+                .run_simple(task_content)
+                .await
+                .map_err(to_py_runtime_error)?;
             Ok(out)
         })
     }
@@ -1002,6 +1029,17 @@ impl PyAgent {
             "timeout_secs".to_string(),
             serde_json::Value::Number(cfg.timeout_secs.into()),
         );
+        map.insert(
+            "api_mode".to_string(),
+            serde_json::Value::String(cfg.api_mode.clone()),
+        );
+        map.insert(
+            "reasoning_effort".to_string(),
+            cfg.reasoning_effort
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
 
         json_to_py(py, &serde_json::to_value(map).map_err(to_py_runtime_error)?)
     }
@@ -1106,7 +1144,8 @@ impl PyAgent {
         let tool_name = py_tool.name().to_string();
         let tool_description = py_tool.description().to_string();
         let tool_schema = py_tool.schema_json();
-        let tool_schema: serde_json::Value = serde_json::from_str(&tool_schema).unwrap_or(serde_json::Value::Null);
+        let tool_schema: serde_json::Value =
+            serde_json::from_str(&tool_schema).unwrap_or(serde_json::Value::Null);
         drop(py_tool);
 
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;

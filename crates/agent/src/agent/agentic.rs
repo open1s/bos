@@ -139,7 +139,9 @@ impl LlmClient<AgentSession, AgentReactContext> for LlmProvider {
         session: &mut AgentSession,
         context: &mut AgentReactContext,
     ) -> Result<ReactTokenStream, ReactLlmError> {
-        self.inner.stream_complete(persona, req, session, context).await
+        self.inner
+            .stream_complete(persona, req, session, context)
+            .await
     }
 
     fn supports_tools(&self) -> bool {
@@ -269,6 +271,13 @@ pub struct AgentConfig {
     pub max_tokens: Option<u32>,
     pub timeout_secs: u64,
     pub max_steps: usize,
+    /// API protocol selection: `"chat"` (default, `/chat/completions`) or
+    /// `"responses"` (`/v1/responses`). Kept as a string so it archives cleanly
+    /// under qserde/rkyv.
+    pub api_mode: String,
+    /// Reasoning effort for reasoning models: `"low"`, `"medium"` (default), or
+    /// `"high"`. Kept as an optional string so it archives cleanly under qserde/rkyv.
+    pub reasoning_effort: Option<String>,
     /// Circuit breaker configuration for resilience
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Rate limiter configuration for resilience
@@ -287,6 +296,8 @@ impl Default for AgentConfig {
             max_tokens: None,
             timeout_secs: 60,
             max_steps: 10,
+            api_mode: "chat".to_string(),
+            reasoning_effort: None,
             circuit_breaker: None,
             rate_limit: None,
         }
@@ -324,7 +335,7 @@ pub struct Agent {
     #[rkyv(with = qserde::rkyv::with::Skip)]
     last_stream_tokens: std::sync::Mutex<Option<(u64, u64)>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
-    last_stream_tool_calls: std::sync::Mutex<u64>
+    last_stream_tool_calls: std::sync::Mutex<u64>,
 }
 
 impl Agent {
@@ -349,7 +360,7 @@ impl Agent {
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
-            last_stream_tool_calls: std::sync::Mutex::new(0)
+            last_stream_tool_calls: std::sync::Mutex::new(0),
         }
     }
 
@@ -566,7 +577,9 @@ impl Agent {
             .app(app);
 
         if let Some(ref bus) = self.bus {
-            builder = builder.bus(bus.clone()).agent_name(self.config.name.clone());
+            builder = builder
+                .bus(bus.clone())
+                .agent_name(self.config.name.clone());
         }
 
         if let Some(ref registry) = self.registry {
@@ -719,6 +732,12 @@ impl Agent {
             input: task_content,
             temperature: Some(self.config.temperature),
             max_tokens: self.config.max_tokens,
+            reasoning_effort: self
+                .config
+                .reasoning_effort
+                .as_deref()
+                .map(react::llm::ReasoningEffort::from_str),
+            api_mode: react::llm::ApiMode::from_str(&self.config.api_mode),
             ..Default::default()
         };
 
@@ -726,7 +745,12 @@ impl Agent {
         let result = engine
             .as_mut()
             .unwrap()
-            .react(Some(self.config.system_prompt.clone()), request, &mut agent_session, &mut *context.as_mut().unwrap())
+            .react(
+                Some(self.config.system_prompt.clone()),
+                request,
+                &mut agent_session,
+                &mut *context.as_mut().unwrap(),
+            )
             .await;
         let engine_time = engine_start.elapsed();
 
@@ -867,6 +891,12 @@ impl Agent {
                 input: task_content,
                 temperature: Some(self.config.temperature),
                 max_tokens: self.config.max_tokens,
+                reasoning_effort: self
+                    .config
+                    .reasoning_effort
+                    .as_deref()
+                    .map(react::llm::ReasoningEffort::from_str),
+                api_mode: react::llm::ApiMode::from_str(&self.config.api_mode),
                 ..Default::default()
             };
 
@@ -976,9 +1006,9 @@ impl Agent {
             let mut cache = self.engine_cache.lock().unwrap();
             cache.take()
         };
-        
+
         match cached_engine {
-            Some(mut e) =>{
+            Some(mut e) => {
                 e.stop();
             }
             None => {}
@@ -1176,7 +1206,7 @@ impl Clone for Agent {
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
-            last_stream_tool_calls: std::sync::Mutex::new(0)
+            last_stream_tool_calls: std::sync::Mutex::new(0),
         }
     }
 }
@@ -1293,8 +1323,6 @@ mod tests {
         assert!(config.circuit_breaker.is_none());
         assert!(config.rate_limit.is_none());
     }
-
-    
 
     // =========================================================================
     // LlmProvider Tests

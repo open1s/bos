@@ -168,7 +168,8 @@ impl McpClient {
             serde_json::from_value(capabilities).map_err(|e| McpError::Protocol(e.to_string()))?;
 
         *self.capabilities.lock().unwrap() = Some(caps.clone());
-        self.initialized.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.initialized
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.state.lock().unwrap() = ConnectionState::Connected;
 
         self.notify("notifications/initialized", None).await?;

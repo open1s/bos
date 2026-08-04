@@ -25,6 +25,8 @@ pub struct PyLlmRequestWrapper {
     #[pyo3(get, set)]
     pub input: String,
     #[pyo3(get, set)]
+    pub reasoning_effort: Option<String>,
+    #[pyo3(get, set)]
     pub api_mode: String,
 }
 
@@ -53,7 +55,10 @@ impl From<&InnerLlmRequest> for PyLlmRequestWrapper {
         let input_json = match &req.input {
             react::llm::Content::Text(s) => serde_json::Value::String(s.clone()),
             react::llm::Content::Parts(parts) => serde_json::Value::Array(
-                parts.iter().map(|p| serde_json::to_value(p).unwrap_or_default()).collect()
+                parts
+                    .iter()
+                    .map(|p| serde_json::to_value(p).unwrap_or_default())
+                    .collect(),
             ),
         };
         Self {
@@ -63,6 +68,7 @@ impl From<&InnerLlmRequest> for PyLlmRequestWrapper {
             top_p: req.top_p,
             top_k: req.top_k,
             input: input_json.to_string(),
+            reasoning_effort: req.reasoning_effort.map(|e| e.as_str().to_string()),
             api_mode: req.api_mode.as_str().to_string(),
         }
     }
@@ -70,7 +76,8 @@ impl From<&InnerLlmRequest> for PyLlmRequestWrapper {
 
 impl From<PyLlmRequestWrapper> for InnerLlmRequest {
     fn from(py_req: PyLlmRequestWrapper) -> Self {
-        let json: serde_json::Value = serde_json::from_str(&py_req.input).unwrap_or_else(|_| serde_json::Value::String(py_req.input));
+        let json: serde_json::Value = serde_json::from_str(&py_req.input)
+            .unwrap_or_else(|_| serde_json::Value::String(py_req.input));
         InnerLlmRequest {
             model: py_req.model,
             input: json_to_content(&json),
@@ -78,6 +85,10 @@ impl From<PyLlmRequestWrapper> for InnerLlmRequest {
             max_tokens: py_req.max_tokens,
             top_p: py_req.top_p,
             top_k: py_req.top_k,
+            reasoning_effort: py_req
+                .reasoning_effort
+                .as_deref()
+                .map(react::llm::ReasoningEffort::from_str),
             api_mode: react::llm::ApiMode::from_str(&py_req.api_mode),
             metadata: Default::default(),
         }
@@ -136,7 +147,9 @@ impl From<&InnerLlmResponse> for PyLlmResponseWrapper {
             InnerLlmResponse::Responses(rsp) => {
                 if let Some(item) = rsp.output.first() {
                     match item {
-                        react::llm::vendor::ResponsesItem::FunctionCall { name, arguments, .. } => {
+                        react::llm::vendor::ResponsesItem::FunctionCall {
+                            name, arguments, ..
+                        } => {
                             return Self {
                                 response_type: "ToolCall".to_string(),
                                 content: None,
@@ -149,9 +162,10 @@ impl From<&InnerLlmResponse> for PyLlmResponseWrapper {
                             let text: String = content
                                 .iter()
                                 .filter_map(|p| match p {
-                                    react::llm::vendor::ResponsesContentPart::OutputText { text, .. } => {
-                                        Some(text.clone())
-                                    }
+                                    react::llm::vendor::ResponsesContentPart::OutputText {
+                                        text,
+                                        ..
+                                    } => Some(text.clone()),
                                     _ => None,
                                 })
                                 .collect();
@@ -334,8 +348,7 @@ where
 {
     let result = Python::attach(|py| callback.call1(py, (py_arg(py)?,))).ok()?;
 
-    let is_coroutine = Python::attach(|py| result.bind(py).hasattr("__await__"))
-        .unwrap_or(false);
+    let is_coroutine = Python::attach(|py| result.bind(py).hasattr("__await__")).unwrap_or(false);
 
     let final_result = if is_coroutine {
         crate::utils::await_python_coroutine(result).await.ok()?
@@ -363,21 +376,24 @@ impl InnerPlugin for PythonPlugin {
                 if val.is_none() {
                     return None;
                 }
-                val.extract::<PyLlmRequestWrapper>()
-                    .ok()
-                    .map(|wrapped| {
-                        let json: serde_json::Value = serde_json::from_str(&wrapped.input).unwrap_or_else(|_| serde_json::Value::String(wrapped.input.clone()));
-                        InnerLlmRequest {
-                            model: wrapped.model,
-                            input: json_to_content(&json),
-                            temperature: wrapped.temperature,
-                            max_tokens: wrapped.max_tokens,
-                            top_p: wrapped.top_p,
-                            top_k: wrapped.top_k,
-                            api_mode: react::llm::ApiMode::from_str(&wrapped.api_mode),
-                            metadata: request.metadata.clone(),
-                        }
-                    })
+                val.extract::<PyLlmRequestWrapper>().ok().map(|wrapped| {
+                    let json: serde_json::Value = serde_json::from_str(&wrapped.input)
+                        .unwrap_or_else(|_| serde_json::Value::String(wrapped.input.clone()));
+                    InnerLlmRequest {
+                        model: wrapped.model,
+                        input: json_to_content(&json),
+                        temperature: wrapped.temperature,
+                        max_tokens: wrapped.max_tokens,
+                        top_p: wrapped.top_p,
+                        top_k: wrapped.top_k,
+                        reasoning_effort: wrapped
+                            .reasoning_effort
+                            .as_deref()
+                            .map(react::llm::ReasoningEffort::from_str),
+                        api_mode: react::llm::ApiMode::from_str(&wrapped.api_mode),
+                        metadata: request.metadata.clone(),
+                    }
+                })
             },
         )
         .await

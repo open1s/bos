@@ -111,6 +111,8 @@ async function main() {
       'Format: Thought: <reasoning>\nFinal Answer: <response or tool call>',
     temperature: 0.7,
     timeoutSecs: 120,
+    apiMode: 'responses',
+    reasoningEffort: 'high',
   })
 
   console.log('\n' + '═'.repeat(60))

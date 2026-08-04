@@ -51,12 +51,16 @@ async def main():
                 circuit_breaker_max_failures=3,
                 circuit_breaker_cooldown_secs=60,
             )
+            .with_api_mode("responses")
+            .with_reasoning_effort("high")
             .with_tools(add)
             .start()
         )
         print("Agent configured via fluent API with resilience:")
         print(f"  rate_limit_capacity={agent.config.get('rate_limit_capacity')}")
         print(f"  circuit_breaker_max_failures={agent.config.get('circuit_breaker_max_failures')}")
+        print(f"  api_mode={agent.config.get('api_mode')}")
+        print(f"  reasoning_effort={agent.config.get('reasoning_effort')}")
         try:
             result = await agent.ask("What is 10 + 20?")
             print(f"  Result: {result}")
@@ -75,10 +79,14 @@ async def main():
             rate_limit_window_secs=15,
             circuit_breaker_max_failures=2,
             circuit_breaker_cooldown_secs=10,
+            api_mode="responses",
+            reasoning_effort="medium",
         ).start()
         print("Agent2 created via constructor:")
         print(f"  rate_limit_capacity={agent2.config.get('rate_limit_capacity')}")
         print(f"  circuit_breaker_max_failures={agent2.config.get('circuit_breaker_max_failures')}")
+        print(f"  api_mode={agent2.config.get('api_mode')}")
+        print(f"  reasoning_effort={agent2.config.get('reasoning_effort')}")
 
     print()
     print("=" * 60)

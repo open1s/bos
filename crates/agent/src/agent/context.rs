@@ -68,7 +68,9 @@ impl AgentSession {
     }
 
     pub fn add_user(&mut self, content: String) {
-        self.messages.push(Message::User { content: Content::Text(content) });
+        self.messages.push(Message::User {
+            content: Content::Text(content),
+        });
         self.update_metadata();
     }
 
@@ -392,6 +394,9 @@ impl ReactContext for AgentReactContext {
     }
 
     fn add_tool(&mut self, tool: LlmTool) {
+        if self.tools.iter().any(|t| t.name == tool.name) {
+            return;
+        }
         self.tools.push(tool);
     }
 
@@ -639,7 +644,9 @@ impl MessageContext {
     }
 
     pub fn add_user(&mut self, content: String) {
-        self.messages.push(Message::User { content: Content::Text(content) });
+        self.messages.push(Message::User {
+            content: Content::Text(content),
+        });
     }
 
     pub fn add_system(&mut self, profile: String) {

@@ -90,7 +90,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             let model = model_id.to_string();
             let mut req = request;
             req.model = model;
-            e.value().stream_complete(persona, req, session, context).await
+            e.value()
+                .stream_complete(persona, req, session, context)
+                .await
         } else {
             Ok(Box::pin(futures::stream::empty()))
         }

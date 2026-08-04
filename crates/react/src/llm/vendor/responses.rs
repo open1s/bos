@@ -50,7 +50,15 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResponsesReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponsesReasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::llm::ReasoningEffort>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -351,24 +359,19 @@ fn serialize_tools(tools: Option<&[LlmTool]>) -> Option<Vec<Value>> {
                         "parameters": tool.parameters,
                     }));
                 }
-                LlmToolKind::WebSearch => {
-                    let mut v = serde_json::json!({ "type": "web_search" });
+                // Hosted tools (`web_search`, `file_search`, `computer_use`) are
+                // sent as `{"type": "<kind>", ...config}`. The Responses API
+                // expects config keys (e.g. `max_results`, `vector_store_ids`,
+                // `display_width`) at the TOP level of the tool object, not
+                // nested under a sub-key.
+                LlmToolKind::WebSearch | LlmToolKind::FileSearch | LlmToolKind::ComputerUse => {
+                    let mut v = serde_json::json!({ "type": tool.kind.as_str() });
                     if let Some(cfg) = &tool.config {
-                        v["web_search"] = cfg.clone();
-                    }
-                    out.push(v);
-                }
-                LlmToolKind::FileSearch => {
-                    let mut v = serde_json::json!({ "type": "file_search" });
-                    if let Some(cfg) = &tool.config {
-                        v["file_search"] = cfg.clone();
-                    }
-                    out.push(v);
-                }
-                LlmToolKind::ComputerUse => {
-                    let mut v = serde_json::json!({ "type": "computer_use" });
-                    if let Some(cfg) = &tool.config {
-                        v["computer_use"] = cfg.clone();
+                        if let Some(obj) = cfg.as_object() {
+                            for (key, val) in obj {
+                                v[key] = val.clone();
+                            }
+                        }
                     }
                     out.push(v);
                 }
@@ -460,6 +463,9 @@ pub fn build_request(
         temperature: req.temperature,
         top_p: req.top_p,
         max_output_tokens: req.max_tokens,
+        reasoning: req.reasoning_effort.map(|effort| ResponsesReasoning {
+            effort: Some(effort),
+        }),
         stream: Some(stream),
     }
 }
@@ -592,6 +598,9 @@ struct PendingResponsesFunctionCall {
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
+    /// True once `function_call_arguments.done` (or `drain`) has emitted this
+    /// call. A later `output_item.done` for the same item must not re-emit it.
+    finalized: bool,
 }
 
 impl ResponsesFunctionCallAccumulator {
@@ -639,6 +648,9 @@ impl ResponsesFunctionCallAccumulator {
         final_arguments: Option<String>,
     ) -> Option<(String, Value, Option<String>)> {
         let entry = self.pending.get_mut(item_id)?;
+        if entry.finalized {
+            return None;
+        }
         if let Some(args) = &final_arguments {
             if !args.is_empty() {
                 entry.arguments = args.clone();
@@ -647,7 +659,7 @@ impl ResponsesFunctionCallAccumulator {
         let name = entry.name.clone().unwrap_or_default();
         let call_id = entry.call_id.clone();
         let arguments = std::mem::take(&mut entry.arguments);
-        self.pending.remove(item_id);
+        entry.finalized = true;
 
         if name.is_empty() {
             return None;
@@ -660,7 +672,7 @@ impl ResponsesFunctionCallAccumulator {
     }
 
     /// Drain all pending calls (stream end / error). Incomplete arguments fall
-    /// back to `{}`.
+    /// back to `{}`. Already-finalized calls are skipped.
     pub fn drain(&mut self) -> Vec<(String, Value, Option<String>)> {
         let keys: Vec<String> = self.pending.keys().cloned().collect();
         keys.into_iter()
@@ -916,5 +928,338 @@ impl ResponsesTransport {
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{Instruction, LlmContext, LlmMessage, LlmSession, Skill};
+
+    fn session_with_history() -> LlmSession {
+        let mut session = LlmSession::new();
+        session.push(LlmMessage::system("You are a helpful assistant."));
+        session.push(LlmMessage::user("What is the weather in SF?"));
+        session.push(LlmMessage::Assistant {
+            content: String::new(),
+        });
+        session.push(LlmMessage::AssistantToolCall {
+            tool_call_id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            args: serde_json::json!({"location": "San Francisco, CA"}),
+        });
+        session.push(LlmMessage::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            content: "72 F and sunny".to_string(),
+        });
+        session
+    }
+
+    fn context_with_tools() -> LlmContext {
+        let mut context = LlmContext::default();
+        context.add_tool(LlmTool::function(
+            "get_weather",
+            "Get the current weather",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"}
+                }
+            }),
+        ));
+        context.add_tool(LlmTool::web_search(Some(serde_json::json!({
+            "max_results": 5
+        }))));
+        context.add_tool(LlmTool::file_search(Some(serde_json::json!({
+            "vector_store_ids": ["vs_abc"]
+        }))));
+        context.add_tool(LlmTool::computer_use(None));
+        context.skills = vec![Skill {
+            category: "general".to_string(),
+            name: "web_browsing".to_string(),
+            description: "Browse the web".to_string(),
+        }];
+        context.instructions = vec![Instruction {
+            instruction: "be concise".to_string(),
+            description: "Keep answers short".to_string(),
+            name: "concise".to_string(),
+            dependon: None,
+        }];
+        context
+    }
+
+    #[test]
+    fn build_request_maps_history_and_hosted_tools() {
+        let session = session_with_history();
+        let context = context_with_tools();
+        let req = LlmRequest {
+            model: "gpt-5".to_string(),
+            input: Content::text("Summarize"),
+            temperature: Some(0.5),
+            top_p: None,
+            top_k: None,
+            max_tokens: Some(100),
+            reasoning_effort: Some(crate::llm::ReasoningEffort::High),
+            api_mode: crate::llm::ApiMode::Responses,
+        };
+
+        let built = build_request(None, &req, &session, &context, false);
+
+        assert_eq!(built.model, "gpt-5");
+        assert_eq!(built.max_output_tokens, Some(100));
+        assert_eq!(built.stream, Some(false));
+        assert_eq!(
+            built.reasoning.as_ref().and_then(|r| r.effort),
+            Some(crate::llm::ReasoningEffort::High),
+            "reasoning_effort maps to reasoning.effort"
+        );
+        let wire = serde_json::to_string(&built).unwrap();
+        assert!(
+            wire.contains("\"reasoning\":{\"effort\":\"high\"}"),
+            "wire format must nest effort under reasoning: {wire}"
+        );
+        assert!(
+            built
+                .instructions
+                .as_deref()
+                .unwrap()
+                .contains("You are a helpful assistant."),
+            "system messages fold into instructions"
+        );
+        assert!(
+            built
+                .instructions
+                .as_deref()
+                .unwrap()
+                .contains("web_browsing"),
+            "skills are appended to instructions"
+        );
+
+        let item_types: Vec<&str> = built
+            .input
+            .iter()
+            .map(|i| match i {
+                ResponsesInputItem::Message { .. } => "message",
+                ResponsesInputItem::FunctionCall { .. } => "function_call",
+                ResponsesInputItem::FunctionCallOutput { .. } => "function_call_output",
+            })
+            .collect();
+        assert_eq!(
+            item_types,
+            vec!["message", "message", "function_call", "function_call_output"],
+            "system folds into instructions; history maps to user/assistant messages + tool round-trip items"
+        );
+
+        let tools = built.tools.expect("tools serialized");
+        assert_eq!(tools.len(), 4);
+        let types: Vec<&str> = tools
+            .iter()
+            .map(|t| t.get("type").and_then(|v| v.as_str()).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["function", "web_search", "file_search", "computer_use"]
+        );
+        assert_eq!(
+            tools[1].get("max_results").unwrap().as_u64(),
+            Some(5),
+            "web_search config keys sit at the top level of the tool object"
+        );
+        assert!(
+            tools[1].get("web_search").is_none(),
+            "config must not be nested under a sub-key"
+        );
+        assert_eq!(
+            tools[2].get("vector_store_ids").unwrap(),
+            &serde_json::json!(["vs_abc"]),
+            "file_search config keys sit at the top level"
+        );
+        assert!(
+            tools[3].get("display_width").is_none(),
+            "computer_use without config omits config keys"
+        );
+        assert!(
+            tools[0].get("name").is_some(),
+            "function tools keep their name"
+        );
+    }
+
+    #[test]
+    fn bare_request_produces_single_user_message() {
+        let session = LlmSession::new();
+        let context = LlmContext::default();
+        let mut req = LlmRequest::new("gpt-5");
+        req.input = Content::text("hi");
+
+        let built = build_request(None, &req, &session, &context, false);
+
+        assert_eq!(built.input.len(), 1);
+        match &built.input[0] {
+            ResponsesInputItem::Message { role, content } => {
+                assert_eq!(role, "user");
+                assert_eq!(content.len(), 1);
+            }
+            other => panic!("expected a user message, got {:?}", other),
+        }
+        assert!(built.tools.is_none(), "empty tool set serializes to None");
+        assert!(
+            built.instructions.is_none(),
+            "no system/persona -> no instructions"
+        );
+    }
+
+    #[test]
+    fn output_text_and_chat_usage_mapping() {
+        let response: ResponsesResponse = serde_json::from_value(serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "gpt-5",
+            "output": [
+                {"type": "message", "id": "msg_1", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "Hello", "annotations": []},
+                    {"type": "output_text", "text": " world", "annotations": []}
+                ]},
+                {"type": "message", "id": "msg_2", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "!", "annotations": []}
+                ]}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        }))
+        .unwrap();
+
+        assert_eq!(response.output_text(), "Hello world!");
+        let usage = response.chat_usage().unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn accumulator_joins_streamed_function_call() {
+        let mut acc = ResponsesFunctionCallAccumulator::new();
+
+        acc.add_item(&serde_json::json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "name": "get_weather",
+            "call_id": "call_1",
+            "arguments": ""
+        }));
+        acc.push_args_delta("fc_1", r#"{"location":"SF"}"#);
+
+        let (name, args, id) = acc.done("fc_1", None).expect("call completes");
+        assert_eq!(name, "get_weather");
+        assert_eq!(args, serde_json::json!({"location": "SF"}));
+        assert_eq!(id.as_deref(), Some("call_1"));
+        assert!(acc.drain().is_empty(), "done() removes the pending entry");
+    }
+
+    #[test]
+    fn accumulator_drain_emits_incomplete_calls() {
+        let mut acc = ResponsesFunctionCallAccumulator::new();
+        acc.add_item(&serde_json::json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "name": "noop",
+            "call_id": "call_9",
+            "arguments": ""
+        }));
+
+        let drained = acc.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, "noop");
+        assert_eq!(drained[0].1, serde_json::json!({}));
+    }
+
+    #[test]
+    fn accumulator_does_not_duplicate_call_after_output_item_done() {
+        let mut acc = ResponsesFunctionCallAccumulator::new();
+
+        acc.add_item(&serde_json::json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "name": "add",
+            "call_id": "call_1",
+            "arguments": ""
+        }));
+        acc.push_args_delta("fc_1", r#"{"a":3,"b":4}"#);
+
+        let (name, args, id) = acc
+            .done("fc_1", Some(r#"{"a":3,"b":4}"#.to_string()))
+            .unwrap();
+        assert_eq!(name, "add");
+        assert_eq!(args, serde_json::json!({"a": 3, "b": 4}));
+        assert_eq!(id.as_deref(), Some("call_1"));
+
+        acc.add_item(&serde_json::json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "name": "add",
+            "call_id": "call_1",
+            "arguments": r#"{"a":3,"b":4}"#
+        }));
+
+        assert!(
+            acc.drain().is_empty(),
+            "a trailing output_item.done must not re-emit the same call_id"
+        );
+    }
+
+    #[test]
+    fn extractor_parses_sse_json_events() {
+        let mut extractor = ResponsesExtractor::new(JsonExtractor::default());
+        let payload = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hel"}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"lo"}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","name":"get_weather","call_id":"call_1","arguments":""}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"gpt-5","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+        );
+
+        let events = extractor.push(&payload).unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[0],
+            ResponsesStreamEvent::OutputTextDelta { ref delta, .. } if delta == "Hel"
+        ));
+        assert!(matches!(
+            events[1],
+            ResponsesStreamEvent::OutputTextDelta { ref delta, .. } if delta == "lo"
+        ));
+        assert!(matches!(
+            events[2],
+            ResponsesStreamEvent::OutputItemAdded { ref item, .. }
+                if item.get("name").and_then(|v| v.as_str()) == Some("get_weather")
+        ));
+        assert!(events[3].is_final());
+    }
+
+    #[test]
+    fn responses_response_serde_roundtrip() {
+        let response: ResponsesResponse = serde_json::from_value(serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "gpt-5",
+            "output": [
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather", "arguments": "{\"location\":\"SF\"}"}
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+        }))
+        .unwrap();
+
+        assert_eq!(response.id, "resp_1");
+        assert!(matches!(
+            &response.output[0],
+            ResponsesItem::FunctionCall { name, .. } if name == "get_weather"
+        ));
+
+        let serialized = serde_json::to_string(&response).unwrap();
+        let back: ResponsesResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(back.output_text(), "");
+        assert_eq!(back.chat_usage().unwrap().total_tokens, 7);
     }
 }

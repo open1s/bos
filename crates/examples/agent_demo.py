@@ -130,6 +130,8 @@ async def main():
         ),
         temperature=0.7,
         timeout_secs=120,
+        api_mode="responses",
+        reasoning_effort="high",
     )
 
     agent = await Agent.create(config, bus)

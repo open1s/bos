@@ -14,7 +14,9 @@ impl ReactSession for DummySession {
 }
 
 #[derive(Default)]
-struct DummyContext;
+struct DummyContext {
+    tools: Vec<react::llm::LlmTool>,
+}
 
 impl ReactContext for DummyContext {
     fn session_id(&self) -> String {
@@ -24,7 +26,11 @@ impl ReactContext for DummyContext {
         None
     }
     fn tools(&self) -> Option<&[react::llm::LlmTool]> {
-        None
+        if self.tools.is_empty() {
+            None
+        } else {
+            Some(&self.tools)
+        }
     }
     fn rules(&self) -> Option<&[react::llm::Rule]> {
         None
@@ -32,7 +38,9 @@ impl ReactContext for DummyContext {
     fn instructions(&self) -> Option<&[react::llm::Instruction]> {
         None
     }
-    fn add_tool(&mut self, _tool: react::llm::LlmTool) {}
+    fn add_tool(&mut self, tool: react::llm::LlmTool) {
+        self.tools.push(tool);
+    }
 
     fn notify_request(&self, _req: &LlmRequest) {}
     fn notify_response(&self, _resp: &react::llm::LlmResponse) {}
@@ -102,18 +110,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nvidia_cfg = VendorConfig::from_nvidia(config).ok_or("no llm.nvidia config")?;
     let model = nvidia_cfg.model;
 
-    let req = LlmRequest {
-        model: model.clone(),
-        input: Content::text("Count from 1 to 5, one number per line"),
-        temperature: Some(0.7),
-        max_tokens: Some(100),
-        top_p: None,
-        top_k: None,
-        api_mode: react::llm::ApiMode::Chat,
-    };
+    let mut req = LlmRequest::new(model.clone())
+        .temperature(0.7)
+        .max_tokens(100)
+        .reasoning_effort(react::llm::ReasoningEffort::Medium)
+        .api_mode(react::llm::ApiMode::Responses);
+    req.input = Content::text("Count from 1 to 5, one number per line");
 
     let mut session = DummySession::default();
     let mut ctx = DummyContext::default();
+    // Function + hosted tools are sent on the Responses wire; streamed
+    // function-call arguments are accumulated into a StreamToken::ToolCall.
+    ctx.add_tool(react::llm::LlmTool::function(
+        "add",
+        "Add two integers",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"}
+            },
+            "required": ["a", "b"]
+        }),
+    ));
+    ctx.add_tool(react::llm::LlmTool::file_search(Some(serde_json::json!({
+        "max_num_results": 5
+    }))));
 
     let input_str = match &req.input {
         react::llm::Content::Text(s) => s.clone(),
@@ -122,7 +144,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Streaming: {} with model {}", input_str, req.model);
     println!();
 
-    let mut stream = router.stream_complete(None, req, &mut session, &mut ctx).await?;
+    let mut stream = router
+        .stream_complete(None, req, &mut session, &mut ctx)
+        .await?;
 
     while let Some(token) = stream.next().await {
         match token {

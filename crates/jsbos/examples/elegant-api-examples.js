@@ -116,7 +116,8 @@ Use type hints, snake_case, docstrings.`)
 
   console.log('Streaming (callback): "Count from 1 to 3"\n')
   let tokenCount = 0
-  await agent.stream('Count from 1 to 3', (token) => {
+  await agent.stream('Count from 1 to 3', (err, token) => {
+    if (err) return
     if (!token) return
     tokenCount++
     if (token.type === 'Error' || token.type === 'Done' || token.type === 'Stopped') return

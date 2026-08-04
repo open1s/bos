@@ -109,7 +109,7 @@ impl Subscriber {
               |_result, _env| Ok(()),
             );
           }
-            None => {}
+          None => {}
         }
       }
       running.store(false, Ordering::SeqCst);
@@ -146,7 +146,8 @@ impl Subscriber {
 
         match message {
           Some(msg) => {
-            let value: serde_json::Value = serde_json::from_str(&msg).unwrap_or(serde_json::Value::String(msg));
+            let value: serde_json::Value =
+              serde_json::from_str(&msg).unwrap_or(serde_json::Value::String(msg));
             let tsfn_clone = Arc::clone(&tsfn);
             tsfn_clone.call_with_return_value(
               Ok(JSAny(value)),

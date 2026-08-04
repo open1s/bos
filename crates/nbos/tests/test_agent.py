@@ -23,6 +23,12 @@ class TestAgentConfig:
         repr_str = repr(config)
         assert "AgentConfig" in repr_str or repr_str is not None
 
+    def test_agent_config_api_mode_and_reasoning_effort(self):
+        """Test AgentConfig exposes api_mode and reasoning_effort"""
+        config = AgentConfig(api_mode="responses", reasoning_effort="high")
+        assert config.api_mode == "responses"
+        assert config.reasoning_effort == "high"
+
 
 class TestAgent:
     """Agent functionality tests - using BrainOS pattern"""
@@ -50,6 +56,31 @@ class TestAgent:
         async with BrainOS() as brain:
             agent = await brain.agent("test").with_model("gpt-4").start()
             assert agent is not None
+
+    @pytest.mark.asyncio
+    async def test_agent_builder_api_mode_and_reasoning_effort_kwargs(self):
+        """Test api_mode/reasoning_effort flow through builder kwargs"""
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = await brain.agent(
+                "test", api_mode="responses", reasoning_effort="high"
+            ).start()
+            assert agent.config.get("api_mode") == "responses"
+            assert agent.config.get("reasoning_effort") == "high"
+
+    @pytest.mark.asyncio
+    async def test_agent_builder_with_reasoning_methods(self):
+        """Test the with_api_mode/with_reasoning_effort fluent methods"""
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = (
+                await brain.agent("test")
+                .with_api_mode("responses")
+                .with_reasoning_effort("medium")
+                .start()
+            )
+            assert agent.config.get("api_mode") == "responses"
+            assert agent.config.get("reasoning_effort") == "medium"
 
     @pytest.mark.asyncio
     async def test_multiple_agents_same_bus(self):

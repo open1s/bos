@@ -206,7 +206,12 @@ fn test_no_load_skill_when_no_skills() {
 
     rt.block_on(async {
         engine
-            .react(None, LlmRequest::new("test"), &mut session, &mut context.clone())
+            .react(
+                None,
+                LlmRequest::new("test"),
+                &mut session,
+                &mut context.clone(),
+            )
             .await
     })
     .unwrap();

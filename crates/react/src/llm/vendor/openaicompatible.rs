@@ -252,11 +252,8 @@ impl StreamToolCallAccumulator {
         let mut results = Vec::new();
         for (_, entry) in self.pending.drain() {
             let name = entry.name.unwrap_or_default();
-            let id = entry
-                .id
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let args_val =
-                serde_json::from_str(&entry.arguments).unwrap_or(serde_json::json!({}));
+            let id = entry.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let args_val = serde_json::from_str(&entry.arguments).unwrap_or(serde_json::json!({}));
             results.push((name, args_val, Some(id)));
         }
         results
@@ -352,7 +349,12 @@ mod tests {
     #[test]
     fn accumulator_drain_flushes_incomplete_calls() {
         let mut acc = StreamToolCallAccumulator::new();
-        acc.push_delta(0, Some("call_abc".into()), Some("get_weather".into()), r#"{"loc"#);
+        acc.push_delta(
+            0,
+            Some("call_abc".into()),
+            Some("get_weather".into()),
+            r#"{"loc"#,
+        );
         assert_eq!(acc.len(), 1);
 
         let drained = acc.drain();
@@ -370,7 +372,12 @@ mod tests {
         let mut acc = StreamToolCallAccumulator::new();
 
         // Two tool calls interleaved at different indices
-        acc.push_delta(0, Some("call_0".into()), Some("get_weather".into()), r#"{"loc"#);
+        acc.push_delta(
+            0,
+            Some("call_0".into()),
+            Some("get_weather".into()),
+            r#"{"loc"#,
+        );
         acc.push_delta(1, Some("call_1".into()), Some("search".into()), r#"{"q"#);
         assert_eq!(acc.len(), 2);
 

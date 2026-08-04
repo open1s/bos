@@ -17,52 +17,52 @@ use react::llm::{Content, ContentPart};
 use react::tool::registry::AsyncTool;
 
 fn extract_json_value(val: Unknown<'_>) -> napi::Result<serde_json::Value> {
-    let raw = val.value();
-    unsafe {
-        let env = raw.env;
-        let napi_val = raw.value;
-        <serde_json::Value as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, napi_val)
-    }
+  let raw = val.value();
+  unsafe {
+    let env = raw.env;
+    let napi_val = raw.value;
+    <serde_json::Value as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, napi_val)
+  }
 }
 
 #[napi(object)]
 pub struct JsContent {
-    #[napi(js_name = "type")]
-    pub part_type: String,
-    pub text: Option<String>,
-    pub content_type: Option<String>,
-    pub url: Option<String>,
-    pub base64: Option<String>,
-    pub name: Option<String>,
+  #[napi(js_name = "type")]
+  pub part_type: String,
+  pub text: Option<String>,
+  pub content_type: Option<String>,
+  pub url: Option<String>,
+  pub base64: Option<String>,
+  pub name: Option<String>,
 }
 
 impl From<JsContent> for ContentPart {
-    fn from(js: JsContent) -> Self {
-        match js.part_type.as_str() {
-            "text" => ContentPart::Text {
-                text: js.text.unwrap_or_default(),
-            },
-            _ => ContentPart::Binary {
-                binary: react::llm::Binary {
-                    content_type: js.content_type.unwrap_or_else(|| "image/jpeg".to_string()),
-                    source: if let Some(url) = js.url {
-                        react::llm::BinarySource::Url(url)
-                    } else {
-                        react::llm::BinarySource::Base64(js.base64.unwrap_or_default())
-                    },
-                    name: js.name,
-                },
-            },
-        }
+  fn from(js: JsContent) -> Self {
+    match js.part_type.as_str() {
+      "text" => ContentPart::Text {
+        text: js.text.unwrap_or_default(),
+      },
+      _ => ContentPart::Binary {
+        binary: react::llm::Binary {
+          content_type: js.content_type.unwrap_or_else(|| "image/jpeg".to_string()),
+          source: if let Some(url) = js.url {
+            react::llm::BinarySource::Url(url)
+          } else {
+            react::llm::BinarySource::Base64(js.base64.unwrap_or_default())
+          },
+          name: js.name,
+        },
+      },
     }
+  }
 }
 
 fn vec_jscontent_to_content(parts: Vec<JsContent>) -> Content {
-    if parts.is_empty() {
-        Content::Text(String::new())
-    } else {
-        Content::Parts(parts.into_iter().map(Into::into).collect())
-    }
+  if parts.is_empty() {
+    Content::Text(String::new())
+  } else {
+    Content::Parts(parts.into_iter().map(Into::into).collect())
+  }
 }
 
 struct JSTool {
@@ -179,6 +179,10 @@ pub struct AgentConfig {
   pub timeout_secs: i64,
   #[napi(js_name = "maxSteps")]
   pub max_steps: Option<i64>,
+  #[napi(js_name = "apiMode")]
+  pub api_mode: Option<String>,
+  #[napi(js_name = "reasoningEffort")]
+  pub reasoning_effort: Option<String>,
   #[napi(js_name = "circuitBreakerMaxFailures")]
   pub circuit_breaker_max_failures: Option<i32>,
   #[napi(js_name = "circuitBreakerCooldownSecs")]
@@ -208,6 +212,8 @@ impl Default for AgentConfig {
       max_tokens: c.max_tokens.map(|v| v as i32),
       timeout_secs: c.timeout_secs as i64,
       max_steps: None,
+      api_mode: Some("chat".to_string()),
+      reasoning_effort: None,
       circuit_breaker_max_failures: None,
       circuit_breaker_cooldown_secs: None,
       rate_limit_capacity: None,
@@ -264,6 +270,8 @@ impl From<AgentConfig> for agent::AgentConfig {
       max_tokens: max_tokens_converted,
       timeout_secs: value.timeout_secs as u64,
       max_steps: value.max_steps.unwrap_or(10) as usize,
+      api_mode: value.api_mode.unwrap_or_else(|| "chat".to_string()),
+      reasoning_effort: value.reasoning_effort,
       circuit_breaker,
       rate_limit,
     }
@@ -285,7 +293,8 @@ pub struct Agent {
 impl Agent {
   #[napi(factory)]
   pub async fn create(config: AgentConfig) -> Result<Self> {
-    let cfg: agent::AgentConfig = config.into();
+    let mut cfg: agent::AgentConfig = config.into();
+    agent::agent::config::apply_model_defaults(&mut cfg);
     let js_hooks = HookRegistry::new();
 
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
@@ -335,7 +344,8 @@ impl Agent {
     config: AgentConfig,
     _bus: &External<Arc<crate::Session>>,
   ) -> Result<Self> {
-    let cfg: agent::AgentConfig = config.into();
+    let mut cfg: agent::AgentConfig = config.into();
+    agent::agent::config::apply_model_defaults(&mut cfg);
     let js_hooks = HookRegistry::new();
 
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
@@ -448,6 +458,8 @@ impl Agent {
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
         "timeout_secs": cfg.timeout_secs,
+        "api_mode": cfg.api_mode,
+        "reasoning_effort": cfg.reasoning_effort,
     }))
   }
 

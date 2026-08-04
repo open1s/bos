@@ -4,8 +4,8 @@ use agent::agent::hooks::{AgentHook, HookContext, HookRegistry as InnerHookRegis
 use async_trait::async_trait;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi_derive::napi;
 use napi::Unknown;
+use napi_derive::napi;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -66,9 +66,7 @@ impl AgentHook for JSHook {
     callback.call_with_return_value(
       Ok(ctx_data),
       ThreadsafeFunctionCallMode::NonBlocking,
-      move |result: std::result::Result<Unknown<'_>, napi::Error>,
-            env|
-            -> napi::Result<()> {
+      move |result: std::result::Result<Unknown<'_>, napi::Error>, env| -> napi::Result<()> {
         match result {
           Ok(val) => {
             let is_promise = val.is_promise().unwrap_or(false);
@@ -78,7 +76,9 @@ impl AgentHook for JSHook {
               let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
               let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
               let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
-                let decision = ctx.value.coerce_to_string()
+                let decision = ctx
+                  .value
+                  .coerce_to_string()
                   .and_then(|s| s.into_utf8())
                   .and_then(|u| u.as_str().map(|s| s.to_string()))
                   .unwrap_or_else(|e| format!("error:{}", e));
@@ -88,7 +88,8 @@ impl AgentHook for JSHook {
                 Ok(())
               });
             } else {
-              let decision = val.coerce_to_string()
+              let decision = val
+                .coerce_to_string()
                 .and_then(|s| s.into_utf8())
                 .and_then(|u| u.as_str().map(|s| s.to_string()))
                 .unwrap_or_else(|e| format!("error:{}", e));

@@ -45,6 +45,10 @@ pub struct TomlAgentConfig {
     pub timeout_secs: u64,
     pub max_steps: Option<usize>,
     #[serde(default)]
+    pub api_mode: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
     pub tools: Option<Vec<TomlToolRef>>,
 }
 
@@ -72,6 +76,8 @@ impl From<TomlAgentConfig> for AgentConfig {
             max_tokens: t.max_tokens,
             timeout_secs: t.timeout_secs,
             max_steps: t.max_steps.unwrap_or(10),
+            api_mode: t.api_mode.unwrap_or_default(),
+            reasoning_effort: t.reasoning_effort,
             circuit_breaker: None,
             rate_limit: None,
         }
@@ -157,7 +163,8 @@ impl TomlAgentBuilder {
         }
         let llm = Arc::new(llm);
 
-        let config: AgentConfig = self.config.clone().into();
+        let mut config: AgentConfig = self.config.clone().into();
+        apply_model_defaults(&mut config);
 
         let mut agent = Agent::new(config, llm);
 
@@ -180,5 +187,120 @@ impl TomlAgentBuilder {
         }
 
         Ok(agent)
+    }
+}
+
+/// Applies per-model defaults from a home config's `[llm.*]` sections to the
+/// given agent config. A section is matched when its `model` field equals
+/// `config.model` exactly. The section's `api_mode`/`reasoning_effort` values
+/// override any agent-level setting (model always wins).
+pub fn apply_model_defaults_from(config: &mut AgentConfig, home: &serde_json::Value) {
+    let Some(llm) = home.get("llm") else {
+        return;
+    };
+    let Some(sections) = llm.as_object() else {
+        return;
+    };
+    for section in sections.values() {
+        let Some(model) = section.get("model").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if model != config.model {
+            continue;
+        }
+        if let Some(api_mode) = section.get("api_mode").and_then(|v| v.as_str()) {
+            config.api_mode = api_mode.to_string();
+        }
+        if let Some(effort) = section.get("reasoning_effort").and_then(|v| v.as_str()) {
+            config.reasoning_effort = Some(effort.to_string());
+        }
+    }
+}
+
+/// Loads the home config and applies per-model `[llm.*]` defaults to the given
+/// agent config. No-op when no config is discoverable.
+pub fn apply_model_defaults(config: &mut AgentConfig) {
+    let mut loader = config::loader::ConfigLoader::new().discover();
+    if let Ok(home) = loader.load_sync() {
+        apply_model_defaults_from(config, &home);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::AgentConfig;
+
+    #[test]
+    fn applies_model_defaults_by_exact_model_match() {
+        let home = serde_json::json!({
+            "llm": {
+                "deepseek": {
+                    "model": "nvidia/deepseek-ai/deepseek-v4-flash",
+                    "base_url": "http://127.0.0.1:11436/v1",
+                    "api_key": "1234560",
+                    "api_mode": "responses",
+                    "reasoning_effort": "high"
+                },
+                "other": {
+                    "model": "nvidia/other/model",
+                    "api_mode": "chat"
+                }
+            }
+        });
+
+        let mut config = AgentConfig {
+            model: "nvidia/deepseek-ai/deepseek-v4-flash".to_string(),
+            api_mode: "chat".to_string(),
+            reasoning_effort: Some("low".to_string()),
+            ..Default::default()
+        };
+
+        apply_model_defaults_from(&mut config, &home);
+
+        assert_eq!(config.api_mode, "responses");
+        assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn unmatched_model_keeps_agent_defaults() {
+        let home = serde_json::json!({
+            "llm": {
+                "deepseek": {
+                    "model": "nvidia/deepseek-ai/deepseek-v4-flash",
+                    "api_mode": "responses",
+                    "reasoning_effort": "high"
+                }
+            }
+        });
+
+        let mut config = AgentConfig {
+            model: "openai/gpt-4o".to_string(),
+            api_mode: "chat".to_string(),
+            reasoning_effort: Some("low".to_string()),
+            ..Default::default()
+        };
+
+        apply_model_defaults_from(&mut config, &home);
+
+        assert_eq!(config.api_mode, "chat");
+        assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn missing_home_sections_is_noop() {
+        let home = serde_json::json!({ "global_model": {} });
+
+        let mut config = AgentConfig {
+            model: "nvidia/deepseek-ai/deepseek-v4-flash".to_string(),
+            api_mode: "chat".to_string(),
+            reasoning_effort: None,
+            ..Default::default()
+        };
+
+        apply_model_defaults_from(&mut config, &home);
+
+        assert_eq!(config.api_mode, "chat");
+        assert_eq!(config.reasoning_effort, None);
     }
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     llm::vendor::openaicompatible::{
-        ChatCompletionResponse, OpenAIExtractor, StreamToolCallAccumulator, sse_has_done_signal,
+        sse_has_done_signal, ChatCompletionResponse, OpenAIExtractor, StreamToolCallAccumulator,
     },
     utils::{JsonExtractor, StreamExtractor},
 };
@@ -12,11 +12,11 @@ use log::info;
 use reqwest::Client;
 use serde::Serialize;
 
-use crate::llm::{
-    ApiMode, Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse,
-    LlmResponseResult, ReactContext, ReactSession, StreamToken, TokenStream, VendorBuilderError,
-};
 use crate::llm::vendor::responses::ResponsesTransport;
+use crate::llm::{
+    ApiMode, Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult,
+    ReactContext, ReactSession, StreamToken, TokenStream, VendorBuilderError,
+};
 
 pub struct OpenRouterVendor {
     client: Arc<Client>,
@@ -35,6 +35,8 @@ struct OpenRouterRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<crate::llm::ReasoningEffort>,
     stream: bool,
 }
 
@@ -197,11 +199,11 @@ impl OpenRouterVendor {
 
         if messages.is_empty() {
             messages.push(OpenRouterMessageJson {
-                    role: "user",
-                    content: Some(serialize_content(&req.input)),
-                    tool_call_id: None,
-                    tool_calls: None,
-                });
+                role: "user",
+                content: Some(serialize_content(&req.input)),
+                tool_call_id: None,
+                tool_calls: None,
+            });
         }
 
         let tools: Vec<serde_json::Value> = context
@@ -286,6 +288,7 @@ impl OpenRouterVendor {
             tools,
             temperature: req.temperature,
             max_tokens: Some(max_tokens),
+            reasoning_effort: req.reasoning_effort,
             stream: false,
         }
     }
@@ -301,7 +304,7 @@ impl OpenRouterVendor {
             req.model = self.model.clone();
         }
 
-        let mut openrouter_req = self.convert_request(persona,&req, session, context);
+        let mut openrouter_req = self.convert_request(persona, &req, session, context);
         openrouter_req.stream = true;
         openrouter_req
     }
@@ -318,6 +321,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         session: &mut S,
         context: &mut C,
     ) -> LlmResponseResult {
+        if request.model.is_empty() {
+            request.model = self.model.clone();
+        }
         if request.api_mode == ApiMode::Responses {
             return ResponsesTransport::new(
                 self.client.clone(),
@@ -339,7 +345,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         context.notify_request(&request);
 
         let t0 = std::time::Instant::now();
-        let openrouter_req = self.convert_request(persona,&request, session, context);
+        let openrouter_req = self.convert_request(persona, &request, session, context);
         info!("[TIMING] convert_request: {:?}", t0.elapsed());
 
         let url = format!("{}/chat/completions", endpoint);
@@ -399,6 +405,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         session: &mut S,
         context: &mut C,
     ) -> Result<TokenStream, LlmError> {
+        if request.model.is_empty() {
+            request.model = self.model.clone();
+        }
         if request.api_mode == ApiMode::Responses {
             return ResponsesTransport::new(
                 self.client.clone(),
@@ -419,7 +428,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         context.notify_request(&request);
 
-        let openrouter_req = self.build_stream_request(persona,request, session, context);
+        let openrouter_req = self.build_stream_request(persona, request, session, context);
 
         let url = format!("{}/chat/completions", endpoint);
 
@@ -483,8 +492,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     if let Some(calls) = &choice.delta.tool_calls {
                                         for call in calls {
                                             let index = call.index.unwrap_or(0);
-                                            let id =
-                                                call.id.clone().filter(|s| !s.is_empty());
+                                            let id = call.id.clone().filter(|s| !s.is_empty());
                                             let name = call
                                                 .function
                                                 .as_ref()
@@ -541,9 +549,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }
                                 }
                                 if let Some(usage) = &chat.usage {
-                                    let _ = tx
-                                        .send(Ok(StreamToken::Usage(usage.clone())))
-                                        .await;
+                                    let _ = tx.send(Ok(StreamToken::Usage(usage.clone()))).await;
                                 }
                             }
                         }
@@ -696,10 +702,16 @@ mod tests {
             max_tokens: None,
             top_p: None,
             top_k: None,
+            reasoning_effort: None,
             api_mode: crate::llm::ApiMode::Chat,
         };
         let outcome = vendor
-            .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
+            .complete(
+                None,
+                request,
+                &mut LlmSession::new(),
+                &mut LlmContext::default(),
+            )
             .await;
 
         if let Err(e) = outcome {

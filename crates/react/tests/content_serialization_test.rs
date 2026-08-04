@@ -85,10 +85,8 @@ mod content_serialization_tests {
 
     #[test]
     fn test_content_multimodal_parts() {
-        let content = create_multimodal_content(
-            "What is in this image?",
-            "https://example.com/photo.jpg",
-        );
+        let content =
+            create_multimodal_content("What is in this image?", "https://example.com/photo.jpg");
         match content {
             Content::Parts(parts) => {
                 assert_eq!(parts.len(), 2);
@@ -103,10 +101,8 @@ mod content_serialization_tests {
 
     #[test]
     fn test_content_serialization_round_trip() {
-        let original = create_multimodal_content(
-            "Describe this image",
-            "https://example.com/photo.jpg",
-        );
+        let original =
+            create_multimodal_content("Describe this image", "https://example.com/photo.jpg");
 
         // Serialize to JSON string
         let json_str = serde_json::to_string(&original).unwrap();
@@ -131,7 +127,11 @@ mod content_serialization_tests {
     #[test]
     fn test_content_part_binary_serialization() {
         let part = ContentPart::Binary {
-            binary: Binary::from_url("image/url", "https://example.com/img.jpg", Some("test".to_string())),
+            binary: Binary::from_url(
+                "image/url",
+                "https://example.com/img.jpg",
+                Some("test".to_string()),
+            ),
         };
         let json = serde_json::to_string(&part).unwrap();
         assert!(json.contains("\"type\":\"binary\""));

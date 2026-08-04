@@ -1,9 +1,14 @@
 use std::sync::Arc;
 
 use crate::{
-    llm::vendor::{
-        openaicompatible::{ChatCompletionResponse, StreamToolCallAccumulator, sse_has_done_signal},
-        OpenAIExtractor,
+    llm::{
+        vendor::{
+            openaicompatible::{
+                sse_has_done_signal, ChatCompletionResponse, StreamToolCallAccumulator,
+            },
+            OpenAIExtractor,
+        },
+        ApiMode,
     },
     utils::{JsonExtractor, StreamExtractor},
 };
@@ -13,9 +18,10 @@ use log::info;
 use reqwest::Client;
 use serde::Serialize;
 
+use crate::llm::vendor::responses::ResponsesTransport;
 use crate::llm::{
-    Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse,
-    LlmResponseResult, ReactContext, ReactSession, StreamToken, TokenStream, VendorBuilderError,
+    Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult,
+    ReactContext, ReactSession, StreamToken, TokenStream, VendorBuilderError,
 };
 
 pub struct NvidiaVendor {
@@ -39,6 +45,8 @@ struct NvidiaRequest {
     top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<crate::llm::ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
 }
@@ -89,15 +97,15 @@ fn serialize_content(content: &Content) -> serde_json::Value {
                 serde_json::Value::Array(parts.iter().map(serialize_part).collect())
             } else if let Ok(part) = serde_json::from_str::<ContentPart>(s) {
                 serde_json::Value::Array(vec![serialize_part(&part)])
-                                } else {
-                                    serde_json::Value::String(s.clone())
-                                }
-                            }
-                            Content::Parts(parts) => {
-                                serde_json::Value::Array(parts.iter().map(serialize_part).collect())
-                            }
-                        }
-                    }
+            } else {
+                serde_json::Value::String(s.clone())
+            }
+        }
+        Content::Parts(parts) => {
+            serde_json::Value::Array(parts.iter().map(serialize_part).collect())
+        }
+    }
+}
 
 fn serialize_args(args: &serde_json::Value) -> String {
     if args.is_null() || !args.is_object() {
@@ -275,14 +283,14 @@ impl NvidiaVendor {
         }
 
         messages.insert(
-                    0,
-                    NvidiaMessageJson {
-                        role: "system",
-                        content: Some(serde_json::Value::String(extra_system_prompt)),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    },
-                );
+            0,
+            NvidiaMessageJson {
+                role: "system",
+                content: Some(serde_json::Value::String(extra_system_prompt)),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        );
 
         let max_tokens = req.max_tokens.unwrap_or(12800);
 
@@ -292,6 +300,7 @@ impl NvidiaVendor {
             tools,
             temperature: req.temperature,
             max_tokens: Some(max_tokens),
+            reasoning_effort: req.reasoning_effort,
             stream: Some(false),
             top_p: req.top_p,
             top_k: req.top_k,
@@ -326,6 +335,19 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         session: &mut S,
         context: &mut C,
     ) -> LlmResponseResult {
+        if request.model.is_empty() {
+            request.model = self.model.clone();
+        }
+        if request.api_mode == ApiMode::Responses {
+            return ResponsesTransport::new(
+                self.client.clone(),
+                self.api_key.clone(),
+                self.endpoint.clone(),
+            )
+            .complete(persona, request, session, context)
+            .await;
+        }
+
         let api_key = Arc::clone(&self.api_key);
         let client = Arc::clone(&self.client);
         let endpoint = Arc::clone(&self.endpoint);
@@ -397,6 +419,19 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         session: &mut S,
         context: &mut C,
     ) -> Result<TokenStream, LlmError> {
+        if request.model.is_empty() {
+            request.model = self.model.clone();
+        }
+        if request.api_mode == ApiMode::Responses {
+            return ResponsesTransport::new(
+                self.client.clone(),
+                self.api_key.clone(),
+                self.endpoint.clone(),
+            )
+            .stream_complete(persona, request, session, context)
+            .await;
+        }
+
         let api_key = Arc::clone(&self.api_key);
         let client = Arc::clone(&self.client);
         let endpoint = Arc::clone(&self.endpoint);
@@ -504,9 +539,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                         }
                                     }
 
-                                    if choice.finish_reason.as_deref()
-                                        == Some("tool_calls")
-                                    {
+                                    if choice.finish_reason.as_deref() == Some("tool_calls") {
                                         for (name, args_val, id) in acc.drain() {
                                             let _ = tx
                                                 .send(Ok(StreamToken::ToolCall {
@@ -536,9 +569,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }
                                 }
                                 if let Some(usage) = &chat.usage {
-                                    let _ = tx
-                                        .send(Ok(StreamToken::Usage(usage.clone())))
-                                        .await;
+                                    let _ = tx.send(Ok(StreamToken::Usage(usage.clone()))).await;
                                 }
                             }
                         }
@@ -653,9 +684,15 @@ mod tests {
 
     #[test]
     fn serialize_args_converts_non_object_to_empty() {
-        assert_eq!(super::serialize_args(&serde_json::Value::String("foo".into())), "{}");
+        assert_eq!(
+            super::serialize_args(&serde_json::Value::String("foo".into())),
+            "{}"
+        );
         assert_eq!(super::serialize_args(&serde_json::Value::Bool(true)), "{}");
-        assert_eq!(super::serialize_args(&serde_json::Value::Number(42.into())), "{}");
+        assert_eq!(
+            super::serialize_args(&serde_json::Value::Number(42.into())),
+            "{}"
+        );
     }
 
     #[test]
@@ -728,6 +765,7 @@ mod tests {
             max_tokens: None,
             top_p: None,
             top_k: None,
+            reasoning_effort: None,
             api_mode: crate::llm::ApiMode::Chat,
         };
         let result = match vendor

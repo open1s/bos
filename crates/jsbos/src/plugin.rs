@@ -7,8 +7,8 @@ use agent::agent::plugin::{
 use async_trait::async_trait;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi_derive::napi;
 use napi::Unknown;
+use napi_derive::napi;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
 use react::llm::Content;
 use std::collections::HashMap;
@@ -25,23 +25,23 @@ pub enum PluginStage {
 }
 
 fn json_to_content(json: &serde_json::Value) -> Content {
-    match json {
-        serde_json::Value::String(s) => Content::Text(s.clone()),
-        serde_json::Value::Array(arr) => {
-            let parts: Vec<react::llm::ContentPart> = arr
-                .iter()
-                .filter_map(|v| {
-                    if let Ok(part) = serde_json::from_value(v.clone()) {
-                        Some(part)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            Content::Parts(parts)
-        }
-        _ => Content::Text(json.to_string()),
+  match json {
+    serde_json::Value::String(s) => Content::Text(s.clone()),
+    serde_json::Value::Array(arr) => {
+      let parts: Vec<react::llm::ContentPart> = arr
+        .iter()
+        .filter_map(|v| {
+          if let Ok(part) = serde_json::from_value(v.clone()) {
+            Some(part)
+          } else {
+            None
+          }
+        })
+        .collect();
+      Content::Parts(parts)
     }
+    _ => Content::Text(json.to_string()),
+  }
 }
 
 #[napi(object)]
@@ -52,13 +52,15 @@ pub struct PluginLlmRequest {
   pub max_tokens: Option<u32>,
   pub top_p: Option<f64>,
   pub top_k: Option<u32>,
+  pub reasoning_effort: Option<String>,
   pub api_mode: String,
   pub metadata: HashMap<String, String>,
 }
 
 impl From<PluginLlmRequest> for LlmRequestWrapper {
   fn from(req: PluginLlmRequest) -> Self {
-    let json: serde_json::Value = serde_json::from_str(&req.input).unwrap_or_else(|_| serde_json::Value::String(req.input));
+    let json: serde_json::Value =
+      serde_json::from_str(&req.input).unwrap_or_else(|_| serde_json::Value::String(req.input));
     LlmRequestWrapper {
       model: req.model,
       input: json_to_content(&json),
@@ -66,6 +68,10 @@ impl From<PluginLlmRequest> for LlmRequestWrapper {
       max_tokens: req.max_tokens,
       top_p: req.top_p.map(|p| p as f32),
       top_k: req.top_k,
+      reasoning_effort: req
+        .reasoning_effort
+        .as_deref()
+        .map(react::llm::ReasoningEffort::from_str),
       api_mode: react::llm::ApiMode::from_str(&req.api_mode),
       metadata: req.metadata,
     }
@@ -75,10 +81,13 @@ impl From<PluginLlmRequest> for LlmRequestWrapper {
 impl From<LlmRequestWrapper> for PluginLlmRequest {
   fn from(wrapper: LlmRequestWrapper) -> Self {
     let input_json = match &wrapper.input {
-        Content::Text(s) => serde_json::Value::String(s.clone()),
-        Content::Parts(parts) => serde_json::Value::Array(
-            parts.iter().map(|p| serde_json::to_value(p).unwrap_or_default()).collect()
-        ),
+      Content::Text(s) => serde_json::Value::String(s.clone()),
+      Content::Parts(parts) => serde_json::Value::Array(
+        parts
+          .iter()
+          .map(|p| serde_json::to_value(p).unwrap_or_default())
+          .collect(),
+      ),
     };
     PluginLlmRequest {
       input: input_json.to_string(),
@@ -87,6 +96,7 @@ impl From<LlmRequestWrapper> for PluginLlmRequest {
       max_tokens: wrapper.max_tokens,
       top_p: wrapper.top_p.map(|p| p as f64),
       top_k: wrapper.top_k,
+      reasoning_effort: wrapper.reasoning_effort.map(|e| e.as_str().to_string()),
       api_mode: wrapper.api_mode.as_str().to_string(),
       metadata: wrapper.metadata,
     }
@@ -119,18 +129,19 @@ pub struct PluginToolCallInfo {
 impl From<PluginLlmResponse> for LlmResponseWrapper {
   fn from(resp: PluginLlmResponse) -> Self {
     match resp {
-      PluginLlmResponse::OpenAI { id, model, content, response_type } => {
+      PluginLlmResponse::OpenAI {
+        id,
+        model,
+        content,
+        response_type,
+      } => {
         let has_tool_calls = response_type.as_deref() == Some("ToolCall");
         let choices = vec![Choice {
           index: 0,
           message: ChatMessage {
             role: "assistant".to_string(),
             content: content.clone(),
-            tool_calls: if has_tool_calls {
-              Some(vec![])
-            } else {
-              None
-            },
+            tool_calls: if has_tool_calls { Some(vec![]) } else { None },
             function_call: None,
             reasoning_content: None,
             extra: serde_json::Value::Object(serde_json::Map::new()),
@@ -150,12 +161,19 @@ impl From<PluginLlmResponse> for LlmResponseWrapper {
           nvext: None,
         })
       }
-      PluginLlmResponse::Responses { id, model, content, .. } => {
+      PluginLlmResponse::Responses {
+        id, model, content, ..
+      } => {
         let output = vec![react::llm::vendor::ResponsesItem::Message {
           id: String::new(),
           role: "assistant".to_string(),
           content: content
-            .map(|c| vec![react::llm::vendor::ResponsesContentPart::OutputText { text: c, annotations: vec![] }])
+            .map(|c| {
+              vec![react::llm::vendor::ResponsesContentPart::OutputText {
+                text: c,
+                annotations: vec![],
+              }]
+            })
             .unwrap_or_default(),
         }];
         LlmResponseWrapper::Responses(react::llm::vendor::ResponsesResponse {
@@ -178,7 +196,10 @@ impl From<LlmResponseWrapper> for PluginLlmResponse {
       LlmResponseWrapper::OpenAI(rsp) => {
         let choice = rsp.choices.first();
         let content = choice.and_then(|c| c.message.content.clone());
-        let has_tool_calls = choice.and_then(|c| c.message.tool_calls.as_ref()).map(|tc| !tc.is_empty()).unwrap_or(false);
+        let has_tool_calls = choice
+          .and_then(|c| c.message.tool_calls.as_ref())
+          .map(|tc| !tc.is_empty())
+          .unwrap_or(false);
         let response_type = if has_tool_calls {
           Some("ToolCall".to_string())
         } else {
@@ -303,9 +324,7 @@ impl JSPlugin {
     callback.call_with_return_value(
       Ok(JSAny(input)),
       ThreadsafeFunctionCallMode::NonBlocking,
-      move |result: std::result::Result<Unknown<'_>, napi::Error>,
-            env|
-            -> napi::Result<()> {
+      move |result: std::result::Result<Unknown<'_>, napi::Error>, env| -> napi::Result<()> {
         match result {
           Ok(val) => {
             let is_promise = val.is_promise().unwrap_or(false);
@@ -315,7 +334,9 @@ impl JSPlugin {
               let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
               let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
               let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
-                let json_val = ctx.value.coerce_to_string()
+                let json_val = ctx
+                  .value
+                  .coerce_to_string()
                   .and_then(|s| s.into_utf8())
                   .and_then(|u| u.as_str().map(|s| s.to_string()))
                   .ok()
@@ -332,7 +353,8 @@ impl JSPlugin {
                 Ok(())
               });
             } else {
-              let json_val = val.coerce_to_string()
+              let json_val = val
+                .coerce_to_string()
                 .and_then(|s| s.into_utf8())
                 .and_then(|u| u.as_str().map(|s| s.to_string()))
                 .ok()
@@ -419,9 +441,19 @@ impl AgentPlugin for JSPlugin {
           .output
           .iter()
           .filter_map(|item| {
-            if let react::llm::vendor::ResponsesItem::FunctionCall { id, call_id, name, arguments } = item {
+            if let react::llm::vendor::ResponsesItem::FunctionCall {
+              id,
+              call_id,
+              name,
+              arguments,
+            } = item
+            {
               Some(react::llm::vendor::openaicompatible::ToolCall {
-                id: if call_id.is_empty() { id.clone() } else { call_id.clone() },
+                id: if call_id.is_empty() {
+                  id.clone()
+                } else {
+                  call_id.clone()
+                },
                 r#type: "function".to_string(),
                 function: react::llm::vendor::openaicompatible::FunctionCall {
                   name: Some(name.clone()),
@@ -433,7 +465,14 @@ impl AgentPlugin for JSPlugin {
             }
           })
           .collect();
-        (content, if tool_calls.is_empty() { None } else { Some(tool_calls) })
+        (
+          content,
+          if tool_calls.is_empty() {
+            None
+          } else {
+            Some(tool_calls)
+          },
+        )
       }
     };
 
@@ -453,7 +492,11 @@ impl AgentPlugin for JSPlugin {
       None => return Some(response),
     };
 
-    if result.get("response_type").and_then(|v| v.as_str()).is_some() {
+    if result
+      .get("response_type")
+      .and_then(|v| v.as_str())
+      .is_some()
+    {
       match response {
         LlmResponseWrapper::OpenAI(mut rsp) => {
           if let Some(choice) = rsp.choices.first_mut() {

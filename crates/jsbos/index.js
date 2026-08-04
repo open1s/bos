@@ -582,6 +582,8 @@ class AgentBuilder {
       temperature: options.temperature ?? 0.7,
       timeoutSecs: options.timeoutSecs || 120,
       maxTokens: options.maxTokens,
+      apiMode: options.apiMode || 'chat',
+      reasoningEffort: options.reasoningEffort,
     };
   }
 
@@ -599,6 +601,8 @@ class AgentBuilder {
     if (config.temperature !== undefined) this._config.temperature = config.temperature;
     if (config.timeoutSecs) this._config.timeoutSecs = config.timeoutSecs;
     if (config.maxTokens) this._config.maxTokens = config.maxTokens;
+    if (config.apiMode) this._config.apiMode = config.apiMode;
+    if (config.reasoningEffort) this._config.reasoningEffort = config.reasoningEffort;
     if (config.circuitBreaker) {
       this._config.circuitBreakerMaxFailures = config.circuitBreaker.maxFailures;
       this._config.circuitBreakerCooldownSecs = config.circuitBreaker.cooldownSecs;
@@ -647,6 +651,16 @@ class AgentBuilder {
 
   maxTokens(tokens) {
     this._config.maxTokens = tokens;
+    return this;
+  }
+
+  apiMode(mode) {
+    this._config.apiMode = mode;
+    return this;
+  }
+
+  reasoningEffort(effort) {
+    this._config.reasoningEffort = effort;
     return this;
   }
 
@@ -848,7 +862,8 @@ class AgentBuilder {
     const tokens = [];
     try {
       await new Promise((resolve, reject) => {
-        this.stream(task, token => {
+        this.stream(task, (err, token) => {
+          if (err) { reject(typeof err === 'string' ? new Error(err) : err); return; }
           if (!token) return;
           tokens.push(token);
           if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
@@ -947,7 +962,8 @@ class AgentWrapperClass {
     const tokens = [];
     try {
       await new Promise((resolve, reject) => {
-        this.stream(task, token => {
+        this.stream(task, (err, token) => {
+          if (err) { reject(typeof err === 'string' ? new Error(err) : err); return; }
           if (!token) return;
           tokens.push(token);
           if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
@@ -1418,6 +1434,8 @@ class BrainOS {
       systemPrompt: options.systemPrompt || 'You are a helpful assistant.',
       temperature: options.temperature ?? 0.7,
       timeoutSecs: options.timeoutSecs || 120,
+      apiMode: options.apiMode || 'chat',
+      reasoningEffort: options.reasoningEffort,
     }).tools(this._registry);
   }
 

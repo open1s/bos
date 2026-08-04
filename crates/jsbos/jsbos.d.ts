@@ -175,6 +175,8 @@ export interface AgentConfig {
   maxTokens?: number
   timeoutSecs: number
   maxSteps?: number
+  apiMode?: string
+  reasoningEffort?: string
   circuitBreakerMaxFailures?: number
   circuitBreakerCooldownSecs?: number
   rateLimitCapacity?: number
@@ -270,11 +272,14 @@ export interface PluginLlmRequest {
   maxTokens?: number
   topP?: number
   topK?: number
+  reasoningEffort?: string
+  apiMode: string
   metadata: Record<string, string>
 }
 
 export type PluginLlmResponse =
   | { type: 'OpenAI', id: string, model: string, content?: string, responseType?: string }
+  | { type: 'Responses', id: string, model: string, content?: string, responseType?: string }
 
 export declare const enum PluginStage {
   PreRequest = 0,

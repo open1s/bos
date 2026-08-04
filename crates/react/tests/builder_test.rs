@@ -172,7 +172,12 @@ fn test_builder_pattern() {
     let mut context = LlmContext::default();
     let result = rt.block_on(async {
         engine
-            .react(None, LlmRequest::new("test-model"), &mut session, &mut context)
+            .react(
+                None,
+                LlmRequest::new("test-model"),
+                &mut session,
+                &mut context,
+            )
             .await
     });
     assert_eq!(result.unwrap(), "5");
@@ -211,7 +216,7 @@ fn test_message_log_input() {
 
     #[async_trait]
     impl LlmClient<LlmSession, LlmContext> for MockLlmWithHistory {
-async fn complete(
+        async fn complete(
             &self,
             _persona: Option<String>,
             request: LlmRequest,
@@ -220,12 +225,11 @@ async fn complete(
         ) -> LlmResponseResult {
             let input_str = match &request.input {
                 react::llm::Content::Text(s) => s.clone(),
-                react::llm::Content::Parts(parts) => serde_json::to_string(parts).unwrap_or_default(),
+                react::llm::Content::Parts(parts) => {
+                    serde_json::to_string(parts).unwrap_or_default()
+                }
             };
-            self.received_inputs
-                .lock()
-                .unwrap()
-                .push(input_str);
+            self.received_inputs.lock().unwrap().push(input_str);
             Ok(make_text_response("Hello back!".to_string(), true))
         }
 
@@ -263,7 +267,11 @@ async fn complete(
     let mut request = LlmRequest::new("test");
     request.input = react::llm::Content::text("New message");
     let _result = rt
-        .block_on(async { engine.react(None, request, &mut session, &mut context).await })
+        .block_on(async {
+            engine
+                .react(None, request, &mut session, &mut context)
+                .await
+        })
         .unwrap();
 
     let inputs = received.lock().unwrap();
@@ -340,12 +348,17 @@ fn test_react_with_request() {
         top_p: None,
         top_k: None,
         max_tokens: None,
+        reasoning_effort: None,
         api_mode: react::llm::ApiMode::Chat,
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async { engine.react(None, request, &mut session, &mut context).await })
-        .unwrap();
+    rt.block_on(async {
+        engine
+            .react(None, request, &mut session, &mut context)
+            .await
+    })
+    .unwrap();
 
     let model = received_model.lock().unwrap();
     assert_eq!(model.as_ref().unwrap(), "custom-model");
