@@ -12,6 +12,7 @@ pub type TokenStream = Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> 
 #[derive(Debug, Clone, Serialize)]
 pub enum LlmResponse {
     OpenAI(ChatCompletionResponse),
+    Responses(ResponsesResponse),
 }
 
 impl LlmResponse {
@@ -20,6 +21,9 @@ impl LlmResponse {
             LlmResponse::OpenAI(rsp) => rsp
                 .usage
                 .as_ref()
+                .map(|u| TokenUsage::new(u.prompt_tokens, u.completion_tokens)),
+            LlmResponse::Responses(rsp) => rsp
+                .chat_usage()
                 .map(|u| TokenUsage::new(u.prompt_tokens, u.completion_tokens)),
         }
     }
@@ -77,3 +81,4 @@ pub use crate::llm::vendor::openaicompatible::{
     ChatCompletionChunk, ChatCompletionResponse, ChatMessage, Choice, ChunkChoice, Delta,
     FunctionCall, FunctionCallDelta, LogProbContent, LogProbs, ToolCall, ToolCallDelta, Usage,
 };
+pub use crate::llm::vendor::responses::ResponsesResponse;

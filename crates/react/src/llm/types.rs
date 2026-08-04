@@ -375,11 +375,80 @@ pub struct Skill {
 
 impl Stringfy for Skill {}
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmToolKind {
+    #[default]
+    Function,
+    WebSearch,
+    FileSearch,
+    ComputerUse,
+}
+
+fn is_function_kind(kind: &LlmToolKind) -> bool {
+    *kind == LlmToolKind::Function
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmTool {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    /// Tool kind. `Function` (default) is the normal callable tool. The other
+    /// variants map to OpenAI Responses API hosted tools (`web_search`,
+    /// `file_search`, `computer_use`) which run server-side.
+    #[serde(default, skip_serializing_if = "is_function_kind")]
+    pub kind: LlmToolKind,
+    /// Hosted-tool configuration, e.g. `{"max_results": 5}` for web_search or
+    /// `{"vector_store_ids": ["..."]}` for file_search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+impl LlmTool {
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+            kind: LlmToolKind::Function,
+            config: None,
+        }
+    }
+
+    pub fn web_search(config: Option<Value>) -> Self {
+        Self {
+            name: "web_search".into(),
+            description: "Search the web for up-to-date information.".into(),
+            parameters: serde_json::json!({}),
+            kind: LlmToolKind::WebSearch,
+            config,
+        }
+    }
+
+    pub fn file_search(config: Option<Value>) -> Self {
+        Self {
+            name: "file_search".into(),
+            description: "Search files in the attached vector stores.".into(),
+            parameters: serde_json::json!({}),
+            kind: LlmToolKind::FileSearch,
+            config,
+        }
+    }
+
+    pub fn computer_use(config: Option<Value>) -> Self {
+        Self {
+            name: "computer_use".into(),
+            description: "Operate a virtual computer (screenshots, clicks, typing).".into(),
+            parameters: serde_json::json!({}),
+            kind: LlmToolKind::ComputerUse,
+            config,
+        }
+    }
 }
 
 impl Stringfy for LlmTool {}
@@ -398,6 +467,8 @@ pub fn load_skill_tool() -> LlmTool {
             },
             "required": ["name"]
         }),
+        kind: LlmToolKind::Function,
+        config: None,
     }
 }
 
@@ -494,6 +565,37 @@ pub struct LlmRequest {
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Which OpenAI API protocol to use. `Chat` (default) targets
+    /// `/chat/completions`; `Responses` targets the newer `/v1/responses` API.
+    #[serde(default)]
+    pub api_mode: ApiMode,
+}
+
+/// Selects the protocol used for a single LLM request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiMode {
+    /// OpenAI Chat Completions API (`/chat/completions`).
+    #[default]
+    Chat,
+    /// OpenAI Responses API (`/v1/responses`).
+    Responses,
+}
+
+impl ApiMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ApiMode::Chat => "chat",
+            ApiMode::Responses => "responses",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "responses" => ApiMode::Responses,
+            _ => ApiMode::Chat,
+        }
+    }
 }
 
 impl LlmRequest {
@@ -505,6 +607,7 @@ impl LlmRequest {
             max_tokens: None,
             top_p: None,
             top_k: None,
+            api_mode: ApiMode::Chat,
         }
     }
 
@@ -525,6 +628,11 @@ impl LlmRequest {
 
     pub fn top_k(mut self, top_k: u32) -> Self {
         self.top_k = Some(top_k);
+        self
+    }
+
+    pub fn api_mode(mut self, mode: ApiMode) -> Self {
+        self.api_mode = mode;
         self
     }
 }

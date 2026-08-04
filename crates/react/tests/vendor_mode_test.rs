@@ -132,6 +132,7 @@ fn test_vendor_tool_response_parsing() {
             let tc = choice.message.tool_calls.as_ref().unwrap();
             assert_eq!(tc[0].function.name.as_ref().unwrap(), "add");
         }
+        LlmResponse::Responses(_) => panic!("Unexpected Responses API"),
     }
 }
 
@@ -144,6 +145,7 @@ fn test_vendor_text_response_parsing() {
             let content = resp.choices[0].message.content.as_ref().unwrap();
             assert_eq!(content, "Hello world");
         }
+        LlmResponse::Responses(_) => panic!("Unexpected Responses API"),
     }
 }
 
@@ -155,6 +157,7 @@ fn test_vendor_finish_reason_stop() {
         LlmResponse::OpenAI(resp) => {
             assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
         }
+        LlmResponse::Responses(_) => panic!("Unexpected Responses API"),
     }
 }
 
@@ -166,6 +169,7 @@ fn test_vendor_finish_reason_continue() {
         LlmResponse::OpenAI(resp) => {
             assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("continue"));
         }
+        LlmResponse::Responses(_) => panic!("Unexpected Responses API"),
     }
 }
 
@@ -177,6 +181,7 @@ fn test_vendor_finish_reason_tool_calls() {
         LlmResponse::OpenAI(resp) => {
             assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("tool_calls"));
         }
+        LlmResponse::Responses(_) => panic!("Unexpected Responses API"),
     }
 }
 

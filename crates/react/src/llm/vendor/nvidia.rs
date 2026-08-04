@@ -728,6 +728,7 @@ mod tests {
             max_tokens: None,
             top_p: None,
             top_k: None,
+            api_mode: crate::llm::ApiMode::Chat,
         };
         let result = match vendor
             .complete(None, request, &mut LlmSession::new(), &mut ())

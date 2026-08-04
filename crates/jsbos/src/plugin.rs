@@ -52,6 +52,7 @@ pub struct PluginLlmRequest {
   pub max_tokens: Option<u32>,
   pub top_p: Option<f64>,
   pub top_k: Option<u32>,
+  pub api_mode: String,
   pub metadata: HashMap<String, String>,
 }
 
@@ -65,6 +66,7 @@ impl From<PluginLlmRequest> for LlmRequestWrapper {
       max_tokens: req.max_tokens,
       top_p: req.top_p.map(|p| p as f32),
       top_k: req.top_k,
+      api_mode: react::llm::ApiMode::from_str(&req.api_mode),
       metadata: req.metadata,
     }
   }
@@ -85,6 +87,7 @@ impl From<LlmRequestWrapper> for PluginLlmRequest {
       max_tokens: wrapper.max_tokens,
       top_p: wrapper.top_p.map(|p| p as f64),
       top_k: wrapper.top_k,
+      api_mode: wrapper.api_mode.as_str().to_string(),
       metadata: wrapper.metadata,
     }
   }
@@ -93,6 +96,12 @@ impl From<LlmRequestWrapper> for PluginLlmRequest {
 #[napi]
 pub enum PluginLlmResponse {
   OpenAI {
+    id: String,
+    model: String,
+    content: Option<String>,
+    response_type: Option<String>,
+  },
+  Responses {
     id: String,
     model: String,
     content: Option<String>,
@@ -141,6 +150,24 @@ impl From<PluginLlmResponse> for LlmResponseWrapper {
           nvext: None,
         })
       }
+      PluginLlmResponse::Responses { id, model, content, .. } => {
+        let output = vec![react::llm::vendor::ResponsesItem::Message {
+          id: String::new(),
+          role: "assistant".to_string(),
+          content: content
+            .map(|c| vec![react::llm::vendor::ResponsesContentPart::OutputText { text: c, annotations: vec![] }])
+            .unwrap_or_default(),
+        }];
+        LlmResponseWrapper::Responses(react::llm::vendor::ResponsesResponse {
+          id,
+          object: "response".to_string(),
+          created_at: 0,
+          status: "completed".to_string(),
+          model,
+          output,
+          usage: None,
+        })
+      }
     }
   }
 }
@@ -162,6 +189,16 @@ impl From<LlmResponseWrapper> for PluginLlmResponse {
           model: rsp.model,
           content,
           response_type,
+        }
+      }
+      LlmResponseWrapper::Responses(rsp) => {
+        let text = rsp.output_text();
+        let content = if text.is_empty() { None } else { Some(text) };
+        PluginLlmResponse::Responses {
+          id: rsp.id,
+          model: rsp.model,
+          content,
+          response_type: Some("Text".to_string()),
         }
       }
     }
@@ -375,6 +412,29 @@ impl AgentPlugin for JSPlugin {
         let tool_calls = choice.and_then(|c| c.message.tool_calls.clone());
         (content, tool_calls)
       }
+      LlmResponseWrapper::Responses(rsp) => {
+        let text = rsp.output_text();
+        let content = if text.is_empty() { None } else { Some(text) };
+        let tool_calls: Vec<react::llm::vendor::openaicompatible::ToolCall> = rsp
+          .output
+          .iter()
+          .filter_map(|item| {
+            if let react::llm::vendor::ResponsesItem::FunctionCall { id, call_id, name, arguments } = item {
+              Some(react::llm::vendor::openaicompatible::ToolCall {
+                id: if call_id.is_empty() { id.clone() } else { call_id.clone() },
+                r#type: "function".to_string(),
+                function: react::llm::vendor::openaicompatible::FunctionCall {
+                  name: Some(name.clone()),
+                  arguments: Some(arguments.clone()),
+                },
+              })
+            } else {
+              None
+            }
+          })
+          .collect();
+        (content, if tool_calls.is_empty() { None } else { Some(tool_calls) })
+      }
     };
 
     let input = if let Some(ref tc) = tool_calls {
@@ -394,27 +454,62 @@ impl AgentPlugin for JSPlugin {
     };
 
     if result.get("response_type").and_then(|v| v.as_str()).is_some() {
-      let LlmResponseWrapper::OpenAI(mut rsp) = response;
-      if let Some(choice) = rsp.choices.first_mut() {
-        if let Some(c) = result.get("content").and_then(|v| v.as_str()) {
-          choice.message.content = Some(c.to_string());
-        }
-        if let Some(name) = result.get("name").and_then(|v| v.as_str()) {
-          if let Some(ref mut tc) = choice.message.tool_calls {
-            if let Some(first_tc) = tc.first_mut() {
-              first_tc.function.name = Some(name.to_string());
+      match response {
+        LlmResponseWrapper::OpenAI(mut rsp) => {
+          if let Some(choice) = rsp.choices.first_mut() {
+            if let Some(c) = result.get("content").and_then(|v| v.as_str()) {
+              choice.message.content = Some(c.to_string());
+            }
+            if let Some(name) = result.get("name").and_then(|v| v.as_str()) {
+              if let Some(ref mut tc) = choice.message.tool_calls {
+                if let Some(first_tc) = tc.first_mut() {
+                  first_tc.function.name = Some(name.to_string());
+                }
+              }
+            }
+            if let Some(args) = result.get("args") {
+              if let Some(ref mut tc) = choice.message.tool_calls {
+                if let Some(first_tc) = tc.first_mut() {
+                  first_tc.function.arguments = Some(args.to_string());
+                }
+              }
             }
           }
+          return Some(LlmResponseWrapper::OpenAI(rsp));
         }
-        if let Some(args) = result.get("args") {
-          if let Some(ref mut tc) = choice.message.tool_calls {
-            if let Some(first_tc) = tc.first_mut() {
-              first_tc.function.arguments = Some(args.to_string());
+        LlmResponseWrapper::Responses(mut rsp) => {
+          if let Some(c) = result.get("content").and_then(|v| v.as_str()) {
+            if !c.is_empty() {
+              let mut found = false;
+              for item in rsp.output.iter_mut() {
+                if let react::llm::vendor::ResponsesItem::Message { content, .. } = item {
+                  content.clear();
+                  content.push(react::llm::vendor::ResponsesContentPart::OutputText {
+                    text: c.to_string(),
+                    annotations: vec![],
+                  });
+                  found = true;
+                  break;
+                }
+              }
+              if !found {
+                rsp.output.insert(
+                  0,
+                  react::llm::vendor::ResponsesItem::Message {
+                    id: String::new(),
+                    role: "assistant".to_string(),
+                    content: vec![react::llm::vendor::ResponsesContentPart::OutputText {
+                      text: c.to_string(),
+                      annotations: vec![],
+                    }],
+                  },
+                );
+              }
             }
           }
+          return Some(LlmResponseWrapper::Responses(rsp));
         }
       }
-      return Some(LlmResponseWrapper::OpenAI(rsp));
     }
     Some(response)
   }

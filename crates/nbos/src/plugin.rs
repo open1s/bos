@@ -24,6 +24,8 @@ pub struct PyLlmRequestWrapper {
     pub top_k: Option<u32>,
     #[pyo3(get, set)]
     pub input: String,
+    #[pyo3(get, set)]
+    pub api_mode: String,
 }
 
 fn json_to_content(json: &serde_json::Value) -> react::llm::Content {
@@ -61,6 +63,7 @@ impl From<&InnerLlmRequest> for PyLlmRequestWrapper {
             top_p: req.top_p,
             top_k: req.top_k,
             input: input_json.to_string(),
+            api_mode: req.api_mode.as_str().to_string(),
         }
     }
 }
@@ -75,6 +78,7 @@ impl From<PyLlmRequestWrapper> for InnerLlmRequest {
             max_tokens: py_req.max_tokens,
             top_p: py_req.top_p,
             top_k: py_req.top_k,
+            api_mode: react::llm::ApiMode::from_str(&py_req.api_mode),
             metadata: Default::default(),
         }
     }
@@ -119,6 +123,49 @@ impl From<&InnerLlmResponse> for PyLlmResponseWrapper {
                             tool_args: None,
                             tool_id: None,
                         };
+                    }
+                }
+                Self {
+                    response_type: "Done".to_string(),
+                    content: None,
+                    tool_name: None,
+                    tool_args: None,
+                    tool_id: None,
+                }
+            }
+            InnerLlmResponse::Responses(rsp) => {
+                if let Some(item) = rsp.output.first() {
+                    match item {
+                        react::llm::vendor::ResponsesItem::FunctionCall { name, arguments, .. } => {
+                            return Self {
+                                response_type: "ToolCall".to_string(),
+                                content: None,
+                                tool_name: Some(name.clone()),
+                                tool_args: Some(arguments.clone()),
+                                tool_id: None,
+                            };
+                        }
+                        react::llm::vendor::ResponsesItem::Message { content, .. } => {
+                            let text: String = content
+                                .iter()
+                                .filter_map(|p| match p {
+                                    react::llm::vendor::ResponsesContentPart::OutputText { text, .. } => {
+                                        Some(text.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            if !text.is_empty() {
+                                return Self {
+                                    response_type: "Text".to_string(),
+                                    content: Some(text),
+                                    tool_name: None,
+                                    tool_args: None,
+                                    tool_id: None,
+                                };
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Self {
@@ -327,6 +374,7 @@ impl InnerPlugin for PythonPlugin {
                             max_tokens: wrapped.max_tokens,
                             top_p: wrapped.top_p,
                             top_k: wrapped.top_k,
+                            api_mode: react::llm::ApiMode::from_str(&wrapped.api_mode),
                             metadata: request.metadata.clone(),
                         }
                     })

@@ -109,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_tokens: Some(100),
         top_p: None,
         top_k: None,
+        api_mode: react::llm::ApiMode::Chat,
     };
 
     let mut session = DummySession::default();

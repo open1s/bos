@@ -13,9 +13,10 @@ use reqwest::Client;
 use serde::Serialize;
 
 use crate::llm::{
-    Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse,
+    ApiMode, Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse,
     LlmResponseResult, ReactContext, ReactSession, StreamToken, TokenStream, VendorBuilderError,
 };
+use crate::llm::vendor::responses::ResponsesTransport;
 
 pub struct OpenRouterVendor {
     client: Arc<Client>,
@@ -317,6 +318,16 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         session: &mut S,
         context: &mut C,
     ) -> LlmResponseResult {
+        if request.api_mode == ApiMode::Responses {
+            return ResponsesTransport::new(
+                self.client.clone(),
+                self.api_key.clone(),
+                self.endpoint.clone(),
+            )
+            .complete(persona, request, session, context)
+            .await;
+        }
+
         let api_key = self.api_key.clone();
         let client = Arc::clone(&self.client);
         let endpoint = Arc::clone(&self.endpoint);
@@ -388,6 +399,16 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         session: &mut S,
         context: &mut C,
     ) -> Result<TokenStream, LlmError> {
+        if request.api_mode == ApiMode::Responses {
+            return ResponsesTransport::new(
+                self.client.clone(),
+                self.api_key.clone(),
+                self.endpoint.clone(),
+            )
+            .stream_complete(persona, request, session, context)
+            .await;
+        }
+
         let api_key = self.api_key.clone();
         let client = Arc::clone(&self.client);
         let endpoint = Arc::clone(&self.endpoint);
@@ -675,6 +696,7 @@ mod tests {
             max_tokens: None,
             top_p: None,
             top_k: None,
+            api_mode: crate::llm::ApiMode::Chat,
         };
         let outcome = vendor
             .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())

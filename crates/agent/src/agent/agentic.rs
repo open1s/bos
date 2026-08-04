@@ -511,6 +511,8 @@ impl Agent {
                     name: name.clone(),
                     description: tool.description(),
                     parameters: tool.json_schema(),
+                    kind: react::llm::LlmToolKind::Function,
+                    config: None,
                 })
                 .collect();
 
@@ -520,6 +522,8 @@ impl Agent {
                         name: async_tool.name().to_string(),
                         description: async_tool.description(),
                         parameters: async_tool.json_schema(),
+                        kind: react::llm::LlmToolKind::Function,
+                        config: None,
                     });
                 }
             }

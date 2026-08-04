@@ -9,9 +9,9 @@ pub use response::{
     LlmResponse, LlmResponseResult, StreamResponseAccumulator, StreamToken, TokenStream,
 };
 pub use types::{
-    Binary, BinarySource, Content, ContentPart, Instruction,
-    LlmContext, LlmError, LlmMessage, LlmRequest, LlmSession, LlmTool, ReactContext, ReactSession,
-    Rule, Skill, Stringfy, VendorBuilderError,
+    ApiMode, Binary, BinarySource, Content, ContentPart, Instruction,
+    LlmContext, LlmError, LlmMessage, LlmRequest, LlmSession, LlmTool, LlmToolKind, ReactContext,
+    ReactSession, Rule, Skill, Stringfy, VendorBuilderError,
 };
 pub use vendor::*;
 pub use vendor::ChatMessage as OpenAiMessage;

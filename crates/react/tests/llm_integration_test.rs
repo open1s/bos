@@ -66,6 +66,7 @@ fn make_simple_request(model: &str) -> LlmRequest {
         max_tokens: Some(50),
         top_p: None,
         top_k: None,
+        api_mode: react::llm::ApiMode::Chat,
     }
 }
 
@@ -100,6 +101,14 @@ fn verify_text_response(response: &LlmResponse) -> Result<String, String> {
                 }
             }
             Err("Response has no content".to_string())
+        }
+        LlmResponse::Responses(resp) => {
+            let text = resp.output_text();
+            if text.is_empty() {
+                Err("Response has no content".to_string())
+            } else {
+                Ok(text)
+            }
         }
     }
 }
@@ -321,6 +330,7 @@ async fn test_nvidia_response_parsing() {
         max_tokens: None,
         top_p: None,
         top_k: None,
+        api_mode: react::llm::ApiMode::Chat,
     };
     let result = match vendor
         .complete(None, request, &mut LlmSession::new(), &mut LlmContext::default())
@@ -419,6 +429,9 @@ async fn test_nvidia_response_parsing() {
 
             println!("✓ All NVIDIA ChatCompletionResponse fields verified");
         }
+        LlmResponse::Responses(_) => {
+            panic!("Unexpected Responses API response from NVIDIA vendor");
+        }
     }
 }
 
@@ -465,6 +478,7 @@ async fn test_nvidia_tool_calls_stream_with_config() {
         max_tokens: Some(256),
         top_p: None,
         top_k: None,
+        api_mode: react::llm::ApiMode::Chat,
     };
 
     let stream_result = vendor

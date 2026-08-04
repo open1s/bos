@@ -24,6 +24,7 @@ pub struct LlmRequestWrapper {
     pub max_tokens: Option<u32>,
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
+    pub api_mode: react::llm::ApiMode,
     pub metadata: std::collections::HashMap<String, String>,
 }
 
@@ -36,6 +37,7 @@ impl LlmRequestWrapper {
             max_tokens: request.max_tokens,
             top_p: request.top_p,
             top_k: request.top_k,
+            api_mode: request.api_mode,
             metadata: std::collections::HashMap::new(),
         }
     }
@@ -48,6 +50,7 @@ impl LlmRequestWrapper {
             max_tokens: self.max_tokens,
             top_p: self.top_p,
             top_k: self.top_k,
+            api_mode: self.api_mode,
         }
     }
 }
@@ -55,6 +58,7 @@ impl LlmRequestWrapper {
 #[derive(Debug, Clone)]
 pub enum LlmResponseWrapper {
     OpenAI(react::llm::vendor::ChatCompletionResponse),
+    Responses(react::llm::vendor::ResponsesResponse),
 }
 
 #[derive(Debug, Clone)]
@@ -107,12 +111,14 @@ impl LlmResponseWrapper {
     pub fn new(response: &react::llm::LlmResponse) -> Self {
         match response {
             react::llm::LlmResponse::OpenAI(resp) => LlmResponseWrapper::OpenAI(resp.clone()),
+            react::llm::LlmResponse::Responses(resp) => LlmResponseWrapper::Responses(resp.clone()),
         }
     }
 
     pub fn into_response(self) -> react::llm::LlmResponse {
         match self {
             LlmResponseWrapper::OpenAI(resp) => react::llm::LlmResponse::OpenAI(resp),
+            LlmResponseWrapper::Responses(resp) => react::llm::LlmResponse::Responses(resp),
         }
     }
 }

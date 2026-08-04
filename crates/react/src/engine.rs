@@ -1,4 +1,5 @@
 use crate::llm::types::{load_skill_tool, ReactContext, ReactSession};
+use crate::llm::vendor::responses::{ResponsesContentPart, ResponsesItem};
 use crate::llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken};
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::runtime::{HookDecision, ReActApp};
@@ -833,6 +834,162 @@ impl<A: ReActApp> ReActEngine<A> {
                             });
                             return Ok(thought);
                         }
+                    }
+                }
+                LlmResponse::Responses(rsp) => {
+                    let mut found_tool_call = false;
+                    let mut assistant_text = String::new();
+
+                    for item in &rsp.output {
+                        match item {
+                            ResponsesItem::FunctionCall {
+                                call_id,
+                                name,
+                                arguments,
+                                ..
+                            } => {
+                                found_tool_call = true;
+                                let call_id = call_id.clone();
+                                let name = name.clone();
+                                let mut args: Value = serde_json::from_str(arguments)
+                                    .unwrap_or(serde_json::json!({}));
+
+                                if name == "load_skill" {
+                                    let skill_name =
+                                        args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    if let Some(cached_skill) = self.skill_cache.get(skill_name) {
+                                        session.push(LlmMessage::AssistantToolCall {
+                                            tool_call_id: call_id.clone(),
+                                            name: name.clone(),
+                                            args: args.clone(),
+                                        });
+                                        session.push(LlmMessage::ToolResult {
+                                            tool_call_id: call_id,
+                                            content: format!(
+                                                "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.\n\nskill_dir: {}\n\n{}",
+                                                skill_name, cached_skill.skill_dir, cached_skill.instructions
+                                            ),
+                                        });
+                                        continue;
+                                    }
+                                }
+
+                                self.inject_call_id(&mut args, &call_id);
+
+                                match self
+                                    .react_app
+                                    .before_tool_call(&name, &mut args, &call_id, session, context)
+                                    .await
+                                {
+                                    HookDecision::Continue => {}
+                                    HookDecision::Abort => {
+                                        return Err(ReactError::HookAbort(
+                                            "before_tool_call aborted".to_string(),
+                                        ));
+                                    }
+                                    HookDecision::Error(msg) => {
+                                        return Err(ReactError::HookAbort(msg));
+                                    }
+                                }
+
+                                let mut result = self.call_tool(&name, &mut args, &call_id).await;
+                                self.tool_call_count.fetch_add(1, Ordering::Relaxed);
+
+                                match self
+                                    .react_app
+                                    .after_tool_result(&name, &mut result, &call_id, session, context)
+                                    .await
+                                {
+                                    HookDecision::Continue => {}
+                                    HookDecision::Abort => {
+                                        return Err(ReactError::HookAbort(
+                                            "after_tool_call aborted".to_string(),
+                                        ));
+                                    }
+                                    HookDecision::Error(msg) => {
+                                        return Err(ReactError::HookAbort(msg));
+                                    }
+                                }
+
+                                if let Ok(ret) = &result {
+                                    if name == "load_skill" {
+                                        let skill_name = args
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let instructions = ret
+                                            .get("instructions")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let skill_dir = ret
+                                            .get("skill_dir")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        if !instructions.is_empty() {
+                                            self.skill_cache.get_or_insert(
+                                                skill_name,
+                                                instructions.to_string(),
+                                                skill_dir.to_string(),
+                                            );
+                                        }
+                                    }
+
+                                    self.telemetry.emit(&TelemetryEvent::ToolInvocation {
+                                        tool: name.clone(),
+                                        input: args.clone(),
+                                        output: ret.clone(),
+                                    });
+
+                                    session.push(LlmMessage::AssistantToolCall {
+                                        tool_call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        args: args.clone(),
+                                    });
+                                    session.push(LlmMessage::ToolResult {
+                                        tool_call_id: call_id,
+                                        content: ret.to_string(),
+                                    });
+                                } else {
+                                    session.push(LlmMessage::AssistantToolCall {
+                                        tool_call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        args: args.clone(),
+                                    });
+                                    session.push(LlmMessage::ToolResult {
+                                        tool_call_id: call_id,
+                                        content: format!("Error: {:?}", result),
+                                    });
+                                }
+                            }
+                            ResponsesItem::Message { content, .. } => {
+                                for part in content {
+                                    if let ResponsesContentPart::OutputText { text, .. } = part {
+                                        assistant_text.push_str(text);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !found_tool_call {
+                        if !assistant_text.is_empty() {
+                            thought = assistant_text.trim().to_string();
+                            if let Some(pos) = thought.find("Final Answer:") {
+                                thought = thought[(pos + "Final Answer:".len())..]
+                                    .trim()
+                                    .to_string();
+                            }
+                            self.react_app.on_thought(&thought, session, context).await;
+                            session.push(LlmMessage::assistant(thought.clone()));
+                        }
+                        self.react_app
+                            .on_final_answer(&thought, session, context)
+                            .await;
+                        self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                            answer: thought.clone(),
+                        });
+                        return Ok(thought);
                     }
                 }
             }
