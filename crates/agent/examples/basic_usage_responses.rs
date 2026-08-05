@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== DeepSeek Responses API Test ===");
 
     let base_url = env_or("BOS_BASE_URL", "https://api.deepseek.com");
-    let api_key = env_or("BOS_API_KEY", "sk-06d3155ad2104fab8802e698c719c750");
+    let api_key = env_or("BOS_API_KEY", "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
     let model = env_or("BOS_MODEL", "deepseek-v4-flash");
 
     let mut provider = LlmProvider::new();
