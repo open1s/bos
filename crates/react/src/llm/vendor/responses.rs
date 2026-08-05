@@ -496,6 +496,14 @@ pub enum ResponsesStreamEvent {
         output_index: u32,
         delta: String,
     },
+    /// DeepSeek's Responses API streams the same progress under
+    /// `response.reasoning_text.delta`.
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningTextDelta {
+        item_id: String,
+        output_index: u32,
+        delta: String,
+    },
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded { output_index: u32, item: Value },
     #[serde(rename = "response.output_item.done")]
@@ -825,7 +833,8 @@ impl ResponsesTransport {
                                     let _ = tx.send(Ok(StreamToken::Text(delta))).await;
                                 }
                             }
-                            ResponsesStreamEvent::ReasoningSummaryDelta { delta, .. } => {
+                            ResponsesStreamEvent::ReasoningSummaryDelta { delta, .. }
+                            | ResponsesStreamEvent::ReasoningTextDelta { delta, .. } => {
                                 if !delta.is_empty() {
                                     let _ = tx.send(Ok(StreamToken::ReasoningContent(delta))).await;
                                 }

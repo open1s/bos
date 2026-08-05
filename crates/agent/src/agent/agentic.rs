@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use react::engine::{ReActEngine, ReActEngineBuilder};
-use react::llm::vendor::{LlmRouter, NvidiaVendor, OpenRouterVendor};
+use react::llm::vendor::{DeepSeekVendor, LlmRouter, NvidiaVendor, OpenAiClient, OpenRouterVendor};
 use react::llm::{
     Content, LlmError as ReactLlmError, LlmResponse as ReactLlmResponse,
     TokenStream as ReactTokenStream, TokenStream,
@@ -63,6 +63,23 @@ impl LlmProvider {
         self
     }
 
+    pub fn with_deepseek(&mut self, model: &str, base_url: &str, api_key: &str) -> &mut Self {
+        if !model.starts_with("deepseek/") {
+            return self;
+        }
+
+        let model = model.strip_prefix("deepseek/").unwrap_or(model);
+        self.register_vendor(
+            "deepseek".into(),
+            Box::new(DeepSeekVendor::new(
+                base_url.to_string(),
+                model.to_string(),
+                api_key.to_string(),
+            )),
+        );
+        self
+    }
+
     pub fn with_openrouter(&mut self, model: &str, base_url: &str, api_key: &str) -> &mut Self {
         if !model.starts_with("openrouter/") {
             return self;
@@ -79,6 +96,50 @@ impl LlmProvider {
         );
         self
     }
+}
+
+/// Selects and constructs the LLM vendor for an agent config. Returns the
+/// router key and the vendor boxed as the concrete agent session/context types.
+///
+/// `api_mode` is left untouched: every vendor (including DeepSeek, which
+/// supports both `/responses` and `/chat/completions`) honors the configured
+/// `api_mode` verbatim.
+pub fn build_vendor(
+    config: &AgentConfig,
+) -> (String, Box<dyn LlmClient<AgentSession, AgentReactContext>>) {
+    let (vendor_name, model_name) = if let Some(pos) = config.model.find('/') {
+        (
+            config.model[..pos].to_string(),
+            config.model[pos + 1..].to_string(),
+        )
+    } else {
+        ("openai".to_string(), config.model.clone())
+    };
+
+    let vendor: Box<dyn LlmClient<AgentSession, AgentReactContext>> = match vendor_name.as_str() {
+        "deepseek" => Box::new(DeepSeekVendor::new(
+            config.base_url.clone(),
+            model_name,
+            config.api_key.clone(),
+        )),
+        "nvidia" => Box::new(NvidiaVendor::new(
+            config.base_url.clone(),
+            model_name,
+            config.api_key.clone(),
+        )),
+        "openrouter" => Box::new(OpenRouterVendor::new(
+            config.base_url.clone(),
+            model_name,
+            config.api_key.clone(),
+        )),
+        _ => Box::new(OpenAiClient::new(
+            config.base_url.clone(),
+            model_name,
+            config.api_key.clone(),
+        )),
+    };
+
+    (vendor_name, vendor)
 }
 
 struct ArcLlmClient(Arc<LlmProvider>);

@@ -1,9 +1,11 @@
+pub mod deepseek;
 pub mod nvidia;
 pub mod openai;
 pub mod openaicompatible;
 pub mod openrouter;
 pub mod responses;
 pub mod router;
+pub use deepseek::{DeepSeekVendor, DeepSeekVendorBuilder};
 pub use nvidia::NvidiaVendor;
 pub use openai::{OpenAiClient, OpenAiVendor, OpenAiVendorBuilder};
 pub use openaicompatible::{

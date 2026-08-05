@@ -21,7 +21,9 @@ import os
 
 from nbos import BrainOS, tool
 from nbos import ConfigLoader as PyConfigLoader
+from nbos import init_tracing
 
+init_tracing()  # optional, for debugging
 
 @tool("Add two integers and return their sum.")
 def add(a: int, b: int) -> int:

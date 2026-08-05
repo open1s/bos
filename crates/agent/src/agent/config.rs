@@ -8,7 +8,6 @@ use crate::agent::agentic::LlmProvider;
 use crate::agent::{Agent, AgentConfig};
 use crate::error::AgentError;
 use crate::tools::{FunctionTool, Tool};
-use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TomlToolRef {
@@ -117,54 +116,32 @@ impl TomlAgentBuilder {
             .map(|tools| tools.iter().map(|t| t.to_openai_tool()).collect())
     }
 
-    pub async fn build(self, _session: Option<Arc<ZenohSession>>) -> Result<Agent, AgentError> {
-        let mut llm = LlmProvider::new();
-
-        let (vendor_name, model_for_vendor) = if let Some(pos) = self.config.model.find('/') {
-            (
-                self.config.model[..pos].to_string(),
-                self.config.model[pos + 1..].to_string(),
-            )
+    /// DeepSeek natively supports the Responses API; default to it unless the
+    /// config explicitly selects chat.
+    fn deepseek_api_mode_default(model: &str, explicit: Option<&str>) -> Option<&'static str> {
+        if explicit.is_none() && model.split('/').next() == Some("deepseek") {
+            Some("responses")
         } else {
-            ("openai".to_string(), self.config.model.clone())
-        };
-
-        match vendor_name.as_str() {
-            "nvidia" => {
-                llm.register_vendor(
-                    "nvidia".to_string(),
-                    Box::new(NvidiaVendor::new(
-                        self.config.base_url.clone(),
-                        model_for_vendor,
-                        self.config.api_key.clone(),
-                    )),
-                );
-            }
-            "openrouter" => {
-                llm.register_vendor(
-                    "openrouter".to_string(),
-                    Box::new(OpenRouterVendor::new(
-                        self.config.base_url.clone(),
-                        model_for_vendor,
-                        self.config.api_key.clone(),
-                    )),
-                );
-            }
-            _ => {
-                llm.register_vendor(
-                    "openai".to_string(),
-                    Box::new(OpenAiClient::new(
-                        self.config.base_url.clone(),
-                        model_for_vendor,
-                        self.config.api_key.clone(),
-                    )),
-                );
-            }
+            None
         }
-        let llm = Arc::new(llm);
+    }
 
+    pub async fn build(self, _session: Option<Arc<ZenohSession>>) -> Result<Agent, AgentError> {
         let mut config: AgentConfig = self.config.clone().into();
         apply_model_defaults(&mut config);
+
+        // DeepSeek natively supports the Responses API; default to it unless
+        // the config explicitly selects chat.
+        if let Some(mode) =
+            Self::deepseek_api_mode_default(&config.model, self.config.api_mode.as_deref())
+        {
+            config.api_mode = mode.to_string();
+        }
+
+        let mut llm = LlmProvider::new();
+        let (vendor_name, vendor) = crate::agent::agentic::build_vendor(&config);
+        llm.register_vendor(vendor_name, vendor);
+        let llm = Arc::new(llm);
 
         let mut agent = Agent::new(config, llm);
 
@@ -302,5 +279,21 @@ mod tests {
 
         assert_eq!(config.api_mode, "chat");
         assert_eq!(config.reasoning_effort, None);
+    }
+
+    #[test]
+    fn deepseek_defaults_to_responses_unless_explicit() {
+        assert_eq!(
+            TomlAgentBuilder::deepseek_api_mode_default("deepseek/deepseek-v4-flash", None),
+            Some("responses")
+        );
+        assert_eq!(
+            TomlAgentBuilder::deepseek_api_mode_default("openai/gpt-4o", None),
+            None
+        );
+        assert_eq!(
+            TomlAgentBuilder::deepseek_api_mode_default("deepseek/deepseek-v4-flash", Some("chat")),
+            None
+        );
     }
 }

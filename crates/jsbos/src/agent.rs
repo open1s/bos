@@ -12,7 +12,6 @@ use tokio::sync::Mutex;
 use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
 use agent::BashTool;
-use react::llm::vendor::{NvidiaVendor, OpenAiClient, OpenRouterVendor};
 use react::llm::{Content, ContentPart};
 use react::tool::registry::AsyncTool;
 
@@ -299,32 +298,7 @@ impl Agent {
 
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
 
-    let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
-      (
-        cfg.model[..pos].to_string(),
-        cfg.model[pos + 1..].to_string(),
-      )
-    } else {
-      ("openai".to_string(), cfg.model.clone())
-    };
-
-    let vendor: Box<dyn react::llm::LlmClient<_, _>> = match vendor_name.as_str() {
-      "nvidia" => Box::new(NvidiaVendor::new(
-        cfg.base_url.clone(),
-        model_name,
-        cfg.api_key.clone(),
-      )),
-      "openrouter" => Box::new(OpenRouterVendor::new(
-        cfg.base_url.clone(),
-        model_name,
-        cfg.api_key.clone(),
-      )),
-      _ => Box::new(OpenAiClient::new(
-        cfg.base_url.clone(),
-        model_name,
-        cfg.api_key.clone(),
-      )),
-    };
+    let (vendor_name, vendor) = agent::agent::agentic::build_vendor(&cfg);
     llm_provider.register_vendor(vendor_name, vendor);
 
     let agent = agent::Agent::new(cfg, Arc::new(llm_provider));
@@ -350,32 +324,7 @@ impl Agent {
 
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
 
-    let (vendor_name, model_name) = if let Some(pos) = cfg.model.find('/') {
-      (
-        cfg.model[..pos].to_string(),
-        cfg.model[pos + 1..].to_string(),
-      )
-    } else {
-      ("openai".to_string(), cfg.model.clone())
-    };
-
-    let vendor: Box<dyn react::llm::LlmClient<_, _>> = match vendor_name.as_str() {
-      "nvidia" => Box::new(NvidiaVendor::new(
-        cfg.base_url.clone(),
-        model_name,
-        cfg.api_key.clone(),
-      )),
-      "openrouter" => Box::new(OpenRouterVendor::new(
-        cfg.base_url.clone(),
-        model_name,
-        cfg.api_key.clone(),
-      )),
-      _ => Box::new(OpenAiClient::new(
-        cfg.base_url.clone(),
-        model_name,
-        cfg.api_key.clone(),
-      )),
-    };
+    let (vendor_name, vendor) = agent::agent::agentic::build_vendor(&cfg);
     llm_provider.register_vendor(vendor_name, vendor);
 
     let session = _bus.as_ref().clone();

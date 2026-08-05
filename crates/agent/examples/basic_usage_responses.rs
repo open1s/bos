@@ -1,8 +1,8 @@
 use agent::agent::agentic::{Agent, AgentConfig, LlmProvider};
 use agent::tools::FunctionTool;
-use react::llm::vendor::NvidiaVendor;
-use std::sync::Arc;
 use logging::auto_init_tracing;
+use react::llm::vendor::DeepSeekVendor;
+use std::sync::Arc;
 
 // Self-contained DeepSeek Responses-API test. Override the credentials via
 // env when running outside of CI/local test so the secret is not committed:
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut provider = LlmProvider::new();
     println!("Registering deepseek: {} @ {}", model, base_url);
-    let vendor = NvidiaVendor::new(base_url, model.clone(), api_key);
+    let vendor = DeepSeekVendor::new(base_url, model.clone(), api_key);
     provider.register_vendor("deepseek".into(), Box::new(vendor));
     let llm = Arc::new(provider);
 
@@ -50,7 +50,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )));
 
-    println!("Agent created: model={} api_mode=responses reasoning_effort=high\n", model);
+    println!(
+        "Agent created: model={} api_mode=responses reasoning_effort=high\n",
+        model
+    );
 
     println!("--- 1. run_simple() (Responses, non-stream) ---");
     match agent.run_simple("Say hi in one word").await {
