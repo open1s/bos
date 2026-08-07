@@ -607,6 +607,18 @@ impl<A: ReActApp> ReActEngine<A> {
         }
     }
 
+    /// Strip the engine-injected `__call_id__` from args before they are
+    /// recorded in the session. The session is sent back to the LLM as
+    /// context; if the injected call_id leaked into it, the LLM would start
+    /// echoing `__call_id__` in its own tool-call arguments.
+    fn strip_call_id(args: &Value) -> Value {
+        let mut clean = args.clone();
+        if let Some(obj) = clean.as_object_mut() {
+            obj.remove("__call_id__");
+        }
+        clean
+    }
+
     /// Call tool - no resilience wrapper (only LLM calls need rate limiting)
     pub async fn call_tool(
         &self,
@@ -723,7 +735,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                         session.push(LlmMessage::AssistantToolCall {
                                             tool_call_id: call_id.clone(),
                                             name: name.clone(),
-                                            args: args.clone(),
+                                            args: Self::strip_call_id(&args),
                                         });
                                         session.push(LlmMessage::ToolResult {
                                             tool_call_id: call_id,
@@ -809,7 +821,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     session.push(LlmMessage::AssistantToolCall {
                                         tool_call_id: call_id.clone(),
                                         name: name.clone(),
-                                        args: args.clone(),
+                                        args: Self::strip_call_id(&args),
                                     });
                                     session.push(LlmMessage::ToolResult {
                                         tool_call_id: call_id,
@@ -819,7 +831,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     session.push(LlmMessage::AssistantToolCall {
                                         tool_call_id: call_id.clone(),
                                         name: name.clone(),
-                                        args: args.clone(),
+                                        args: Self::strip_call_id(&args),
                                     });
                                     session.push(LlmMessage::ToolResult {
                                         tool_call_id: call_id,
@@ -892,7 +904,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                         session.push(LlmMessage::AssistantToolCall {
                                             tool_call_id: call_id.clone(),
                                             name: name.clone(),
-                                            args: args.clone(),
+                                            args: Self::strip_call_id(&args),
                                         });
                                         session.push(LlmMessage::ToolResult {
                                             tool_call_id: call_id,
@@ -978,7 +990,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     session.push(LlmMessage::AssistantToolCall {
                                         tool_call_id: call_id.clone(),
                                         name: name.clone(),
-                                        args: args.clone(),
+                                        args: Self::strip_call_id(&args),
                                     });
                                     session.push(LlmMessage::ToolResult {
                                         tool_call_id: call_id,
@@ -988,7 +1000,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     session.push(LlmMessage::AssistantToolCall {
                                         tool_call_id: call_id.clone(),
                                         name: name.clone(),
-                                        args: args.clone(),
+                                        args: Self::strip_call_id(&args),
                                     });
                                     session.push(LlmMessage::ToolResult {
                                         tool_call_id: call_id,
@@ -1213,7 +1225,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 Err(ref e) => format!("Error: {}", e),
                             };
 
-                            session.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), args.clone()));
+                            session.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), Self::strip_call_id(&args)));
                             session.push(LlmMessage::tool_result(call_id.clone(), result_text));
                         }
                         Err(e) => {
