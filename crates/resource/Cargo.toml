@@ -1,0 +1,74 @@
+[package]
+name = "resource"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+tokio-stream.workspace = true
+
+# Filesystem watching for Subscribe on file:// / folder:// resources.
+notify.workspace = true
+
+# Zero-copy serialization for the message envelope (matches existing bus).
+rkyv.workspace = true
+rkyv_derive.workspace = true
+
+# Base64 encoding for binary fields in the JSON (LLM-facing) tool surface.
+base64 = "0.22"
+
+# HMAC-SHA256 for signed discovery announcements.
+hmac = "0.12"
+sha2 = "0.10"
+# Hostname for default node ID.
+hostname = "0.4"
+
+# QUIC transport (remote resources) + TLS identity.
+#
+# `default-features = false` on both keeps the crypto stack **pure Rust**:
+# rustls's default features pull in `aws_lc_rs` (which needs a C compiler /
+# cmake to cross-compile). We use `ring` instead, which is Rust everywhere,
+# so the crate builds identically on macOS, Linux, and Windows.
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+x509-parser = "0.16"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+# CLI argument parsing for the `rex` binary only (kept out of the library).
+clap = { version = "4", features = ["derive"], optional = true }
+# Config-file loading for the `rex` binary (TOML etc.), also CLI-only.
+config = { path = "../config", optional = true }
+# Unified logging for CLI and library.
+logging = { path = "../logging", optional = true }
+# Bus for node discovery (pub/sub).
+bus = { path = "../bus", optional = true }
+# Standard logging facade.
+log = "0.4"
+# Rego policy engine (regorus).
+regorus = "0.11"
+
+[features]
+# Building the CLI pulls clap + config + logging.
+cli = ["dep:clap", "dep:config", "dep:logging", "dep:bus"]
+default = []
+
+[[bin]]
+name = "rex"
+path = "src/bin/rex.rs"
+required-features = ["cli"]
+
+[lib]
+name = "resource"
+path = "src/lib.rs"
