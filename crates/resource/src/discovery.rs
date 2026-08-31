@@ -23,6 +23,28 @@ pub fn discovery_topic(node_id: &str) -> String {
     format!("{DISCOVERY_TOPIC}/{node_id}")
 }
 
+/// A snapshot of a node's current load, kept to primitives so the bus codec
+/// needs no serde. All counters are best-effort and informational.
+#[derive(Debug, Clone, Copy, PartialEq, Archive, Serialize, Deserialize)]
+pub struct LoadSnapshot {
+    /// Number of resources the node hosts (registered + auto-bound).
+    pub num_resources: u32,
+    /// Number of running child processes (proc manager).
+    pub num_procs: u32,
+    /// Seconds since the node process started.
+    pub uptime_secs: u64,
+}
+
+impl LoadSnapshot {
+    pub fn zero() -> Self {
+        Self {
+            num_resources: 0,
+            num_procs: 0,
+            uptime_secs: 0,
+        }
+    }
+}
+
 /// A node's announcement message, published on the bus when the node starts.
 /// Uses only rkyv-compatible primitives (strings + tuples) so it can be
 /// serialized by the bus codec without serde.
@@ -38,6 +60,12 @@ pub struct NodeAnnounce {
     pub resources: Vec<(String, String, String, String)>,
     /// PEM-encoded CA certificate, so peers can verify this node's client certs.
     pub ca_cert: String,
+    /// Feature tags this node supports (e.g. "stream", "proc", "supervisor",
+    /// "relay", "vnode"). Directory consumers match on these instead of
+    /// assuming every node has every subsystem.
+    pub capabilities: Vec<String>,
+    /// Current load snapshot (informational; refreshed on re-announce).
+    pub load: LoadSnapshot,
     /// HMAC-SHA256 signature of `(node_id || quic_addr || server_name)`,
     /// or empty if unsigned.
     pub signature: Vec<u8>,
@@ -68,8 +96,22 @@ impl NodeAnnounce {
                 })
                 .collect(),
             ca_cert,
+            capabilities: Vec::new(),
+            load: LoadSnapshot::zero(),
             signature: Vec::new(),
         }
+    }
+
+    /// Set capability tags (replaces any prior set).
+    pub fn with_capabilities(mut self, caps: impl IntoIterator<Item = String>) -> Self {
+        self.capabilities = caps.into_iter().collect();
+        self
+    }
+
+    /// Record a load snapshot.
+    pub fn with_load(mut self, load: LoadSnapshot) -> Self {
+        self.load = load;
+        self
     }
 
     /// Sign this announcement with HMAC-SHA256 using the shared secret.
@@ -171,6 +213,27 @@ mod tests {
     #[test]
     fn discovery_topic_format() {
         assert_eq!(discovery_topic("nodeA"), "bos/discovery/nodeA");
+    }
+
+    #[test]
+    fn rich_directory_fields_roundtrip() {
+        let a = NodeAnnounce::new(
+            "nodeX".into(),
+            "10.0.0.9:4433".into(),
+            "xserver".into(),
+            vec![],
+            String::new(),
+        )
+        .with_capabilities(vec!["stream".into(), "proc".into()])
+        .with_load(LoadSnapshot {
+            num_resources: 12,
+            num_procs: 3,
+            uptime_secs: 99,
+        });
+        assert_eq!(a.capabilities, vec!["stream", "proc"]);
+        assert_eq!(a.load.num_resources, 12);
+        assert_eq!(a.load.num_procs, 3);
+        assert_eq!(a.load.uptime_secs, 99);
     }
 
     #[test]

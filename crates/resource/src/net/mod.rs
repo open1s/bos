@@ -8,6 +8,8 @@
 //! `keep_alive_interval` so idle connections stay punched through NATs and
 //! the server-side idle timeout never fires on an otherwise-quiet link.
 
+pub mod router;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

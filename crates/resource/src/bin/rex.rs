@@ -33,7 +33,7 @@ use resource::{
     VirtualNodeResource,
 };
 use resource::meta::ResourceStateLabel;
-use resource::discovery::{NodeAnnounce, discovery_topic, DISCOVERY_TOPIC};
+use resource::discovery::{discovery_topic, LoadSnapshot, NodeAnnounce, DISCOVERY_TOPIC};
 use resource::transport::Transport;
 use bus::{Bus, BusConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -696,7 +696,31 @@ async fn serve(
         let quic_addr = bind.to_string();
         let resources = mgr_for_discovery.list_all().await;
         let ca_pem_str = String::from_utf8_lossy(&ca).to_string();
-        let mut announce = NodeAnnounce::new(nid.to_string(), quic_addr, cert_cn.clone(), resources, ca_pem_str);
+
+        // Rich directory: which subsystems this node exposes, plus a load
+        // snapshot refreshed on each re-announce.
+        let capabilities = vec![
+            "stream".to_string(),
+            "proc".to_string(),
+            "supervisor".to_string(),
+            "relay".to_string(),
+            "vnode".to_string(),
+        ];
+        let started = Instant::now();
+        let num_resources = resources.len() as u32;
+        let mut announce = NodeAnnounce::new(
+            nid.to_string(),
+            quic_addr,
+            cert_cn.clone(),
+            resources,
+            ca_pem_str,
+        )
+        .with_capabilities(capabilities)
+        .with_load(LoadSnapshot {
+            num_resources,
+            num_procs: 0,
+            uptime_secs: 0,
+        });
         if let Some(secret) = shared_secret {
             announce.sign(secret.as_bytes());
             d!("signed discovery announcement with shared secret");
@@ -743,8 +767,12 @@ async fn serve(
                 });
             }
 
-            d!("discovered peer {} with {} resources",
-                ann.node_id, ann.resources.len());
+            d!("discovered peer {} (caps=[{}]) with {} resources (procs={}, uptime={}s)",
+                ann.node_id,
+                ann.capabilities.join(", "),
+                ann.resources.len(),
+                ann.load.num_procs,
+                ann.load.uptime_secs);
 
             let nid2 = ann.node_id.clone();
             let ca_c = ca_clone.clone();
@@ -799,14 +827,27 @@ async fn serve(
         }).await;
         d!("subscribed to {DISCOVERY_TOPIC}/* for peer discovery");
 
-        // Periodic re-announce so late-joining peers discover us.
+        // Periodic re-announce so late-joining peers discover us. Load is
+        // refreshed (uptime + live resource/proc counts) on each tick.
         let re_topic = discovery_topic(nid);
         let mut re_bus = bus.clone();
-        let re_announce = announce.clone();
+        let mut re_announce = announce.clone();
+        let re_secret = shared_secret.map(|s| s.to_string());
+        let re_mgr = mgr_for_discovery.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.tick().await; // skip immediate first fire
             loop {
                 interval.tick().await;
+                let num_resources = re_mgr.list_all().await.len() as u32;
+                re_announce.load = LoadSnapshot {
+                    num_resources,
+                    num_procs: 0, // proc manager count is not inspected here
+                    uptime_secs: started.elapsed().as_secs(),
+                };
+                if let Some(ref secret) = re_secret {
+                    re_announce.sign(secret.as_bytes());
+                }
                 if re_bus.publish(&re_topic, &re_announce).await.is_err() {
                     break;
                 }

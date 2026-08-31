@@ -47,7 +47,7 @@ pub use action::{
     ResourceOutput,
 };
 pub use client::{Resource, ResourceClient};
-pub use discovery::{NodeAnnounce, DISCOVERY_TOPIC};
+pub use discovery::{LoadSnapshot, NodeAnnounce, DISCOVERY_TOPIC};
 pub use resource::combine::CombineResource;
 pub use resource::vnode::VirtualNodeResource;
 pub use debug::init_logging;
@@ -56,6 +56,7 @@ pub use explorer::{handler_for, Explorer, Row};
 pub use handler::ResourceHandler;
 pub use manager::ResourceManager;
 pub use meta::{ResourceInfo, ResourceMeta, ResourceStateLabel, ResourceType};
+pub use net::router::{RelayResource, RelayTransport};
 pub use net::Net;
 pub use platform::{Os, Terminate};
 pub use policy::{PolicyDoc, Rule, SharedPolicy, Effect};

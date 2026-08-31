@@ -120,6 +120,18 @@ pub enum ResourceAction {
     EnvSet { key: String, value: String },
     PipeOpen { name: String },
 
+    // ---- multi-hop routing ----
+    /// Forward `payload` (an rkyv-serialized inner `ResourceAction`) targeting
+    /// `uri` on a downstream node. Only meaningful on a `relay://<node>`
+    /// resource: the handler decodes the payload and re-invokes it downstream.
+    /// Bytes instead of `Box<ResourceAction>` because recursive enum inference
+    /// in rkyv is not worth the complexity for a transport hop.
+    Forward {
+        uri: String,
+        #[serde(with = "b64")]
+        payload: Vec<u8>,
+    },
+
     // ---- abstract / virtual ----
     Query {
         statement: String,
@@ -175,6 +187,7 @@ impl ResourceAction {
             ResourceAction::Invoke { .. } => "invoke",
             ResourceAction::Get { .. } => "get",
             ResourceAction::Put { .. } => "put",
+            ResourceAction::Forward { .. } => "forward",
             ResourceAction::PolicyUpdate { .. } => "policy_update",
         }
     }
