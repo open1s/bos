@@ -124,6 +124,18 @@ impl Explorer {
             {
                 debug!("walk: {} listed {} entries", uri, entries.len());
                 for entry in entries {
+                    // vnode children are member names; the vnode itself owns
+                    // the sub-path namespace.
+                    if uri.starts_with("vnode://") {
+                        let child_uri = format!("{uri}/{entry}");
+                        if let Ok(Some(_)) = self.client.resolve(&child_uri).await {
+                            debug!("walk: recursing into vnode {}", child_uri);
+                            self.walk(&child_uri, depth + 1, max_depth, out).await;
+                            continue;
+                        }
+                        out.push(Row::Child { depth: depth + 1, name: entry });
+                        continue;
+                    }
                     // A child may be a file or a folder; probe both schemes so
                     // a file under a folder binds as a file handle (peekable)
                     // and a subdir binds as a folder handle (recurseable).

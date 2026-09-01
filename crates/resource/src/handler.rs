@@ -73,4 +73,12 @@ pub trait ResourceHandler: Send + Sync {
             self.meta().uri
         )))
     }
+
+    /// If this resource acts as a URI *prefix* (e.g. `vnode://name`), return a
+    /// handler for the sub-path. The manager consults this when a dispatch
+    /// targets `<meta.uri>/<rest>` and no exact handler is registered.
+    /// Default: no sub-path support.
+    fn sub_handler(&self, _relpath: &str) -> Option<Box<dyn ResourceHandler>> {
+        None
+    }
 }

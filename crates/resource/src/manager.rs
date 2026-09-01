@@ -101,8 +101,27 @@ impl ResourceManager {
         if let Ok(slot) = self.slot(uri).await {
             return Ok(slot);
         }
-        let (scheme, path) = uri.split_once("://")
+        let (scheme, path) = uri
+            .split_once("://")
             .ok_or_else(|| ResourceError::NotFound(uri.to_string()))?;
+        // `vnode://<name>/<subpath>`: prefix routes to the base vnode, which
+        // mints a handler owning the sub-path (`sub_handler`). The handler is
+        // created without being registered — it serves this one dispatch.
+        if scheme == "vnode" {
+            let (base, rest) = match path.split_once('/') {
+                Some((b, r)) => (b, r),
+                None => (path, ""),
+            };
+            let base_uri = format!("vnode://{base}");
+            if let Ok(base_slot) = self.slot(&base_uri).await {
+                let base = base_slot.lock().await;
+                if let Some(handler) = base.sub_handler(rest) {
+                    let slot: HandlerSlot = Arc::new(Mutex::new(handler));
+                    return Ok(slot);
+                }
+            }
+            return Err(ResourceError::NotFound(uri.to_string()));
+        }
         // Auto-bind a URI against what's actually on the filesystem. A URI is
         // only a valid handle if the scheme matches the on-disk kind, so a
         // file never accidentally binds as a folder handle (or vice versa).
