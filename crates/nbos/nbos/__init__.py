@@ -24,9 +24,13 @@ from nbos.core import (
     SessionManager,
 )
 from nbos.tool import tool, ToolDef, ToolResult
-from nbos.bus import BusManager, Publisher, Subscriber
-from nbos.query import Query, Queryable
-from nbos.caller import Caller, Callable
+from nbos.bus import (
+    BusManager,
+    Publisher as PublisherWrapper,
+    Subscriber as SubscriberWrapper,
+)
+from nbos.query import Query as QueryWrapper, Queryable as QueryableWrapper
+from nbos.caller import Caller as CallerWrapper, Callable as CallableWrapper
 from nbos.config import Config
 from nbos.content import Content, ContentPart, Binary
 from nbos_native import (
@@ -66,6 +70,15 @@ from nbos_native import (
     init_tracing as InitTracing,
 )
 
+# The native (pyo3) bus classes keep their plain exported names; the high
+# level wrappers returned by BusManager are available under the *_Wrapper aliases.
+PyPublisher = Publisher
+PySubscriber = Subscriber
+PyQuery = Query
+PyQueryable = Queryable
+PyCaller = Caller
+PyCallable = Callable
+
 # Export both casing styles for backward compatibility
 init_tracing = InitTracing
 
@@ -94,10 +107,18 @@ __all__ = [
     "StreamSender",
     "Caller",
     "Callable",
-    "Caller",
-    "Callable",
-    "AgentConfig",
-    "AgentPlugin",
+    "PublisherWrapper",
+    "SubscriberWrapper",
+    "QueryWrapper",
+    "QueryableWrapper",
+    "CallerWrapper",
+    "CallableWrapper",
+    "PyPublisher",
+    "PySubscriber",
+    "PyQuery",
+    "PyQueryable",
+    "PyCaller",
+    "PyCallable",
     "PluginRegistry",
     "ConfigLoader",
     "Config",
@@ -121,7 +142,7 @@ __all__ = [
     "init_tracing",
     "Content",
     "ContentPart",
-    "ImageUrlContent",
-    "InputAudioContent",
+    "Binary",
 ]
-__version__ = "2.1.1"
+# Keep in sync with pyproject.toml; tests/test_public_api.py enforces this.
+__version__ = "2.4.1"

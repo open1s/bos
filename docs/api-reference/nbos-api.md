@@ -358,6 +358,12 @@ The native Rust-backed agent class from `nbos_native`.
 
 ## Bus / BusConfig
 
+The `*Wrapper` aliases name the high-level wrappers returned by `BusManager`
+(`PublisherWrapper`, `SubscriberWrapper`, `QueryWrapper`, `QueryableWrapper`,
+`CallerWrapper`, `CallableWrapper`). The plain `Publisher`, `Subscriber`,
+`Query`, `Queryable`, `Caller` and `Callable` exports are the lower-level
+native classes, kept under their original names for compatibility.
+
 #### BusManager
 
 High-level bus lifecycle and factory, mirroring the JavaScript `BusManager`.
