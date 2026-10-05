@@ -1,101 +1,155 @@
+//! OpenAI-compatible chat-completion wire types and streaming extractors.
+
 use crate::{JsonExtractor, StreamExtractor, StreamSpan};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A tool call requested by the model.
 pub struct ToolCall {
+    /// Provider-assigned tool call id.
     pub id: String,
+    /// Call type, normally `function`.
     #[serde(rename = "type")]
     pub r#type: String, // "function"
+    /// The function to call.
     pub function: FunctionCall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A function name and its JSON-encoded arguments.
 pub struct FunctionCall {
+    /// Function name.
     pub name: Option<String>,
+    /// JSON-encoded arguments.
     pub arguments: Option<String>, // JSON string
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Token usage for a chat completion.
 pub struct Usage {
+    /// Tokens in the prompt.
     pub prompt_tokens: u32,
+    /// Tokens in the completion.
     pub completion_tokens: u32,
+    /// Prompt plus completion tokens.
     pub total_tokens: u32,
+    /// Breakdown of prompt tokens, when reported.
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Breakdown of prompt token usage.
 pub struct PromptTokensDetails {
+    /// Audio input tokens.
     #[serde(default)]
     pub audio_tokens: Option<u32>,
+    /// Prompt tokens served from cache.
     #[serde(default)]
     pub cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Log probabilities for a response.
 pub struct LogProbs {
+    /// Per-token log probabilities.
     pub content: Option<Vec<LogProbContent>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A log probability for one token.
 pub struct LogProbContent {
+    /// The token.
     pub token: String,
+    /// Log probability of the token.
     pub logprob: f32,
+    /// UTF-8 bytes of the token.
     pub bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+/// A streamed fragment of a function call.
 pub struct FunctionCallDelta {
+    /// Function name, when present.
     pub name: Option<String>,
+    /// A fragment of the JSON arguments.
     pub arguments: Option<String>, // streamed JSON fragments
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+/// A streamed fragment of a tool call.
 pub struct ToolCallDelta {
+    /// Index of the tool call within the message.
     pub index: Option<u32>,
+    /// Provider-assigned tool call id.
     pub id: Option<String>,
+    /// Call type, normally `function`.
     #[serde(rename = "type")]
     pub kind: Option<String>,
+    /// Function fragment.
     pub function: Option<FunctionCallDelta>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+/// The incremental content of a streamed chunk.
 pub struct Delta {
+    /// Role of the message, when it first appears.
     pub role: Option<String>,
+    /// A fragment of assistant text.
     pub content: Option<String>,
+    /// Tool call fragments.
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+    /// Legacy function call fragment.
     pub function_call: Option<FunctionCallDelta>,
+    /// A fragment of reasoning text.
     pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+/// One choice within a streamed chunk.
 pub struct ChunkChoice {
+    /// Index of the choice.
     pub index: u32,
+    /// Incremental content.
     pub delta: Delta,
+    /// Why generation stopped, when finished.
     pub finish_reason: Option<String>,
+    /// Log probabilities, when requested.
     pub logprobs: Option<LogProbs>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+/// One SSE chunk of a chat completion.
 pub struct ChatCompletionChunk {
+    /// Completion id.
     pub id: String,
+    /// Object type, normally `chat.completion.chunk`.
     pub object: String,
+    /// Unix creation timestamp.
     pub created: u64,
+    /// Model that served the request.
     pub model: String,
+    /// Choices in this chunk.
     pub choices: Vec<ChunkChoice>,
+    /// Token usage, usually only in the final chunk.
     #[serde(default)]
     pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A chat message in an OpenAI request or response.
 pub struct ChatMessage {
+    /// Message role.
     pub role: String,
+    /// Message text, if any.
     pub content: Option<String>,
 
+    /// Tool calls requested by the model.
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCall>>,
 
+    /// Legacy function call.
     #[serde(default)]
     pub function_call: Option<FunctionCall>,
 
@@ -103,38 +157,56 @@ pub struct ChatMessage {
     #[serde(default)]
     pub reasoning_content: Option<String>,
 
+    /// Any additional provider fields.
     #[serde(flatten)]
     pub extra: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// One completion choice.
 pub struct Choice {
+    /// Index of the choice.
     pub index: u32,
+    /// The generated message.
     pub message: ChatMessage,
+    /// Why generation stopped.
     pub finish_reason: Option<String>,
+    /// Provider-specific numeric stop reason.
     #[serde(default)]
     pub stop_reason: Option<u32>,
+    /// Log probabilities, when requested.
     pub logprobs: Option<LogProbs>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A non-streaming chat completion response.
 pub struct ChatCompletionResponse {
+    /// Completion id.
     pub id: String,
+    /// Object type, normally `chat.completion`.
     pub object: String, // "chat.completion"
+    /// Unix creation timestamp.
     pub created: u64,
+    /// Model that served the request.
     pub model: String,
+    /// Generated choices.
     pub choices: Vec<Choice>,
+    /// Token usage.
     pub usage: Option<Usage>,
+    /// Backend configuration fingerprint.
     pub system_fingerprint: Option<String>,
+    /// NVIDIA-specific extension fields.
     #[serde(default)]
     pub nvext: Option<serde_json::Value>,
 }
 
+/// Extracts chat completion chunks from an SSE stream.
 pub struct OpenAIExtractor {
     inner: JsonExtractor,
 }
 
 impl OpenAIExtractor {
+    /// Wrap a JSON extractor.
     pub fn new(inner: JsonExtractor) -> Self {
         Self { inner }
     }
@@ -196,13 +268,18 @@ pub struct StreamToolCallAccumulator {
 
 /// A single pending (incomplete) streaming tool call.
 #[derive(Debug)]
+/// A single pending (incomplete) streaming tool call.
 pub struct PendingToolCall {
+    /// Tool name.
     pub name: Option<String>,
+    /// Tool call id.
     pub id: Option<String>,
+    /// Accumulated JSON argument fragments.
     pub arguments: String,
 }
 
 impl StreamToolCallAccumulator {
+    /// Create an empty accumulator.
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
@@ -259,10 +336,12 @@ impl StreamToolCallAccumulator {
         results
     }
 
+    /// Whether any tool calls are pending.
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
 
+    /// Number of pending tool calls.
     pub fn len(&self) -> usize {
         self.pending.len()
     }

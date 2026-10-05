@@ -4,6 +4,7 @@ pub mod deepseek;
 pub mod nvidia;
 #[warn(missing_docs)]
 pub mod openai;
+#[warn(missing_docs)]
 pub mod openaicompatible;
 #[warn(missing_docs)]
 pub mod openrouter;
