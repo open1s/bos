@@ -32,21 +32,18 @@ matches model), and fails on any difference not on an explicit allowlist.
 It runs inside the existing yarn test (ava) job and needs no Python runtime,
 because it reads the Python source instead of importing it.
 
-## Allowlist
+## Contract
 
-Known, intentional differences are listed in the test:
+The high-level agent surface is now fully mirrored, so its allowlist is empty.
+Getting there closed real gaps and reconciled names:
 
-- JS-only: the import back-compat alias, plus the system and skillsFromDir
-  names (aliases of the prompt setter and the skills-directory setter).
-- Python-only: chat (an ask alias) and the plugins / skills_dir names.
+- Python gained with_config, with_circuit_breaker, with_rate_limit, stop,
+  is_running and stream_collect.
+- JS gained chat and plugins as alias/bulk forms, and Python gained with_system,
+  so every alias now exists on both sides.
+- JS skillsFromDir was renamed to skillsDir, matching the noun form used by
+  baseUrl and model and aligning with Python's with_skills_dir.
 
-Both bindings now expose the same config surface: Python gained with_config,
-with_circuit_breaker and with_rate_limit to match JS withConfig, circuitBreaker
-and rateLimit. The contract checks presence, not arity, so a getter and a
-similarly named setter collapse into one entry.
-
-When one binding gains a member, the suite fails until the other side (or the
-allowlist) is updated, so divergence becomes a deliberate decision rather than
-an accident. The allowlist is now down to alias and naming choices; every
-capability gap it once tracked (Python stop, isRunning, streamCollect,
-with_config, granular resilience) has been closed.
+Only SessionManager keeps a documented difference: the JS import alias. The
+contract checks presence, not arity, so a getter and a similarly named setter
+collapse into one entry.

@@ -404,6 +404,8 @@ class TestAgentAccessors:
             builder.with_rate_limit(7).with_circuit_breaker(9)
             assert builder._config.rate_limit_capacity == 7
             assert builder._config.circuit_breaker_max_failures == 9
+            builder.with_system("be terse")
+            assert builder._config.system_prompt == "be terse"
 
     @pytest.mark.asyncio
     async def test_agent_stop_suppresses_next_call(self):

@@ -746,12 +746,17 @@ class AgentBuilder {
     return this;
   }
 
+  plugins(...plugins) {
+    for (const plugin of plugins) this.plugin(plugin);
+    return this;
+  }
+
   skill(name, content) {
     this._skills.push({ name, content });
     return this;
   }
 
-  skillsFromDir(dirPath) {
+  skillsDir(dirPath) {
     this._skills.push({ dirPath });
     return this;
   }
@@ -853,6 +858,10 @@ class AgentBuilder {
   async ask(prompt) {
     if (!this._inner) await this.start();
     return this._inner.runSimple(this._resolveContent(prompt));
+  }
+
+  async chat(message) {
+    return this.ask(message);
   }
 
   async runSimple(prompt) {

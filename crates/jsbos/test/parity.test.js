@@ -82,8 +82,8 @@ test('high-level agent surface matches across bindings', (t) => {
     'Agent',
     js,
     py,
-    // Remaining differences are aliases and naming choices, not capabilities.
-    new Set(['skills_from_dir', 'system']),
-    new Set(['chat', 'plugins', 'skills_dir']),
+    // Agent surface is fully mirrored; only SessionManager keeps an alias.
+    new Set(),
+    new Set(),
   )
 })

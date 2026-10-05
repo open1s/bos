@@ -77,7 +77,7 @@ Use type hints, snake_case, docstrings.`)
     .hook(raw.HookEvent.AfterToolCall, (err, ctx) => { if (err) return 'error'; console.log('  [Hook:AfterToolCall]', ctx?.data?.tool_name || 'unknown'); return 'continue'; })
     .hook(raw.HookEvent.BeforeLlmCall, (err, ctx) => { if (err) return 'error'; console.log('  [Hook:BeforeLlmCall]'); return 'continue'; })
     .hook(raw.HookEvent.AfterLlmCall, (err, ctx) => { if (err) return 'error'; console.log('  [Hook:AfterLlmCall]'); return 'continue'; })
-    .skillsFromDir(skillsDir)
+    .skillsDir(skillsDir)
     .start()
 
   console.log('───────────────────────────────────────────────────────────')

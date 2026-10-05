@@ -761,6 +761,7 @@ LLM-powered agent with tool support. Created via `AgentBuilder` (`.with_X()` cha
 |--------|-------------|---------|
 | `with_model(model)` | Set model | `AgentBuilder` |
 | `with_prompt(prompt)` | Set system prompt | `AgentBuilder` |
+| `with_system(prompt)` | Alias for with_prompt | `AgentBuilder` |
 | `with_temperature(temp)` | Set temperature | `AgentBuilder` |
 | `with_timeout(secs)` | Set timeout | `AgentBuilder` |
 | `with_resilience(**opts)` | Set resilience config | `AgentBuilder` |

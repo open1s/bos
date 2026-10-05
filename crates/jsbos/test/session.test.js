@@ -141,3 +141,10 @@ test.serial('stop suppresses the next call and reports run state', async (t) => 
   t.false(agent.stop().stopped)
   t.is(await agent.runSimple('hi'), '')
 })
+
+test.serial('builder aliases chain and expose the mirrored surface', async (t) => {
+  const agent = await startAgent(t)
+  t.is(typeof agent.chat, 'function')
+  t.is(agent.plugins({ name: 'parity' }), agent)
+  t.is(agent.skillsDir('/tmp/parity-skills'), agent)
+})

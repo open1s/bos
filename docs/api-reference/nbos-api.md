@@ -89,6 +89,7 @@ AgentBuilder(bus, options=None)
 | `with_base_url(url)` | Set base URL | `AgentBuilder` |
 | `with_api_key(key)` | Set API key | `AgentBuilder` |
 | `with_prompt(prompt)` | Set system prompt | `AgentBuilder` |
+| `with_system(prompt)` | Alias for with_prompt | `AgentBuilder` |
 | `with_temperature(temp)` | Set temperature | `AgentBuilder` |
 | `with_max_tokens(tokens)` | Set max tokens | `AgentBuilder` |
 | `with_timeout(secs)` | Set timeout | `AgentBuilder` |

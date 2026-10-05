@@ -120,7 +120,7 @@ const agent = brain
   .register(myTool)           // Register a ToolDef
   .hook(HookEvent.BeforeLlmCall, (err, ctx) => 'continue')
   .plugin('my-plugin', { onLlmRequest: (req) => req })
-  .skillsFromDir('./skills')
+  .skillsDir('./skills')
   .start();                   // Returns an AgentWrapper
 ```
 

@@ -396,14 +396,16 @@ export class AgentBuilder {
     hook(event: any, callback: any): this;
     hooks(hooks: any): this;
     plugin(nameOrObj: any, handlers?: {}): this;
+    plugins(...plugins: any[]): this;
     skill(name: any, content: any): this;
-    skillsFromDir(dirPath: any): this;
+    skillsDir(dirPath: any): this;
     mcp(namespace: any, command: any, args: any): this;
     mcpHttp(namespace: any, url: any): this;
     start(): Promise<this>;
     _contentPartsToJsContentArray(input: any): any;
     _resolveContent(input: any): any;
     ask(prompt: any): Promise<string>;
+    chat(message: any): Promise<string>;
     runSimple(prompt: any): Promise<string>;
     react(task: any): Promise<string>;
     stream(task: any, onToken: any): Promise<string>;

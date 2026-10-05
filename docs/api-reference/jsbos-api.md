@@ -93,8 +93,9 @@ new AgentBuilder(bus, options = {})
 | `hook(event, callback)` | Register a lifecycle hook | `AgentBuilder` |
 | `hooks(hooks)` | Register multiple hooks | `AgentBuilder` |
 | `plugin(nameOrObj, handlers)` | Register a plugin | `AgentBuilder` |
+| `plugins(...plugins)` | Register multiple plugins | `AgentBuilder` |
 | `skill(name, content)` | Add inline skill | `AgentBuilder` |
-| `skillsFromDir(dirPath)` | Load skills from directory | `AgentBuilder` |
+| `skillsDir(dirPath)` | Load skills from directory | `AgentBuilder` |
 | `mcp(ns, cmd, args)` | Add MCP server (process) | `AgentBuilder` |
 | `mcpHttp(ns, url)` | Add MCP server (HTTP) | `AgentBuilder` |
 
@@ -104,6 +105,7 @@ new AgentBuilder(bus, options = {})
 |--------|-------------|---------|
 | `start()` | Build and initialize the agent | `Promise<AgentBuilder>` |
 | `ask(prompt)` | Auto-start + run simple | `Promise<string>` |
+| `chat(prompt)` | Alias for ask | `Promise<string>` |
 | `runSimple(prompt)` | Auto-start + run simple | `Promise<string>` |
 | `react(task)` | Auto-start + run ReAct | `Promise<string>` |
 | `stream(task, onToken)` | Stream response tokens | `void` |

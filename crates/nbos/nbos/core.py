@@ -202,6 +202,10 @@ class AgentBuilder:
         self._config.system_prompt = prompt
         return self
 
+    def with_system(self, prompt: str) -> "AgentBuilder":
+        """Alias for with_prompt (matches JS system)."""
+        return self.with_prompt(prompt)
+
     def with_temperature(self, temperature: float) -> "AgentBuilder":
         self._config.temperature = temperature
         return self
