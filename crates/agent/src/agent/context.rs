@@ -213,7 +213,7 @@ impl AgentSession {
 
     pub fn save(&self, path: &str) -> Result<(), std::io::Error> {
         let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
@@ -224,7 +224,7 @@ impl AgentSession {
 
     pub fn restore_from_json(&mut self, json: &str) -> Result<(), std::io::Error> {
         let restored: AgentSession = serde_json::from_str(json)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         self.messages = restored.messages;
         self.context = restored.context;
         self.metadata = restored.metadata;
@@ -233,7 +233,7 @@ impl AgentSession {
 
     pub fn to_json_string(&self) -> Result<String, std::io::Error> {
         serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
     }
 
     pub fn clear(&mut self) {
@@ -254,14 +254,14 @@ impl AgentSession {
 
         let summary_input: String = removed
             .iter()
-            .filter_map(|msg| match msg {
-                Message::System { content } => Some(content.clone()),
-                Message::User { content } => Some(content_to_summary_string(content)),
-                Message::Assistant { content } => Some(content.clone()),
+            .map(|msg| match msg {
+                Message::System { content } => content.clone(),
+                Message::User { content } => content_to_summary_string(content),
+                Message::Assistant { content } => content.clone(),
                 Message::AssistantToolCall { name, args, .. } => {
-                    Some(format!("Tool call {}: {}", name, args))
+                    format!("Tool call {}: {}", name, args)
                 }
-                Message::ToolResult { content, .. } => Some(content.clone()),
+                Message::ToolResult { content, .. } => content.clone(),
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -404,7 +404,7 @@ impl ReactContext for AgentReactContext {
     fn notify_response(&self, _resp: &ReactLlmResponse) {}
     fn notify_error(&self, _err: &react::llm::LlmError) {}
     fn on_chunk(&self, _chunk: &str) {}
-    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
+    fn on_chunk_callback(&self) -> Option<react::llm::ChunkCallback> {
         None
     }
 }
@@ -502,12 +502,11 @@ impl ReActApp for AgentReActApp {
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
         let response_text = response_text.to_string();
-        let had_tool_call = had_tool_call;
         async move {
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("response_type", "stream");
             ctx.set("response_text", &response_text);
-            ctx.set("had_tool_call", &had_tool_call.to_string());
+            ctx.set("had_tool_call", had_tool_call.to_string());
             let _ = hooks
                 .trigger(crate::agent::hooks::HookEvent::AfterLlmCall, ctx)
                 .await;
@@ -539,7 +538,7 @@ impl ReActApp for AgentReActApp {
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("tool_name", &tool_name);
             ctx.set("call_id", &call_id);
-            ctx.set("tool_args", &args.to_string());
+            ctx.set("tool_args", args.to_string());
             hooks
                 .trigger(crate::agent::hooks::HookEvent::BeforeToolCall, ctx)
                 .await

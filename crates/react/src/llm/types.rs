@@ -167,6 +167,9 @@ impl Content {
     }
 }
 
+/// Callback invoked with each streamed chunk of text, when one is installed.
+pub type ChunkCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 pub trait ReactContext {
     fn session_id(&self) -> String;
     fn skills(&self) -> Option<&[Skill]>;
@@ -179,7 +182,7 @@ pub trait ReactContext {
     fn notify_response(&self, _resp: &super::LlmResponse);
     fn notify_error(&self, _err: &LlmError);
     fn on_chunk(&self, _chunk: &str);
-    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>;
+    fn on_chunk_callback(&self) -> Option<ChunkCallback>;
 }
 
 impl ReactContext for () {
@@ -208,7 +211,7 @@ impl ReactContext for () {
 
     fn on_chunk(&self, __chunk: &str) {}
 
-    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
+    fn on_chunk_callback(&self) -> Option<ChunkCallback> {
         None
     }
 }
@@ -567,7 +570,7 @@ impl ReactContext for LlmContext {
 
     fn on_chunk(&self, _chunk: &str) {}
 
-    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
+    fn on_chunk_callback(&self) -> Option<ChunkCallback> {
         None
     }
 }
@@ -612,7 +615,7 @@ impl ApiMode {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_name(s: &str) -> Self {
         match s {
             "responses" => ApiMode::Responses,
             _ => ApiMode::Chat,
@@ -638,7 +641,7 @@ impl ReasoningEffort {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_name(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "low" => ReasoningEffort::Low,
             "high" => ReasoningEffort::High,

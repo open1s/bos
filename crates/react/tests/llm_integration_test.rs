@@ -54,7 +54,6 @@ async fn load_config() -> Result<serde_json::Value, String> {
         .await
         .map_err(|e| e.to_string())
         .cloned()
-        .map(|v| v.clone())
 }
 
 /// Create a simple text completion request.

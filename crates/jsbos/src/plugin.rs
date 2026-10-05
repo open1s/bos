@@ -71,8 +71,8 @@ impl From<PluginLlmRequest> for LlmRequestWrapper {
       reasoning_effort: req
         .reasoning_effort
         .as_deref()
-        .map(react::llm::ReasoningEffort::from_str),
-      api_mode: react::llm::ApiMode::from_str(&req.api_mode),
+        .map(react::llm::ReasoningEffort::from_name),
+      api_mode: react::llm::ApiMode::from_name(&req.api_mode),
       metadata: req.metadata,
     }
   }

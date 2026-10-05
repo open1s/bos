@@ -45,7 +45,7 @@ impl ReactContext for DummyContext {
     fn notify_response(&self, _resp: &react::llm::LlmResponse) {}
     fn notify_error(&self, _err: &react::llm::LlmError) {}
     fn on_chunk(&self, _chunk: &str) {}
-    fn on_chunk_callback(&self) -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
+    fn on_chunk_callback(&self) -> Option<react::llm::ChunkCallback> {
         None
     }
 }
@@ -133,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .api_mode(react::llm::ApiMode::Responses);
     req.input = Content::text("Say hello in 3 words");
 
-    let mut session = DummySession::default();
+    let mut session = DummySession;
     let mut ctx = DummyContext::default();
     // Hosted tools serialize as `{"type":"web_search", ...config}` on the
     // Responses wire; function tools as `{"type":"function", ...}`.

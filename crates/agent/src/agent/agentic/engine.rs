@@ -227,8 +227,8 @@ impl Agent {
                 .config
                 .reasoning_effort
                 .as_deref()
-                .map(react::llm::ReasoningEffort::from_str),
-            api_mode: react::llm::ApiMode::from_str(&self.config.api_mode),
+                .map(react::llm::ReasoningEffort::from_name),
+            api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
             ..Default::default()
         };
 
@@ -386,8 +386,8 @@ impl Agent {
                     .config
                     .reasoning_effort
                     .as_deref()
-                    .map(react::llm::ReasoningEffort::from_str),
-                api_mode: react::llm::ApiMode::from_str(&self.config.api_mode),
+                    .map(react::llm::ReasoningEffort::from_name),
+                api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
                 ..Default::default()
             };
 

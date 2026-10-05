@@ -19,6 +19,12 @@ pub struct ToolRunManager {
     agent_name: String,
 }
 
+impl Default for ToolRunManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRunManager {
     pub fn new() -> Self {
         Self {

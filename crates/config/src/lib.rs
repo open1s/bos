@@ -19,12 +19,7 @@ impl Section {
                 "No config sources found. Make sure ~/.bos/conf/config.toml exists.".to_string(),
             );
         }
-        let result = loader
-            .load()
-            .await
-            .map_err(|e| e.to_string())
-            .cloned()
-            .map(|v| v.clone());
+        let result = loader.load().await.map_err(|e| e.to_string()).cloned();
 
         self.config = result?;
 

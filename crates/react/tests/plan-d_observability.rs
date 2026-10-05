@@ -36,12 +36,10 @@ fn make_text_response(content: String, is_final: bool) -> LlmResponse {
     })
 }
 
-#[allow(dead_code)]
 struct MockLlm {
     responses: Arc<Mutex<Vec<String>>>,
 }
 
-#[allow(dead_code)]
 impl MockLlm {
     fn new(responses: Vec<String>) -> Self {
         Self {
@@ -83,5 +81,27 @@ impl LlmClient<LlmSession, LlmContext> for MockLlm {
     }
     fn provider_name(&self) -> &'static str {
         "mock"
+    }
+}
+
+#[tokio::test]
+async fn mock_llm_complete_returns_scripted_response() {
+    let mock = MockLlm::new(vec!["Final Answer: 42".to_string()]);
+    let response = mock
+        .complete(
+            None,
+            LlmRequest::new("test-model"),
+            &mut LlmSession::new(),
+            &mut LlmContext::default(),
+        )
+        .await
+        .expect("mock completion should succeed");
+
+    match response {
+        LlmResponse::OpenAI(chat) => {
+            assert_eq!(chat.choices[0].finish_reason.as_deref(), Some("stop"));
+            assert_eq!(chat.choices[0].message.content.as_deref(), Some("Final Answer: 42"));
+        }
+        _ => panic!("expected an OpenAI response"),
     }
 }

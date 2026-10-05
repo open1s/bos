@@ -64,8 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let nvidia_cfg = VendorConfig::from_nvidia(&config).ok_or("no llm.nvidia config")?;
 
-    let mut config = AgentConfig::default();
-    config.model = nvidia_cfg.model.clone();
+    let config = AgentConfig {
+        model: nvidia_cfg.model.clone(),
+        ..Default::default()
+    };
 
     let llm = Arc::new(provider);
     let agent = Agent::new(config, llm.clone());
@@ -110,10 +112,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The Responses API (`/v1/responses`) sends `reasoning: {effort}` nested
     // in the request body. Registering a tool lets the model delegate work to
     // local functions during `react()`.
-    let mut responses_config = AgentConfig::default();
-    responses_config.model = nvidia_cfg.model.clone();
-    responses_config.api_mode = "responses".to_string();
-    responses_config.reasoning_effort = Some("high".to_string());
+    let responses_config = AgentConfig {
+        model: nvidia_cfg.model.clone(),
+        api_mode: "responses".to_string(),
+        reasoning_effort: Some("high".to_string()),
+        ..Default::default()
+    };
 
     let mut responses_agent = Agent::new(responses_config, llm);
     responses_agent.add_tool(Arc::new(FunctionTool::new(
@@ -133,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(serde_json::json!({"sum": a + b}))
         },
     )));
-    println!("api_mode={} reasoning_effort={:?}", "responses", "high");
+    println!("api_mode=responses reasoning_effort=high");
     match responses_agent.react("What is 3 + 4?").await {
         Ok(response) => println!("Response: {}\n", response),
         Err(e) => println!("Error: {}\n", e),

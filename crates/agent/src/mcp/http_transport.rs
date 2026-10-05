@@ -52,7 +52,7 @@ impl HttpTransport {
         .await
         .map_err(|e| HttpTransportError::Http(format!("Join error: {e}")))?;
 
-        let response = response.map_err(|e| HttpTransportError::Http(e))?;
+        let response = response.map_err(HttpTransportError::Http)?;
 
         let status = response.status().as_u16();
         let session_id_header = response

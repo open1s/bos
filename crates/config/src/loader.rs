@@ -615,14 +615,8 @@ y = 1"#,
         let sources = loader.sources();
 
         for src in sources {
-            match src {
-                ConfigSource::Directory(dir) => {
-                    assert!(
-                        Path::new(dir).exists(),
-                        "discover should only add existing dirs"
-                    );
-                }
-                _ => {}
+            if let ConfigSource::Directory(dir) = src {
+                assert!(Path::new(dir).exists(), "discover should only add existing dirs");
             }
         }
     }

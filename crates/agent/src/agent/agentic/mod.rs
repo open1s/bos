@@ -300,7 +300,7 @@ impl Agent {
     }
 
     pub fn last_token_usage(&self) -> Option<(u64, u64)> {
-        self.last_stream_tokens.lock().unwrap().clone()
+        *self.last_stream_tokens.lock().unwrap()
     }
 
     pub fn last_stream_tool_calls(&self) -> u64 {
@@ -397,12 +397,9 @@ impl Agent {
             cache.take()
         };
 
-        match cached_engine {
-            Some(mut e) => {
-                e.stop();
-            }
-            None => {}
-        };
+        if let Some(mut e) = cached_engine {
+            e.stop();
+        }
     }
 
     /// Mark a tool name as an MCP-registered tool.

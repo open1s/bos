@@ -111,7 +111,7 @@ impl Tool for BashTool {
             success: output.status.success(),
         };
 
-        Ok(serde_json::to_value(result).map_err(|e| ToolError::Failed(e.to_string()))?)
+        serde_json::to_value(result).map_err(|e| ToolError::Failed(e.to_string()))
     }
 }
 

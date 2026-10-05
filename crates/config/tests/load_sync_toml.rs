@@ -2,7 +2,6 @@
 use std::fs;
 
 use config::loader::ConfigLoader;
-use tempfile;
 
 #[test]
 fn test_load_sync_toml() {

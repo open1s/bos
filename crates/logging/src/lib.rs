@@ -24,7 +24,7 @@ pub fn short_format(
         record.module_path().unwrap_or(""),
         short_file,
         record.line().unwrap_or(0),
-        &record.args()
+        record.args()
     )
 }
 
@@ -64,7 +64,7 @@ pub fn auto_init_tracing() {
         }
     };
 
-    if let Err(_) = std::fs::create_dir_all(&logdir) {
+    if std::fs::create_dir_all(&logdir).is_err() {
         return;
     }
 

@@ -47,7 +47,7 @@ fn build_tools_from_context(context: &impl ReactContext) -> Vec<serde_json::Valu
         .tools()
         .map(|tools| {
             tools
-                .into_iter()
+                .iter()
                 .map(|t| {
                     serde_json::json!({
                         "type": "function",

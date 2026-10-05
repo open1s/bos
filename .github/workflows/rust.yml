@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   test:
-    name: Test the core workspace
+    name: Test and lint the core workspace
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -29,6 +29,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Lint
+        run: cargo clippy --workspace --exclude jsbos --exclude nbos --all-targets -- -D warnings
 
       # The binding crates are exercised by the jsbos/nbos pipelines; this job
       # covers the pure-Rust framework so a regression there is never silent.

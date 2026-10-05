@@ -260,8 +260,12 @@ impl PluginRegistry {
         self.plugin_count.load(Ordering::Acquire)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn has_plugins(&self) -> bool {
-        self.len() > 0
+        !self.is_empty()
     }
 
     pub fn clear(&self) {

@@ -4,7 +4,17 @@ use reqwest::Client;
 use serde_json::json;
 use std::time::Duration;
 
-fn start_server(port: u16) -> std::process::Child {
+/// Reaps the spawned MCP server when it goes out of scope, on every path.
+struct ServerGuard(std::process::Child);
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start_server(port: u16) -> ServerGuard {
     let cargo_manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let examples_path = std::path::Path::new(&cargo_manifest_dir)
         .parent()
@@ -13,9 +23,9 @@ fn start_server(port: u16) -> std::process::Child {
         .unwrap()
         .join("crates/examples");
 
-    std::process::Command::new("python3")
+    let child = std::process::Command::new("python3")
         .current_dir(examples_path.as_os_str())
-        .args(&[
+        .args([
             "-c",
             &format!(
                 r#"
@@ -28,13 +38,14 @@ run_server({})
             ),
         ])
         .spawn()
-        .unwrap()
+        .unwrap();
+    ServerGuard(child)
 }
 
 #[tokio::test]
 async fn test_http_mcp_with_ureq() {
     // Use ureq - a simpler synchronous HTTP/1.1 client
-    let mut server = start_server(8783);
+    let _server = start_server(8783);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let base_url = "http://127.0.0.1:8783/mcp";
@@ -121,13 +132,12 @@ async fn test_http_mcp_with_ureq() {
         "Response should contain 'BrainOS'"
     );
 
-    server.kill().ok();
     println!("\n✅ ureq tests passed!");
 }
 
 #[tokio::test]
 async fn test_http_mcp_with_reqwest_no_proxy() {
-    let mut server = start_server(8784);
+    let _server = start_server(8784);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let base_url = "http://127.0.0.1:8784/mcp";
@@ -212,13 +222,12 @@ async fn test_http_mcp_with_reqwest_no_proxy() {
         "Response should contain 'BrainOS'"
     );
 
-    server.kill().ok();
     println!("\n✅ reqwest no_proxy tests passed!");
 }
 
 #[tokio::test]
 async fn test_http_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
-    let mut server = start_server(8781);
+    let _server = start_server(8781);
 
     // Wait for server to start
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -307,7 +316,6 @@ async fn test_http_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Cleanup
-    server.kill()?;
 
     println!("\n✅ All HTTP MCP tests passed!");
     Ok(())

@@ -47,7 +47,7 @@ mod rkyv_tests {
         let value = TestStruct {
             id: 123,
             name: "test".to_string(),
-            value: 3.14,
+            value: std::f64::consts::PI,
         };
 
         let bytes = backend.serialize(&value).expect("serialize struct");

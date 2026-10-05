@@ -143,10 +143,12 @@
 
     #[test]
     fn test_agent_new_with_custom_config() {
-        let mut config = AgentConfig::default();
-        config.name = "test-agent".to_string();
-        config.model = "gpt-3.5-turbo".to_string();
-        config.max_steps = 5;
+        let config = AgentConfig {
+            name: "test-agent".to_string(),
+            model: "gpt-3.5-turbo".to_string(),
+            max_steps: 5,
+            ..Default::default()
+        };
 
         let provider = make_llm_provider();
         let agent = Agent::new(config, Arc::new(provider));

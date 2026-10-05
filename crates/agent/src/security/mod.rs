@@ -46,7 +46,7 @@ impl WorkspaceValidator {
     }
 
     fn normalize_path(path: &Path) -> Result<PathBuf, SecurityError> {
-        let canonical = fs::canonicalize(path).map_err(|e| SecurityError::Io(e))?;
+        let canonical = fs::canonicalize(path).map_err(SecurityError::Io)?;
         Ok(canonical)
     }
 
@@ -60,13 +60,11 @@ impl WorkspaceValidator {
             )));
         }
 
-        if !self.allow_symlinks {
-            if input_path.is_symlink() {
-                return Err(SecurityError::PathTraversal(format!(
-                    "Symlink detected: {}",
-                    path
-                )));
-            }
+        if !self.allow_symlinks && input_path.is_symlink() {
+            return Err(SecurityError::PathTraversal(format!(
+                "Symlink detected: {}",
+                path
+            )));
         }
 
         let expanded = if path.starts_with('~') {

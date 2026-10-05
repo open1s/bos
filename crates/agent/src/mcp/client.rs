@@ -189,7 +189,7 @@ impl McpClient {
     pub fn health_status(&self) -> McpHealthStatus {
         let state = self.state.lock().unwrap().clone();
         let initialized = self.is_initialized();
-        let last_ping = self.last_ping.lock().unwrap().clone();
+        let last_ping = *self.last_ping.lock().unwrap();
         let last_error = self.last_error.lock().unwrap().clone();
         let restart_count = self.restart_count.load(std::sync::atomic::Ordering::SeqCst);
 

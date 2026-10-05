@@ -19,7 +19,7 @@ pub enum SkillCategory {
 }
 
 impl SkillCategory {
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_name(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "code" => Self::Code,
             "analysis" => Self::Analysis,
@@ -176,7 +176,7 @@ impl SkillLoader {
         let category = frontmatter
             .get("category")
             .and_then(|v| v.as_str())
-            .map(SkillCategory::from_str)
+            .map(SkillCategory::from_name)
             .unwrap_or(SkillCategory::Other);
 
         Some(SkillMetadata {
@@ -248,21 +248,16 @@ impl SkillInjector {
             return String::new();
         }
 
-        if self.compact {
-            let mut xml = String::from("<available_skills>\n");
-            for skill in skills {
+        let mut xml = String::from("<available_skills>\n");
+        for skill in skills {
+            if self.compact {
+                xml.push_str(&format!("- {}\n", skill.name));
+            } else {
                 xml.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
             }
-            xml.push_str("</available_skills>");
-            xml
-        } else {
-            let mut xml = String::from("<available_skills>\n");
-            for skill in skills {
-                xml.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
-            }
-            xml.push_str("</available_skills>");
-            xml
         }
+        xml.push_str("</available_skills>");
+        xml
     }
 }
 

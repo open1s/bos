@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = AgentConfig {
         name: "resilient-agent".to_string(),
-        model: model,
+        model,
         base_url: nvidia_cfg.base_url,
         api_key: nvidia_cfg.api_key,
         system_prompt: "You are a helpful assistant.".to_string(),
@@ -89,7 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             retry_backoff: Duration::from_secs(2),
             auto_wait: true,
         }),
-        ..Default::default()
     };
 
     println!("Agent config with resilience:");

@@ -20,7 +20,7 @@ fn test_serialize_large_array() {
 
 #[test]
 fn test_serialize_tuple() {
-    let value = (1u32, "hello".to_string(), 3.14f64);
+    let value = (1u32, "hello".to_string(), std::f64::consts::PI);
     let bytes = value.serialize().expect("tuple should serialize");
     let restored: (u32, String, f64) =
         <(u32, String, f64)>::deserialize(&bytes).expect("tuple should deserialize");
@@ -65,7 +65,7 @@ fn test_serialize_btreeset() {
         BTreeSet::deserialize(&bytes).expect("BTreeSet should deserialize");
 
     assert_eq!(restored.len(), 3);
-    assert!(restored.contains(&"a".to_string()));
+    assert!(restored.contains("a"));
 }
 
 #[test]
@@ -174,7 +174,8 @@ fn test_unit_type() {
     let value = ();
     let bytes = value.serialize().expect("unit should serialize");
     let restored: () = <()>::deserialize(&bytes).expect("unit should deserialize");
-    assert_eq!(restored, value);
+    // A zero-sized value always round-trips; the successful deserialize is the contract.
+    assert_eq!(std::mem::size_of_val(&restored), 0);
 }
 
 #[test]
@@ -229,7 +230,7 @@ fn test_generic_wrapper() {
 
 #[test]
 fn test_f32() {
-    let value: f32 = 3.14159;
+    let value: f32 = std::f32::consts::PI;
     let bytes = value.serialize().expect("f32 should serialize");
     let restored: f32 = f32::deserialize(&bytes).expect("f32 should deserialize");
     assert!((restored - value).abs() < f32::EPSILON);

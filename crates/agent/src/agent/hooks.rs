@@ -120,10 +120,13 @@ pub trait AgentHook: Send + Sync + 'static {
 /// Re-exports react::runtime::HookDecision for unified type across the codebase.
 pub use react::runtime::HookDecision;
 
+/// Hooks registered per event.
+type HookMap = HashMap<HookEvent, Vec<Arc<dyn AgentHook>>>;
+
 /// Registry for managing hooks
 #[derive(Default, Clone)]
 pub struct HookRegistry {
-    hooks: Arc<Mutex<HashMap<HookEvent, Vec<Arc<dyn AgentHook>>>>>,
+    hooks: Arc<Mutex<HookMap>>,
     bus_enabled: Arc<AtomicBool>,
     bus_publishers: Arc<Mutex<HashMap<HookEvent, Publisher>>>,
 }
@@ -137,7 +140,7 @@ impl HookRegistry {
     /// Register a hook for an event
     pub fn register(&self, event: HookEvent, hook: Arc<dyn AgentHook>) {
         let mut hooks = self.hooks.lock().unwrap();
-        hooks.entry(event).or_insert_with(Vec::new).push(hook);
+        hooks.entry(event).or_default().push(hook);
     }
 
     /// Get all hooks registered for an event
@@ -296,7 +299,7 @@ impl ReActApp for HookRegistry {
         let mut ctx = HookContext::new("");
         ctx.set("response_type", "stream");
         ctx.set("response_text", response_text);
-        ctx.set("had_tool_call", &had_tool_call.to_string());
+        ctx.set("had_tool_call", had_tool_call.to_string());
         let _ = self.trigger(HookEvent::AfterLlmCall, ctx).await;
     }
 
@@ -332,7 +335,7 @@ impl ReActApp for HookRegistry {
         ctx.set("call_id", call_id);
         ctx.set(
             "tool_result",
-            &result.as_ref().map(|v| v.to_string()).unwrap_or_default(),
+            result.as_ref().map(|v| v.to_string()).unwrap_or_default(),
         );
         match self.trigger(HookEvent::AfterToolCall, ctx).await {
             HookDecision::Continue => HookDecision::Continue,

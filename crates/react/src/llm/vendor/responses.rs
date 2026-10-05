@@ -829,7 +829,7 @@ impl ResponsesTransport {
                         match event {
                             ResponsesStreamEvent::OutputTextDelta { delta, .. } => {
                                 if !delta.is_empty() {
-                                    on_chunk.as_ref().map(|cb| cb(&delta));
+                                    on_chunk.as_ref().inspect(|cb| cb(&delta));
                                     let _ = tx.send(Ok(StreamToken::Text(delta))).await;
                                 }
                             }
@@ -858,7 +858,7 @@ impl ResponsesTransport {
                                 if let Some((name, args_val, id)) =
                                     func_calls.done(&item_id, Some(arguments))
                                 {
-                                    on_chunk.as_ref().map(|cb| cb(&name));
+                                    on_chunk.as_ref().inspect(|cb| cb(&name));
                                     let _ = tx
                                         .send(Ok(StreamToken::ToolCall {
                                             name,

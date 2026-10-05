@@ -26,10 +26,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     provider.register_vendor("deepseek".into(), Box::new(vendor));
     let llm = Arc::new(provider);
 
-    let mut config = AgentConfig::default();
-    config.model = model.clone();
-    config.api_mode = "responses".to_string();
-    config.reasoning_effort = Some("high".to_string());
+    let config = AgentConfig {
+        model: model.clone(),
+        api_mode: "responses".to_string(),
+        reasoning_effort: Some("high".to_string()),
+        ..Default::default()
+    };
 
     let mut agent = Agent::new(config, llm.clone());
     agent.add_tool(Arc::new(FunctionTool::new(

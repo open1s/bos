@@ -173,6 +173,12 @@ pub struct AtomicTokenUsage {
     pub total_tokens: AtomicU32,
 }
 
+impl Default for AtomicTokenUsage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AtomicTokenUsage {
     pub fn new() -> Self {
         Self {

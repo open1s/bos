@@ -125,7 +125,7 @@ mod tests {
         let mut section = Section::default();
         let result = section.init();
 
-        let _config = match result.await {
+        match result.await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Skipping test (no config): {}", e);

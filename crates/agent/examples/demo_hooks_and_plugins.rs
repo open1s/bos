@@ -157,9 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nvidia_cfg = VendorConfig::from_nvidia(&config).ok_or("no llm.nvidia config")?;
 
     // Create agent config
-    let mut agent_config = AgentConfig::default();
-    agent_config.model = nvidia_cfg.model;
-    agent_config.timeout_secs = 120;
+    let agent_config = AgentConfig {
+        model: nvidia_cfg.model,
+        timeout_secs: 120,
+        ..Default::default()
+    };
 
     // Create agent
     let agent = Agent::new(agent_config, Arc::new(provider));

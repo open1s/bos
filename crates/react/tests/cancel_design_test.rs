@@ -70,15 +70,14 @@ struct CapturingTool {
     cancelable: bool,
 }
 
+type CapturingToolParts = (
+    CapturingTool,
+    Arc<DashMap<String, Value>>,
+    Arc<DashMap<String, usize>>,
+);
+
 impl CapturingTool {
-    fn new(
-        name: &str,
-        cancelable: bool,
-    ) -> (
-        Self,
-        Arc<DashMap<String, Value>>,
-        Arc<DashMap<String, usize>>,
-    ) {
+    fn new(name: &str, cancelable: bool) -> CapturingToolParts {
         let received_args = Arc::new(DashMap::new());
         let received_cancel_calls = Arc::new(DashMap::new());
         (
@@ -197,7 +196,7 @@ async fn tool_cancel_invokes_cancel_callback() {
         (Box::new(t) as Box<dyn AsyncTool>, c)
     };
 
-    assert_eq!(tool.is_cancelable(), true, "tool should be cancelable",);
+    assert!(tool.is_cancelable(), "tool should be cancelable");
 
     let count_before = cancel_calls
         .get("call-XYZ")

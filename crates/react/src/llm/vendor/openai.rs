@@ -496,7 +496,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                 for choice in chat.choices {
                                     if let Some(content) = &choice.delta.reasoning_content {
                                         if !content.is_empty() {
-                                            on_chunk.as_ref().map(|cb| cb(content));
+                                            on_chunk.as_ref().inspect(|cb| cb(content));
                                             let _ = tx
                                                 .send(Ok(StreamToken::ReasoningContent(
                                                     content.clone(),
@@ -506,7 +506,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                     }
                                     if let Some(content) = &choice.delta.content {
                                         if !content.is_empty() {
-                                            on_chunk.as_ref().map(|cb| cb(content));
+                                            on_chunk.as_ref().inspect(|cb| cb(content));
                                             let _ = tx
                                                 .send(Ok(StreamToken::Text(content.clone())))
                                                 .await;
@@ -530,7 +530,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                             if let Some((n, args_val, id)) =
                                                 acc.push_delta(index, id, name, &args_delta)
                                             {
-                                                on_chunk.as_ref().map(|cb| cb(&n));
+                                                on_chunk.as_ref().inspect(|cb| cb(&n));
                                                 let _ = tx
                                                     .send(Ok(StreamToken::ToolCall {
                                                         name: n,
@@ -753,7 +753,7 @@ mod tests {
         let mut section = Section::default();
         let result = section.init();
 
-        let _config = match result.await {
+        match result.await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Skipping test (no config): {}", e);

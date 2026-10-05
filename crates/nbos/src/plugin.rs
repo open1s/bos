@@ -88,8 +88,8 @@ impl From<PyLlmRequestWrapper> for InnerLlmRequest {
             reasoning_effort: py_req
                 .reasoning_effort
                 .as_deref()
-                .map(react::llm::ReasoningEffort::from_str),
-            api_mode: react::llm::ApiMode::from_str(&py_req.api_mode),
+                .map(react::llm::ReasoningEffort::from_name),
+            api_mode: react::llm::ApiMode::from_name(&py_req.api_mode),
             metadata: Default::default(),
         }
     }
@@ -389,8 +389,8 @@ impl InnerPlugin for PythonPlugin {
                         reasoning_effort: wrapped
                             .reasoning_effort
                             .as_deref()
-                            .map(react::llm::ReasoningEffort::from_str),
-                        api_mode: react::llm::ApiMode::from_str(&wrapped.api_mode),
+                            .map(react::llm::ReasoningEffort::from_name),
+                        api_mode: react::llm::ApiMode::from_name(&wrapped.api_mode),
                         metadata: request.metadata.clone(),
                     }
                 })

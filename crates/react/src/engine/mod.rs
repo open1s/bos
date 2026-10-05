@@ -571,7 +571,7 @@ impl<A: ReActApp> ReActEngine<A> {
                 let llm_stream = match self.call_llm_stream(persona.clone(),request.clone(), session, context).await {
                     Ok(s) => s,
                     Err(e) => {
-                        yield Err(ReactError::from(e));
+                        yield Err(e);
                         break;
                     }
                 };
@@ -744,7 +744,7 @@ impl<A: ReActApp> ReActEngine<A> {
     }
 
     pub fn get_stop_flag(&self) -> Arc<AtomicBool> {
-        return self.stop_flag.clone();
+        self.stop_flag.clone()
     }
 
     pub fn set_stop_flag(&mut self, flag: bool) {
