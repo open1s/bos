@@ -1,3 +1,4 @@
+/// Render a JSON schema as a short human-readable description.
 pub fn describe_schema(schema: &serde_json::Value) -> String {
     match schema.get("type").and_then(|t| t.as_str()) {
         Some("object") => describe_object(schema),

@@ -33,6 +33,7 @@ impl FunctionTool {
         }
     }
 
+    /// Create a tool marked as a skill, with category `skill`.
     pub fn skill<F>(name: &str, description: &str, schema: serde_json::Value, func: F) -> Self
     where
         F: Fn(&serde_json::Value) -> Result<serde_json::Value, ToolError> + Send + Sync + 'static,
@@ -47,6 +48,7 @@ impl FunctionTool {
         }
     }
 
+    /// Override the tool category.
     pub fn with_category(mut self, category: &str) -> Self {
         self.category = category.to_string();
         self

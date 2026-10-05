@@ -15,6 +15,7 @@ pub mod security;
 pub mod session;
 #[warn(missing_docs)]
 pub mod skills;
+#[warn(missing_docs)]
 pub mod tools;
 
 pub use prelude::*;

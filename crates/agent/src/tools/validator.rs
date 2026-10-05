@@ -1,5 +1,6 @@
 use crate::error::ToolError;
 
+/// Validate `args` against `schema`, returning the first mismatch.
 pub fn validate_args(
     schema: &serde_json::Value,
     args: &serde_json::Value,

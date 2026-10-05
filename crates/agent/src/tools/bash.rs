@@ -3,12 +3,18 @@ use react::tool::{Tool, ToolError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Configuration for [`BashTool`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BashToolConfig {
+    /// Workspace root; when set, commands are validated against it.
     pub workspace_root: Option<String>,
+    /// Optional allowlist of command names.
     pub allowed_commands: Option<Vec<String>>,
+    /// Optional denylist of command names.
     pub denied_commands: Option<Vec<String>>,
+    /// Command timeout in seconds.
     pub timeout_secs: u64,
+    /// Whether shell metacharacters are permitted.
     pub allow_shell_injection: bool,
 }
 
@@ -24,6 +30,7 @@ impl Default for BashToolConfig {
     }
 }
 
+/// A [`Tool`] that runs shell commands via `sh -c`.
 pub struct BashTool {
     name: String,
     config: BashToolConfig,
@@ -31,6 +38,7 @@ pub struct BashTool {
 }
 
 impl BashTool {
+    /// Create a bash tool with the default configuration.
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -39,6 +47,7 @@ impl BashTool {
         }
     }
 
+    /// Replace the configuration; a workspace root also installs a validator.
     pub fn with_config(mut self, config: BashToolConfig) -> Self {
         if let Some(ref root) = config.workspace_root {
             self.validator = Some(WorkspaceValidator::new(std::path::PathBuf::from(root)));
@@ -47,6 +56,7 @@ impl BashTool {
         self
     }
 
+    /// Restrict the tool to `workspace_root`.
     pub fn with_workspace(mut self, workspace_root: &str) -> Self {
         self.validator = Some(WorkspaceValidator::new(std::path::PathBuf::from(
             workspace_root,
@@ -56,11 +66,16 @@ impl BashTool {
     }
 }
 
+/// Captured output of one bash command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BashExecutionResult {
+    /// Captured standard output.
     pub stdout: String,
+    /// Captured standard error.
     pub stderr: String,
+    /// Process exit code, or -1 when killed by a signal.
     pub exit_code: i32,
+    /// Whether the process exited successfully.
     pub success: bool,
 }
 
