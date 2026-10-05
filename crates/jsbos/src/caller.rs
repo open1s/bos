@@ -66,8 +66,7 @@ impl Caller {
 #[napi]
 pub struct Callable {
   inner: Arc<tokio::sync::Mutex<Option<bus::Callable<String, String>>>>,
-  pub(crate) handler:
-    Arc<std::sync::Mutex<Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>>>>>>,
+  pub(crate) handler: crate::StringHandlerSlot,
   is_started: Arc<std::sync::atomic::AtomicBool>,
 }
 

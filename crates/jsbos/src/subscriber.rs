@@ -100,16 +100,13 @@ impl Subscriber {
             .await
         };
 
-        match message {
-          Some(msg) => {
-            let tsfn_clone = Arc::clone(&tsfn);
-            tsfn_clone.call_with_return_value(
-              Ok(JSAny(serde_json::Value::String(msg))),
-              ThreadsafeFunctionCallMode::NonBlocking,
-              |_result, _env| Ok(()),
-            );
-          }
-          None => {}
+        if let Some(msg) = message {
+          let tsfn_clone = Arc::clone(&tsfn);
+          tsfn_clone.call_with_return_value(
+            Ok(JSAny(serde_json::Value::String(msg))),
+            ThreadsafeFunctionCallMode::NonBlocking,
+            |_result, _env| Ok(()),
+          );
         }
       }
       running.store(false, Ordering::SeqCst);
@@ -144,18 +141,15 @@ impl Subscriber {
             .await
         };
 
-        match message {
-          Some(msg) => {
-            let value: serde_json::Value =
-              serde_json::from_str(&msg).unwrap_or(serde_json::Value::String(msg));
-            let tsfn_clone = Arc::clone(&tsfn);
-            tsfn_clone.call_with_return_value(
-              Ok(JSAny(value)),
-              ThreadsafeFunctionCallMode::NonBlocking,
-              |_result, _env| Ok(()),
-            );
-          }
-          None => {}
+        if let Some(msg) = message {
+          let value: serde_json::Value =
+            serde_json::from_str(&msg).unwrap_or(serde_json::Value::String(msg));
+          let tsfn_clone = Arc::clone(&tsfn);
+          tsfn_clone.call_with_return_value(
+            Ok(JSAny(value)),
+            ThreadsafeFunctionCallMode::NonBlocking,
+            |_result, _env| Ok(()),
+          );
         }
       }
       running.store(false, Ordering::SeqCst);

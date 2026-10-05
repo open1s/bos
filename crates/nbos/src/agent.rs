@@ -36,8 +36,7 @@ fn json_to_content(json: &serde_json::Value) -> Content {
             }
         }
         serde_json::Value::Object(obj) => {
-            if let Some(part) = serde_json::from_value(serde_json::Value::Object(obj.clone())).ok()
-            {
+            if let Ok(part) = serde_json::from_value(serde_json::Value::Object(obj.clone())) {
                 Content::Parts(vec![part])
             } else {
                 Content::Text(json.to_string())
@@ -861,7 +860,7 @@ impl PyAgent {
                 async move { Ok(String::new()) },
             );
         }
-        let task_content = py_value_to_content(&task.bind(py))?;
+        let task_content = py_value_to_content(task.bind(py))?;
         let agent = {
             let guard = self
                 .inner
@@ -895,7 +894,7 @@ impl PyAgent {
                 async move { Ok(String::new()) },
             );
         }
-        let task_content = py_value_to_content(&task.bind(py))?;
+        let task_content = py_value_to_content(task.bind(py))?;
         let agent = {
             let guard = self
                 .inner
@@ -962,7 +961,7 @@ impl PyAgent {
                 },
             );
         }
-        let task_content = py_value_to_content(&task.bind(py))?;
+        let task_content = py_value_to_content(task.bind(py))?;
         let agent = self.inner.clone();
         self.is_running.store(true, Ordering::SeqCst);
         let is_running = self.is_running.clone();

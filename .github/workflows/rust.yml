@@ -67,3 +67,41 @@ jobs:
       # quietly going stale. --locked also keeps Cargo.lock in sync.
       - name: Check the workspace at 1.88
         run: cargo check --workspace --exclude jsbos --exclude nbos --locked
+
+  bindings:
+    name: Lint the binding crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bindings-${{ hashFiles('Cargo.lock') }}
+
+      # The core job excludes the binding crates because building them needs
+      # Python and Node. That left their Rust glue never linted; cover it here.
+      - name: Lint
+        run: cargo clippy -p jsbos -p nbos --all-targets -- -D warnings
+
+      # nbos is a pyo3 extension with no Rust unit tests; jsbos carries the two
+      # async-tool tests below it.
+      - name: Test
+        run: cargo test -p jsbos

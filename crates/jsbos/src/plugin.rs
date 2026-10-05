@@ -30,13 +30,7 @@ fn json_to_content(json: &serde_json::Value) -> Content {
     serde_json::Value::Array(arr) => {
       let parts: Vec<react::llm::ContentPart> = arr
         .iter()
-        .filter_map(|v| {
-          if let Ok(part) = serde_json::from_value(v.clone()) {
-            Some(part)
-          } else {
-            None
-          }
-        })
+        .filter_map(|v| serde_json::from_value(v.clone()).ok())
         .collect();
       Content::Parts(parts)
     }
@@ -60,7 +54,7 @@ pub struct PluginLlmRequest {
 impl From<PluginLlmRequest> for LlmRequestWrapper {
   fn from(req: PluginLlmRequest) -> Self {
     let json: serde_json::Value =
-      serde_json::from_str(&req.input).unwrap_or_else(|_| serde_json::Value::String(req.input));
+      serde_json::from_str(&req.input).unwrap_or(serde_json::Value::String(req.input));
     LlmRequestWrapper {
       model: req.model,
       input: json_to_content(&json),
@@ -630,6 +624,12 @@ impl AgentPlugin for JSPlugin {
 #[napi]
 pub struct PluginRegistry {
   inner: InnerPluginRegistry,
+}
+
+impl Default for PluginRegistry {
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 #[napi]

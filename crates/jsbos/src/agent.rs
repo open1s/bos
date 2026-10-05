@@ -539,6 +539,7 @@ impl Agent {
     Ok(self.is_running.load(Ordering::SeqCst))
   }
 
+  #[allow(clippy::too_many_arguments)] // positional JS arguments; a struct would change the JS API
   #[napi]
   pub async fn add_tool(
     &self,
@@ -558,7 +559,7 @@ impl Agent {
       schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
       cancelable,
       callback: callback.into(),
-      cancel_callback: cancel_callback.map(|c| Arc::new(c)),
+      cancel_callback: cancel_callback.map(Arc::new),
     };
     let mut guard = self.inner.lock().await;
     guard

@@ -36,13 +36,7 @@ fn json_to_content(json: &serde_json::Value) -> react::llm::Content {
         serde_json::Value::Array(arr) => {
             let parts: Vec<react::llm::ContentPart> = arr
                 .iter()
-                .filter_map(|v| {
-                    if let Ok(part) = serde_json::from_value(v.clone()) {
-                        Some(part)
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
                 .collect();
             react::llm::Content::Parts(parts)
         }
@@ -76,8 +70,8 @@ impl From<&InnerLlmRequest> for PyLlmRequestWrapper {
 
 impl From<PyLlmRequestWrapper> for InnerLlmRequest {
     fn from(py_req: PyLlmRequestWrapper) -> Self {
-        let json: serde_json::Value = serde_json::from_str(&py_req.input)
-            .unwrap_or_else(|_| serde_json::Value::String(py_req.input));
+        let json: serde_json::Value =
+            serde_json::from_str(&py_req.input).unwrap_or(serde_json::Value::String(py_req.input));
         InnerLlmRequest {
             model: py_req.model,
             input: json_to_content(&json),
@@ -371,7 +365,7 @@ impl InnerPlugin for PythonPlugin {
 
         call_plugin_callback(
             callback,
-            |py| Ok(PyLlmRequestWrapper::from(&request_clone).into_py_any(py)?),
+            |py| PyLlmRequestWrapper::from(&request_clone).into_py_any(py),
             |val| {
                 if val.is_none() {
                     return None;
@@ -405,7 +399,7 @@ impl InnerPlugin for PythonPlugin {
 
         call_plugin_callback(
             callback,
-            |py| Ok(PyLlmResponseWrapper::from(&response_clone).into_py_any(py)?),
+            |py| PyLlmResponseWrapper::from(&response_clone).into_py_any(py),
             |val| {
                 if val.is_none() {
                     return None;
@@ -422,7 +416,7 @@ impl InnerPlugin for PythonPlugin {
 
         call_plugin_callback(
             callback,
-            |py| Ok(PyToolCallWrapper::from(&tool_call_clone).into_py_any(py)?),
+            |py| PyToolCallWrapper::from(&tool_call_clone).into_py_any(py),
             |val| {
                 if val.is_none() {
                     return None;
@@ -439,7 +433,7 @@ impl InnerPlugin for PythonPlugin {
 
         call_plugin_callback(
             callback,
-            |py| Ok(PyToolResultWrapper::from(&tool_result_clone).into_py_any(py)?),
+            |py| PyToolResultWrapper::from(&tool_result_clone).into_py_any(py),
             |val| {
                 if val.is_none() {
                     return None;

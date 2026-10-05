@@ -130,6 +130,12 @@ pub struct HookRegistry {
   inner: InnerHookRegistry,
 }
 
+impl Default for HookRegistry {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 #[napi]
 impl HookRegistry {
   #[napi(constructor)]

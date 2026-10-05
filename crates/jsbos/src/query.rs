@@ -87,10 +87,8 @@ impl Query {
 #[napi]
 pub struct Queryable {
   pub(crate) inner: Arc<tokio::sync::Mutex<bus::QueryableWrapper<String, String>>>,
-  pub(crate) handler:
-    Arc<std::sync::Mutex<Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>>>>>>,
-  pub(crate) stream_handler:
-    Arc<std::sync::Mutex<Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>>>>>>,
+  pub(crate) handler: crate::StringHandlerSlot,
+  pub(crate) stream_handler: crate::StringHandlerSlot,
 }
 
 #[napi]
@@ -186,7 +184,9 @@ impl Queryable {
       .set_stream_handler(move |input: String, tx| {
         let tsfn_clone = Arc::clone(&tsfn);
         async move {
-          let _ = tx.send(call_string_handler(&tsfn_clone, input).map_err(bus::ZenohError::Query));
+          let _ = tx
+            .send(call_string_handler(&tsfn_clone, input).map_err(bus::ZenohError::Query))
+            .await;
         }
       })
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;

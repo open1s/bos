@@ -1,4 +1,11 @@
+use napi::threadsafe_function::ThreadsafeFunction;
+use napi::Unknown;
 use napi_derive::napi;
+use std::sync::{Arc, Mutex};
+
+/// A lock-protected slot holding an optional JavaScript string handler.
+pub(crate) type StringHandlerSlot =
+  Arc<Mutex<Option<Arc<ThreadsafeFunction<String, Unknown<'static>>>>>>;
 
 mod agent;
 mod bus;
