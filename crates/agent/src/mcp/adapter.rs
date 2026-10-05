@@ -6,6 +6,7 @@ use react::tool::{Tool, ToolError};
 
 use super::client::McpClient;
 
+/// Adapts a remote MCP tool to the local [`Tool`] trait.
 pub struct McpToolAdapter {
     client: Arc<McpClient>,
     registry_name: String,
@@ -15,6 +16,7 @@ pub struct McpToolAdapter {
 }
 
 impl McpToolAdapter {
+    /// Wrap `mcp_tool_name` from `client`, exposed locally as `registry_name`.
     pub fn new(
         client: Arc<McpClient>,
         registry_name: String,

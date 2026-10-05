@@ -5,6 +5,7 @@ pub mod agent;
 pub mod bus;
 #[warn(missing_docs)]
 pub mod error;
+#[warn(missing_docs)]
 pub mod mcp;
 #[warn(missing_docs)]
 pub mod metrics;

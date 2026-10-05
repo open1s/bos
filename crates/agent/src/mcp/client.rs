@@ -42,26 +42,39 @@ pub struct McpHealthStatus {
     pub idle_duration: Option<Duration>,
 }
 
+/// Errors raised by [`McpClient`].
 #[derive(Error, Debug)]
 pub enum McpError {
+    /// The stdio transport failed.
     #[error("Transport error: {0}")]
     Transport(#[from] super::transport::TransportError),
 
+    /// The HTTP transport failed.
     #[error("HTTP transport error: {0}")]
     HttpTransport(String),
 
+    /// The server sent a malformed message.
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// Serialization or deserialization failed.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// The server returned a JSON-RPC error.
     #[error("Server error: {code} {message}")]
-    Server { code: i32, message: String },
+    Server {
+        /// Numeric JSON-RPC error code.
+        code: i32,
+        /// Error message from the server.
+        message: String,
+    },
 
+    /// A method was called before `initialize`.
     #[error("Not initialized")]
     NotInitialized,
 
+    /// The `initialize` handshake failed.
     #[error("Initialization failed: {0}")]
     InitFailed(String),
 }
@@ -72,6 +85,7 @@ impl From<McpError> for crate::error::ToolError {
     }
 }
 
+/// A JSON-RPC client for one MCP server, over stdio or HTTP.
 pub struct McpClient {
     transport: Arc<Mutex<TransportBackend>>,
     request_id: std::sync::atomic::AtomicU64,
@@ -92,6 +106,7 @@ enum TransportBackend {
 }
 
 impl McpClient {
+    /// Spawn an MCP server process and connect over stdio.
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self, McpError> {
         let transport = StdioTransport::spawn(command, args).await?;
         Ok(Self {
@@ -107,6 +122,7 @@ impl McpClient {
         })
     }
 
+    /// Create a client that talks to `base_url` over HTTP.
     pub fn connect_http(base_url: impl Into<String>) -> Self {
         Self {
             transport: Arc::new(Mutex::new(TransportBackend::Http(HttpTransport::new(
@@ -123,6 +139,7 @@ impl McpClient {
         }
     }
 
+    /// Perform the MCP handshake and return the server capabilities.
     pub async fn initialize(&self) -> Result<ServerCapabilities, McpError> {
         if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(McpError::InitFailed("Already initialized".into()));
@@ -177,10 +194,12 @@ impl McpClient {
         Ok(caps)
     }
 
+    /// Whether the handshake has completed.
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether the client is initialized and usable.
     pub fn is_healthy(&self) -> bool {
         self.is_initialized()
     }
@@ -240,12 +259,14 @@ impl McpClient {
         }
     }
 
+    /// Record that the connection failed with `error`.
     pub fn mark_failed(&self, error: impl Into<String>) {
         let msg = error.into();
         *self.state.lock().unwrap() = ConnectionState::Failed(msg.clone());
         *self.last_error.lock().unwrap() = Some(msg);
     }
 
+    /// Ping the server, returning whether it responded.
     pub async fn health_check(&self) -> Result<bool, McpError> {
         if !self.is_initialized() {
             return Ok(false);
@@ -254,6 +275,7 @@ impl McpClient {
         Ok(resp.error.is_none())
     }
 
+    /// List the tools the server exposes.
     pub async fn list_tools(&self) -> Result<Vec<ToolDefinition>, McpError> {
         let resp = self.call("tools/list", None).await?;
 
@@ -277,6 +299,7 @@ impl McpClient {
         Ok(defs)
     }
 
+    /// Invoke a tool by name with JSON arguments.
     pub async fn call_tool(
         &self,
         name: &str,
@@ -306,6 +329,7 @@ impl McpClient {
         Self::parse_tool_call_result(result)
     }
 
+    /// List the resources the server exposes.
     pub async fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
         let resp = self.call("resources/list", None).await?;
 
@@ -328,6 +352,7 @@ impl McpClient {
         }
     }
 
+    /// Read one resource by URI.
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
         let resp = self
             .call(
@@ -355,6 +380,7 @@ impl McpClient {
         }
     }
 
+    /// List the prompts the server exposes, or an empty list on error.
     pub async fn list_prompts(&self) -> Vec<McpPrompt> {
         match self.call("prompts/list", None).await {
             Ok(resp) => {
@@ -375,6 +401,7 @@ impl McpClient {
         }
     }
 
+    /// The capabilities captured during initialization, if any.
     pub async fn get_capabilities(&self) -> Option<ServerCapabilities> {
         self.capabilities.lock().unwrap().clone()
     }

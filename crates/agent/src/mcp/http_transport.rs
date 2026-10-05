@@ -1,12 +1,17 @@
+/// Posts JSON-RPC messages to an MCP server over streamable HTTP.
 pub struct HttpTransport {
     base_url: String,
     session_id: std::sync::Mutex<Option<String>>,
 }
 
+/// Errors from the HTTP transport.
 #[derive(Debug, Clone)]
 pub enum HttpTransportError {
+    /// The request or response was invalid.
     Http(String),
+    /// The server could not be reached.
     Connect(String),
+    /// The MCP session could not be established or used.
     Session(String),
 }
 
@@ -23,6 +28,7 @@ impl std::fmt::Display for HttpTransportError {
 impl std::error::Error for HttpTransportError {}
 
 impl HttpTransport {
+    /// Create a transport for `base_url`, trimming any trailing slash.
     pub fn new(base_url: impl Into<String>) -> Self {
         let url = base_url.into().trim_end_matches('/').to_string();
         Self {
@@ -31,6 +37,7 @@ impl HttpTransport {
         }
     }
 
+    /// Post one JSON-RPC message and return the response body.
     pub async fn send(&self, msg: &serde_json::Value) -> Result<String, HttpTransportError> {
         let base_url = self.base_url.clone();
         let body =
@@ -99,14 +106,17 @@ impl HttpTransport {
         Ok(body_str)
     }
 
+    /// Override the MCP session id.
     pub fn set_session_id(&self, id: String) {
         *self.session_id.lock().unwrap() = Some(id);
     }
 
+    /// The current MCP session id, if any.
     pub fn session_id(&self) -> Option<String> {
         self.session_id.lock().unwrap().clone()
     }
 
+    /// Send `DELETE` to end the session and clear the stored id.
     pub async fn terminate_session(&self) -> Result<(), HttpTransportError> {
         let base_url = self.base_url.clone();
         let session_id = self.session_id.lock().unwrap().clone();

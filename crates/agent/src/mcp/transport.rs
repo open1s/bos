@@ -13,17 +13,23 @@ fn trim_newline_suffix(s: &mut String) {
     }
 }
 
+/// Talks to an MCP server over a child process stdio pipes.
 pub struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
+/// Errors from the stdio transport.
 #[derive(Debug, Clone)]
 pub enum TransportError {
+    /// Reading or writing a pipe failed.
     Io(String),
+    /// The server process could not be spawned.
     Process(String),
+    /// The child has no stdout pipe.
     NoStdout,
+    /// The child has no stdin pipe.
     NoStdin,
 }
 
@@ -47,6 +53,7 @@ impl From<TransportError> for AgentError {
 }
 
 impl StdioTransport {
+    /// Spawn `command` with `args` and connect to its stdio.
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self, TransportError> {
         let mut child = tokio::process::Command::new(command)
             .args(args)
@@ -66,6 +73,7 @@ impl StdioTransport {
         })
     }
 
+    /// Write one message followed by a newline.
     pub async fn send(&mut self, msg: &[u8]) -> Result<(), TransportError> {
         self.stdin
             .write_all(msg)
@@ -82,6 +90,7 @@ impl StdioTransport {
         Ok(())
     }
 
+    /// Read one newline-terminated line into `buffer`, capped at 16 MB.
     pub async fn recv_line(&mut self, buffer: &mut String) -> Result<(), TransportError> {
         buffer.clear();
         let bytes_read = self
@@ -99,6 +108,7 @@ impl StdioTransport {
         Ok(())
     }
 
+    /// Ensure `buffer` holds at least `min_capacity` bytes, then read a line.
     pub async fn recv_line_with_capacity(
         &mut self,
         buffer: &mut String,
@@ -110,11 +120,13 @@ impl StdioTransport {
         self.recv_line(buffer).await
     }
 
+    /// Kill the server process.
     pub async fn shutdown(mut self) -> Result<(), TransportError> {
         let _ = self.child.kill().await;
         Ok(())
     }
 
+    /// OS process id of the server, or 0 when unavailable.
     pub fn id(&self) -> u32 {
         self.child.id().unwrap_or(0)
     }
