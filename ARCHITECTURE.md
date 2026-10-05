@@ -61,23 +61,37 @@ BrainOS is structured as a modular, event-driven system with the following core 
 **Architecture** (actual tree):
 ```
 crates/react/src
-├── engine.rs            # ReAct loop + step orchestration
+├── engine/              # ReAct loop + step orchestration
+│   ├── mod.rs           # ReActEngine, react/react_stream, call-id helpers
+│   ├── builder.rs       # ReActEngineBuilder
+│   ├── llm_calls.rs     # call_llm / call_llm_stream / is_transient_error
+│   ├── tool_calls.rs    # call_tool
+│   ├── tool_run.rs      # ToolRunManager + ToolCallEvent
+│   ├── skill_cache.rs   # SkillCache + CachedSkill
+│   └── error.rs         # ReactError + BuilderError
 ├── llm/
 │   ├── client.rs        # LlmClient trait (complete / stream_complete)
 │   ├── response.rs      # LlmResponse, StreamToken, TokenStream
-│   ├── types.rs         # LlmRequest, Content, LlmMessage, ReactSession/Context
+│   ├── types.rs         # LlmRequest, Content, LlmMessage, ReactSession/Context, LlmError
 │   └── vendor/          # LLM provider adapters
 │       ├── openaicompatible.rs  # shared OpenAI wire types, SSE extractor, tool-call accumulator
-│       ├── openai.rs            # canonical OpenAI-compatible transport (+ Responses API)
+│       ├── openai.rs            # canonical OpenAI-compatible transport
 │       ├── deepseek.rs | nvidia.rs | openrouter.rs  # thin delegating vendors
 │       ├── responses.rs         # OpenAI Responses API transport
 │       └── router.rs            # LlmRouter: named-vendor dispatch
-├── tool/                # Tool / AsyncTool, registry, descriptor, error
+├── tool/                # Tool / AsyncTool, ToolRegistry, descriptor, ToolError
 ├── resilience/          # circuit breaker, rate limiter, retry
 ├── runtime/             # ReActApp lifecycle-hook seam (NoopApp)
 ├── telemetry/           # token counting + budget
 └── utils/               # streaming extractors (JSON / XML / mixed)
 ```
+
+> **Two tool registries, by layer — not a duplicated seam.**
+> `react::tool::ToolRegistry` is the engine-internal store (name → `ToolVariant`)
+> used for dispatch and cancellation. `agent::tools::registry::ToolRegistry` is
+> the user-facing registry (sync + async tools, JSON-schema cache, namespaces,
+> MCP marking). They live in different layers and have different interfaces on
+> purpose; `react::Tool` and `react::ToolError` are the shared seam both use.
 
 **Data Flow**:
 ```
@@ -116,19 +130,24 @@ Final Output
 ```
 crates/agent/src
 ├── agent/
-│   ├── agentic.rs      # Agent, LlmProvider, ReAct engine assembly
-│   ├── config.rs       # AgentConfig + TOML builder
+│   ├── agentic/        # Agent assembly
+│   │   ├── mod.rs      # Agent struct, config, session/metrics, MCP wiring
+│   │   ├── llm.rs      # LlmProvider + build_vendor
+│   │   ├── adapters.rs # ExtensibleToolAdapter (sync + async)
+│   │   ├── engine.rs   # prepare_context / build_react_engine / react / stream
+│   │   └── tests.rs
+│   ├── config.rs       # TOML agent config builder
 │   ├── context.rs      # AgentReactContext / AgentReActApp / AgentSession
 │   ├── hooks.rs        # AgentHook lifecycle seam
 │   └── plugin.rs       # AgentPlugin middleware seam
 ├── tools/              # ToolRegistry, FunctionTool, BashTool, validator, translator
-├── skills/             # SkillLoader, SkillMetadata, SkillInjector
+├── skills/             # SkillLoader, SkillMetadata
 ├── mcp/                # MCP client, protocol, stdio/HTTP transports
-├── bus/                # agent RPC: AgentRpcClient, AgentCallableServer, AgentCallerTool
+├── bus/                # agent RPC: wire / transport / client / server / tool
 ├── session/            # SessionManager
 ├── security/           # WorkspaceValidator
 ├── metrics.rs          # CallMetrics
-└── error.rs            # AgentError / LlmError / ToolError
+└── error.rs            # AgentError (re-exports react's LlmError + ToolError)
 ```
 
 **Design Patterns**:
