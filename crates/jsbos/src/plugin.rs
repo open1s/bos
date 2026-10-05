@@ -290,19 +290,20 @@ impl From<ToolResultWrapper> for PluginToolResult {
 
 pub(crate) struct JSPlugin {
   name: String,
-  on_llm_request_cb: Option<Arc<ThreadsafeFunction<JSAny>>>,
-  on_llm_response_cb: Option<Arc<ThreadsafeFunction<JSAny>>>,
-  on_tool_call_cb: Option<Arc<ThreadsafeFunction<JSAny>>>,
-  on_tool_result_cb: Option<Arc<ThreadsafeFunction<JSAny>>>,
+  // Weak so a registered plugin does not pin the Node event loop after the run.
+  on_llm_request_cb: Option<Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>>,
+  on_llm_response_cb: Option<Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>>,
+  on_tool_call_cb: Option<Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>>,
+  on_tool_result_cb: Option<Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>>,
 }
 
 impl JSPlugin {
   pub fn new(
     name: String,
-    on_llm_request: Option<ThreadsafeFunction<JSAny>>,
-    on_llm_response: Option<ThreadsafeFunction<JSAny>>,
-    on_tool_call: Option<ThreadsafeFunction<JSAny>>,
-    on_tool_result: Option<ThreadsafeFunction<JSAny>>,
+    on_llm_request: Option<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
+    on_llm_response: Option<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
+    on_tool_call: Option<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
+    on_tool_result: Option<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
   ) -> Self {
     Self {
       name,
@@ -314,7 +315,7 @@ impl JSPlugin {
   }
 
   async fn call_js_callback(
-    callback: &Arc<ThreadsafeFunction<JSAny>>,
+    callback: &Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
     input: serde_json::Value,
   ) -> Option<serde_json::Value> {
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<serde_json::Value>>();

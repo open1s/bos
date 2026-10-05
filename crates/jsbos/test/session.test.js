@@ -2,7 +2,7 @@ import test from 'ava'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rmSync } from 'node:fs'
-import { BrainOS, ToolDef } from '../index.js'
+import { BrainOS, ToolDef, HookEvent } from '../index.js'
 
 async function startAgent(t) {
   const brain = new BrainOS()
@@ -84,4 +84,26 @@ test.serial('toolNames lists registered tools', async (t) => {
   const agent = await brain.agent('tools-test').register(addTool).start()
   t.deepEqual(agent.toolNames, ['add'])
   t.deepEqual(agent.session.context, null)
+})
+
+// A registered callback must not pin the Node event loop: if it did, ava would
+// fail to exit after the suite. These two tests would hang the process.
+test.serial('registering a plugin does not pin the event loop', async (t) => {
+  const brain = new BrainOS()
+  await brain.start()
+  t.teardown(() => brain.stop())
+  const agent = await brain.agent('plugin-exit-test')
+    .plugin('noop', { on_llm_request: (d) => d })
+    .start()
+  t.is(agent.config.name, 'plugin-exit-test')
+})
+
+test.serial('registering a hook does not pin the event loop', async (t) => {
+  const brain = new BrainOS()
+  await brain.start()
+  t.teardown(() => brain.stop())
+  const agent = await brain.agent('hook-exit-test')
+    .hook(HookEvent.BeforeToolCall, () => 'continue')
+    .start()
+  t.is(agent.config.name, 'hook-exit-test')
 })
