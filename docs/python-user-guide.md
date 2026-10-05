@@ -346,29 +346,29 @@ from nbos import BusManager
 
 async with BusManager() as bus:
     # Publish
-    await bus.publish_text("my/topic", "hello")
-    await bus.publish_json("my/topic", {"data": 123})
+    await bus.publish("my/topic", "hello")
+    await bus.publish("my/topic", {"data": 123}, is_json=True)
 
     # Create publisher
-    pub = await bus.create_publisher("output/topic")
+    pub = await bus.publisher("output/topic")
     await pub.publish_text("message")
 
     # Create subscriber
-    sub = await bus.create_subscriber("input/topic")
+    sub = await bus.subscriber("input/topic")
     msg = await sub.recv()
 ```
 
 ### Subscriber Patterns
 
 ```python
-sub = await bus.create_subscriber("my/topic")
+sub = await bus.subscriber("my/topic")
 
 # One-shot receive
 msg = await sub.recv()
-msg = await sub.recv_with_timeout_ms(5000)
+msg = await sub.recv(5000)          # with timeout
 
 # Get JSON
-data = await sub.recv_json_with_timeout_ms(5000)
+data = await sub.recv_json(5000)
 
 # Callback loop
 await sub.run(lambda msg: print(f"Received: {msg}"))
@@ -391,7 +391,7 @@ def upper_handler(text: str) -> str:
     return text.upper()
 
 async with BusManager() as bus:
-    q = await bus.create_queryable("svc/upper", upper_handler)
+    q = await bus.queryable("svc/upper", upper_handler)
     await q.start()
 ```
 
@@ -399,9 +399,9 @@ async with BusManager() as bus:
 
 ```python
 async with BusManager() as bus:
-    query = await bus.create_query("svc/upper")
-    result = await query.query_text("hello")  # "HELLO"
-    result = await query.query_text_timeout_ms("hello", 5000)  # with timeout
+    query = await bus.query("svc/upper")
+    result = await query.ask("hello")  # "HELLO"
+    result = await query.ask("hello", 5000)  # with timeout
 ```
 
 ### Query API
@@ -414,14 +414,15 @@ async with BusManager() as bus:
 **Methods:**
 | Method | Description |
 |--------|-------------|
-| `query_text(payload)` | Send text query |
-| `query_text_timeout_ms(payload, ms)` | Send with timeout |
+| `ask(payload, timeout_ms=None)` | Send text query |
+| `ask_json(payload, timeout_ms=None)` | Send JSON and decode the response |
 
 ### Queryable API
 
 **Methods:**
 | Method | Description |
 |--------|-------------|
+| `handle(handler)` | Register the handler (applied on `start`) |
 | `start()` | Start server |
 | `run(handler)` | Run with handler |
 | `run_json(handler)` | Run JSON handler |
@@ -439,7 +440,7 @@ def echo_handler(text: str) -> str:
     return f"echo: {text}"
 
 async with BusManager() as bus:
-    srv = await bus.create_callable("svc/echo", echo_handler)
+    srv = await bus.callable("svc/echo", echo_handler)
     await srv.start()
 ```
 
@@ -447,8 +448,8 @@ async with BusManager() as bus:
 
 ```python
 async with BusManager() as bus:
-    caller = await bus.create_caller("svc/echo")
-    result = await caller.call_text("ping")  # "echo: ping"
+    caller = await bus.caller("svc/echo")
+    result = await caller.call("ping")  # "echo: ping"
 ```
 
 ### Caller API
@@ -456,7 +457,8 @@ async with BusManager() as bus:
 **Methods:**
 | Method | Description |
 |--------|-------------|
-| `call_text(payload)` | Call remote service |
+| `call(payload)` | Call remote service |
+| `call_json(payload)` | Send JSON and decode the response |
 
 ### Callable API
 
@@ -468,6 +470,7 @@ async with BusManager() as bus:
 **Methods:**
 | Method | Description |
 |--------|-------------|
+| `handle(handler)` | Register the handler (applied on `start`) |
 | `start()` | Start server |
 | `run(handler)` | Run with handler |
 | `run_json(handler)` | Run JSON handler |
@@ -498,10 +501,11 @@ from nbos import Config
 
 config = Config() \
     .discover() \
-    .add_file("/path/to/config.toml") \
-    .add_inline({"key": "value"})
+    .file("/path/to/config.toml") \
+    .inline({"key": "value"}) \
+    .load()
 
-data = config.load_sync()
+data = config.to_json()
 ```
 
 ### Environment Variables
@@ -914,14 +918,15 @@ BusManager(mode="peer", connect=None, listen=None, peer=None)
 **Methods:**
 | Method | Description |
 |--------|-------------|
-| `publish_text(topic, payload)` | Publish text message |
-| `publish_json(topic, data)` | Publish JSON message |
-| `create_publisher(topic)` | Create a publisher |
-| `create_subscriber(topic)` | Create a subscriber |
-| `create_query(topic)` | Create a query client |
-| `create_queryable(topic, handler)` | Create a queryable server |
-| `create_caller(name)` | Create a caller client |
-| `create_callable(uri, handler)` | Create a callable server |
+| `create(**options)` | Construct and start (classmethod) |
+| `start()` / `stop()` | Start or close the underlying bus |
+| `publish(topic, payload, is_json=False)` | Publish text or JSON |
+| `mode(m)` / `connect(a)` / `listen(a)` / `peer(id)` | Fluent configuration |
+| `publisher(topic)` / `subscriber(topic)` | Create a publisher or subscriber |
+| `query(topic)` / `queryable(topic, handler=None)` | Create a query or queryable |
+| `caller(name)` / `callable(uri, handler=None)` | Create a caller or callable |
+
+The `publish_text`/`publish_json` and `create_*` methods remain as aliases.
 
 ### `Publisher`
 
@@ -935,6 +940,7 @@ Message publisher for a specific topic.
 **Methods:**
 | Method | Description |
 |--------|-------------|
+| `publish(payload, is_json=False)` | Publish text or JSON |
 | `publish_text(payload)` | Publish text |
 | `publish_json(data)` | Publish JSON |
 
@@ -950,11 +956,11 @@ Message subscriber with receive methods.
 **Methods:**
 | Method | Description |
 |--------|-------------|
-| `recv()` | Receive message (blocking) |
-| `recv_with_timeout_ms(ms)` | Receive with timeout |
-| `recv_json_with_timeout_ms(ms)` | Receive JSON with timeout |
+| `recv(timeout_ms=None)` | Receive a message, with an optional timeout |
+| `recv_json(timeout_ms=None)` | Receive and decode JSON |
 | `run(callback)` | Run callback loop |
 | `run_json(callback)` | Run JSON callback loop |
+| `next()` | One async-iterator step |
 
 ### `Query` / `Queryable`
 
@@ -963,12 +969,13 @@ Request-response pattern.
 **Query Methods:**
 | Method | Description |
 |--------|-------------|
-| `query_text(payload)` | Send query |
-| `query_text_timeout_ms(payload, ms)` | Send with timeout |
+| `ask(payload, timeout_ms=None)` | Send a text query |
+| `ask_json(payload, timeout_ms=None)` | Send JSON and decode the response |
 
 **Queryable Methods:**
 | Method | Description |
 |--------|-------------|
+| `handle(handler)` | Register the handler (applied on `start`) |
 | `start()` | Start server |
 | `run(handler)` | Run with handler |
 | `run_json(handler)` | Run JSON handler |
@@ -980,11 +987,13 @@ RPC pattern.
 **Caller Methods:**
 | Method | Description |
 |--------|-------------|
-| `call_text(payload)` | Call remote service |
+| `call(payload)` | Call remote service |
+| `call_json(payload)` | Send JSON and decode the response |
 
 **Callable Methods:**
 | Method | Description |
 |--------|-------------|
+| `handle(handler)` | Register the handler (applied on `start`) |
 | `start()` | Start server |
 | `run(handler)` | Run with handler |
 | `run_json(handler)` | Run JSON handler |
@@ -997,13 +1006,15 @@ Configuration loader.
 **Methods:**
 | Method | Description |
 |--------|-------------|
+| `from_file(path)` / `from_directory(path)` / `from_inline(data)` | Construct and load (classmethods) |
 | `discover()` | Auto-discover config files |
-| `add_file(path)` | Add config file |
-| `add_directory(path)` | Add config directory |
-| `add_inline(data)` | Add inline config |
+| `file(path)` / `directory(path)` / `inline(data)` | Declare a source (fluent) |
 | `reset()` | Reset config |
-| `load_sync()` | Load configuration |
-| `reload_sync()` | Reload configuration |
+| `load()` / `reload()` | Resolve and cache the configuration |
+| `get(key, default=None)` | Dotted-path lookup |
+| `to_json()` / `is_loaded()` | Cached config dict / load state |
+
+`add_file`/`add_directory`/`add_inline`/`load_sync`/`reload_sync` remain as aliases.
 
 ---
 
@@ -1051,12 +1062,12 @@ from nbos import BusManager
 
 async def publisher():
     async with BusManager() as bus:
-        await bus.publish_text("events/start", "Hello subscribers!")
+        await bus.publish("events/start", "Hello subscribers!")
 
 async def subscriber():
     async with BusManager() as bus:
-        sub = await bus.create_subscriber("events/start")
-        msg = await sub.recv_with_timeout_ms(5000)
+        sub = await bus.subscriber("events/start")
+        msg = await sub.recv(5000)
         print(f"Received: {msg}")
 
 # Run both in separate processes or tasks
@@ -1074,12 +1085,12 @@ def uppercase(text: str) -> str:
 async def main():
     async with BusManager() as bus:
         # Server
-        q = await bus.create_queryable("svc/uppercase", uppercase)
+        q = await bus.queryable("svc/uppercase", uppercase)
         await q.start()
         
         # Client
-        query = await bus.create_query("svc/uppercase")
-        result = await query.query_text("hello world")
+        query = await bus.query("svc/uppercase")
+        result = await query.ask("hello world")
         print(result)  # "HELLO WORLD"
 
 asyncio.run(main())

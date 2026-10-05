@@ -115,3 +115,28 @@ installs only Node and the jsbos dev dependencies, then runs
 npx ava test/parity.test.js on every pull request. The full jsbos pipeline
 stays main-and-tags only, so this adds the fast check without the per-target
 native build matrix.
+
+## Canonical names
+
+The unified vocabulary, by concept. Python keeps its original spellings as
+deprecated aliases (allowlisted in the guard); JavaScript camelCases the same
+names.
+
+| Concept | Python | JavaScript |
+|---------|--------|------------|
+| Construct and start | `BrainOS.create()` / `BusManager.create()` | `BrainOS.create()` / `BusManager.create()` |
+| Lifecycle | `start()` / `stop()` / `is_started` | `start()` / `stop()` / `isStarted` |
+| Publish | `publish_text` / `publish_json` / `publish(payload, is_json=)` | `publishText` / `publishJson` / `publish(...)` |
+| Receive | `recv(timeout_ms=None)` / `recv_json(timeout_ms=None)` / `next()` | `recv(timeoutMs)` / `recvJson(timeoutMs)` / `next()` |
+| Query | `ask(payload, timeout_ms=None)` / `ask_json(...)` | `ask(...)` / `askJson(...)` |
+| Serve | `handle(h)` then `start()`, or `run(h)` / `run_json(h)` | `handle(h)` then `start()`, or `run(h)` / `runJson(h)` |
+| Call | `call(payload)` / `call_json(payload)` | `call(...)` / `callJson(...)` |
+| Config sources | `file` / `directory` / `inline` / `discover` / `reset` | same |
+| Config read | `load()` / `reload()` / `get(key, default)` | same |
+| Config accessors | `global_model` / `model` / `base_url` / `api_key` / `bus` | same |
+
+Deprecated Python aliases: `query_text`, `query_text_timeout_ms`, `call_text`,
+`recv_with_timeout_ms`, `recv_json_with_timeout_ms`, the `BusManager`
+`publish_text`/`publish_json` pair where the fluent `publish` exists, every
+`create_*` factory, and `add_file`/`add_directory`/`add_inline`/`load_sync`/
+`reload_sync` on `Config`. None are removed, so existing code keeps working.

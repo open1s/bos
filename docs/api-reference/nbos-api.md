@@ -358,6 +358,40 @@ The native Rust-backed agent class from `nbos_native`.
 
 ## Bus / BusConfig
 
+#### BusManager
+
+High-level bus lifecycle and factory, mirroring the JavaScript `BusManager`.
+
+```python
+from nbos import BusManager
+
+bus = await BusManager.create(mode="peer")   # construct + start
+async with BusManager() as bus:              # or use it as a context manager
+    ...
+```
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `create(**options)` | Construct and start (classmethod) | `BusManager` |
+| `start()` | Create the underlying bus if needed | `BusManager` |
+| `stop()` | Close the underlying bus | `None` |
+| `mode(mode)` | Set the mode (fluent) | `BusManager` |
+| `connect(addresses)` | Set connect endpoints (fluent) | `BusManager` |
+| `listen(addresses)` | Set listen endpoints (fluent) | `BusManager` |
+| `peer(id)` | Set the peer id (fluent) | `BusManager` |
+| `publish(topic, payload, is_json=False)` | Publish text or JSON | `None` |
+| `publisher(topic)` | Create a `Publisher` | `Publisher` |
+| `subscriber(topic)` | Create a `Subscriber` | `Subscriber` |
+| `query(topic)` | Create a `Query` | `Query` |
+| `queryable(topic, handler=None)` | Create a `Queryable` | `Queryable` |
+| `caller(name)` | Create a `Caller` | `Caller` |
+| `callable(uri, handler=None)` | Create a `Callable` | `Callable` |
+| `bus` | The underlying native `Bus` (property) | `Bus` |
+
+`create_publisher`/`create_subscriber`/`create_query`/`create_queryable`/
+`create_caller`/`create_callable` and `publish_text`/`publish_json` remain as
+aliases of the fluent names above.
+
 #### Bus
 
 ```python
@@ -397,18 +431,24 @@ bus = await Bus.create(BusConfig())
 
 | Method | Description |
 |--------|-------------|
+| `publish(payload, is_json=False)` | Publish text or JSON |
 | `publish_text(payload)` | Publish text |
 | `publish_json(data)` | Publish JSON |
+| `topic` | The publisher topic (property) |
 
 #### Subscriber
 
 | Method | Description |
 |--------|-------------|
-| `recv()` | Receive message (blocking) |
-| `recv_with_timeout_ms(ms)` | Receive with timeout |
-| `recv_json_with_timeout_ms(ms)` | Receive JSON with timeout |
-| `run(callback)` | Run callback loop |
-| `run_json(callback)` | Run JSON callback loop |
+| `recv(timeout_ms=None)` | Receive a message, with an optional timeout |
+| `recv_json(timeout_ms=None)` | Receive and decode a JSON message |
+| `run(callback)` | Run a callback loop |
+| `run_json(callback)` | Run a JSON callback loop |
+| `next()` | One async-iterator step: `{"done", "value"}` |
+| `topic` | The subscriber topic (property) |
+
+`recv_with_timeout_ms` and `recv_json_with_timeout_ms` remain as deprecated
+aliases of `recv` and `recv_json`.
 
 ---
 
@@ -418,16 +458,20 @@ bus = await Bus.create(BusConfig())
 
 | Method | Description |
 |--------|-------------|
-| `query_text(payload)` | Send text query |
-| `query_text_timeout_ms(payload, ms)` | Query with timeout |
+| `ask(payload, timeout_ms=None)` | Send a text query |
+| `ask_json(payload, timeout_ms=None)` | Send JSON and decode the JSON response |
+| `topic` | The query topic (property) |
+
+`query_text` and `query_text_timeout_ms` remain as deprecated aliases.
 
 #### Queryable
 
 | Method | Description |
 |--------|-------------|
-| `start()` | Start server |
-| `run(handler)` | Run with handler |
-| `run_json(handler)` | Run with JSON handler |
+| `handle(handler)` | Register the handler, applied on `start` (fluent) |
+| `start()` | Start serving |
+| `run(handler)` | Set the handler and start serving |
+| `run_json(handler)` | Set a JSON handler and start serving |
 
 ---
 
@@ -437,16 +481,56 @@ bus = await Bus.create(BusConfig())
 
 | Method | Description |
 |--------|-------------|
-| `call_text(payload)` | Call remote service |
+| `call(payload)` | Call the remote service |
+| `call_json(payload)` | Send JSON and decode the JSON response |
+
+`call_text` remains as a deprecated alias.
 
 #### Callable
 
 | Method | Description |
 |--------|-------------|
-| `start()` | Start server |
-| `run(handler)` | Run with handler |
-| `run_json(handler)` | Run with JSON handler |
-| `is_started()` | Check if running |
+| `handle(handler)` | Register the handler, applied on `start` (fluent) |
+| `start()` | Start serving |
+| `run(handler)` | Set the handler and start serving |
+| `run_json(handler)` | Set a JSON handler and start serving |
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `is_started` | `bool` | Whether the callable is serving |
+
+---
+
+## Config
+
+High-level configuration wrapper. Sources are declared fluently, then `load()`
+resolves them once and caches the result for `get()` and the accessors.
+
+```python
+from nbos import Config
+
+cfg = Config().discover().load()
+print(cfg.model, cfg.base_url)
+
+cfg = Config.from_inline({"global_model": {"model": "x"}})
+```
+
+| Member | Description |
+|--------|-------------|
+| `Config(strategy="override", options=None)` | Constructor |
+| `from_file(path)` / `from_directory(path)` / `from_inline(data)` | Construct, load and return (classmethods) |
+| `file(path)` / `directory(path)` / `inline(data)` | Declare a source (fluent) |
+| `discover()` | Add the standard search paths |
+| `reset()` | Clear sources and cached state |
+| `load()` | Resolve and cache the config |
+| `reload()` | Reset, then load again |
+| `get(key, default=None)` | Dotted-path lookup, loading on first use |
+| `global_model` / `model` / `base_url` / `api_key` / `bus` | Convenience accessors (properties) |
+| `to_json()` | The cached config dict |
+| `is_loaded()` | Whether `load()` has run |
+
+`add_file`/`add_directory`/`add_inline`/`load_sync`/`reload_sync` remain as
+deprecated aliases.
 
 ---
 
