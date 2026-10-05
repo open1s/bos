@@ -555,16 +555,26 @@ class SessionManager {
   }
 
   export() {
+    return JSON.parse(this._inner.getSessionJson());
+  }
+
+  exportJson() {
     return this._inner.getSessionJson();
   }
 
-  import(json) {
+  importSession(data) {
+    const json = typeof data === 'string' ? data : JSON.stringify(data);
     this._inner.restoreSessionJson(json);
     return this;
   }
 
+  // Retained for backwards compatibility; accepts an object or a JSON string.
+  import(data) {
+    return this.importSession(data);
+  }
+
   get context() {
-    return JSON.parse(this._inner.getSessionJson()).context;
+    return this.export().context;
   }
 }
 

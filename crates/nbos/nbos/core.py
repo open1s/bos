@@ -118,6 +118,14 @@ class SessionManager:
     def export(self) -> dict:
         return self._agent.session_state()
 
+    def export_json(self) -> str:
+        return json.dumps(self.export())
+
+    def import_session(self, data: dict | str) -> "SessionManager":
+        payload = data if isinstance(data, str) else json.dumps(data)
+        self._agent.restore_session_json(payload)
+        return self
+
     @property
     def context(self) -> dict:
         return self._agent.session_context()

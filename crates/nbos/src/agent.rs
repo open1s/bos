@@ -1403,10 +1403,28 @@ impl PyAgent {
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        let state = guard.session_state();
-        let state_json = serde_json::to_value(state)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Serialize the canonical session (messages/context/metadata) so the
+        // snapshot round-trips through restore_session_json and matches the JS
+        // binding's getSessionJson. guard.session_state() uses a different
+        // AgentState shape (message_log/agent_id) that restore_from_json rejects.
+        let state_json = {
+            let session = guard.session();
+            serde_json::to_value(&*session)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+        };
         json_to_py(py, &state_json).map(|py_obj| py_obj.into_bound(py))
+    }
+
+    fn restore_session_json(&self, json: String) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let result = guard
+            .session_mut()
+            .restore_from_json(&json)
+            .map_err(to_py_runtime_error);
+        result
     }
 
     fn save_session<'py>(&self, _py: Python<'py>, path: String) -> PyResult<()> {

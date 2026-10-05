@@ -1411,8 +1411,10 @@ main().catch(console.error);
 | `restoreFull(path)` | Restore the full session from a file |
 | `compact(keepRecent?, maxSummaryChars?)` | Summarize older messages (defaults 10 / 2000) |
 | `clear()` | Clear the conversation |
-| `export()` | Serialize the session to a JSON string |
-| `import(json)` | Restore the session from a JSON string |
+| `export()` | Return the session snapshot as an object |
+| `exportJson()` | Return the session snapshot as a JSON string |
+| `importSession(data)` | Restore from a snapshot object or JSON string |
+| `import(data)` | Alias for `importSession` (back-compat) |
 | `context` | The session context object (read-only) |
 
 The started agent also exposes `agent.config` (the resolved configuration) and `agent.toolNames` (registered tool names).
@@ -1434,7 +1436,6 @@ While the JavaScript API mirrors the Python API for consistency, there are some 
 | Context manager | `async with` | `await brain.start()/stop()` |
 | Async iteration | `async for` | `for await` |
 | Class naming | `Subscriber` | `SubscriberWrapper` |
-| `SessionManager.export()` | Returns a `dict` | Returns a JSON string |
 
 ---
 

@@ -325,6 +325,21 @@ class TestSessionManager:
                 for m in msgs
             )
 
+    @pytest.mark.asyncio
+    async def test_session_export_import(self):
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = await brain.agent("test-agent").start()
+            agent.session.add_message("user", "snapshot me")
+            snapshot = agent.session.export()
+            assert isinstance(snapshot, dict)
+            assert isinstance(agent.session.export_json(), str)
+            agent.session.add_message("user", "another")
+            agent.session.import_session(snapshot)
+            assert len(agent.session.get_messages()) == len(snapshot["messages"])
+            agent.session.import_session(agent.session.export_json())
+            assert len(agent.session.get_messages()) == len(snapshot["messages"])
+
 
 class TestAgentAccessors:
     """Read-only agent accessors shared with the JS binding"""

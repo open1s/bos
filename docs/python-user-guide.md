@@ -722,6 +722,8 @@ asyncio.run(main())
 | `compact(keep_recent=10, max_summary_chars=2000)` | Compact long conversation logs |
 | `clear()` | Clear the conversation |
 | `export()` | Return the session state as a dict |
+| `export_json()` | Return the session state as a JSON string |
+| `import_session(data)` | Restore from a snapshot dict or JSON string |
 | `context` | The session context object (read-only) |
 
 ---

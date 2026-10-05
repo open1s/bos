@@ -567,7 +567,9 @@ export class SessionManager {
     getMessages(): any;
     addMessage(role: any, content: any): this;
     export(): any;
-    import(json: any): this;
+    exportJson(): any;
+    importSession(data: any): this;
+    import(data: any): this;
     get context(): any;
 }
 export class Config {

@@ -113,3 +113,17 @@ test.serial('metrics exposes a zeroed perf snapshot and resets', async (t) => {
   t.is(agent.metrics.llmCallCount, 0)
   t.is(agent.resetMetrics(), agent)
 })
+
+test.serial('export/import round-trip through objects and JSON strings', async (t) => {
+  const agent = await startAgent(t)
+  agent.session.addMessage('user', 'snapshot me')
+  const snapshot = agent.session.export()
+  t.is(typeof snapshot, 'object')
+  t.true(Array.isArray(snapshot.messages))
+  t.is(typeof agent.session.exportJson(), 'string')
+  agent.session.addMessage('user', 'another')
+  agent.session.importSession(snapshot)
+  t.deepEqual(agent.session.getMessages(), snapshot.messages)
+  agent.session.import(JSON.stringify(snapshot))
+  t.deepEqual(agent.session.getMessages(), snapshot.messages)
+})
