@@ -10,6 +10,7 @@ use rkyv::{
 use crate::{error::ZenohError, Codec, Session};
 use std::sync::Arc;
 
+/// Publishes rkyv-encoded messages to a single topic.
 pub struct Publisher {
     topic: String,
     session: Option<Arc<Session>>,

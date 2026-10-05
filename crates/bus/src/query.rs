@@ -15,6 +15,7 @@ use crate::{error::ZenohError, DEFAULT_CODEC};
 /// Type alias for backward compatibility
 pub type QueryWrapper = Query;
 
+/// Sends rkyv-encoded queries and decodes the first reply.
 pub struct Query {
     topic: String,
     session: Option<Arc<Session>>,

@@ -8,15 +8,18 @@ use rkyv::{Archive, Serialize};
 use std::sync::Arc;
 use zenoh::Session;
 
+/// Thin request/response client: sends a query to `name` and awaits one reply.
 pub struct Caller {
     name: String,
     session: Option<Arc<Session>>,
 }
 
 impl Caller {
+    /// Create a caller for the given topic with an optional session.
     pub fn new(name: String, session: Option<Arc<Session>>) -> Self {
         Self { name, session }
     }
+    /// Send one request and decode the reply.
     pub async fn call<Q, R>(&self, payload: &Q) -> Result<R, ZenohError>
     where
         Q: Archive,

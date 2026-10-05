@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use zenoh::Session;
 
+/// Serves requests for one topic, replying with a handler result.
 pub struct Callable<Q, R>
 where
     Q: Archive + 'static,
@@ -33,6 +34,7 @@ where
     for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
     for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
+    /// Whether the callable is currently serving requests.
     pub fn is_started(&self) -> bool {
         self.started.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -47,6 +49,7 @@ where
     for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
     for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
+    /// Create a callable for `uri` on `session`.
     pub fn new(uri: &str, session: Arc<Session>) -> Self {
         let inner = QueryableWrapper::<Q, R>::new(uri);
         Self {
@@ -56,6 +59,7 @@ where
         }
     }
 
+    /// Attach the async handler used to answer requests.
     pub fn with_handler<F, Fut>(mut self, handler: F) -> Self
     where
         F: Fn(Q) -> Fut + Send + Sync + 'static,
@@ -65,6 +69,7 @@ where
         self
     }
 
+    /// Declare the queryable and start serving requests.
     pub async fn start(&mut self) -> Result<(), ZenohError> {
         if self.started.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(ZenohError::AlreadyStarted);
@@ -78,6 +83,7 @@ where
         Ok(())
     }
 
+    /// Replace the handler before the callable starts.
     pub fn set_handler<F, Fut>(&mut self, handler: F) -> Result<(), ZenohError>
     where
         F: Fn(Q) -> Fut + Send + Sync + 'static,
@@ -96,6 +102,7 @@ where
         }
     }
 
+    /// Declare the queryable and start serving requests.
     pub async fn init_and_run(&mut self) -> Result<(), ZenohError> {
         if self.started.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(ZenohError::AlreadyStarted);

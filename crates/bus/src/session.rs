@@ -15,6 +15,7 @@ use zenoh::Config;
 
 #[derive(Clone)]
 #[allow(clippy::type_complexity)]
+/// An open Zenoh session plus the background tasks the bus spawned.
 pub struct Bus {
     session: Arc<Session>,
     handles: Arc<tokio::sync::Mutex<Vec<JoinHandle<Result<(), String>>>>>,
@@ -29,6 +30,7 @@ impl Bus {
         }
     }
 
+    /// The underlying Zenoh session.
     pub fn session(&self) -> Arc<Session> {
         self.session.clone()
     }
@@ -58,6 +60,7 @@ impl Bus {
         }
     }
 
+    /// Subscribe to `topic`, calling `handler` for every decoded message.
     pub async fn subscribe<T, F>(&mut self, topic: &str, mut handler: F)
     where
         F: FnMut(T) + Send + 'static,
@@ -80,6 +83,7 @@ impl Bus {
         self.handles.lock().await.push(handle);
     }
 
+    /// Publish one rkyv-encoded value to `topic`.
     pub async fn publish<T>(&mut self, topic: &str, payload: &T) -> Result<(), ZenohError>
     where
         T: Archive,
@@ -119,15 +123,21 @@ impl From<Bus> for Session {
     }
 }
 
+/// Connection settings used to open a Zenoh session.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BusConfig {
+    /// Zenoh mode, usually `peer` or `router`.
     pub mode: String,
+    /// Endpoints to connect to.
     pub connect: Option<Vec<String>>,
+    /// Endpoints to listen on.
     pub listen: Option<Vec<String>>,
+    /// Peer id override.
     pub peer: Option<Option<String>>,
 }
 
 impl BusConfig {
+    /// Create a config with just `mode` set.
     pub fn new(mode: &str) -> Self {
         Self {
             mode: mode.to_string(),

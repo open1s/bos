@@ -1,4 +1,5 @@
 //! BrainOS communication layer: pub/sub, queryable, and caller/callable over Zenoh.
+#![warn(missing_docs)]
 
 mod callable;
 mod caller;

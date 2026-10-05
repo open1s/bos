@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use zenoh::query::Query;
 
+/// Serves queries on one topic with either a single-shot or a streaming handler.
 pub struct QueryableWrapper<Q, R>
 where
     Q: Archive + 'static,
@@ -58,6 +59,7 @@ where
     for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
     for<'a> R: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
 {
+    /// Create a queryable for `topic` with no handler yet.
     pub fn new(topic: impl Into<String>) -> Self {
         Self {
             topic: topic.into(),
@@ -71,6 +73,7 @@ where
         }
     }
 
+    /// Attach a single-shot async handler.
     pub fn with_handler<F, Fut>(mut self, handler: F) -> Self
     where
         F: Fn(Q) -> Fut + Send + Sync + 'static,
@@ -81,6 +84,7 @@ where
         self
     }
 
+    /// Attach a streaming handler that may reply many times.
     pub fn with_stream_handler<F, Fut>(mut self, handler: F) -> Self
     where
         F: Fn(Q, tokio::sync::mpsc::Sender<Result<R, ZenohError>>) -> Fut + Send + Sync + 'static,
@@ -91,6 +95,7 @@ where
         self
     }
 
+    /// Declare the underlying Zenoh queryable.
     pub async fn init(&mut self, session: &Arc<Session>) -> Result<(), ZenohError> {
         let queryable = session
             .declare_queryable(&self.topic)
@@ -101,6 +106,7 @@ where
         Ok(())
     }
 
+    /// Spawn the task that dispatches incoming queries to the handler.
     pub fn run(&mut self) -> Result<(), ZenohError> {
         let queryable = self.queryable.take().ok_or(ZenohError::NotConnected)?;
 
@@ -222,10 +228,12 @@ where
         Ok(())
     }
 
+    /// The topic this queryable serves.
     pub fn topic(&self) -> &str {
         &self.topic
     }
 
+    /// Replace the single-shot handler before the queryable starts.
     pub fn set_handler<F, Fut>(&mut self, handler: F) -> Result<(), ZenohError>
     where
         F: Fn(Q) -> Fut + Send + Sync + 'static,
@@ -239,6 +247,7 @@ where
         Ok(())
     }
 
+    /// Replace the streaming handler before the queryable starts.
     pub fn set_stream_handler<F, Fut>(&mut self, handler: F) -> Result<(), ZenohError>
     where
         F: Fn(Q, tokio::sync::mpsc::Sender<Result<R, ZenohError>>) -> Fut + Send + Sync + 'static,
@@ -252,6 +261,7 @@ where
         Ok(())
     }
 
+    /// Declare the queryable and start dispatching.
     pub async fn init_and_run(&mut self, session: &Arc<Session>) -> Result<(), ZenohError> {
         self.init(session).await?;
         self.run()

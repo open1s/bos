@@ -4,32 +4,42 @@ use thiserror::Error;
 
 use serde_json;
 
+/// Errors produced by the bus layer.
 #[derive(Error, Debug)]
 pub enum ZenohError {
+    /// The underlying Zenoh session failed.
     #[error("Session error: {0}")]
     Session(String),
 
+    /// A publish failed.
     #[error("Publisher error: {0}")]
     Publisher(String),
 
+    /// A subscription failed.
     #[error("Subscriber error: {0}")]
     Subscriber(String),
 
+    /// A query or reply failed.
     #[error("Query error: {0}")]
     Query(String),
 
+    /// A value could not be encoded or decoded.
     #[error("Serialization error: {0}")]
     Serialization(String),
 
+    /// The operation needs a session, but none is attached.
     #[error("Not connected")]
     NotConnected,
 
+    /// The session is already connected.
     #[error("Already connected")]
     AlreadyConnected,
 
+    /// The queryable or callable was started twice.
     #[error("Already started")]
     AlreadyStarted,
 
+    /// The operation exceeded its timeout.
     #[error("Operation timed out")]
     Timeout,
 }

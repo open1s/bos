@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use zenoh::sample::Sample;
 
+/// Receives rkyv-encoded messages from a single topic.
 pub struct Subscriber<T> {
     topic: String,
     subscriber: Option<zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<Sample>>>,
@@ -34,6 +35,7 @@ where
         }
     }
 
+    /// Declare the underlying Zenoh subscription on `session`.
     pub async fn init(&mut self, session: Arc<Session>) -> Result<(), ZenohError> {
         let subscriber = session
             .declare_subscriber(&self.topic)
@@ -88,6 +90,7 @@ where
         Ok(())
     }
 
+    /// Spawn a task that invokes `handler` for every decoded message.
     pub async fn run<F>(&mut self, handler: F) -> Result<(), ZenohError>
     where
         F: Fn(T) + std::marker::Send + 'static,
@@ -165,6 +168,7 @@ where
     }
 }
 
+/// Spawn a task that forwards every decoded message to `handler`.
 pub fn subscriber_receiver<T, F>(
     mut subscriber: Subscriber<T>,
     mut handler: F,
