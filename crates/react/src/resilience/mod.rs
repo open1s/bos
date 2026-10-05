@@ -1,5 +1,5 @@
-// Resilience layer for ReAct engine: Circuit Breaker and Rate Limiter.
-// This module provides simple, production-friendly resilience patterns.
+//! Resilience layer for ReAct engine: Circuit Breaker and Rate Limiter.
+//! This module provides simple, production-friendly resilience patterns.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -158,6 +158,7 @@ impl CircuitBreaker {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Allow a call through, or return the current failure mode.
     pub fn check(&self) -> Result<(), ResilienceError<()>> {
         let mut state = self.lock_state();
         let now = Instant::now();
@@ -352,6 +353,7 @@ impl RateLimiter {
         Ok(())
     }
 
+    /// Number of calls still allowed in the current window.
     pub fn remaining(&self) -> u32 {
         let timestamps = self.lock_timestamps();
         let now = Instant::now();

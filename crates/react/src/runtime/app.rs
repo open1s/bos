@@ -17,15 +17,20 @@ pub enum HookDecision {
 }
 
 impl HookDecision {
+    /// Whether this decision allows execution to continue.
     pub fn is_continue(&self) -> bool {
         matches!(self, HookDecision::Continue)
     }
 }
 
+/// Hooks invoked around each step of the ReAct loop.
 pub trait ReActApp: Send + Sync {
+    /// Conversation state type used by the app.
     type Session: Send + Sync + ReactSession;
+    /// Per-run context type used by the app.
     type Context: Send + Sync + ReactContext;
 
+    /// Name of the app, for logging.
     fn name(&self) -> &str {
         "react_app"
     }
@@ -178,6 +183,7 @@ impl<T: ReActApp + ?Sized> ReActApp for Box<T> {
     }
 }
 
+/// An app that does nothing, useful as a default.
 pub struct NoopApp;
 
 impl Default for NoopApp {
