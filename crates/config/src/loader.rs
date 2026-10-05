@@ -1,9 +1,15 @@
+//! Config source discovery, parsing, and merging.
+//!
+//! [`ConfigLoader`] collects [`ConfigSource`]s and merges them according to a
+//! [`ConfigMergeStrategy`].
+
 use crate::error::{ConfigError, ConfigResult};
 use crate::types::{ConfigFormat, ConfigMergeStrategy, ConfigMetadata, ConfigSource};
 use log::{debug, info, warn};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Collects configuration sources and merges them into one JSON document.
 #[derive(Clone)]
 pub struct ConfigLoader {
     sources: Vec<ConfigSource>,
@@ -13,6 +19,7 @@ pub struct ConfigLoader {
 }
 
 impl ConfigLoader {
+    /// Create an empty loader with the default merge strategy.
     pub fn new() -> Self {
         Self {
             sources: Vec::new(),
@@ -22,17 +29,20 @@ impl ConfigLoader {
         }
     }
 
+    /// Set the merge strategy.
     pub fn with_strategy(mut self, strategy: ConfigMergeStrategy) -> Self {
         self.strategy = strategy;
         self
     }
 
+    /// Append a configuration source.
     pub fn add_source(mut self, source: ConfigSource) -> Self {
         self.sources.push(source);
         self.cached_config = None;
         self
     }
 
+    /// Append a single config file.
     pub fn add_file(mut self, path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_string_lossy().to_string();
         self.sources.push(ConfigSource::File(path));
@@ -40,6 +50,7 @@ impl ConfigLoader {
         self
     }
 
+    /// Append several config files.
     pub fn add_files(mut self, paths: Vec<PathBuf>) -> Self {
         for path in paths {
             self.sources
@@ -49,6 +60,7 @@ impl ConfigLoader {
         self
     }
 
+    /// Append a directory of config files, erroring if it does not exist.
     pub fn add_directory(mut self, path: impl AsRef<Path>) -> ConfigResult<Self> {
         let path = path.as_ref();
         if !path.exists() {
@@ -60,6 +72,7 @@ impl ConfigLoader {
         Ok(self)
     }
 
+    /// Append an already-parsed JSON value.
     pub fn add_inline(mut self, value: serde_json::Value) -> Self {
         self.sources.push(ConfigSource::Inline(value));
         self.cached_config = None;
@@ -82,11 +95,13 @@ impl ConfigLoader {
     }
 
     // Mutable builder methods for Python bindings
+    /// Mutable variant of [`ConfigLoader::discover`] for the bindings.
     pub fn discover_mut(&mut self) -> &mut Self {
         self.discover_locations();
         self
     }
 
+    /// Mutable variant of [`ConfigLoader::add_file`].
     pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
         let path = path.as_ref().to_string_lossy().to_string();
         self.sources.push(ConfigSource::File(path));
@@ -94,6 +109,7 @@ impl ConfigLoader {
         self
     }
 
+    /// Mutable variant of [`ConfigLoader::add_files`].
     pub fn add_files_mut(&mut self, paths: Vec<PathBuf>) -> &mut Self {
         for path in paths {
             self.sources
@@ -103,6 +119,7 @@ impl ConfigLoader {
         self
     }
 
+    /// Mutable variant of [`ConfigLoader::add_directory`].
     pub fn add_directory_mut(&mut self, path: impl AsRef<Path>) -> ConfigResult<&mut Self> {
         let path = path.as_ref();
         if !path.exists() {
@@ -114,6 +131,7 @@ impl ConfigLoader {
         Ok(self)
     }
 
+    /// Mutable variant of [`ConfigLoader::add_inline`].
     pub fn add_inline_mut(&mut self, value: serde_json::Value) -> &mut Self {
         self.sources.push(ConfigSource::Inline(value));
         self.cached_config = None;
@@ -132,30 +150,31 @@ impl ConfigLoader {
             let expanded = shellexpand::tilde(dir);
             let path = Path::new(expanded.as_ref());
             if path.exists() && path.is_dir() {
-                debug!("发现配置目录: {}", expanded);
+                debug!("discovered config directory: {}", expanded);
                 self.sources
                     .push(ConfigSource::Directory(expanded.into_owned()));
             } else {
-                debug!("跳过不存在的配置目录: {}", expanded);
+                debug!("skipping missing config directory: {}", expanded);
             }
         }
 
         self.cached_config = None;
     }
 
+    /// Load, merge, and cache the sources; repeated calls reuse the cache.
     pub async fn load(&mut self) -> ConfigResult<&serde_json::Value> {
         if let Some(ref cached) = self.cached_config {
-            debug!("使用缓存的配置");
+            debug!("using cached config");
             return Ok(cached);
         }
 
-        info!("开始加载配置，策略: {}", self.strategy.name());
-        debug!("配置源数量: {}", self.sources.len());
+        info!("loading config, strategy: {}", self.strategy.name());
+        debug!("config source count: {}", self.sources.len());
 
         let mut metadata = ConfigMetadata::new(self.strategy);
 
         if self.sources.is_empty() {
-            warn!("未指定任何配置源，返回空配置");
+            warn!("no config sources specified, returning empty config");
             let empty = serde_json::Value::Object(serde_json::Map::new());
             self.cached_config = Some(empty.clone());
             self.metadata = Some(metadata);
@@ -179,11 +198,14 @@ impl ConfigLoader {
             }
         }
 
-        self.cached_config
-            .as_ref()
-            .ok_or_else(|| ConfigError::LoadError(anyhow::anyhow!("配置加载完成但未产生缓存值")))
+        self.cached_config.as_ref().ok_or_else(|| {
+            ConfigError::LoadError(anyhow::anyhow!(
+                "config load finished but produced no cached value"
+            ))
+        })
     }
 
+    /// Load and deserialize the merged config into `T`.
     pub async fn load_typed<T>(&mut self) -> ConfigResult<T>
     where
         T: for<'de> Deserialize<'de>,
@@ -193,45 +215,52 @@ impl ConfigLoader {
         Ok(config)
     }
 
+    /// The last merged value, if a load has run.
     pub fn get(&self) -> Option<&serde_json::Value> {
         self.cached_config.as_ref()
     }
 
+    /// Metadata describing the last load.
     pub fn metadata(&self) -> Option<&ConfigMetadata> {
         self.metadata.as_ref()
     }
 
+    /// The configured sources, in order.
     pub fn sources(&self) -> &[ConfigSource] {
         &self.sources
     }
 
+    /// The active merge strategy.
     pub fn strategy(&self) -> ConfigMergeStrategy {
         self.strategy
     }
 
+    /// Drop the cached value and metadata without touching the sources.
     pub fn reset(&mut self) {
         self.cached_config = None;
         self.metadata = None;
     }
 
+    /// Drop the cache and load again.
     pub async fn reload(&mut self) -> ConfigResult<&serde_json::Value> {
         self.cached_config = None;
         self.metadata = None;
         self.load().await
     }
 
+    /// Synchronous equivalent of [`ConfigLoader::load`].
     pub fn load_sync(&mut self) -> ConfigResult<serde_json::Value> {
         if let Some(ref cached) = self.cached_config {
             return Ok(cached.clone());
         }
 
-        info!("开始加载配置（同步），策略: {}", self.strategy.name());
-        debug!("配置源数量: {}", self.sources.len());
+        info!("loading config (sync), strategy: {}", self.strategy.name());
+        debug!("config source count: {}", self.sources.len());
 
         let mut metadata = ConfigMetadata::new(self.strategy);
 
         if self.sources.is_empty() {
-            warn!("未指定任何配置源，返回空配置");
+            warn!("no config sources specified, returning empty config");
             let empty = serde_json::Value::Object(serde_json::Map::new());
             self.cached_config = Some(empty.clone());
             self.metadata = Some(metadata);
@@ -258,13 +287,13 @@ impl ConfigLoader {
                     return Ok(v);
                 }
                 Err(e) => {
-                    debug!("加载配置源失败: {:#}, 尝试下一个", e);
+                    debug!("failed to load config source: {:#}, trying next", e);
                     continue;
                 }
             }
         }
         Err(ConfigError::LoadError(anyhow::anyhow!(
-            "所有配置源均加载失败"
+            "all config sources failed to load"
         )))
     }
 
@@ -282,7 +311,7 @@ impl ConfigLoader {
                     has_value = true;
                 }
                 Err(e) => {
-                    debug!("加载配置源失败: {:#}, 尝试下一个", e);
+                    debug!("failed to load config source: {:#}, trying next", e);
                     continue;
                 }
             }
@@ -290,7 +319,7 @@ impl ConfigLoader {
 
         if !has_value {
             return Err(ConfigError::LoadError(anyhow::anyhow!(
-                "所有配置源均加载失败"
+                "all config sources failed to load"
             )));
         }
 
@@ -313,7 +342,7 @@ impl ConfigLoader {
                     has_value = true;
                 }
                 Err(e) => {
-                    debug!("加载配置源失败: {:#}, 跳过", e);
+                    debug!("failed to load config source: {:#}, skipping", e);
                     continue;
                 }
             }
@@ -321,7 +350,7 @@ impl ConfigLoader {
 
         if !has_value {
             return Err(ConfigError::LoadError(anyhow::anyhow!(
-                "所有配置源均加载失败"
+                "all config sources failed to load"
             )));
         }
 
@@ -344,7 +373,7 @@ impl ConfigLoader {
                     has_value = true;
                 }
                 Err(e) => {
-                    debug!("加载配置源失败: {:#}, 跳过", e);
+                    debug!("failed to load config source: {:#}, skipping", e);
                     continue;
                 }
             }
@@ -352,7 +381,7 @@ impl ConfigLoader {
 
         if !has_value {
             return Err(ConfigError::LoadError(anyhow::anyhow!(
-                "所有配置源均加载失败"
+                "all config sources failed to load"
             )));
         }
 
@@ -460,7 +489,7 @@ impl ConfigLoader {
             let path_str = match path.to_str() {
                 Some(s) => s,
                 None => {
-                    debug!("跳过无法转换为 UTF-8 的文件路径: {:?}", path);
+                    debug!("skipping path that is not valid UTF-8: {:?}", path);
                     continue;
                 }
             };
@@ -469,7 +498,7 @@ impl ConfigLoader {
                     merged = Self::deep_merge_json(merged, value);
                 }
                 Err(e) => {
-                    debug!("跳过文件 {:?}: {:#}", path, e);
+                    debug!("skipping file {:?}: {:#}", path, e);
                     continue;
                 }
             }

@@ -1,13 +1,18 @@
-/// 配置文件格式支持
+//! Configuration value types: formats, merge strategies, sources, metadata.
+
+/// Supported configuration file formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFormat {
+    /// TOML (`.toml`).
     Toml,
+    /// YAML (`.yaml`, `.yml`).
     Yaml,
+    /// JSON (`.json`).
     Json,
 }
 
 impl ConfigFormat {
-    /// 从文件路径推断格式
+    /// Infer the format from a file extension.
     pub fn from_path(path: &str) -> Option<Self> {
         let ext = std::path::Path::new(path)
             .extension()?
@@ -22,7 +27,7 @@ impl ConfigFormat {
         }
     }
 
-    /// 获取格式名称
+    /// Human-readable format name.
     pub fn name(&self) -> &'static str {
         match self {
             ConfigFormat::Toml => "TOML",
@@ -32,21 +37,22 @@ impl ConfigFormat {
     }
 }
 
-/// 配置合并策略
+/// How multiple configuration sources are combined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConfigMergeStrategy {
-    /// 覆盖：后面的配置完全覆盖前面的
+    /// Later values overwrite earlier ones, one level deep.
     #[default]
     Override,
-    /// 深度合并：递归合并嵌套结构
+    /// Recurse into nested objects and merge key by key.
     DeepMerge,
-    /// 首个：只使用第一个有效的配置
+    /// Use the first source that loads successfully.
     First,
-    /// 累加：数组类型累加，其他覆盖
+    /// Concatenate arrays; overwrite every other value.
     Accumulate,
 }
 
 impl ConfigMergeStrategy {
+    /// Stable identifier used in logs and config values.
     pub fn name(&self) -> &'static str {
         match self {
             ConfigMergeStrategy::Override => "override",
@@ -59,50 +65,64 @@ impl ConfigMergeStrategy {
 
 use std::sync::Arc;
 
-/// 配置源
+/// A place configuration is read from.
 #[derive(Debug, Clone)]
 pub enum ConfigSource {
+    /// A single config file.
     File(String),
+    /// A directory whose config files are merged in filename order.
     Directory(String),
+    /// An already-parsed JSON value.
     Inline(serde_json::Value),
+    /// A user-provided provider.
     Custom(Arc<dyn CustomConfigSource>),
 }
 
 impl ConfigSource {
+    /// Wrap a custom provider as a source.
     pub fn custom(source: Arc<dyn CustomConfigSource>) -> Self {
         ConfigSource::Custom(source)
     }
 }
 
 impl ConfigSource {
+    /// A single config file.
     pub fn file(path: impl Into<String>) -> Self {
         ConfigSource::File(path.into())
     }
 
+    /// A directory of config files.
     pub fn directory(path: impl Into<String>) -> Self {
         ConfigSource::Directory(path.into())
     }
 
+    /// An already-parsed JSON value.
     pub fn inline(value: serde_json::Value) -> Self {
         ConfigSource::Inline(value)
     }
 }
 
-/// 自定义配置源 trait
+/// A user-provided configuration source.
 pub trait CustomConfigSource: std::fmt::Debug + Send + Sync {
+    /// Load this source into a JSON value.
     fn load(&self) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-/// 配置加载元数据
+/// What the last load read and how it merged it.
 #[derive(Debug, Clone)]
 pub struct ConfigMetadata {
+    /// Names of the sources that contributed, in load order.
     pub sources: Vec<String>,
+    /// Format of the last file read, if a single format applied.
     pub format: Option<ConfigFormat>,
+    /// The merge strategy that was used.
     pub strategy: ConfigMergeStrategy,
+    /// When the load finished.
     pub loaded_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ConfigMetadata {
+    /// Empty metadata for `strategy`, stamped with the current time.
     pub fn new(strategy: ConfigMergeStrategy) -> Self {
         Self {
             sources: Vec::new(),
