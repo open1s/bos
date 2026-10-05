@@ -30,6 +30,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
+      - name: Format
+        run: cargo fmt --all -- --check
+
       - name: Lint
         run: cargo clippy --workspace --exclude jsbos --exclude nbos --all-targets -- -D warnings
 
