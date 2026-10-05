@@ -38,6 +38,10 @@ export declare class Agent {
   restoreSessionFromFile(path: string): void
   clearSession(): void
   compactSession(keepRecent: number, maxSummaryChars: number): void
+  saveMessageLog(path: string): void
+  restoreMessageLog(path: string): void
+  getMessages(): any
+  addMessage(message: any): void
   getPerfMetrics(): PerfSnapshot
   resetPerfMetrics(): void
 }

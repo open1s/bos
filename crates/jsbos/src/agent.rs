@@ -841,6 +841,56 @@ impl Agent {
     Ok(())
   }
 
+  /// Persist the agent's conversation to a file path.
+  #[napi]
+  pub fn save_message_log(&self, path: String) -> Result<()> {
+    self.save_session(path)
+  }
+
+  /// Load a previously saved conversation from a file path.
+  #[napi]
+  pub fn restore_message_log(&self, path: String) -> Result<()> {
+    self.restore_session_from_file(path)
+  }
+
+  /// The conversation messages, serialized as JSON.
+  #[napi]
+  pub fn get_messages(&self) -> Result<serde_json::Value> {
+    let guard = self.inner.blocking_lock();
+    let messages = guard.session().messages().to_vec();
+    serde_json::to_value(messages)
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  /// Append a role/content message to the conversation.
+  #[napi]
+  pub fn add_message(&self, message: serde_json::Value) -> Result<()> {
+    let role = message
+      .get("role")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| Error::new(napi::Status::InvalidArg, "message.role is required"))?;
+    let content = message
+      .get("content")
+      .and_then(|v| v.as_str())
+      .unwrap_or_default();
+    let msg = match role {
+      "system" => react::llm::LlmMessage::system(content),
+      "user" => react::llm::LlmMessage::user_text(content),
+      "assistant" => react::llm::LlmMessage::Assistant {
+        content: content.to_string(),
+      },
+      other => {
+        return Err(Error::new(
+          napi::Status::InvalidArg,
+          format!("unsupported message role: {other}"),
+        ))
+      }
+    };
+    let mut guard = self.inner.blocking_lock();
+    guard.add_message(msg);
+    Ok(())
+  }
+
   #[napi]
   pub fn get_perf_metrics(&self) -> crate::perf::PerfSnapshot {
     let guard = self.inner.blocking_lock();
