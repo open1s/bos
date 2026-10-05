@@ -24,13 +24,10 @@ from nbos_native import HookEvent, HookDecision, HookContext
 
 from nbos.tool import ToolDef
 from nbos.content import Content as NbosContent
+from nbos.config import DEFAULT_BASE_URL, DEFAULT_MODEL
 
 # Import ContentPart for convenience
 from nbos.content import ContentPart, Binary
-
-
-DEFAULT_MODEL = "nvidia/meta/llama-3.1-8b-instruct"
-DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 
 class ToolRegistry:

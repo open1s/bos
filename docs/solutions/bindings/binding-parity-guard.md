@@ -62,9 +62,16 @@ The guard also covers the multimodal wire types (Binary, ContentPart, Content),
 the tool definition types (ToolDef, ToolResult), and ToolRegistry. The value
 types keep two documented differences: cross-idiom serialization (Python's
 to_dict versus JS's toJSON, and JS's toString alongside Python's to_json) and the
-JS-only static ToolResult.fromResult helper. Config and the bus/query/caller
-classes remain uncovered: the JS surfaces are materially richer, so reconciling
-them is tracked as follow-up work rather than locked in.
+JS-only static ToolResult.fromResult helper. The bus/query/caller classes remain
+uncovered: their JS surfaces are richer, so reconciling them is tracked as
+follow-up work rather than locked in.
+
+Config was reconciled by giving Python the JS fluent surface (file, directory,
+inline, discover, reset, load, reload, get, is_loaded, to_json, the
+global_model/model/base_url/api_key/bus accessors, and the from_file,
+from_directory and from_inline constructors). The original add_file,
+add_directory, add_inline, load_sync and reload_sync names remain as documented
+aliases, which is the only allowlisted difference.
 
 Closing the ToolRegistry gap added unregister, list_tool_defs, list_by_category,
 filter and to_json to Python. list_by_category filters on an optional category

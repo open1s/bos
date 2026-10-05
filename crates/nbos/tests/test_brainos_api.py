@@ -209,6 +209,41 @@ class TestConfig:
         data2 = cfg.reload_sync()
         assert data2["key"] == "initial"
 
+    def test_config_fluent_load_and_accessors(self):
+        cfg = Config.from_inline(
+            {
+                "global_model": {"model": "m", "base_url": "u", "api_key": "k"},
+                "bus": {"x": 1},
+            }
+        )
+        assert cfg.is_loaded() is True
+        assert cfg.model == "m"
+        assert cfg.base_url == "u"
+        assert cfg.api_key == "k"
+        assert cfg.bus == {"x": 1}
+        assert cfg.global_model["model"] == "m"
+        assert cfg.to_json()["bus"] == {"x": 1}
+
+    def test_config_get_defaults_and_lazy_load(self):
+        from nbos.config import DEFAULT_MODEL
+
+        cfg = Config()
+        cfg.add_inline({"a": {"b": 7}})
+        # get() loads lazily on first use
+        assert cfg.get("a.b") == 7
+        assert cfg.get("a.missing", "fallback") == "fallback"
+        assert cfg.is_loaded() is True
+        # falls back to the documented default when global_model is absent
+        assert cfg.model == DEFAULT_MODEL
+
+    def test_config_aliases_match_fluent_names(self):
+        cfg = Config()
+        assert cfg.add_inline({"v": 1}) is cfg
+        assert cfg.inline({"w": 2}) is cfg
+        assert cfg.load() is cfg
+        assert cfg.get("v") == 1
+        assert cfg.get("w") == 2
+
 
 class TestBusManager:
     """BusManager lifecycle tests (requires nbos extension)"""

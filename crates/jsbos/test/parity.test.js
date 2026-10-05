@@ -165,3 +165,16 @@ test('ToolRegistry surface matches across bindings', (t) => {
     new Set(),
   )
 })
+
+test('Config surface matches across bindings', (t) => {
+  assertNoDrift(
+    t,
+    'Config',
+    norm(jsMembers(jsSrc, 'Config')),
+    norm(pyMembers(pySrc, 'Config')),
+    new Set(),
+    // Python keeps the original add_*/load_sync names as backward-compatible
+    // aliases of file/directory/inline/load/reload.
+    new Set(['add_file', 'add_directory', 'add_inline', 'load_sync', 'reload_sync']),
+  )
+})
