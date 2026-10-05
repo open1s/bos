@@ -36,6 +36,10 @@ export declare class Agent {
   restoreSessionFromFile(path: string): void
   clearSession(): void
   compactSession(keepRecent: number, maxSummaryChars: number): void
+  saveMessageLog(path: string): void
+  restoreMessageLog(path: string): void
+  getMessages(): any
+  addMessage(message: any): void
   getPerfMetrics(): PerfSnapshot
   resetPerfMetrics(): void
 }
@@ -407,6 +411,7 @@ export class AgentBuilder {
     stop(options?: {}): any;
     isRunning(): boolean;
     get session(): SessionManager;
+    config(): any;
 }
 export function tool(descriptionOrOptions: any, maybeOptions?: {}): (target: any, propertyKey: any, descriptor: any) => any;
 export class ToolDef {
@@ -560,6 +565,7 @@ export class SessionManager {
     addMessage(role: any, content: any): this;
     export(): any;
     import(json: any): this;
+    get context(): any;
 }
 export class Config {
     static load(options?: {}): Config;

@@ -562,6 +562,10 @@ class SessionManager {
     this._inner.restoreSessionJson(json);
     return this;
   }
+
+  get context() {
+    return JSON.parse(this._inner.getSessionJson()).context;
+  }
 }
 
 class AgentBuilder {
@@ -892,6 +896,10 @@ class AgentBuilder {
   get session() {
     if (!this._inner) throw new Error('Agent not started');
     return new SessionManager(this._inner);
+  }
+
+  config() {
+    return this._inner ? this._inner.config() : { ...this._config };
   }
 }
 

@@ -56,3 +56,22 @@ test.serial('addMessage rejects an unsupported role', async (t) => {
   const error = t.throws(() => agent.session.addMessage('bogus', 'x'))
   t.regex(String(error.message), /unsupported message role/)
 })
+
+test.serial('context exposes the session context', async (t) => {
+  const agent = await startAgent(t)
+  t.is(agent.session.context, null)
+  agent.session.import(
+    JSON.stringify({
+      context: { topic: 'math' },
+      messages: [],
+      metadata: { created_at: 0, updated_at: 0, message_count: 0 },
+    })
+  )
+  t.deepEqual(agent.session.context, { topic: 'math' })
+})
+
+test.serial('config exposes the resolved agent config', async (t) => {
+  const agent = await startAgent(t)
+  t.is(agent.config().name, 'session-test')
+  t.truthy(agent.config().model)
+})
