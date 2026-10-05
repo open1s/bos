@@ -1,9 +1,16 @@
+//! Logging setup for BrainOS.
+//!
+//! Provides the log-file formatter, the rotating logger initializer, and a
+//! small test helper.
+#![warn(missing_docs)]
+
 use flexi_logger::{Cleanup, Criterion, DeferredNow, FileSpec, Logger, Naming};
 use log::Record;
 use std::{io::Write, path::Path, sync::Mutex};
 
 static LOGGER_HANDLE: Mutex<Option<flexi_logger::LoggerHandle>> = Mutex::new(None);
 
+/// Flexi-logger format function: one compact line per record, for log files.
 pub fn short_format(
     w: &mut dyn Write,
     now: &mut DeferredNow,
@@ -56,6 +63,12 @@ fn pretty_msg(msg: &str) -> String {
     msg.to_string()
 }
 
+/// Initialize the global logger.
+///
+/// Writes rotating files under `~/.bos/log` and mirrors them to stdout. The
+/// level comes from `RUST_LOG`, then `BOS_LOG`, then the `logging.level` config
+/// key, defaulting to `error`. Returns early if the log directory cannot be
+/// created; a failure to install the logger is printed to stderr.
 pub fn auto_init_tracing() {
     let logdir = match dirs::home_dir() {
         Some(d) => d.join(".bos/log"),
@@ -121,6 +134,7 @@ pub fn auto_init_tracing() {
     }
 }
 
+/// Log `message` at info level with a `[TEST]` prefix.
 pub fn log_test_message(message: &str) {
     log::info!("[TEST] {}", message);
 }

@@ -1,3 +1,9 @@
+//! Attribute macros that add rkyv archive support to qserde types.
+//!
+//! [`Archive`] points the derived rkyv impls at the rkyv re-export inside the
+//! qserde crate, so downstream crates depend only on qserde.
+#![warn(missing_docs)]
+
 use proc_macro::TokenStream;
 
 use quote::quote;
@@ -73,22 +79,28 @@ impl Parse for ArchiveArgs {
 
 #[allow(non_snake_case)]
 #[proc_macro_attribute]
+/// Derive rkyv `Archive`, `Serialize`, and `Deserialize` for a type.
+///
+/// Accepts `crate`/`crate_path` and `rkyv`/`rkyv_path` arguments.
 pub fn Archive(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand(attr, item)
 }
 
 #[allow(non_snake_case)]
 #[proc_macro_attribute]
+/// Alias of [`Archive`], kept for rkyv-style naming.
 pub fn Snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand(attr, item)
 }
 
 #[proc_macro_attribute]
+/// Lowercase alias of [`Archive`].
 pub fn archive(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand(attr, item)
 }
 
 #[proc_macro_attribute]
+/// Lowercase alias of [`Snapshot`].
 pub fn snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand(attr, item)
 }

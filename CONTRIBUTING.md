@@ -103,6 +103,8 @@ cargo clippy
 cargo fmt
 ```
 
+> **公共 API 文档**：新增或修改公共条目（类型、字段、方法、变体）时请附上文档注释。已启用 `#![warn(missing_docs)]` 的 crate 会让 CI 拒绝未写文档的公共 API。
+
 #### 4. 提交更改
 
 ```bash
