@@ -1,6 +1,6 @@
 use crate::error::{ConfigError, ConfigResult};
 use crate::types::{ConfigFormat, ConfigMergeStrategy, ConfigMetadata, ConfigSource};
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -162,12 +162,26 @@ impl ConfigLoader {
             return Ok(self.cached_config.as_ref().unwrap());
         }
 
+        // The sync strategies are the single implementation; the async entry
+        // point delegates to them so the two cannot drift.
         match self.strategy {
-            ConfigMergeStrategy::First => self.load_first(&mut metadata).await,
-            ConfigMergeStrategy::Override => self.load_override(&mut metadata).await,
-            ConfigMergeStrategy::DeepMerge => self.load_deep_merge(&mut metadata).await,
-            ConfigMergeStrategy::Accumulate => self.load_accumulate(&mut metadata).await,
+            ConfigMergeStrategy::First => {
+                self.load_first_sync(&mut metadata)?;
+            }
+            ConfigMergeStrategy::Override => {
+                self.load_override_sync(&mut metadata)?;
+            }
+            ConfigMergeStrategy::DeepMerge => {
+                self.load_deep_merge_sync(&mut metadata)?;
+            }
+            ConfigMergeStrategy::Accumulate => {
+                self.load_accumulate_sync(&mut metadata)?;
+            }
         }
+
+        self.cached_config.as_ref().ok_or_else(|| {
+            ConfigError::LoadError(anyhow::anyhow!("配置加载完成但未产生缓存值"))
+        })
     }
 
     pub async fn load_typed<T>(&mut self) -> ConfigResult<T>
@@ -465,233 +479,6 @@ impl ConfigLoader {
         Ok((dir.to_string(), merged))
     }
 
-    async fn load_first(
-        &mut self,
-        metadata: &mut ConfigMetadata,
-    ) -> ConfigResult<&serde_json::Value> {
-        for source in &self.sources {
-            match self.load_source(source, metadata).await {
-                Ok(v) => {
-                    self.cached_config = Some(v);
-                    self.metadata = Some(metadata.clone());
-                    return Ok(self.cached_config.as_ref().unwrap());
-                }
-                Err(e) => {
-                    debug!("加载配置源失败: {:#}, 尝试下一个", e);
-                    continue;
-                }
-            }
-        }
-        Err(ConfigError::LoadError(anyhow::anyhow!(
-            "所有配置源均加载失败"
-        )))
-    }
-
-    async fn load_override(
-        &mut self,
-        metadata: &mut ConfigMetadata,
-    ) -> ConfigResult<&serde_json::Value> {
-        let mut final_value = serde_json::Value::Object(serde_json::Map::new());
-        let mut has_value = false;
-
-        for source in &self.sources {
-            match self.load_source(source, metadata).await {
-                Ok(value) => {
-                    final_value = Self::override_merge_json(final_value, value);
-                    has_value = true;
-                }
-                Err(e) => {
-                    debug!("加载配置源失败: {:#}, 尝试下一个", e);
-                    continue;
-                }
-            }
-        }
-
-        if !has_value {
-            return Err(ConfigError::LoadError(anyhow::anyhow!(
-                "所有配置源均加载失败"
-            )));
-        }
-
-        self.cached_config = Some(final_value);
-        self.metadata = Some(metadata.clone());
-        Ok(self.cached_config.as_ref().unwrap())
-    }
-
-    async fn load_deep_merge(
-        &mut self,
-        metadata: &mut ConfigMetadata,
-    ) -> ConfigResult<&serde_json::Value> {
-        let mut final_value = serde_json::Value::Object(serde_json::Map::new());
-        let mut has_value = false;
-
-        for source in &self.sources {
-            match self.load_source(source, metadata).await {
-                Ok(value) => {
-                    final_value = Self::deep_merge_json(final_value, value);
-                    has_value = true;
-                }
-                Err(e) => {
-                    debug!("加载配置源失败: {:#}, 跳过", e);
-                    continue;
-                }
-            }
-        }
-
-        if !has_value {
-            return Err(ConfigError::LoadError(anyhow::anyhow!(
-                "所有配置源均加载失败"
-            )));
-        }
-
-        self.cached_config = Some(final_value);
-        self.metadata = Some(metadata.clone());
-        Ok(self.cached_config.as_ref().unwrap())
-    }
-
-    async fn load_accumulate(
-        &mut self,
-        metadata: &mut ConfigMetadata,
-    ) -> ConfigResult<&serde_json::Value> {
-        let mut final_value = serde_json::Value::Object(serde_json::Map::new());
-        let mut has_value = false;
-
-        for source in &self.sources {
-            match self.load_source(source, metadata).await {
-                Ok(value) => {
-                    final_value = Self::accumulate_merge_json(final_value, value);
-                    has_value = true;
-                }
-                Err(e) => {
-                    debug!("加载配置源失败: {:#}, 跳过", e);
-                    continue;
-                }
-            }
-        }
-
-        if !has_value {
-            return Err(ConfigError::LoadError(anyhow::anyhow!(
-                "所有配置源均加载失败"
-            )));
-        }
-
-        self.cached_config = Some(final_value);
-        self.metadata = Some(metadata.clone());
-        Ok(self.cached_config.as_ref().unwrap())
-    }
-
-    async fn load_source(
-        &self,
-        source: &ConfigSource,
-        metadata: &mut ConfigMetadata,
-    ) -> ConfigResult<serde_json::Value> {
-        let (source_name, value) = match source {
-            ConfigSource::File(path) => {
-                let res = self.load_file(path).await?;
-                if let Some(format) = ConfigFormat::from_path(path) {
-                    metadata.format = Some(format);
-                }
-                res
-            }
-            ConfigSource::Directory(dir) => {
-                metadata.format = None;
-                self.load_directory(dir, metadata).await?
-            }
-            ConfigSource::Inline(value) => ("inline".to_string(), value.clone()),
-            ConfigSource::Custom(custom) => {
-                metadata.format = None;
-                let value = custom
-                    .load()
-                    .map_err(|e| ConfigError::Custom(e.to_string()))?;
-                ("custom".to_string(), value)
-            }
-        };
-        metadata.sources.push(source_name);
-        Ok(value)
-    }
-
-    async fn load_file(&self, path: &str) -> ConfigResult<(String, serde_json::Value)> {
-        let path_obj = Path::new(path);
-
-        if !path_obj.exists() {
-            return Err(ConfigError::NotFound(path.to_string()));
-        }
-
-        let format = ConfigFormat::from_path(path)
-            .ok_or_else(|| ConfigError::UnsupportedFormat(path.to_string()))?;
-
-        let content = match tokio::fs::read_to_string(path_obj).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to read config file '{}': {}", path, e);
-                return Err(ConfigError::LoadError(anyhow::anyhow!(
-                    "Failed to read {}: {}",
-                    path,
-                    e
-                )));
-            }
-        };
-
-        let value = match Self::parse_content(&content, format) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Failed to parse config file '{}': {}", path, e);
-                return Err(e);
-            }
-        };
-
-        info!("Loaded config file '{}'", path);
-
-        Ok((path.to_string(), value))
-    }
-
-    async fn load_directory(
-        &self,
-        dir: &str,
-        metadata: &mut ConfigMetadata,
-    ) -> ConfigResult<(String, serde_json::Value)> {
-        let dir_path = Path::new(dir);
-        let mut merged = serde_json::Value::Object(serde_json::Map::new());
-
-        let mut entries = vec![];
-        let mut read_dir = tokio::fs::read_dir(dir_path).await?;
-        while let Some(entry) = read_dir.next_entry().await? {
-            entries.push(entry);
-        }
-
-        let mut files: Vec<_> = entries
-            .into_iter()
-            .filter(|e| {
-                let path = e.path();
-                path.is_file() && ConfigFormat::from_path(path.to_str().unwrap_or("")).is_some()
-            })
-            .collect();
-
-        files.sort_by_key(|e| e.path());
-
-        for entry in files {
-            let path = entry.path();
-            let path_str = match path.to_str() {
-                Some(s) => s,
-                None => {
-                    error!("跳过无法转换为 UTF-8 的文件路径: {:?}", path);
-                    continue;
-                }
-            };
-            match self.load_file(path_str).await {
-                Ok((_, value)) => {
-                    merged = Self::deep_merge_json(merged, value);
-                }
-                Err(e) => {
-                    error!("跳过文件 {:?}: {:#}", path, e);
-                    continue;
-                }
-            }
-        }
-
-        metadata.format = None;
-        Ok((dir.to_string(), merged))
-    }
 
     fn parse_content(content: &str, format: ConfigFormat) -> ConfigResult<serde_json::Value> {
         let value = match format {
