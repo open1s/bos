@@ -1,3 +1,5 @@
+//! The ReAct engine: an LLM loop with tools, skills, streaming, and telemetry.
+
 use crate::llm::types::{load_skill_tool, ReactContext, ReactSession};
 use crate::llm::vendor::responses::{ResponsesContentPart, ResponsesItem};
 use crate::llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken};
@@ -31,6 +33,7 @@ pub use error::{BuilderError, ReactError};
 pub use skill_cache::{CachedSkill, SkillCache};
 pub use tool_run::{ToolCallEvent, ToolRunManager};
 
+/// The ReAct loop: LLM calls, tool execution, skills, telemetry, and resilience.
 pub struct ReActEngine<A: ReActApp> {
     llm: Box<dyn LlmClient<A::Session, A::Context> + Send + Sync>,
     tools: Arc<ToolRegistry>,
@@ -47,6 +50,7 @@ pub struct ReActEngine<A: ReActApp> {
     run_manager: Arc<ToolRunManager>,
 }
 
+/// Builder for [`ReActEngine`].
 pub struct ReActEngineBuilder<A: ReActApp> {
     llm: Option<Box<dyn LlmClient<A::Session, A::Context>>>,
     tools: ToolRegistry,
@@ -63,18 +67,22 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     _phantom: std::marker::PhantomData<A>,
 }
 impl<A: ReActApp> ReActEngine<A> {
+    /// Start configuring an engine.
     pub fn builder() -> ReActEngineBuilder<A> {
         ReActEngineBuilder::new()
     }
 
+    /// The manager tracking in-flight tool calls.
     pub fn tool_run_manager(&self) -> &ToolRunManager {
         &self.run_manager
     }
 
+    /// Register a synchronous tool at runtime.
     pub fn register_tool(&self, t: Box<dyn Tool>) {
         self.tools.register_sync(t);
     }
 
+    /// Register an asynchronous tool at runtime.
     pub fn register_async_tool(&self, t: Box<dyn AsyncTool>) {
         self.tools.register_async(t);
     }
@@ -504,6 +512,7 @@ impl<A: ReActApp> ReActEngine<A> {
         Ok(thought)
     }
 
+    /// Run the ReAct loop to completion and return the final answer.
     pub async fn react(
         &mut self,
         persona: Option<String>,
@@ -525,6 +534,7 @@ impl<A: ReActApp> ReActEngine<A> {
         Ok(result)
     }
 
+    /// Run the ReAct loop, streaming tokens as they arrive.
     pub fn react_stream<'a>(
         &'a mut self,
         persona: Option<String>,
@@ -742,14 +752,17 @@ impl<A: ReActApp> ReActEngine<A> {
         self.tool_call_count.store(0, Ordering::Relaxed);
     }
 
+    /// The shared stop flag.
     pub fn get_stop_flag(&self) -> Arc<AtomicBool> {
         self.stop_flag.clone()
     }
 
+    /// Set the shared stop flag.
     pub fn set_stop_flag(&mut self, flag: bool) {
         self.stop_flag.store(flag, Ordering::SeqCst);
     }
 
+    /// Cancel running tools and signal the loop to stop.
     pub fn stop(&mut self) {
         let running = self.run_manager.cancel_all_running();
         for (call_id, name) in running {
@@ -760,6 +773,7 @@ impl<A: ReActApp> ReActEngine<A> {
         self.set_stop_flag(true);
     }
 
+    /// Signal the loop to stop.
     pub fn close(&mut self) {
         self.set_stop_flag(true);
     }

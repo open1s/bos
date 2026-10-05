@@ -1,17 +1,24 @@
 use super::*;
 
 #[derive(Debug, Error)]
+/// Errors raised while running the ReAct loop.
 pub enum ReactError {
+    /// The underlying LLM call failed.
     #[error("LLM error: {0}")]
     Llm(#[from] LlmError),
+    /// A tool failed.
     #[error("Tool error: {0}")]
     ToolError(String),
+    /// The model returned a malformed response.
     #[error("Malformed response: {0}")]
     Malformed(String),
+    /// The engine timed out.
     #[error("Engine timeout: {0}")]
     Timeout(String),
+    /// A resilience guard rejected the call.
     #[error("Resilience error: {0}")]
     Resilience(ResilienceError<LlmError>),
+    /// A hook aborted the run.
     #[error("Hook abort: {0}")]
     HookAbort(String),
 }
@@ -37,7 +44,9 @@ impl From<ResilienceError<()>> for ReactError {
 }
 
 #[derive(Debug, Error)]
+/// Errors raised while building a [`ReActEngine`].
 pub enum BuilderError {
+    /// No LLM client was supplied.
     #[error("LLM is required")]
     MissingLlm,
 }

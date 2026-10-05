@@ -5,14 +5,18 @@ use super::*;
 #[rkyv(crate = qserde::rkyv)]
 /// Lifecycle event for a tool call published on the bus.
 pub struct ToolCallEvent {
+    /// Identifier of the tool call.
     pub call_id: String,
+    /// Name of the tool.
     pub tool: String,
     /// "started" | "completed" | "cancelled" | "failed"
     pub status: String,
+    /// Unix timestamp in milliseconds.
     pub timestamp_ms: u64,
 }
 
 #[derive(Clone)]
+/// Tracks in-flight tool calls and publishes their lifecycle events.
 pub struct ToolRunManager {
     running: Arc<DashMap<String, String>>,
     bus: Option<Bus>,
@@ -26,6 +30,7 @@ impl Default for ToolRunManager {
 }
 
 impl ToolRunManager {
+    /// Create a manager with no bus.
     pub fn new() -> Self {
         Self {
             running: Arc::new(DashMap::new()),
@@ -34,6 +39,7 @@ impl ToolRunManager {
         }
     }
 
+    /// Attach the bus and agent name used for event topics.
     pub fn with_bus(mut self, bus: Bus, agent_name: String) -> Self {
         self.bus = Some(bus);
         self.agent_name = agent_name;
@@ -69,15 +75,18 @@ impl ToolRunManager {
         }
     }
 
+    /// Mark `call_id` running and publish a started event.
     pub fn register(&self, call_id: &str, name: &str) {
         self.running.insert(call_id.to_string(), name.to_string());
         self.publish_event(call_id, name, "started");
     }
 
+    /// Whether `call_id` is still running.
     pub fn is_running(&self, call_id: &str) -> bool {
         self.running.contains_key(call_id)
     }
 
+    /// Mark `call_id` cancelled, returning the tool name if it was running.
     pub fn cancel(&self, call_id: &str) -> Option<String> {
         let name = self.running.remove(call_id).map(|(_, n)| n);
         if let Some(ref n) = name {
@@ -86,18 +95,21 @@ impl ToolRunManager {
         name
     }
 
+    /// Mark `call_id` completed.
     pub fn complete(&self, call_id: &str) {
         if let Some((_, name)) = self.running.remove(call_id) {
             self.publish_event(call_id, &name, "completed");
         }
     }
 
+    /// Mark `call_id` failed.
     pub fn fail(&self, call_id: &str) {
         if let Some((_, name)) = self.running.remove(call_id) {
             self.publish_event(call_id, &name, "failed");
         }
     }
 
+    /// Cancel every running call and return their ids and tool names.
     pub fn cancel_all_running(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
         for entry in self.running.iter() {
@@ -110,6 +122,7 @@ impl ToolRunManager {
         result
     }
 
+    /// Subscribe to the cancellation topic and cancel matching tools.
     pub fn start_listener(&self, tools: Arc<ToolRegistry>) {
         let bus = match self.bus.as_ref() {
             Some(b) => b.clone(),

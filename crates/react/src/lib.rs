@@ -1,5 +1,6 @@
 //! ReAct engine, LLM clients, tool registry, resilience, and runtime seams.
 
+#[warn(missing_docs)]
 pub mod engine;
 pub mod llm;
 pub mod prelude;

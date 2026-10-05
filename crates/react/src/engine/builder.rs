@@ -1,6 +1,7 @@
 use super::*;
 
 impl<A: ReActApp> ReActEngineBuilder<A> {
+    /// Create a builder with sensible defaults.
     pub fn new() -> Self {
         Self {
             llm: None,
@@ -19,6 +20,7 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         }
     }
 
+    /// Set the LLM client.
     pub fn llm<S: Send + Sync + Clone + 'static, C: Send + Sync + Clone + 'static>(
         mut self,
         llm: Box<dyn LlmClient<S, C>>,
@@ -30,31 +32,37 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         self
     }
 
+    /// Register a tool.
     pub fn with_tool(self, t: ToolVariant) -> Self {
         self.tools.register(t);
         self
     }
 
+    /// Wrap and register a synchronous tool.
     pub fn with_sync_tool(self, t: Box<dyn Tool>) -> Self {
         self.tools.register_sync(t);
         self
     }
 
+    /// Wrap and register an asynchronous tool.
     pub fn with_async_tool(self, t: Box<dyn AsyncTool>) -> Self {
         self.tools.register_async(t);
         self
     }
 
+    /// Set the maximum number of ReAct steps.
     pub fn max_steps(mut self, steps: usize) -> Self {
         self.max_steps = steps;
         self
     }
 
+    /// Set the telemetry sink.
     pub fn telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
     }
 
+    /// Set the resilience configuration.
     pub fn resilience(mut self, resilience: ReActResilience) -> Self {
         log::debug!(
             "[ReActEngine] Resilience enabled: circuit_state={:?}, rate_limit_remaining={:?}",
@@ -65,26 +73,31 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         self
     }
 
+    /// Set the per-call LLM timeout in seconds.
     pub fn llm_timeout(mut self, secs: u64) -> Self {
         self.llm_timeout_secs = secs;
         self
     }
 
+    /// Set the model name reported in telemetry.
     pub fn model(mut self, model: String) -> Self {
         self.model = model;
         self
     }
 
+    /// Set the app providing the ReAct hooks.
     pub fn app(mut self, app: A) -> Self {
         self.react_app = Some(app);
         self
     }
 
+    /// Set the bus used to publish tool events.
     pub fn bus(mut self, bus: Bus) -> Self {
         self.bus = Some(bus);
         self
     }
 
+    /// Set the agent name used as the bus topic prefix.
     pub fn agent_name(mut self, name: String) -> Self {
         self.agent_name = name;
         self
@@ -92,6 +105,7 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
 }
 
 impl<A: ReActApp + Default> ReActEngineBuilder<A> {
+    /// Build the engine, or fail if no LLM was set.
     pub fn build(self) -> Result<ReActEngine<A>, BuilderError> {
         let llm = self.llm.ok_or(BuilderError::MissingLlm)?;
         let tools = Arc::new(self.tools);
