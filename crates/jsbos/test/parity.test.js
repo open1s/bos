@@ -189,3 +189,25 @@ test('BrainOS facade surface matches across bindings', (t) => {
     new Set(),
   )
 })
+
+test('Publisher and Subscriber surfaces match across bindings', (t) => {
+  assertNoDrift(
+    t,
+    'Publisher',
+    norm(jsMembers(jsSrc, 'PublisherWrapper')),
+    norm(pyMembers(pySrc, 'Publisher')),
+    // JS keeps text/json as deprecated aliases of publishText/publishJson.
+    new Set(['text', 'json']),
+    new Set(),
+  )
+  assertNoDrift(
+    t,
+    'Subscriber',
+    norm(jsMembers(jsSrc, 'SubscriberWrapper')),
+    norm(pyMembers(pySrc, 'Subscriber')),
+    new Set(),
+    // Python keeps the original *_with_timeout_ms names as deprecated
+    // aliases of recv/recv_json.
+    new Set(['recv_with_timeout_ms', 'recv_json_with_timeout_ms']),
+  )
+})

@@ -10,6 +10,8 @@ use bus::Subscriber;
 #[derive(Clone)]
 pub struct PySubscriber {
     pub inner: Arc<tokio::sync::Mutex<Subscriber<String>>>,
+    // Cached so reading the topic never has to wait for a pending recv.
+    pub topic: String,
 }
 
 impl Drop for PySubscriber {
@@ -33,7 +35,7 @@ impl PySubscriber {
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let session = session_from_bus(bus_inner).await;
-            let sub = Subscriber::<String>::new(topic)
+            let sub = Subscriber::<String>::new(topic.clone())
                 .with_session(session)
                 .await
                 .map_err(crate::utils::to_py_runtime_error)?;
@@ -42,11 +44,16 @@ impl PySubscriber {
                     py,
                     PySubscriber {
                         inner: Arc::new(tokio::sync::Mutex::new(sub)),
+                        topic,
                     },
                 )?;
                 Ok(py_obj.into_any())
             })
         })
+    }
+
+    fn topic(&self) -> String {
+        self.topic.clone()
     }
 
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -106,6 +113,26 @@ impl PySubscriber {
                         let json_value: serde_json::Value = serde_json::from_str(&json_str)
                             .map_err(crate::utils::to_py_runtime_error)?;
                         // Convert serde_json::Value to Python object
+                        crate::utils::json_to_py(py, &json_value)
+                    }
+                    None => Ok(py.None()),
+                }
+            })
+        })
+    }
+
+    fn recv_json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let mut guard = inner.lock().await;
+            let out = guard.recv().await;
+
+            Python::attach(|py| -> PyResult<Py<PyAny>> {
+                match out {
+                    Some(json_str) => {
+                        let json_value: serde_json::Value = serde_json::from_str(&json_str)
+                            .map_err(crate::utils::to_py_runtime_error)?;
                         crate::utils::json_to_py(py, &json_value)
                     }
                     None => Ok(py.None()),

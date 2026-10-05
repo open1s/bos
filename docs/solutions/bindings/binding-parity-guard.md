@@ -78,6 +78,15 @@ is_started, config and create_bus to match the JS entry point. BusManager
 gained start and stop along the way, which also fixed a leak: its __aexit__
 used to return without closing the underlying bus.
 
+The Publisher and Subscriber wrappers now share one vocabulary:
+publish/publish_text/publish_json and recv/recv_json/run/run_json/next, plus
+topic on both. JS keeps text/json as deprecated aliases of publishText and
+publishJson; Python keeps recv_with_timeout_ms and recv_json_with_timeout_ms
+as deprecated aliases of recv and recv_json. Both sets are allowlisted, so
+the guard still fails on any new drift. Fixing the pair closed a latent JS
+bug: SubscriberWrapper.recvJson() with no timeout called a native recvJson
+that does not exist.
+
 Closing the ToolRegistry gap added unregister, list_tool_defs, list_by_category,
 filter and to_json to Python. list_by_category filters on an optional category
 attribute and returns an empty list until Python's ToolDef gains a category

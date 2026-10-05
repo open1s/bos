@@ -154,6 +154,13 @@ class Publisher:
     def topic(self) -> str:
         return self._inner.topic()
 
+    async def publish(self, payload: Any, is_json: bool = False) -> None:
+        """Publish ``payload``, JSON-encoding it when ``is_json`` is true."""
+        if is_json:
+            await self.publish_json(payload)
+        else:
+            await self.publish_text(payload)
+
     async def publish_text(self, payload: str) -> None:
         await self._inner.publish_text(payload)
 
@@ -173,7 +180,7 @@ class Subscriber:
         msg = await sub.recv()
 
         # With timeout
-        msg = await sub.recv_with_timeout_ms(500)
+        msg = await sub.recv(500)
 
         # Async iteration
         async for msg in sub:
@@ -186,14 +193,29 @@ class Subscriber:
     def __init__(self, inner: PySubscriber) -> None:
         self._inner = inner
 
-    async def recv(self) -> str | None:
+    @property
+    def topic(self) -> str:
+        return self._inner.topic()
+
+    async def recv(self, timeout_ms: int | None = None) -> str | None:
+        """Receive the next message, waiting at most ``timeout_ms`` if given."""
+        if timeout_ms is not None:
+            return await self._inner.recv_with_timeout_ms(timeout_ms)
         return await self._inner.recv()
 
+    async def recv_json(self, timeout_ms: int | None = None) -> Any | None:
+        """Receive and decode the next JSON message, with an optional timeout."""
+        if timeout_ms is not None:
+            return await self._inner.recv_json_with_timeout_ms(timeout_ms)
+        return await self._inner.recv_json()
+
     async def recv_with_timeout_ms(self, timeout_ms: int) -> str | None:
-        return await self._inner.recv_with_timeout_ms(timeout_ms)
+        """Deprecated: use ``recv(timeout_ms)`` instead."""
+        return await self.recv(timeout_ms)
 
     async def recv_json_with_timeout_ms(self, timeout_ms: int) -> Any | None:
-        return await self._inner.recv_json_with_timeout_ms(timeout_ms)
+        """Deprecated: use ``recv_json(timeout_ms)`` instead."""
+        return await self.recv_json(timeout_ms)
 
     async def run(self, callback: Callable[[str], None]) -> None:
         await self._inner.run(callback)
@@ -201,13 +223,20 @@ class Subscriber:
     async def run_json(self, callback: Callable[[Any], None]) -> None:
         await self._inner.run_json(callback)
 
+    async def next(self) -> dict[str, Any]:
+        """One async-iterator step: ``{"done": bool, "value": message}``."""
+        message = await self.recv()
+        if message is None:
+            return {"done": True, "value": None}
+        return {"done": False, "value": message}
+
     # ── Async iterator ─────────────────────────────────────────────
 
     def __aiter__(self) -> Subscriber:
         return self
 
     async def __anext__(self) -> str:
-        msg = await self._inner.recv()
-        if msg is None:
+        step = await self.next()
+        if step["done"]:
             raise StopAsyncIteration
-        return msg
+        return step["value"]

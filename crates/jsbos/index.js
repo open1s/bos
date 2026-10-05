@@ -1181,11 +1181,21 @@ class PublisherWrapper {
       : this._inner.publishText(payload);
   }
 
+  /** @deprecated Use publishText. */
   async text(payload) {
     return this._inner.publishText(payload);
   }
 
+  /** @deprecated Use publishJson. */
   async json(data) {
+    return this._inner.publishJson(data);
+  }
+
+  async publishText(payload) {
+    return this._inner.publishText(payload);
+  }
+
+  async publishJson(data) {
     return this._inner.publishJson(data);
   }
 }
@@ -1206,9 +1216,18 @@ class SubscriberWrapper {
   }
 
   async recvJson(timeoutMs) {
-    return timeoutMs
-      ? this._inner.recvJsonWithTimeoutMs(timeoutMs)
-      : this._inner.recvJson();
+    if (timeoutMs) {
+      return this._inner.recvJsonWithTimeoutMs(timeoutMs);
+    }
+    // The native subscriber exposes recvJsonWithTimeoutMs but no plain
+    // recvJson, so decode a normal receive here instead of calling undefined.
+    const raw = await this._inner.recv();
+    if (typeof raw !== "string") return raw;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
   }
 
   async run(callback) {

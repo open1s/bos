@@ -1,7 +1,7 @@
 """Tests for Publisher and Subscriber binding"""
 import pytest
 import asyncio
-from nbos import Bus, BusConfig, Publisher, Subscriber
+from nbos import Bus, BusConfig, BusManager, Publisher, Subscriber
 
 
 class TestPublisher:
@@ -199,3 +199,53 @@ class TestSubscriber:
         received = await sub_task
         
         assert len(received) == 5
+
+    @pytest.mark.asyncio
+    async def test_subscriber_exposes_topic(self):
+        """The native subscriber reports its topic"""
+        bus = await Bus.create(BusConfig())
+        subscriber = await Subscriber.create(bus, "native/topic")
+        assert subscriber.topic() == "native/topic"
+
+    @pytest.mark.asyncio
+    async def test_subscriber_recv_json_without_timeout(self):
+        """Plain recv_json decodes the payload without a timeout argument"""
+        bus = await Bus.create(BusConfig())
+        subscriber = await Subscriber.create(bus, "native/json")
+        publisher = await Publisher.create(bus, "native/json")
+
+        await publisher.publish_json({"n": 7})
+        received = await subscriber.recv_json()
+        assert received == {"n": 7}
+
+
+class TestBusWrappers:
+    """High-level Publisher/Subscriber wrappers (nbos.bus)"""
+
+    @pytest.mark.asyncio
+    async def test_wrapper_publish_and_recv(self):
+        async with BusManager() as bus:
+            subscriber = await bus.create_subscriber("wrap/text")
+            publisher = await bus.create_publisher("wrap/text")
+
+            await publisher.publish("hello", is_json=False)
+            assert await subscriber.recv(1000) == "hello"
+            assert subscriber.topic == "wrap/text"
+
+    @pytest.mark.asyncio
+    async def test_wrapper_json_round_trip(self):
+        async with BusManager() as bus:
+            subscriber = await bus.create_subscriber("wrap/json")
+            publisher = await bus.create_publisher("wrap/json")
+
+            await publisher.publish({"k": 1}, is_json=True)
+            assert await subscriber.recv_json(1000) == {"k": 1}
+
+    @pytest.mark.asyncio
+    async def test_wrapper_next_step(self):
+        async with BusManager() as bus:
+            subscriber = await bus.create_subscriber("wrap/next")
+            publisher = await bus.create_publisher("wrap/next")
+
+            await publisher.publish_text("one")
+            assert await subscriber.next() == {"done": False, "value": "one"}
