@@ -1,25 +1,34 @@
+//! Filesystem and command safety checks for agent tools.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Errors raised by workspace validation.
 #[derive(Debug, Error)]
 pub enum SecurityError {
+    /// The path contains `..` or an unexpected symlink.
     #[error("Path traversal detected: {0}")]
     PathTraversal(String),
 
+    /// The resolved path escapes the workspace root.
     #[error("Path outside workspace: {0}")]
     OutsideWorkspace(String),
 
+    /// A command matched a destructive pattern.
     #[error("Destructive operation: {0}")]
     DestructiveOperation(String),
 
+    /// A command matched an elevated-privilege pattern.
     #[error("Elevated privilege operation: {0}")]
     ElevatedPrivilege(String),
 
+    /// The path could not be canonicalized.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
 
+/// Validates paths and commands against a workspace root.
 pub struct WorkspaceValidator {
     workspace_root: PathBuf,
     allow_symlinks: bool,
@@ -27,6 +36,7 @@ pub struct WorkspaceValidator {
 }
 
 impl WorkspaceValidator {
+    /// Create a validator rooted at `workspace_root`; symlinks and absolute paths are denied.
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
             workspace_root,
@@ -35,11 +45,13 @@ impl WorkspaceValidator {
         }
     }
 
+    /// Allow or deny symlinks.
     pub fn with_symlinks(mut self, allow: bool) -> Self {
         self.allow_symlinks = allow;
         self
     }
 
+    /// Allow or deny absolute paths.
     pub fn with_absolute_paths(mut self, allow: bool) -> Self {
         self.allow_absolute_paths = allow;
         self
@@ -50,6 +62,7 @@ impl WorkspaceValidator {
         Ok(canonical)
     }
 
+    /// Resolve `path` inside the workspace, rejecting traversal and escapes.
     pub fn validate_path(&self, path: &str) -> Result<PathBuf, SecurityError> {
         let input_path = Path::new(path);
 
@@ -105,6 +118,7 @@ impl WorkspaceValidator {
         Ok(normalized)
     }
 
+    /// Whether `command` matches a known destructive pattern.
     pub fn is_destructive_command(command: &str) -> bool {
         let destructive_patterns = [
             "rm -rf",
@@ -125,6 +139,7 @@ impl WorkspaceValidator {
         destructive_patterns.iter().any(|p| cmd_lower.contains(p))
     }
 
+    /// Whether `command` matches a known privilege-escalation pattern.
     pub fn requires_elevated_privilege(command: &str) -> bool {
         let elevated_patterns = [
             "sudo",

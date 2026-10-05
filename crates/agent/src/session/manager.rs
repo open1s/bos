@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Tracks live sessions in an in-memory cache.
 pub struct SessionManager {
     cache: Arc<RwLock<HashMap<String, SessionState>>>,
 }
@@ -16,12 +17,14 @@ struct SessionState {
 }
 
 impl SessionManager {
+    /// Create an empty manager.
     pub fn new(_config: SessionConfig) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
+    /// Register a new session, failing if it already exists.
     pub async fn create(&self, agent_id: String) -> Result<SessionSummary, SessionError> {
         if self.exists(&agent_id).await {
             return Err(SessionError::AlreadyExists(agent_id));
@@ -48,6 +51,7 @@ impl SessionManager {
         Ok(summary)
     }
 
+    /// Summary for one session, if it exists.
     pub async fn get(&self, agent_id: &str) -> Option<SessionSummary> {
         let cache = self.cache.read().await;
         cache.get(agent_id).map(|s| SessionSummary {
@@ -58,6 +62,7 @@ impl SessionManager {
         })
     }
 
+    /// Set and timestamp the stored message count for a session.
     pub async fn update_message_count(
         &self,
         agent_id: &str,
@@ -73,6 +78,7 @@ impl SessionManager {
         }
     }
 
+    /// Remove a session, failing if it does not exist.
     pub async fn delete(&self, agent_id: &str) -> Result<(), SessionError> {
         let mut cache = self.cache.write().await;
         if cache.remove(agent_id).is_some() {
@@ -82,6 +88,7 @@ impl SessionManager {
         }
     }
 
+    /// Summaries for every live session.
     pub async fn list(&self) -> Vec<SessionSummary> {
         let cache = self.cache.read().await;
         cache
@@ -108,11 +115,14 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Errors returned by [`SessionManager`].
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
+    /// No session is registered for the agent.
     #[error("Session not found: {0}")]
     NotFound(String),
 
+    /// A session is already registered for the agent.
     #[error("Session already exists: {0}")]
     AlreadyExists(String),
 }

@@ -9,16 +9,23 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[qserde::Archive]
 pub enum SkillCategory {
+    /// Unclassified skill.
     #[default]
     Other,
+    /// Writes or edits code.
     Code,
+    /// Analyses code or data.
     Analysis,
+    /// Transforms data sets.
     Data,
+    /// Runs tests.
     Testing,
+    /// General-purpose helper.
     Utility,
 }
 
 impl SkillCategory {
+    /// Map a category name to its variant, defaulting to [`SkillCategory::Other`].
     pub fn from_name(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "code" => Self::Code,
@@ -30,6 +37,7 @@ impl SkillCategory {
         }
     }
 
+    /// Lowercase name for this category.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Other => "other",
@@ -46,12 +54,16 @@ impl SkillCategory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[qserde::Archive]
 pub struct SkillVersion {
+    /// Major version.
     pub major: u32,
+    /// Minor version.
     pub minor: u32,
+    /// Patch version.
     pub patch: u32,
 }
 
 impl SkillVersion {
+    /// Create a version from its parts.
     pub fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
             major,
@@ -60,6 +72,7 @@ impl SkillVersion {
         }
     }
 
+    /// Format the version as `major.minor.patch`.
     pub fn display(&self) -> String {
         format!("{}.{}.{}", self.major, self.minor, self.patch)
     }
@@ -69,16 +82,23 @@ impl SkillVersion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[qserde::Archive]
 pub struct SkillMetadata {
+    /// Unique skill name.
     pub name: String,
+    /// One-line description shown to the model.
     pub description: String,
+    /// Path to the skill definition file.
     #[rkyv(with = qserde::rkyv::with::AsString)]
     pub path: PathBuf,
+    /// Classification used when listing skills.
     pub category: SkillCategory,
+    /// Skill version.
     pub version: SkillVersion,
+    /// Free-form tags.
     pub tags: Vec<String>,
 }
 
 impl SkillMetadata {
+    /// Create metadata with the `Other` category, version 1.0.0, and no tags.
     pub fn new(name: String, description: String, path: PathBuf) -> Self {
         Self {
             name,
@@ -95,8 +115,11 @@ impl SkillMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[qserde::Archive]
 pub struct SkillContent {
+    /// Metadata discovered for the skill.
     pub metadata: SkillMetadata,
+    /// Skill body, with frontmatter stripped.
     pub instructions: String,
+    /// Directory containing the skill.
     #[rkyv(with = qserde::rkyv::with::AsString)]
     pub skill_dir: PathBuf,
 }
@@ -108,6 +131,7 @@ pub struct SkillLoader {
 }
 
 impl SkillLoader {
+    /// Create a loader rooted at `skills_dir`.
     pub fn new(skills_dir: PathBuf) -> Self {
         Self {
             skills_dir,
@@ -221,28 +245,34 @@ pub struct SkillInjector {
     compact: bool,
 }
 
+/// Formatting options for skill injection.
 #[derive(Debug, Clone)]
 pub struct InjectionOptions {
+    /// Emit names only instead of full descriptions.
     pub compact: bool,
 }
 
 impl InjectionOptions {
+    /// Options that emit names only.
     pub fn compact() -> Self {
         Self { compact: true }
     }
 }
 
 impl SkillInjector {
+    /// Create an injector that emits full descriptions.
     pub fn new() -> Self {
         Self { compact: false }
     }
 
+    /// Create an injector from explicit [`InjectionOptions`].
     pub fn with_options(options: InjectionOptions) -> Self {
         Self {
             compact: options.compact,
         }
     }
 
+    /// Render the `<available_skills>` block, or an empty string when there are none.
     pub fn inject_available(&self, skills: &[SkillMetadata]) -> String {
         if skills.is_empty() {
             return String::new();
@@ -267,17 +297,22 @@ impl Default for SkillInjector {
     }
 }
 
+/// Errors raised while loading skills.
 #[derive(thiserror::Error, Debug)]
 pub enum SkillError {
+    /// The skills directory does not exist.
     #[error("Directory not found: {0}")]
     DirectoryNotFound(String),
 
+    /// No skill matched the requested name.
     #[error("Skill not found: {0}")]
     NotFound(String),
 
+    /// Reading a skill file failed.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A skill frontmatter block was not valid YAML.
     #[error("YAML parse error: {0}")]
     YamlError(#[from] serde_yaml::Error),
 }
