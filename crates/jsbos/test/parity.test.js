@@ -178,3 +178,14 @@ test('Config surface matches across bindings', (t) => {
     new Set(['add_file', 'add_directory', 'add_inline', 'load_sync', 'reload_sync']),
   )
 })
+
+test('BrainOS facade surface matches across bindings', (t) => {
+  assertNoDrift(
+    t,
+    'BrainOS',
+    norm(jsMembers(jsSrc, 'BrainOS')),
+    norm(pyMembers(pySrc, 'BrainOS')),
+    new Set(),
+    new Set(),
+  )
+})

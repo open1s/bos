@@ -34,7 +34,11 @@ async with BrainOS() as brain:
 
 | Method | Description | Returns |
 |--------|-------------|---------|
+| `create(**options)` | Construct and start in one call (classmethod) | `BrainOS` |
+| `start()` | Create the bus and enter the started state (idempotent) | `BrainOS` |
+| `stop()` | Close the bus and return to the stopped state | `None` |
 | `agent(name, **options)` | Create an AgentBuilder | `AgentBuilder` |
+| `create_bus(**options)` | Build a standalone `BusManager` | `BusManager` |
 | `register_global(*tools)` | Register tools available to all agents | `BrainOS` |
 | `tools(*tools)` | Alias for `register_global` | `BrainOS` |
 
@@ -43,6 +47,8 @@ async with BrainOS() as brain:
 | Property | Type | Description |
 |----------|------|-------------|
 | `bus` | `Bus` | The underlying Bus instance |
+| `is_started` | `bool` | Whether `start()` has run and `stop()` has not |
+| `config` | `Config` | The loaded configuration |
 | `registry` | `ToolRegistry` | Global tool registry |
 
 #### Example

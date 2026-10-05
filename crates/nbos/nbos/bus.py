@@ -51,18 +51,29 @@ class BusManager:
         self._peer = peer
         self._bus: PyBus | None = None
 
-    async def __aenter__(self) -> BusManager:
-        cfg = PyBusConfig(
-            mode=self._mode,
-            connect=self._connect,
-            listen=self._listen,
-            peer=self._peer,
-        )
-        self._bus = await PyBus.create(cfg)
+    async def start(self) -> "BusManager":
+        """Create the underlying bus if it does not exist yet."""
+        if self._bus is None:
+            cfg = PyBusConfig(
+                mode=self._mode,
+                connect=self._connect,
+                listen=self._listen,
+                peer=self._peer,
+            )
+            self._bus = await PyBus.create(cfg)
         return self
 
+    async def stop(self) -> None:
+        """Close the underlying bus and drop the handle."""
+        if self._bus is not None:
+            await self._bus.close()
+            self._bus = None
+
+    async def __aenter__(self) -> BusManager:
+        return await self.start()
+
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        pass
+        await self.stop()
 
     # ── Convenience ────────────────────────────────────────────────
 

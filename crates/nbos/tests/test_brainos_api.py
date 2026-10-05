@@ -245,6 +245,35 @@ class TestConfig:
         assert cfg.get("w") == 2
 
 
+class TestBrainOSFacade:
+    """BrainOS lifecycle and entry-point parity"""
+
+    @pytest.mark.asyncio
+    async def test_create_starts_and_stops(self):
+        brain = await BrainOS.create()
+        assert brain.is_started is True
+        assert isinstance(brain.config, Config)
+        assert brain.registry is not None
+        await brain.stop()
+        assert brain.is_started is False
+
+    @pytest.mark.asyncio
+    async def test_start_is_idempotent(self):
+        brain = BrainOS()
+        assert brain.is_started is False
+        await brain.start()
+        await brain.start()
+        assert brain.is_started is True
+        await brain.stop()
+        assert brain.is_started is False
+
+    @pytest.mark.asyncio
+    async def test_create_bus_returns_started_manager(self):
+        manager = await BrainOS().create_bus()
+        assert manager.bus is not None
+        await manager.stop()
+
+
 class TestBusManager:
     """BusManager lifecycle tests (requires nbos extension)"""
 

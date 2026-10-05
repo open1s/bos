@@ -73,6 +73,11 @@ from_directory and from_inline constructors). The original add_file,
 add_directory, add_inline, load_sync and reload_sync names remain as documented
 aliases, which is the only allowlisted difference.
 
+The BrainOS facade is guarded too. Python gained create, start, stop,
+is_started, config and create_bus to match the JS entry point. BusManager
+gained start and stop along the way, which also fixed a leak: its __aexit__
+used to return without closing the underlying bus.
+
 Closing the ToolRegistry gap added unregister, list_tool_defs, list_by_category,
 filter and to_json to Python. list_by_category filters on an optional category
 attribute and returns an empty list until Python's ToolDef gains a category

@@ -18,13 +18,12 @@ from nbos_native import AgentConfig as PyAgentConfig
 from nbos_native import AgentPlugin as PyAgentPlugin
 from nbos_native import Bus as PyBus
 from nbos_native import BusConfig as PyBusConfig
-from nbos_native import ConfigLoader as PyConfigLoader
 from nbos_native import PythonTool
 from nbos_native import HookEvent, HookDecision, HookContext
 
 from nbos.tool import ToolDef
 from nbos.content import Content as NbosContent
-from nbos.config import DEFAULT_BASE_URL, DEFAULT_MODEL
+from nbos.config import DEFAULT_BASE_URL, DEFAULT_MODEL, Config
 
 # Import ContentPart for convenience
 from nbos.content import ContentPart, Binary
@@ -555,32 +554,67 @@ class BrainOS(AbstractAsyncContextManager):
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
+        **options: Any,
     ) -> None:
-        loader = PyConfigLoader()
-        loader.discover()
-        file_config = loader.load_sync()
-        global_model = file_config.get("global_model", {})
+        self._options = options
+        self._config = Config()
+        self._config.discover().load()
+        global_model = self._config.global_model
+        overrides = config or {}
 
-        if config:
-            self._api_key = api_key or config.get("api_key") or global_model.get("api_key")
-            self._base_url = base_url or config.get("base_url") or global_model.get("base_url", DEFAULT_BASE_URL)
-            self._model = model or config.get("model") or global_model.get("model", DEFAULT_MODEL)
-        else:
-            self._api_key = api_key or global_model.get("api_key")
-            self._base_url = base_url or global_model.get("base_url", DEFAULT_BASE_URL)
-            self._model = model or global_model.get("model", DEFAULT_MODEL)
+        self._api_key = api_key or overrides.get("api_key") or global_model.get("api_key")
+        self._base_url = (
+            base_url
+            or overrides.get("base_url")
+            or global_model.get("base_url", DEFAULT_BASE_URL)
+        )
+        self._model = (
+            model or overrides.get("model") or global_model.get("model", DEFAULT_MODEL)
+        )
 
         self._bus: PyBus | None = None
+        self._started = False
         self._registry = ToolRegistry()
 
-    async def __aenter__(self) -> "BrainOS":
-        self._bus = await PyBus.create(PyBusConfig())
+    @classmethod
+    async def create(cls, **options: Any) -> "BrainOS":
+        """Construct and start an instance in one call."""
+        instance = cls(**options)
+        await instance.start()
+        return instance
+
+    async def start(self) -> "BrainOS":
+        """Start the bus if needed; safe to call more than once."""
+        if self._bus is None:
+            self._bus = await PyBus.create(
+                PyBusConfig(
+                    mode=self._options.get("mode") or self._options.get("bus_mode") or "peer",
+                    connect=self._options.get("connect") or self._options.get("bus_connect"),
+                    listen=self._options.get("listen") or self._options.get("bus_listen"),
+                    peer=self._options.get("peer") or self._options.get("bus_peer"),
+                )
+            )
+        self._started = True
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def stop(self) -> None:
+        """Close the bus and return to the stopped state."""
         if self._bus is not None:
             await self._bus.close()
             self._bus = None
+        self._started = False
+
+    async def create_bus(self, **options: Any) -> Any:
+        """Build a standalone managed bus, mirroring the JS createBus helper."""
+        from nbos.bus import BusManager
+
+        return await BusManager(**options).start()
+
+    async def __aenter__(self) -> "BrainOS":
+        return await self.start()
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.stop()
 
     def agent(
         self,
@@ -617,6 +651,14 @@ class BrainOS(AbstractAsyncContextManager):
 
     def tools(self, *tools: ToolDef) -> "BrainOS":
         return self.register_global(*tools)
+
+    @property
+    def is_started(self) -> bool:
+        return self._started
+
+    @property
+    def config(self) -> Config:
+        return self._config
 
     @property
     def bus(self) -> PyBus:
