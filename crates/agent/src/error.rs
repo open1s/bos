@@ -1,74 +1,14 @@
-//! Agent error types
+//! Agent error types.
 //!
-//! Provides typed errors for the agent crate following the pattern from `brainos-bus`.
+//! The LLM and tool error types are the canonical ones defined in `react`; this
+//! crate re-exports them instead of maintaining parallel enums with lossy
+//! conversions. `AgentError` is the composition point.
 
 use crate::skills::SkillError;
-use react::llm::LlmError as ReactLlmError;
 use thiserror::Error;
 
-/// Errors from LLM client operations.
-#[derive(Error, Debug, Clone)]
-pub enum LlmError {
-    #[error("HTTP error: {0}")]
-    Http(String),
-
-    #[error("Parse error: {0}")]
-    Parse(String),
-
-    #[error("Request timed out")]
-    Timeout,
-
-    #[error("API key is missing")]
-    ApiKeyMissing,
-
-    #[error("Rate limited")]
-    RateLimited,
-}
-
-impl From<reqwest::Error> for LlmError {
-    fn from(e: reqwest::Error) -> Self {
-        if e.is_timeout() {
-            LlmError::Timeout
-        } else {
-            LlmError::Http(e.to_string())
-        }
-    }
-}
-
-impl From<ReactLlmError> for LlmError {
-    fn from(e: ReactLlmError) -> Self {
-        match e {
-            ReactLlmError::Http(s) => LlmError::Http(s),
-            ReactLlmError::Parse(s) => LlmError::Parse(s),
-            ReactLlmError::Timeout => LlmError::Timeout,
-            ReactLlmError::ApiKeyMissing => LlmError::ApiKeyMissing,
-            ReactLlmError::RateLimited => LlmError::RateLimited,
-            ReactLlmError::Other(s) => LlmError::Http(s),
-        }
-    }
-}
-
-/// Errors from tool execution.
-#[derive(Error, Debug, Clone)]
-pub enum ToolError {
-    #[error("Tool not found: {0}")]
-    NotFound(String),
-
-    #[error("Schema mismatch: {message}")]
-    SchemaMismatch { message: String },
-
-    #[error("Execution failed: {0}")]
-    ExecutionFailed(String),
-
-    #[error("Tool execution timed out")]
-    Timeout,
-}
-
-impl From<react::ToolError> for ToolError {
-    fn from(e: react::ToolError) -> Self {
-        ToolError::ExecutionFailed(e.to_string())
-    }
-}
+pub use react::llm::LlmError;
+pub use react::tool::ToolError;
 
 /// Top-level agent errors.
 #[derive(Error, Debug, Clone)]
@@ -92,34 +32,9 @@ pub enum AgentError {
     Serde(String),
 }
 
-impl From<ReactLlmError> for AgentError {
-    fn from(e: ReactLlmError) -> Self {
-        AgentError::Llm(e.into())
-    }
-}
-
 impl From<SkillError> for AgentError {
     fn from(e: SkillError) -> Self {
         AgentError::Session(e.to_string())
-    }
-}
-
-impl From<react::ToolError> for AgentError {
-    fn from(e: react::ToolError) -> Self {
-        AgentError::Tool(ToolError::ExecutionFailed(e.to_string()))
-    }
-}
-
-impl From<crate::error::ToolError> for react::ToolError {
-    fn from(e: crate::error::ToolError) -> Self {
-        match e {
-            crate::error::ToolError::NotFound(s) => react::ToolError::NotFound(s),
-            crate::error::ToolError::SchemaMismatch { message } => {
-                react::ToolError::InvalidInput(message)
-            }
-            crate::error::ToolError::ExecutionFailed(s) => react::ToolError::Failed(s),
-            crate::error::ToolError::Timeout => react::ToolError::Failed("timeout".to_string()),
-        }
     }
 }
 

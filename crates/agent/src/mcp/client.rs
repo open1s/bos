@@ -68,7 +68,7 @@ pub enum McpError {
 
 impl From<McpError> for crate::error::ToolError {
     fn from(e: McpError) -> Self {
-        crate::error::ToolError::ExecutionFailed(e.to_string())
+        crate::error::ToolError::Failed(e.to_string())
     }
 }
 
