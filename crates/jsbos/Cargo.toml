@@ -2,6 +2,7 @@
 name = "jsbos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "JavaScript/Node.js bindings for BrainOS (agent/config/bus) via NAPI-RS"

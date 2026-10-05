@@ -2,6 +2,7 @@
 name = "nbos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Python bindings for BrainOS — multi-language AI agent framework with tools, bus, MCP, skills"
@@ -12,9 +13,6 @@ repository = "https://github.com/open1s/bos"
 [lib]
 name = "nbos_native"
 crate-type = ["cdylib"]
-
-[dev-dependencies]
-maturin = "1.8.7"
 
 [dependencies]
 agent = { path = "../agent" }

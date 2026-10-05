@@ -132,7 +132,7 @@ git push origin feature/your-feature-name
 
 ### 前置要求
 
-- Rust 1.70 或更高版本
+- Rust 1.88 或更高版本
 - Cargo（随 Rust 安装）
 - Git
 

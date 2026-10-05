@@ -230,7 +230,7 @@ Agent uses tool at runtime via ReAct engine
 
 ### Setup
 
-Prerequisites: Rust 1.70+, Python 3.9+ or Node.js 18+, maturin (for Python bindings)
+Prerequisites: Rust 1.88+, Python 3.9+ or Node.js 18+, maturin (for Python bindings)
 
 ```bash
 # Clone and enter the project

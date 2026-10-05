@@ -7,7 +7,7 @@ Comprehensive Python tests for the BOS Python bindings (nbos).
 ### Prerequisites
 
 - Python 3.9+
-- Rust 1.70+ (for building maturin extension)
+- Rust 1.88+ (for building the maturin extension)
 - pytest and pytest-asyncio
 
 ### Installation

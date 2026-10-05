@@ -768,7 +768,7 @@ RPC servers. Agent RPC exposes `AgentRpcClient` / `AgentCallableServer`.
 ## 📋 Version & Compatibility
 
 - **Edition**: 2021
-- **Min Rust**: 1.70+
+- **Min Rust**: 1.88+ (declared as `rust-version` in the workspace manifest)
 - **Feature Flags**: Per-crate feature configuration
 - **Breaking Changes**: Documented in CHANGELOG.md
 

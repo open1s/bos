@@ -2,6 +2,7 @@
 name = "qserde_derive"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Derive helpers for the BOS serde crate"
