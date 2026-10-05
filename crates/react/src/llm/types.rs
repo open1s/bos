@@ -4,8 +4,11 @@ use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Conversation history shared with an LLM client.
 pub trait ReactSession {
+    /// Append a message to the history.
     fn push(&mut self, msg: LlmMessage);
+    /// The accumulated messages, if the session keeps any.
     fn history(&self) -> Option<&[LlmMessage]>;
 }
 
@@ -15,31 +18,48 @@ pub trait ReactSession {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// One part of a multimodal message.
 pub enum ContentPart {
+    /// A text part.
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        /// The text content.
+        text: String,
+    },
+    /// A binary part, such as an image or audio.
     #[serde(rename = "binary")]
-    Binary { binary: Binary },
+    Binary {
+        /// The binary payload.
+        binary: Binary,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Where a [`Binary`] payload comes from.
 pub enum BinarySource {
+    /// A URL to fetch the payload from.
     #[serde(rename = "url")]
     Url(String),
+    /// Base64-encoded payload bytes.
     #[serde(rename = "base64")]
     Base64(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A binary payload attached to a message.
 pub struct Binary {
+    /// MIME type, for example `image/png`.
     #[serde(rename = "content_type")]
     pub content_type: String,
+    /// Where the payload comes from.
     pub source: BinarySource,
+    /// Optional file name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
 impl Binary {
+    /// Build a binary from base64-encoded `content`.
     pub fn from_base64(
         content_type: impl Into<String>,
         content: impl Into<String>,
@@ -52,6 +72,7 @@ impl Binary {
         }
     }
 
+    /// Build a binary from a `url`.
     pub fn from_url(
         content_type: impl Into<String>,
         url: impl Into<String>,
@@ -64,14 +85,17 @@ impl Binary {
         }
     }
 
+    /// Whether the content type is an image.
     pub fn is_image(&self) -> bool {
         self.content_type.starts_with("image/")
     }
 
+    /// Whether the content type is audio.
     pub fn is_audio(&self) -> bool {
         self.content_type.starts_with("audio/")
     }
 
+    /// The payload as a URL, inlining base64 data as a data URL.
     pub fn url(&self) -> String {
         match &self.source {
             BinarySource::Url(url) => url.clone(),
@@ -81,6 +105,7 @@ impl Binary {
         }
     }
 
+    /// Consume the binary and return its URL.
     pub fn into_url(self) -> String {
         match self.source {
             BinarySource::Url(url) => url,
@@ -93,8 +118,11 @@ impl Binary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
+/// Message content: plain text or multimodal parts.
 pub enum Content {
+    /// Plain text.
     Text(String),
+    /// A sequence of multimodal parts.
     Parts(Vec<ContentPart>),
 }
 
@@ -123,42 +151,51 @@ impl<'a> From<&'a String> for Content {
 }
 
 impl Content {
+    /// Create text content.
     pub fn text(text: impl Into<String>) -> Self {
         Content::Text(text.into())
     }
 
+    /// Create content from parts.
     pub fn parts(parts: Vec<ContentPart>) -> Self {
         Content::Parts(parts)
     }
 
+    /// Create content holding one image URL.
     pub fn image(url: impl Into<String>) -> Self {
         Content::binary("image url".to_string(), url.into())
     }
 
+    /// Create content holding base64 audio of `format`.
     pub fn audio(data: impl Into<String>, format: &str) -> Self {
         Content::binary(format!("audio/{}", format), data)
     }
 
+    /// Create content holding an audio URL of `format`.
     pub fn audio_url(url: impl Into<String>, format: &str) -> Self {
         Content::binary_url(format!("audio/{}", format), url)
     }
 
+    /// Create content holding one base64 binary of `content_type`.
     pub fn binary(content_type: impl Into<String>, data: impl Into<String>) -> Self {
         Content::Parts(vec![ContentPart::Binary {
             binary: Binary::from_base64(content_type, data, None),
         }])
     }
 
+    /// Create content holding one binary URL of `content_type`.
     pub fn binary_url(content_type: impl Into<String>, url: impl Into<String>) -> Self {
         Content::Parts(vec![ContentPart::Binary {
             binary: Binary::from_url(content_type, url, None),
         }])
     }
 
+    /// Whether this is plain text.
     pub fn is_text_only(&self) -> bool {
         matches!(self, Content::Text(_))
     }
 
+    /// The text, if this is plain text.
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Content::Text(s) => Some(s),
@@ -170,18 +207,30 @@ impl Content {
 /// Callback invoked with each streamed chunk of text, when one is installed.
 pub type ChunkCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Per-request context: session id, tools, skills, rules, and hooks.
 pub trait ReactContext {
+    /// Identifier for the current session.
     fn session_id(&self) -> String;
+    /// Skills available to the model.
     fn skills(&self) -> Option<&[Skill]>;
+    /// Tools available to the model.
     fn tools(&self) -> Option<&[LlmTool]>;
+    /// Rules constraining the model.
     fn rules(&self) -> Option<&[Rule]>;
+    /// Instructions prepended to the prompt.
     fn instructions(&self) -> Option<&[Instruction]>;
+    /// Add a tool to the context.
     fn add_tool(&mut self, tool: LlmTool);
 
+    /// Called before a request is sent.
     fn notify_request(&self, _req: &LlmRequest);
+    /// Called after a response is received.
     fn notify_response(&self, _resp: &super::LlmResponse);
+    /// Called when a call fails.
     fn notify_error(&self, _err: &LlmError);
+    /// Called with each streamed chunk of text.
     fn on_chunk(&self, _chunk: &str);
+    /// The installed chunk callback, if any.
     fn on_chunk_callback(&self) -> Option<ChunkCallback>;
 }
 
@@ -223,16 +272,21 @@ impl ReactSession for () {
     }
 }
 
+/// Serialization helpers for config-like types.
 pub trait Stringfy: Serialize + for<'de> Deserialize<'de> {
+    /// Serialize to YAML.
     fn yaml(&self) -> String {
         serde_yaml::to_string(&self).unwrap()
     }
+    /// Serialize to JSON.
     fn json(&self) -> String {
         serde_json::to_string(&self).unwrap()
     }
+    /// Serialize to a [`Value`].
     fn to_value(&self) -> Result<Value, serde_json::Error> {
         serde_json::to_value(self)
     }
+    /// Deserialize from a [`Value`].
     fn from_value(value: &Value) -> Result<Self, serde_json::Error>
     where
         Self: Sized,
@@ -242,29 +296,41 @@ pub trait Stringfy: Serialize + for<'de> Deserialize<'de> {
 }
 
 #[derive(Debug, Error, Clone)]
+/// Errors raised by an LLM client.
 pub enum LlmError {
+    /// The HTTP request failed.
     #[error("HTTP error: {0}")]
     Http(String),
+    /// The response could not be parsed.
     #[error("Parse error: {0}")]
     Parse(String),
+    /// The request timed out.
     #[error("Request timed out")]
     Timeout,
+    /// No API key was configured.
     #[error("API key is missing")]
     ApiKeyMissing,
+    /// The provider rate-limited the request.
     #[error("Rate limited")]
     RateLimited,
+    /// Any other error.
     #[error("LLM error: {0}")]
     Other(String),
 }
 
 #[derive(Debug, Error, Clone)]
+/// Errors raised while building a vendor.
 pub enum VendorBuilderError {
+    /// No API key was supplied.
     #[error("API key is required")]
     MissingApiKey,
+    /// No model was supplied.
     #[error("Model is required")]
     MissingModel,
+    /// No endpoint was supplied.
     #[error("Endpoint URL is required")]
     MissingEndpoint,
+    /// The configuration was invalid.
     #[error("Configuration error: {0}")]
     Config(String),
 }
@@ -284,58 +350,79 @@ impl From<reqwest::Error> for LlmError {
 // =============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+/// A message in an LLM conversation.
 pub enum LlmMessage {
+    /// A system message.
     System {
+        /// The system prompt.
         content: String,
     },
+    /// A user message.
     User {
+        /// The user content.
         content: Content,
     },
+    /// An assistant message.
     Assistant {
+        /// The assistant text.
         content: String,
     },
+    /// An assistant request to call a tool.
     AssistantToolCall {
+        /// Id linking this call to its result.
         tool_call_id: String,
+        /// Tool name.
         name: String,
+        /// Tool arguments.
         args: Value,
     },
+    /// The result of a tool call.
     ToolResult {
+        /// Id of the call this answers.
         tool_call_id: String,
+        /// The tool output.
         content: String,
     },
 }
 
 impl LlmMessage {
+    /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self::System {
             content: content.into(),
         }
     }
+    /// Create a user message with arbitrary content.
     pub fn user(content: impl Into<Content>) -> Self {
         Self::User {
             content: content.into(),
         }
     }
+    /// Create a user message from plain text.
     pub fn user_text(content: impl Into<String>) -> Self {
         Self::User {
             content: Content::Text(content.into()),
         }
     }
+    /// Create a user message holding an image URL.
     pub fn user_image(url: impl Into<String>) -> Self {
         Self::User {
             content: Content::image(url),
         }
     }
+    /// Create a user message holding base64 audio.
     pub fn user_audio(data: impl Into<String>, format: &str) -> Self {
         Self::User {
             content: Content::audio(data, format),
         }
     }
+    /// Create an assistant message.
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant {
             content: content.into(),
         }
     }
+    /// Create an assistant tool-call message.
     pub fn assistant_tool_call(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -347,6 +434,7 @@ impl LlmMessage {
             args,
         }
     }
+    /// Create a tool-result message.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self::ToolResult {
             tool_call_id: tool_call_id.into(),
@@ -378,9 +466,13 @@ impl<'a> From<&'a String> for LlmMessage {
 // =============================================================================
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A skill the model can load.
 pub struct Skill {
+    /// Skill category.
     pub category: String,
+    /// Short description.
     pub description: String,
+    /// Skill name.
     pub name: String,
 }
 
@@ -388,15 +480,21 @@ impl Stringfy for Skill {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// The kind of tool passed to the provider.
 pub enum LlmToolKind {
+    /// A normal callable function tool.
     #[default]
     Function,
+    /// A hosted web-search tool.
     WebSearch,
+    /// A hosted file-search tool.
     FileSearch,
+    /// A hosted computer-use tool.
     ComputerUse,
 }
 
 impl LlmToolKind {
+    /// The wire name of this kind.
     pub fn as_str(&self) -> &'static str {
         match self {
             LlmToolKind::Function => "function",
@@ -412,9 +510,13 @@ fn is_function_kind(kind: &LlmToolKind) -> bool {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A tool definition passed to the provider.
 pub struct LlmTool {
+    /// Tool name.
     pub name: String,
+    /// Tool description.
     pub description: String,
+    /// JSON schema for the arguments.
     pub parameters: Value,
     /// Tool kind. `Function` (default) is the normal callable tool. The other
     /// variants map to OpenAI Responses API hosted tools (`web_search`,
@@ -428,6 +530,7 @@ pub struct LlmTool {
 }
 
 impl LlmTool {
+    /// Create a normal function tool.
     pub fn function(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -442,6 +545,7 @@ impl LlmTool {
         }
     }
 
+    /// Create a hosted web-search tool.
     pub fn web_search(config: Option<Value>) -> Self {
         Self {
             name: "web_search".into(),
@@ -452,6 +556,7 @@ impl LlmTool {
         }
     }
 
+    /// Create a hosted file-search tool.
     pub fn file_search(config: Option<Value>) -> Self {
         Self {
             name: "file_search".into(),
@@ -462,6 +567,7 @@ impl LlmTool {
         }
     }
 
+    /// Create a hosted computer-use tool.
     pub fn computer_use(config: Option<Value>) -> Self {
         Self {
             name: "computer_use".into(),
@@ -475,6 +581,7 @@ impl LlmTool {
 
 impl Stringfy for LlmTool {}
 
+/// The built-in tool that loads skill instructions.
 pub fn load_skill_tool() -> LlmTool {
     LlmTool {
         name: "load_skill".to_string(),
@@ -495,33 +602,47 @@ pub fn load_skill_tool() -> LlmTool {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A rule that constrains the model.
 pub struct Rule {
+    /// Rule name.
     pub name: String,
+    /// Rule text.
     pub content: String,
 }
 
 impl Stringfy for Rule {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// An instruction prepended to the prompt.
 pub struct Instruction {
+    /// The instruction text.
     pub instruction: String,
+    /// Short description.
     pub description: String,
+    /// Instruction name.
     pub name: String,
+    /// Names of instructions that must run first.
     pub dependon: Option<Vec<String>>,
 }
 
 impl Stringfy for Instruction {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A ready-made [`ReactContext`] with tools, skills, rules, and history.
 pub struct LlmContext {
+    /// Tools available to the model.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<LlmTool>,
+    /// Skills available to the model.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<Skill>,
+    /// Prior conversation messages.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub conversations: Vec<LlmMessage>,
+    /// Rules constraining the model.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
+    /// Instructions prepended to the prompt.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub instructions: Vec<Instruction>,
 }
@@ -576,15 +697,22 @@ impl ReactContext for LlmContext {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+/// A request to an LLM provider.
 pub struct LlmRequest {
+    /// Model identifier.
     pub model: String,
+    /// The prompt content.
     pub input: Content,
+    /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Nucleus sampling probability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    /// Top-k sampling cutoff.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
+    /// Completion token cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// Reasoning effort for supported reasoning models (`low`/`medium`/`high`).
@@ -608,6 +736,7 @@ pub enum ApiMode {
 }
 
 impl ApiMode {
+    /// The wire name of this mode.
     pub fn as_str(&self) -> &'static str {
         match self {
             ApiMode::Chat => "chat",
@@ -615,6 +744,7 @@ impl ApiMode {
         }
     }
 
+    /// Parse `s`, defaulting to chat.
     pub fn from_name(s: &str) -> Self {
         match s {
             "responses" => ApiMode::Responses,
@@ -627,12 +757,16 @@ impl ApiMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    /// Low reasoning effort.
     Low,
+    /// Medium reasoning effort.
     Medium,
+    /// High reasoning effort.
     High,
 }
 
 impl ReasoningEffort {
+    /// The wire name of this effort.
     pub fn as_str(&self) -> &'static str {
         match self {
             ReasoningEffort::Low => "low",
@@ -641,6 +775,7 @@ impl ReasoningEffort {
         }
     }
 
+    /// Parse `s`, defaulting to medium.
     pub fn from_name(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "low" => ReasoningEffort::Low,
@@ -651,6 +786,7 @@ impl ReasoningEffort {
 }
 
 impl LlmRequest {
+    /// Create a request for `model` with default sampling.
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -664,31 +800,37 @@ impl LlmRequest {
         }
     }
 
+    /// Set the sampling temperature.
     pub fn temperature(mut self, temp: f32) -> Self {
         self.temperature = Some(temp);
         self
     }
 
+    /// Set the completion token cap.
     pub fn max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
         self
     }
 
+    /// Set nucleus sampling probability.
     pub fn top_p(mut self, top_p: f32) -> Self {
         self.top_p = Some(top_p);
         self
     }
 
+    /// Set the top-k sampling cutoff.
     pub fn top_k(mut self, top_k: u32) -> Self {
         self.top_k = Some(top_k);
         self
     }
 
+    /// Set the reasoning effort.
     pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
         self
     }
 
+    /// Set the API protocol.
     pub fn api_mode(mut self, mode: ApiMode) -> Self {
         self.api_mode = mode;
         self
@@ -715,24 +857,29 @@ pub struct LlmSession {
 }
 
 impl LlmSession {
+    /// Create an empty session.
     pub fn new() -> Self {
         Self {
             history: Arc::new(Vec::new()),
         }
     }
 
+    /// Append a message to the history.
     pub fn push(&mut self, msg: LlmMessage) {
         Arc::make_mut(&mut self.history).push(msg);
     }
 
+    /// Append another session history.
     pub fn merge(&mut self, other: LlmSession) {
         Arc::make_mut(&mut self.history).extend_from_slice(&other.history);
     }
 
+    /// Number of messages in the history.
     pub fn len(&self) -> usize {
         self.history.len()
     }
 
+    /// Whether the history is empty.
     pub fn is_empty(&self) -> bool {
         self.history.is_empty()
     }
