@@ -248,6 +248,55 @@ class AgentBuilder:
         self._config.circuit_breaker_cooldown_secs = circuit_breaker_cooldown_secs
         return self
 
+    def with_circuit_breaker(
+        self, max_failures: int, cooldown_secs: int = 30
+    ) -> "AgentBuilder":
+        """Set circuit-breaker thresholds (matches JS circuitBreaker)."""
+        self._config.circuit_breaker_max_failures = max_failures
+        self._config.circuit_breaker_cooldown_secs = cooldown_secs
+        return self
+
+    def with_rate_limit(
+        self, capacity: int, window_secs: int = 60, max_retries: int = 3
+    ) -> "AgentBuilder":
+        """Set the rate limiter (matches JS rateLimit)."""
+        self._config.rate_limit_capacity = capacity
+        self._config.rate_limit_window_secs = window_secs
+        self._config.rate_limit_max_retries = max_retries
+        return self
+
+    def with_config(self, config: dict[str, Any]) -> "AgentBuilder":
+        """Apply a config mapping in one call (matches JS withConfig)."""
+        if config.get("name"):
+            self._config.name = config["name"]
+        if config.get("model"):
+            self._config.model = config["model"]
+        if config.get("base_url"):
+            self._config.base_url = config["base_url"]
+        if config.get("api_key"):
+            self._config.api_key = config["api_key"]
+        if config.get("system_prompt"):
+            self._config.system_prompt = config["system_prompt"]
+        if config.get("temperature") is not None:
+            self._config.temperature = config["temperature"]
+        if config.get("timeout_secs"):
+            self._config.timeout_secs = config["timeout_secs"]
+        if config.get("max_tokens"):
+            self._config.max_tokens = config["max_tokens"]
+        if config.get("api_mode"):
+            self._config.api_mode = config["api_mode"]
+        if config.get("reasoning_effort"):
+            self._config.reasoning_effort = config["reasoning_effort"]
+        if config.get("circuit_breaker"):
+            cb = config["circuit_breaker"]
+            self.with_circuit_breaker(cb["max_failures"], cb.get("cooldown_secs", 30))
+        if config.get("rate_limit"):
+            rl = config["rate_limit"]
+            self.with_rate_limit(
+                rl["capacity"], rl.get("window_secs", 60), rl.get("max_retries", 3)
+            )
+        return self
+
     def with_hooks(self, hooks: dict[str, Callable] | list[tuple[str, Callable]]) -> "AgentBuilder":
         if isinstance(hooks, dict):
             for event, callback in hooks.items():

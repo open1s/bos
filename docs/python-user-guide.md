@@ -764,6 +764,9 @@ LLM-powered agent with tool support. Created via `AgentBuilder` (`.with_X()` cha
 | `with_temperature(temp)` | Set temperature | `AgentBuilder` |
 | `with_timeout(secs)` | Set timeout | `AgentBuilder` |
 | `with_resilience(**opts)` | Set resilience config | `AgentBuilder` |
+| `with_config(config)` | Apply a config mapping in one call | `AgentBuilder` |
+| `with_circuit_breaker(max_failures, cooldown_secs=30)` | Set circuit breaker | `AgentBuilder` |
+| `with_rate_limit(capacity, window_secs=60, max_retries=3)` | Set rate limiter | `AgentBuilder` |
 | `with_tools(*tools)` | Register one or more tools | `AgentBuilder` |
 | `register(*tools)` | Alias for with_tools | `AgentBuilder` |
 | `with_hooks(hooks)` | Register lifecycle hooks | `AgentBuilder` |

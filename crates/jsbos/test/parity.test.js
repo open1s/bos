@@ -47,13 +47,13 @@ function pyMembers(src, className) {
 }
 
 const snake = (name) => name.replace(/[A-Z]/g, (ch) => '_' + ch.toLowerCase())
-const normJs = (set) =>
-  new Set([...set].map(snake).filter((name) => !name.startsWith('_')))
-const normPy = (set) =>
+const stripWith = (name) => (name.startsWith('with_') ? name.slice(5) : name)
+// Normalize both bindings: camelCase to snake_case, drop the optional with_
+// builder prefix on either side, and ignore private members. A withFoo setter
+// therefore matches a foo getter; the contract checks presence, not arity.
+const norm = (members) =>
   new Set(
-    [...set]
-      .filter((name) => !name.startsWith('_'))
-      .map((name) => (name.startsWith('with_') ? name.slice(5) : name)),
+    [...members].map(snake).map(stripWith).filter((name) => !name.startsWith('_')),
   )
 
 function assertNoDrift(t, label, js, py, knownJsOnly, knownPyOnly) {
@@ -67,29 +67,23 @@ test('SessionManager surface matches across bindings', (t) => {
   assertNoDrift(
     t,
     'SessionManager',
-    normJs(jsMembers(jsSrc, 'SessionManager')),
-    normPy(pyMembers(pySrc, 'SessionManager')),
+    norm(jsMembers(jsSrc, 'SessionManager')),
+    norm(pyMembers(pySrc, 'SessionManager')),
     new Set(['import']),
     new Set(),
   )
 })
 
 test('high-level agent surface matches across bindings', (t) => {
-  const js = normJs(jsMembers(jsSrc, 'AgentBuilder'))
-  const py = normPy(new Set([...pyMembers(pySrc, 'Agent'), ...pyMembers(pySrc, 'AgentBuilder')]))
+  const js = norm(jsMembers(jsSrc, 'AgentBuilder'))
+  const py = norm(new Set([...pyMembers(pySrc, 'Agent'), ...pyMembers(pySrc, 'AgentBuilder')]))
   assertNoDrift(
     t,
     'Agent',
     js,
     py,
-    new Set([
-      'circuit_breaker',
-      'rate_limit',
-      'skills_from_dir',
-      'system',
-      'with_config',
-      'with_tools',
-    ]),
+    // Remaining differences are aliases and naming choices, not capabilities.
+    new Set(['skills_from_dir', 'system']),
     new Set(['chat', 'plugins', 'skills_dir']),
   )
 })

@@ -384,6 +384,28 @@ class TestAgentAccessors:
             assert await agent.list_mcp_prompts() == []
 
     @pytest.mark.asyncio
+    async def test_agent_builder_with_config_and_resilience(self):
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            builder = brain.agent("cfg").with_config(
+                {
+                    "temperature": 0.2,
+                    "max_tokens": 512,
+                    "rate_limit": {"capacity": 10, "window_secs": 5, "max_retries": 2},
+                    "circuit_breaker": {"max_failures": 3, "cooldown_secs": 45},
+                }
+            )
+            assert builder._config.temperature == pytest.approx(0.2)
+            assert builder._config.max_tokens == 512
+            assert builder._config.rate_limit_capacity == 10
+            assert builder._config.rate_limit_window_secs == 5
+            assert builder._config.circuit_breaker_max_failures == 3
+            assert builder._config.circuit_breaker_cooldown_secs == 45
+            builder.with_rate_limit(7).with_circuit_breaker(9)
+            assert builder._config.rate_limit_capacity == 7
+            assert builder._config.circuit_breaker_max_failures == 9
+
+    @pytest.mark.asyncio
     async def test_agent_stop_suppresses_next_call(self):
         from nbos import BrainOS
         async with BrainOS() as brain:
