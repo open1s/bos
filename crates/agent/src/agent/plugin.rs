@@ -1,35 +1,55 @@
+//! Plugin hooks that can rewrite LLM requests, responses, tool calls, and
+//! stream tokens.
+
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use react::llm::Content;
 
+/// Stage at which an LLM plugin runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LlmStage {
+    /// Before the request is sent.
     PreRequest,
+    /// After the response is received.
     PostResponse,
 }
 
+/// Stage at which a tool plugin runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolStage {
+    /// Before the tool runs.
     PreExecute,
+    /// After the tool returns.
     PostExecute,
 }
 
+/// A plugin-facing view of an LLM request.
 #[derive(Debug, Clone)]
 pub struct LlmRequestWrapper {
+    /// Model identifier.
     pub model: String,
+    /// Conversation input.
     pub input: Content,
+    /// Optional sampling temperature.
     pub temperature: Option<f32>,
+    /// Optional completion token cap.
     pub max_tokens: Option<u32>,
+    /// Optional nucleus sampling parameter.
     pub top_p: Option<f32>,
+    /// Optional top-k sampling parameter.
     pub top_k: Option<u32>,
+    /// Optional reasoning effort.
     pub reasoning_effort: Option<react::llm::ReasoningEffort>,
+    /// API mode to use.
     pub api_mode: react::llm::ApiMode,
+    /// Free-form key-value metadata.
     pub metadata: std::collections::HashMap<String, String>,
 }
 
 impl LlmRequestWrapper {
+    /// Wrap a borrowed [`LlmRequest`](react::llm::LlmRequest).
     pub fn new(request: &react::llm::LlmRequest) -> Self {
         Self {
             model: request.model.clone(),
@@ -44,6 +64,7 @@ impl LlmRequestWrapper {
         }
     }
 
+    /// Convert back into an [`LlmRequest`](react::llm::LlmRequest).
     pub fn into_request(self) -> react::llm::LlmRequest {
         react::llm::LlmRequest {
             model: self.model,
@@ -58,27 +79,41 @@ impl LlmRequestWrapper {
     }
 }
 
+/// A plugin-facing view of an LLM response.
 #[derive(Debug, Clone)]
 pub enum LlmResponseWrapper {
+    /// A Chat Completions response.
     OpenAI(react::llm::vendor::ChatCompletionResponse),
+    /// A Responses API response.
     Responses(react::llm::vendor::ResponsesResponse),
 }
 
+/// A plugin-facing view of one stream token.
 #[derive(Debug, Clone)]
 pub enum StreamTokenWrapper {
+    /// Plain text output.
     Text(String),
+    /// Reasoning text emitted alongside the answer.
     ReasoningContent(String),
+    /// A tool call request.
     ToolCall {
+        /// Tool name.
         name: String,
+        /// Tool arguments.
         args: serde_json::Value,
+        /// Optional provider-assigned call id.
         id: Option<String>,
     },
+    /// Token usage reported by the provider.
     Usage(react::llm::vendor::openaicompatible::Usage),
+    /// The stream completed normally.
     Done,
+    /// The stream was stopped early.
     Stopped,
 }
 
 impl StreamTokenWrapper {
+    /// Wrap a borrowed [`StreamToken`](react::llm::StreamToken).
     pub fn new(token: &react::llm::StreamToken) -> Self {
         match token {
             react::llm::StreamToken::Text(s) => StreamTokenWrapper::Text(s.clone()),
@@ -96,6 +131,7 @@ impl StreamTokenWrapper {
         }
     }
 
+    /// Convert back into a [`StreamToken`](react::llm::StreamToken).
     pub fn into_token(self) -> react::llm::StreamToken {
         match self {
             StreamTokenWrapper::Text(s) => react::llm::StreamToken::Text(s),
@@ -111,6 +147,7 @@ impl StreamTokenWrapper {
 }
 
 impl LlmResponseWrapper {
+    /// Wrap a borrowed [`LlmResponse`](react::llm::LlmResponse).
     pub fn new(response: &react::llm::LlmResponse) -> Self {
         match response {
             react::llm::LlmResponse::OpenAI(resp) => LlmResponseWrapper::OpenAI(resp.clone()),
@@ -118,6 +155,7 @@ impl LlmResponseWrapper {
         }
     }
 
+    /// Convert back into an [`LlmResponse`](react::llm::LlmResponse).
     pub fn into_response(self) -> react::llm::LlmResponse {
         match self {
             LlmResponseWrapper::OpenAI(resp) => react::llm::LlmResponse::OpenAI(resp),
@@ -126,15 +164,21 @@ impl LlmResponseWrapper {
     }
 }
 
+/// A plugin-facing view of a tool call.
 #[derive(Debug, Clone)]
 pub struct ToolCallWrapper {
+    /// Tool name.
     pub name: String,
+    /// Tool arguments.
     pub args: serde_json::Value,
+    /// Optional provider-assigned call id.
     pub id: Option<String>,
+    /// Free-form key-value metadata.
     pub metadata: std::collections::HashMap<String, String>,
 }
 
 impl ToolCallWrapper {
+    /// Create a tool call wrapper.
     pub fn new(name: impl Into<String>, args: serde_json::Value, id: Option<String>) -> Self {
         Self {
             name: name.into(),
@@ -144,6 +188,7 @@ impl ToolCallWrapper {
         }
     }
 
+    /// Create a wrapper from borrowed tool-call fields.
     pub fn from_tool_call(name: &str, args: &serde_json::Value, id: Option<&str>) -> Self {
         Self {
             name: name.to_string(),
@@ -154,15 +199,21 @@ impl ToolCallWrapper {
     }
 }
 
+/// A plugin-facing view of a tool result.
 #[derive(Debug, Clone)]
 pub struct ToolResultWrapper {
+    /// Result value, or null on failure.
     pub result: serde_json::Value,
+    /// Whether the tool succeeded.
     pub success: bool,
+    /// Error message when `success` is false.
     pub error: Option<String>,
+    /// Free-form key-value metadata.
     pub metadata: std::collections::HashMap<String, String>,
 }
 
 impl ToolResultWrapper {
+    /// Wrap a successful result value.
     pub fn new(result: serde_json::Value) -> Self {
         Self {
             result,
@@ -172,6 +223,7 @@ impl ToolResultWrapper {
         }
     }
 
+    /// Wrap a `Result` from the tool layer.
     pub fn from_result(result: &Result<serde_json::Value, react::tool::ToolError>) -> Self {
         match result {
             Ok(v) => Self::new(v.clone()),
@@ -184,6 +236,7 @@ impl ToolResultWrapper {
         }
     }
 
+    /// Convert back into a `Result`.
     pub fn into_result(self) -> Result<serde_json::Value, react::tool::ToolError> {
         if self.success {
             Ok(self.result)
@@ -196,55 +249,68 @@ impl ToolResultWrapper {
 }
 
 #[async_trait]
+/// A hook that can rewrite requests, responses, tool calls, and tokens.
 pub trait AgentPlugin: Send + Sync + 'static {
+    /// Unique plugin name.
     fn name(&self) -> &str;
 
+    /// Rewrite an LLM request before it is sent; return `None` to veto.
     async fn on_llm_request(&self, request: LlmRequestWrapper) -> Option<LlmRequestWrapper> {
         Some(request)
     }
 
+    /// Rewrite an LLM response; return `None` to veto.
     async fn on_llm_response(&self, response: LlmResponseWrapper) -> Option<LlmResponseWrapper> {
         Some(response)
     }
 
+    /// Rewrite a tool call before execution; return `None` to veto.
     async fn on_tool_call(&self, tool_call: ToolCallWrapper) -> Option<ToolCallWrapper> {
         Some(tool_call)
     }
 
+    /// Rewrite a tool result; return `None` to veto.
     async fn on_tool_result(&self, tool_result: ToolResultWrapper) -> Option<ToolResultWrapper> {
         Some(tool_result)
     }
 
+    /// Rewrite a stream token; return `None` to veto.
     async fn on_stream_token(&self, token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
         Some(token)
     }
 }
 
 #[derive(Default, Clone)]
+/// An ordered collection of [`AgentPlugin`]s.
 pub struct PluginRegistry {
     plugins: Arc<Mutex<Vec<Arc<dyn AgentPlugin>>>>,
     plugin_count: Arc<AtomicUsize>,
 }
 
 impl PluginRegistry {
+    /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Append a plugin.
     pub fn register(&self, plugin: Arc<dyn AgentPlugin>) {
         let mut plugins = self.plugins.lock().unwrap();
         plugins.push(plugin);
         self.plugin_count.store(plugins.len(), Ordering::Release);
     }
 
+    /// Snapshot of the registered plugins.
     pub fn plugins(&self) -> Vec<Arc<dyn AgentPlugin>> {
         self.plugins.lock().unwrap().clone()
     }
 
+    /// Blocking alias for [`PluginRegistry::plugins`].
     pub fn plugins_blocking(&self) -> Vec<Arc<dyn AgentPlugin>> {
         self.plugins()
     }
 
+    /// Names of the registered plugins.
     pub fn plugin_names_blocking(&self) -> Vec<String> {
         self.plugins_blocking()
             .iter()
@@ -252,27 +318,33 @@ impl PluginRegistry {
             .collect()
     }
 
+    /// Blocking alias for [`PluginRegistry::register`].
     pub fn register_blocking(&self, plugin: Arc<dyn AgentPlugin>) {
         self.register(plugin)
     }
 
+    /// Number of registered plugins.
     pub fn len(&self) -> usize {
         self.plugin_count.load(Ordering::Acquire)
     }
 
+    /// Whether no plugins are registered.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Whether at least one plugin is registered.
     pub fn has_plugins(&self) -> bool {
         !self.is_empty()
     }
 
+    /// Remove every plugin.
     pub fn clear(&self) {
         self.plugins.lock().unwrap().clear();
         self.plugin_count.store(0, Ordering::Release);
     }
 
+    /// Blocking alias for [`PluginRegistry::clear`].
     pub fn clear_blocking(&self) {
         self.clear();
     }

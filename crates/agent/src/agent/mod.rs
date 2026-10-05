@@ -6,6 +6,7 @@ pub mod config;
 pub mod context;
 #[warn(missing_docs)]
 pub mod hooks;
+#[warn(missing_docs)]
 pub mod plugin;
 
 pub use self::agentic::{Agent, AgentConfig};
