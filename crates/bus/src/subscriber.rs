@@ -125,29 +125,6 @@ where
         }
     }
 
-    /// Create a stream of messages (requires subscriber to be initialized)
-    pub fn _stream_placeholder_(&mut self) -> tokio::sync::mpsc::Receiver<T> {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-        let subscriber = self.subscriber.take();
-        if let Some(sub) = subscriber {
-            tokio::spawn(async move {
-                while let Ok(sample) = sub.recv_async().await {
-                    let bytes = sample.payload().to_bytes();
-                    if let Ok(result) = Codec.decode::<T>(bytes.as_ref()) {
-                        // Move ownership of the decoded message
-                        let msg = result;
-                        if tx.send(msg).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
-        rx
-    }
-
     /// Get the topic
     pub fn topic(&self) -> &str {
         &self.topic

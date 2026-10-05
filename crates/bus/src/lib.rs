@@ -1,3 +1,5 @@
+//! BrainOS communication layer: pub/sub, queryable, and caller/callable over Zenoh.
+
 mod callable;
 mod caller;
 pub mod codec;

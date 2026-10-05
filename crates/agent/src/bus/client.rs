@@ -215,8 +215,8 @@ impl AgentRpcClient {
     ) -> Result<serde_json::Value, ToolError> {
         let mut text = String::new();
         let mut chunks = Vec::new();
-        let mut _stream_placeholder_ = self.stream_run_live(task).await?;
-        while let Some(item) = _stream_placeholder_.next().await {
+        let mut token_stream = self.stream_run_live(task).await?;
+        while let Some(item) = token_stream.next().await {
             match item? {
                 crate::StreamToken::Text(t) => {
                     text.push_str(&t);

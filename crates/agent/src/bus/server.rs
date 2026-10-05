@@ -33,11 +33,11 @@ pub(crate) async fn handle_rpc_request(
         }
         "stream/run" | "stream_run" => {
             let task = req.task.unwrap_or_default();
-            let mut _stream_placeholder_ = agent.stream(&task);
+            let mut token_stream = agent.stream(&task);
             let mut text = String::new();
             let mut chunks: Vec<String> = Vec::new();
             loop {
-                match _stream_placeholder_.next().await {
+                match token_stream.next().await {
                     Some(Ok(crate::StreamToken::Text(t))) => {
                         text.push_str(&t);
                         chunks.push(t);
@@ -224,10 +224,10 @@ pub(crate) async fn handle_incoming_query(
 
     if matches!(req.method.as_str(), "stream/run" | "stream_run") {
         let task = req.task.unwrap_or_default();
-        let mut _stream_placeholder_ = agent.stream(&task);
+        let mut token_stream = agent.stream(&task);
         let mut full_text = String::new();
 
-        while let Some(item) = _stream_placeholder_.next().await {
+        while let Some(item) = token_stream.next().await {
             match item {
                 Ok(crate::StreamToken::Text(t)) => {
                     full_text.push_str(&t);
@@ -693,8 +693,8 @@ mod tests {
         let client = AgentRpcClient::with_transport("agent/rpc/x", transport);
 
         let mut out = String::new();
-        let mut _stream_placeholder_ = client.stream_run_live("hello").await.unwrap();
-        while let Some(item) = _stream_placeholder_.next().await {
+        let mut token_stream = client.stream_run_live("hello").await.unwrap();
+        while let Some(item) = token_stream.next().await {
             match item.unwrap() {
                 crate::StreamToken::Text(t) => out.push_str(&t),
                 crate::StreamToken::Done => break,

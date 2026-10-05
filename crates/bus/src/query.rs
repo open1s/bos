@@ -165,37 +165,6 @@ impl Query {
         Ok(rx)
     }
 
-    /// Send a query and process responses with a callback
-    pub async fn _stream_placeholder_<Q, R>(&self, payload: &Q) -> Result<Vec<R>, ZenohError>
-    where
-        Q: Archive,
-        for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
-        R: Archive,
-        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
-    {
-        let codec = DEFAULT_CODEC;
-        let bytes = codec
-            .encode(payload)
-            .map_err(|e| ZenohError::Serialization(e.to_string()))?;
-        let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
-        let replies = session
-            .get(&self.topic)
-            .payload(bytes)
-            .consolidation(ConsolidationMode::None)
-            .await?;
-
-        let mut results = Vec::new();
-        while let Ok(reply) = replies.recv_async().await {
-            if let Ok(sample) = reply.result() {
-                let decoded = codec
-                    .decode(sample.payload().to_bytes().as_ref())
-                    .map_err(|e| ZenohError::Serialization(e.to_string()))?;
-                results.push(decoded);
-            }
-        }
-        Ok(results)
-    }
-
     async fn query_internal_bytes(
         &self,
         payload: &[u8],
@@ -222,21 +191,6 @@ impl Query {
         }
 
         Ok(results)
-    }
-
-    /// Compat shim for old naming
-    pub async fn query_with_timeoutquery<Q, R>(
-        &self,
-        payload: &Q,
-        timeout: std::time::Duration,
-    ) -> Result<R, ZenohError>
-    where
-        Q: Archive,
-        for<'a> Q: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
-        R: Archive,
-        R::Archived: rkyv::Deserialize<R, rkyv::api::high::HighDeserializer<Error>>,
-    {
-        self.query_with_timeout(payload, timeout).await
     }
 
     /// Get the topic

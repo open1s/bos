@@ -976,8 +976,8 @@ impl PyAgent {
             let (tx, rx) = mpsc::channel::<Result<String, String>>(32);
 
             tokio::spawn(async move {
-                let mut _stream_placeholder_ = agent_clone.stream(task_content);
-                while let Some(token_result) = _stream_placeholder_.next().await {
+                let mut token_stream = agent_clone.stream(task_content);
+                while let Some(token_result) = token_stream.next().await {
                     let item = match token_result {
                         Ok(StreamToken::Text(text)) => Ok(text),
                         Ok(StreamToken::ReasoningContent(text)) => Ok(serde_json::json!({

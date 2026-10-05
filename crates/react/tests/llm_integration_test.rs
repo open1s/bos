@@ -213,12 +213,12 @@ async fn test_nvidia_vendor_stream_with_config() {
         .await;
 
     match stream_result {
-        Ok(mut _stream_placeholder_) => {
+        Ok(mut token_stream) => {
             use futures::StreamExt;
             let mut collected_text = String::new();
             let mut has_content = false;
 
-            while let Some(token_result) = _stream_placeholder_.next().await {
+            while let Some(token_result) = token_stream.next().await {
                 match token_result {
                     Ok(token) => {
                         use react::llm::StreamToken;
@@ -522,7 +522,7 @@ async fn test_nvidia_tool_calls_stream_with_config() {
         .await;
 
     match stream_result {
-        Ok(mut _stream_placeholder_) => {
+        Ok(mut token_stream) => {
             let mut has_tool_call = false;
             let mut tool_call_name = String::new();
             #[allow(unused_assignments)]
@@ -530,7 +530,7 @@ async fn test_nvidia_tool_calls_stream_with_config() {
             let mut tool_call_id: Option<String> = None;
             let mut collected_text = String::new();
 
-            while let Some(token_result) = _stream_placeholder_.next().await {
+            while let Some(token_result) = token_stream.next().await {
                 match token_result {
                     Ok(token) => {
                         use react::llm::StreamToken;
