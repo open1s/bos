@@ -12,6 +12,7 @@ pub mod runtime;
 pub mod telemetry;
 #[warn(missing_docs)]
 pub mod tool;
+#[warn(missing_docs)]
 pub mod utils;
 
 pub use prelude::*;

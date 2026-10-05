@@ -1,14 +1,20 @@
+//! Streaming JSON/XML extractors, span tracking, and byte-arena utilities.
+
 /// Span representing a matched element with its position, nesting level, and parent span
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Span {
+    /// Byte offset where the span starts.
     pub start: usize,
+    /// Byte offset one past the span end.
     pub end: usize,
+    /// Nesting depth, with 1 for the outermost element.
     pub level: usize,
     /// Index of parent span in the spans list (None for root elements)
     pub parent_idx: Option<usize>,
 }
 
 impl Span {
+    /// Create a root span covering `start..end` at `level`.
     pub fn new(start: usize, end: usize, level: usize) -> Self {
         Self {
             start,
@@ -18,47 +24,58 @@ impl Span {
         }
     }
 
+    /// The span start offset.
     pub fn start(&self) -> usize {
         self.start
     }
+    /// The span end offset.
     pub fn end(&self) -> usize {
         self.end
     }
 
+    /// The nesting depth.
     pub fn level(&self) -> usize {
         self.level
     }
 
+    /// Index of the parent span, if any.
     pub fn parent_idx(&self) -> Option<usize> {
         self.parent_idx
     }
 
+    /// Whether this span is at the outermost level.
     pub fn is_root(&self) -> bool {
         self.level == 1
     }
 }
 
+/// A span produced by a streaming extractor.
 pub type StreamSpan = Span;
 
 #[derive(Debug, Default)]
+/// A growable byte buffer with absolute offsets.
 pub struct Arena {
     buf: Vec<u8>,
     start: usize,
 }
 
 impl Arena {
+    /// Append the UTF-8 bytes of `chunk`.
     pub fn push(&mut self, chunk: &str) {
         self.buf.extend_from_slice(chunk.as_bytes());
     }
 
+    /// Number of buffered bytes.
     pub fn len(&self) -> usize {
         self.buf.len()
     }
 
+    /// Whether the buffer is empty.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
 
+    /// Drop the first `keep_from` bytes and advance the origin.
     pub fn compact(&mut self, keep_from: usize) {
         if keep_from == 0 {
             return;
@@ -68,30 +85,39 @@ impl Arena {
         self.start += keep_from;
     }
 
+    /// The buffered bytes.
     pub fn as_slice(&self) -> &[u8] {
         &self.buf
     }
 }
 
+/// Incrementally extracts balanced elements from a text stream.
 pub trait StreamExtractor {
+    /// Type of one extracted element.
     type Item<'a>;
 
+    /// Feed `chunk` and return any elements completed by it.
     fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>>;
 
+    /// Raw bytes for `span`.
     fn extract<'a>(&'a self, span: &Span) -> &'a [u8];
 
+    /// UTF-8 view of `span`, if valid.
     fn extract_str<'a>(&'a self, span: &Span) -> Option<&'a str> {
         std::str::from_utf8(self.extract(span)).ok()
     }
 
+    /// Owned string for `span`, if valid UTF-8.
     fn extract_string(&self, span: &Span) -> Option<String> {
         self.extract_str(span).map(|s| s.to_string())
     }
 
+    /// Discard buffered state.
     fn reset(&mut self);
 }
 
 #[derive(Debug, Default)]
+/// Extracts balanced JSON values from a stream.
 pub struct JsonExtractor {
     arena: Arena,
     stack: Vec<(u8, usize)>,
@@ -217,6 +243,7 @@ impl StreamExtractor for JsonExtractor {
 }
 
 #[derive(Debug, Default)]
+/// Extracts balanced XML elements from a stream.
 pub struct XmlExtractor {
     arena: Arena,
     stack: Vec<(Vec<u8>, usize)>,
@@ -361,6 +388,7 @@ impl StreamExtractor for XmlExtractor {
 }
 
 #[derive(Debug, Default)]
+/// Extracts JSON and XML, exposing which mode is active.
 pub struct MixedExtractor {
     json: JsonExtractor,
     xml: XmlExtractor,
@@ -409,6 +437,7 @@ impl StreamExtractor for MixedExtractor {
 }
 
 impl MixedExtractor {
+    /// The active extractor as `json` or `xml`.
     pub fn mode(&self) -> Option<&'static str> {
         match self.mode {
             Some(MixedMode::Json) => Some("json"),
@@ -421,13 +450,18 @@ impl MixedExtractor {
 /// A span with its source extractor type
 #[derive(Debug, Clone)]
 pub struct TypedSpan {
+    /// The matched span.
     pub span: Span,
+    /// Extractor that produced the span.
     pub source: SpanSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which extractor produced a [`TypedSpan`].
 pub enum SpanSource {
+    /// Produced by the JSON extractor.
     Json,
+    /// Produced by the XML extractor.
     Xml,
 }
 
@@ -459,6 +493,7 @@ impl StreamExtractor for MixedExtractorV2 {
 }
 
 impl MixedExtractorV2 {
+    /// Raw bytes for a typed span, using its source extractor.
     pub fn extract_typed<'a>(&'a self, typed: &TypedSpan) -> &'a [u8] {
         match typed.source {
             SpanSource::Json => self.json.extract(&typed.span),
@@ -478,6 +513,7 @@ impl MixedExtractorV2 {
         }
     }
 
+    /// Feed `chunk` and return any completed typed spans.
     pub fn push_typed(&mut self, chunk: &str) -> Option<Vec<TypedSpan>> {
         let json_spans = self.json.push(chunk);
         let xml_spans = self.xml.push(chunk);
@@ -518,6 +554,7 @@ impl MixedExtractorV2 {
         Some(typed)
     }
 
+    /// Discard buffered state in both extractors.
     pub fn reset_typed(&mut self) {
         self.json.reset();
         self.xml.reset();
