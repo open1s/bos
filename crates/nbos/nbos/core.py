@@ -96,8 +96,12 @@ class SessionManager:
         self._agent.save_session(path)
         return self
 
+    def restore_full(self, path: str) -> "SessionManager":
+        self._agent.restore_session(path)
+        return self
+
     def compact(self, keep_recent: int = 10, max_summary_chars: int = 2000) -> "SessionManager":
-        self._agent.compact_message_log()
+        self._agent.compact_message_log(keep_recent, max_summary_chars)
         return self
 
     def clear(self) -> "SessionManager":

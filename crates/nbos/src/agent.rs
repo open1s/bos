@@ -1384,12 +1384,20 @@ impl PyAgent {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
-    fn compact_message_log<'py>(&self, _py: Python<'py>) -> PyResult<()> {
+    #[pyo3(signature = (keep_recent = 10, max_summary_chars = 2000))]
+    fn compact_message_log<'py>(
+        &self,
+        _py: Python<'py>,
+        keep_recent: u32,
+        max_summary_chars: u32,
+    ) -> PyResult<()> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        guard.session_mut().compact(12, 4000);
+        guard
+            .session_mut()
+            .compact(keep_recent as usize, max_summary_chars as usize);
         Ok(())
     }
 

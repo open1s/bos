@@ -281,6 +281,31 @@ class TestSessionManager:
             agent.session.restore(session_file)
 
     @pytest.mark.asyncio
+    async def test_session_compact_forwards_limits(self):
+        from nbos import BrainOS
+
+        async with BrainOS() as brain:
+            agent = await brain.agent("compact-test").start()
+            for i in range(30):
+                agent.session.add_message("user", f"message {i}")
+            # The builder defaults used to be dropped and the native layer
+            # hard-coded (12, 4000); passing limits must not raise.
+            agent.session.compact(keep_recent=5, max_summary_chars=100)
+            assert isinstance(agent.session.get_messages(), list)
+
+    @pytest.mark.asyncio
+    async def test_session_restore_full(self, tmp_path):
+        from nbos import BrainOS
+
+        session_file = str(tmp_path / "session-full.json")
+
+        async with BrainOS() as brain:
+            agent = await brain.agent("full-session-test").start()
+            agent.session.add_message("user", "hello")
+            agent.session.save_full(session_file)
+            agent.session.restore_full(session_file)
+
+    @pytest.mark.asyncio
     async def test_session_get_messages(self):
         from nbos import BrainOS
         async with BrainOS() as brain:
