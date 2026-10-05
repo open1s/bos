@@ -1,16 +1,21 @@
+//! LLM vendor selection and the agent-scoped provider wrapper.
+
 use super::*;
 
+/// A vendor router bound to the agent session and context types.
 pub struct LlmProvider {
     inner: LlmRouter<AgentSession, AgentReactContext>,
 }
 
 impl LlmProvider {
+    /// Create an empty provider with no vendors registered.
     pub fn new() -> Self {
         Self {
             inner: LlmRouter::new(),
         }
     }
 
+    /// Register a named vendor.
     pub fn register_vendor(
         &mut self,
         name: String,
@@ -19,10 +24,12 @@ impl LlmProvider {
         self.inner.register_vendor(name, vendor);
     }
 
+    /// Convert this provider into a trait-object client.
     pub fn as_dyn(self: Arc<Self>) -> Box<dyn LlmClient<AgentSession, AgentReactContext>> {
         Box::new(ArcLlmClient(self))
     }
 
+    /// Register the NVIDIA vendor when `model` is `nvidia/...`.
     pub fn with_nvidia(&mut self, model: &str, base_url: &str, api_key: &str) -> &mut Self {
         if !model.starts_with("nvidia/") {
             return self;
@@ -40,6 +47,7 @@ impl LlmProvider {
         self
     }
 
+    /// Register the DeepSeek vendor when `model` is `deepseek/...`.
     pub fn with_deepseek(&mut self, model: &str, base_url: &str, api_key: &str) -> &mut Self {
         if !model.starts_with("deepseek/") {
             return self;
@@ -57,6 +65,7 @@ impl LlmProvider {
         self
     }
 
+    /// Register the OpenRouter vendor when `model` is `openrouter/...`.
     pub fn with_openrouter(&mut self, model: &str, base_url: &str, api_key: &str) -> &mut Self {
         if !model.starts_with("openrouter/") {
             return self;

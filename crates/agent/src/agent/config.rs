@@ -1,3 +1,5 @@
+//! TOML agent configuration and the builder that turns it into an Agent.
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,14 +10,19 @@ use crate::agent::{Agent, AgentConfig};
 use crate::error::AgentError;
 use crate::tools::{FunctionTool, Tool};
 
+/// A tool declaration in a TOML agent config.
 #[derive(Debug, Deserialize, Clone)]
 pub struct TomlToolRef {
+    /// Tool name.
     pub name: String,
+    /// Optional tool description.
     pub description: Option<String>,
+    /// Optional JSON schema for the tool arguments.
     pub schema: Option<serde_json::Value>,
 }
 
 impl TomlToolRef {
+    /// Render this tool as an OpenAI function definition.
     pub fn to_openai_tool(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "function",
@@ -28,24 +35,37 @@ impl TomlToolRef {
     }
 }
 
+/// Agent configuration as read from TOML.
 #[derive(Debug, Deserialize, Clone)]
 pub struct TomlAgentConfig {
+    /// Agent name.
     pub name: String,
+    /// Model identifier in `vendor/model` form.
     pub model: String,
+    /// LLM API base URL.
     pub base_url: String,
+    /// LLM API key.
     pub api_key: String,
+    /// System prompt.
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
+    /// Sampling temperature.
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    /// Optional completion token cap.
     pub max_tokens: Option<u32>,
+    /// Per-request timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Optional ReAct step cap.
     pub max_steps: Option<usize>,
+    /// Optional API mode, `chat` or `responses`.
     #[serde(default)]
     pub api_mode: Option<String>,
+    /// Optional reasoning effort for reasoning models.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Optional tool declarations.
     #[serde(default)]
     pub tools: Option<Vec<TomlToolRef>>,
 }
@@ -82,12 +102,14 @@ impl From<TomlAgentConfig> for AgentConfig {
     }
 }
 
+/// Builds an [`Agent`] from TOML configuration and extra tools.
 pub struct TomlAgentBuilder {
     config: TomlAgentConfig,
     tools: Vec<Arc<dyn Tool>>,
 }
 
 impl TomlAgentBuilder {
+    /// Parse a TOML agent configuration.
     pub fn from_toml(toml_str: &str) -> Result<Self, AgentError> {
         let config: TomlAgentConfig = toml::from_str(toml_str)
             .map_err(|e| AgentError::Config(format!("TOML parse error: {}", e)))?;
@@ -97,17 +119,20 @@ impl TomlAgentBuilder {
         })
     }
 
+    /// Parse a TOML agent configuration from a file.
     pub fn from_file(path: &Path) -> Result<Self, AgentError> {
         let content =
             std::fs::read_to_string(path).map_err(|e| AgentError::Config(e.to_string()))?;
         Self::from_toml(&content)
     }
 
+    /// Add a tool to the agent being built.
     pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
     }
 
+    /// The configured tools as OpenAI function definitions, if any.
     pub fn config_tools(&self) -> Option<Vec<serde_json::Value>> {
         self.config
             .tools
@@ -125,6 +150,7 @@ impl TomlAgentBuilder {
         }
     }
 
+    /// Construct the agent and register every configured tool.
     pub async fn build(self, _session: Option<Arc<ZenohSession>>) -> Result<Agent, AgentError> {
         let mut config: AgentConfig = self.config.clone().into();
         apply_model_defaults(&mut config);

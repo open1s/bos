@@ -149,23 +149,28 @@ impl HookRegistry {
         hooks.get(event).cloned().unwrap_or_default()
     }
 
+    /// Whether any hook is registered for `event`.
     pub fn has_hooks(&self, event: &HookEvent) -> bool {
         let hooks = self.hooks.lock().unwrap();
         hooks.get(event).map(|v| !v.is_empty()).unwrap_or(false)
     }
 
+    /// Blocking alias for [`HookRegistry::register`].
     pub fn register_blocking(&self, event: HookEvent, hook: Arc<dyn AgentHook>) {
         self.register(event, hook);
     }
 
+    /// Blocking alias for [`HookRegistry::get_hooks`].
     pub fn get_hooks_blocking(&self, event: &HookEvent) -> Vec<Arc<dyn AgentHook>> {
         self.get_hooks(event)
     }
 
+    /// Blocking alias for [`HookRegistry::has_hooks`].
     pub fn has_hooks_blocking(&self, event: &HookEvent) -> bool {
         self.has_hooks(event)
     }
 
+    /// Blocking alias for [`HookRegistry::trigger`].
     pub fn trigger_blocking(&self, event: HookEvent, context: HookContext) -> HookDecision {
         block_on_future(self.trigger(event, context))
     }
@@ -215,6 +220,7 @@ impl HookRegistry {
         }
     }
 
+    /// Blocking alias for [`HookRegistry::trigger_all`].
     pub fn trigger_all_blocking(&self, event: HookEvent, context: HookContext) {
         block_on_future(self.trigger_all(event, context))
     }
@@ -229,6 +235,7 @@ impl HookRegistry {
         self.bus_enabled.load(Ordering::Acquire)
     }
 
+    /// Lock-free check of the bus-enabled flag.
     pub fn is_bus_enabled_fast(&self) -> bool {
         self.bus_enabled.load(Ordering::Acquire)
     }
@@ -251,6 +258,7 @@ impl HookRegistry {
         hooks.clear();
     }
 
+    /// Blocking alias for [`HookRegistry::clear_all`].
     pub fn clear_all_blocking(&self) {
         self.clear_all();
     }

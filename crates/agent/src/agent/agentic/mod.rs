@@ -25,6 +25,7 @@ use react::{CircuitBreakerConfig, LlmRequest, RateLimiterConfig, ReActResilience
 
 mod adapters;
 mod engine;
+#[warn(missing_docs)]
 mod llm;
 
 use adapters::{AsyncExtensibleToolAdapter, ExtensibleToolAdapter};

@@ -1,8 +1,10 @@
 //! Core agent types: Message, MessageLog, Agent, AgentConfig.
 
 pub mod agentic;
+#[warn(missing_docs)]
 pub mod config;
 pub mod context;
+#[warn(missing_docs)]
 pub mod hooks;
 pub mod plugin;
 
