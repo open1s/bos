@@ -46,6 +46,10 @@ struct OpenAiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<crate::llm::ReasoningEffort>,
@@ -302,6 +306,8 @@ impl OpenAiVendor {
             messages,
             tools,
             temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
             max_tokens: Some(max_tokens),
             reasoning_effort: req.reasoning_effort,
             stream: Some(false),
@@ -717,6 +723,30 @@ mod tests {
 
     use crate::llm::vendor::OpenAiVendor;
     use crate::llm::{Content, LlmClient, LlmContext, LlmRequest, LlmSession};
+
+    #[test]
+    fn serialize_args_converts_null_to_empty_object() {
+        assert_eq!(super::serialize_args(&serde_json::Value::Null), "{}");
+    }
+
+    #[test]
+    fn serialize_args_passes_through_valid_object() {
+        let args = serde_json::json!({"location": "NYC"});
+        assert_eq!(super::serialize_args(&args), "{\"location\":\"NYC\"}");
+    }
+
+    #[test]
+    fn serialize_args_converts_non_object_to_empty() {
+        assert_eq!(
+            super::serialize_args(&serde_json::Value::String("foo".into())),
+            "{}"
+        );
+        assert_eq!(super::serialize_args(&serde_json::Value::Bool(true)), "{}");
+        assert_eq!(
+            super::serialize_args(&serde_json::Value::Number(42.into())),
+            "{}"
+        );
+    }
 
     #[tokio::test]
     async fn test_openai_vendor() {
