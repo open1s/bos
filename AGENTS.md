@@ -8,13 +8,16 @@ High-signal facts for working in this repo.
 
 ```
 crates/
-├── agent/      # Core agent with tools, skills, LLM providers
-├── bus/        # Pub/sub, queryable, caller/callable
-├── config/    # TOML/YAML config loading
-├── logging/   # Tracing, instrumentation
-├── nbos/     # Python bindings (cdylib, maturin)
-├── jsbos/     # Node.js bindings (NAPI-RS)
-└── react/     # ReAct engine, LLM integration
+├── agent/          # Core agent: tools, skills, hooks, plugins, sessions
+├── bus/            # Pub/sub, queryable, caller/callable
+├── config/         # TOML/YAML config loading
+├── jsbos/          # Node.js bindings (NAPI-RS)
+├── logging/        # Tracing, instrumentation
+├── nbos/           # Python bindings (cdylib, maturin)
+├── qserde/         # rkyv archive support used by the bus wire format
+├── qserde_derive/  # Derive macros for qserde
+├── react/          # ReAct engine, LLM integration
+└── resource/       # Standalone resource subsystem + `rex` CLI (no dependents)
 ```
 ---
 ## Version Control
@@ -77,11 +80,19 @@ cd crates/jsbos && npm install && npm run build
 
 ## Crate Dependencies
 
-- `agent` depends on: `bus`, `config`, `logging`, `react`
-- `nbos` depends on: `agent`, `bus`, `config`
-- `jsbos` depends on: `agent`, `bus`, `config`
+Each layer depends only on the layers to its right:
 
-**Key**: All cross-crate communication flows through `bus`.
+```
+nbos / jsbos  →  agent  →  react  →  bus  →  logging  →  config
+```
+
+- `qserde_derive` is the proc-macro half of `qserde`.
+- `resource` is an independent subsystem; nothing in the agent stack depends on
+  it (it pulls `bus`/`config`/`logging` only for its optional `cli` feature).
+
+**Key**: Agent-to-agent messaging and pub/sub flow through `bus`. Direct
+request/response work (LLM calls, tool execution) flows through the trait seams
+in `react` (`LlmClient`, `Tool`/`AsyncTool`), not the bus.
 
 ---
 
@@ -89,7 +100,7 @@ cd crates/jsbos && npm install && npm run build
 
 | Bindings | Entry | Build |
 |----------|-------|-------|
-| Python | `crates/pybos/brainos/` | `maturin develop` |
+| Python | `crates/nbos/` | `maturin develop` |
 | JS | `crates/jsbos/brainos.js` | `npm run build` |
 
 **User guides**: `docs/python-user-guide.md`, `docs/javascript-user-guide.md`, `docs/rust-user-guide.md`
@@ -142,4 +153,4 @@ const result = await agent.ask('What is 2+2?');
 
 ---
 
-## Last Updated: 2026-04-09
+## Last Updated: 2026-10-05
