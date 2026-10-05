@@ -1,3 +1,5 @@
+//! ReAct session and context implementations plus the message accumulator.
+
 use crate::agent::hooks::HookRegistry;
 use crate::agent::plugin::PluginRegistry;
 use crate::OpenAiMessage;
@@ -47,14 +49,19 @@ pub struct AgentSession {
     metadata: SessionMetadata,
 }
 
+/// Timestamps and counters stored with an [`AgentSession`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
+    /// Unix timestamp when the session was created.
     pub created_at: u64,
+    /// Unix timestamp of the last update.
     pub updated_at: u64,
+    /// Number of messages recorded so far.
     pub message_count: usize,
 }
 
 impl AgentSession {
+    /// Create an empty session.
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
@@ -67,6 +74,7 @@ impl AgentSession {
         }
     }
 
+    /// Append a user message.
     pub fn add_user(&mut self, content: String) {
         self.messages.push(Message::User {
             content: Content::Text(content),
@@ -74,11 +82,13 @@ impl AgentSession {
         self.update_metadata();
     }
 
+    /// Append a system message.
     pub fn add_system(&mut self, profile: String) {
         self.messages.push(Message::System { content: profile });
         self.update_metadata();
     }
 
+    /// Append an assistant message.
     pub fn add_assistant(&mut self, content: String) {
         self.messages.push(Message::Assistant { content });
         self.update_metadata();
@@ -89,27 +99,32 @@ impl AgentSession {
         self.metadata.message_count = self.messages.len();
     }
 
+    /// Take the history, leaving the session empty.
     pub fn take_messages(&mut self) -> Vec<Message> {
         let msgs = std::mem::take(&mut self.messages);
         self.update_metadata();
         msgs
     }
 
+    /// Replace the conversation history.
     pub fn restore_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
         self.update_metadata();
     }
 
+    /// Borrow the conversation history.
     pub fn history_ref(&self) -> &[Message] {
         &self.messages
     }
 
+    /// Render the history as OpenAI chat messages.
     pub fn to_api_format(&self) -> Vec<OpenAiMessage> {
         let mut api_messages = Vec::with_capacity(self.messages.len());
         self.extend_api_format(&mut api_messages);
         api_messages
     }
 
+    /// Append the history to `target` as OpenAI chat messages.
     pub fn extend_api_format(&self, target: &mut Vec<OpenAiMessage>) {
         target.reserve(self.messages.len());
         for message in &self.messages {
@@ -182,45 +197,55 @@ impl AgentSession {
         }
     }
 
+    /// Number of messages.
     pub fn len(&self) -> usize {
         self.messages.len()
     }
 
+    /// Whether there are no messages.
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
 
+    /// Borrow the conversation history.
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
 
+    /// Append a message of any kind.
     pub fn push(&mut self, msg: Message) {
         self.messages.push(msg);
         self.update_metadata();
     }
 
+    /// The opaque session context value.
     pub fn session_context(&self) -> JsonValue {
         self.context.clone()
     }
 
+    /// Replace the session context value.
     pub fn set_session_context(&mut self, context: JsonValue) {
         self.context = context;
     }
 
+    /// Reset the session context to null.
     pub fn clear_session_context(&mut self) {
         self.context = JsonValue::Null;
     }
 
+    /// Write the session to `path` as pretty JSON.
     pub fn save(&self, path: &str) -> Result<(), std::io::Error> {
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
+    /// Load the session from a JSON file at `path`.
     pub fn restore(&mut self, path: &str) -> Result<(), std::io::Error> {
         let json = std::fs::read_to_string(path)?;
         self.restore_from_json(&json)
     }
 
+    /// Load the session from a JSON string.
     pub fn restore_from_json(&mut self, json: &str) -> Result<(), std::io::Error> {
         let restored: AgentSession = serde_json::from_str(json).map_err(std::io::Error::other)?;
         self.messages = restored.messages;
@@ -229,10 +254,12 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Serialize the session to pretty JSON.
     pub fn to_json_string(&self) -> Result<String, std::io::Error> {
         serde_json::to_string_pretty(self).map_err(std::io::Error::other)
     }
 
+    /// Drop all messages except system messages and reset the context.
     pub fn clear(&mut self) {
         self.messages
             .retain(|msg| matches!(msg, Message::System { .. }));
@@ -240,6 +267,7 @@ impl AgentSession {
         self.metadata.updated_at = current_timestamp();
     }
 
+    /// Summarize all but the most recent `keep_recent` messages and prepend a summary.
     pub fn compact(&mut self, keep_recent: usize, max_summary_chars: usize) {
         if self.messages.len() <= keep_recent {
             return;
@@ -322,16 +350,23 @@ fn current_timestamp() -> u64 {
 
 /// AgentReactContext holds tools, skills, rules, and instructions for the ReAct engine.
 /// Implements ReactContext trait for integration with the react crate.
+/// Tools, skills, rules, and instructions for one ReAct run.
 #[derive(Debug, Clone, Default)]
 pub struct AgentReactContext {
+    /// Identifier for the session this context belongs to.
     pub session_id: String,
+    /// Tools offered to the model.
     pub tools: Vec<LlmTool>,
+    /// Skills offered to the model.
     pub skills: Vec<Skill>,
+    /// Rules constraining the model.
     pub rules: Vec<Rule>,
+    /// Extra instructions prepended to the prompt.
     pub instructions: Vec<Instruction>,
 }
 
 impl AgentReactContext {
+    /// Create an empty context for `session_id`.
     pub fn new(session_id: String) -> Self {
         Self {
             session_id,
@@ -342,11 +377,13 @@ impl AgentReactContext {
         }
     }
 
+    /// Replace the tool list.
     pub fn with_tools(mut self, tools: Vec<LlmTool>) -> Self {
         self.tools = tools;
         self
     }
 
+    /// Replace the skill list.
     pub fn with_skills(mut self, skills: Vec<Skill>) -> Self {
         self.skills = skills;
         self
@@ -416,6 +453,7 @@ pub struct AgentReActApp {
 }
 
 impl AgentReActApp {
+    /// Create an app bridging `hooks` and `plugins` into the ReAct loop.
     pub fn new(hooks: Arc<HookRegistry>, plugins: Arc<PluginRegistry>, agent_name: String) -> Self {
         Self {
             hooks,
@@ -627,32 +665,38 @@ impl ReActApp for AgentReActApp {
     }
 }
 
+/// A simple accumulator for building a message list.
 #[derive(Debug, Clone, Default)]
 pub struct MessageContext {
     pub(crate) messages: Vec<Message>,
 }
 
 impl MessageContext {
+    /// Create an empty accumulator.
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
         }
     }
 
+    /// Append a user message.
     pub fn add_user(&mut self, content: String) {
         self.messages.push(Message::User {
             content: Content::Text(content),
         });
     }
 
+    /// Append a system message.
     pub fn add_system(&mut self, profile: String) {
         self.messages.push(Message::System { content: profile });
     }
 
+    /// Append an assistant message.
     pub fn add_assistant(&mut self, content: String) {
         self.messages.push(Message::Assistant { content });
     }
 
+    /// Append `chunk` to the trailing assistant message, or start one.
     pub fn append_assistant_chunk(&mut self, chunk: &str) {
         match self.messages.last_mut() {
             Some(Message::Assistant { content }) => content.push_str(chunk),
@@ -662,6 +706,7 @@ impl MessageContext {
         }
     }
 
+    /// Record an assistant tool call.
     pub fn add_tool_call(&mut self, tool_call_id: String, name: String, args: serde_json::Value) {
         self.messages.push(Message::AssistantToolCall {
             tool_call_id,
@@ -670,6 +715,7 @@ impl MessageContext {
         });
     }
 
+    /// Record a tool result.
     pub fn add_tool_result(&mut self, name: String, content: String) {
         self.messages.push(Message::ToolResult {
             tool_call_id: name,
@@ -677,12 +723,14 @@ impl MessageContext {
         });
     }
 
+    /// Render the history as OpenAI chat messages.
     pub fn to_api_format(&self) -> Vec<OpenAiMessage> {
         let mut api_messages = Vec::with_capacity(self.messages.len());
         self.extend_api_format(&mut api_messages);
         api_messages
     }
 
+    /// Append the history to `target` as OpenAI chat messages.
     pub fn extend_api_format(&self, target: &mut Vec<OpenAiMessage>) {
         target.reserve(self.messages.len());
         for message in &self.messages {
@@ -755,10 +803,12 @@ impl MessageContext {
         }
     }
 
+    /// Number of messages.
     pub fn len(&self) -> usize {
         self.messages.len()
     }
 
+    /// Whether there are no messages.
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }

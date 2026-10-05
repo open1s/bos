@@ -3,6 +3,7 @@
 pub mod agentic;
 #[warn(missing_docs)]
 pub mod config;
+#[warn(missing_docs)]
 pub mod context;
 #[warn(missing_docs)]
 pub mod hooks;
