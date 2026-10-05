@@ -7,6 +7,9 @@ import json
 import pytest
 from nbos import BrainOS, ToolDef
 
+# These tests call a live model through run_simple; excluded from CI with -m "not llm".
+pytestmark = pytest.mark.llm
+
 
 @pytest.fixture
 def brain():

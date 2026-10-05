@@ -1,7 +1,7 @@
 """Tests for Agent stream API"""
 import pytest
 import asyncio
-from nbos import Agent, AgentConfig, Bus, BusConfig
+from nbos import PyAgent, AgentConfig, Bus, BusConfig
 
 
 class TestAgentStream:
@@ -12,7 +12,7 @@ class TestAgentStream:
         """Test that stream() returns an async iterator"""
         config = AgentConfig()
         bus = await Bus.create(BusConfig())
-        agent = await Agent.create(config, bus)
+        agent = await PyAgent.create(config, bus)
         
         # stream() returns a Future that resolves to a StreamIterator
         stream_iter = await agent.stream("hello")
@@ -26,7 +26,7 @@ class TestAgentStream:
         """Test that stream iterator properly raises StopAsyncIteration when done"""
         config = AgentConfig()
         bus = await Bus.create(BusConfig())
-        agent = await Agent.create(config, bus)
+        agent = await PyAgent.create(config, bus)
         
         stream_iter = await agent.stream("hello")
         
@@ -52,7 +52,7 @@ class TestAgentStream:
         """Test that stream works with async for loop"""
         config = AgentConfig()
         bus = await Bus.create(BusConfig())
-        agent = await Agent.create(config, bus)
+        agent = await PyAgent.create(config, bus)
         
         stream_iter = await agent.stream("hello")
         
@@ -69,15 +69,15 @@ class TestAgentStream:
 
     @pytest.mark.asyncio
     async def test_stream_multiple_calls(self):
-        """Test that stream can be called multiple times"""
-        config = AgentConfig()
+        """Test that separate agents can each start a stream"""
         bus = await Bus.create(BusConfig())
-        agent = await Agent.create(config, bus)
-        
-        # Each call should return a new iterator
-        stream1 = await agent.stream("first")
-        stream2 = await agent.stream("second")
-        
+        agent1 = await PyAgent.create(AgentConfig(), bus)
+        agent2 = await PyAgent.create(AgentConfig(), bus)
+
+        # Each agent owns its run, so each returns a distinct iterator
+        stream1 = await agent1.stream("first")
+        stream2 = await agent2.stream("second")
+
         assert stream1 is not None
         assert stream2 is not None
         assert stream1 is not stream2

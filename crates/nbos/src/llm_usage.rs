@@ -21,7 +21,7 @@ impl PyPromptTokensDetails {
 }
 
 #[pyclass(name = "LlmUsage", skip_from_py_object)]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PyLlmUsage {
     #[pyo3(get, set)]
     pub prompt_tokens: u32,
@@ -29,16 +29,25 @@ pub struct PyLlmUsage {
     pub completion_tokens: u32,
     #[pyo3(get, set)]
     pub total_tokens: u32,
+    #[pyo3(get, set)]
+    pub prompt_tokens_details: Option<Py<PyPromptTokensDetails>>,
 }
 
 #[pymethods]
 impl PyLlmUsage {
     #[new]
-    pub fn new(prompt_tokens: u32, completion_tokens: u32, total_tokens: u32) -> Self {
+    #[pyo3(signature = (prompt_tokens, completion_tokens, total_tokens, prompt_tokens_details = None))]
+    pub fn new(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+        prompt_tokens_details: Option<Py<PyPromptTokensDetails>>,
+    ) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            prompt_tokens_details,
         }
     }
 }

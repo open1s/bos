@@ -77,9 +77,34 @@ jobs:
           path: dist/*.whl
           retention-days: 7
 
+  test:
+    name: Test Python bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin and pytest
+        run: pip install maturin pytest pytest-asyncio
+
+      - name: Build and install the wheel
+        run: |
+          maturin build -m crates/nbos/Cargo.toml --release --out dist
+          pip install dist/*.whl
+
+      - name: Run Python tests
+        run: pytest crates/nbos/tests -m "not llm" -q
+
   publish:
     name: Publish to PyPI
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.event.ref == 'refs/heads/main'
     steps:

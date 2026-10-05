@@ -272,7 +272,7 @@ class TestCaller:
     @pytest.mark.asyncio
     async def test_caller_vs_query_pattern(self):
         """Test that both Caller and Query patterns work"""
-        from pybos import Query, Queryable
+        from nbos import Query, Queryable
 
         def handler(text: str) -> str:
             return f"processed: {text}"

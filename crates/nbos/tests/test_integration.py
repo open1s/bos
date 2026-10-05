@@ -4,7 +4,7 @@ import asyncio
 from nbos import (
     Bus, BusConfig, Publisher, Subscriber,
     Query, Queryable, Caller, Callable,
-    Agent, AgentConfig, ConfigLoader
+    AgentConfig, ConfigLoader, PyAgent
 )
 
 
@@ -72,7 +72,7 @@ class TestIntegration:
         bus = await Bus.create(BusConfig())
         
         config = AgentConfig(name="integration_agent")
-        agent = await Agent.create(config, bus)
+        agent = await PyAgent.create(config, bus)
         
         assert agent is not None
 
@@ -139,8 +139,8 @@ class TestIntegration:
         config1 = AgentConfig(name="agent1")
         config2 = AgentConfig(name="agent2")
         
-        agent1 = await Agent.create(config1, bus)
-        agent2 = await Agent.create(config2, bus)
+        agent1 = await PyAgent.create(config1, bus)
+        agent2 = await PyAgent.create(config2, bus)
         
         # Create services that agents could use
         def service_handler(text: str) -> str:
