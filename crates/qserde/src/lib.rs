@@ -17,6 +17,7 @@
 //! assert_eq!(restored, user);
 //! # Ok::<(), qserde::Error>(())
 //! ```
+#![warn(missing_docs)]
 
 use rkyv::{
     api::high::HighDeserializer,
@@ -34,31 +35,39 @@ pub use rkyv;
 type SerializeStrategy<'a> = Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, RkyvError>;
 type DeserializeStrategy = HighDeserializer<RkyvError>;
 
-// pub mod ergonomic; // Temporarily disabled - needs refactoring for new backend design
 pub mod backends;
 pub mod error;
+/// Common trait and helper imports.
 pub mod prelude {
-    // pub use crate::ergonomic::{DeserializeExt2, SerializeExt};
     pub use crate::{
         archive, decode, dump, encode, load, snapshot, Archive, Archived, Deserialize,
         DeserializeExt, Result, Serialize, SkipNone, Snapshot,
     };
 }
 
+/// Errors from the rkyv-backed helpers.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// rkyv could not serialize the value.
     #[error("failed to serialize value with rkyv: {0}")]
     Serialize(#[source] RkyvError),
+    /// rkyv could not deserialize the bytes.
     #[error("failed to deserialize value with rkyv: {0}")]
     Deserialize(#[source] RkyvError),
 }
 
+/// Result alias for the helpers in this crate.
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// Serialize a value into rkyv bytes.
+///
+/// Implemented for every archived type that rkyv can serialize, so it is
+/// usually used through the [`prelude`] import.
 pub trait Serialize: RkyvArchive
 where
     for<'a> Self: rkyv::Serialize<SerializeStrategy<'a>>,
 {
+    /// Alias of [`Serialize::to_bytes`].
     #[inline]
     fn serialize(&self) -> Result<Vec<u8>>
     where
@@ -67,6 +76,7 @@ where
         to_bytes(self)
     }
 
+    /// Serialize into rkyv bytes.
     #[inline]
     fn to_bytes(&self) -> Result<Vec<u8>>
     where
@@ -75,6 +85,7 @@ where
         to_bytes(self)
     }
 
+    /// Alias of [`Serialize::to_bytes`].
     #[inline]
     fn dump(&self) -> Result<Vec<u8>>
     where
@@ -83,6 +94,7 @@ where
         to_bytes(self)
     }
 
+    /// Serialize into a reusable [`Archived`] buffer.
     #[inline]
     fn snapshot(&self) -> Result<Archived<Self>>
     where
@@ -99,20 +111,24 @@ where
 {
 }
 
+/// Rebuild a value from rkyv bytes.
 pub trait Deserialize: RkyvArchive + Sized
 where
     Self::Archived: rkyv::Deserialize<Self, DeserializeStrategy>,
 {
+    /// Deserialize from rkyv bytes.
     #[inline]
     fn deserialize(bytes: &[u8]) -> Result<Self> {
         from_bytes(bytes)
     }
 
+    /// Alias of [`Deserialize::deserialize`].
     #[inline]
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
         from_bytes(bytes)
     }
 
+    /// Alias of [`Deserialize::deserialize`].
     #[inline]
     fn load(bytes: &[u8]) -> Result<Self> {
         from_bytes(bytes)
@@ -126,12 +142,15 @@ where
 {
 }
 
+/// Deserialize directly from any byte container.
 pub trait DeserializeExt {
+    /// Deserialize a `T` from `self`.
     fn load<T>(&self) -> Result<T>
     where
         T: RkyvArchive,
         T::Archived: rkyv::Deserialize<T, DeserializeStrategy>;
 
+    /// Alias of [`DeserializeExt::load`].
     #[inline]
     fn decode<T>(&self) -> Result<T>
     where
@@ -156,6 +175,7 @@ where
     }
 }
 
+/// A serialized value kept in its rkyv byte form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Archived<T> {
     bytes: Vec<u8>,
@@ -164,6 +184,7 @@ pub struct Archived<T> {
 
 impl<T> Archived<T> {
     #[inline]
+    /// Wrap already-serialized bytes.
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
@@ -172,21 +193,25 @@ impl<T> Archived<T> {
     }
 
     #[inline]
+    /// The raw bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
     #[inline]
+    /// Length of the byte buffer.
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
 
     #[inline]
+    /// Whether the buffer is empty.
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 
     #[inline]
+    /// Consume the wrapper and return the bytes.
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
@@ -198,6 +223,7 @@ where
     for<'a> T: rkyv::Serialize<SerializeStrategy<'a>>,
 {
     #[inline]
+    /// Serialize `value` into a new wrapper.
     pub fn from_value(value: &T) -> Result<Self> {
         to_bytes(value).map(Self::new)
     }
@@ -209,11 +235,13 @@ where
     T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
 {
     #[inline]
+    /// Rebuild the value from the stored bytes.
     pub fn deserialize(&self) -> Result<T> {
         from_bytes(&self.bytes)
     }
 
     #[inline]
+    /// Alias of [`Archived::deserialize`].
     pub fn load(&self) -> Result<T> {
         self.deserialize()
     }
@@ -240,6 +268,7 @@ impl<T> From<Archived<T>> for Vec<u8> {
     }
 }
 
+/// Serialize `value` into rkyv bytes.
 pub fn to_bytes<T>(value: &T) -> Result<Vec<u8>>
 where
     T: RkyvArchive,
@@ -250,6 +279,7 @@ where
         .map_err(Error::Serialize)
 }
 
+/// Deserialize a `T` from rkyv bytes.
 pub fn from_bytes<T>(bytes: &[u8]) -> Result<T>
 where
     T: RkyvArchive,
@@ -259,6 +289,7 @@ where
 }
 
 #[inline]
+/// Alias of [`to_bytes`].
 pub fn dump<T>(value: &T) -> Result<Vec<u8>>
 where
     T: RkyvArchive,
@@ -268,6 +299,7 @@ where
 }
 
 #[inline]
+/// Alias of [`from_bytes`].
 pub fn load<T>(bytes: &[u8]) -> Result<T>
 where
     T: RkyvArchive,
@@ -277,6 +309,7 @@ where
 }
 
 #[inline]
+/// Alias of [`to_bytes`].
 pub fn encode<T>(value: &T) -> Result<Vec<u8>>
 where
     T: RkyvArchive,
@@ -286,6 +319,7 @@ where
 }
 
 #[inline]
+/// Alias of [`from_bytes`].
 pub fn decode<T>(bytes: &[u8]) -> Result<T>
 where
     T: RkyvArchive,
@@ -295,6 +329,7 @@ where
 }
 
 #[inline]
+/// Serialize `value` into an [`Archived`] buffer.
 pub fn snapshot<T>(value: &T) -> Result<Archived<T>>
 where
     T: RkyvArchive,

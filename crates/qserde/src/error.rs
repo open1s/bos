@@ -6,15 +6,19 @@ use thiserror::Error;
 /// Unified error enum for qserde operations
 #[derive(Debug, Error)]
 pub enum QserdeError {
+    /// A value could not be serialized.
     #[error("serialization failed: {0}")]
     Serialize(String),
 
+    /// Bytes could not be deserialized.
     #[error("deserialization failed: {0}")]
     Deserialize(String),
 
+    /// The chosen backend failed.
     #[error("backend error: {0}")]
     Backend(String),
 
+    /// The chosen backend cannot perform this operation.
     #[error("backend not supported for this operation: {0}")]
     UnsupportedBackend(String),
 }
@@ -29,22 +33,27 @@ impl From<QserdeLibError> for QserdeError {
 }
 
 impl QserdeError {
+    /// Build a serialize error from a message.
     pub fn serialize(msg: impl Into<String>) -> Self {
         Self::Serialize(msg.into())
     }
 
+    /// Build a deserialize error from a message.
     pub fn deserialize(msg: impl Into<String>) -> Self {
         Self::Deserialize(msg.into())
     }
 
+    /// Build a backend error from a message.
     pub fn backend(msg: impl Into<String>) -> Self {
         Self::Backend(msg.into())
     }
 
+    /// Whether this is a serialize error.
     pub fn is_serialize_error(&self) -> bool {
         matches!(self, QserdeError::Serialize(_))
     }
 
+    /// Whether this is a deserialize error.
     pub fn is_deserialize_error(&self) -> bool {
         matches!(self, QserdeError::Deserialize(_))
     }
