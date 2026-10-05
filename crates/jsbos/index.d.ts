@@ -642,6 +642,7 @@ export class Content {
     _text: any;
     toJSON(): any;
     toString(): string;
+    isMultimodal(): boolean;
 }
 export class ContentPart {
     static text(text: any): ContentPart;

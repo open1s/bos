@@ -1,15 +1,23 @@
 // Guards the Python and JavaScript binding surfaces against silent drift.
-// It reads the Python source statically, so it runs in the JS test job without a
+// It reads both sources statically, so it runs in the JS test job without a
 // Python runtime. See docs/solutions/bindings/binding-parity-guard.md.
 import test from 'ava'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const jsSrc = readFileSync(join(here, '..', 'index.js'), 'utf8')
-const pySrc = readFileSync(join(here, '..', '..', 'nbos', 'nbos', 'core.py'), 'utf8')
+// Read every Python module, not just core.py: the content, tool, bus, query
+// and caller surfaces live in sibling modules.
+const pyDir = join(here, '..', '..', 'nbos', 'nbos')
+const pySrc = readdirSync(pyDir)
+  .filter((f) => f.endsWith('.py'))
+  .map((f) => readFileSync(join(pyDir, f), 'utf8'))
+  .join('\n')
 
+// JS: accept static/async/get/set modifiers. Static methods used to be
+// invisible, which hid half of every class's surface from the guard.
 function jsMembers(src, className) {
   const members = new Set()
   let inside = false
@@ -24,12 +32,15 @@ function jsMembers(src, className) {
       continue
     }
     if (!inside) continue
-    const m = line.match(/^  (?:async )?(?:get |set )?([A-Za-z_]\w*)\s*\(/)
+    const m = line.match(/^  (?:static )?(?:async )?(?:get |set )?([A-Za-z_]\w*)\s*\(/)
     if (m && m[1] !== 'constructor') members.add(m[1])
   }
   return members
 }
 
+// Python: a class body ends at the first column-0 statement that is not a
+// class. Tracking the dedent keeps module-level helpers (and the functions
+// nested inside them) from being attributed to the last class in a file.
 function pyMembers(src, className) {
   const members = new Set()
   let inside = false
@@ -40,13 +51,23 @@ function pyMembers(src, className) {
       continue
     }
     if (!inside) continue
+    if (line.trim() !== '' && !/^\s/.test(line)) {
+      inside = false
+      continue
+    }
     const m = line.match(/^    (?:async )?def (\w+)/)
     if (m && m[1] !== '__init__') members.add(m[1])
   }
   return members
 }
 
-const snake = (name) => name.replace(/[A-Z]/g, (ch) => '_' + ch.toLowerCase())
+// camelCase to snake_case with acronym runs collapsed: toJSON becomes to_json,
+// fromBase64 becomes from_base64, audioURL becomes audio_url.
+const snake = (name) =>
+  name
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .toLowerCase()
 const stripWith = (name) => (name.startsWith('with_') ? name.slice(5) : name)
 // Normalize both bindings: camelCase to snake_case, drop the optional with_
 // builder prefix on either side, and ignore private members. A withFoo setter
@@ -63,6 +84,28 @@ function assertNoDrift(t, label, js, py, knownJsOnly, knownPyOnly) {
   t.deepEqual(pyOnly, [], label + ': Python members missing from JS: ' + pyOnly.join(', '))
 }
 
+// --- extractor self-tests -------------------------------------------------
+// A broken extractor fails open: it simply returns fewer members, and every
+// surface looks like it matches. Cover the two ways that used to happen.
+test('extractor sees static methods on both sides', (t) => {
+  t.true(jsMembers(jsSrc, 'Binary').has('fromBase64'))
+  t.true(jsMembers(jsSrc, 'Content').has('text'))
+  t.true(pyMembers(pySrc, 'Binary').has('from_base64'))
+})
+
+test('extractor does not leak module-level functions into a class', (t) => {
+  // def decorator is nested inside the module-level def tool, and used to be
+  // attributed to ToolResult, the last class in tool.py.
+  t.false(pyMembers(pySrc, 'ToolResult').has('decorator'))
+  t.true(pyMembers(pySrc, 'ToolResult').has('success'))
+})
+
+test('acronyms normalize to snake_case words', (t) => {
+  t.true(norm(jsMembers(jsSrc, 'Content')).has('to_json'))
+  t.true(norm(jsMembers(jsSrc, 'Binary')).has('to_json'))
+})
+
+// --- surface parity -------------------------------------------------------
 test('SessionManager surface matches across bindings', (t) => {
   assertNoDrift(
     t,
@@ -86,4 +129,28 @@ test('high-level agent surface matches across bindings', (t) => {
     new Set(),
     new Set(),
   )
+})
+
+// The multimodal wire types and tool definitions. Both sides serialize the
+// same shape, but Python returns a dict from to_dict while JS implements
+// toJSON, and JS keeps a toString alongside Python's to_json; those two idioms
+// are the only documented differences, plus JS's ToolResult.fromResult helper.
+test('multimodal and tool value types match across bindings', (t) => {
+  const cases = [
+    ['Binary', 'Binary', new Set(['to_json']), new Set(['to_dict'])],
+    ['ContentPart', 'ContentPart', new Set(['to_json']), new Set(['to_dict'])],
+    ['Content', 'Content', new Set(['to_string']), new Set()],
+    ['ToolDef', 'ToolDef', new Set(), new Set()],
+    ['ToolResult', 'ToolResult', new Set(['from_result']), new Set()],
+  ]
+  for (const [label, name, jsOnly, pyOnly] of cases) {
+    assertNoDrift(
+      t,
+      label,
+      norm(jsMembers(jsSrc, name)),
+      norm(pyMembers(pySrc, name)),
+      jsOnly,
+      pyOnly,
+    )
+  }
 })

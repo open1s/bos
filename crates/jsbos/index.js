@@ -186,6 +186,10 @@ class Content {
   toString() {
     return JSON.stringify(this.toJSON());
   }
+
+  isMultimodal() {
+    return this._parts !== null && this._parts.length > 0;
+  }
 }
 
 const ToolCategory = Object.freeze({
