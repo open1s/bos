@@ -84,11 +84,8 @@ test('high-level agent surface matches across bindings', (t) => {
     py,
     new Set([
       'circuit_breaker',
-      'is_running',
       'rate_limit',
       'skills_from_dir',
-      'stop',
-      'stream_collect',
       'system',
       'with_config',
       'with_tools',

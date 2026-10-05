@@ -134,3 +134,10 @@ test.serial('high-level agent exposes empty MCP listings without servers', async
   t.deepEqual(await agent.listMcpResources('none'), [])
   t.deepEqual(await agent.listMcpPrompts(), [])
 })
+
+test.serial('stop suppresses the next call and reports run state', async (t) => {
+  const agent = await startAgent(t)
+  t.false(agent.isRunning())
+  t.false(agent.stop().stopped)
+  t.is(await agent.runSimple('hi'), '')
+})

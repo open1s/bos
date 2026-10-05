@@ -37,12 +37,12 @@ because it reads the Python source instead of importing it.
 Known, intentional differences are listed in the test:
 
 - JS-only: the import back-compat alias; resilience split into circuitBreaker
-  and rateLimit where Python groups both under with_resilience; stop, isRunning
-  and streamCollect, which Python does not implement yet; and naming variants
-  (system, skillsFromDir, withConfig, withTools).
+  and rateLimit where Python groups both under with_resilience; and naming
+  variants (system, skillsFromDir, withConfig, withTools).
 - Python-only: chat (an ask alias) and the plugins / skills_dir names.
 
 When one binding gains a member, the suite fails until the other side (or the
 allowlist) is updated, so divergence becomes a deliberate decision rather than
-an accident. The allowlist doubles as the tracked list of real gaps: stop,
-isRunning and streamCollect are still missing from Python.
+an accident. The allowlist is now down to naming and grouping choices; the
+capability gaps it previously tracked (Python stop, isRunning, streamCollect)
+have been closed.

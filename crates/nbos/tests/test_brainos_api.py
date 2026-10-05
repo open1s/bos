@@ -383,6 +383,15 @@ class TestAgentAccessors:
             assert await agent.list_mcp_resources("none") == []
             assert await agent.list_mcp_prompts() == []
 
+    @pytest.mark.asyncio
+    async def test_agent_stop_suppresses_next_call(self):
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = await brain.agent("stop-test").start()
+            assert agent.is_running is False
+            assert agent.stop() is False
+            assert await agent.run_simple("hi") == ""
+
 
 class TestParamExtraction:
     """Parameter extraction utilities"""

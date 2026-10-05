@@ -785,6 +785,9 @@ LLM-powered agent with tool support. Created via `AgentBuilder` (`.with_X()` cha
 | `run_simple(message)` | Simple run | `str` |
 | `react(task)` | Run with ReAct | `str` |
 | `stream(task)` | Stream response | `AsyncIterator` |
+| `stream_collect(task)` | Collect all stream tokens | `list` |
+| `stop(clear_session=False)` | Cooperatively stop the agent | `bool` |
+| `is_running` | Whether a call is in flight | `bool` |
 | `session` | Session manager | `SessionManager` |
 | `tools` | Registered tool names | `list[str]` |
 | `tool_names` | Alias for `tools` (matches JS `toolNames`) | `list[str]` |

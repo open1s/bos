@@ -407,6 +407,23 @@ class Agent:
         content = self._resolve_content(task)
         return await self._inner.stream(content)
 
+    async def stream_collect(self, task: str | NbosContent) -> list:
+        """Collect all stream tokens into a list (matches JS streamCollect)."""
+        tokens = []
+        stream = await self.stream(task)
+        async for token in stream:
+            tokens.append(token)
+        return tokens
+
+    def stop(self, clear_session: bool = False) -> bool:
+        """Cooperatively stop the agent; suppresses the next run."""
+        return self._inner.stop(clear_session)
+
+    @property
+    def is_running(self) -> bool:
+        """Whether an agent call is currently in flight."""
+        return bool(self._inner.is_running())
+
     @property
     def session(self) -> SessionManager:
         return SessionManager(self._inner)

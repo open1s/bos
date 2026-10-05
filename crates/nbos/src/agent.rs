@@ -701,6 +701,10 @@ pub struct PyAgent {
     pub mcp_clients: std::sync::Arc<Mutex<Vec<std::sync::Arc<agent::mcp::McpClient>>>>,
     /// Hook registry for extensibility
     pub hooks: std::sync::Arc<Mutex<crate::hooks::PyHookRegistry>>,
+    /// True while run_simple/react/stream is in flight.
+    pub is_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by stop() to suppress the next call (cooperative, matching jsbos).
+    pub stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[pymethods]
@@ -727,6 +731,8 @@ impl PyAgent {
             inner: std::sync::Arc::new(Mutex::new(agent)),
             mcp_clients: Default::default(),
             hooks: std::sync::Arc::new(Mutex::new(py_hooks)),
+            is_running: Default::default(),
+            stop_flag: Default::default(),
         })
     }
 
@@ -762,6 +768,8 @@ impl PyAgent {
                         inner: std::sync::Arc::new(Mutex::new(agent)),
                         mcp_clients: Default::default(),
                         hooks: std::sync::Arc::new(Mutex::new(py_hooks)),
+                        is_running: Default::default(),
+                        stop_flag: Default::default(),
                     },
                 )?;
                 Ok(py_agent.into_any())
@@ -838,6 +846,19 @@ impl PyAgent {
     }
 
     fn react<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        use std::sync::atomic::Ordering;
+        if self.is_running.load(Ordering::SeqCst) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("Agent is already running"));
+        }
+        if self.stop_flag.load(Ordering::SeqCst) {
+            self.stop_flag.store(false, Ordering::SeqCst);
+            let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+            return pyo3_async_runtimes::tokio::future_into_py_with_locals(
+                py,
+                current_locals,
+                async move { Ok(String::new()) },
+            );
+        }
         let task_content = py_value_to_content(&task.bind(py))?;
         let agent = {
             let guard = self
@@ -846,17 +867,30 @@ impl PyAgent {
                 .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
             guard.clone()
         };
+        self.is_running.store(true, Ordering::SeqCst);
+        let is_running = self.is_running.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let out = agent
-                .react(task_content)
-                .await
-                .map_err(to_py_runtime_error)?;
-            Ok(out)
+            let out = agent.react(task_content).await;
+            is_running.store(false, Ordering::SeqCst);
+            out.map_err(to_py_runtime_error)
         })
     }
 
     fn run_simple<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        use std::sync::atomic::Ordering;
+        if self.is_running.load(Ordering::SeqCst) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("Agent is already running"));
+        }
+        if self.stop_flag.load(Ordering::SeqCst) {
+            self.stop_flag.store(false, Ordering::SeqCst);
+            let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+            return pyo3_async_runtimes::tokio::future_into_py_with_locals(
+                py,
+                current_locals,
+                async move { Ok(String::new()) },
+            );
+        }
         let task_content = py_value_to_content(&task.bind(py))?;
         let agent = {
             let guard = self
@@ -865,19 +899,67 @@ impl PyAgent {
                 .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
             guard.clone()
         };
+        self.is_running.store(true, Ordering::SeqCst);
+        let is_running = self.is_running.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let out = agent
-                .run_simple(task_content)
-                .await
-                .map_err(to_py_runtime_error)?;
-            Ok(out)
+            let out = agent.run_simple(task_content).await;
+            is_running.store(false, Ordering::SeqCst);
+            out.map_err(to_py_runtime_error)
         })
     }
 
+    /// Cooperatively stop the agent. Suppresses the next run and, when
+    /// clear_session is set, clears the session. Returns whether it was running.
+    #[pyo3(signature = (clear_session = false))]
+    fn stop(&self, clear_session: bool) -> PyResult<bool> {
+        use std::sync::atomic::Ordering;
+        let was_running = self.is_running.load(Ordering::SeqCst);
+        self.stop_flag.store(true, Ordering::SeqCst);
+        self.is_running.store(false, Ordering::SeqCst);
+        if clear_session {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+            guard.stop();
+            guard.session_mut().clear();
+        }
+        Ok(was_running)
+    }
+
+    fn is_running(&self) -> PyResult<bool> {
+        Ok(self.is_running.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     fn stream<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        use std::sync::atomic::Ordering;
+        if self.is_running.load(Ordering::SeqCst) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("Agent is already running"));
+        }
+        if self.stop_flag.load(Ordering::SeqCst) {
+            self.stop_flag.store(false, Ordering::SeqCst);
+            // Already-exhausted stream: the sender is dropped immediately.
+            let (tx, rx) = mpsc::channel::<Result<String, String>>(1);
+            drop(tx);
+            let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+            return pyo3_async_runtimes::tokio::future_into_py_with_locals(
+                py,
+                current_locals,
+                async move {
+                    Python::attach(|py| -> PyResult<Py<PyAny>> {
+                        let iter = PyStreamIterator {
+                            inner: Arc::new(tokio::sync::Mutex::new(Some(rx))),
+                        };
+                        Ok(Py::new(py, iter)?.into_any())
+                    })
+                },
+            );
+        }
         let task_content = py_value_to_content(&task.bind(py))?;
         let agent = self.inner.clone();
+        self.is_running.store(true, Ordering::SeqCst);
+        let is_running = self.is_running.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
 
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
@@ -920,6 +1002,7 @@ impl PyAgent {
                         break;
                     }
                 }
+                is_running.store(false, Ordering::SeqCst);
             });
 
             Python::attach(|py| -> PyResult<Py<PyAny>> {
