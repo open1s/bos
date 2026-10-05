@@ -137,6 +137,7 @@ pub struct AgentCallableServer {
 }
 
 impl AgentCallableServer {
+    /// Serve `agent` on `endpoint` over `session`.
     pub fn new(endpoint: impl Into<String>, session: Arc<Session>, agent: Arc<Agent>) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -147,10 +148,12 @@ impl AgentCallableServer {
         }
     }
 
+    /// The endpoint this server listens on.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
+    /// Declare the queryable and begin serving; errors if already started.
     pub async fn start(&mut self) -> Result<(), AgentError> {
         if self.started.swap(true, Ordering::Relaxed) {
             return Err(AgentError::Bus("server already started".to_string()));

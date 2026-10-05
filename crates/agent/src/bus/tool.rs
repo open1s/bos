@@ -18,6 +18,7 @@ pub struct AgentCallerTool {
 }
 
 impl AgentCallerTool {
+    /// Wrap a remote agent tool as a local [`Tool`](react::tool::Tool).
     pub fn new(
         tool_name: impl Into<String>,
         endpoint: impl Into<String>,

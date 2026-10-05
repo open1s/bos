@@ -23,6 +23,7 @@ pub struct AgentRpcClient {
 }
 
 impl AgentRpcClient {
+    /// Create a client that calls `endpoint` over `session`.
     pub fn new(endpoint: impl Into<String>, session: Arc<Session>) -> Self {
         let endpoint = endpoint.into();
         let caller_endpoint = endpoint.clone();
@@ -72,10 +73,12 @@ impl AgentRpcClient {
         self.transport.request_stream(&payload).await
     }
 
+    /// The remote endpoint this client targets.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
+    /// List the remote agent tools.
     pub async fn list(&self) -> Result<serde_json::Value, ToolError> {
         self.invoke_rpc(AgentRpcRequest {
             method: "tool/list".to_string(),
@@ -86,6 +89,7 @@ impl AgentRpcClient {
         .await
     }
 
+    /// Invoke a remote tool by name with JSON arguments.
     pub async fn call(
         &self,
         tool_name: impl Into<String>,
@@ -100,6 +104,7 @@ impl AgentRpcClient {
         .await
     }
 
+    /// Run one task through the remote agent LLM.
     pub async fn llm_run(&self, task: impl Into<String>) -> Result<serde_json::Value, ToolError> {
         self.invoke_rpc(AgentRpcRequest {
             method: "llm/run".to_string(),
