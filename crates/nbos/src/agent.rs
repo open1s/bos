@@ -1058,7 +1058,14 @@ impl PyAgent {
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
         if let Some(registry) = guard.registry() {
-            let tools: Vec<String> = registry.iter().map(|(name, _)| name.clone()).collect();
+            // Tools added through the bindings are registered as async tools, so
+            // a sync-only listing would hide every Python-registered tool.
+            let mut tools: Vec<String> = registry.iter().map(|(name, _)| name.clone()).collect();
+            for name in registry.async_tool_names() {
+                if !tools.contains(&name) {
+                    tools.push(name);
+                }
+            }
             Ok(tools)
         } else {
             Ok(Vec::new())

@@ -715,9 +715,14 @@ asyncio.run(main())
 |--------|-------------|
 | `save(path)` | Save conversation messages to file |
 | `restore(path)` | Restore conversation messages from file |
+| `save_full(path)` | Save the full session (messages + context) to file |
+| `restore_full(path)` | Restore the full session from file |
 | `add_message(role, content)` | Add message to conversation |
 | `get_messages()` | Get conversation messages |
-| `compact()` | Compact long conversation logs |
+| `compact(keep_recent=10, max_summary_chars=2000)` | Compact long conversation logs |
+| `clear()` | Clear the conversation |
+| `export()` | Return the session state as a dict |
+| `context` | The session context object (read-only) |
 
 ---
 

@@ -69,8 +69,11 @@ struct JSTool {
   description: String,
   schema: serde_json::Value,
   cancelable: bool,
-  callback: Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>>>,
-  cancel_callback: Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>>>>,
+  // Weak threadsafe functions so a registered tool does not pin the Node
+  // event loop: a script that only registers tools must still be able to exit.
+  callback: Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
+  cancel_callback:
+    Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>, String, napi::Status, true, true>>>,
 }
 
 #[async_trait]
@@ -416,7 +419,15 @@ impl Agent {
   pub fn list_tools(&self) -> Result<Vec<String>> {
     let guard = self.inner.blocking_lock();
     if let Some(registry) = guard.registry() {
-      Ok(registry.iter().map(|(name, _)| name.clone()).collect())
+      // Tools added through the bindings are registered as async tools, so a
+      // sync-only listing would hide every JS-registered tool.
+      let mut names: Vec<String> = registry.iter().map(|(name, _)| name.clone()).collect();
+      for name in registry.async_tool_names() {
+        if !names.contains(&name) {
+          names.push(name);
+        }
+      }
+      Ok(names)
     } else {
       Ok(Vec::new())
     }
@@ -519,9 +530,11 @@ impl Agent {
     description: String,
     _parameters: String,
     schema: String,
-    callback: ThreadsafeFunction<JSAny>,
+    callback: ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
     cancelable: bool,
-    cancel_callback: Option<ThreadsafeFunction<String>>,
+    cancel_callback: Option<
+      ThreadsafeFunction<String, napi::Unknown<'static>, String, napi::Status, true, true>,
+    >,
   ) -> Result<String> {
     let tool = JSTool {
       name: name.clone(),

@@ -411,6 +411,11 @@ class Agent:
     def config(self) -> dict[str, Any]:
         return self._inner.config()
 
+    @property
+    def tool_names(self) -> list[str]:
+        """Alias for :attr:`tools`, matching JavaScript's `toolNames`."""
+        return self._inner.list_tools()
+
 
 class BrainOS(AbstractAsyncContextManager):
     """Main entry point - manages Bus lifecycle and agent creation.

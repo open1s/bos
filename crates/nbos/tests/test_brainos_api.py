@@ -326,6 +326,30 @@ class TestSessionManager:
             )
 
 
+class TestAgentAccessors:
+    """Read-only agent accessors shared with the JS binding"""
+
+    @pytest.mark.asyncio
+    async def test_agent_config_is_dict(self):
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = await brain.agent("accessor-test").start()
+            assert isinstance(agent.config, dict)
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_names(self):
+        from nbos import BrainOS
+        from nbos import tool as _tool
+
+        @_tool("Add numbers")
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        async with BrainOS() as brain:
+            agent = await brain.agent("accessor-test").with_tools(add).start()
+            assert agent.tool_names == ["add"]
+
+
 class TestParamExtraction:
     """Parameter extraction utilities"""
 

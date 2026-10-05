@@ -2,7 +2,7 @@ import test from 'ava'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rmSync } from 'node:fs'
-import { BrainOS } from '../index.js'
+import { BrainOS, ToolDef } from '../index.js'
 
 async function startAgent(t) {
   const brain = new BrainOS()
@@ -72,6 +72,16 @@ test.serial('context exposes the session context', async (t) => {
 
 test.serial('config exposes the resolved agent config', async (t) => {
   const agent = await startAgent(t)
-  t.is(agent.config().name, 'session-test')
-  t.truthy(agent.config().model)
+  t.is(agent.config.name, 'session-test')
+  t.truthy(agent.config.model)
+})
+
+test.serial('toolNames lists registered tools', async (t) => {
+  const brain = new BrainOS()
+  await brain.start()
+  t.teardown(() => brain.stop())
+  const addTool = new ToolDef('add', 'Add two numbers', (args) => (args.a || 0) + (args.b || 0))
+  const agent = await brain.agent('tools-test').register(addTool).start()
+  t.deepEqual(agent.toolNames, ['add'])
+  t.deepEqual(agent.session.context, null)
 })

@@ -411,7 +411,8 @@ export class AgentBuilder {
     stop(options?: {}): any;
     isRunning(): boolean;
     get session(): SessionManager;
-    config(): any;
+    get config(): any;
+    get toolNames(): any[];
 }
 export function tool(descriptionOrOptions: any, maybeOptions?: {}): (target: any, propertyKey: any, descriptor: any) => any;
 export class ToolDef {

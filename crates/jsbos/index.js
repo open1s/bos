@@ -898,8 +898,12 @@ class AgentBuilder {
     return new SessionManager(this._inner);
   }
 
-  config() {
+  get config() {
     return this._inner ? this._inner.config() : { ...this._config };
+  }
+
+  get toolNames() {
+    return this._inner ? this._inner.listTools() : this._tools.list();
   }
 }
 

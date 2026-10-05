@@ -1378,11 +1378,10 @@ async function main() {
   const agent = await brain.agent('assistant')
     .start();
   
-  // Save session
-  agent.saveMessageLog('/tmp/session.json');
+  // Save the conversation, then restore it in a later run.
+  await agent.session.save('/tmp/session.json');
   
-  // Later, restore session
-  // agent.restoreMessageLog('/tmp/session.json');
+  // await agent.session.restore('/tmp/session.json');
   
   const result = await agent.runSimple('Hello');
   console.log(result);
@@ -1397,10 +1396,19 @@ main().catch(console.error);
 
 | Method | Description |
 |--------|-------------|
-| `addMessage(message)` | Add message to conversation log |
-| `getMessages()` | Get conversation messages |
-| `saveMessageLog(path)` | Save message log to file |
-| `restoreMessageLog(path)` | Restore message log from file |
+| `addMessage(role, content)` | Append a message to the conversation |
+| `getMessages()` | Get the conversation messages (JSON array) |
+| `save(path)` | Save the conversation to a file |
+| `restore(path)` | Restore the conversation from a file |
+| `saveFull(path)` | Save the full session (messages + context) to a file |
+| `restoreFull(path)` | Restore the full session from a file |
+| `compact(keepRecent?, maxSummaryChars?)` | Summarize older messages (defaults 10 / 2000) |
+| `clear()` | Clear the conversation |
+| `export()` | Serialize the session to a JSON string |
+| `import(json)` | Restore the session from a JSON string |
+| `context` | The session context object (read-only) |
+
+The started agent also exposes `agent.config` (the resolved configuration) and `agent.toolNames` (registered tool names).
 
 ---
 
@@ -1419,6 +1427,7 @@ While the JavaScript API mirrors the Python API for consistency, there are some 
 | Context manager | `async with` | `await brain.start()/stop()` |
 | Async iteration | `async for` | `for await` |
 | Class naming | `Subscriber` | `SubscriberWrapper` |
+| `SessionManager.export()` | Returns a `dict` | Returns a JSON string |
 
 ---
 
