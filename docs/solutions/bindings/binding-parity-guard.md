@@ -96,6 +96,12 @@ Python is_started was async, so the wrapper property returned a coroutine
 instead of a bool. The native now tracks a sync atomic flag, as the JS
 binding already did.
 
+BusManager closes the set. Python gained the fluent create(static), mode,
+connect, listen, peer, publish, publisher, subscriber, query, queryable,
+caller and callable names; the explicit create_*/publish_* methods remain as
+allowlisted aliases. That makes every paired wrapper class covered; the
+guard now has no unpaired surface left.
+
 Closing the ToolRegistry gap added unregister, list_tool_defs, list_by_category,
 filter and to_json to Python. list_by_category filters on an optional category
 attribute and returns an empty list until Python's ToolDef gains a category

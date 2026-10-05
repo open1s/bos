@@ -147,3 +147,51 @@ class TestBus:
         
         # Wait for all tasks to complete
         await asyncio.gather(*tasks)
+
+
+class TestBusManagerFluent:
+    """Fluent BusManager surface (nbos.bus)"""
+
+    @pytest.mark.asyncio
+    async def test_create_and_fluent_factories(self):
+        from nbos.bus import BusManager
+
+        bus = await BusManager.create(mode="peer")
+        try:
+            assert bus.bus is not None
+
+            sub = await bus.subscriber("fluent/topic")
+            pub = await bus.publisher("fluent/topic")
+            await bus.publish("fluent/topic", "hi")
+            assert await sub.recv(1000) == "hi"
+
+            await pub.publish_text("again")
+            assert await sub.recv(1000) == "again"
+        finally:
+            await bus.stop()
+
+    @pytest.mark.asyncio
+    async def test_fluent_configuration_chains(self):
+        from nbos.bus import BusManager
+
+        manager = BusManager().mode("peer").peer("p1")
+        await manager.start()
+        assert manager.bus is not None
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_query_and_caller_factories(self):
+        from nbos.bus import BusManager
+
+        async with BusManager() as bus:
+            server = await bus.queryable("fluent/q", lambda text: text.upper())
+            await server.start()
+            await asyncio.sleep(0.1)
+            client = await bus.query("fluent/q")
+            assert await client.ask("ok") == "OK"
+
+            rpc = await bus.callable("fluent/rpc", lambda text: text[::-1])
+            await rpc.start()
+            await asyncio.sleep(0.1)
+            caller = await bus.caller("fluent/rpc")
+            assert await caller.call("abc") == "cba"

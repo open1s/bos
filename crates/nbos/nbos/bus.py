@@ -51,6 +51,18 @@ class BusManager:
         self._peer = peer
         self._bus: PyBus | None = None
 
+    @classmethod
+    async def create(
+        cls,
+        *,
+        mode: str = "peer",
+        connect: list[str] | None = None,
+        listen: list[str] | None = None,
+        peer: str | None = None,
+    ) -> "BusManager":
+        """Construct and start a manager in one call."""
+        return await cls(mode=mode, connect=connect, listen=listen, peer=peer).start()
+
     async def start(self) -> "BusManager":
         """Create the underlying bus if it does not exist yet."""
         if self._bus is None:
@@ -69,6 +81,24 @@ class BusManager:
             await self._bus.close()
             self._bus = None
 
+    # ── Fluent configuration ───────────────────────────────────────
+
+    def mode(self, mode: str) -> "BusManager":
+        self._mode = mode
+        return self
+
+    def connect(self, addresses: list[str]) -> "BusManager":
+        self._connect = addresses
+        return self
+
+    def listen(self, addresses: list[str]) -> "BusManager":
+        self._listen = addresses
+        return self
+
+    def peer(self, peer: str) -> "BusManager":
+        self._peer = peer
+        return self
+
     async def __aenter__(self) -> BusManager:
         return await self.start()
 
@@ -86,6 +116,13 @@ class BusManager:
         if self._bus is None:
             raise RuntimeError("Bus not started. Use 'async with' context.")
         await self._bus.publish_json(topic, data)
+
+    async def publish(self, topic: str, payload: Any, is_json: bool = False) -> None:
+        """Publish ``payload`` to ``topic``, JSON-encoding it when asked."""
+        if is_json:
+            await self.publish_json(topic, payload)
+        else:
+            await self.publish_text(topic, payload)
 
     # ── Factory ────────────────────────────────────────────────────
 
@@ -128,6 +165,32 @@ class BusManager:
             raise RuntimeError("Bus not started. Use 'async with' context.")
         raw = await PyCallable.create(self._bus, uri, handler)
         return Callable(raw)
+
+    # ── Fluent factories ───────────────────────────────────────────
+
+    async def publisher(self, topic: str) -> Publisher:
+        """Fluent alias for :meth:`create_publisher`."""
+        return await self.create_publisher(topic)
+
+    async def subscriber(self, topic: str) -> Subscriber:
+        """Fluent alias for :meth:`create_subscriber`."""
+        return await self.create_subscriber(topic)
+
+    async def query(self, topic: str):
+        """Fluent alias for :meth:`create_query`."""
+        return await self.create_query(topic)
+
+    async def queryable(self, topic: str, handler=None):
+        """Fluent alias for :meth:`create_queryable`."""
+        return await self.create_queryable(topic, handler)
+
+    async def caller(self, name: str):
+        """Fluent alias for :meth:`create_caller`."""
+        return await self.create_caller(name)
+
+    async def callable(self, name: str, handler=None):
+        """Fluent alias for :meth:`create_callable`."""
+        return await self.create_callable(name, handler)
 
     @property
     def bus(self) -> PyBus:

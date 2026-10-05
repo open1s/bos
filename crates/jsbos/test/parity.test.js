@@ -246,3 +246,25 @@ test('Query, Queryable, Caller and Callable surfaces match across bindings', (t)
     new Set(['create']),
   )
 })
+
+test('BusManager surface matches across bindings', (t) => {
+  assertNoDrift(
+    t,
+    'BusManager',
+    norm(jsMembers(jsSrc, 'BusManager')),
+    norm(pyMembers(pySrc, 'BusManager')),
+    new Set(),
+    // Python keeps the explicit create_*/publish_* names as aliases of the
+    // fluent publisher/subscriber/query/queryable/caller/callable and publish.
+    new Set([
+      'publish_text',
+      'publish_json',
+      'create_publisher',
+      'create_subscriber',
+      'create_query',
+      'create_queryable',
+      'create_caller',
+      'create_callable',
+    ]),
+  )
+})
