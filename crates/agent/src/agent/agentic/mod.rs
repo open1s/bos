@@ -1,3 +1,5 @@
+//! The Agent type, its config, and the ReAct execution paths.
+
 use crate::agent::context::{AgentReActApp, AgentReactContext, AgentSession};
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
 use crate::agent::plugin::{AgentPlugin, PluginRegistry, StreamTokenWrapper};
@@ -25,7 +27,6 @@ use react::{CircuitBreakerConfig, LlmRequest, RateLimiterConfig, ReActResilience
 
 mod adapters;
 mod engine;
-#[warn(missing_docs)]
 mod llm;
 
 use adapters::{AsyncExtensibleToolAdapter, ExtensibleToolAdapter};
@@ -39,14 +40,23 @@ pub use llm::{build_vendor, LlmProvider};
 #[derive(Debug, Clone)]
 #[qserde::Archive]
 pub struct AgentConfig {
+    /// Agent name.
     pub name: String,
+    /// Model identifier in `vendor/model` form.
     pub model: String,
+    /// LLM API base URL.
     pub base_url: String,
+    /// LLM API key.
     pub api_key: String,
+    /// System prompt prepended to every conversation.
     pub system_prompt: String,
+    /// Sampling temperature.
     pub temperature: f32,
+    /// Optional completion token cap.
     pub max_tokens: Option<u32>,
+    /// Per-request timeout in seconds.
     pub timeout_secs: u64,
+    /// Maximum ReAct steps before the run is stopped.
     pub max_steps: usize,
     /// API protocol selection: `"chat"` (default, `/chat/completions`) or
     /// `"responses"` (`/v1/responses`). Kept as a string so it archives cleanly
@@ -84,38 +94,47 @@ impl Default for AgentConfig {
 /// Fluent setters, so a programmatic config reads like the Python/JS APIs:
 /// `AgentConfig::default().name("assistant").model("openai/gpt-4o")`.
 impl AgentConfig {
+    /// Set the agent name.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
+    /// Set the model identifier.
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
+    /// Set the LLM base URL.
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
+    /// Set the LLM API key.
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = api_key.into();
         self
     }
+    /// Set the system prompt.
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = prompt.into();
         self
     }
+    /// Set the sampling temperature.
     pub fn temperature(mut self, temperature: f32) -> Self {
         self.temperature = temperature;
         self
     }
+    /// Set the completion token cap.
     pub fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
+    /// Set the per-request timeout.
     pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
         self
     }
+    /// Set the maximum ReAct step count.
     pub fn max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
         self
@@ -130,10 +149,12 @@ impl AgentConfig {
         self.reasoning_effort = Some(effort.into());
         self
     }
+    /// Set the circuit-breaker configuration.
     pub fn circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
         self.circuit_breaker = Some(config);
         self
     }
+    /// Set the rate-limiter configuration.
     pub fn rate_limit(mut self, config: RateLimiterConfig) -> Self {
         self.rate_limit = Some(config);
         self
@@ -239,16 +260,19 @@ impl Agent {
         &self.hooks
     }
 
+    /// Borrow the plugin registry.
     pub fn plugins(&self) -> &PluginRegistry {
         &self.plugins
     }
 
+    /// Append a message and fire the `OnMessage` hook.
     pub fn add_message(&mut self, message: react::llm::LlmMessage) {
         self.session.lock().unwrap().push(message);
         self.hooks
             .trigger_all_blocking(HookEvent::OnMessage, HookContext::new(&self.config.name));
     }
 
+    /// Snapshot the session as an [`AgentState`].
     pub fn session_state(&self) -> AgentState {
         let session = self.session.lock().unwrap();
         AgentState {
@@ -263,18 +287,22 @@ impl Agent {
         }
     }
 
+    /// Lock and borrow the session.
     pub fn session(&self) -> std::sync::MutexGuard<'_, AgentSession> {
         self.session.lock().unwrap()
     }
 
+    /// Lock and mutably borrow the session.
     pub fn session_mut(&mut self) -> std::sync::MutexGuard<'_, AgentSession> {
         self.session.lock().unwrap()
     }
 
+    /// Snapshot the collected call metrics.
     pub fn metrics(&self) -> crate::metrics::CallMetrics {
         self.metrics.snapshot()
     }
 
+    /// Record one streaming LLM call and its timings and tokens.
     pub fn record_stream_call(
         &self,
         wall_time: std::time::Duration,
@@ -292,31 +320,38 @@ impl Agent {
         );
     }
 
+    /// Record one failed LLM call.
     pub fn record_llm_error(&self) {
         self.metrics.record_llm_error();
     }
 
+    /// Record several tool invocations and their combined duration.
     pub fn record_tool_calls(&self, count: u64, time: std::time::Duration) {
         self.metrics.record_tool_calls(count, time);
     }
 
+    /// Token usage from the most recent stream, if any.
     pub fn last_token_usage(&self) -> Option<(u64, u64)> {
         *self.last_stream_tokens.lock().unwrap()
     }
 
+    /// Number of tool calls seen in the most recent stream.
     pub fn last_stream_tool_calls(&self) -> u64 {
         *self.last_stream_tool_calls.lock().unwrap()
     }
 
+    /// Number of tool invocations recorded by the ReAct engine.
     pub fn tool_invocation_count(&self) -> u64 {
         let cache = self.engine_cache.lock().unwrap();
         cache.as_ref().map(|e| e.tool_call_count()).unwrap_or(0)
     }
 
+    /// Zero the collected metrics.
     pub fn reset_metrics(&self) {
         self.metrics.reset()
     }
 
+    /// Write the session to `path`.
     pub fn save_session(&self, path: &str) -> Result<(), AgentError> {
         self.session
             .lock()
@@ -325,6 +360,7 @@ impl Agent {
             .map_err(|e| AgentError::Session(e.to_string()))
     }
 
+    /// Load the session from `path`.
     pub fn restore_session(&mut self, path: &str) -> Result<(), AgentError> {
         self.session
             .lock()
@@ -371,10 +407,12 @@ impl Agent {
         }
     }
 
+    /// Register a plugin.
     pub fn add_plugin(&mut self, plugin: Arc<dyn AgentPlugin>) {
         self.plugins.register_blocking(plugin);
     }
 
+    /// Register a hook for `event`.
     pub fn add_hook(&mut self, event: HookEvent, hook: Arc<dyn AgentHook>) {
         self.hooks.register_blocking(event, hook);
     }

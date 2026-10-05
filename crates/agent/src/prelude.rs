@@ -1,3 +1,5 @@
+//! Convenience re-exports for `use agent::prelude::*`.
+
 pub use crate::agent::agentic::LlmProvider;
 pub use crate::agent::config::TomlAgentBuilder as AgentBuilder;
 pub use crate::agent::config::TomlAgentConfig;

@@ -1,13 +1,9 @@
 //! Core agent types: Message, MessageLog, Agent, AgentConfig.
 
 pub mod agentic;
-#[warn(missing_docs)]
 pub mod config;
-#[warn(missing_docs)]
 pub mod context;
-#[warn(missing_docs)]
 pub mod hooks;
-#[warn(missing_docs)]
 pub mod plugin;
 
 pub use self::agentic::{Agent, AgentConfig};

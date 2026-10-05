@@ -1,22 +1,15 @@
 //! Core agent runtime: tools, skills, hooks, plugins, sessions, and MCP.
+#![warn(missing_docs)]
 
 pub mod agent;
-#[warn(missing_docs)]
 pub mod bus;
-#[warn(missing_docs)]
 pub mod error;
-#[warn(missing_docs)]
 pub mod mcp;
-#[warn(missing_docs)]
 pub mod metrics;
 pub mod prelude;
-#[warn(missing_docs)]
 pub mod security;
-#[warn(missing_docs)]
 pub mod session;
-#[warn(missing_docs)]
 pub mod skills;
-#[warn(missing_docs)]
 pub mod tools;
 
 pub use prelude::*;
