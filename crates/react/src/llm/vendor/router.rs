@@ -1,20 +1,25 @@
+//! Model-prefix router that dispatches to registered vendor clients.
+
 use crate::llm::{
     LlmClient, LlmError, LlmRequest, LlmResponseResult, ReactContext, ReactSession, TokenStream,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
 
+/// Routes requests to named vendor clients by model prefix.
 pub struct LlmRouter<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> {
     vendors: DashMap<String, Box<dyn LlmClient<S, C>>>,
 }
 
 impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmRouter<S, C> {
+    /// Create an empty router.
     pub fn new() -> Self {
         Self {
             vendors: DashMap::new(),
         }
     }
 
+    /// Register a vendor under `name`.
     pub fn register_vendor(&mut self, name: String, vendor: Box<dyn LlmClient<S, C>>) {
         self.vendors.insert(name, vendor);
     }

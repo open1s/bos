@@ -1,3 +1,5 @@
+//! The OpenRouter vendor, an OpenAI-compatible provider.
+
 use async_trait::async_trait;
 
 use crate::llm::{
@@ -25,12 +27,14 @@ impl Clone for OpenRouterVendor {
 }
 
 impl OpenRouterVendor {
+    /// Create a OpenRouter vendor with an explicit endpoint, model, and key.
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
         Self {
             inner: OpenAiVendor::new(endpoint, model, api_key),
         }
     }
 
+    /// Start building a OpenRouter vendor.
     pub fn builder() -> OpenRouterVendorBuilder {
         OpenRouterVendorBuilder::new()
     }
@@ -70,6 +74,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
     }
 }
 
+/// Builder for [`OpenRouterVendor`].
 pub struct OpenRouterVendorBuilder {
     endpoint: String,
     model: String,
@@ -77,6 +82,7 @@ pub struct OpenRouterVendorBuilder {
 }
 
 impl OpenRouterVendorBuilder {
+    /// Create a builder with OpenRouter defaults.
     pub fn new() -> Self {
         Self {
             endpoint: "https://openrouter.ai/api/v1".to_string(),
@@ -85,21 +91,25 @@ impl OpenRouterVendorBuilder {
         }
     }
 
+    /// Set the API endpoint.
     pub fn endpoint(mut self, endpoint: String) -> Self {
         self.endpoint = endpoint;
         self
     }
 
+    /// Set the model id.
     pub fn model(mut self, model: String) -> Self {
         self.model = model;
         self
     }
 
+    /// Set the API key.
     pub fn api_key(mut self, api_key: String) -> Self {
         self.api_key = Some(api_key);
         self
     }
 
+    /// Build the vendor, or fail if no key was set.
     pub fn build(self) -> Result<OpenRouterVendor, VendorBuilderError> {
         let api_key = self.api_key.ok_or(VendorBuilderError::MissingApiKey)?;
         Ok(OpenRouterVendor::new(self.endpoint, self.model, api_key))

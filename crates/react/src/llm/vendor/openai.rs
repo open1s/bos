@@ -1,3 +1,5 @@
+//! The OpenAI vendor and its OpenAI-compatible HTTP client.
+
 use std::sync::Arc;
 
 use crate::{
@@ -19,6 +21,7 @@ use crate::llm::{
     ReactContext, ReactSession, StreamToken, TokenStream, VendorBuilderError,
 };
 
+/// An OpenAI-compatible vendor client.
 pub struct OpenAiVendor {
     client: Arc<Client>,
     endpoint: Arc<String>,
@@ -136,6 +139,7 @@ struct FunctionCallJson {
 }
 
 impl OpenAiVendor {
+    /// Create a vendor with an explicit endpoint, model, and key.
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
         let client = Arc::new(
             Client::builder()
@@ -152,6 +156,7 @@ impl OpenAiVendor {
         }
     }
 
+    /// Start building an OpenAI vendor.
     pub fn builder() -> OpenAiVendorBuilder {
         OpenAiVendorBuilder::new()
     }
@@ -620,6 +625,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         "openai"
     }
 }
+/// Builder for [`OpenAiVendor`].
 pub struct OpenAiVendorBuilder {
     endpoint: String,
     model: String,
@@ -627,6 +633,7 @@ pub struct OpenAiVendorBuilder {
 }
 
 impl OpenAiVendorBuilder {
+    /// Create a builder with OpenAI defaults.
     pub fn new() -> Self {
         Self {
             endpoint: "https://api.openai.com/v1".to_string(),
@@ -635,21 +642,25 @@ impl OpenAiVendorBuilder {
         }
     }
 
+    /// Set the API endpoint.
     pub fn endpoint(mut self, endpoint: String) -> Self {
         self.endpoint = endpoint;
         self
     }
 
+    /// Set the model id.
     pub fn model(mut self, model: String) -> Self {
         self.model = model;
         self
     }
 
+    /// Set the API key.
     pub fn api_key(mut self, api_key: String) -> Self {
         self.api_key = Some(api_key);
         self
     }
 
+    /// Build the vendor, or fail if no key was set.
     pub fn build(self) -> Result<OpenAiVendor, VendorBuilderError> {
         let api_key = self.api_key.ok_or(VendorBuilderError::MissingApiKey)?;
         Ok(OpenAiVendor::new(self.endpoint, self.model, api_key))
@@ -662,6 +673,7 @@ impl Default for OpenAiVendorBuilder {
     }
 }
 
+/// A thin OpenAI client wrapper used by the bindings.
 pub struct OpenAiClient {
     inner: OpenAiVendor,
 }
@@ -675,6 +687,7 @@ impl Clone for OpenAiClient {
 }
 
 impl OpenAiClient {
+    /// Create a client with an explicit endpoint, model, and key.
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
         Self {
             inner: OpenAiVendor::new(endpoint, model, api_key),

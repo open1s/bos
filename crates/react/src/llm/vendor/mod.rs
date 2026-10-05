@@ -1,9 +1,14 @@
+#[warn(missing_docs)]
 pub mod deepseek;
+#[warn(missing_docs)]
 pub mod nvidia;
+#[warn(missing_docs)]
 pub mod openai;
 pub mod openaicompatible;
+#[warn(missing_docs)]
 pub mod openrouter;
 pub mod responses;
+#[warn(missing_docs)]
 pub mod router;
 pub use deepseek::{DeepSeekVendor, DeepSeekVendorBuilder};
 pub use nvidia::NvidiaVendor;
@@ -21,6 +26,7 @@ pub use responses::{
 };
 pub use router::LlmRouter;
 
+/// Merge `extra` into `leading_system`, returning `None` when `extra` is empty.
 pub fn merge_system_prompt(extra: String, leading_system: Option<&str>) -> Option<String> {
     if extra.is_empty() {
         return None;

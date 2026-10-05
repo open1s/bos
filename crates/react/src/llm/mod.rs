@@ -1,5 +1,7 @@
 //! LLM types and client abstraction.
+#[warn(missing_docs)]
 pub mod client;
+#[warn(missing_docs)]
 pub mod response;
 pub mod types;
 pub mod vendor;
