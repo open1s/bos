@@ -4,7 +4,6 @@ use std::sync::Arc;
 use serde::Deserialize;
 use zenoh::Session as ZenohSession;
 
-use crate::agent::agentic::LlmProvider;
 use crate::agent::{Agent, AgentConfig};
 use crate::error::AgentError;
 use crate::tools::{FunctionTool, Tool};
@@ -138,12 +137,7 @@ impl TomlAgentBuilder {
             config.api_mode = mode.to_string();
         }
 
-        let mut llm = LlmProvider::new();
-        let (vendor_name, vendor) = crate::agent::agentic::build_vendor(&config);
-        llm.register_vendor(vendor_name, vendor);
-        let llm = Arc::new(llm);
-
-        let mut agent = Agent::new(config, llm);
+        let mut agent = Agent::from_config(config);
 
         for tool in self.tools {
             agent.try_add_tool(tool)?;

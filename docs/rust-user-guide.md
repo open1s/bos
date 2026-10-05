@@ -64,22 +64,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use agent::{Agent, AgentConfig};
-use agent::llm::LlmProvider;
-use agent::llm::openai::OpenAiClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The vendor is inferred from the model prefix (openai/, nvidia/, deepseek/,
+    // openrouter/); unprefixed models use the OpenAI-compatible client.
     let config = AgentConfig::default()
         .name("assistant")
-        .model("nvidia/meta/llama-3.1-8b-instruct");
+        .model("nvidia/meta/llama-3.1-8b-instruct")
+        .base_url("https://integrate.api.nvidia.com/v1")
+        .api_key("your-api-key");
 
-    let provider = LlmProvider::new();
-    provider.register_vendor("openai", Box::new(OpenAiClient::new(
-        "https://api.openai.com/v1",
-        "sk-...".to_string(),
-    )));
-
-    let agent = Agent::new(config, Arc::new(provider));
+    let agent = Agent::from_config(config);
 
     let result = agent.run_simple("What is 42 + 58?").await?;
     println!("{}", result);
@@ -121,8 +117,8 @@ let config = AgentConfig::default()
     .name("assistant")
     .system_prompt("You are a helpful assistant.");
 
-// Agent::new requires a config and an LLM provider
-let agent = Agent::new(config, llm_provider);
+// Builds the LLM provider from the config's model / base_url / api_key.
+let agent = Agent::from_config(config);
 ```
 
 ### Tool

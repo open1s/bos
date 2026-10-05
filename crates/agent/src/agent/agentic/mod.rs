@@ -80,6 +80,65 @@ impl Default for AgentConfig {
     }
 }
 
+/// Fluent setters, so a programmatic config reads like the Python/JS APIs:
+/// `AgentConfig::default().name("assistant").model("openai/gpt-4o")`.
+impl AgentConfig {
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = api_key.into();
+        self
+    }
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = prompt.into();
+        self
+    }
+    pub fn temperature(mut self, temperature: f32) -> Self {
+        self.temperature = temperature;
+        self
+    }
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+    pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
+    }
+    pub fn max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = max_steps;
+        self
+    }
+    /// `"chat"` (default) or `"responses"`.
+    pub fn api_mode(mut self, api_mode: impl Into<String>) -> Self {
+        self.api_mode = api_mode.into();
+        self
+    }
+    /// `"low"`, `"medium"` or `"high"`.
+    pub fn reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
+        self
+    }
+    pub fn circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
+        self.circuit_breaker = Some(config);
+        self
+    }
+    pub fn rate_limit(mut self, config: RateLimiterConfig) -> Self {
+        self.rate_limit = Some(config);
+        self
+    }
+}
+
 /// Agent is the main abstraction for AI agents with LLM integration,
 /// tool registries, and skill management.
 #[qserde::Archive]
@@ -138,6 +197,24 @@ impl Agent {
             last_stream_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0),
         }
+    }
+
+    /// Create an agent from a programmatic [`AgentConfig`], constructing the
+    /// LLM provider from `model` / `base_url` / `api_key`.
+    ///
+    /// This is the one-call path for code that configures an agent directly
+    /// instead of loading TOML; it does not read the home config.
+    ///
+    /// ```
+    /// use agent::{Agent, AgentConfig};
+    /// let agent = Agent::from_config(AgentConfig::default().name("assistant"));
+    /// assert_eq!(agent.config().name, "assistant");
+    /// ```
+    pub fn from_config(config: AgentConfig) -> Self {
+        let mut llm = LlmProvider::new();
+        let (vendor_name, vendor) = build_vendor(&config);
+        llm.register_vendor(vendor_name, vendor);
+        Self::new(config, Arc::new(llm))
     }
 
     /// Set the bus for tool event publishing.

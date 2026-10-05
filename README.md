@@ -104,8 +104,11 @@ const result3 = await agent.ask(audioContent);
 ```rust
 use agent::{Agent, AgentConfig};
 
-let config = AgentConfig::default().name("assistant");
-let agent = Agent::builder().config(config).build()?;
+let config = AgentConfig::default()
+    .name("assistant")
+    .model("openai/gpt-4o")            // vendor inferred from the model prefix
+    .api_key(std::env::var("OPENAI_API_KEY")?);
+let agent = Agent::from_config(config);
 let result = agent.run_simple("Hello").await?;
 ```
 

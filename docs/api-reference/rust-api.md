@@ -11,8 +11,7 @@ The core abstraction for AI agents with LLM integration, tool registries, skill 
 #### Constructor
 
 ```rust
-use agent::{Agent, AgentConfig, LlmProvider};
-use std::sync::Arc;
+use agent::{Agent, AgentConfig};
 
 let config = AgentConfig::default()
     .name("assistant")
@@ -21,12 +20,21 @@ let config = AgentConfig::default()
     .api_key("sk-...")
     .system_prompt("You are helpful.")
     .temperature(0.7)
-    .max_tokens(Some(4096))
+    .max_tokens(4096)
     .timeout_secs(120);
+
+// Constructs the vendor from the model prefix and wires it up.
+let agent = Agent::from_config(config);
+```
+
+Or wire the provider yourself when you need several vendors or a custom client:
+
+```rust
+use agent::{Agent, AgentConfig, LlmProvider};
+use std::sync::Arc;
 
 let mut llm = LlmProvider::new();
 llm.with_nvidia("nvidia/meta/llama-3.1-8b-instruct", base_url, api_key);
-// or
 llm.with_openrouter("openrouter/anthropic/claude-3", base_url, api_key);
 
 let agent = Agent::new(config, Arc::new(llm));
