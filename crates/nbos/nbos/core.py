@@ -434,6 +434,18 @@ class Agent:
         self._inner.reset_perf_metrics()
         return self
 
+    async def list_mcp_tools(self) -> list[dict]:
+        """List tools exposed by connected MCP servers."""
+        return await self._inner.list_mcp_tools()
+
+    async def list_mcp_resources(self, namespace: str) -> list[dict]:
+        """List resources exposed by the MCP server in the given namespace."""
+        return await self._inner.list_mcp_resources(namespace)
+
+    async def list_mcp_prompts(self) -> list[dict]:
+        """List prompts exposed by connected MCP servers."""
+        return await self._inner.list_mcp_prompts()
+
 
 class BrainOS(AbstractAsyncContextManager):
     """Main entry point - manages Bus lifecycle and agent creation.

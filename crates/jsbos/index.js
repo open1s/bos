@@ -924,6 +924,18 @@ class AgentBuilder {
     if (this._inner) this._inner.resetPerfMetrics();
     return this;
   }
+
+  async listMcpTools() {
+    return this._inner.listMcpTools();
+  }
+
+  async listMcpResources(namespace) {
+    return this._inner.listMcpResources(namespace);
+  }
+
+  async listMcpPrompts() {
+    return this._inner.listMcpPrompts();
+  }
 }
 
 class AgentWrapperClass {
@@ -1027,6 +1039,14 @@ class AgentWrapperClass {
 
   async listMcpTools() {
     return this._inner.listMcpTools();
+  }
+
+  async listMcpResources(namespace) {
+    return this._inner.listMcpResources(namespace);
+  }
+
+  async listMcpPrompts() {
+    return this._inner.listMcpPrompts();
   }
 
   get metrics() {

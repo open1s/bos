@@ -374,6 +374,15 @@ class TestAgentAccessors:
             assert "total_wall_time_us" in metrics
             assert agent.reset_metrics() is agent
 
+    @pytest.mark.asyncio
+    async def test_agent_mcp_listing_empty(self):
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = await brain.agent("mcp-test").start()
+            assert await agent.list_mcp_tools() == []
+            assert await agent.list_mcp_resources("none") == []
+            assert await agent.list_mcp_prompts() == []
+
 
 class TestParamExtraction:
     """Parameter extraction utilities"""

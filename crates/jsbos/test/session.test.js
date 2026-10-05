@@ -127,3 +127,10 @@ test.serial('export/import round-trip through objects and JSON strings', async (
   agent.session.import(JSON.stringify(snapshot))
   t.deepEqual(agent.session.getMessages(), snapshot.messages)
 })
+
+test.serial('high-level agent exposes empty MCP listings without servers', async (t) => {
+  const agent = await startAgent(t)
+  t.deepEqual(await agent.listMcpTools(), [])
+  t.deepEqual(await agent.listMcpResources('none'), [])
+  t.deepEqual(await agent.listMcpPrompts(), [])
+})

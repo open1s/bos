@@ -791,6 +791,9 @@ LLM-powered agent with tool support. Created via `AgentBuilder` (`.with_X()` cha
 | `config` | Agent configuration | `dict` |
 | `metrics` | Performance metrics (timings in µs) | `dict` |
 | `reset_metrics()` | Reset performance metrics | `Agent` |
+| `list_mcp_tools()` | Tools from connected MCP servers | `list[dict]` |
+| `list_mcp_resources(namespace)` | Resources for an MCP namespace | `list[dict]` |
+| `list_mcp_prompts()` | Prompts from connected MCP servers | `list[dict]` |
 
 ### Resilience Configuration
 

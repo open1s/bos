@@ -415,6 +415,9 @@ export class AgentBuilder {
     get toolNames(): any[];
     get metrics(): jsbos.PerfSnapshot | null;
     resetMetrics(): this;
+    listMcpTools(): Promise<any[]>;
+    listMcpResources(namespace: any): Promise<any[]>;
+    listMcpPrompts(): Promise<any[]>;
 }
 export function tool(descriptionOrOptions: any, maybeOptions?: {}): (target: any, propertyKey: any, descriptor: any) => any;
 export class ToolDef {

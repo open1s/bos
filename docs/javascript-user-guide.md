@@ -862,6 +862,9 @@ new Agent(bus, options = {})
 | `toolNames` | Registered tool names | `string[]` |
 | `metrics` | Performance metrics (timings in µs) | `object` |
 | `resetMetrics()` | Reset performance metrics | `AgentBuilder` |
+| `listMcpTools()` | Tools from connected MCP servers | `Promise<any[]>` |
+| `listMcpResources(namespace)` | Resources for an MCP namespace | `Promise<any[]>` |
+| `listMcpPrompts()` | Prompts from connected MCP servers | `Promise<any[]>` |
 | `stop(options?)` | Stop the agent | `Promise<void>` |
 | `isRunning()` | Whether the agent is running | `boolean` |
 

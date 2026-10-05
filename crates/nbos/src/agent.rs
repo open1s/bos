@@ -1310,16 +1310,23 @@ impl PyAgent {
         })
     }
 
-    fn list_mcp_prompts<'py>(&self) -> PyResult<Vec<String>> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        let prompts: Vec<String> = guard
-            .registry()
-            .map(|r| r.mcp_prompt_names())
-            .unwrap_or_default();
-        Ok(prompts)
+    fn list_mcp_prompts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let agent = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let guard = agent
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+            // Return the prompt entries, matching list_mcp_tools/resources and the
+            // JS binding, rather than bare prompt names.
+            let prompts = guard
+                .registry()
+                .map(|r| r.mcp_prompt_entries())
+                .unwrap_or_default();
+            let prompts_json = serde_json::to_value(&prompts)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            Python::attach(|py| json_to_py(py, &prompts_json))
+        })
     }
 
     fn add_message<'py>(&self, _py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<()> {
