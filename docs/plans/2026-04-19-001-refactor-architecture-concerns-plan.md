@@ -1,7 +1,7 @@
 ---
 title: Refactor Architecture Concerns from Codebase Review
 type: refactor
-status: active
+status: completed
 date: 2026-04-19
 ---
 
@@ -54,7 +54,7 @@ The architecture review revealed several code quality concerns that reduce maint
 
 ## Implementation Units
 
-- [ ] **Unit 1: Deduplicate engine.rs ReAct loop**
+- [x] **Unit 1: Deduplicate engine.rs ReAct loop**
   **Goal:** Extract shared step logic from `react()` and `react_with_request()` into a single private method, eliminating ~260 lines of duplication.
   **Requirements:** R1
   **Dependencies:** None
@@ -75,7 +75,7 @@ The architecture review revealed several code quality concerns that reduce maint
   - Integration: Skill caching works correctly through both entry points
   **Verification:** `cargo test -p react` passes; `cargo clippy -p react` clean
 
-- [ ] **Unit 2: Fix `histroy` typo → `history`**
+- [x] **Unit 2: Fix `histroy` typo → `history`**
   **Goal:** Rename all 9 occurrences of the misspelled `histroy` variable to `history` in engine.rs.
   **Requirements:** R3
   **Dependencies:** Unit 1 (apply after dedup to avoid rebase churn — if Unit 1 moves the lines, fix in the deduplicated version)
@@ -86,7 +86,7 @@ The architecture review revealed several code quality concerns that reduce maint
   - Test expectation: none — pure rename, no behavioral change
   **Verification:** `rg "histroy" crates/react/src/` returns no results; `cargo build -p react` succeeds
 
-- [ ] **Unit 3: Deduplicate agentic.rs tool/skill adapter construction**
+- [x] **Unit 3: Deduplicate agentic.rs tool/skill adapter construction**
   **Goal:** Extract the duplicated tool adapter + skill tool + load_skill tool registration from `Agent::react()` and `Agent::run_simple()` into a shared private method.
   **Requirements:** R2
   **Dependencies:** None (independent of Unit 1)
@@ -106,7 +106,7 @@ The architecture review revealed several code quality concerns that reduce maint
   - Integration: Hook-wrapped tools receive BeforeToolCall/AfterToolCall events in both paths
   **Verification:** `cargo test -p agent` passes; `cargo clippy -p agent` clean
 
-- [ ] **Unit 4: Fix `LlmRouter.supports_tools()` to return true**
+- [x] **Unit 4: Fix `LlmRouter.supports_tools()` to return true**
   **Goal:** Change `supports_tools()` from `false` to `true` so callers don't skip tool-aware code paths when using the router.
   **Requirements:** R4
   **Dependencies:** None
@@ -119,7 +119,7 @@ The architecture review revealed several code quality concerns that reduce maint
   - Integration: Agent code paths that check `supports_tools()` now include tools in requests routed through the router
   **Verification:** `cargo test -p react` passes; grep for `supports_tools` consumers confirms no breakage
 
-- [ ] **Unit 5: Fix plugin streaming semantic mismatch**
+- [x] **Unit 5: Fix plugin streaming semantic mismatch**
   **Goal:** Add `on_stream_token` method to `AgentPlugin` trait and call it from `process_stream_token` instead of routing through `on_llm_response`.
   **Requirements:** R5
   **Dependencies:** None
@@ -141,7 +141,7 @@ The architecture review revealed several code quality concerns that reduce maint
   - Backward compat: Existing plugins that don't implement `on_stream_token` still work (default no-op)
   **Verification:** `cargo test -p agent` passes; existing plugin tests still pass
 
-- [ ] **Unit 6: Wire SkillInjector into Agent.react() system prompt**
+- [x] **Unit 6: Wire SkillInjector into Agent.react() system prompt** *(satisfied via `context.skills` — see Resolution)*
   **Goal:** Use `SkillInjector::inject_available()` to augment the system prompt with a list of available skills, giving the LLM upfront context about what skills exist before it needs to call `load_skill`.
   **Requirements:** R6
   **Dependencies:** Unit 3 (modifies the same `react()` flow)
@@ -188,3 +188,23 @@ Unit 6 depends on Unit 3 (touches the same method).
 Recommended parallel waves:
 - **Wave 1**: Units 1, 3, 4, 5 (all independent)
 - **Wave 2**: Units 2, 6 (depend on wave 1)
+
+---
+
+## Resolution (2026-10-05)
+
+All six units are resolved. Verified against the current tree:
+
+- **Unit 1** — `ReActEngine::react_loop` exists (`crates/react/src/engine.rs`);
+  `react()` and `react_with_request()` share it. `histroy` no longer appears in
+  `crates/react/src/`.
+- **Unit 2** — typo gone (same rename).
+- **Unit 3** — `Agent::build_react_engine()` (`crates/agent/src/agent/agentic.rs`) is
+  shared by `react()`, `run_simple()`, and `stream()`.
+- **Unit 4** — `LlmRouter::supports_tools()` returns `true`.
+- **Unit 5** — `AgentPlugin::on_stream_token` exists and `PluginRegistry::on_stream_token`
+  dispatches it.
+- **Unit 6** — *not* implemented through `SkillInjector`. Instead `Agent::prepare_context()`
+  populates `AgentReactContext.skills`, and every provider `convert_request()` injects the
+  skill list into the system prompt. The outcome is achieved; `SkillInjector`
+  (`crates/agent/src/skills/mod.rs`) is now redundant dead code and a candidate for removal.

@@ -58,16 +58,25 @@ BrainOS is structured as a modular, event-driven system with the following core 
 - Handles timeouts and failures
 - Persists memory across sessions
 
-**Architecture**:
+**Architecture** (actual tree):
 ```
-ReActEngine
-├── engine.rs           # Main orchestration logic
-├── llm.rs              # LLM interface & integration
-├── tool.rs             # Tool execution framework
-├── memory.rs           # Session state & persistence
-├── prompts.rs          # Prompt templates & generation
-├── resilience.rs       # Timeouts, retries, circuit breaker
-└── telemetry.rs        # Observability hooks
+crates/react/src
+├── engine.rs            # ReAct loop + step orchestration
+├── llm/
+│   ├── client.rs        # LlmClient trait (complete / stream_complete)
+│   ├── response.rs      # LlmResponse, StreamToken, TokenStream
+│   ├── types.rs         # LlmRequest, Content, LlmMessage, ReactSession/Context
+│   └── vendor/          # LLM provider adapters
+│       ├── openaicompatible.rs  # shared OpenAI wire types, SSE extractor, tool-call accumulator
+│       ├── openai.rs            # canonical OpenAI-compatible transport (+ Responses API)
+│       ├── deepseek.rs | nvidia.rs | openrouter.rs  # thin delegating vendors
+│       ├── responses.rs         # OpenAI Responses API transport
+│       └── router.rs            # LlmRouter: named-vendor dispatch
+├── tool/                # Tool / AsyncTool, registry, descriptor, error
+├── resilience/          # circuit breaker, rate limiter, retry
+├── runtime/             # ReActApp lifecycle-hook seam (NoopApp)
+├── telemetry/           # token counting + budget
+└── utils/               # streaming extractors (JSON / XML / mixed)
 ```
 
 **Data Flow**:
@@ -103,34 +112,23 @@ Final Output
 - Session state management
 - Error handling and recovery
 
-**Architecture**:
+**Architecture** (actual tree):
 ```
-Agent
+crates/agent/src
 ├── agent/
-│   ├── base.rs         # Core agent traits
-│   ├── context.rs      # Agent execution context
-│   └── executor.rs     # Agent execution engine
-├── skills/
-│   ├── registry.rs     # Skill loading & discovery
-│   ├── loader.rs       # Dynamic skill loading
-│   └── skill.rs        # Skill interface & traits
-├── tools/
-│   ├── registry.rs     # Tool registration
-│   ├── executor.rs     # Tool execution logic
-│   ├── circuit_breaker.rs  # Resilience patterns
-│   ├── http_tool.rs    # HTTP client tool
-│   ├── cache.rs        # Tool result caching
-│   └── policy.rs       # Tool policy enforcement
-├── llm/
-│   ├── provider.rs     # LLM provider abstraction
-│   ├── openai.rs       # OpenAI integration
-│   └── anthropic.rs    # Claude integration
-├── mcp/
-│   ├── protocol.rs     # MCP message handling
-│   └── handler.rs      # MCP server handler
-└── session/
-    ├── manager.rs      # Session lifecycle
-    └── storage.rs      # Session state storage
+│   ├── agentic.rs      # Agent, LlmProvider, ReAct engine assembly
+│   ├── config.rs       # AgentConfig + TOML builder
+│   ├── context.rs      # AgentReactContext / AgentReActApp / AgentSession
+│   ├── hooks.rs        # AgentHook lifecycle seam
+│   └── plugin.rs       # AgentPlugin middleware seam
+├── tools/              # ToolRegistry, FunctionTool, BashTool, validator, translator
+├── skills/             # SkillLoader, SkillMetadata, SkillInjector
+├── mcp/                # MCP client, protocol, stdio/HTTP transports
+├── bus/                # agent RPC: AgentRpcClient, AgentCallableServer, AgentCallerTool
+├── session/            # SessionManager
+├── security/           # WorkspaceValidator
+├── metrics.rs          # CallMetrics
+└── error.rs            # AgentError / LlmError / ToolError
 ```
 
 **Design Patterns**:
@@ -200,11 +198,11 @@ Session {
 
 **Architecture**:
 ```
-Config System
-├── loader.rs          # Configuration file loading
-├── types.rs           # Configuration data types
-├── schema.rs          # Configuration validation schemas
-└── error.rs           # Configuration errors
+crates/config/src
+├── lib.rs             # public surface + Section API
+├── loader.rs          # file discovery, parsing, env overrides
+├── types.rs           # configuration data types
+└── error.rs           # configuration errors
 ```
 
 **Loading Priority**:
@@ -228,12 +226,8 @@ Config System
 
 **Architecture**:
 ```
-Logging System
-├── lib.rs              # Initialization & setup
-├── subscriber.rs       # Tracing subscriber configuration
-├── filters.rs          # Log level filtering
-├── formatters.rs       # Output formatting
-└── exporters.rs        # Metrics/trace exporters
+crates/logging/src
+└── lib.rs              # init_tracing / auto_init_tracing + flexi_logger setup
 ```
 
 **Tracing Levels**:
@@ -682,56 +676,73 @@ pub trait ToolPolicy {
 
 ## 📚 Component Dependencies
 
+Layers flow downward. Lower layers never depend on higher ones.
+
 ```
-react
-├── agent (skills, tools, LLM integration)
-├── bus (event communication)
-├── config (settings loading)
-├── logging (telemetry)
-└── tokio (async runtime)
+bindings        nbos (pyo3)        jsbos (napi)
+                    └──────┬───────────┘
+                           ▼
+agent           agent  ──►  react, bus, config, logging, qserde
+                           │
+react           react  ──►  bus, qserde
+                           │
+infrastructure  bus    ──►  logging
+                logging──►  config
+                config ──►  (serde only)
+                qserde ──►  qserde_derive
 
-agent
-├── bus (session communication)
-├── config (agent configuration)
-├── logging (instrumentation)
-└── tokio (async support)
-
-bus
-├── tokio (async channels)
-├── serde (message serialization)
-├── zenoh (distributed messaging)
-└── logging (tracing)
-
-config
-└── serde (TOML/YAML parsing)
-
-logging
-└── tracing (structured logging)
+independent     resource   (feature-gated bus/config/logging; nothing depends on it)
 ```
+
+**Layer rule**: `react` is the reasoning/LLM layer; `agent` composes it;
+`nbos`/`jsbos` only marshal across an FFI seam. `resource` is an independent
+subsystem (QUIC transport, Rego policy, `rex` CLI) that is not yet wired into
+the agent graph.
+
+---
+
+### Layer ownership
+
+| Crate | Owns | Must not |
+|---|---|---|
+| `qserde` | multi-backend (de)serialization | know about agents or LLMs |
+| `bus` | transport, pub/sub, query/RPC, codecs | know about agents or LLMs |
+| `config` | file/env configuration | depend on runtime crates |
+| `logging` | tracing initialization | depend on runtime crates |
+| `react` | ReAct loop, LLM providers, tool trait, resilience | depend on `agent` |
+| `agent` | composition: hooks, plugins, skills, MCP, sessions | depend on bindings |
+| `nbos`/`jsbos` | FFI marshalling only | hold business logic |
+| `resource` | external resource transport/policy (isolated) | be imported without a declared seam |
 
 ---
 
 ## 🔄 Extension Points
 
-### 1. Custom LLM Providers
+### 1. Custom LLM providers
 
-Implement `LLMProvider` trait for new models
+Implement `react::llm::LlmClient` and register it with `LlmProvider::register_vendor`
+(or `LlmRouter`). OpenAI-compatible providers should delegate to `OpenAiVendor`;
+`deepseek`, `nvidia`, and `openrouter` are ~200-line config adapters that show the pattern.
 
-### 2. Custom Tools
+### 2. Custom tools
 
-Implement `Tool` trait and register in `ToolRegistry`
+Implement `react::tool::Tool` (sync) or `react::tool::registry::AsyncTool` (async) and
+register it in `agent::tools::ToolRegistry`.
 
-### 3. Custom Memory Backends
+### 3. Lifecycle hooks
 
-Implement `MemoryBackend` trait for different storage
+Implement `AgentHook` and add it to `HookRegistry` to observe or veto agent, LLM, and
+tool events.
 
-### 4. Custom Subscribers
+### 4. Middleware
 
-Implement `Subscriber` trait for specialized event handling
+Implement `AgentPlugin` and add it to `PluginRegistry` to wrap LLM requests/responses,
+stream tokens, and tool calls.
 
-### 5. Custom Policies
+### 5. Bus participants
 
-Implement `AgentPolicy` for custom authorization rules
+Use `bus::Bus` for publishers/subscribers/queryables, or implement `bus::Callable` for
+RPC servers. Agent RPC exposes `AgentRpcClient` / `AgentCallableServer`.
 
 ---
 
@@ -744,4 +755,4 @@ Implement `AgentPolicy` for custom authorization rules
 
 ---
 
-**Last Updated**: 2026-03-30
+**Last Updated**: 2026-10-05
