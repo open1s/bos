@@ -785,7 +785,10 @@ LLM-powered agent with tool support. Created via `AgentBuilder` (`.with_X()` cha
 | `stream(task)` | Stream response | `AsyncIterator` |
 | `session` | Session manager | `SessionManager` |
 | `tools` | Registered tool names | `list[str]` |
+| `tool_names` | Alias for `tools` (matches JS `toolNames`) | `list[str]` |
 | `config` | Agent configuration | `dict` |
+| `metrics` | Performance metrics (timings in µs) | `dict` |
+| `reset_metrics()` | Reset performance metrics | `Agent` |
 
 ### Resilience Configuration
 

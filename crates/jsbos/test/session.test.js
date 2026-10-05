@@ -107,3 +107,9 @@ test.serial('registering a hook does not pin the event loop', async (t) => {
     .start()
   t.is(agent.config.name, 'hook-exit-test')
 })
+
+test.serial('metrics exposes a zeroed perf snapshot and resets', async (t) => {
+  const agent = await startAgent(t)
+  t.is(agent.metrics.llmCallCount, 0)
+  t.is(agent.resetMetrics(), agent)
+})

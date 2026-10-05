@@ -349,6 +349,16 @@ class TestAgentAccessors:
             agent = await brain.agent("accessor-test").with_tools(add).start()
             assert agent.tool_names == ["add"]
 
+    @pytest.mark.asyncio
+    async def test_agent_metrics(self):
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = await brain.agent("metrics-test").start()
+            metrics = agent.metrics
+            assert metrics["llm_call_count"] == 0
+            assert "total_wall_time_us" in metrics
+            assert agent.reset_metrics() is agent
+
 
 class TestParamExtraction:
     """Parameter extraction utilities"""

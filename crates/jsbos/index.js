@@ -905,6 +905,15 @@ class AgentBuilder {
   get toolNames() {
     return this._inner ? this._inner.listTools() : this._tools.list();
   }
+
+  get metrics() {
+    return this._inner ? this._inner.getPerfMetrics() : null;
+  }
+
+  resetMetrics() {
+    if (this._inner) this._inner.resetPerfMetrics();
+    return this;
+  }
 }
 
 class AgentWrapperClass {

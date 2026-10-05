@@ -1072,6 +1072,44 @@ impl PyAgent {
         }
     }
 
+    /// Performance metrics collected across LLM calls (timings in microseconds).
+    ///
+    /// Mirrors JavaScript's `getPerfMetrics`.
+    fn get_perf_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let cm = guard.metrics();
+        let llm_call_count = cm.llm_call_count as i64;
+        let total_wall_time_us = cm.total_wall_time.as_micros() as i64;
+        let value = serde_json::json!({
+            "llm_call_count": llm_call_count,
+            "total_wall_time_us": total_wall_time_us,
+            "avg_wall_time_us": if llm_call_count > 0 { total_wall_time_us / llm_call_count } else { 0 },
+            "total_engine_time_us": cm.total_engine_time.as_micros() as i64,
+            "total_resilience_time_us": cm.total_resilience_time.as_micros() as i64,
+            "rate_limit_waits": cm.rate_limit_waits as i64,
+            "total_rate_limit_wait_us": cm.total_rate_limit_wait.as_micros() as i64,
+            "circuit_trips": cm.circuit_trips as i64,
+            "llm_errors": cm.llm_errors as i64,
+            "tool_invocation_count": cm.tool_invocation_count as i64,
+            "total_tool_time_us": cm.total_tool_time.as_micros() as i64,
+            "total_input_tokens": cm.total_input_tokens as i64,
+            "total_output_tokens": cm.total_output_tokens as i64,
+        });
+        json_to_py(py, &value).map(|obj| obj.into_bound(py))
+    }
+
+    fn reset_perf_metrics(&self) -> PyResult<()> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.reset_metrics();
+        Ok(())
+    }
+
     fn register_skills_from_dir<'py>(
         &self,
         py: Python<'py>,

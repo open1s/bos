@@ -416,6 +416,16 @@ class Agent:
         """Alias for :attr:`tools`, matching JavaScript's `toolNames`."""
         return self._inner.list_tools()
 
+    @property
+    def metrics(self) -> dict[str, Any]:
+        """Performance metrics collected across LLM calls (timings in microseconds)."""
+        return self._inner.get_perf_metrics()
+
+    def reset_metrics(self) -> "Agent":
+        """Reset the performance metrics collected so far."""
+        self._inner.reset_perf_metrics()
+        return self
+
 
 class BrainOS(AbstractAsyncContextManager):
     """Main entry point - manages Bus lifecycle and agent creation.

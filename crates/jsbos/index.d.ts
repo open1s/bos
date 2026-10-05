@@ -413,6 +413,8 @@ export class AgentBuilder {
     get session(): SessionManager;
     get config(): any;
     get toolNames(): any[];
+    get metrics(): jsbos.PerfSnapshot | null;
+    resetMetrics(): this;
 }
 export function tool(descriptionOrOptions: any, maybeOptions?: {}): (target: any, propertyKey: any, descriptor: any) => any;
 export class ToolDef {

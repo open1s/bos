@@ -857,6 +857,13 @@ new Agent(bus, options = {})
 | `react(task)` | Run with ReAct | `Promise<string>` |
 | `stream(task, callback)` | Stream response | `Promise<void>` |
 | `streamCollect(task)` | Collect stream tokens | `Promise<any[]>` |
+| `session` | Session manager | `SessionManager` |
+| `config` | Resolved agent configuration | `object` |
+| `toolNames` | Registered tool names | `string[]` |
+| `metrics` | Performance metrics (timings in µs) | `object` |
+| `resetMetrics()` | Reset performance metrics | `AgentBuilder` |
+| `stop(options?)` | Stop the agent | `Promise<void>` |
+| `isRunning()` | Whether the agent is running | `boolean` |
 
 ### Resilience Configuration
 
