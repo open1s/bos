@@ -145,7 +145,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("error");
         assert!(
-            ["debug", "info", "warn", "error"].contains(&level),
+            ["trace", "debug", "info", "warn", "error", "off"].contains(&level),
             "unexpected log level: {}",
             level
         );

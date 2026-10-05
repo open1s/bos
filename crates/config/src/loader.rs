@@ -640,15 +640,10 @@ y = 1"#,
         }
 
         let mut loader = ConfigLoader::new().discover();
+        // Discovery must find the home directory, but its contents are the
+        // user's own config, so assert structure rather than specific values.
+        assert!(!loader.sources().is_empty());
         let config = loader.load().await.unwrap();
-
         assert!(!config.as_object().unwrap().is_empty());
-        assert_eq!(
-            config
-                .get("general")
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str()),
-            Some("BrianOS")
-        );
     }
 }

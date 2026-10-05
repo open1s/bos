@@ -119,6 +119,7 @@ fn verify_text_response(response: &LlmResponse) -> Result<String, String> {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_nvidia_vendor_with_config() {
     // Skip if no config available
     let config = match load_config().await {
@@ -178,6 +179,7 @@ async fn test_nvidia_vendor_with_config() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_nvidia_vendor_stream_with_config() {
     // Skip if no config available
     let config = match load_config().await {
@@ -267,6 +269,7 @@ async fn test_nvidia_vendor_stream_with_config() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_nvidia_vendor_invalid_api_key() {
     // Create vendor with invalid API key
     let vendor = NvidiaVendor::new(
@@ -293,6 +296,7 @@ async fn test_nvidia_vendor_invalid_api_key() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_openrouter_vendor_invalid_api_key() {
     // Create vendor with invalid API key
     let vendor = OpenRouterVendor::new(
@@ -321,6 +325,7 @@ async fn test_openrouter_vendor_invalid_api_key() {
 // Response Parsing Tests
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_nvidia_response_parsing() {
     let config = match load_config().await {
         Ok(c) => c,
@@ -463,6 +468,7 @@ async fn test_nvidia_response_parsing() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_nvidia_tool_calls_stream_with_config() {
     // Integration test for delta.tool_calls streaming in NVIDIA vendor.
     // Uses real config from ~/.bos/conf/config.toml and validates that
@@ -624,6 +630,7 @@ async fn load_global_config() -> Option<LlmConfig> {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_responses_api_complete() {
     let llm_config = match load_global_config().await {
         Some(c) => c,
@@ -700,6 +707,7 @@ async fn test_responses_api_complete() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_responses_api_stream() {
     let llm_config = match load_global_config().await {
         Some(c) => c,
