@@ -131,7 +131,7 @@ impl ResourceClient {
         Err(ResourceError::NotFound(uri.to_string()))
     }
 
-    /// Subscribe to push events for a resource (routed like [`invoke`]).
+    /// Subscribe to push events for a resource (routed like [`Self::invoke`]).
     pub async fn subscribe(
         &self,
         uri: &str,
@@ -179,7 +179,7 @@ impl ResourceClient {
         Ok(out)
     }
 
-    /// Resolve a single URI to its info (routed like [`invoke`]).
+    /// Resolve a single URI to its info (routed like [`Self::invoke`]).
     pub async fn resolve(&self, uri: &str) -> Result<Option<ResourceInfo>> {
         if let Some(mgr) = &self.manager {
             if let Some(i) = mgr.resolve(&self.agent, uri).await? {
@@ -199,7 +199,7 @@ impl ResourceClient {
         Resource::new(self.clone(), uri)
     }
 
-    /// Data-plane read, routed like [`invoke`]. The returned stream yields
+    /// Data-plane read, routed like [`Self::invoke`]. The returned stream yields
     /// chunks as they arrive — bytes are not buffered as a whole on either
     /// side. `len: None` streams from `offset` to end-of-data.
     pub async fn read_stream(
@@ -219,7 +219,7 @@ impl ResourceClient {
         Err(ResourceError::NotFound(uri.to_string()))
     }
 
-    /// Data-plane write sink, routed like [`invoke`]. Chunks are written at
+    /// Data-plane write sink, routed like [`Self::invoke`]. Chunks are written at
     /// increasing offsets starting at `offset`; `finish` returns the total.
     pub async fn write_stream(
         &self,

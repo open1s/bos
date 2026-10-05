@@ -54,7 +54,7 @@ pub trait Transport: Send + Sync {
 
     /// Data-plane read: bytes are delivered incrementally, never buffered as a
     /// single allocation. `len` of `None` reads from `offset` to end-of-data.
-    /// Default falls back to a buffered [`invoke`], chunked at 8 MiB.
+    /// Default falls back to a buffered [`Self::invoke`], chunked at 8 MiB.
     async fn read_stream(&self, uri: &str, offset: u64, len: Option<u64>) -> Result<ChunkStream>;
 
     /// Data-plane write sink starting at byte `offset`.

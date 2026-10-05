@@ -1,7 +1,7 @@
 //! Node-level network pool: one transport per peer node, shared by every
 //! subsystem (fs explorer, proc manager, vnodes, supervisors). This is the
 //! seam that owns *identity* (`node_id` → transport); per-connection
-//! reconnect lives in the transport itself ([`QuicTransport`] re-establishes a
+//! reconnect lives in the transport itself ([`crate::transport::QuicTransport`] re-establishes a
 //! closed connection on next use).
 //!
 //! Keepalive is a transport property: QUIC streams are configured with a

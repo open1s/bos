@@ -10,7 +10,7 @@ use super::OpenAiVendor;
 /// DeepSeek vendor. DeepSeek's API is OpenAI-compatible on both protocols:
 /// `/chat/completions` for `ApiMode::Chat` and `/responses` for
 /// `ApiMode::Responses`. The HTTP work is delegated to [`OpenAiVendor`] (which
-/// already routes `Responses` mode through [`ResponsesTransport`]); this type
+/// already routes `Responses` mode through [`crate::llm::vendor::ResponsesTransport`]); this type
 /// exists to give DeepSeek its own identity and correct defaults.
 pub struct DeepSeekVendor {
     inner: OpenAiVendor,

@@ -36,6 +36,9 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --exclude jsbos --exclude nbos --all-targets -- -D warnings
 
+      - name: Docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
       # The binding crates are exercised by the jsbos/nbos pipelines; this job
       # covers the pure-Rust framework so a regression there is never silent.
       - name: Test
