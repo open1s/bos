@@ -58,10 +58,15 @@ Only SessionManager keeps a documented difference: the JS import alias. The
 contract checks presence, not arity, so a getter and a similarly named setter
 collapse into one entry.
 
-The guard also covers the multimodal wire types (Binary, ContentPart, Content)
-and the tool definition types (ToolDef, ToolResult). Their only documented
-differences are cross-idiom serialization (Python's to_dict versus JS's toJSON,
-and JS's toString alongside Python's to_json) and the JS-only static
-ToolResult.fromResult helper. ToolRegistry, Config, and the bus/query/caller
-classes are not yet covered: the JS surfaces are materially richer, so
-reconciling them is tracked as follow-up work rather than locked in.
+The guard also covers the multimodal wire types (Binary, ContentPart, Content),
+the tool definition types (ToolDef, ToolResult), and ToolRegistry. The value
+types keep two documented differences: cross-idiom serialization (Python's
+to_dict versus JS's toJSON, and JS's toString alongside Python's to_json) and the
+JS-only static ToolResult.fromResult helper. Config and the bus/query/caller
+classes remain uncovered: the JS surfaces are materially richer, so reconciling
+them is tracked as follow-up work rather than locked in.
+
+Closing the ToolRegistry gap added unregister, list_tool_defs, list_by_category,
+filter and to_json to Python. list_by_category filters on an optional category
+attribute and returns an empty list until Python's ToolDef gains a category
+field; the JS side reads it from BaseTool metadata.

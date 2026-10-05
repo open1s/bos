@@ -154,3 +154,14 @@ test('multimodal and tool value types match across bindings', (t) => {
     )
   }
 })
+
+test('ToolRegistry surface matches across bindings', (t) => {
+  assertNoDrift(
+    t,
+    'ToolRegistry',
+    norm(jsMembers(jsSrc, 'ToolRegistry')),
+    norm(pyMembers(pySrc, 'ToolRegistry')),
+    new Set(),
+    new Set(),
+  )
+})

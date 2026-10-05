@@ -53,6 +53,10 @@ class ToolRegistry:
         self._tools.pop(name, None)
         return self
 
+    def unregister(self, name: str) -> "ToolRegistry":
+        """Alias of remove, mirroring the JS registry surface."""
+        return self.remove(name)
+
     def get(self, name: str) -> ToolDef | None:
         return self._tools.get(name)
 
@@ -65,6 +69,18 @@ class ToolRegistry:
     def list_tools(self) -> list[ToolDef]:
         return list(self._tools.values())
 
+    def list_tool_defs(self) -> list[ToolDef]:
+        """Alias of list_tools; every entry here is already a ToolDef."""
+        return self.list_tools()
+
+    def list_by_category(self, category: str) -> list[ToolDef]:
+        """Tools whose optional category attribute matches."""
+        return [t for t in self._tools.values() if getattr(t, "category", None) == category]
+
+    def filter(self, predicate: Callable[[ToolDef], bool]) -> "ToolRegistry":
+        """A new registry holding only the tools the predicate accepts."""
+        return ToolRegistry([t for t in self._tools.values() if predicate(t)])
+
     def size(self) -> int:
         return len(self._tools)
 
@@ -76,6 +92,18 @@ class ToolRegistry:
         for t in other.list_tools():
             self.add(t)
         return self
+
+    def to_json(self) -> list[dict[str, Any]]:
+        """Tool metadata as plain dictionaries, mirroring the JS registry."""
+        return [
+            {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+                "schema": t.schema,
+            }
+            for t in self._tools.values()
+        ]
 
 
 class SessionManager:

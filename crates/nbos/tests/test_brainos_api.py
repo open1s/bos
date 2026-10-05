@@ -143,6 +143,41 @@ class TestToolRegistry:
         r = ToolRegistry(tools)
         assert r.size() == 2
 
+    def test_registry_unregister_and_list_tool_defs(self):
+        r = ToolRegistry()
+        t = ToolDef(name="test", description="A test tool", callback=lambda x: x)
+        r.add(t)
+        assert r.list_tool_defs() == [t]
+        assert r.unregister("test") is r
+        assert not r.has("test")
+
+    def test_registry_filter(self):
+        r = ToolRegistry(
+            [
+                ToolDef(name="a", description="Tool A", callback=lambda x: x),
+                ToolDef(name="b", description="Tool B", callback=lambda x: x),
+            ]
+        )
+        only_a = r.filter(lambda t: t.name == "a")
+        assert only_a.list() == ["a"]
+        # filter returns a new registry; the original is untouched
+        assert r.size() == 2
+
+    def test_registry_list_by_category(self):
+        r = ToolRegistry()
+        r.add(ToolDef(name="plain", description="No category", callback=lambda x: x))
+        tagged = ToolDef(name="cat", description="Has category", callback=lambda x: x)
+        tagged.category = "search"
+        r.add(tagged)
+        assert [t.name for t in r.list_by_category("search")] == ["cat"]
+        assert r.list_by_category("missing") == []
+
+    def test_registry_to_json(self):
+        r = ToolRegistry([ToolDef(name="a", description="Tool A", callback=lambda x: x)])
+        assert r.to_json() == [
+            {"name": "a", "description": "Tool A", "parameters": {}, "schema": {}}
+        ]
+
 
 class TestConfig:
     """Config wrapper functionality"""
