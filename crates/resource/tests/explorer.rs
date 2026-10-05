@@ -40,8 +40,14 @@ async fn describe_lists_local_plus_remote() {
     let explorer = Explorer::new(client);
     let infos = explorer.describe(None).await.unwrap();
     let uris: Vec<&str> = infos.iter().map(|i| i.uri.as_str()).collect();
-    assert!(uris.contains(&"mem://notes"), "local resource present: {uris:?}");
-    assert!(uris.contains(&"mem://n1/notes"), "remote resource present: {uris:?}");
+    assert!(
+        uris.contains(&"mem://notes"),
+        "local resource present: {uris:?}"
+    );
+    assert!(
+        uris.contains(&"mem://n1/notes"),
+        "remote resource present: {uris:?}"
+    );
 }
 
 #[tokio::test]
@@ -51,7 +57,13 @@ async fn tree_walks_local_and_remote_identically() {
     // Seed both stores with a key so listing has content.
     for uri in ["mem://notes", "mem://n1/notes"] {
         client
-            .invoke(uri, ResourceAction::Put { key: "a".into(), value: b"1".to_vec() })
+            .invoke(
+                uri,
+                ResourceAction::Put {
+                    key: "a".into(),
+                    value: b"1".to_vec(),
+                },
+            )
             .await
             .unwrap();
     }
@@ -68,7 +80,8 @@ async fn tree_walks_local_and_remote_identically() {
             _ => panic!("first row should be the resource"),
         }
         assert!(
-            rows.iter().any(|r| matches!(r, Row::Child { depth: 1, name } if name == "a")),
+            rows.iter()
+                .any(|r| matches!(r, Row::Child { depth: 1, name } if name == "a")),
             "key listed as child: {rows:?}"
         );
     }
@@ -86,9 +99,12 @@ async fn tree_recurses_into_registered_children() {
     mgr.register(Box::new(FolderResource::new(&dir)), "agent1".to_string())
         .await
         .unwrap();
-    mgr.register(Box::new(FolderResource::new(dir.join("kv"))), "agent1".to_string())
-        .await
-        .unwrap();
+    mgr.register(
+        Box::new(FolderResource::new(dir.join("kv"))),
+        "agent1".to_string(),
+    )
+    .await
+    .unwrap();
     let client = Arc::new(ResourceClient::new("agent1", Some(mgr), None));
     let explorer = Explorer::new(client);
 

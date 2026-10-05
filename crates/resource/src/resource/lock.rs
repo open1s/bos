@@ -30,7 +30,9 @@ impl LockState {
             return Err(ResourceError::Locked("exclusive lock busy".into()));
         }
         if !exclusive && self.exclusive {
-            return Err(ResourceError::Locked("shared lock blocked by exclusive".into()));
+            return Err(ResourceError::Locked(
+                "shared lock blocked by exclusive".into(),
+            ));
         }
         if exclusive {
             self.exclusive = true;

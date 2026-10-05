@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use std::pin::Pin;
 use futures::{Stream, StreamExt};
+use std::pin::Pin;
 use tokio::sync::{watch, Mutex};
 
 use crate::action::{ResourceAction, ResourceEvent, ResourceOutput};
@@ -132,7 +132,9 @@ async fn spawn_child(
 /// never other processes on the node.
 async fn kill_children(mgr: &Arc<ResourceManager>, owner: &str, uris: Vec<String>) {
     for uri in uris {
-        let _ = mgr.dispatch(owner, &uri, ResourceAction::Kill { signal: 9 }).await;
+        let _ = mgr
+            .dispatch(owner, &uri, ResourceAction::Kill { signal: 9 })
+            .await;
         let _ = mgr.deregister(&uri).await;
     }
 }
@@ -146,7 +148,11 @@ async fn monitor(
     policy: SupPolicy,
     state: Arc<Mutex<GroupState>>,
 ) {
-    let MonitorCtx { sup_uri, mgr, owner } = ctx;
+    let MonitorCtx {
+        sup_uri,
+        mgr,
+        owner,
+    } = ctx;
     loop {
         // Snapshot this child's URI and the group's run flag.
         let (my_uri, group_running) = {

@@ -151,7 +151,10 @@ impl VirtualNodeResource {
         if self.relpath.is_empty() {
             return members
                 .iter()
-                .map(|m| MemberRef { uri: m.uri.clone(), transport: m.transport.clone() })
+                .map(|m| MemberRef {
+                    uri: m.uri.clone(),
+                    transport: m.transport.clone(),
+                })
                 .collect();
         }
         let mut out = Vec::new();
@@ -181,7 +184,9 @@ impl VirtualNodeResource {
                 .invoke(&member.uri, ResourceAction::List { pattern: None })
                 .await
             {
-                Ok(ResourceOutput::Listed { entries: member_entries }) => {
+                Ok(ResourceOutput::Listed {
+                    entries: member_entries,
+                }) => {
                     entries.extend(member_entries);
                 }
                 _ => continue,
@@ -382,7 +387,11 @@ mod tests {
             ],
         );
         // Base List: union of both members' contents.
-        match vnode.handle(ResourceAction::List { pattern: None }).await.unwrap() {
+        match vnode
+            .handle(ResourceAction::List { pattern: None })
+            .await
+            .unwrap()
+        {
             ResourceOutput::Listed { entries } => {
                 assert_eq!(entries, vec!["docs".to_string(), "top.txt".to_string()]);
             }
@@ -392,7 +401,11 @@ mod tests {
         // Sub-path "docs": union of the two members' docs/ contents.
         let mut sub = vnode.sub_handler("docs").unwrap();
         assert_eq!(sub.meta().uri, "vnode://v/docs");
-        match sub.handle(ResourceAction::List { pattern: None }).await.unwrap() {
+        match sub
+            .handle(ResourceAction::List { pattern: None })
+            .await
+            .unwrap()
+        {
             ResourceOutput::Listed { entries } => {
                 assert_eq!(entries, vec!["a.txt".to_string(), "b.txt".to_string()]);
             }
@@ -402,7 +415,11 @@ mod tests {
         // Deep sub-path "docs/a.txt": read via member A's file variant.
         let mut sub2 = vnode.sub_handler("docs/a.txt").unwrap();
         sub2.handle(ResourceAction::Open).await.unwrap();
-        match sub2.handle(ResourceAction::Read { offset: 0, len: 10 }).await.unwrap() {
+        match sub2
+            .handle(ResourceAction::Read { offset: 0, len: 10 })
+            .await
+            .unwrap()
+        {
             ResourceOutput::ReadOk { data } => assert_eq!(data, b"aa"),
             other => panic!("{other:?}"),
         }

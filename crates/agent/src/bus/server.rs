@@ -6,12 +6,15 @@ use futures::StreamExt;
 use tokio::task::JoinHandle;
 use zenoh::query::Query as ZenohQuery;
 
+use super::wire::*;
 use crate::agent::Agent;
 use crate::error::AgentError;
 use react::ToolError;
-use super::wire::*;
 
-pub(crate) async fn handle_rpc_request(agent: Arc<Agent>, req: AgentRpcRequest) -> AgentRpcResponse {
+pub(crate) async fn handle_rpc_request(
+    agent: Arc<Agent>,
+    req: AgentRpcRequest,
+) -> AgentRpcResponse {
     match req.method.as_str() {
         "llm/run" | "llm_run" => {
             let task = req.task.unwrap_or_default();
@@ -345,18 +348,18 @@ pub(crate) async fn handle_incoming_query(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::client::AgentRpcClient;
     use super::super::tool::AgentCallerTool;
     use super::super::transport::RpcTransport;
-    use async_trait::async_trait;
-    use react::tool::Tool;
+    use super::*;
     use crate::agent::agentic::{Agent, AgentConfig, LlmProvider};
     use crate::agent::context::{AgentReactContext, AgentSession};
     use crate::tools::FunctionTool;
+    use async_trait::async_trait;
     use futures::Stream;
     use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
     use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, StreamToken};
+    use react::tool::Tool;
     use std::pin::Pin;
     use std::sync::Mutex;
 

@@ -154,7 +154,13 @@ impl Transport for RelayTransport {
                 None => 8 * 1024 * 1024,
             };
             match self
-                .invoke(uri, ResourceAction::Read { offset: next, len: want })
+                .invoke(
+                    uri,
+                    ResourceAction::Read {
+                        offset: next,
+                        len: want,
+                    },
+                )
                 .await
             {
                 Ok(ResourceOutput::ReadOk { data }) => {
@@ -221,7 +227,13 @@ impl crate::transport::ChunkWriter for RelayChunkWriter {
         })?;
         let out = self
             .transport
-            .invoke(&self.relay_uri, ResourceAction::Forward { uri: self.uri.clone(), payload })
+            .invoke(
+                &self.relay_uri,
+                ResourceAction::Forward {
+                    uri: self.uri.clone(),
+                    payload,
+                },
+            )
             .await?;
         match out {
             ResourceOutput::WriteOk { written } => Ok(written),

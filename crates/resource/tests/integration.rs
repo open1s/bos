@@ -1,6 +1,6 @@
 use resource::action::ResourceAction;
 use resource::meta::ResourceStateLabel;
-use resource::policy::{PolicyDoc, Rule, SharedPolicy, Effect};
+use resource::policy::{Effect, PolicyDoc, Rule, SharedPolicy};
 use resource::prelude::*;
 use resource::transport::inprocess::InProcessTransport;
 use std::sync::Arc;
@@ -34,10 +34,19 @@ async fn file_roundtrip_via_client() {
 
     let client = ResourceClient::new("agent1", Some(mgr.clone()), None);
 
-    assert!(matches!(client.invoke(&uri, ResourceAction::Open).await, Ok(ResourceOutput::Opened)));
+    assert!(matches!(
+        client.invoke(&uri, ResourceAction::Open).await,
+        Ok(ResourceOutput::Opened)
+    ));
     assert!(matches!(
         client
-            .invoke(&uri, ResourceAction::Write { offset: 0, data: b"hello".to_vec() })
+            .invoke(
+                &uri,
+                ResourceAction::Write {
+                    offset: 0,
+                    data: b"hello".to_vec()
+                }
+            )
             .await,
         Ok(ResourceOutput::WriteOk { written: 5 })
     ));
@@ -84,9 +93,12 @@ async fn discovery_is_policy_gated() {
     // Registry holds one resource of several kinds, but policy only allows
     // agent1 file access.
     let mgr = Arc::new(ResourceManager::new(policy_doc()));
-    mgr.register(Box::new(FileResource::new("/tmp/gated_file")), "agent1".to_string())
-        .await
-        .unwrap();
+    mgr.register(
+        Box::new(FileResource::new("/tmp/gated_file")),
+        "agent1".to_string(),
+    )
+    .await
+    .unwrap();
     mgr.register(Box::new(MemResource::new("gated")), "agent1".to_string())
         .await
         .unwrap();
@@ -99,7 +111,10 @@ async fn discovery_is_policy_gated() {
 
     // list: the denied agent sees nothing (not even mem/proc resources).
     let infos = evil.list(None).await.unwrap();
-    assert!(infos.is_empty(), "denied agent must not see any resource, got {infos:?}");
+    assert!(
+        infos.is_empty(),
+        "denied agent must not see any resource, got {infos:?}"
+    );
 
     // resolve: the denied agent gets PolicyDenied, not the resource info.
     let res = evil.resolve("mem://gated").await;
@@ -110,8 +125,14 @@ async fn discovery_is_policy_gated() {
     let infos = agent1.list(None).await.unwrap();
     let uris: Vec<&str> = infos.iter().map(|i| i.uri.as_str()).collect();
     assert!(uris.contains(&"file:///tmp/gated_file"));
-    assert!(!uris.contains(&"mem://gated"), "file-only policy must hide mem resource");
-    assert!(!uris.contains(&"proc://gated"), "file-only policy must hide proc resource");
+    assert!(
+        !uris.contains(&"mem://gated"),
+        "file-only policy must hide mem resource"
+    );
+    assert!(
+        !uris.contains(&"proc://gated"),
+        "file-only policy must hide proc resource"
+    );
 }
 
 #[tokio::test]
@@ -178,7 +199,10 @@ async fn folder_mkdir_list_remove() {
     ));
     std::fs::write(path.join("a.txt"), b"a").unwrap();
     std::fs::write(path.join("b.txt"), b"b").unwrap();
-    let out = client.invoke(&uri, ResourceAction::List { pattern: None }).await.unwrap();
+    let out = client
+        .invoke(&uri, ResourceAction::List { pattern: None })
+        .await
+        .unwrap();
     match out {
         ResourceOutput::Listed { entries } => assert_eq!(entries.len(), 2),
         _ => panic!("expected Listed"),
@@ -201,7 +225,13 @@ async fn proc_spawn_wait_and_kill() {
         .unwrap();
     let c1 = ResourceClient::new("agent1", Some(mgr.clone()), None);
     let _ = c1
-        .invoke("proc://p1", ResourceAction::Spawn { args: vec!["true".into()], env: vec![] })
+        .invoke(
+            "proc://p1",
+            ResourceAction::Spawn {
+                args: vec!["true".into()],
+                env: vec![],
+            },
+        )
         .await
         .unwrap();
     let out = c1.invoke("proc://p1", ResourceAction::Wait).await.unwrap();
@@ -226,7 +256,8 @@ async fn proc_spawn_wait_and_kill() {
         .await
         .unwrap();
     assert!(matches!(
-        c2.invoke("proc://p2", ResourceAction::Kill { signal: 9 }).await,
+        c2.invoke("proc://p2", ResourceAction::Kill { signal: 9 })
+            .await,
         Ok(ResourceOutput::Killed)
     ));
 }
@@ -251,7 +282,10 @@ async fn combine_fans_out_and_aggregates() {
     client
         .invoke(
             "combine://c1",
-            ResourceAction::Put { key: "k".into(), value: b"v".to_vec() },
+            ResourceAction::Put {
+                key: "k".into(),
+                value: b"v".to_vec(),
+            },
         )
         .await
         .unwrap();
@@ -260,19 +294,31 @@ async fn combine_fans_out_and_aggregates() {
         .invoke("combine://c1", ResourceAction::Get { key: "k".into() })
         .await
         .unwrap();
-    assert_eq!(out, ResourceOutput::Got { value: Some(b"v".to_vec()) });
+    assert_eq!(
+        out,
+        ResourceOutput::Got {
+            value: Some(b"v".to_vec())
+        }
+    );
 
     // List is the union across children.
     let out = client
         .invoke("combine://c1", ResourceAction::List { pattern: None })
         .await
         .unwrap();
-    assert_eq!(out, ResourceOutput::Listed { entries: vec!["k".to_string()] });
+    assert_eq!(
+        out,
+        ResourceOutput::Listed {
+            entries: vec!["k".to_string()]
+        }
+    );
 
     // Status/Open/Close go through the combine node itself.
     assert!(matches!(
         client.invoke("combine://c1", ResourceAction::Status).await,
-        Ok(ResourceOutput::Status { state: ResourceStateLabel::Closed })
+        Ok(ResourceOutput::Status {
+            state: ResourceStateLabel::Closed
+        })
     ));
     assert!(matches!(
         client.invoke("combine://c1", ResourceAction::Open).await,
@@ -286,9 +332,12 @@ async fn combine_get_first_hit_wins() {
 
     // Prepare child "b" with a key before hand it to the combine node.
     let mut b = MemResource::new("b");
-    b.handle(ResourceAction::Put { key: "hit".into(), value: b"42".to_vec() })
-        .await
-        .unwrap();
+    b.handle(ResourceAction::Put {
+        key: "hit".into(),
+        value: b"42".to_vec(),
+    })
+    .await
+    .unwrap();
 
     let combine = Box::new(CombineResource::new("c2"));
     // Child a (empty) sorts first; child b holds the key.
@@ -319,15 +368,29 @@ async fn mem_put_get_list() {
     let client = ResourceClient::new("agent1", Some(mgr), None);
 
     assert!(matches!(
-        client.invoke(uri, ResourceAction::Put { key: "a".into(), value: b"x".to_vec() }).await,
+        client
+            .invoke(
+                uri,
+                ResourceAction::Put {
+                    key: "a".into(),
+                    value: b"x".to_vec()
+                }
+            )
+            .await,
         Ok(ResourceOutput::Put)
     ));
-    let out = client.invoke(uri, ResourceAction::Get { key: "a".into() }).await.unwrap();
+    let out = client
+        .invoke(uri, ResourceAction::Get { key: "a".into() })
+        .await
+        .unwrap();
     match out {
         ResourceOutput::Got { value: Some(v) } => assert_eq!(v, b"x"),
         _ => panic!("expected Got Some"),
     }
-    let out = client.invoke(uri, ResourceAction::List { pattern: None }).await.unwrap();
+    let out = client
+        .invoke(uri, ResourceAction::List { pattern: None })
+        .await
+        .unwrap();
     match out {
         ResourceOutput::Listed { entries } => assert!(entries.contains(&"a".to_string())),
         _ => panic!("expected Listed"),
@@ -343,30 +406,50 @@ async fn sock_connect_send_recv_echo() {
     tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 64];
-        let n = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await.unwrap();
-        tokio::io::AsyncWriteExt::write_all(&mut s, &buf[..n]).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut s, &mut buf)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut s, &buf[..n])
+            .await
+            .unwrap();
     });
 
     let uri = "sock://127.0.0.1:echo";
     let mgr = Arc::new(ResourceManager::new(allow_all()));
-    mgr.register(Box::new(SockResource::new("127.0.0.1:echo")), "agent1".to_string())
-        .await
-        .unwrap();
+    mgr.register(
+        Box::new(SockResource::new("127.0.0.1:echo")),
+        "agent1".to_string(),
+    )
+    .await
+    .unwrap();
     let client = ResourceClient::new("agent1", Some(mgr), None);
 
     assert!(matches!(
         client
-            .invoke(uri, ResourceAction::Connect { addr: addr.to_string() })
+            .invoke(
+                uri,
+                ResourceAction::Connect {
+                    addr: addr.to_string()
+                }
+            )
             .await,
         Ok(ResourceOutput::Connected)
     ));
     assert!(matches!(
         client
-            .invoke(uri, ResourceAction::Send { data: b"hi".to_vec() })
+            .invoke(
+                uri,
+                ResourceAction::Send {
+                    data: b"hi".to_vec()
+                }
+            )
             .await,
         Ok(ResourceOutput::Sent { sent: 2 })
     ));
-    let out = client.invoke(uri, ResourceAction::Recv { max: 10 }).await.unwrap();
+    let out = client
+        .invoke(uri, ResourceAction::Recv { max: 10 })
+        .await
+        .unwrap();
     match out {
         ResourceOutput::RecvOk { data } => assert_eq!(data, b"hi"),
         _ => panic!("expected RecvOk"),
@@ -462,30 +545,72 @@ async fn network_resources_routed_by_host() {
 
     // Local resource served locally.
     client
-        .invoke("mem://local", ResourceAction::Put { key: "k".into(), value: b"local!".to_vec() })
+        .invoke(
+            "mem://local",
+            ResourceAction::Put {
+                key: "k".into(),
+                value: b"local!".to_vec(),
+            },
+        )
         .await
         .unwrap();
 
     // Host-addressed resources routed to the right remote node. `h1` and `h2`
     // are independent stores, despite the identical call shape.
     client
-        .invoke("mem://h1", ResourceAction::Put { key: "k".into(), value: b"host1".to_vec() })
+        .invoke(
+            "mem://h1",
+            ResourceAction::Put {
+                key: "k".into(),
+                value: b"host1".to_vec(),
+            },
+        )
         .await
         .unwrap();
     client
-        .invoke("mem://h2", ResourceAction::Put { key: "k".into(), value: b"host2".to_vec() })
+        .invoke(
+            "mem://h2",
+            ResourceAction::Put {
+                key: "k".into(),
+                value: b"host2".to_vec(),
+            },
+        )
         .await
         .unwrap();
 
-    let from_h1 = client.invoke("mem://h1", ResourceAction::Get { key: "k".into() }).await.unwrap();
-    let from_h2 = client.invoke("mem://h2", ResourceAction::Get { key: "k".into() }).await.unwrap();
-    assert_eq!(from_h1, ResourceOutput::Got { value: Some(b"host1".to_vec()) });
-    assert_eq!(from_h2, ResourceOutput::Got { value: Some(b"host2".to_vec()) });
+    let from_h1 = client
+        .invoke("mem://h1", ResourceAction::Get { key: "k".into() })
+        .await
+        .unwrap();
+    let from_h2 = client
+        .invoke("mem://h2", ResourceAction::Get { key: "k".into() })
+        .await
+        .unwrap();
+    assert_eq!(
+        from_h1,
+        ResourceOutput::Got {
+            value: Some(b"host1".to_vec())
+        }
+    );
+    assert_eq!(
+        from_h2,
+        ResourceOutput::Got {
+            value: Some(b"host2".to_vec())
+        }
+    );
 
     // A `Resource` handle pins the URI and is used identically for either kind.
     let res = Resource::new(client.clone(), "mem://h1");
-    let v = res.invoke(ResourceAction::Get { key: "k".into() }).await.unwrap();
-    assert_eq!(v, ResourceOutput::Got { value: Some(b"host1".to_vec()) });
+    let v = res
+        .invoke(ResourceAction::Get { key: "k".into() })
+        .await
+        .unwrap();
+    assert_eq!(
+        v,
+        ResourceOutput::Got {
+            value: Some(b"host1".to_vec())
+        }
+    );
 
     // Discovery aggregates from local + every remote endpoint.
     let all = client.list(None).await.unwrap();
@@ -528,18 +653,24 @@ async fn operate_local_and_remote_identically_via_facade() {
     // Remote: a separate manager exposed as another node on "node1".
     let remote = Arc::new(ResourceManager::new(allow.clone()));
     remote
-        .register(Box::new(MemResource::new("node1/notes")), "agent1".to_string())
+        .register(
+            Box::new(MemResource::new("node1/notes")),
+            "agent1".to_string(),
+        )
         .await
         .unwrap();
-    client.connect(
-        "node1",
-        Arc::new(InProcessTransport::new(remote, "agent1")),
-    );
+    client.connect("node1", Arc::new(InProcessTransport::new(remote, "agent1")));
 
     // The *identical* operation, applied to a local and a remote resource.
     async fn poke(client: &ResourceClient, uri: &str, marker: &[u8]) {
         let res = client
-            .invoke(uri, ResourceAction::Put { key: "k".into(), value: marker.to_vec() })
+            .invoke(
+                uri,
+                ResourceAction::Put {
+                    key: "k".into(),
+                    value: marker.to_vec(),
+                },
+            )
             .await
             .unwrap();
         assert_eq!(res, ResourceOutput::Put);
@@ -547,7 +678,12 @@ async fn operate_local_and_remote_identically_via_facade() {
             .invoke(uri, ResourceAction::Get { key: "k".into() })
             .await
             .unwrap();
-        assert_eq!(got, ResourceOutput::Got { value: Some(marker.to_vec()) });
+        assert_eq!(
+            got,
+            ResourceOutput::Got {
+                value: Some(marker.to_vec())
+            }
+        );
     }
 
     poke(&client, "mem://local", b"local!").await;
@@ -555,8 +691,16 @@ async fn operate_local_and_remote_identically_via_facade() {
 
     // A `Resource` handle is equally location-oblivious.
     let handle = client.resource("mem://node1/notes");
-    let got = handle.invoke(ResourceAction::Get { key: "k".into() }).await.unwrap();
-    assert_eq!(got, ResourceOutput::Got { value: Some(b"remote!".to_vec()) });
+    let got = handle
+        .invoke(ResourceAction::Get { key: "k".into() })
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        ResourceOutput::Got {
+            value: Some(b"remote!".to_vec())
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -570,17 +714,29 @@ async fn vnode_fans_out_writes_and_aggregates_list() {
 
     // Two separate managers, each hosting its own `mem://` resource.
     let mgr_a = Arc::new(ResourceManager::new(allow_all()));
-    mgr_a.register(Box::new(MemResource::new("a")), "agent1".into()).await.unwrap();
+    mgr_a
+        .register(Box::new(MemResource::new("a")), "agent1".into())
+        .await
+        .unwrap();
 
     let mgr_b = Arc::new(ResourceManager::new(allow_all()));
-    mgr_b.register(Box::new(MemResource::new("b")), "agent1".into()).await.unwrap();
+    mgr_b
+        .register(Box::new(MemResource::new("b")), "agent1".into())
+        .await
+        .unwrap();
 
     let vnode = Box::new(VirtualNodeResource::new(
         "pool1",
         "agent1",
         vec![
-            ("mem://a".into(), Arc::new(InProcessTransport::new(mgr_a.clone(), "agent1")) as Arc<dyn Transport>),
-            ("mem://b".into(), Arc::new(InProcessTransport::new(mgr_b.clone(), "agent1")) as Arc<dyn Transport>),
+            (
+                "mem://a".into(),
+                Arc::new(InProcessTransport::new(mgr_a.clone(), "agent1")) as Arc<dyn Transport>,
+            ),
+            (
+                "mem://b".into(),
+                Arc::new(InProcessTransport::new(mgr_b.clone(), "agent1")) as Arc<dyn Transport>,
+            ),
         ],
     ));
 
@@ -592,7 +748,10 @@ async fn vnode_fans_out_writes_and_aggregates_list() {
     client
         .invoke(
             "vnode://pool1",
-            ResourceAction::Put { key: "k".into(), value: b"v".to_vec() },
+            ResourceAction::Put {
+                key: "k".into(),
+                value: b"v".to_vec(),
+            },
         )
         .await
         .unwrap();
@@ -601,7 +760,12 @@ async fn vnode_fans_out_writes_and_aggregates_list() {
         .invoke("vnode://pool1", ResourceAction::Get { key: "k".into() })
         .await
         .unwrap();
-    assert_eq!(out, ResourceOutput::Got { value: Some(b"v".to_vec()) });
+    assert_eq!(
+        out,
+        ResourceOutput::Got {
+            value: Some(b"v".to_vec())
+        }
+    );
 
     // List is the union of each member's List entries (the keys), not the member URIs.
     let out = client
@@ -610,7 +774,10 @@ async fn vnode_fans_out_writes_and_aggregates_list() {
         .unwrap();
     match out {
         ResourceOutput::Listed { entries } => {
-            assert!(entries.contains(&"k".to_string()), "expected key 'k' in: {entries:?}");
+            assert!(
+                entries.contains(&"k".to_string()),
+                "expected key 'k' in: {entries:?}"
+            );
         }
         other => panic!("expected Listed, got {:?}", other),
     }
@@ -623,7 +790,10 @@ async fn vnode_write_failure_surfaces_failed_members() {
 
     // mgr_a is alive; mgr_b has no resource → Put on mem://b fails.
     let mgr_a = Arc::new(ResourceManager::new(allow_all()));
-    mgr_a.register(Box::new(MemResource::new("a")), "agent1".into()).await.unwrap();
+    mgr_a
+        .register(Box::new(MemResource::new("a")), "agent1".into())
+        .await
+        .unwrap();
 
     let mgr_b = Arc::new(ResourceManager::new(allow_all()));
 
@@ -631,8 +801,14 @@ async fn vnode_write_failure_surfaces_failed_members() {
         "pool2",
         "agent1",
         vec![
-            ("mem://a".into(), Arc::new(InProcessTransport::new(mgr_a, "agent1")) as Arc<dyn Transport>),
-            ("mem://b".into(), Arc::new(InProcessTransport::new(mgr_b, "agent1")) as Arc<dyn Transport>),
+            (
+                "mem://a".into(),
+                Arc::new(InProcessTransport::new(mgr_a, "agent1")) as Arc<dyn Transport>,
+            ),
+            (
+                "mem://b".into(),
+                Arc::new(InProcessTransport::new(mgr_b, "agent1")) as Arc<dyn Transport>,
+            ),
         ],
     ));
 
@@ -643,12 +819,18 @@ async fn vnode_write_failure_surfaces_failed_members() {
     let err = client
         .invoke(
             "vnode://pool2",
-            ResourceAction::Put { key: "k".into(), value: b"v".to_vec() },
+            ResourceAction::Put {
+                key: "k".into(),
+                value: b"v".to_vec(),
+            },
         )
         .await
         .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("failed on members"), "expected failure info in: {msg}");
+    assert!(
+        msg.contains("failed on members"),
+        "expected failure info in: {msg}"
+    );
     assert!(msg.contains("mem://b"), "expected failed URI in: {msg}");
 }
 
@@ -658,7 +840,9 @@ async fn vnode_with_transport_convenience_constructor() {
     use resource::transport::Transport;
 
     let mgr = Arc::new(ResourceManager::new(allow_all()));
-    mgr.register(Box::new(MemResource::new("x")), "agent1".into()).await.unwrap();
+    mgr.register(Box::new(MemResource::new("x")), "agent1".into())
+        .await
+        .unwrap();
 
     let transport: Arc<dyn Transport> = Arc::new(InProcessTransport::new(mgr, "agent1"));
     let vnode = Box::new(VirtualNodeResource::with_transport(
@@ -673,14 +857,25 @@ async fn vnode_with_transport_convenience_constructor() {
     let client = ResourceClient::new("agent1", Some(outer), None);
 
     client
-        .invoke("vnode://pool3", ResourceAction::Put { key: "a".into(), value: b"1".into() })
+        .invoke(
+            "vnode://pool3",
+            ResourceAction::Put {
+                key: "a".into(),
+                value: b"1".into(),
+            },
+        )
         .await
         .unwrap();
     let out = client
         .invoke("vnode://pool3", ResourceAction::Get { key: "a".into() })
         .await
         .unwrap();
-    assert_eq!(out, ResourceOutput::Got { value: Some(b"1".to_vec()) });
+    assert_eq!(
+        out,
+        ResourceOutput::Got {
+            value: Some(b"1".to_vec())
+        }
+    );
 }
 
 #[tokio::test]
@@ -689,27 +884,36 @@ async fn vnode_member_accessors() {
     use resource::transport::Transport;
 
     let mgr_a = Arc::new(ResourceManager::new(allow_all()));
-    mgr_a.register(Box::new(MemResource::new("a")), "agent1".into()).await.unwrap();
+    mgr_a
+        .register(Box::new(MemResource::new("a")), "agent1".into())
+        .await
+        .unwrap();
 
     let mgr_b = Arc::new(ResourceManager::new(allow_all()));
-    mgr_b.register(Box::new(MemResource::new("b")), "agent1".into()).await.unwrap();
+    mgr_b
+        .register(Box::new(MemResource::new("b")), "agent1".into())
+        .await
+        .unwrap();
 
     let vnode = VirtualNodeResource::new(
         "pool4",
         "agent1",
-        vec![
-            ("mem://a".into(), Arc::new(InProcessTransport::new(mgr_a, "agent1")) as Arc<dyn Transport>),
-        ],
+        vec![(
+            "mem://a".into(),
+            Arc::new(InProcessTransport::new(mgr_a, "agent1")) as Arc<dyn Transport>,
+        )],
     );
 
     // Initially one member.
     assert_eq!(vnode.member_uris().await, vec!["mem://a"]);
 
     // Add a second member.
-    vnode.add_member(
-        "mem://b".into(),
-        Arc::new(InProcessTransport::new(mgr_b, "agent1")),
-    ).await;
+    vnode
+        .add_member(
+            "mem://b".into(),
+            Arc::new(InProcessTransport::new(mgr_b, "agent1")),
+        )
+        .await;
     let mut uris = vnode.member_uris().await;
     uris.sort();
     assert_eq!(uris, vec!["mem://a", "mem://b"]);

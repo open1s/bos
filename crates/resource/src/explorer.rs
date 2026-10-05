@@ -16,8 +16,8 @@ use crate::error::{ResourceError, Result};
 use crate::handler::ResourceHandler;
 use crate::meta::{ResourceInfo, ResourceType};
 use crate::resource::{
-    combine::CombineResource, file::FileResource, folder::FolderResource,
-    mem::MemResource, proc::ProcResource, sock::SockResource,
+    combine::CombineResource, file::FileResource, folder::FolderResource, mem::MemResource,
+    proc::ProcResource, sock::SockResource,
 };
 use log::debug;
 
@@ -133,7 +133,10 @@ impl Explorer {
                             self.walk(&child_uri, depth + 1, max_depth, out).await;
                             continue;
                         }
-                        out.push(Row::Child { depth: depth + 1, name: entry });
+                        out.push(Row::Child {
+                            depth: depth + 1,
+                            name: entry,
+                        });
                         continue;
                     }
                     // A child may be a file or a folder; probe both schemes so
@@ -189,7 +192,11 @@ impl Explorer {
                     .invoke(uri, ResourceAction::Read { offset: 0, len })
                     .await?
             }
-            "sock" => self.client.invoke(uri, ResourceAction::Recv { max: len }).await?,
+            "sock" => {
+                self.client
+                    .invoke(uri, ResourceAction::Recv { max: len })
+                    .await?
+            }
             other => {
                 return Err(ResourceError::Unsupported(format!(
                     "peek is not supported for `{other}://` (files and sockets only)"
@@ -200,8 +207,10 @@ impl Explorer {
             ResourceOutput::ReadOk { data } | ResourceOutput::RecvOk { data } => {
                 debug!("peek: got {} bytes", data.len());
                 Ok(data)
-            },
-            other => Err(ResourceError::Other(format!("unexpected peek output: {other:?}"))),
+            }
+            other => Err(ResourceError::Other(format!(
+                "unexpected peek output: {other:?}"
+            ))),
         }
     }
 

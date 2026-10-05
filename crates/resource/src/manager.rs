@@ -37,7 +37,11 @@ impl ResourceManager {
 
     /// Register a resource. Its `uri` (from `meta()`) is the registry key.
     /// The registering agent becomes the owner recorded in metadata.
-    pub async fn register(&self, mut resource: Box<dyn ResourceHandler>, owner: String) -> Result<()> {
+    pub async fn register(
+        &self,
+        mut resource: Box<dyn ResourceHandler>,
+        owner: String,
+    ) -> Result<()> {
         resource.set_owner(owner);
         let uri = resource.meta().uri.clone();
         // Check-and-insert under a single write lock to avoid a TOCTOU race
@@ -126,11 +130,17 @@ impl ResourceManager {
         // only a valid handle if the scheme matches the on-disk kind, so a
         // file never accidentally binds as a folder handle (or vice versa).
         let kind_matches = match scheme {
-            "file" => tokio::fs::metadata(path).await.map(|m| m.is_file()).unwrap_or(false),
-            "folder" => tokio::fs::metadata(path).await.map(|m| m.is_dir()).unwrap_or(false),
+            "file" => tokio::fs::metadata(path)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false),
+            "folder" => tokio::fs::metadata(path)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false),
             _ => return Err(ResourceError::NotFound(uri.to_string())),
         };
-if !kind_matches {
+        if !kind_matches {
             return Err(ResourceError::NotFound(uri.to_string()));
         }
         let handler = crate::explorer::handler_for(uri)

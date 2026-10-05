@@ -67,12 +67,9 @@ fn ca_pem(c: &CertifiedKey) -> Vec<u8> {
 /// Spin up C: QUIC server on top of its manager, plus the transport to reach it.
 async fn node_c() -> (Arc<ResourceManager>, Arc<dyn resource::Transport>) {
     let mgr = Arc::new(ResourceManager::new(policy()));
-    mgr.register(
-        Box::new(ProcManager::new(mgr.clone())),
-        "admin".into(),
-    )
-    .await
-    .unwrap();
+    mgr.register(Box::new(ProcManager::new(mgr.clone())), "admin".into())
+        .await
+        .unwrap();
 
     let ca = gen_ca();
     let server_k = gen_entity(&ca, "c-server");
@@ -80,7 +77,13 @@ async fn node_c() -> (Arc<ResourceManager>, Arc<dyn resource::Transport>) {
     let server = Arc::new(QuicServer::new(mgr.clone()));
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let local = server
-        .bind(addr, cert_der(&server_k), key_der(&server_k), &ca_pem(&ca), &[])
+        .bind(
+            addr,
+            cert_der(&server_k),
+            key_der(&server_k),
+            &ca_pem(&ca),
+            &[],
+        )
         .await
         .expect("bind C");
     tokio::spawn(async move {
@@ -89,8 +92,14 @@ async fn node_c() -> (Arc<ResourceManager>, Arc<dyn resource::Transport>) {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let trust = ca_pem(&ca);
-    let t = QuicTransport::new(local, "c-server".into(), &trust, cert_der(&client_k), key_der(&client_k))
-        .expect("client B→C");
+    let t = QuicTransport::new(
+        local,
+        "c-server".into(),
+        &trust,
+        cert_der(&client_k),
+        key_der(&client_k),
+    )
+    .expect("client B→C");
     (mgr, Arc::new(t))
 }
 
@@ -100,9 +109,12 @@ async fn three_nodes() -> ResourceClient {
 
     // B: intermediate manager with relay to C.
     let b = Arc::new(ResourceManager::new(policy()));
-    b.register(Box::new(RelayResource::new("c", c_transport)), "admin".into())
-        .await
-        .unwrap();
+    b.register(
+        Box::new(RelayResource::new("c", c_transport)),
+        "admin".into(),
+    )
+    .await
+    .unwrap();
 
     // A: relay transport over in-process B, then a ResourceClient with the relay.
     let upstream: Arc<dyn resource::Transport> = Arc::new(InProcessTransport::new(b, "admin"));
@@ -133,7 +145,10 @@ async fn relay_spawn_kill_wait() {
     // Wait through the relay — sees the exit propagated from C.
     let uri = format!("proc://{pid}");
     let out = client.invoke(&uri, ResourceAction::Wait).await.unwrap();
-    assert!(matches!(out, ResourceOutput::Exited { code: 3 }), "got {out:?}");
+    assert!(
+        matches!(out, ResourceOutput::Exited { code: 3 }),
+        "got {out:?}"
+    );
 
     // Kill through the relay.
     let out = client
@@ -168,7 +183,10 @@ async fn relay_file_roundtrip() {
 
     // Seed the file, then Open it through the relay (Write/Read need an open
     // handle; the relay streams those as buffered invoke actions).
-    std::fs::File::create(&path).unwrap().write_all(b"seed").unwrap();
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(b"seed")
+        .unwrap();
     client.invoke(&uri, ResourceAction::Open).await.unwrap();
 
     let mut w = client.write_stream(&uri, 4).await.unwrap();

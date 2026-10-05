@@ -212,8 +212,7 @@ impl AgentSession {
     }
 
     pub fn save(&self, path: &str) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
@@ -223,8 +222,7 @@ impl AgentSession {
     }
 
     pub fn restore_from_json(&mut self, json: &str) -> Result<(), std::io::Error> {
-        let restored: AgentSession = serde_json::from_str(json)
-            .map_err(std::io::Error::other)?;
+        let restored: AgentSession = serde_json::from_str(json).map_err(std::io::Error::other)?;
         self.messages = restored.messages;
         self.context = restored.context;
         self.metadata = restored.metadata;
@@ -232,8 +230,7 @@ impl AgentSession {
     }
 
     pub fn to_json_string(&self) -> Result<String, std::io::Error> {
-        serde_json::to_string_pretty(self)
-            .map_err(std::io::Error::other)
+        serde_json::to_string_pretty(self).map_err(std::io::Error::other)
     }
 
     pub fn clear(&mut self) {

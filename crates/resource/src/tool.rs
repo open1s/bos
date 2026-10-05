@@ -23,7 +23,8 @@ impl ResourceTool {
     /// Bind a tool to `uri` on `client`.
     pub fn new(uri: impl Into<String>, client: Arc<ResourceClient>) -> Self {
         let uri = uri.into();
-        let description = format!("Invoke actions on resource `{uri}` (send a JSON ResourceAction).");
+        let description =
+            format!("Invoke actions on resource `{uri}` (send a JSON ResourceAction).");
         Self {
             name: uri.clone(),
             uri,

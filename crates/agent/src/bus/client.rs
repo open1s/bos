@@ -5,9 +5,9 @@ use async_stream::stream;
 use bus::{Caller, Session};
 use futures::{Stream, StreamExt};
 
-use react::ToolError;
 use super::transport::*;
 use super::wire::*;
+use react::ToolError;
 
 /// Typed client for agent-to-agent RPC over bus.
 ///
@@ -39,7 +39,10 @@ impl AgentRpcClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_transport(endpoint: impl Into<String>, transport: Arc<dyn RpcTransport>) -> Self {
+    pub(crate) fn with_transport(
+        endpoint: impl Into<String>,
+        transport: Arc<dyn RpcTransport>,
+    ) -> Self {
         Self {
             endpoint: endpoint.into(),
             transport,

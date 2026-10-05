@@ -95,10 +95,13 @@ impl ResourceHandler for ProcManager {
                 self.mgr
                     .register(Box::new(resource), self.meta.owner.clone())
                     .await?;
-                self.procs
-                    .write()
-                    .await
-                    .insert(pid, ProcEntry { uri: uri.clone(), cmdline });
+                self.procs.write().await.insert(
+                    pid,
+                    ProcEntry {
+                        uri: uri.clone(),
+                        cmdline,
+                    },
+                );
                 Ok(ResourceOutput::Spawned { pid })
             }
             ResourceAction::List { .. } => {

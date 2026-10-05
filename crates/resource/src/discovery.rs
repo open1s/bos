@@ -86,14 +86,7 @@ impl NodeAnnounce {
             server_name,
             resources: resources
                 .into_iter()
-                .map(|r| {
-                    (
-                        r.uri,
-                        r.kind.to_string(),
-                        format!("{:?}", r.state),
-                        r.owner,
-                    )
-                })
+                .map(|r| (r.uri, r.kind.to_string(), format!("{:?}", r.state), r.owner))
                 .collect(),
             ca_cert,
             capabilities: Vec::new(),
@@ -121,8 +114,7 @@ impl NodeAnnounce {
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 
-        let mut mac = HmacSha256::new_from_slice(secret)
-            .expect("HMAC can take key of any size");
+        let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
         mac.update(self.node_id.as_bytes());
         mac.update(self.quic_addr.as_bytes());
         mac.update(self.server_name.as_bytes());
@@ -140,8 +132,7 @@ impl NodeAnnounce {
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 
-        let mut mac = HmacSha256::new_from_slice(secret)
-            .expect("HMAC can take key of any size");
+        let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
         mac.update(self.node_id.as_bytes());
         mac.update(self.quic_addr.as_bytes());
         mac.update(self.server_name.as_bytes());

@@ -24,11 +24,11 @@ use react::tool::{Tool as ReactToolTrait, ToolError as ReactToolError};
 use react::{CircuitBreakerConfig, LlmRequest, RateLimiterConfig, ReActResilience};
 
 mod adapters;
-mod llm;
 mod engine;
+mod llm;
 
-pub use llm::{build_vendor, LlmProvider};
 use adapters::{AsyncExtensibleToolAdapter, ExtensibleToolAdapter};
+pub use llm::{build_vendor, LlmProvider};
 
 // ============================================================================
 // Simplified Agent API - Builder Pattern
@@ -362,7 +362,6 @@ impl Agent {
     ) -> crate::bus::AgentCallableServer {
         crate::bus::AgentCallableServer::new(endpoint, session, Arc::new(self.clone()))
     }
-
 
     /// Register a tool.
     pub fn add_tool(&mut self, tool: Arc<dyn Tool>) {

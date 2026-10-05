@@ -19,13 +19,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use super::{Dispatcher, Transport};
-use log::debug;
 use crate::action::{
     decode_action, decode_event, decode_output, encode_action, encode_event, encode_output,
     ResourceAction, ResourceEvent, ResourceOutput,
 };
 use crate::error::{ResourceError, Result};
 use crate::meta::{ResourceInfo, ResourceType};
+use log::debug;
 
 // Frame tags.
 const TAG_INVOKE: u8 = 1;
@@ -33,8 +33,9 @@ const TAG_INVOKE: u8 = 1;
 /// rustls 0.23 requires a crypto provider to be installed explicitly. Safe to
 /// call more than once (subsequent calls are ignored).
 fn ensure_crypto_provider() {
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
-    }
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+}
 
 /// Responses larger than this are streamed as raw bytes on the QUIC stream
 /// after a `Streaming` header frame, instead of being embedded in the frame.
@@ -52,7 +53,7 @@ fn streaming_payload(out: &ResourceOutput) -> Option<(u8, &Vec<u8>)> {
         ResourceOutput::RecvOk { data } => Some((2, data)),
         _ => None,
     }
-    }
+}
 
 /// Reconstruct the final output from a streamed `(kind, bytes)` pair.
 fn from_streaming(kind: u8, data: Vec<u8>) -> ResourceOutput {
@@ -60,7 +61,7 @@ fn from_streaming(kind: u8, data: Vec<u8>) -> ResourceOutput {
         2 => ResourceOutput::RecvOk { data },
         _ => ResourceOutput::ReadOk { data },
     }
-    }
+}
 
 const TAG_INVOKE_RESP: u8 = 1;
 const TAG_SUB: u8 = 2;
@@ -121,7 +122,7 @@ where
         .write_all(&buf)
         .await
         .map_err(|e| ResourceError::Transport(e.to_string()))
-    }
+}
 
 async fn read_frame<S>(stream: &mut S) -> Result<(u8, Vec<u8>)>
 where
@@ -147,7 +148,7 @@ where
         .await
         .map_err(|e| ResourceError::Transport(e.to_string()))?;
     Ok((tag[0], payload))
-    }
+}
 
 // ---------- client ----------
 
@@ -158,7 +159,7 @@ pub struct QuicTransport {
     server_addr: SocketAddr,
     server_name: String,
     conn: Mutex<Option<Connection>>,
-    }
+}
 
 impl QuicTransport {
     /// Build a client connecting to `server_addr` (SNI `server_name`), trusting
@@ -195,9 +196,12 @@ impl QuicTransport {
         let bind_addr: SocketAddr = "0.0.0.0:0"
             .parse()
             .map_err(|e: std::net::AddrParseError| ResourceError::Transport(e.to_string()))?;
-        let endpoint = Endpoint::client(bind_addr)
-            .map_err(|e| ResourceError::Transport(e.to_string()))?;
-        debug!("QUIC client endpoint bound to {} -> {}", bind_addr, server_addr);
+        let endpoint =
+            Endpoint::client(bind_addr).map_err(|e| ResourceError::Transport(e.to_string()))?;
+        debug!(
+            "QUIC client endpoint bound to {} -> {}",
+            bind_addr, server_addr
+        );
         Ok(Self {
             endpoint,
             client_config,
@@ -215,19 +219,29 @@ impl QuicTransport {
                 return Ok(c.clone());
             }
         }
-        debug!("QUIC establishing new connection to {} (server_name={})", self.server_addr, self.server_name);
+        debug!(
+            "QUIC establishing new connection to {} (server_name={})",
+            self.server_addr, self.server_name
+        );
         let connecting = self
             .endpoint
-            .connect_with(self.client_config.clone(), self.server_addr, &self.server_name)
+            .connect_with(
+                self.client_config.clone(),
+                self.server_addr,
+                &self.server_name,
+            )
             .map_err(|e| ResourceError::Transport(e.to_string()))?;
         let conn = connecting
             .await
             .map_err(|e| ResourceError::Transport(e.to_string()))?;
-        debug!("QUIC connection established: remote={}", conn.remote_address());
+        debug!(
+            "QUIC connection established: remote={}",
+            conn.remote_address()
+        );
         *guard = Some(conn.clone());
         Ok(conn)
     }
-    }
+}
 
 #[async_trait]
 impl Transport for QuicTransport {
@@ -249,7 +263,9 @@ impl Transport for QuicTransport {
         let (tag, body) = read_frame(&mut stream.1).await?;
         if tag == TAG_ERR {
             // The server dispatched and returned a real error — surface it.
-            return Err(ResourceError::Other(String::from_utf8_lossy(&body).into_owned()));
+            return Err(ResourceError::Other(
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
         }
         if tag != TAG_INVOKE_RESP {
             return Err(ResourceError::Transport(format!("unexpected tag {tag}")));
@@ -261,7 +277,12 @@ impl Transport for QuicTransport {
             let len = total.ok_or_else(|| {
                 ResourceError::Transport("streaming response missing length".to_string())
             })? as usize;
-            debug!("QUIC streaming response: uri={} kind={} len={}", uri, kind, total.unwrap_or(0));
+            debug!(
+                "QUIC streaming response: uri={} kind={} len={}",
+                uri,
+                kind,
+                total.unwrap_or(0)
+            );
             let mut buf = vec![0u8; len];
             stream
                 .1
@@ -297,7 +318,9 @@ impl Transport for QuicTransport {
         write_frame(&mut stream.0, TAG_SUB, &payload).await?;
         let (tag, ack) = read_frame(&mut stream.1).await?;
         if tag == TAG_ERR {
-            return Err(ResourceError::Other(String::from_utf8_lossy(&ack).into_owned()));
+            return Err(ResourceError::Other(
+                String::from_utf8_lossy(&ack).into_owned(),
+            ));
         }
         debug!("QUIC subscribe ack received: uri={}", uri);
         let recv = stream.1;
@@ -327,10 +350,12 @@ impl Transport for QuicTransport {
         let _ = stream.0.finish();
         let (tag, body) = read_frame(&mut stream.1).await?;
         if tag == TAG_ERR {
-            return Err(ResourceError::Other(String::from_utf8_lossy(&body).into_owned()));
+            return Err(ResourceError::Other(
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
         }
-        let infos: Vec<ResourceInfo> = serde_json::from_slice(&body)
-            .map_err(|e| ResourceError::Codec(e.to_string()))?;
+        let infos: Vec<ResourceInfo> =
+            serde_json::from_slice(&body).map_err(|e| ResourceError::Codec(e.to_string()))?;
         debug!("QUIC list returned {} resources", infos.len());
         Ok(infos)
     }
@@ -349,14 +374,16 @@ impl Transport for QuicTransport {
         let _ = stream.0.finish();
         let (tag, body) = read_frame(&mut stream.1).await?;
         if tag == TAG_ERR {
-            return Err(ResourceError::Other(String::from_utf8_lossy(&body).into_owned()));
+            return Err(ResourceError::Other(
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
         }
         if body.is_empty() {
             debug!("QUIC resolve not found: uri={}", uri);
             return Ok(None);
         }
-        let info: ResourceInfo = serde_json::from_slice(&body[1..])
-            .map_err(|e| ResourceError::Codec(e.to_string()))?;
+        let info: ResourceInfo =
+            serde_json::from_slice(&body[1..]).map_err(|e| ResourceError::Codec(e.to_string()))?;
         debug!("QUIC resolve found: uri={}", uri);
         Ok(Some(info))
     }
@@ -367,7 +394,10 @@ impl Transport for QuicTransport {
         offset: u64,
         len: Option<u64>,
     ) -> Result<super::ChunkStream> {
-        debug!("QUIC read_stream: uri={} offset={} len={:?}", uri, offset, len);
+        debug!(
+            "QUIC read_stream: uri={} offset={} len={:?}",
+            uri, offset, len
+        );
         let conn = self.connection().await?;
         let mut stream = conn
             .open_bi()
@@ -380,7 +410,11 @@ impl Transport for QuicTransport {
         let (tag, body) = read_frame(&mut stream.1).await?;
         match tag {
             TAG_STREAM_HDR => {}
-            TAG_ERR => return Err(ResourceError::Other(String::from_utf8_lossy(&body).into_owned())),
+            TAG_ERR => {
+                return Err(ResourceError::Other(
+                    String::from_utf8_lossy(&body).into_owned(),
+                ))
+            }
             other => return Err(ResourceError::Transport(format!("unexpected tag {other}"))),
         }
         let mut recv = stream.1;
@@ -407,11 +441,7 @@ impl Transport for QuicTransport {
         Ok(Box::pin(chunks))
     }
 
-    async fn write_stream(
-        &self,
-        uri: &str,
-        offset: u64,
-    ) -> Result<Box<dyn super::ChunkWriter>> {
+    async fn write_stream(&self, uri: &str, offset: u64) -> Result<Box<dyn super::ChunkWriter>> {
         debug!("QUIC write_stream: uri={} offset={}", uri, offset);
         let conn = self.connection().await?;
         let mut stream = conn
@@ -424,7 +454,11 @@ impl Transport for QuicTransport {
         let (tag, body) = read_frame(&mut stream.1).await?;
         match tag {
             TAG_STREAM_HDR => {}
-            TAG_ERR => return Err(ResourceError::Other(String::from_utf8_lossy(&body).into_owned())),
+            TAG_ERR => {
+                return Err(ResourceError::Other(
+                    String::from_utf8_lossy(&body).into_owned(),
+                ))
+            }
             other => return Err(ResourceError::Transport(format!("unexpected tag {other}"))),
         }
         Ok(Box::new(QuicChunkWriter {
@@ -433,7 +467,7 @@ impl Transport for QuicTransport {
             written: 0,
         }))
     }
-    }
+}
 
 /// Client-side write half of a data-plane stream: chunks become `TAG_CHUNK`
 /// frames; `finish` sends `TAG_STREAM_END` and awaits the server's `WriteOk`.
@@ -462,7 +496,9 @@ impl super::ChunkWriter for QuicChunkWriter {
                     "unexpected write ack {other:?}"
                 ))),
             },
-            TAG_ERR => Err(ResourceError::Other(String::from_utf8_lossy(&body).into_owned())),
+            TAG_ERR => Err(ResourceError::Other(
+                String::from_utf8_lossy(&body).into_owned(),
+            )),
             other => Err(ResourceError::Transport(format!("unexpected tag {other}"))),
         }
     }
@@ -522,7 +558,7 @@ fn decode_offset(body: &[u8]) -> Result<(String, u64)> {
 pub struct QuicServer {
     dispatcher: Arc<dyn Dispatcher>,
     endpoint: Mutex<Option<Endpoint>>,
-    }
+}
 
 impl QuicServer {
     pub fn new(dispatcher: Arc<dyn Dispatcher>) -> Self {
@@ -568,8 +604,8 @@ impl QuicServer {
         let quic_server = QuicServerConfig::try_from(server_tls)
             .map_err(|e| ResourceError::Transport(e.to_string()))?;
         let config = ServerConfig::with_crypto(Arc::new(quic_server));
-        let endpoint = Endpoint::server(config, addr)
-            .map_err(|e| ResourceError::Transport(e.to_string()))?;
+        let endpoint =
+            Endpoint::server(config, addr).map_err(|e| ResourceError::Transport(e.to_string()))?;
         let local = endpoint
             .local_addr()
             .map_err(|e| ResourceError::Transport(e.to_string()))?;
@@ -603,14 +639,14 @@ impl QuicServer {
         }
         Ok(())
     }
-    }
+}
 
 fn parse_ca(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     rustls_pemfile::certs(&mut Cursor::new(pem))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map(|c| c.into_iter().map(|c| c.into_owned()).collect())
         .map_err(|e| ResourceError::Transport(e.to_string()))
-    }
+}
 
 fn extract_cn(conn: &Connection) -> Option<String> {
     let data = conn.peer_identity()?;
@@ -623,7 +659,7 @@ fn extract_cn(conn: &Connection) -> Option<String> {
         }
     }
     None
-    }
+}
 
 async fn handle_conn(disp: Arc<dyn Dispatcher>, conn: Connection, agent: String) -> Result<()> {
     loop {
@@ -641,7 +677,7 @@ async fn handle_conn(disp: Arc<dyn Dispatcher>, conn: Connection, agent: String)
         });
     }
     Ok(())
-    }
+}
 
 async fn handle_stream(
     disp: Arc<dyn Dispatcher>,
@@ -671,9 +707,14 @@ async fn handle_stream(
                                     kind,
                                     total: Some(data.len() as u64),
                                 };
-                                write_frame(&mut stream.0, TAG_INVOKE_RESP, &encode_output(&header)?)
-                                    .await?;
-                                stream.0
+                                write_frame(
+                                    &mut stream.0,
+                                    TAG_INVOKE_RESP,
+                                    &encode_output(&header)?,
+                                )
+                                .await?;
+                                stream
+                                    .0
                                     .write_all(data)
                                     .await
                                     .map_err(|e| ResourceError::Transport(e.to_string()))?;
@@ -749,7 +790,9 @@ async fn handle_stream(
                         let j = match serde_json::to_vec(&i) {
                             Ok(j) => j,
                             Err(e) => {
-                                let _ = write_frame(&mut stream.0, TAG_ERR, e.to_string().as_bytes()).await;
+                                let _ =
+                                    write_frame(&mut stream.0, TAG_ERR, e.to_string().as_bytes())
+                                        .await;
                                 continue;
                             }
                         };
@@ -858,7 +901,7 @@ async fn handle_stream(
             other => return Err(ResourceError::Transport(format!("bad tag {other}"))),
         }
     }
-    }
+}
 
 fn parse_uri_action(payload: &[u8]) -> Result<(String, ResourceAction)> {
     if payload.len() < 4 {
@@ -871,7 +914,7 @@ fn parse_uri_action(payload: &[u8]) -> Result<(String, ResourceAction)> {
     let uri = String::from_utf8_lossy(&payload[4..4 + ulen]).to_string();
     let action = decode_action(&payload[4 + ulen..])?;
     Ok((uri, action))
-    }
+}
 
 fn parse_uri_events(payload: &[u8]) -> Result<(String, Vec<String>)> {
     if payload.len() < 4 {

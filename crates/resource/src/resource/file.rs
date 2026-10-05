@@ -110,7 +110,9 @@ impl ResourceHandler for FileResource {
             }),
             ResourceAction::Read { offset, len } => {
                 let f = inner.file.as_mut().ok_or(ResourceError::Closed)?;
-                f.seek(SeekFrom::Start(offset)).await.map_err(ResourceError::Io)?;
+                f.seek(SeekFrom::Start(offset))
+                    .await
+                    .map_err(ResourceError::Io)?;
                 let to_read = len.min(8 * 1024 * 1024) as usize;
                 let mut buf = vec![0u8; to_read];
                 let n = f.read(&mut buf).await.map_err(ResourceError::Io)?;
@@ -119,7 +121,9 @@ impl ResourceHandler for FileResource {
             }
             ResourceAction::Write { offset, data } => {
                 let f = inner.file.as_mut().ok_or(ResourceError::Closed)?;
-                f.seek(SeekFrom::Start(offset)).await.map_err(ResourceError::Io)?;
+                f.seek(SeekFrom::Start(offset))
+                    .await
+                    .map_err(ResourceError::Io)?;
                 f.write_all(&data).await.map_err(ResourceError::Io)?;
                 Ok(ResourceOutput::WriteOk {
                     written: data.len() as u64,
@@ -176,13 +180,11 @@ impl ResourceHandler for FileResource {
                 Ok(ResourceOutput::Truncated)
             }
             ResourceAction::Rename { new_uri } => {
-                let new_path = new_uri
-                    .strip_prefix("file://")
-                    .ok_or_else(|| {
-                        ResourceError::Unsupported(format!(
-                            "rename target must be file://, got {new_uri}"
-                        ))
-                    })?;
+                let new_path = new_uri.strip_prefix("file://").ok_or_else(|| {
+                    ResourceError::Unsupported(format!(
+                        "rename target must be file://, got {new_uri}"
+                    ))
+                })?;
                 tokio::fs::rename(&inner.path, new_path)
                     .await
                     .map_err(|e| map_io(&inner.path, e))?;
@@ -284,7 +286,9 @@ impl ResourceHandler for FileResource {
         Ok(Box::new(FileChunkWriter { f, written: 0 }))
     }
 
-    fn events(&mut self) -> Option<std::pin::Pin<Box<dyn futures::Stream<Item = ResourceEvent> + Send + 'static>>>
+    fn events(
+        &mut self,
+    ) -> Option<std::pin::Pin<Box<dyn futures::Stream<Item = ResourceEvent> + Send + 'static>>>
     {
         // Watch the path; events stream until the subscriber drops.
         let path = {

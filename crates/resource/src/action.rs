@@ -1,8 +1,8 @@
 //! The unified message envelope: a single `ResourceAction` rkyv enum covers
 //! all five resource classes. Responses mirror it via `ResourceOutput`.
 
+use rkyv::api::high::{from_bytes, to_bytes};
 use rkyv::{Archive, Deserialize, Serialize};
-use rkyv::api::high::{to_bytes, from_bytes};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 use crate::meta::ResourceStateLabel;
@@ -54,7 +54,10 @@ mod b64_opt {
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
         match Option::<String>::deserialize(d)? {
-            Some(s) => STANDARD.decode(s).map(Some).map_err(serde::de::Error::custom),
+            Some(s) => STANDARD
+                .decode(s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
             None => Ok(None),
         }
     }
@@ -63,7 +66,9 @@ mod b64_opt {
 /// A request to a resource. This is the single, typed entry point that the
 /// message model exposes; everything an agent can do to any resource is one
 /// of these variants.
-#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize,
+)]
 #[rkyv(derive(Debug))]
 pub enum ResourceAction {
     // ---- universal lifecycle / discovery ----
@@ -74,51 +79,88 @@ pub enum ResourceAction {
     /// Query current status.
     Status,
     /// List children / entries (where meaningful).
-    List { pattern: Option<String> },
+    List {
+        pattern: Option<String>,
+    },
     /// Subscribe to push events (see [`ResourceEvent`]).
-    Subscribe { events: Vec<String> },
+    Subscribe {
+        events: Vec<String>,
+    },
 
     // ---- storage ----
-    Read { offset: u64, len: u64 },
+    Read {
+        offset: u64,
+        len: u64,
+    },
     Write {
         offset: u64,
         #[serde(with = "b64")]
         data: Vec<u8>,
     },
-    MkDir { recursive: bool },
-    Remove { recursive: bool },
+    MkDir {
+        recursive: bool,
+    },
+    Remove {
+        recursive: bool,
+    },
     /// Shrink or extend a file to exactly `len` bytes (POSIX `ftruncate`).
-    Truncate { len: u64 },
+    Truncate {
+        len: u64,
+    },
     /// Atomically rename to `new_uri` (must be a same-scheme URI on the same
     /// node; POSIX `rename`).
-    Rename { new_uri: String },
+    Rename {
+        new_uri: String,
+    },
     /// Stat-like metadata: size, kind, read-only flag, modification time.
     Stat,
     /// Advisory lock (`flock` semantics). `exclusive` = write lock;
     /// `exclusive = false` = shared read lock.
-    Lock { exclusive: bool },
+    Lock {
+        exclusive: bool,
+    },
     /// Release a held advisory lock.
     Unlock,
 
     // ---- network ----
-    Bind { addr: String },
-    Connect { addr: String },
+    Bind {
+        addr: String,
+    },
+    Connect {
+        addr: String,
+    },
     Send {
         #[serde(with = "b64")]
         data: Vec<u8>,
     },
-    Recv { max: u64 },
+    Recv {
+        max: u64,
+    },
 
     // ---- compute ----
-    Spawn { args: Vec<String>, env: Vec<(String, String)> },
-    Kill { signal: i32 },
+    Spawn {
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    Kill {
+        signal: i32,
+    },
     Wait,
 
     // ---- system ----
-    SendSignal { signal: i32 },
-    EnvGet { key: String },
-    EnvSet { key: String, value: String },
-    PipeOpen { name: String },
+    SendSignal {
+        signal: i32,
+    },
+    EnvGet {
+        key: String,
+    },
+    EnvSet {
+        key: String,
+        value: String,
+    },
+    PipeOpen {
+        name: String,
+    },
 
     // ---- multi-hop routing ----
     /// Forward `payload` (an rkyv-serialized inner `ResourceAction`) targeting
@@ -143,7 +185,9 @@ pub enum ResourceAction {
         #[serde(with = "b64")]
         input: Vec<u8>,
     },
-    Get { key: String },
+    Get {
+        key: String,
+    },
     Put {
         key: String,
         #[serde(with = "b64")]
@@ -151,7 +195,9 @@ pub enum ResourceAction {
     },
 
     // ---- policy administration (admin identity only) ----
-    PolicyUpdate { doc: String },
+    PolicyUpdate {
+        doc: String,
+    },
 }
 
 impl ResourceAction {
@@ -199,7 +245,9 @@ impl ResourceAction {
 }
 
 /// Successful response payload, mirroring [`ResourceAction`].
-#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize,
+)]
 #[rkyv(derive(Debug))]
 pub enum ResourceOutput {
     Opened,
@@ -277,11 +325,16 @@ pub enum ResourceOutput {
     /// Streaming header: large `ReadOk`/`RecvOk` bodies are sent as raw bytes
     /// on the same QUIC stream *after* this frame. `kind`: 1 = ReadOk, 2 = RecvOk.
     /// `total` is the byte length of the body that follows.
-    Streaming { kind: u8, total: Option<u64> },
+    Streaming {
+        kind: u8,
+        total: Option<u64>,
+    },
 }
 
 /// Push events delivered over the subscription stream.
-#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize,
+)]
 #[rkyv(derive(Debug))]
 pub enum ResourceEvent {
     Data(#[serde(with = "b64")] Vec<u8>),

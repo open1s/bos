@@ -71,14 +71,15 @@ impl ResourceHandler for FolderResource {
                 state: self.meta.state,
             }),
             ResourceAction::List { pattern } => {
-                let mut read_dir = tokio::fs::read_dir(&inner.path)
-                    .await
-                    .map_err(|e| match e.kind() {
-                        std::io::ErrorKind::NotFound => {
-                            ResourceError::NotFound(inner.path.display().to_string())
-                        }
-                        _ => ResourceError::Io(e),
-                    })?;
+                let mut read_dir =
+                    tokio::fs::read_dir(&inner.path)
+                        .await
+                        .map_err(|e| match e.kind() {
+                            std::io::ErrorKind::NotFound => {
+                                ResourceError::NotFound(inner.path.display().to_string())
+                            }
+                            _ => ResourceError::Io(e),
+                        })?;
                 let mut entries = Vec::new();
                 loop {
                     let entry = match read_dir.next_entry().await {
@@ -123,13 +124,11 @@ impl ResourceHandler for FolderResource {
                 Ok(ResourceOutput::Removed)
             }
             ResourceAction::Rename { new_uri } => {
-                let new_path = new_uri
-                    .strip_prefix("folder://")
-                    .ok_or_else(|| {
-                        ResourceError::Unsupported(format!(
-                            "folder rename target must be folder://, got {new_uri}"
-                        ))
-                    })?;
+                let new_path = new_uri.strip_prefix("folder://").ok_or_else(|| {
+                    ResourceError::Unsupported(format!(
+                        "folder rename target must be folder://, got {new_uri}"
+                    ))
+                })?;
                 tokio::fs::rename(&inner.path, new_path)
                     .await
                     .map_err(ResourceError::Io)?;
@@ -172,7 +171,9 @@ impl ResourceHandler for FolderResource {
         }
     }
 
-    fn events(&mut self) -> Option<std::pin::Pin<Box<dyn futures::Stream<Item = ResourceEvent> + Send + 'static>>>
+    fn events(
+        &mut self,
+    ) -> Option<std::pin::Pin<Box<dyn futures::Stream<Item = ResourceEvent> + Send + 'static>>>
     {
         let path = {
             let inner = self.inner.try_lock().ok()?;
@@ -181,4 +182,3 @@ impl ResourceHandler for FolderResource {
         crate::resource::watch::watch(&path).ok()
     }
 }
-

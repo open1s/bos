@@ -10,7 +10,7 @@ use futures::StreamExt;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedKey, DnType, IsCa, KeyPair};
 use resource::prelude::*;
 use resource::transport::{QuicServer, QuicTransport};
-use resource::{PolicyDoc, Rule, Effect};
+use resource::{Effect, PolicyDoc, Rule};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn policy() -> SharedPolicy {
@@ -64,7 +64,13 @@ async fn connected_client(mgr: Arc<ResourceManager>) -> ResourceClient {
     let server = Arc::new(QuicServer::new(mgr));
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let local = server
-        .bind(addr, cert_der(&server_k), key_der(&server_k), &ca_pem(&ca), &[])
+        .bind(
+            addr,
+            cert_der(&server_k),
+            key_der(&server_k),
+            &ca_pem(&ca),
+            &[],
+        )
         .await
         .expect("bind server");
     tokio::spawn(async move {
@@ -72,8 +78,14 @@ async fn connected_client(mgr: Arc<ResourceManager>) -> ResourceClient {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     let trust = ca_pem(&ca);
-    let t = QuicTransport::new(local, "server".to_string(), &trust, cert_der(&client_k), key_der(&client_k))
-        .expect("client");
+    let t = QuicTransport::new(
+        local,
+        "server".to_string(),
+        &trust,
+        cert_der(&client_k),
+        key_der(&client_k),
+    )
+    .expect("client");
     ResourceClient::new("agent1", None, Some(Arc::new(t)))
 }
 
@@ -91,9 +103,12 @@ fn write_file(path: &std::path::Path, data: &[u8]) {
 
 async fn stat_ok(client: &ResourceClient, uri: &str) -> (u64, bool, bool, i64) {
     match client.invoke(uri, ResourceAction::Stat).await.unwrap() {
-        ResourceOutput::StatOk { size, is_dir, readonly, modified_secs } => {
-            (size, is_dir, readonly, modified_secs)
-        }
+        ResourceOutput::StatOk {
+            size,
+            is_dir,
+            readonly,
+            modified_secs,
+        } => (size, is_dir, readonly, modified_secs),
         other => panic!("expected StatOk, got {other:?}"),
     }
 }
@@ -118,14 +133,19 @@ async fn file_ops(client: &ResourceClient, mgr: Option<&Arc<ResourceManager>>) {
 
     // Truncate to 5 bytes.
     assert!(matches!(
-        client.invoke(&uri, ResourceAction::Truncate { len: 5 }).await,
+        client
+            .invoke(&uri, ResourceAction::Truncate { len: 5 })
+            .await,
         Ok(ResourceOutput::Truncated)
     ));
     let (size, ..) = stat_ok(client, &uri).await;
     assert_eq!(size, 5);
 
     // Extend via truncate — new tail is zero-filled.
-    client.invoke(&uri, ResourceAction::Truncate { len: 8 }).await.unwrap();
+    client
+        .invoke(&uri, ResourceAction::Truncate { len: 8 })
+        .await
+        .unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"hello\0\0\0");
 
     // Rename. The registry still keys the handler by the old URI (routing is
@@ -134,9 +154,17 @@ async fn file_ops(client: &ResourceClient, mgr: Option<&Arc<ResourceManager>>) {
     let new_path = dir.join("moved.txt");
     let new_uri = format!("file://{}", new_path.display());
     let r = client
-        .invoke(&uri, ResourceAction::Rename { new_uri: new_uri.clone() })
+        .invoke(
+            &uri,
+            ResourceAction::Rename {
+                new_uri: new_uri.clone(),
+            },
+        )
         .await;
-    assert!(matches!(r, Ok(ResourceOutput::Renamed)), "rename failed: {r:?}");
+    assert!(
+        matches!(r, Ok(ResourceOutput::Renamed)),
+        "rename failed: {r:?}"
+    );
     assert!(new_path.exists() && !path.exists());
     if let Some(m) = mgr {
         m.register(Box::new(FileResource::new(&new_path)), "agent1".into())
@@ -148,26 +176,39 @@ async fn file_ops(client: &ResourceClient, mgr: Option<&Arc<ResourceManager>>) {
 
     // Lock exclusivity: second exclusive lock fails, unlock releases.
     assert!(matches!(
-        client.invoke(&new_uri, ResourceAction::Lock { exclusive: true }).await,
+        client
+            .invoke(&new_uri, ResourceAction::Lock { exclusive: true })
+            .await,
         Ok(ResourceOutput::Locked)
     ));
     let conflict = client
         .invoke(&new_uri, ResourceAction::Lock { exclusive: true })
         .await;
-    assert!(matches!(conflict, Err(ResourceError::Other(_)) | Err(ResourceError::Locked(_))));
+    assert!(matches!(
+        conflict,
+        Err(ResourceError::Other(_)) | Err(ResourceError::Locked(_))
+    ));
     assert!(matches!(
         client.invoke(&new_uri, ResourceAction::Unlock).await,
         Ok(ResourceOutput::Unlocked)
     ));
     assert!(matches!(
-        client.invoke(&new_uri, ResourceAction::Lock { exclusive: false }).await,
+        client
+            .invoke(&new_uri, ResourceAction::Lock { exclusive: false })
+            .await,
         Ok(ResourceOutput::Locked)
     ));
 
     // Remove.
-    client.invoke(&new_uri, ResourceAction::Remove { recursive: false }).await.unwrap();
+    client
+        .invoke(&new_uri, ResourceAction::Remove { recursive: false })
+        .await
+        .unwrap();
     assert!(!new_path.exists());
-    client.invoke(&new_uri, ResourceAction::Stat).await.unwrap_err();
+    client
+        .invoke(&new_uri, ResourceAction::Stat)
+        .await
+        .unwrap_err();
 }
 
 /// MkDir / List / Stat / Rename on `folder://`.
@@ -198,7 +239,11 @@ async fn folder_ops(client: &ResourceClient, mgr: Option<&Arc<ResourceManager>>)
 
     write_file(&dir.join("alpha.txt"), b"a");
     write_file(&dir.join("beta.txt"), b"b");
-    match client.invoke(&root_uri, ResourceAction::List { pattern: None }).await.unwrap() {
+    match client
+        .invoke(&root_uri, ResourceAction::List { pattern: None })
+        .await
+        .unwrap()
+    {
         ResourceOutput::Listed { entries } => {
             let mut e = entries;
             e.sort();
@@ -211,7 +256,12 @@ async fn folder_ops(client: &ResourceClient, mgr: Option<&Arc<ResourceManager>>)
     let sub2 = dir.join("sub2");
     let sub2_uri = format!("folder://{}", sub2.display());
     client
-        .invoke(&sub_uri, ResourceAction::Rename { new_uri: sub2_uri.clone() })
+        .invoke(
+            &sub_uri,
+            ResourceAction::Rename {
+                new_uri: sub2_uri.clone(),
+            },
+        )
         .await
         .unwrap();
     assert!(sub2.exists() && !sub.exists());
@@ -230,7 +280,10 @@ async fn watch_ops(client: &ResourceClient, mgr: Option<&Arc<ResourceManager>>) 
         .invoke(&uri, ResourceAction::Open) // ensure bound
         .await
         .unwrap();
-    let mut sub = client.subscribe(&uri, vec!["create".to_string()]).await.unwrap();
+    let mut sub = client
+        .subscribe(&uri, vec!["create".to_string()])
+        .await
+        .unwrap();
 
     // Overlap: give the watcher a moment to register, then create a file.
     tokio::time::sleep(Duration::from_millis(400)).await;

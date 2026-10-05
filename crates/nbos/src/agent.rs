@@ -848,7 +848,9 @@ impl PyAgent {
     fn react<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
         use std::sync::atomic::Ordering;
         if self.is_running.load(Ordering::SeqCst) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err("Agent is already running"));
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Agent is already running",
+            ));
         }
         if self.stop_flag.load(Ordering::SeqCst) {
             self.stop_flag.store(false, Ordering::SeqCst);
@@ -880,7 +882,9 @@ impl PyAgent {
     fn run_simple<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
         use std::sync::atomic::Ordering;
         if self.is_running.load(Ordering::SeqCst) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err("Agent is already running"));
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Agent is already running",
+            ));
         }
         if self.stop_flag.load(Ordering::SeqCst) {
             self.stop_flag.store(false, Ordering::SeqCst);
@@ -935,7 +939,9 @@ impl PyAgent {
     fn stream<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
         use std::sync::atomic::Ordering;
         if self.is_running.load(Ordering::SeqCst) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err("Agent is already running"));
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Agent is already running",
+            ));
         }
         if self.stop_flag.load(Ordering::SeqCst) {
             self.stop_flag.store(false, Ordering::SeqCst);

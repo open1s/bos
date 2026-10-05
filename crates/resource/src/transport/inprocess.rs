@@ -51,12 +51,7 @@ impl Transport for InProcessTransport {
         self.dispatcher.resolve(agent, uri).await
     }
 
-    async fn read_stream(
-        &self,
-        uri: &str,
-        offset: u64,
-        len: Option<u64>,
-    ) -> Result<ChunkStream> {
+    async fn read_stream(&self, uri: &str, offset: u64, len: Option<u64>) -> Result<ChunkStream> {
         self.dispatcher
             .read_stream(&self.agent, uri, offset, len)
             .await

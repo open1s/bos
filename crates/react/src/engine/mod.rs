@@ -20,17 +20,16 @@ use thiserror::Error;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
-mod error;
-mod skill_cache;
 mod builder;
+mod error;
 mod llm_calls;
+mod skill_cache;
 mod tool_calls;
 mod tool_run;
 
 pub use error::{BuilderError, ReactError};
 pub use skill_cache::{CachedSkill, SkillCache};
 pub use tool_run::{ToolCallEvent, ToolRunManager};
-
 
 pub struct ReActEngine<A: ReActApp> {
     llm: Box<dyn LlmClient<A::Session, A::Context> + Send + Sync>,

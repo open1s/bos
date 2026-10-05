@@ -72,8 +72,9 @@ struct JSTool {
   // Weak threadsafe functions so a registered tool does not pin the Node
   // event loop: a script that only registers tools must still be able to exit.
   callback: Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
-  cancel_callback:
-    Option<Arc<ThreadsafeFunction<String, napi::Unknown<'static>, String, napi::Status, true, true>>>,
+  cancel_callback: Option<
+    Arc<ThreadsafeFunction<String, napi::Unknown<'static>, String, napi::Status, true, true>>,
+  >,
 }
 
 #[async_trait]
@@ -447,7 +448,14 @@ impl Agent {
   pub fn register_hook(
     &self,
     event: HookEvent,
-    callback: ThreadsafeFunction<HookContextData, napi::Unknown<'static>, HookContextData, napi::Status, true, true>,
+    callback: ThreadsafeFunction<
+      HookContextData,
+      napi::Unknown<'static>,
+      HookContextData,
+      napi::Status,
+      true,
+      true,
+    >,
   ) -> Result<()> {
     let hook = crate::hooks::JSHook {
       callback: callback.into(),
@@ -471,10 +479,18 @@ impl Agent {
   pub fn register_plugin(
     &self,
     name: String,
-    on_llm_request: Option<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
-    on_llm_response: Option<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
-    on_tool_call: Option<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
-    on_tool_result: Option<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
+    on_llm_request: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
+    on_llm_response: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
+    on_tool_call: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
+    on_tool_result: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
   ) -> Result<()> {
     let js_plugin = crate::plugin::JSPlugin::new(
       name,
@@ -619,28 +635,34 @@ impl Agent {
   #[napi]
   pub async fn list_mcp_tools(&self) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
-    Ok(guard
-      .registry()
-      .map(|registry| registry.mcp_tool_entries())
-      .unwrap_or_default())
+    Ok(
+      guard
+        .registry()
+        .map(|registry| registry.mcp_tool_entries())
+        .unwrap_or_default(),
+    )
   }
 
   #[napi]
   pub async fn list_mcp_resources(&self, namespace: String) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
-    Ok(guard
-      .registry()
-      .map(|registry| registry.mcp_resource_entries(&namespace))
-      .unwrap_or_default())
+    Ok(
+      guard
+        .registry()
+        .map(|registry| registry.mcp_resource_entries(&namespace))
+        .unwrap_or_default(),
+    )
   }
 
   #[napi]
   pub async fn list_mcp_prompts(&self) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
-    Ok(guard
-      .registry()
-      .map(|registry| registry.mcp_prompt_entries())
-      .unwrap_or_default())
+    Ok(
+      guard
+        .registry()
+        .map(|registry| registry.mcp_prompt_entries())
+        .unwrap_or_default(),
+    )
   }
 
   #[napi]
@@ -689,7 +711,14 @@ impl Agent {
   pub async fn stream(
     &self,
     task: Either<String, Vec<JsContent>>,
-    callback: ThreadsafeFunction<serde_json::Value, napi::Unknown<'static>, serde_json::Value, napi::Status, true, true>,
+    callback: ThreadsafeFunction<
+      serde_json::Value,
+      napi::Unknown<'static>,
+      serde_json::Value,
+      napi::Status,
+      true,
+      true,
+    >,
   ) -> Result<String> {
     if self.is_running.load(Ordering::SeqCst) {
       return Err(Error::new(

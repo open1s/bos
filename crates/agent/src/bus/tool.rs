@@ -4,9 +4,9 @@ use std::sync::Arc;
 use bus::Session;
 use futures::Stream;
 
+use super::client::AgentRpcClient;
 use react::tool::Tool;
 use react::ToolError;
-use super::client::AgentRpcClient;
 
 #[cfg(test)]
 use super::transport::RpcTransport;

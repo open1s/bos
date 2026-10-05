@@ -35,7 +35,18 @@ impl std::fmt::Display for ResourceType {
 }
 
 /// Serializable projection of a resource's runtime state for agents/policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize, Archive, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    SerdeSerialize,
+    SerdeDeserialize,
+    Archive,
+    Serialize,
+    Deserialize,
+)]
 #[rkyv(derive(Debug))]
 pub enum ResourceStateLabel {
     Provisioning,

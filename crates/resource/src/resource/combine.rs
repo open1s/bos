@@ -154,7 +154,9 @@ impl ResourceHandler for CombineResource {
                 let mut entries: Vec<String> = Vec::new();
                 for slot in self.snapshot().await {
                     let mut guard = slot.lock().await;
-                    if let Ok(ResourceOutput::Listed { entries: child_entries }) = guard
+                    if let Ok(ResourceOutput::Listed {
+                        entries: child_entries,
+                    }) = guard
                         .handle(ResourceAction::List {
                             pattern: pattern.clone(),
                         })

@@ -100,7 +100,10 @@ async fn mock_llm_complete_returns_scripted_response() {
     match response {
         LlmResponse::OpenAI(chat) => {
             assert_eq!(chat.choices[0].finish_reason.as_deref(), Some("stop"));
-            assert_eq!(chat.choices[0].message.content.as_deref(), Some("Final Answer: 42"));
+            assert_eq!(
+                chat.choices[0].message.content.as_deref(),
+                Some("Final Answer: 42")
+            );
         }
         _ => panic!("expected an OpenAI response"),
     }

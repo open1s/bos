@@ -10,7 +10,7 @@ use futures::StreamExt;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedKey, DnType, IsCa, KeyPair};
 use resource::prelude::*;
 use resource::transport::{QuicServer, QuicTransport};
-use resource::{ProcManager, Effect, Rule};
+use resource::{Effect, ProcManager, Rule};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn policy() -> SharedPolicy {
@@ -64,7 +64,13 @@ async fn connected_client(mgr: Arc<ResourceManager>) -> ResourceClient {
     let server = Arc::new(QuicServer::new(mgr));
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let local = server
-        .bind(addr, cert_der(&server_k), key_der(&server_k), &ca_pem(&ca), &[])
+        .bind(
+            addr,
+            cert_der(&server_k),
+            key_der(&server_k),
+            &ca_pem(&ca),
+            &[],
+        )
         .await
         .expect("bind");
     tokio::spawn(async move {
@@ -72,8 +78,14 @@ async fn connected_client(mgr: Arc<ResourceManager>) -> ResourceClient {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     let trust = ca_pem(&ca);
-    let t = QuicTransport::new(local, "server".into(), &trust, cert_der(&client_k), key_der(&client_k))
-        .expect("client");
+    let t = QuicTransport::new(
+        local,
+        "server".into(),
+        &trust,
+        cert_der(&client_k),
+        key_der(&client_k),
+    )
+    .expect("client");
     ResourceClient::new("agent1", None, Some(Arc::new(t)))
 }
 
@@ -106,28 +118,43 @@ async fn proc_suite(client: &ResourceClient) {
     let uri = proc_uri(pid);
 
     // Manager lists the child.
-    let out = client.invoke("proc://", ResourceAction::List { pattern: None }).await.unwrap();
+    let out = client
+        .invoke("proc://", ResourceAction::List { pattern: None })
+        .await
+        .unwrap();
     match out {
         ResourceOutput::Listed { entries } => {
-            assert!(entries.iter().any(|e| e.contains(&uri)), "list should contain {uri}: {entries:?}");
+            assert!(
+                entries.iter().any(|e| e.contains(&uri)),
+                "list should contain {uri}: {entries:?}"
+            );
         }
         other => panic!("expected Listed, got {other:?}"),
     }
 
     // Wait for exit.
     let out = client.invoke(&uri, ResourceAction::Wait).await.unwrap();
-    assert!(matches!(out, ResourceOutput::Exited { code: 0 }), "echo should exit 0: {out:?}");
+    assert!(
+        matches!(out, ResourceOutput::Exited { code: 0 }),
+        "echo should exit 0: {out:?}"
+    );
 
     // env propagation: exit code carries it.
     let pid2 = spawn_shell(client, "exit 7").await;
     let uri2 = proc_uri(pid2);
     let out = client.invoke(&uri2, ResourceAction::Wait).await.unwrap();
-    assert!(matches!(out, ResourceOutput::Exited { code: 7 }), "expected 7, got {out:?}");
+    assert!(
+        matches!(out, ResourceOutput::Exited { code: 7 }),
+        "expected 7, got {out:?}"
+    );
 
     // Kill a long-running process.
     let pid3 = spawn_shell(client, "exec sleep 300").await;
     let uri3 = proc_uri(pid3);
-    client.invoke(&uri3, ResourceAction::Kill { signal: 9 }).await.unwrap();
+    client
+        .invoke(&uri3, ResourceAction::Kill { signal: 9 })
+        .await
+        .unwrap();
     let out = client.invoke(&uri3, ResourceAction::Wait).await.unwrap();
     match out {
         ResourceOutput::Exited { code } => assert_ne!(code, 0, "killed process must not exit 0"),
@@ -139,7 +166,10 @@ async fn proc_suite(client: &ResourceClient) {
 async fn proc_events(client: &ResourceClient) {
     let pid = spawn_shell(client, "sleep 0.2; exit 42").await;
     let uri = proc_uri(pid);
-    let mut sub = client.subscribe(&uri, vec![]).await.expect("subscribe proc");
+    let mut sub = client
+        .subscribe(&uri, vec![])
+        .await
+        .expect("subscribe proc");
     let got = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(ev) = sub.next().await {
             if let ResourceEvent::Exited(code) = ev {
@@ -155,12 +185,9 @@ async fn proc_events(client: &ResourceClient) {
 #[tokio::test]
 async fn local_proc_manager() {
     let mgr = Arc::new(ResourceManager::new(policy()));
-    mgr.register(
-        Box::new(ProcManager::new(mgr.clone())),
-        "admin".to_string(),
-    )
-    .await
-    .unwrap();
+    mgr.register(Box::new(ProcManager::new(mgr.clone())), "admin".to_string())
+        .await
+        .unwrap();
     let client = ResourceClient::new("agent1", Some(mgr.clone()), None);
     proc_suite(&client).await;
     proc_events(&client).await;
@@ -169,12 +196,9 @@ async fn local_proc_manager() {
 #[tokio::test]
 async fn quic_proc_manager() {
     let mgr = Arc::new(ResourceManager::new(policy()));
-    mgr.register(
-        Box::new(ProcManager::new(mgr.clone())),
-        "admin".to_string(),
-    )
-    .await
-    .unwrap();
+    mgr.register(Box::new(ProcManager::new(mgr.clone())), "admin".to_string())
+        .await
+        .unwrap();
     let client = connected_client(mgr).await;
     proc_suite(&client).await;
     proc_events(&client).await;

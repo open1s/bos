@@ -49,11 +49,7 @@ async fn load_config() -> Result<serde_json::Value, String> {
             "No config sources found. Make sure ~/.bos/conf/config.toml exists.".to_string(),
         );
     }
-    loader
-        .load()
-        .await
-        .map_err(|e| e.to_string())
-        .cloned()
+    loader.load().await.map_err(|e| e.to_string()).cloned()
 }
 
 /// Create a simple text completion request.

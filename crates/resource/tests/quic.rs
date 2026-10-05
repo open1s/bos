@@ -41,10 +41,7 @@ fn gen_entity(ca: &CertifiedKey, cn: &str) -> CertifiedKey {
     let cert = params
         .signed_by(&kp, &ca.cert, &ca.key_pair)
         .expect("sign entity cert");
-    CertifiedKey {
-        cert,
-        key_pair: kp,
-    }
+    CertifiedKey { cert, key_pair: kp }
 }
 
 fn cert_der(c: &CertifiedKey) -> CertificateDer<'static> {
@@ -68,7 +65,13 @@ async fn connected_client(mgr: Arc<ResourceManager>) -> ResourceClient {
     let server = Arc::new(QuicServer::new(mgr));
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let local = server
-        .bind(addr, cert_der(&server_k), key_der(&server_k), &ca_pem(&ca), &[])
+        .bind(
+            addr,
+            cert_der(&server_k),
+            key_der(&server_k),
+            &ca_pem(&ca),
+            &[],
+        )
         .await
         .expect("bind server");
     let srv = server.clone();
@@ -111,7 +114,13 @@ async fn quic_file_roundtrip() {
     ));
     assert!(matches!(
         client
-            .invoke(&uri, ResourceAction::Write { offset: 0, data: b"quic!".to_vec() })
+            .invoke(
+                &uri,
+                ResourceAction::Write {
+                    offset: 0,
+                    data: b"quic!".to_vec()
+                }
+            )
             .await,
         Ok(ResourceOutput::WriteOk { written: 5 })
     ));
@@ -142,11 +151,23 @@ async fn quic_large_read_streams() {
     let big = vec![0xABu8; 256 * 1024]; // 256 KiB > STREAM_THRESHOLD (64 KiB)
     client.invoke(&uri, ResourceAction::Open).await.unwrap();
     client
-        .invoke(&uri, ResourceAction::Write { offset: 0, data: big.clone() })
+        .invoke(
+            &uri,
+            ResourceAction::Write {
+                offset: 0,
+                data: big.clone(),
+            },
+        )
         .await
         .unwrap();
     let out = client
-        .invoke(&uri, ResourceAction::Read { offset: 0, len: big.len() as u64 })
+        .invoke(
+            &uri,
+            ResourceAction::Read {
+                offset: 0,
+                len: big.len() as u64,
+            },
+        )
         .await
         .unwrap();
     match out {

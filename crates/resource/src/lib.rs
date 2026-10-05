@@ -47,10 +47,8 @@ pub use action::{
     ResourceOutput,
 };
 pub use client::{Resource, ResourceClient};
-pub use discovery::{LoadSnapshot, NodeAnnounce, DISCOVERY_TOPIC};
-pub use resource::combine::CombineResource;
-pub use resource::vnode::VirtualNodeResource;
 pub use debug::init_logging;
+pub use discovery::{LoadSnapshot, NodeAnnounce, DISCOVERY_TOPIC};
 pub use error::{ResourceError, Result};
 pub use explorer::{handler_for, Explorer, Row};
 pub use handler::ResourceHandler;
@@ -59,10 +57,18 @@ pub use meta::{ResourceInfo, ResourceMeta, ResourceStateLabel, ResourceType};
 pub use net::router::{RelayResource, RelayTransport};
 pub use net::Net;
 pub use platform::{Os, Terminate};
-pub use policy::{PolicyDoc, Rule, SharedPolicy, Effect};
+pub use policy::{Effect, PolicyDoc, Rule, SharedPolicy};
+pub use resource::combine::CombineResource;
+pub use resource::vnode::VirtualNodeResource;
 pub use resource::{
-    file::FileResource, folder::FolderResource, mem::MemResource,
-    proc::{manager::ProcManager, supervisor::{ChildSpec, RestartPolicy, SupPolicy, Supervisor}, ProcResource},
+    file::FileResource,
+    folder::FolderResource,
+    mem::MemResource,
+    proc::{
+        manager::ProcManager,
+        supervisor::{ChildSpec, RestartPolicy, SupPolicy, Supervisor},
+        ProcResource,
+    },
     sock::SockResource,
 };
 pub use tool::ResourceTool;
@@ -80,10 +86,17 @@ pub mod prelude {
     pub use crate::net::Net;
     pub use crate::policy::{PolicyDoc, SharedPolicy};
     pub use crate::resource::{
-        combine::CombineResource, file::FileResource, folder::FolderResource,
+        combine::CombineResource,
+        file::FileResource,
+        folder::FolderResource,
         mem::MemResource,
-        proc::{manager::ProcManager, supervisor::{ChildSpec, RestartPolicy, SupPolicy, Supervisor}, ProcResource},
-        sock::SockResource, vnode::VirtualNodeResource,
+        proc::{
+            manager::ProcManager,
+            supervisor::{ChildSpec, RestartPolicy, SupPolicy, Supervisor},
+            ProcResource,
+        },
+        sock::SockResource,
+        vnode::VirtualNodeResource,
     };
     pub use crate::tool::ResourceTool;
     pub use crate::transport::{Chunk, ChunkStream, ChunkWriter, Dispatcher, Transport};

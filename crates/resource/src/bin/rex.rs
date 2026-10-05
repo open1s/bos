@@ -22,20 +22,20 @@ use std::process::exit;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bus::{Bus, BusConfig};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use rcgen::{BasicConstraints, CertifiedKey, CertificateParams, DnType, IsCa, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, CertifiedKey, DnType, IsCa, KeyPair};
+use resource::discovery::{discovery_topic, LoadSnapshot, NodeAnnounce, DISCOVERY_TOPIC};
 use resource::explorer::{handler_for, Explorer, Row};
+use resource::meta::ResourceStateLabel;
 use resource::policy::{Effect, PolicyDoc, Rule, SharedPolicy};
+use resource::transport::Transport;
 use resource::transport::{QuicServer, QuicTransport};
 use resource::{
     d, init_logging, ResourceClient, ResourceError, ResourceManager, ResourceType,
     VirtualNodeResource,
 };
-use resource::meta::ResourceStateLabel;
-use resource::discovery::{discovery_topic, LoadSnapshot, NodeAnnounce, DISCOVERY_TOPIC};
-use resource::transport::Transport;
-use bus::{Bus, BusConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 #[derive(Parser)]
@@ -49,8 +49,8 @@ struct Cli {
     #[arg(long, global = true)]
     no_color: bool,
 
-/// Register a local resource by URI (`file:///path`, `folder:///path`,
-/// `mem://id`, `proc://name`, `sock://addr`, `combine://name`). Repeatable.
+    /// Register a local resource by URI (`file:///path`, `folder:///path`,
+    /// `mem://id`, `proc://name`, `sock://addr`, `combine://name`). Repeatable.
     #[arg(long)]
     register: Vec<String>,
 
@@ -276,8 +276,9 @@ async fn assemble(cli: &Cli) -> Result<Arc<ResourceClient>, String> {
     });
     let manager = Arc::new(ResourceManager::new(policy));
     for uri in &cli.register {
-        let handler = handler_for(uri)
-            .ok_or_else(|| format!("no known scheme for `{uri}` (try file/folder/mem/proc/sock/combine)"))?;
+        let handler = handler_for(uri).ok_or_else(|| {
+            format!("no known scheme for `{uri}` (try file/folder/mem/proc/sock/combine)")
+        })?;
         manager
             .register(handler, reviewer.to_string())
             .await
@@ -291,7 +292,9 @@ async fn assemble(cli: &Cli) -> Result<Arc<ResourceClient>, String> {
         Some(addr) => {
             let cert = cli.cert.as_deref().ok_or("--node requires --cert")?;
             let key = cli.key.as_deref().ok_or("--node requires --key")?;
-            let sock: SocketAddr = addr.parse().map_err(|e| format!("node addr `{addr}`: {e}"))?;
+            let sock: SocketAddr = addr
+                .parse()
+                .map_err(|e| format!("node addr `{addr}`: {e}"))?;
 
             // If --ca not provided, auto-discover the server's CA from the bus.
             let ca_bytes = match cli.ca.as_deref() {
@@ -310,7 +313,8 @@ async fn assemble(cli: &Cli) -> Result<Arc<ResourceClient>, String> {
                                 let _ = tx.send(ann.ca_cert.clone());
                             }
                         }
-                    }).await;
+                    })
+                    .await;
                     // Wait for server CA — peer re-announces every 5s.
                     match rx.recv_timeout(std::time::Duration::from_secs(8)) {
                         Ok(ca_pem) => {
@@ -328,7 +332,8 @@ async fn assemble(cli: &Cli) -> Result<Arc<ResourceClient>, String> {
 
             let cert_bytes = std::fs::read(cert).map_err(|e| format!("read cert: {e}"))?;
             let key_bytes = std::fs::read(key).map_err(|e| format!("read key: {e}"))?;
-            let t = build_quic_from_bytes(sock, &cli.server, &ca_bytes, &cert_bytes, &key_bytes, None)?;
+            let t =
+                build_quic_from_bytes(sock, &cli.server, &ca_bytes, &cert_bytes, &key_bytes, None)?;
             Some(Arc::new(t))
         }
         None => {
@@ -378,8 +383,8 @@ fn extract_cn_from_pem(pem: &[u8]) -> Result<String, String> {
         .ok_or("no certificate in PEM")?
         .map_err(|e| format!("parse cert: {e}"))?
         .into_owned();
-    let (_, parsed) =
-        x509_parser::parse_x509_certificate(cert.as_ref()).map_err(|e| format!("x509 parse: {e}"))?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
+        .map_err(|e| format!("x509 parse: {e}"))?;
     for attr in parsed.subject().iter_common_name() {
         if let Ok(cn) = attr.as_str() {
             return Ok(cn.to_string());
@@ -399,15 +404,18 @@ fn gen_certs(out_dir: &str, server_cn: &str, client_cn: &str) -> Result<(), Stri
     };
 
     // CA (self-signed).
-    let mut ca_params = CertificateParams::new(vec!["rex-ca".to_string()])
-        .map_err(|e| e.to_string())?;
-    ca_params.distinguished_name.push(DnType::CommonName, "rex-ca");
+    let mut ca_params =
+        CertificateParams::new(vec!["rex-ca".to_string()]).map_err(|e| e.to_string())?;
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "rex-ca");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca_key = KeyPair::generate().map_err(|e| e.to_string())?;
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .map_err(|e| e.to_string())?;
-    let ca = CertifiedKey { cert: ca_cert, key_pair: ca_key };
+    let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| e.to_string())?;
+    let ca = CertifiedKey {
+        cert: ca_cert,
+        key_pair: ca_key,
+    };
 
     // Server + client signed by the CA.
     let server = sign(&ca, server_cn)?;
@@ -425,17 +433,17 @@ fn gen_certs(out_dir: &str, server_cn: &str, client_cn: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn sign(
-    ca: &CertifiedKey,
-    cn: &str,
-) -> Result<CertifiedKey, String> {
+fn sign(ca: &CertifiedKey, cn: &str) -> Result<CertifiedKey, String> {
     let key = KeyPair::generate().map_err(|e| e.to_string())?;
     let mut params = CertificateParams::new(vec![cn.to_string()]).map_err(|e| e.to_string())?;
     params.distinguished_name.push(DnType::CommonName, cn);
     let cert = params
         .signed_by(&key, &ca.cert, &ca.key_pair)
         .map_err(|e| e.to_string())?;
-    Ok(CertifiedKey { cert, key_pair: key })
+    Ok(CertifiedKey {
+        cert,
+        key_pair: key,
+    })
 }
 
 /// Load `RexFileConfig` from `path`, if it exists; otherwise `None`. A missing
@@ -448,8 +456,8 @@ fn load_file_config(path: &str) -> Result<Option<RexFileConfig>, String> {
     let value = loader
         .load_sync()
         .map_err(|e| format!("load {path}: {e}"))?;
-    let cfg: RexFileConfig = serde_json::from_value(value)
-        .map_err(|e| format!("parse {path}: {e}"))?;
+    let cfg: RexFileConfig =
+        serde_json::from_value(value).map_err(|e| format!("parse {path}: {e}"))?;
     Ok(Some(cfg))
 }
 
@@ -468,20 +476,18 @@ fn load_bus_config_from_discovery() -> Result<BusConfig, String> {
         .load_sync()
         .map_err(|e| format!("load bus config: {e}"))?;
     let mut cfg = match value.get("bus") {
-        Some(bus_section) => {
-            match serde_json::from_value::<BusConfig>(bus_section.clone()) {
-                Ok(mut cfg) => {
-                    if cfg.mode.is_empty() {
-                        cfg.mode = "peer".to_string();
-                    }
-                    cfg
+        Some(bus_section) => match serde_json::from_value::<BusConfig>(bus_section.clone()) {
+            Ok(mut cfg) => {
+                if cfg.mode.is_empty() {
+                    cfg.mode = "peer".to_string();
                 }
-                Err(e) => {
-                    d!("bus config parse error ({e}), using defaults");
-                    BusConfig::default()
-                }
+                cfg
             }
-        }
+            Err(e) => {
+                d!("bus config parse error ({e}), using defaults");
+                BusConfig::default()
+            }
+        },
         None => {
             d!("no [bus] config found, using defaults");
             BusConfig::default()
@@ -500,9 +506,10 @@ fn load_bus_config_from_discovery() -> Result<BusConfig, String> {
 fn apply_config(cli: &mut Cli, cfg: &RexFileConfig) {
     // Priority: CLI > flat keys > nested [node_section].
     if cli.node.is_none() {
-        cli.node = cfg.node.clone().or_else(|| {
-            cfg.node_cfg.bind.as_ref().map(|b| b.clone())
-        });
+        cli.node = cfg
+            .node
+            .clone()
+            .or_else(|| cfg.node_cfg.bind.as_ref().map(|b| b.clone()));
     }
     if cli.server == "server" {
         if let Some(s) = cfg.server.as_ref().or(cfg.node_cfg.server.as_ref()) {
@@ -539,8 +546,8 @@ async fn serve(
     // Load policy from file. Rego files (`.rego`) are used directly; otherwise
     // treated as a JSON `PolicyDoc` (JSON with optional `rego` field).
     let policy_doc = if let Some(path) = policy_path {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("read policy file {path}: {e}"))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("read policy file {path}: {e}"))?;
         if path.ends_with(".rego") {
             // Raw Rego source → wrap in PolicyDoc.
             d!("loaded Rego policy from {path}");
@@ -551,8 +558,7 @@ async fn serve(
             }
         } else {
             // JSON or TOML PolicyDoc
-            PolicyDoc::from_json(&content)
-                .map_err(|e| format!("parse {path}: {e}"))?
+            PolicyDoc::from_json(&content).map_err(|e| format!("parse {path}: {e}"))?
         }
     } else {
         // Permissive default.
@@ -581,11 +587,19 @@ async fn serve(
         d!("hosting proc:// manager");
     }
     for uri in register {
-        let handler = handler_for(uri)
-            .ok_or_else(|| format!("no known scheme for `{uri}` (try file/folder/mem/proc/sock/combine)"))?;
+        let handler = handler_for(uri).ok_or_else(|| {
+            format!("no known scheme for `{uri}` (try file/folder/mem/proc/sock/combine)")
+        })?;
         let owner = handler.meta().owner.clone();
         manager
-            .register(handler, if owner.is_empty() { "node".into() } else { owner })
+            .register(
+                handler,
+                if owner.is_empty() {
+                    "node".into()
+                } else {
+                    owner
+                },
+            )
             .await
             .map_err(|e| format!("register {uri}: {e}"))?;
         d!("hosting resource {uri}");
@@ -618,7 +632,11 @@ async fn serve(
             ));
         }
     } else {
-        (ca_path.to_string(), cert_path.to_string(), key_path.to_string())
+        (
+            ca_path.to_string(),
+            cert_path.to_string(),
+            key_path.to_string(),
+        )
     };
 
     // Load server identity + CA for client verification.
@@ -655,14 +673,19 @@ async fn serve(
         let my_nid = nid.to_string();
         let collect_secret = shared_secret.map(|s| s.to_string());
         bus.subscribe(&topic, move |ann: NodeAnnounce| {
-            if ann.node_id == my_nid { return; }
+            if ann.node_id == my_nid {
+                return;
+            }
             if let Some(ref secret) = collect_secret {
-                if !ann.verify(secret.as_bytes()) { return; }
+                if !ann.verify(secret.as_bytes()) {
+                    return;
+                }
             }
             if !ann.ca_cert.is_empty() {
                 let _ = tx.send(ann.ca_cert.clone());
             }
-        }).await;
+        })
+        .await;
         // Wait for peer CAs — peers re-announce every 5s, so we need to wait
         // at least that long to catch a re-announcement.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
@@ -672,8 +695,12 @@ async fn serve(
                     d!("collected peer CA ({} bytes)", ca.len());
                     peer_ca_pems.push(ca);
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { break; }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { break; }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
             }
         }
         d!("collected {} peer CAs from bus", peer_ca_pems.len());
@@ -728,7 +755,10 @@ async fn serve(
         bus.publish(&discovery_topic(nid), &announce)
             .await
             .map_err(|e| format!("bus publish: {e}"))?;
-        d!("published discovery announcement to {}", discovery_topic(nid));
+        d!(
+            "published discovery announcement to {}",
+            discovery_topic(nid)
+        );
 
         let my_nid = nid.to_string();
         let ca_clone = ca.clone();
@@ -748,11 +778,19 @@ async fn serve(
 
         let topic = format!("{DISCOVERY_TOPIC}/**");
         bus.subscribe(&topic, move |ann: NodeAnnounce| {
-            if ann.node_id == my_nid { return; }
+            if ann.node_id == my_nid {
+                return;
+            }
             if let Some(ref secret) = verify_secret {
-                d!("verifying signature from {} (secret configured)", ann.node_id);
+                d!(
+                    "verifying signature from {} (secret configured)",
+                    ann.node_id
+                );
                 if !ann.verify(secret.as_bytes()) {
-                    eprintln!("discovery: rejecting unsigned/tampered announcement from {}", ann.node_id);
+                    eprintln!(
+                        "discovery: rejecting unsigned/tampered announcement from {}",
+                        ann.node_id
+                    );
                     return;
                 }
                 d!("signature valid for {}", ann.node_id);
@@ -767,12 +805,14 @@ async fn serve(
                 });
             }
 
-            d!("discovered peer {} (caps=[{}]) with {} resources (procs={}, uptime={}s)",
+            d!(
+                "discovered peer {} (caps=[{}]) with {} resources (procs={}, uptime={}s)",
                 ann.node_id,
                 ann.capabilities.join(", "),
                 ann.resources.len(),
                 ann.load.num_procs,
-                ann.load.uptime_secs);
+                ann.load.uptime_secs
+            );
 
             let nid2 = ann.node_id.clone();
             let ca_c = ca_clone.clone();
@@ -790,12 +830,21 @@ async fn serve(
                 };
                 let server_name = ann.server_name.clone();
                 let extra_ca = ann.ca_cert.clone();
-                let transport = match net_c.get_or_add(&nid2, || {
-                    build_quic_from_bytes(peer_addr, &server_name, &ca_c, &cert_c, &key_c,
-                        Some(extra_ca.as_bytes()))
+                let transport = match net_c
+                    .get_or_add(&nid2, || {
+                        build_quic_from_bytes(
+                            peer_addr,
+                            &server_name,
+                            &ca_c,
+                            &cert_c,
+                            &key_c,
+                            Some(extra_ca.as_bytes()),
+                        )
                         .map(|t| Arc::new(t) as Arc<dyn Transport>)
                         .map_err(ResourceError::Other)
-                }).await {
+                    })
+                    .await
+                {
                     Ok(t) => t,
                     Err(e) => {
                         eprintln!("discovery: failed to build transport for {nid2}: {e}");
@@ -803,7 +852,8 @@ async fn serve(
                     }
                 };
 
-                let members: Vec<(String, Arc<dyn Transport>)> = ann.resources
+                let members: Vec<(String, Arc<dyn Transport>)> = ann
+                    .resources
                     .iter()
                     .map(|r| (r.0.clone(), transport.clone()))
                     .collect();
@@ -824,7 +874,8 @@ async fn serve(
                     Err(e) => eprintln!("discovery: failed to register vnode://{nid2}: {e}"),
                 }
             });
-        }).await;
+        })
+        .await;
         d!("subscribed to {DISCOVERY_TOPIC}/* for peer discovery");
 
         // Periodic re-announce so late-joining peers discover us. Load is
@@ -867,7 +918,8 @@ async fn serve(
                 interval.tick().await;
                 let now = Instant::now();
                 let mut ls = cleanup_ls.write().await;
-                let stale: Vec<String> = ls.iter()
+                let stale: Vec<String> = ls
+                    .iter()
                     .filter(|(_, ts)| now.duration_since(**ts).as_secs() > PEER_LOST_SECS)
                     .map(|(id, _)| id.clone())
                     .collect();
@@ -899,16 +951,22 @@ async fn main() {
     // Load file config (--config, else ./rex.toml, else ./config.toml) and fill
     // any flags the user did not set explicitly.
     let mut file_cfg: Option<RexFileConfig> = None;
-    let cfg_path = cli
-        .config
-        .clone()
-        .or_else(|| ["rex.toml", "config.toml"].iter().find(|p| Path::new(p).exists()).map(|s| s.to_string()));
+    let cfg_path = cli.config.clone().or_else(|| {
+        ["rex.toml", "config.toml"]
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .map(|s| s.to_string())
+    });
     if let Some(path) = cfg_path {
         d!("loading config from {path}");
         match load_file_config(&path) {
             Ok(Some(cfg)) => {
-                d!("config loaded: node={:?} server={:?} register={:?}",
-                    cfg.node, cfg.server, cfg.register);
+                d!(
+                    "config loaded: node={:?} server={:?} register={:?}",
+                    cfg.node,
+                    cfg.server,
+                    cfg.register
+                );
                 apply_config(&mut cli, &cfg);
                 file_cfg = Some(cfg);
             }
@@ -923,34 +981,73 @@ async fn main() {
     }
 
     match &cli.cmd {
-        Cmd::Ca { out, server_cn, client_cn } => {
+        Cmd::Ca {
+            out,
+            server_cn,
+            client_cn,
+        } => {
             if let Err(e) = gen_certs(out, server_cn, client_cn) {
                 eprintln!("rex ca: {e}");
                 exit(1);
             }
             return;
         }
-        Cmd::Serve { bind, register, ca, cert, key, policy, node_id } => {
+        Cmd::Serve {
+            bind,
+            register,
+            ca,
+            cert,
+            key,
+            policy,
+            node_id,
+        } => {
             // Merge node_id from config if still default hostname.
-            let effective_node_id = if file_cfg.as_ref().and_then(|c| c.node_cfg.id.as_deref()).is_some() {
-                file_cfg.as_ref().and_then(|c| c.node_cfg.id.as_deref()).unwrap()
+            let effective_node_id = if file_cfg
+                .as_ref()
+                .and_then(|c| c.node_cfg.id.as_deref())
+                .is_some()
+            {
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.node_cfg.id.as_deref())
+                    .unwrap()
             } else {
                 node_id
             };
             // Merge bind from config if still default.
             let effective_bind = if bind == "127.0.0.1:4433" {
-                file_cfg.as_ref().and_then(|c| c.node_cfg.bind.as_deref()).unwrap_or(bind)
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.node_cfg.bind.as_deref())
+                    .unwrap_or(bind)
             } else {
                 bind
             };
             // Merge register from config if not on CLI.
             let effective_register: Vec<String> = if register.is_empty() {
-                file_cfg.as_ref().map(|c| c.register.clone()).unwrap_or_default()
+                file_cfg
+                    .as_ref()
+                    .map(|c| c.register.clone())
+                    .unwrap_or_default()
             } else {
                 register.clone()
             };
-            let shared_secret = file_cfg.as_ref().and_then(|c| c.discovery.shared_secret.as_deref());
-            if let Err(e) = serve(effective_bind, &effective_register, ca, cert, key, policy.as_deref(), Some(effective_node_id), &cli.server, shared_secret).await {
+            let shared_secret = file_cfg
+                .as_ref()
+                .and_then(|c| c.discovery.shared_secret.as_deref());
+            if let Err(e) = serve(
+                effective_bind,
+                &effective_register,
+                ca,
+                cert,
+                key,
+                policy.as_deref(),
+                Some(effective_node_id),
+                &cli.server,
+                shared_secret,
+            )
+            .await
+            {
                 eprintln!("rex serve: {e}");
                 exit(1);
             }
@@ -975,16 +1072,20 @@ async fn run(cmd: &Cmd, explorer: Explorer, no_color: bool) -> resource::Result<
     // Color helpers — no-op when color is disabled or stdout is not a terminal.
     let color = !no_color && std::io::IsTerminal::is_terminal(&std::io::stdout());
     let c = |code: &str, text: &str| -> String {
-        if color { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_string() }
+        if color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
     };
     let kind_icon = |kind: &ResourceType| -> &'static str {
         match kind {
-            ResourceType::Storage => "\u{1f4c1}",   // 📁
-            ResourceType::Combine => "\u{1f517}",  // 🔗
-            ResourceType::Network => "\u{1f310}",  // 🌐
-            ResourceType::Compute => "\u{2699}",   // ⚙
-            ResourceType::System => "\u{1f4bb}",   // 💻
-            ResourceType::Abstract => "\u{2728}",  // ✨
+            ResourceType::Storage => "\u{1f4c1}", // 📁
+            ResourceType::Combine => "\u{1f517}", // 🔗
+            ResourceType::Network => "\u{1f310}", // 🌐
+            ResourceType::Compute => "\u{2699}",  // ⚙
+            ResourceType::System => "\u{1f4bb}",  // 💻
+            ResourceType::Abstract => "\u{2728}", // ✨
         }
     };
     match cmd {
@@ -998,10 +1099,10 @@ async fn run(cmd: &Cmd, explorer: Explorer, no_color: bool) -> resource::Result<
             for info in explorer.describe(kind).await? {
                 let kind_str = format!("{}", info.kind);
                 let colored_kind = match info.kind {
-                    ResourceType::Storage => c("32", &kind_str),      // green
-                    ResourceType::Combine => c("34", &kind_str),      // blue
-                    ResourceType::Network => c("33", &kind_str),      // yellow
-                    ResourceType::Compute => c("36", &kind_str),      // cyan
+                    ResourceType::Storage => c("32", &kind_str), // green
+                    ResourceType::Combine => c("34", &kind_str), // blue
+                    ResourceType::Network => c("33", &kind_str), // yellow
+                    ResourceType::Compute => c("36", &kind_str), // cyan
                     _ => kind_str,
                 };
                 let icon = kind_icon(&info.kind);
@@ -1014,8 +1115,7 @@ async fn run(cmd: &Cmd, explorer: Explorer, no_color: bool) -> resource::Result<
                 };
                 println!(
                     "  {icon}  {colored_kind:<10} {colored_state:<9} {:<10} {}",
-                    info.owner,
-                    info.uri
+                    info.owner, info.uri
                 );
             }
         }
@@ -1025,7 +1125,11 @@ async fn run(cmd: &Cmd, explorer: Explorer, no_color: bool) -> resource::Result<
             let len = rows.len();
             for (i, row) in rows.into_iter().enumerate() {
                 let is_last = i + 1 == len;
-                let prefix = if is_last { "  └── " } else { "  ├── " };
+                let prefix = if is_last {
+                    "  └── "
+                } else {
+                    "  ├── "
+                };
                 match row {
                     Row::Resource { depth, info } => {
                         let indent = "  │  ".repeat(depth.saturating_sub(1));
@@ -1038,9 +1142,19 @@ async fn run(cmd: &Cmd, explorer: Explorer, no_color: bool) -> resource::Result<
                             _ => kind_str,
                         };
                         if depth == 0 {
-                            println!("{icon} {} ({}, {})", c("1", &info.uri), colored_kind, format!("{:?}", info.state));
+                            println!(
+                                "{icon} {} ({}, {})",
+                                c("1", &info.uri),
+                                colored_kind,
+                                format!("{:?}", info.state)
+                            );
                         } else {
-                            println!("{indent}{prefix}{icon} {} ({}, {})", c("1", &info.uri), colored_kind, format!("{:?}", info.state));
+                            println!(
+                                "{indent}{prefix}{icon} {} ({}, {})",
+                                c("1", &info.uri),
+                                colored_kind,
+                                format!("{:?}", info.state)
+                            );
                         }
                     }
                     Row::Child { depth, name } => {
@@ -1056,7 +1170,10 @@ async fn run(cmd: &Cmd, explorer: Explorer, no_color: bool) -> resource::Result<
             d!("peek returned {} bytes", data.len());
             println!("{} bytes:", data.len());
             let text = String::from_utf8_lossy(&data);
-            if data.iter().all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace()) {
+            if data
+                .iter()
+                .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+            {
                 println!("{text}");
             } else {
                 for chunk in data.chunks(16) {

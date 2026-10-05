@@ -16,7 +16,7 @@ use futures::StreamExt;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedKey, DnType, IsCa, KeyPair};
 use resource::prelude::*;
 use resource::transport::{QuicServer, QuicTransport};
-use resource::{ChunkWriter, PolicyDoc, Rule, Effect};
+use resource::{ChunkWriter, Effect, PolicyDoc, Rule};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn policy() -> SharedPolicy {
@@ -72,7 +72,13 @@ async fn connected_client(mgr: Arc<ResourceManager>) -> ResourceClient {
     let server = Arc::new(QuicServer::new(mgr));
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let local = server
-        .bind(addr, cert_der(&server_k), key_der(&server_k), &ca_pem(&ca), &[])
+        .bind(
+            addr,
+            cert_der(&server_k),
+            key_der(&server_k),
+            &ca_pem(&ca),
+            &[],
+        )
         .await
         .expect("bind server");
     let srv = server.clone();
@@ -83,8 +89,14 @@ async fn connected_client(mgr: Arc<ResourceManager>) -> ResourceClient {
 
     let trust = ca_pem(&ca);
     let transport = Arc::new(
-        QuicTransport::new(local, "server".to_string(), &trust, cert_der(&client_k), key_der(&client_k))
-            .expect("build client transport"),
+        QuicTransport::new(
+            local,
+            "server".to_string(),
+            &trust,
+            cert_der(&client_k),
+            key_der(&client_k),
+        )
+        .expect("build client transport"),
     );
     ResourceClient::new("agent1", None, Some(transport))
 }
@@ -139,7 +151,13 @@ async fn read_end_to_end(client: &ResourceClient, mgr: Option<&Arc<ResourceManag
     assert_eq!(got, data[12345..12345 + 7777]);
 
     // len past EOF clamps to available bytes.
-    let got = read_all(client.read_stream(&uri, 999_000, Some(10_000)).await.unwrap()).await;
+    let got = read_all(
+        client
+            .read_stream(&uri, 999_000, Some(10_000))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(got, data[999_000..]);
 }
 
@@ -194,7 +212,10 @@ async fn quic_stream_is_incremental() {
         .expect("first chunk item")
         .expect("first chunk ok");
     assert!(!first.is_empty());
-    assert!(first.len() < data.len(), "chunks must be smaller than the whole body");
+    assert!(
+        first.len() < data.len(),
+        "chunks must be smaller than the whole body"
+    );
     // The rest must total the file.
     let mut rest = Vec::new();
     while let Some(c) = stream.next().await {

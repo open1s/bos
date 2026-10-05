@@ -8,6 +8,6 @@ mod transport;
 mod wire;
 
 pub use client::AgentRpcClient;
+pub use react::ToolError;
 pub use server::AgentCallableServer;
 pub use tool::AgentCallerTool;
-pub use react::ToolError;

@@ -5,8 +5,8 @@ use bus::{Caller, Session, DEFAULT_CODEC};
 use tokio_stream::wrappers::ReceiverStream;
 use zenoh::query::ConsolidationMode;
 
-use react::ToolError;
 use super::wire::*;
+use react::ToolError;
 
 #[async_trait]
 pub(crate) trait RpcTransport: Send + Sync {

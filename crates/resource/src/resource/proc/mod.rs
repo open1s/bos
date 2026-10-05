@@ -63,7 +63,10 @@ fn spawn_reaper(mut child: Child) -> ProcHandle {
         };
         let _ = exit_tx.send(Some(code));
     });
-    ProcHandle { cmd: cmd_tx, exit: exit_rx }
+    ProcHandle {
+        cmd: cmd_tx,
+        exit: exit_rx,
+    }
 }
 
 /// A child-process resource (`proc://<name>`).
@@ -87,7 +90,10 @@ impl ProcResource {
             owner: String::new(),
             metadata: None,
         };
-        Self { meta, inner: Mutex::new(None) }
+        Self {
+            meta,
+            inner: Mutex::new(None),
+        }
     }
 
     /// Wrap an already-spawned `child` as a resource named `name`.
@@ -101,7 +107,10 @@ impl ProcResource {
             owner: String::new(),
             metadata: None,
         };
-        Self { meta, inner: Mutex::new(Some(handle)) }
+        Self {
+            meta,
+            inner: Mutex::new(Some(handle)),
+        }
     }
 }
 
@@ -163,7 +172,9 @@ impl ResourceHandler for ProcResource {
                 // mechanism (e.g. `kill` on Unix), which `start_kill` does not
                 // expose. See [`Terminate`].
                 let _ = signal;
-                h.cmd.send(ProcCmd::Kill).map_err(|_| ResourceError::Closed)?;
+                h.cmd
+                    .send(ProcCmd::Kill)
+                    .map_err(|_| ResourceError::Closed)?;
                 Ok(ResourceOutput::Killed)
             }
             ResourceAction::SendSignal { signal } => {
@@ -174,17 +185,15 @@ impl ResourceHandler for ProcResource {
                 // We normalize intent through [`Terminate`] and document the
                 // degradation: non-force signals collapse to termination.
                 let _term = Terminate::Unix(signal);
-                h.cmd.send(ProcCmd::Kill).map_err(|_| ResourceError::Closed)?;
+                h.cmd
+                    .send(ProcCmd::Kill)
+                    .map_err(|_| ResourceError::Closed)?;
                 Ok(ResourceOutput::SignalSent)
             }
             ResourceAction::Wait => {
                 // Any number of waiters, at any time: subscribe to the exit
                 // broadcast and block until it carries a code.
-                let mut rx = inner
-                    .as_ref()
-                    .ok_or(ResourceError::Closed)?
-                    .exit
-                    .clone();
+                let mut rx = inner.as_ref().ok_or(ResourceError::Closed)?.exit.clone();
                 drop(inner); // release the handler lock while the process runs
                 let code = loop {
                     let cur = *rx.borrow();

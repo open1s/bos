@@ -45,7 +45,16 @@ pub struct HookContextData {
 
 pub struct JSHook {
   // Weak so a registered hook does not pin the Node event loop after the run.
-  pub(super) callback: Arc<ThreadsafeFunction<HookContextData, napi::Unknown<'static>, HookContextData, napi::Status, true, true>>,
+  pub(super) callback: Arc<
+    ThreadsafeFunction<
+      HookContextData,
+      napi::Unknown<'static>,
+      HookContextData,
+      napi::Status,
+      true,
+      true,
+    >,
+  >,
 }
 
 #[async_trait]
@@ -142,7 +151,14 @@ impl HookRegistry {
   pub async fn register(
     &self,
     event: HookEvent,
-    callback: ThreadsafeFunction<HookContextData, napi::Unknown<'static>, HookContextData, napi::Status, true, true>,
+    callback: ThreadsafeFunction<
+      HookContextData,
+      napi::Unknown<'static>,
+      HookContextData,
+      napi::Status,
+      true,
+      true,
+    >,
   ) -> Result<()> {
     let event = match event {
       HookEvent::BeforeToolCall => agent::agent::hooks::HookEvent::BeforeToolCall,

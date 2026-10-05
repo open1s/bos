@@ -179,9 +179,9 @@ impl ConfigLoader {
             }
         }
 
-        self.cached_config.as_ref().ok_or_else(|| {
-            ConfigError::LoadError(anyhow::anyhow!("配置加载完成但未产生缓存值"))
-        })
+        self.cached_config
+            .as_ref()
+            .ok_or_else(|| ConfigError::LoadError(anyhow::anyhow!("配置加载完成但未产生缓存值")))
     }
 
     pub async fn load_typed<T>(&mut self) -> ConfigResult<T>
@@ -479,7 +479,6 @@ impl ConfigLoader {
         Ok((dir.to_string(), merged))
     }
 
-
     fn parse_content(content: &str, format: ConfigFormat) -> ConfigResult<serde_json::Value> {
         let value = match format {
             ConfigFormat::Toml => toml::from_str(content).map_err(ConfigError::TomlParse)?,
@@ -616,7 +615,10 @@ y = 1"#,
 
         for src in sources {
             if let ConfigSource::Directory(dir) = src {
-                assert!(Path::new(dir).exists(), "discover should only add existing dirs");
+                assert!(
+                    Path::new(dir).exists(),
+                    "discover should only add existing dirs"
+                );
             }
         }
     }

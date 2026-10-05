@@ -139,9 +139,9 @@ impl PolicyDoc {
         // regorus returns QueryResults with a `result` field containing Vec<QueryResult>
         // Each QueryResult has expressions with the query result value
         let allowed = results.result.iter().any(|qr| {
-            qr.expressions.iter().any(|expr| {
-                expr.value.as_bool().copied().unwrap_or(false)
-            })
+            qr.expressions
+                .iter()
+                .any(|expr| expr.value.as_bool().copied().unwrap_or(false))
         });
 
         if allowed {
@@ -303,7 +303,9 @@ mod tests {
         };
         let policy = SharedPolicy::new(doc);
         assert!(policy.authorize("agent1", "file:///x", "read").is_ok());
-        assert!(policy.authorize("agent1", "file:///blocked", "read").is_err());
+        assert!(policy
+            .authorize("agent1", "file:///blocked", "read")
+            .is_err());
     }
 
     #[test]
@@ -450,29 +452,37 @@ mod tests {
                 input.action == "read"
             }
         "#;
-        
+
         let doc = PolicyDoc {
             admins: vec!["admin".into()],
             rego: Some(rego.into()),
             ..Default::default()
         };
-        
+
         let policy = SharedPolicy::new(doc);
-        
+
         // Performance test - 100 evaluations should complete quickly
         let start = std::time::Instant::now();
         for _ in 0..100 {
             let _ = policy.authorize("alice", "file:///readme.md", "read");
         }
         let duration = start.elapsed();
-        
+
         // Should be fast (100 evals in under a second)
-        assert!(duration.as_secs() < 1, "Policy evaluation too slow: {:?}", duration);
-        
+        assert!(
+            duration.as_secs() < 1,
+            "Policy evaluation too slow: {:?}",
+            duration
+        );
+
         // Correctness tests
-        assert!(policy.authorize("alice", "file:///readme.md", "read").is_ok());
+        assert!(policy
+            .authorize("alice", "file:///readme.md", "read")
+            .is_ok());
         assert!(policy.authorize("bob", "file:///readme.md", "read").is_ok());
-        assert!(policy.authorize("dave", "file:///readme.md", "read").is_err());
+        assert!(policy
+            .authorize("dave", "file:///readme.md", "read")
+            .is_err());
     }
 
     #[tokio::test]
@@ -486,17 +496,17 @@ mod tests {
                 input.action == "read"
             }
         "#;
-        
+
         let doc = PolicyDoc {
             admins: vec!["admin".into()],
             rego: Some(rego.into()),
             ..Default::default()
         };
-        
+
         // Test individual evaluations (each thread will create own engine)
         let policy1 = SharedPolicy::new(doc.clone());
         let policy2 = SharedPolicy::new(doc.clone());
-        
+
         // Test individual evaluations
         assert!(policy1.authorize("alice", "file:///test", "read").is_ok());
         assert!(policy2.authorize("bob", "file:///test", "read").is_ok());
@@ -509,8 +519,7 @@ mod tests {
     fn test_example_policies_load() {
         // `CARGO_MANIFEST_DIR` is `crates/resource`; the examples live at the
         // workspace root under `examples/policies`.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/policies");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/policies");
         let mut found = 0usize;
         for entry in std::fs::read_dir(&dir).expect("examples/policies dir") {
             let path = entry.unwrap().path();
@@ -520,10 +529,18 @@ mod tests {
             let src = std::fs::read_to_string(&path).unwrap();
             let mut engine = Engine::new();
             engine
-                .add_policy(format!("{}.rego", path.file_stem().unwrap().to_string_lossy()), src)
-                .unwrap_or_else(|e| panic!("example policy {} failed to load: {e}", path.display()));
+                .add_policy(
+                    format!("{}.rego", path.file_stem().unwrap().to_string_lossy()),
+                    src,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("example policy {} failed to load: {e}", path.display())
+                });
             found += 1;
         }
-        assert!(found >= 6, "expected at least 6 example policies, found {found}");
+        assert!(
+            found >= 6,
+            "expected at least 6 example policies, found {found}"
+        );
     }
 }

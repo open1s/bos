@@ -90,7 +90,10 @@ async fn restart_on_failure_keeps_respawning() {
     client.invoke(&sup_uri, ResourceAction::Open).await.unwrap();
     // Give the child a moment to spawn, fail, and respawn at least once.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    client.invoke(&sup_uri, ResourceAction::Close).await.unwrap();
+    client
+        .invoke(&sup_uri, ResourceAction::Close)
+        .await
+        .unwrap();
     let n = count_lines(&marker);
     assert!(n >= 2, "expected >= 2 spawns, got {n}");
 }
@@ -118,7 +121,12 @@ async fn escalate_on_budget_exhaustion() {
         .await
         .unwrap();
     assert!(
-        matches!(failed, ResourceOutput::Status { state: ResourceStateLabel::Closed }),
+        matches!(
+            failed,
+            ResourceOutput::Status {
+                state: ResourceStateLabel::Closed
+            }
+        ),
         "supervisor should be Closed after escalation, got {failed:?}"
     );
 
@@ -126,7 +134,10 @@ async fn escalate_on_budget_exhaustion() {
     let before = count_lines(&marker);
     tokio::time::sleep(Duration::from_secs(1)).await;
     let after = count_lines(&marker);
-    assert_eq!(before, after, "no new spawns after escalation (before={before} after={after})");
+    assert_eq!(
+        before, after,
+        "no new spawns after escalation (before={before} after={after})"
+    );
 }
 
 #[tokio::test]
@@ -144,7 +155,10 @@ async fn always_policy_keeps_alive_long_runner() {
     .await;
     client.invoke(&sup_uri, ResourceAction::Open).await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
-    client.invoke(&sup_uri, ResourceAction::Close).await.unwrap();
+    client
+        .invoke(&sup_uri, ResourceAction::Close)
+        .await
+        .unwrap();
     let n = count_lines(&marker);
     assert!(n >= 2, "expected multiple spawns under Always, got {n}");
 }
@@ -164,7 +178,10 @@ async fn close_kills_children() {
     .await;
     client.invoke(&sup_uri, ResourceAction::Open).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    client.invoke(&sup_uri, ResourceAction::Close).await.unwrap();
+    client
+        .invoke(&sup_uri, ResourceAction::Close)
+        .await
+        .unwrap();
 
     // After close, no proc://<pid> should still be running the child.
     // Query the supervisor's list: nothing running.
@@ -175,7 +192,9 @@ async fn close_kills_children() {
     match out {
         ResourceOutput::Listed { entries } => {
             assert!(
-                entries.iter().all(|e| e.contains("done") || !e.contains("running")),
+                entries
+                    .iter()
+                    .all(|e| e.contains("done") || !e.contains("running")),
                 "children must not be running after close: {entries:?}"
             );
         }
@@ -186,12 +205,8 @@ async fn close_kills_children() {
 
 #[tokio::test]
 async fn list_reports_restart_count() {
-    let (client, sup_uri, _marker) = harness(
-        "list",
-        &["/bin/sh", "-c", "sleep 60"],
-        SupPolicy::default(),
-    )
-    .await;
+    let (client, sup_uri, _marker) =
+        harness("list", &["/bin/sh", "-c", "sleep 60"], SupPolicy::default()).await;
     client.invoke(&sup_uri, ResourceAction::Open).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let out = client
@@ -201,10 +216,19 @@ async fn list_reports_restart_count() {
     match out {
         ResourceOutput::Listed { entries } => {
             assert_eq!(entries.len(), 1, "one child");
-            assert!(entries[0].contains("proc://"), "child URI listed: {entries:?}");
-            assert!(entries[0].contains("running"), "child marked running: {entries:?}");
+            assert!(
+                entries[0].contains("proc://"),
+                "child URI listed: {entries:?}"
+            );
+            assert!(
+                entries[0].contains("running"),
+                "child marked running: {entries:?}"
+            );
         }
         other => panic!("expected Listed, got {other:?}"),
     }
-    client.invoke(&sup_uri, ResourceAction::Close).await.unwrap();
+    client
+        .invoke(&sup_uri, ResourceAction::Close)
+        .await
+        .unwrap();
 }

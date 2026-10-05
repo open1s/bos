@@ -30,14 +30,20 @@ fn gen_ca() -> CertifiedKey {
     p.distinguished_name.push(DnType::CommonName, "BOS-CA");
     p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let kp = KeyPair::generate().unwrap();
-    CertifiedKey { cert: p.self_signed(&kp).unwrap(), key_pair: kp }
+    CertifiedKey {
+        cert: p.self_signed(&kp).unwrap(),
+        key_pair: kp,
+    }
 }
 
 fn gen_entity(ca: &CertifiedKey, cn: &str) -> CertifiedKey {
     let kp = KeyPair::generate().unwrap();
     let mut p = CertificateParams::new(vec![cn.to_string()]).unwrap();
     p.distinguished_name.push(DnType::CommonName, cn);
-    CertifiedKey { cert: p.signed_by(&kp, &ca.cert, &ca.key_pair).unwrap(), key_pair: kp }
+    CertifiedKey {
+        cert: p.signed_by(&kp, &ca.cert, &ca.key_pair).unwrap(),
+        key_pair: kp,
+    }
 }
 
 fn cert_der(c: &CertifiedKey) -> CertificateDer<'static> {
@@ -69,14 +75,29 @@ async fn vnode_subpath_over_quic() {
     let a_server = Arc::new(QuicServer::new(a_mgr.clone()));
     let a_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let a_local = a_server
-        .bind(a_addr, cert_der(&server_k), key_der(&server_k), &ca_pem(&ca), &[])
+        .bind(
+            a_addr,
+            cert_der(&server_k),
+            key_der(&server_k),
+            &ca_pem(&ca),
+            &[],
+        )
         .await
         .unwrap();
-    tokio::spawn(async move { let _ = a_server.run().await; });
+    tokio::spawn(async move {
+        let _ = a_server.run().await;
+    });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let transport_to_a: Arc<dyn Transport> = Arc::new(
-        QuicTransport::new(a_local, "server".into(), &ca_pem(&ca), cert_der(&client_k), key_der(&client_k)).unwrap(),
+        QuicTransport::new(
+            a_local,
+            "server".into(),
+            &ca_pem(&ca),
+            cert_der(&client_k),
+            key_der(&client_k),
+        )
+        .unwrap(),
     );
 
     // B's manager holds the vnode.
@@ -86,20 +107,38 @@ async fn vnode_subpath_over_quic() {
         "me",
         vec![(format!("folder://{}", root.display()), transport_to_a)],
     );
-    b_mgr.register(Box::new(vnode), "admin".into()).await.unwrap();
+    b_mgr
+        .register(Box::new(vnode), "admin".into())
+        .await
+        .unwrap();
 
     // B serves QUIC; a client talks to B.
     let b_server = Arc::new(QuicServer::new(b_mgr));
     let b_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let b_local = b_server
-        .bind(b_addr, cert_der(&server_k), key_der(&server_k), &ca_pem(&ca), &[])
+        .bind(
+            b_addr,
+            cert_der(&server_k),
+            key_der(&server_k),
+            &ca_pem(&ca),
+            &[],
+        )
         .await
         .unwrap();
-    tokio::spawn(async move { let _ = b_server.run().await; });
+    tokio::spawn(async move {
+        let _ = b_server.run().await;
+    });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let client_transport: Arc<dyn Transport> = Arc::new(
-        QuicTransport::new(b_local, "server".into(), &ca_pem(&ca), cert_der(&client_k), key_der(&client_k)).unwrap(),
+        QuicTransport::new(
+            b_local,
+            "server".into(),
+            &ca_pem(&ca),
+            cert_der(&client_k),
+            key_der(&client_k),
+        )
+        .unwrap(),
     );
     let client = ResourceClient::new("me", None, Some(client_transport));
 
@@ -112,7 +151,10 @@ async fn vnode_subpath_over_quic() {
 
     // 3. List the sub-path through the vnode → union of certs/ contents.
     let out = client
-        .invoke("vnode://nodeA/certs", ResourceAction::List { pattern: None })
+        .invoke(
+            "vnode://nodeA/certs",
+            ResourceAction::List { pattern: None },
+        )
         .await
         .unwrap();
     match out {

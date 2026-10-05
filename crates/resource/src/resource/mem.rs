@@ -84,10 +84,10 @@ impl ResourceHandler for MemResource {
                     .collect();
                 Ok(ResourceOutput::Listed { entries })
             }
-                other => Err(ResourceError::Unsupported(format!(
-                    "mem resource does not support {:?}",
-                    other.name()
-                ))),
+            other => Err(ResourceError::Unsupported(format!(
+                "mem resource does not support {:?}",
+                other.name()
+            ))),
         }
     }
 }
