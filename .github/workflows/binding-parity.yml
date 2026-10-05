@@ -1,0 +1,40 @@
+name: binding parity
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    name: Python/JS binding surface parity
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./crates/jsbos
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Setup yarn
+        run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
+      - name: Install dependencies
+        run: yarn install --no-immutable
+
+      # The guard reads both binding sources statically, so it needs no Rust
+      # toolchain and no native addon. Running it on every pull request keeps
+      # the Python and JavaScript surfaces from drifting before merge instead
+      # of only on main-branch builds.
+      - name: Run the binding parity guard
+        run: npx ava test/parity.test.js

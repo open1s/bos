@@ -101,7 +101,7 @@ in `react` (`LlmClient`, `Tool`/`AsyncTool`), not the bus.
 | Bindings | Entry | Build |
 |----------|-------|-------|
 | Python | `crates/nbos/` | `maturin develop` |
-| JS | `crates/jsbos/brainos.js` | `npm run build` |
+| JS | `crates/jsbos/index.js` | `npm run build` |
 
 **User guides**: `docs/python-user-guide.md`, `docs/javascript-user-guide.md`, `docs/rust-user-guide.md`
 
@@ -153,4 +153,4 @@ const result = await agent.ask('What is 2+2?');
 
 ---
 
-## Last Updated: 2026-10-05
+## Last Updated: 2026-10-06

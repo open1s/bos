@@ -106,3 +106,12 @@ Closing the ToolRegistry gap added unregister, list_tool_defs, list_by_category,
 filter and to_json to Python. list_by_category filters on an optional category
 attribute and returns an empty list until Python's ToolDef gains a category
 field; the JS side reads it from BaseTool metadata.
+
+## Enforcement
+
+The guard reads both sources statically, so it needs neither a Python
+runtime nor the compiled native addon. .github/workflows/binding-parity.yml
+installs only Node and the jsbos dev dependencies, then runs
+npx ava test/parity.test.js on every pull request. The full jsbos pipeline
+stays main-and-tags only, so this adds the fast check without the per-target
+native build matrix.
