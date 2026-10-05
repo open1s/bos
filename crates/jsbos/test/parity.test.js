@@ -211,3 +211,38 @@ test('Publisher and Subscriber surfaces match across bindings', (t) => {
     new Set(['recv_with_timeout_ms', 'recv_json_with_timeout_ms']),
   )
 })
+
+test('Query, Queryable, Caller and Callable surfaces match across bindings', (t) => {
+  assertNoDrift(
+    t,
+    'Query',
+    norm(jsMembers(jsSrc, 'QueryClient')),
+    norm(pyMembers(pySrc, 'Query')),
+    new Set(),
+    new Set(['create', 'query_text', 'query_text_timeout_ms']),
+  )
+  assertNoDrift(
+    t,
+    'Queryable',
+    norm(jsMembers(jsSrc, 'QueryableServer')),
+    norm(pyMembers(pySrc, 'Queryable')),
+    new Set(),
+    new Set(['create']),
+  )
+  assertNoDrift(
+    t,
+    'Caller',
+    norm(jsMembers(jsSrc, 'CallerClient')),
+    norm(pyMembers(pySrc, 'Caller')),
+    new Set(),
+    new Set(['create', 'call_text']),
+  )
+  assertNoDrift(
+    t,
+    'Callable',
+    norm(jsMembers(jsSrc, 'CallableServer')),
+    norm(pyMembers(pySrc, 'Callable')),
+    new Set(),
+    new Set(['create']),
+  )
+})

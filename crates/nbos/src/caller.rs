@@ -52,6 +52,9 @@ impl PyCaller {
 #[derive(Clone)]
 pub struct PyCallable {
     pub inner: Arc<tokio::sync::Mutex<Callable<String, String>>>,
+    // Mirrors the JS binding: a sync flag instead of an async probe, so the
+    // Python wrapper can expose is_started as a plain property.
+    is_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[pymethods]
@@ -84,6 +87,7 @@ impl PyCallable {
                     py,
                     PyCallable {
                         inner: Arc::new(tokio::sync::Mutex::new(callable)),
+                        is_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     },
                 )?;
                 Ok(py_obj.into_any())
@@ -93,26 +97,25 @@ impl PyCallable {
 
     fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let started = self.is_started.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             guard
                 .start()
                 .await
                 .map_err(crate::utils::to_py_runtime_error)?;
+            started.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         })
     }
 
-    fn is_started<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            Ok(guard.is_started())
-        })
+    fn is_started(&self) -> bool {
+        self.is_started.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn run<'py>(&self, py: Python<'py>, handler: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let started = self.is_started.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = inner.lock().await;
 
@@ -149,12 +152,14 @@ impl PyCallable {
                 .init_and_run()
                 .await
                 .map_err(crate::utils::to_py_runtime_error)?;
+            started.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         })
     }
 
     fn run_json<'py>(&self, py: Python<'py>, handler: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let started = self.is_started.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = inner.lock().await;
 
@@ -191,6 +196,7 @@ impl PyCallable {
                 .init_and_run()
                 .await
                 .map_err(crate::utils::to_py_runtime_error)?;
+            started.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         })
     }

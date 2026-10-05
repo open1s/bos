@@ -230,3 +230,39 @@ class TestCaller:
         assert len(results) == 3
         for i, result in enumerate(results):
             assert result == f"processed: query{i}"
+
+
+class TestQueryWrappers:
+    """High-level Query/Queryable wrappers (nbos.query + BusManager)"""
+
+    @pytest.mark.asyncio
+    async def test_ask_and_ask_json(self):
+        from nbos.bus import BusManager
+
+        async with BusManager() as bus:
+            server = await bus.create_queryable("wrap/q", lambda text: text.upper())
+            await server.start()
+            await asyncio.sleep(0.1)
+
+            client = await bus.create_query("wrap/q")
+            assert await client.ask("hi") == "HI"
+
+            json_server = await bus.create_queryable("wrap/qjson")
+            await json_server.run_json(lambda data: {"echo": data["n"] + 1})
+            await asyncio.sleep(0.1)
+
+            json_client = await bus.create_query("wrap/qjson")
+            assert await json_client.ask_json({"n": 1}) == {"echo": 2}
+
+    @pytest.mark.asyncio
+    async def test_handle_defers_handler_until_start(self):
+        from nbos.bus import BusManager
+
+        async with BusManager() as bus:
+            server = await bus.create_queryable("wrap/handle")
+            assert server.handle(lambda text: f"got:{text}") is server
+            await server.start()
+            await asyncio.sleep(0.1)
+
+            client = await bus.create_query("wrap/handle")
+            assert await client.ask("x") == "got:x"

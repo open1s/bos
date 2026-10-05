@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable
 
 from nbos_native import Caller as PyCaller
@@ -33,13 +34,26 @@ class Caller:
         raw = await PyCaller.create(bus, name)
         return cls(raw)
 
+    async def call(self, payload: str) -> str:
+        return await self._inner.call_text(payload)
+
+    async def call_json(self, payload: Any) -> Any:
+        """Send ``payload`` as JSON and decode the JSON response."""
+        response = await self.call(json.dumps(payload))
+        try:
+            return json.loads(response)
+        except (TypeError, ValueError):
+            return response
+
     async def call_text(self, payload: str) -> str:
+        """Deprecated: use ``call(payload)`` instead."""
         return await self._inner.call_text(payload)
 
 
 class Callable:
     def __init__(self, inner: PyCallable) -> None:
         self._inner = inner
+        self._handler: Callable[[str], str] | None = None
 
     @classmethod
     async def create(
@@ -51,8 +65,16 @@ class Callable:
         raw = await PyCallable.create(bus, uri, handler)
         return cls(raw)
 
+    def handle(self, handler: Callable[[str], str]) -> "Callable":
+        """Register the handler to serve once ``start`` is called."""
+        self._handler = handler
+        return self
+
     async def start(self) -> None:
-        await self._inner.start()
+        if self._handler is not None:
+            await self._inner.run(self._handler)
+        else:
+            await self._inner.start()
 
     @property
     def is_started(self) -> bool:

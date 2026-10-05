@@ -290,3 +290,41 @@ class TestCaller:
         result1 = await caller.call_text("test")
 
         assert result1 == "processed: test"
+
+
+class TestCallWrappers:
+    """High-level Caller/Callable wrappers (nbos.caller + BusManager)"""
+
+    @pytest.mark.asyncio
+    async def test_call_and_call_json(self):
+        from nbos.bus import BusManager
+
+        async with BusManager() as bus:
+            server = await bus.create_callable("wrap/rpc", lambda text: text.upper())
+            await server.start()
+            await asyncio.sleep(0.1)
+
+            client = await bus.create_caller("wrap/rpc")
+            assert await client.call("hi") == "HI"
+
+            json_server = await bus.create_callable("wrap/rpcjson")
+            await json_server.run_json(lambda data: {"got": data["x"]})
+            await asyncio.sleep(0.1)
+
+            json_client = await bus.create_caller("wrap/rpcjson")
+            assert await json_client.call_json({"x": 5}) == {"got": 5}
+
+    @pytest.mark.asyncio
+    async def test_handle_and_is_started(self):
+        from nbos.bus import BusManager
+
+        async with BusManager() as bus:
+            server = await bus.create_callable("wrap/rpc2")
+            assert server.is_started is False
+            assert server.handle(lambda text: f"hi:{text}") is server
+            await server.start()
+            assert server.is_started is True
+            await asyncio.sleep(0.1)
+
+            client = await bus.create_caller("wrap/rpc2")
+            assert await client.call("x") == "hi:x"

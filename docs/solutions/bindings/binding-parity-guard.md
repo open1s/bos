@@ -87,6 +87,15 @@ the guard still fails on any new drift. Fixing the pair closed a latent JS
 bug: SubscriberWrapper.recvJson() with no timeout called a native recvJson
 that does not exist.
 
+The Query, Queryable, Caller and Callable wrappers followed the same
+template: ask/ask_json and call/call_json on the clients, and
+handle/start/run/run_json on the servers. Python keeps create as a
+constructor and query_text/query_text_timeout_ms and call_text as deprecated
+aliases of ask and call. The Callable wrapper also exposed a native bug:
+Python is_started was async, so the wrapper property returned a coroutine
+instead of a bool. The native now tracks a sync atomic flag, as the JS
+binding already did.
+
 Closing the ToolRegistry gap added unregister, list_tool_defs, list_by_category,
 filter and to_json to Python. list_by_category filters on an optional category
 attribute and returns an empty list until Python's ToolDef gains a category

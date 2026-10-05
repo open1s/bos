@@ -1307,7 +1307,12 @@ class CallerClient {
   }
 
   async callJson(payload) {
-    return this._inner.callText(JSON.stringify(payload));
+    const response = await this._inner.callText(JSON.stringify(payload));
+    try {
+      return JSON.parse(response);
+    } catch {
+      return response;
+    }
   }
 }
 
