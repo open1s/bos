@@ -1231,17 +1231,7 @@ impl PyAgent {
                 .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
             let tools = guard
                 .registry()
-                .map(|r| {
-                    r.iter()
-                        .filter(|(name, _)| r.is_mcp_tool(name))
-                        .map(|(name, tool)| {
-                            serde_json::json!({
-                                "name": name,
-                                "description": tool.description(),
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
+                .map(|r| r.mcp_tool_entries())
                 .unwrap_or_default();
 
             let tools_json = serde_json::to_value(&tools)
@@ -1265,17 +1255,7 @@ impl PyAgent {
 
             let tools = guard
                 .registry()
-                .map(|r| {
-                    r.iter()
-                        .filter(|(name, _)| name.starts_with(&format!("{}_", namespace)))
-                        .map(|(name, tool)| {
-                            serde_json::json!({
-                                "name": name,
-                                "description": tool.description(),
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
+                .map(|r| r.mcp_resource_entries(&namespace))
                 .unwrap_or_default();
 
             let tools_json = serde_json::to_value(&tools)
@@ -1292,12 +1272,7 @@ impl PyAgent {
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
         let prompts: Vec<String> = guard
             .registry()
-            .map(|r| {
-                r.iter()
-                    .filter(|(name, _)| r.is_mcp_tool(name))
-                    .map(|(name, _)| name.clone())
-                    .collect()
-            })
+            .map(|r| r.mcp_prompt_names())
             .unwrap_or_default();
         Ok(prompts)
     }

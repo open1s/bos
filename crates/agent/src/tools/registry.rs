@@ -109,6 +109,69 @@ impl ToolRegistry {
         self.mcp_tool_names.contains(name)
     }
 
+    /// `{name, description}` projections of MCP tools, sync and async.
+    ///
+    /// MCP tools are registered as async tools, so a projection that only walked
+    /// the sync map returned nothing. Both language bindings share this method so
+    /// they cannot drift again.
+    pub fn mcp_tool_entries(&self) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for (name, tool) in &self.tools {
+            if self.mcp_tool_names.contains(name) {
+                out.push(serde_json::json!({
+                    "name": name,
+                    "description": tool.description(),
+                }));
+            }
+        }
+        for (name, tool) in &self.async_tools {
+            if self.mcp_tool_names.contains(name) {
+                out.push(serde_json::json!({
+                    "name": name,
+                    "description": tool.description(),
+                }));
+            }
+        }
+        out
+    }
+
+    /// MCP resources exposed under `namespace`, sync and async.
+    pub fn mcp_resource_entries(&self, namespace: &str) -> Vec<serde_json::Value> {
+        let prefix = format!("{}_", namespace);
+        let mut out = Vec::new();
+        for (name, tool) in &self.tools {
+            if name.starts_with(&prefix) {
+                out.push(serde_json::json!({
+                    "name": name,
+                    "description": tool.description(),
+                }));
+            }
+        }
+        for (name, tool) in &self.async_tools {
+            if name.starts_with(&prefix) {
+                out.push(serde_json::json!({
+                    "name": name,
+                    "description": tool.description(),
+                }));
+            }
+        }
+        out
+    }
+
+    /// `{name, description}` projections for MCP prompts.
+    ///
+    /// Prompts are not yet registered into the tool registry (see the MCP
+    /// client), so this mirrors the MCP-marked set. It exists so both bindings
+    /// resolve to one definition instead of diverging heuristics.
+    pub fn mcp_prompt_entries(&self) -> Vec<serde_json::Value> {
+        self.mcp_tool_entries()
+    }
+
+    /// Names of MCP prompts; see `mcp_prompt_entries`.
+    pub fn mcp_prompt_names(&self) -> Vec<String> {
+        self.mcp_tool_names.iter().cloned().collect()
+    }
+
     /// Find an async tool by exact name or suffix match
     fn find_async_tool(&self, name: &str) -> Option<Arc<dyn AsyncTool>> {
         // Try exact match first
@@ -203,5 +266,60 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod mcp_projection_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct DummyAsync {
+        name: String,
+    }
+
+    #[async_trait]
+    impl AsyncTool for DummyAsync {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> String {
+            format!("{} description", self.name)
+        }
+        fn json_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn run(&self, _input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    fn registry(name: &str, mcp: bool) -> ToolRegistry {
+        let mut r = ToolRegistry::new();
+        r.register_async(Arc::new(DummyAsync { name: name.into() }))
+            .unwrap();
+        if mcp {
+            r.mark_mcp_tool(name);
+        }
+        r
+    }
+
+    #[test]
+    fn mcp_tool_entries_include_async_tools() {
+        let entries = registry("ns_echo", true).mcp_tool_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "ns_echo");
+    }
+
+    #[test]
+    fn mcp_resource_entries_filter_by_namespace() {
+        let r = registry("ns_echo", true);
+        assert_eq!(r.mcp_resource_entries("ns").len(), 1);
+        assert!(r.mcp_resource_entries("other").is_empty());
+    }
+
+    #[test]
+    fn non_mcp_tools_are_excluded() {
+        assert!(registry("plain", false).mcp_tool_entries().is_empty());
     }
 }

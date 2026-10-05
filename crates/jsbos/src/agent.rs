@@ -606,71 +606,28 @@ impl Agent {
   #[napi]
   pub async fn list_mcp_tools(&self) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
-    if let Some(registry) = guard.registry() {
-      let mut tools: Vec<serde_json::Value> = registry
-        .iter()
-        .filter(|(name, _)| registry.is_mcp_tool(name))
-        .map(|(name, tool)| {
-          serde_json::json!({
-              "name": name,
-              "description": tool.description(),
-          })
-        })
-        .collect();
-      for name in registry.async_tool_names() {
-        if registry.is_mcp_tool(&name) {
-          if let Some(async_tool) = registry.get_async(&name) {
-            tools.push(serde_json::json!({
-              "name": name,
-              "description": async_tool.description(),
-            }));
-          }
-        }
-      }
-      Ok(tools)
-    } else {
-      Ok(Vec::new())
-    }
+    Ok(guard
+      .registry()
+      .map(|registry| registry.mcp_tool_entries())
+      .unwrap_or_default())
   }
 
   #[napi]
   pub async fn list_mcp_resources(&self, namespace: String) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
-    if let Some(registry) = guard.registry() {
-      let resources: Vec<serde_json::Value> = registry
-        .iter()
-        .filter(|(name, _)| name.starts_with(&format!("{}_", namespace)))
-        .map(|(name, tool)| {
-          serde_json::json!({
-              "name": name,
-              "description": tool.description(),
-          })
-        })
-        .collect();
-      Ok(resources)
-    } else {
-      Ok(Vec::new())
-    }
+    Ok(guard
+      .registry()
+      .map(|registry| registry.mcp_resource_entries(&namespace))
+      .unwrap_or_default())
   }
 
   #[napi]
   pub async fn list_mcp_prompts(&self) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
-    if let Some(registry) = guard.registry() {
-      let prompts: Vec<serde_json::Value> = registry
-        .iter()
-        .filter(|(name, _)| name.contains('/'))
-        .map(|(name, tool)| {
-          serde_json::json!({
-              "name": name,
-              "description": tool.description(),
-          })
-        })
-        .collect();
-      Ok(prompts)
-    } else {
-      Ok(Vec::new())
-    }
+    Ok(guard
+      .registry()
+      .map(|registry| registry.mcp_prompt_entries())
+      .unwrap_or_default())
   }
 
   #[napi]
