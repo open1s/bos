@@ -99,6 +99,11 @@ AgentBuilder(bus, options=None)
 | `with_temperature(temp)` | Set temperature | `AgentBuilder` |
 | `with_max_tokens(tokens)` | Set max tokens | `AgentBuilder` |
 | `with_timeout(secs)` | Set timeout | `AgentBuilder` |
+| `with_api_mode(mode)` | Set the API mode (`chat` or `responses`) | `AgentBuilder` |
+| `with_reasoning_effort(effort)` | Set reasoning effort for reasoning models | `AgentBuilder` |
+| `with_circuit_breaker(max_failures, cooldown_secs)` | Configure the circuit breaker (matches JS `circuitBreaker`) | `AgentBuilder` |
+| `with_rate_limit(capacity, window_secs, max_retries)` | Configure the rate limiter (matches JS `rateLimit`) | `AgentBuilder` |
+| `with_config(config)` | Apply a config mapping in one call (matches JS `withConfig`) | `AgentBuilder` |
 | `with_tools(*tools)` | Register tools | `AgentBuilder` |
 | `register(*tools)` | Alias for `with_tools` | `AgentBuilder` |
 | `with_resilience(...)` | Configure circuit breaker + rate limiter | `AgentBuilder` |
@@ -153,6 +158,7 @@ High-level agent wrapper with fluent API. Created via `BrainOS.agent()` or `Agen
 | `chat(message)` | Alias for `ask` | `str` |
 | `react(task)` | Run with ReAct reasoning | `str` |
 | `stream(task)` | Stream response tokens | `AsyncIterator` |
+| `reset_metrics()` | Reset the collected performance metrics | `Agent` |
 
 #### Properties
 
@@ -160,7 +166,10 @@ High-level agent wrapper with fluent API. Created via `BrainOS.agent()` or `Agen
 |----------|------|-------------|
 | `session` | `SessionManager` | Session management |
 | `tools` | `list[str]` | Registered tool names |
+| `tool_names` | `list[str]` | Alias for `tools` (matches JS `toolNames`) |
 | `config` | `dict` | Agent configuration |
+| `is_running` | `bool` | Whether an agent call is in flight |
+| `metrics` | `dict` | Performance metrics collected across LLM calls |
 
 #### Example
 
@@ -191,10 +200,14 @@ Session management for an agent.
 | `save_full(path)` | Save full session | `SessionManager` |
 | `restore_full(path)` | Restore full session | `SessionManager` |
 | `compact(keep_recent, max_summary_chars)` | Compact conversation | `SessionManager` |
-| `clear()` | Clear session context | `SessionManager` |
+| `clear()` | Drop every non-system message and reset the context | `SessionManager` |
 | `get_messages()` | Get all messages | `list[dict]` |
 | `add_message(role, content)` | Add a message | `SessionManager` |
-| `export()` | Export session state | `dict` |
+| `export()` | Export the session snapshot | `dict` |
+| `export_json()` | Export the session snapshot as a JSON string | `str` |
+| `import_session(data)` | Import a snapshot dict or JSON string | `SessionManager` |
+| `set_context(context)` | Replace the opaque session context | `SessionManager` |
+| `clear_context()` | Reset the session context to null | `SessionManager` |
 
 #### Properties
 
@@ -282,10 +295,14 @@ Registry for managing multiple tools.
 | `add(tool)` | Add a tool | `ToolRegistry` |
 | `register(tool)` | Alias for `add` | `ToolRegistry` |
 | `remove(name)` | Remove a tool | `ToolRegistry` |
+| `unregister(name)` | Alias for `remove` | `ToolRegistry` |
 | `get(name)` | Get tool by name | `ToolDef \| None` |
 | `has(name)` | Check if tool exists | `bool` |
 | `list()` | List tool names | `list[str]` |
 | `list_tools()` | List tool definitions | `list[ToolDef]` |
+| `list_tool_defs()` | Alias for `list_tools` | `list[ToolDef]` |
+| `list_by_category(category)` | Tools whose category attribute matches | `list[ToolDef]` |
+| `filter(predicate)` | New registry with tools the predicate accepts | `ToolRegistry` |
 | `size()` | Count tools | `int` |
 | `clear()` | Clear all tools | `ToolRegistry` |
 | `merge(other)` | Merge another registry | `ToolRegistry` |

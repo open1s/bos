@@ -32,9 +32,10 @@ jobs:
       - name: Install dependencies
         run: yarn install --no-immutable
 
-      # Both guards read the binding sources statically, so they need no Rust
-      # toolchain and no native addon. Running them on every pull request keeps
-      # the Python and JavaScript surfaces from drifting before merge; the
-      # heavier jsbos pipeline only runs on pushes to main.
+      # All three guards read the binding sources and the API reference
+      # statically, so they need no Rust toolchain and no native addon. Running
+      # them on every pull request keeps the Python and JavaScript surfaces from
+      # drifting before merge; the heavier jsbos pipeline only runs on pushes to
+      # main.
       - name: Run the static binding guards
-        run: npx ava test/parity.test.js test/native-bindings.test.js
+        run: npx ava test/parity.test.js test/native-bindings.test.js test/api-docs.test.js

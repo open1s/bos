@@ -85,6 +85,8 @@ new AgentBuilder(bus, options = {})
 | `timeout(secs)` | Set timeout | `AgentBuilder` |
 | `maxTokens(tokens)` | Set max tokens | `AgentBuilder` |
 | `withConfig(config)` | Apply config object | `AgentBuilder` |
+| `apiMode(mode)` | Set the API mode (`chat` or `responses`) | `AgentBuilder` |
+| `reasoningEffort(effort)` | Set reasoning effort for reasoning models | `AgentBuilder` |
 | `tools(...tools)` / `register(...tools)` / `withTools(...tools)` | Register tools | `AgentBuilder` |
 | `bash(name, workspaceRoot)` | Add bash tool | `AgentBuilder` |
 | `circuitBreaker(maxFailures, cooldownSecs)` | Configure circuit breaker | `AgentBuilder` |
@@ -117,7 +119,10 @@ new AgentBuilder(bus, options = {})
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `session` | `SessionManager` | Session management |
+| `session` | `SessionManager` | Session management (only after `start()`) |
+| `config` | `object` | Resolved config, or the pending builder config before `start()` |
+| `toolNames` | `string[]` | Registered tool names, before or after `start()` |
+| `metrics` | `object \| null` | Performance metrics, or `null` before `start()` |
 
 #### Example
 
@@ -151,6 +156,8 @@ High-level agent wrapper. Created via `AgentBuilder.start()`.
 | `stop(options)` | Stop the agent | `object` |
 | `isRunning()` | Check if running | `boolean` |
 | `listMcpTools()` | List MCP tools | `Promise<Array>` |
+| `listMcpResources(namespace)` | List MCP resources, optionally scoped to one namespace | `Promise<Array>` |
+| `listMcpPrompts()` | List MCP prompts | `Promise<Array>` |
 | `resetMetrics()` | Reset performance metrics | `void` |
 
 #### Properties
@@ -178,11 +185,21 @@ Session management for an agent.
 | `saveFull(path)` | Save full session | `Promise<SessionManager>` |
 | `restoreFull(path)` | Restore full session | `Promise<SessionManager>` |
 | `compact(keepRecent, maxSummaryChars)` | Compact conversation | `SessionManager` |
-| `clear()` | Clear session | `SessionManager` |
+| `clear()` | Drop every non-system message and reset the context | `SessionManager` |
 | `getMessages()` | Get all messages | `Array` |
 | `addMessage(role, content)` | Add a message | `SessionManager` |
-| `export()` | Export session state | `string` (JSON) |
-| `import(json)` | Import session state | `SessionManager` |
+| `export()` | Export the session snapshot | `object` |
+| `exportJson()` | Export the session snapshot as a JSON string | `string` |
+| `importSession(data)` | Import a snapshot object or JSON string | `SessionManager` |
+| `import(data)` | Alias for `importSession` (back-compat) | `SessionManager` |
+| `setContext(context)` | Replace the opaque session context | `SessionManager` |
+| `clearContext()` | Reset the session context to null | `SessionManager` |
+
+#### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `context` | `object \| null` | The session context (`null` until set) |
 
 ---
 
@@ -297,6 +314,14 @@ const result = ToolResult.success(data, { key: 'value' });
 const result = ToolResult.error('Something went wrong');
 ```
 
+#### Static Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `ToolResult.success(data, metadata)` | Build a successful result | `ToolResult` |
+| `ToolResult.error(message, metadata)` | Build a failed result | `ToolResult` |
+| `ToolResult.fromResult(result)` | Rebuild from a native result object | `ToolResult` |
+
 ---
 
 ## BaseTool / FunctionTool
@@ -320,6 +345,17 @@ class MyTool extends BaseTool {
   }
 }
 ```
+
+#### Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `execute(args)` | Run the tool; subclasses must override | `Promise<ToolResult>` |
+| `validate(args)` | Accept non-null arguments; override for real checks | `boolean` |
+| `success(data, metadata)` | Build a successful result tagged with the tool name | `ToolResult` |
+| `failure(error, metadata)` | Build a failed result tagged with the tool name | `ToolResult` |
+| `toToolDef()` | Convert to a `ToolDef` bound to `execute` | `ToolDef` |
+| `BaseTool.fromFunction(fn, name, description, schema)` | Build a `FunctionTool` from a plain function | `FunctionTool` |
 
 #### FunctionTool
 
@@ -380,6 +416,7 @@ Options:
 | Property | Type | Description |
 |----------|------|-------------|
 | `bus` | `Bus` | The native Bus instance |
+| `sessionId` | `string` | Session id shared by this bus's primitives |
 
 ---
 
@@ -389,9 +426,11 @@ Options:
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `publish(payload, isJson)` | Publish message | `Promise<void>` |
-| `text(payload)` | Publish text | `Promise<void>` |
-| `json(data)` | Publish JSON | `Promise<void>` |
+| `publish(payload, isJson)` | Publish text, or JSON when `isJson` is true | `Promise<void>` |
+| `publishText(payload)` | Publish a UTF-8 text payload | `Promise<void>` |
+| `publishJson(data)` | Serialize `data` as JSON and publish it | `Promise<void>` |
+| `text(payload)` | Deprecated alias for `publishText` | `Promise<void>` |
+| `json(data)` | Deprecated alias for `publishJson` | `Promise<void>` |
 
 #### Properties
 
