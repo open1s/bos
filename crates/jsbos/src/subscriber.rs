@@ -11,6 +11,7 @@ use crate::jsany::JSAny;
 pub struct Subscriber {
   pub(crate) inner: Arc<tokio::sync::Mutex<bus::Subscriber<String>>>,
   pub(crate) running: Arc<AtomicBool>,
+  pub(crate) topic: String,
 }
 
 #[napi]
@@ -18,15 +19,18 @@ impl Subscriber {
   #[napi(factory)]
   /// Create a subscriber for `topic`.
   pub async fn new(topic: String) -> Result<Self> {
+    let stored = topic.clone();
     Ok(Subscriber {
       inner: Arc::new(tokio::sync::Mutex::new(bus::Subscriber::new(topic))),
       running: Arc::new(AtomicBool::new(false)),
+      topic: stored,
     })
   }
 
   #[napi(factory)]
   /// Create a subscriber bound to `session`.
   pub async fn with_session(topic: String, session: &External<bus::Session>) -> Result<Self> {
+    let stored = topic.clone();
     let sub = bus::Subscriber::<String>::new(topic)
       .with_session(Arc::new((**session).clone()))
       .await
@@ -34,13 +38,14 @@ impl Subscriber {
     Ok(Subscriber {
       inner: Arc::new(tokio::sync::Mutex::new(sub)),
       running: Arc::new(AtomicBool::new(false)),
+      topic: stored,
     })
   }
 
   #[napi(getter)]
   /// The subscribed topic.
   pub fn topic(&self) -> String {
-    self.inner.blocking_lock().topic().to_string()
+    self.topic.clone()
   }
 
   #[napi]

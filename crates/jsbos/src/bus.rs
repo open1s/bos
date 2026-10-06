@@ -137,6 +137,7 @@ impl Bus {
       let guard = self.inner.lock().await;
       guard.session().clone()
     };
+    let stored = topic.clone();
     let sub_inner = bus::Subscriber::<String>::new(topic)
       .with_session(session)
       .await
@@ -144,6 +145,7 @@ impl Bus {
     Ok(crate::Subscriber {
       inner: std::sync::Arc::new(tokio::sync::Mutex::new(sub_inner)),
       running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+      topic: stored,
     })
   }
 
