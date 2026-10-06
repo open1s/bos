@@ -827,8 +827,11 @@ memory.save('./agent-memory.jsonl');
 const restored = Memory.load('./agent-memory.jsonl');
 ```
 
-`search(query, limit)` returns the best matches, `all`/`remove`/`clear`
-manage the store, and a blank query returns the most recent items.
+`search(query, limit, metadata)` returns the best matches, where `metadata`
+keeps only items whose keys match exactly. `all`/`remove`/`clear` manage
+the store, and a blank query returns the most recent items. A
+`new Memory(maxItems)` (or `withMaxItems(n)`) cap evicts the oldest
+items on overflow.
 
 ## API Reference
 

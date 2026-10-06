@@ -1616,9 +1616,42 @@ function memoryTokens(text) {
     .filter(Boolean);
 }
 
+function memoryEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (a && b && typeof a === 'object') {
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    if (Array.isArray(a)) {
+      return a.length === b.length && a.every((v, i) => memoryEqual(v, b[i]));
+    }
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length
+      && keys.every((key) => key in b && memoryEqual(a[key], b[key]));
+  }
+  return false;
+}
+
+function memoryMatches(item, metadata) {
+  if (!metadata) return true;
+  if (item.metadata === null || typeof item.metadata !== 'object') return false;
+  return Object.entries(metadata).every(
+    ([key, value]) => key in item.metadata && memoryEqual(item.metadata[key], value),
+  );
+}
+
 class Memory {
-  constructor() {
+  constructor(maxItems = null) {
     this._items = [];
+    this._maxItems = maxItems;
+  }
+
+  withMaxItems(maxItems) {
+    this._maxItems = maxItems;
+    return this;
+  }
+
+  get maxItems() {
+    return this._maxItems;
   }
 
   add(content, metadata = null) {
@@ -1629,6 +1662,9 @@ class Memory {
       created_at_ms: Date.now(),
     };
     this._items.push(item);
+    if (this._maxItems !== null && this._items.length > this._maxItems) {
+      this._items.splice(0, this._items.length - this._maxItems);
+    }
     return { ...item };
   }
 
@@ -1636,14 +1672,15 @@ class Memory {
     return this._items.map((item) => ({ ...item }));
   }
 
-  search(query, limit = 5) {
+  search(query, limit = 5, metadata = null) {
+    const candidates = this._items.filter((item) => memoryMatches(item, metadata));
     if (limit <= 0) return [];
     const tokens = memoryTokens(query);
     if (tokens.length === 0) {
-      return [...this._items].reverse().slice(0, limit).map((item) => ({ ...item }));
+      return [...candidates].reverse().slice(0, limit).map((item) => ({ ...item }));
     }
     const scored = [];
-    for (const item of this._items) {
+    for (const item of candidates) {
       const contentTokens = new Set(memoryTokens(item.content));
       let score = 0;
       for (const token of tokens) if (contentTokens.has(token)) score += 1;

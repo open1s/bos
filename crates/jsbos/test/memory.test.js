@@ -126,3 +126,27 @@ test('recallLimit bounds injection', async (t) => {
   await builder.ask('rust')
   t.is((seen[0][0].text.match(/\n- /g) || []).length, 1)
 })
+
+test('search filters by metadata', (t) => {
+  const memory = new Memory()
+  memory.add('deploy to staging', { env: 'staging' })
+  memory.add('deploy to prod', { env: 'prod' })
+  memory.add('deploy notes')
+  t.deepEqual(
+    memory.search('deploy', 5, { env: 'staging' }).map((h) => h.content),
+    ['deploy to staging'],
+  )
+  t.is(memory.search('deploy', 5).length, 3)
+})
+
+test('maxItems evicts the oldest', (t) => {
+  const memory = new Memory(2)
+  t.is(memory.maxItems, 2)
+  memory.add('first')
+  memory.add('second')
+  memory.add('third')
+  t.deepEqual(memory.all().map((i) => i.content), ['second', 'third'])
+  t.is(memory.withMaxItems(1), memory)
+  memory.add('fourth')
+  t.deepEqual(memory.all().map((i) => i.content), ['fourth'])
+})

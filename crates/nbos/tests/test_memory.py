@@ -159,3 +159,32 @@ def test_recall_limit_bounds_injection():
     agent = Agent(inner, ToolRegistry(), memory, recall_limit=1)
     asyncio.run(agent.ask("rust"))
     assert inner.seen[0].count("\n- ") == 1
+
+
+def test_search_filters_by_metadata():
+    memory = Memory()
+    memory.add("deploy to staging", {"env": "staging"})
+    memory.add("deploy to prod", {"env": "prod"})
+    memory.add("deploy notes")
+    hits = memory.search("deploy", 5, {"env": "staging"})
+    assert [h["content"] for h in hits] == ["deploy to staging"]
+    assert len(memory.search("deploy", 5)) == 3
+
+
+def test_metadata_filter_is_type_strict():
+    memory = Memory()
+    memory.add("counted", {"n": 1})
+    assert memory.search("counted", 5, {"n": 1})
+    assert not memory.search("counted", 5, {"n": "1"})
+
+
+def test_max_items_evicts_the_oldest():
+    memory = Memory(max_items=2)
+    assert memory.max_items == 2
+    memory.add("first")
+    memory.add("second")
+    memory.add("third")
+    assert [i["content"] for i in memory.all()] == ["second", "third"]
+    assert memory.with_max_items(1) is memory
+    memory.add("fourth")
+    assert [i["content"] for i in memory.all()] == ["fourth"]

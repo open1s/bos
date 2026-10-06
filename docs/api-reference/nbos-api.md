@@ -850,7 +850,9 @@ into a prompt.
 | `Memory()` | Create an empty store |
 | `memory.add(content, metadata=None)` | Store text and return the item dict |
 | `memory.all()` | Every item, oldest first |
-| `memory.search(query, limit=5)` | Up to `limit` relevant items, best first; a blank query returns the most recent |
+| `memory.search(query, limit=5, metadata=None)` | Up to `limit` relevant items, best first; `metadata` keeps exact key/value matches, a blank query returns the most recent |
+| `memory.with_max_items(max_items)` | Cap the store, evicting the oldest items on overflow |
+| `memory.max_items` | The configured cap, or `None` |
 | `memory.remove(id)` | Remove by id, returning whether it existed |
 | `memory.clear()` | Remove every item |
 | `memory.len()` | Number of stored items |

@@ -22,11 +22,35 @@ def _tokenize(text: str) -> list[str]:
     return [t for t in re.split(r"[^\w]+", text.lower().replace("_", " ")) if t]
 
 
+def _metadata_matches(item: dict[str, Any], metadata: dict[str, Any] | None) -> bool:
+    """Whether ``item`` carries every ``metadata`` pair exactly."""
+    if not metadata:
+        return True
+    stored = item.get("metadata")
+    if not isinstance(stored, dict):
+        return False
+    return all(
+        key in stored and type(stored[key]) is type(value) and stored[key] == value
+        for key, value in metadata.items()
+    )
+
+
 class Memory:
     """A keyword-ranked, in-process memory store."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_items: int | None = None) -> None:
         self._items: list[dict[str, Any]] = []
+        self._max_items = max_items
+
+    def with_max_items(self, max_items: int) -> "Memory":
+        """Cap the store at ``max_items``, evicting the oldest on overflow."""
+        self._max_items = max_items
+        return self
+
+    @property
+    def max_items(self) -> int | None:
+        """The configured item cap, if any."""
+        return self._max_items
 
     def add(self, content: str, metadata: Any = None) -> dict[str, Any]:
         """Store ``content`` and return the stored item."""
@@ -37,21 +61,35 @@ class Memory:
             "created_at_ms": int(time.time() * 1000),
         }
         self._items.append(item)
+        if self._max_items is not None:
+            overflow = len(self._items) - self._max_items
+            if overflow > 0:
+                del self._items[:overflow]
         return dict(item)
 
     def all(self) -> list[dict[str, Any]]:
         """Return every item, oldest first."""
         return [dict(item) for item in self._items]
 
-    def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """Return up to ``limit`` items relevant to ``query``, best first."""
+    def search(
+        self,
+        query: str,
+        limit: int = 5,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return up to ``limit`` items relevant to ``query``, best first.
+
+        Pass ``metadata`` to keep only items whose metadata matches every
+        key/value pair exactly (types must match too).
+        """
+        candidates = [item for item in self._items if _metadata_matches(item, metadata)]
         if limit <= 0:
             return []
         tokens = _tokenize(str(query))
         if not tokens:
-            return [dict(item) for item in reversed(self._items)][:limit]
+            return [dict(item) for item in reversed(candidates)][:limit]
         scored: list[tuple[int, dict[str, Any]]] = []
-        for item in self._items:
+        for item in candidates:
             content_tokens = set(_tokenize(item["content"]))
             score = sum(1 for token in tokens if token in content_tokens)
             if score:

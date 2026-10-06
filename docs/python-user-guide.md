@@ -753,9 +753,11 @@ memory.save("./agent-memory.jsonl")
 restored = Memory.load("./agent-memory.jsonl")
 ```
 
-`search(query, limit)` returns the best matches, `all`/`remove`/`clear`
-manage the store, and a blank query returns the most recent items.
-Multimodal `Content` is passed through without recall.
+`search(query, limit, metadata)` returns the best matches, where `metadata`
+keeps only items whose keys match exactly. `all`/`remove`/`clear` manage
+the store, and a blank query returns the most recent items. A
+`Memory(max_items=N)` (or `with_max_items(N)`) cap evicts the oldest
+items on overflow. Multimodal `Content` is passed through without recall.
 
 ## API Reference
 

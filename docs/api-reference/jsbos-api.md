@@ -746,7 +746,9 @@ into a prompt.
 | `new Memory()` | Create an empty store |
 | `memory.add(content, metadata)` | Store text and return the item object |
 | `memory.all()` | Every item, oldest first |
-| `memory.search(query, limit)` | Up to `limit` relevant items, best first; a blank query returns the most recent |
+| `memory.search(query, limit, metadata)` | Up to `limit` relevant items, best first; `metadata` keeps exact key/value matches, a blank query returns the most recent |
+| `memory.withMaxItems(max_items)` | Cap the store, evicting the oldest items on overflow |
+| `memory.maxItems` | The configured cap, or `null` |
 | `memory.remove(id)` | Remove by id, returning whether it existed |
 | `memory.clear()` | Remove every item |
 | `memory.len()` | Number of stored items |
