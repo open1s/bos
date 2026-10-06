@@ -152,7 +152,7 @@ const result = await agent.ask('What is 2+2?');
 - Current green baselines:
   - Rust (excluding the binding crates): 379 passed, 0 failed, 8 ignored
   - Python (`cd crates/nbos && pytest -m "not llm"`): 194 passed, 4 deselected
-  - JS (`cd crates/jsbos && npx ava`): 34 tests; parity guard: 12 tests
+  - JS (`cd crates/jsbos && npx ava`): 37 tests (12 of them in the parity guard)
 
 ---
 
@@ -174,6 +174,10 @@ const result = await agent.ask('What is 2+2?');
   `publish_json`, `ask`/`ask_json`, `call`/`call_json`, `handle`/`start`/`run`/
   `run_json`, `recv`/`recv_json`. Python keeps the legacy `create_*`/`publish_*`
   names as deprecated aliases for backward compatibility; never remove them.
+  Two static guards in `crates/jsbos/test/` keep the surfaces honest:
+  `parity.test.js` compares the wrapper classes across languages, and
+  `native-bindings.test.js` checks that every wrapper call on a native object
+  resolves to a real member of the generated interface.
 - **Config**: Use `ConfigLoader.discover()` for auto-loading `~/.bos/conf/config.toml`
 - **Documentation**: Every crate carries `#![warn(missing_docs)]` at its root, so
   the workspace must stay at zero missing docs. Document new public items in the
