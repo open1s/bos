@@ -707,6 +707,19 @@ impl Agent {
   }
 
   #[napi]
+  /// Register a tool that calls a remote agent endpoint over the bus.
+  pub async fn add_remote_agent_tool(&self, tool_name: String, endpoint: String) -> Result<()> {
+    let session = self.bus_session.clone().ok_or_else(|| {
+      napi::Error::new(napi::Status::GenericFailure, "Agent not created with bus")
+    })?;
+    let mut guard = self.inner.write().await;
+    guard
+      .add_remote_agent_tool(tool_name, endpoint, session)
+      .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    Ok(())
+  }
+
+  #[napi]
   /// Build an RPC client for this agent.
   pub async fn rpc_client(
     &self,

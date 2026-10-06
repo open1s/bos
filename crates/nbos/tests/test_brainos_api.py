@@ -495,6 +495,17 @@ class TestAgentAccessors:
             assert agent.tool_names == ["add"]
 
     @pytest.mark.asyncio
+    async def test_agent_add_remote_agent_tool(self):
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = await brain.agent("accessor-test").start()
+            assert "remoteEcho" not in agent.tool_names
+            await agent._inner.add_remote_agent_tool(
+                "remoteEcho", "zenoh/remote_echo", brain._bus
+            )
+            assert "remoteEcho" in agent.tool_names
+
+    @pytest.mark.asyncio
     async def test_agent_metrics(self):
         from nbos import BrainOS
         async with BrainOS() as brain:

@@ -28,6 +28,7 @@ export declare class Agent {
   listMcpTools(): Promise<Array<any>>
   listMcpResources(namespace: string): Promise<Array<any>>
   listMcpPrompts(): Promise<Array<any>>
+  addRemoteAgentTool(toolName: string, endpoint: string): Promise<void>
   rpcClient(endpoint: string, bus: ExternalObject<Session>): Promise<AgentRpcClient>
   asCallableServer(endpoint: string, bus: ExternalObject<Session>): Promise<AgentCallableServer>
   stream(task: string | Array<JsContent>, callback: ((err: Error | null, arg: any) => any)): Promise<string>
