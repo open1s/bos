@@ -1413,12 +1413,14 @@ main().catch(console.error);
 | `saveFull(path)` | Save the full session (messages + context) to a file |
 | `restoreFull(path)` | Restore the full session from a file |
 | `compact(keepRecent?, maxSummaryChars?)` | Summarize older messages (defaults 10 / 2000) |
-| `clear()` | Clear the conversation |
+| `clear()` | Drop every non-system message and reset the context |
 | `export()` | Return the session snapshot as an object |
 | `exportJson()` | Return the session snapshot as a JSON string |
 | `importSession(data)` | Restore from a snapshot object or JSON string |
 | `import(data)` | Alias for `importSession` (back-compat) |
-| `context` | The session context object (read-only) |
+| `context` | The session context object (null until set) |
+| `setContext(context)` | Replace the opaque session context |
+| `clearContext()` | Reset the session context to null |
 
 The started agent also exposes `agent.config` (the resolved configuration) and `agent.toolNames` (registered tool names).
 

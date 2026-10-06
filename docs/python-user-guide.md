@@ -724,11 +724,13 @@ asyncio.run(main())
 | `add_message(role, content)` | Add message to conversation |
 | `get_messages()` | Get conversation messages |
 | `compact(keep_recent=10, max_summary_chars=2000)` | Compact long conversation logs |
-| `clear()` | Clear the conversation |
+| `clear()` | Drop every non-system message and reset the context |
 | `export()` | Return the session state as a dict |
 | `export_json()` | Return the session state as a JSON string |
 | `import_session(data)` | Restore from a snapshot dict or JSON string |
-| `context` | The session context object (read-only) |
+| `context` | The session context object (null until set) |
+| `set_context(context)` | Replace the opaque session context |
+| `clear_context()` | Reset the session context to null |
 
 ---
 
