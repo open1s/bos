@@ -7,7 +7,9 @@ use bus::Publisher;
 
 #[pyclass(name = "Publisher", skip_from_py_object)]
 #[derive(Clone)]
+/// Publishes messages to a topic.
 pub struct PyPublisher {
+    /// The underlying publisher.
     pub inner: Publisher,
 }
 

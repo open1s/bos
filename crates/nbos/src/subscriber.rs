@@ -8,8 +8,11 @@ use bus::Subscriber;
 
 #[pyclass(name = "Subscriber", skip_from_py_object)]
 #[derive(Clone)]
+/// Subscribes to a topic.
 pub struct PySubscriber {
+    /// The shared subscriber state.
     pub inner: Arc<tokio::sync::Mutex<Subscriber<String>>>,
+    /// The subscribed topic.
     // Cached so reading the topic never has to wait for a pending recv.
     pub topic: String,
 }

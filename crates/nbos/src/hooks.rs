@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 #[pyclass(name = "HookEvent", from_py_object)]
 #[derive(Clone)]
+/// An agent hook event.
 pub struct PyHookEvent {
+    /// The event name.
     pub value: String,
 }
 
@@ -76,6 +78,7 @@ impl From<InnerEvent> for PyHookEvent {
 
 #[pyclass(name = "HookDecision", from_py_object)]
 #[derive(Clone)]
+/// A hook decision returned to the engine.
 pub struct PyHookDecision(String, Option<String>);
 
 #[pymethods]
@@ -105,9 +108,12 @@ impl From<InnerDecision> for PyHookDecision {
 
 #[pyclass(name = "HookContext", from_py_object)]
 #[derive(Clone)]
+/// Context passed to a hook.
 pub struct PyHookContext {
+    /// Agent the hook is running for.
     #[pyo3(get, set)]
     pub agent_id: String,
+    /// Arbitrary string data for the hook.
     #[pyo3(get, set)]
     pub data: HashMap<String, String>,
 }
@@ -193,21 +199,25 @@ impl AgentHook for PythonHook {
 }
 
 #[pyclass(name = "HookRegistry", frozen, subclass)]
+/// Registry of agent hooks.
 pub struct PyHookRegistry {
     inner: Arc<InnerRegistry>,
 }
 
 impl PyHookRegistry {
+    /// Create an empty registry.
     pub fn create() -> Self {
         Self {
             inner: Arc::new(InnerRegistry::new()),
         }
     }
 
+    /// The shared inner registry.
     pub fn inner(&self) -> Arc<InnerRegistry> {
         self.inner.clone()
     }
 
+    /// Clone the underlying registry.
     pub fn to_hook_registry(&self) -> InnerRegistry {
         self.inner.as_ref().clone()
     }
@@ -220,6 +230,7 @@ impl PyHookRegistry {
         Self::create()
     }
 
+    /// Register `callback` for `event`.
     pub fn register(&self, event: PyHookEvent, callback: Py<PyAny>) {
         let event: InnerEvent = event.into();
         let hook = PythonHook {

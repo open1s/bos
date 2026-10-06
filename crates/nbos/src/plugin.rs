@@ -11,21 +11,30 @@ use std::sync::Arc;
 
 #[pyclass(name = "LlmRequestWrapper", from_py_object)]
 #[derive(Clone, Debug)]
+/// Mutable view of an outgoing LLM request.
 pub struct PyLlmRequestWrapper {
+    /// Model identifier.
     #[pyo3(get, set)]
     pub model: String,
+    /// Sampling temperature.
     #[pyo3(get, set)]
     pub temperature: Option<f32>,
+    /// Completion token cap.
     #[pyo3(get, set)]
     pub max_tokens: Option<u32>,
+    /// Nucleus sampling probability.
     #[pyo3(get, set)]
     pub top_p: Option<f32>,
+    /// Top-k sampling cutoff.
     #[pyo3(get, set)]
     pub top_k: Option<u32>,
+    /// Prompt input.
     #[pyo3(get, set)]
     pub input: String,
+    /// Reasoning effort, if any.
     #[pyo3(get, set)]
     pub reasoning_effort: Option<String>,
+    /// API protocol.
     #[pyo3(get, set)]
     pub api_mode: String,
 }
@@ -91,15 +100,21 @@ impl From<PyLlmRequestWrapper> for InnerLlmRequest {
 
 #[pyclass(name = "LlmResponseWrapper", from_py_object)]
 #[derive(Clone, Debug)]
+/// View of an LLM response.
 pub struct PyLlmResponseWrapper {
+    /// Response kind.
     #[pyo3(get, set)]
     pub response_type: String,
+    /// Text content, if any.
     #[pyo3(get, set)]
     pub content: Option<String>,
+    /// Tool name, if this is a tool call.
     #[pyo3(get, set)]
     pub tool_name: Option<String>,
+    /// Tool arguments, if this is a tool call.
     #[pyo3(get, set)]
     pub tool_args: Option<String>,
+    /// Tool call id, if any.
     #[pyo3(get, set)]
     pub tool_id: Option<String>,
 }
@@ -259,11 +274,15 @@ impl From<PyLlmResponseWrapper> for InnerLlmResponse {
 
 #[pyclass(name = "ToolCallWrapper", from_py_object)]
 #[derive(Clone, Debug)]
+/// View of a tool call.
 pub struct PyToolCallWrapper {
+    /// Tool name.
     #[pyo3(get, set)]
     pub name: String,
+    /// JSON-encoded arguments.
     #[pyo3(get, set)]
     pub args: String,
+    /// Provider call id.
     #[pyo3(get, set)]
     pub id: Option<String>,
 }
@@ -293,11 +312,15 @@ impl From<PyToolCallWrapper> for InnerToolCall {
 
 #[pyclass(name = "ToolResultWrapper", from_py_object)]
 #[derive(Clone, Debug)]
+/// View of a tool result.
 pub struct PyToolResultWrapper {
+    /// Serialized tool result.
     #[pyo3(get, set)]
     pub result: String,
+    /// Whether the call succeeded.
     #[pyo3(get, set)]
     pub success: bool,
+    /// Error message, if the call failed.
     #[pyo3(get, set)]
     pub error: Option<String>,
 }
@@ -446,7 +469,9 @@ impl InnerPlugin for PythonPlugin {
 }
 
 #[pyclass(name = "AgentPlugin", subclass)]
+/// Base class for Python agent plugins.
 pub struct PyAgentPlugin {
+    /// The wrapped plugin.
     pub inner: Arc<dyn InnerPlugin>,
 }
 
@@ -492,17 +517,20 @@ impl PyAgentPlugin {
 }
 
 #[pyclass(name = "PluginRegistry", frozen, subclass)]
+/// Registry of agent plugins.
 pub struct PyPluginRegistry {
     inner: Arc<InnerRegistry>,
 }
 
 impl PyPluginRegistry {
+    /// Create an empty registry.
     pub fn create() -> Self {
         Self {
             inner: Arc::new(InnerRegistry::new()),
         }
     }
 
+    /// The shared inner registry.
     pub fn inner(&self) -> Arc<InnerRegistry> {
         self.inner.clone()
     }

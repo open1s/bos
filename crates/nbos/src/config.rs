@@ -5,7 +5,9 @@ use crate::utils::{json_to_py, parse_merge_strategy, py_to_json, to_py_runtime_e
 use config::loader::ConfigLoader;
 
 #[pyclass(name = "ConfigLoader", skip_from_py_object)]
+/// Loads layered configuration.
 pub struct PyConfigLoader {
+    /// The underlying config loader.
     pub inner: Mutex<ConfigLoader>,
 }
 

@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 #[pyclass(name = "Caller", skip_from_py_object)]
 #[derive(Clone)]
+/// Issues request/response calls over the bus.
 pub struct PyCaller {
+    /// The underlying caller.
     pub inner: Arc<Caller>,
 }
 
@@ -50,7 +52,9 @@ impl PyCaller {
 
 #[pyclass(name = "Callable", skip_from_py_object)]
 #[derive(Clone)]
+/// Serves callable requests over the bus.
 pub struct PyCallable {
+    /// The shared callable state.
     pub inner: Arc<tokio::sync::Mutex<Callable<String, String>>>,
     // Mirrors the JS binding: a sync flag instead of an async probe, so the
     // Python wrapper can expose is_started as a plain property.

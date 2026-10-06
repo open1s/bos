@@ -417,41 +417,60 @@ impl AsyncTool for PyPythonToolWrapper {
 
 #[pyclass(name = "AgentConfig", skip_from_py_object)]
 #[derive(Clone)]
+/// Configuration for a Python agent.
 pub struct PyAgentConfig {
+    /// Agent name.
     #[pyo3(get, set)]
     pub name: String,
+    /// Model identifier.
     #[pyo3(get, set)]
     pub model: String,
+    /// LLM API base URL.
     #[pyo3(get, set)]
     pub base_url: String,
+    /// LLM API key.
     #[pyo3(get, set)]
     pub api_key: String,
+    /// System prompt.
     #[pyo3(get, set)]
     pub system_prompt: String,
+    /// Sampling temperature.
     #[pyo3(get, set)]
     pub temperature: f32,
+    /// Completion token cap.
     #[pyo3(get, set)]
     pub max_tokens: Option<u32>,
+    /// Per-request timeout in seconds.
     #[pyo3(get, set)]
     pub timeout_secs: u64,
+    /// Maximum ReAct steps.
     #[pyo3(get, set)]
     pub max_steps: usize,
+    /// API protocol.
     #[pyo3(get, set)]
     pub api_mode: String,
+    /// Reasoning effort, if any.
     #[pyo3(get, set)]
     pub reasoning_effort: Option<String>,
+    /// Circuit breaker failure threshold.
     #[pyo3(get, set)]
     pub circuit_breaker_max_failures: Option<usize>,
+    /// Circuit breaker cooldown in seconds.
     #[pyo3(get, set)]
     pub circuit_breaker_cooldown_secs: Option<u64>,
+    /// Rate limiter burst capacity.
     #[pyo3(get, set)]
     pub rate_limit_capacity: Option<u32>,
+    /// Rate limiter window in seconds.
     #[pyo3(get, set)]
     pub rate_limit_window_secs: Option<u64>,
+    /// Maximum retries when rate limited.
     #[pyo3(get, set)]
     pub rate_limit_max_retries: Option<u32>,
+    /// Retry backoff in seconds.
     #[pyo3(get, set)]
     pub rate_limit_retry_backoff_secs: Option<u64>,
+    /// Whether to wait automatically when rate limited.
     #[pyo3(get, set)]
     pub rate_limit_auto_wait: Option<bool>,
 }
@@ -597,7 +616,9 @@ impl PyAgentConfig {
 
 #[pyclass(name = "AgentRpcClient", skip_from_py_object)]
 #[derive(Clone)]
+/// Client for calling a remote agent.
 pub struct PyAgentRpcClient {
+    /// The underlying RPC client.
     pub inner: Arc<Mutex<AgentRpcClient>>,
 }
 
@@ -669,7 +690,9 @@ impl PyAgentRpcClient {
 
 #[pyclass(name = "AgentCallableServer", skip_from_py_object)]
 #[derive(Clone)]
+/// Serves calls for a Python agent.
 pub struct PyAgentCallableServer {
+    /// The underlying server.
     pub inner: Arc<Mutex<AgentCallableServer>>,
 }
 
@@ -694,7 +717,9 @@ impl PyAgentCallableServer {
 
 #[pyclass(name = "Agent", frozen, subclass, skip_from_py_object)]
 #[derive(Clone)]
+/// A Python-facing agent.
 pub struct PyAgent {
+    /// The underlying agent.
     pub inner: std::sync::Arc<Mutex<Agent>>,
     /// Stored MCP clients for restart/health_status operations
     pub mcp_clients: std::sync::Arc<Mutex<Vec<std::sync::Arc<agent::mcp::McpClient>>>>,

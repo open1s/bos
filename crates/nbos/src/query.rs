@@ -12,11 +12,13 @@ use tokio::sync::mpsc;
 /// Python-exposed sender for streaming query replies.
 /// Python handlers call `sender.send(chunk)` to push replies.
 #[pyclass(name = "StreamSender", skip_from_py_object)]
+/// Streams chunks back to Python while serving a query.
 pub struct PyStreamSender {
     inner: Option<tokio::sync::mpsc::Sender<Result<String, bus::ZenohError>>>,
 }
 
 impl PyStreamSender {
+    /// Create a stream sender over `tx`.
     pub fn new(tx: tokio::sync::mpsc::Sender<Result<String, bus::ZenohError>>) -> Self {
         Self { inner: Some(tx) }
     }
@@ -92,7 +94,9 @@ impl PyQueryStreamIterator {
 
 #[pyclass(name = "Query", skip_from_py_object)]
 #[derive(Clone)]
+/// Runs queries against a queryable.
 pub struct PyQuery {
+    /// The underlying query.
     pub inner: Query,
 }
 
@@ -182,7 +186,9 @@ impl PyQuery {
 
 #[pyclass(name = "Queryable", skip_from_py_object)]
 #[derive(Clone)]
+/// Serves queries over the bus.
 pub struct PyQueryable {
+    /// The shared queryable state.
     pub inner: Arc<tokio::sync::Mutex<QueryableWrapper<String, String>>>,
 }
 

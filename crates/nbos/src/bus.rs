@@ -6,13 +6,18 @@ use std::sync::Arc;
 
 #[pyclass(name = "BusConfig", skip_from_py_object)]
 #[derive(Clone)]
+/// Python-facing bus configuration.
 pub struct PyBusConfig {
+    /// Transport mode.
     #[pyo3(get, set)]
     pub mode: String,
+    /// Endpoints to connect to.
     #[pyo3(get, set)]
     pub connect: Option<Vec<String>>,
+    /// Endpoints to listen on.
     #[pyo3(get, set)]
     pub listen: Option<Vec<String>>,
+    /// Peer endpoint for peer mode.
     #[pyo3(get, set)]
     pub peer: Option<String>,
 }
@@ -83,7 +88,9 @@ impl PyBusConfig {
 
 #[pyclass(name = "Bus", skip_from_py_object)]
 #[derive(Clone)]
+/// A handle to the message bus.
 pub struct PyBus {
+    /// The shared bus instance.
     pub inner: Arc<tokio::sync::Mutex<Bus>>,
 }
 

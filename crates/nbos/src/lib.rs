@@ -1,6 +1,12 @@
+//! Python bindings for the bos agent framework.
+//!
+//! Wraps the `agent`, `react`, and `bus` crates as `pyo3` extension types so
+//! Python programs can build agents, publish and subscribe, serve queries, and
+//! attach hooks and plugins to the engine.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 #![allow(clippy::while_let_loop, clippy::redundant_pub_crate)]
 #![allow(clippy::needless_lifetimes, clippy::extra_unused_lifetimes)]
+#![warn(missing_docs)]
 
 use pyo3::prelude::*;
 
