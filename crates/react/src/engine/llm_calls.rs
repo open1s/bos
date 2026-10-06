@@ -1,19 +1,12 @@
 use super::*;
 
 impl<A: ReActApp> ReActEngine<A> {
-    /// Check if an error is transient (retryable).
+    /// Whether an LLM error is worth retrying.
+    ///
+    /// Delegates to [`LlmError::is_retryable`], which classifies by variant
+    /// and HTTP status rather than by matching on the debug text.
     fn is_transient_error(err: &LlmError) -> bool {
-        let err_str = format!("{:?}", err);
-        err_str.contains("429")
-            || err_str.contains("Too Many Requests")
-            || err_str.contains("rate limit")
-            || err_str.contains("timeout")
-            || err_str.contains("timed out")
-            || err_str.contains("connection refused")
-            || err_str.contains("service unavailable")
-            || err_str.contains("502")
-            || err_str.contains("503")
-            || err_str.contains("504")
+        err.is_retryable()
     }
 
     /// Call LLM with optional resilience wrapper and retry on transient errors.

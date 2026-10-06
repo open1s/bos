@@ -318,6 +318,57 @@ pub enum LlmError {
     Other(String),
 }
 
+impl LlmError {
+    /// Whether the error is worth retrying.
+    ///
+    /// Rate limits, timeouts, and server-side or connection failures are
+    /// transient; parse errors and missing credentials are not. HTTP
+    /// failures are classified by status code, so a 4xx response is never
+    /// retried even when its body mentions a retryable condition.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            LlmError::RateLimited | LlmError::Timeout => true,
+            LlmError::Http(message) | LlmError::Other(message) => retryable_message(message),
+            LlmError::Parse(_) | LlmError::ApiKeyMissing => false,
+        }
+    }
+}
+
+/// Fragments that mark a provider message as transient when it carries
+/// no HTTP status code.
+const RETRYABLE_FRAGMENTS: &[&str] = &[
+    "timed out",
+    "timeout",
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "temporarily unavailable",
+    "too many requests",
+    "rate limit",
+];
+
+/// Extract the status code from a provider message like `"HTTP 503: ..."`.
+fn http_status(message: &str) -> Option<u16> {
+    let rest = message.strip_prefix("HTTP ")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Whether a provider message describes a transient failure.
+fn retryable_message(message: &str) -> bool {
+    if let Some(status) = http_status(message) {
+        return matches!(status, 408 | 425 | 429) || (500..=599).contains(&status);
+    }
+    let lower = message.to_ascii_lowercase();
+    RETRYABLE_FRAGMENTS
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+}
+
 #[derive(Debug, Error, Clone)]
 /// Errors raised while building a vendor.
 pub enum VendorBuilderError {
