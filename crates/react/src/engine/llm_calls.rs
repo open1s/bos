@@ -92,10 +92,15 @@ impl<A: ReActApp> ReActEngine<A> {
                 return result.map_err(ReactError::from);
             }
 
-            // Exponential backoff: 500ms, 1s, 2s, 4s...
-            let delay_ms = 500 * (1 << (attempt - 1));
-            info!("[TIMING] call_llm retrying after {}ms delay", delay_ms);
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            // Exponential backoff from the configured base, capped at 64x.
+            let backoff = self
+                .resilience
+                .as_ref()
+                .map(|r| r.rate_limit_config().retry_backoff)
+                .unwrap_or(std::time::Duration::from_millis(500));
+            let delay = backoff * (1u32 << (attempt - 1)).min(6);
+            info!("[TIMING] call_llm retrying after {:?} delay", delay);
+            tokio::time::sleep(delay).await;
         }
     }
 

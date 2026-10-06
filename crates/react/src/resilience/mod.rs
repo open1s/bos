@@ -288,39 +288,37 @@ impl RateLimiter {
         }
     }
 
-    /// Try to acquire a slot. Returns Ok(()) if allowed, Err(RateLimited) if exhausted.
-    /// Automatically waits and retries if rate limited.
+    /// Try to acquire a slot.
+    ///
+    /// Returns `Err(RateLimited)` when the limiter is exhausted and either
+    /// `auto_wait` is disabled or `max_retries` attempts are used up. When
+    /// `auto_wait` is enabled each attempt sleeps until the window is due to
+    /// slide, using `retry_backoff` as the fallback wait.
     pub async fn acquire(&self) -> Result<(), ResilienceError<()>> {
-        let max_retries = 3;
-        let base_backoff = Duration::from_millis(500);
+        let attempts = self.config.max_retries.max(1);
 
-        for attempt in 0..max_retries {
-            let result = self.try_acquire();
-            if result.is_ok() {
+        for attempt in 0..attempts {
+            if self.try_acquire().is_ok() {
                 return Ok(());
             }
 
-            if attempt < max_retries - 1 {
-                let backoff = base_backoff * (1 << attempt).min(6);
-                let reset_at = self.reset_at();
-                let wait_time = if let Some(reset) = reset_at {
-                    let now = Instant::now();
-                    if reset > now {
-                        reset.duration_since(now)
-                    } else {
-                        backoff
-                    }
-                } else {
-                    backoff
-                };
-                log::info!(
-                    "[RateLimiter] Waiting {:?} for rate limit reset (attempt {}/{})",
-                    wait_time,
-                    attempt + 1,
-                    max_retries
-                );
-                tokio::time::sleep(wait_time).await;
+            if !self.config.auto_wait || attempt + 1 == attempts {
+                break;
             }
+
+            let backoff = self.config.retry_backoff * (1u32 << attempt).min(6);
+            let wait_time = self
+                .reset_at()
+                .map(|reset| reset.saturating_duration_since(Instant::now()))
+                .filter(|wait| !wait.is_zero())
+                .unwrap_or(backoff);
+            log::info!(
+                "[RateLimiter] Waiting {:?} for rate limit reset (attempt {}/{})",
+                wait_time,
+                attempt + 1,
+                attempts
+            );
+            tokio::time::sleep(wait_time).await;
         }
 
         Err(ResilienceError::RateLimited)
@@ -474,7 +472,7 @@ impl ReActResilience {
         C: Fn(&E) -> bool,
     {
         let max_retries = self.rate_limit_config.max_retries;
-        let base_backoff = Duration::from_millis(500);
+        let base_backoff = self.rate_limit_config.retry_backoff;
 
         for attempt in 0..=max_retries {
             // Rate limit check - use acquire() to wait when about to exceed
@@ -699,9 +697,9 @@ mod tests {
         let config = ResilienceConfig {
             rate_limiter: RateLimiterConfig {
                 capacity: 1,
-                window: Duration::from_secs(1),
+                window: Duration::from_millis(5),
                 max_retries: 3,
-                retry_backoff: Duration::from_secs(1),
+                retry_backoff: Duration::from_millis(10),
                 auto_wait: false,
             },
             ..Default::default()
@@ -728,6 +726,36 @@ mod tests {
         // Should always succeed (no checks)
         let result = resilience.execute(|| async { Ok::<_, ()>(100) }).await;
         assert_eq!(result.unwrap(), 100);
+    }
+
+    #[tokio::test]
+    async fn acquire_fails_fast_without_auto_wait() {
+        let limiter = RateLimiter::new(RateLimiterConfig {
+            capacity: 1,
+            window: Duration::from_secs(60),
+            max_retries: 3,
+            retry_backoff: Duration::from_millis(10),
+            auto_wait: false,
+        });
+
+        assert!(limiter.acquire().await.is_ok());
+        let start = Instant::now();
+        assert!(limiter.acquire().await.is_err());
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn acquire_waits_when_auto_wait_is_enabled() {
+        let limiter = RateLimiter::new(RateLimiterConfig {
+            capacity: 1,
+            window: Duration::from_millis(30),
+            max_retries: 3,
+            retry_backoff: Duration::from_millis(5),
+            auto_wait: true,
+        });
+
+        assert!(limiter.acquire().await.is_ok());
+        assert!(limiter.acquire().await.is_ok());
     }
 
     #[tokio::test]
