@@ -42,6 +42,16 @@ class TestBus:
         assert bus is not None
 
     @pytest.mark.asyncio
+    async def test_bus_session_id(self):
+        """Session id is a stable per-bus identifier"""
+        first = await Bus.create(BusConfig())
+        second = await Bus.create(BusConfig())
+        assert isinstance(first.session_id(), str)
+        assert first.session_id()
+        assert first.session_id() == first.session_id()
+        assert first.session_id() != second.session_id()
+
+    @pytest.mark.asyncio
     async def test_bus_publish_text(self):
         """Test publishing text to bus"""
         config = BusConfig()

@@ -66,6 +66,7 @@ impl From<BusConfig> for bus::BusConfig {
 /// A handle to the message bus.
 pub struct Bus {
   inner: Arc<tokio::sync::Mutex<bus::Bus>>,
+  session_id: String,
 }
 
 #[napi]
@@ -75,9 +76,11 @@ impl Bus {
   pub async fn create(config: Option<BusConfig>) -> Result<Bus> {
     let cfg: BusConfig = config.unwrap_or_default();
     let bus = bus::Bus::from(cfg.into()).await;
+    let session_id = bus.session().zid().to_string();
 
     Ok(Bus {
       inner: Arc::new(tokio::sync::Mutex::new(bus)),
+      session_id,
     })
   }
 
@@ -91,7 +94,7 @@ impl Bus {
   #[napi]
   /// Return the session identifier.
   pub fn session_id(&self) -> String {
-    "session".to_string()
+    self.session_id.clone()
   }
 
   #[napi]

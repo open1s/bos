@@ -26,10 +26,15 @@ async function newBus(t) {
   return bus
 }
 
-test.serial('bus exposes a session id', async (t) => {
+test.serial('bus exposes a stable per-bus session id', async (t) => {
   const bus = await newBus(t)
-  t.is(typeof bus.sessionId(), 'string')
-  t.true(bus.sessionId().length > 0)
+  const id = bus.sessionId()
+  t.is(typeof id, 'string')
+  t.true(id.length > 0)
+  t.is(bus.sessionId(), id)
+
+  const other = await newBus(t)
+  t.not(other.sessionId(), id)
 })
 
 // Publishing to sub.topic is deliberate: the getter must not block on the

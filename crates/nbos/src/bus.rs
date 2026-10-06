@@ -92,6 +92,8 @@ impl PyBusConfig {
 pub struct PyBus {
     /// The shared bus instance.
     pub inner: Arc<tokio::sync::Mutex<Bus>>,
+    /// The unique identifier of the underlying session.
+    pub session_id: String,
 }
 
 impl Drop for PyBus {
@@ -122,16 +124,22 @@ impl PyBus {
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
             let bus = Bus::from(cfg).await;
+            let session_id = bus.session().zid().to_string();
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let py_bus = Py::new(
                     py,
                     PyBus {
                         inner: Arc::new(tokio::sync::Mutex::new(bus)),
+                        session_id,
                     },
                 )?;
                 Ok(py_bus.into_any())
             })
         })
+    }
+
+    fn session_id(&self) -> String {
+        self.session_id.clone()
     }
 
     fn publish_text<'py>(
