@@ -171,7 +171,7 @@ High-level agent wrapper with fluent API. Created via `BrainOS.agent()` or `Agen
 | `tool_names` | `list[str]` | Alias for `tools` (matches JS `toolNames`) |
 | `config` | `dict` | Agent configuration |
 | `is_running` | `bool` | Whether an agent call is in flight |
-| `metrics` | `dict` | Performance metrics collected across LLM calls |
+| `metrics` | `dict` | Performance metrics across LLM calls, incl. `min_wall_time_us`/`max_wall_time_us` |
 
 #### Example
 

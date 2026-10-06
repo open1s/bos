@@ -1200,6 +1200,8 @@ impl PyAgent {
             "llm_call_count": llm_call_count,
             "total_wall_time_us": total_wall_time_us,
             "avg_wall_time_us": if llm_call_count > 0 { total_wall_time_us / llm_call_count } else { 0 },
+            "min_wall_time_us": cm.min_wall_time.as_micros() as i64,
+            "max_wall_time_us": cm.max_wall_time.as_micros() as i64,
             "total_engine_time_us": cm.total_engine_time.as_micros() as i64,
             "total_resilience_time_us": cm.total_resilience_time.as_micros() as i64,
             "rate_limit_waits": cm.rate_limit_waits as i64,

@@ -50,16 +50,6 @@ pub async fn await_python_coroutine(coroutine: Py<PyAny>) -> PyResult<Py<PyAny>>
     .map_err(|e: tokio::task::JoinError| PyRuntimeError::new_err(e.to_string()))?
 }
 
-/// Check if a Python object is a coroutine (awaitable).
-#[allow(dead_code)]
-pub fn is_coroutine(obj: &Py<PyAny>) -> bool {
-    Python::attach(|py| {
-        let bound = obj.bind(py);
-        // Check for __await__ attribute (coroutine protocol)
-        bound.hasattr("__await__").unwrap_or(false)
-    })
-}
-
 pub async fn invoke_python_handler_to_pyany(
     callback: &Py<PyAny>,
     arg: Py<PyAny>,

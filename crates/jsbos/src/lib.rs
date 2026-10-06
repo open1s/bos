@@ -26,7 +26,6 @@ mod plugin;
 mod publisher;
 mod query;
 mod subscriber;
-mod utils;
 
 pub use agent::{Agent, AgentCallableServer, AgentConfig, AgentRpcClient};
 pub use bus::{Bus, BusConfig, Session};

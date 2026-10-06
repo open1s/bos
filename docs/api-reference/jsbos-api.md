@@ -123,7 +123,7 @@ new AgentBuilder(bus, options = {})
 | `session` | `SessionManager` | Session management (only after `start()`) |
 | `config` | `object` | Resolved config, or the pending builder config before `start()` |
 | `toolNames` | `string[]` | Registered tool names, before or after `start()` |
-| `metrics` | `object \| null` | Performance metrics, or `null` before `start()` |
+| `metrics` | `object \| null` | Performance metrics (incl. `minWallTimeUs`/`maxWallTimeUs`), or `null` before `start()` |
 
 #### Example
 

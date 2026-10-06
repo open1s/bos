@@ -10,6 +10,10 @@ pub struct CallMetrics {
     pub llm_call_count: u64,
     /// Total wall-clock time spent in LLM calls.
     pub total_wall_time: Duration,
+    /// Shortest wall-clock time of a single LLM call.
+    pub min_wall_time: Duration,
+    /// Longest wall-clock time of a single LLM call.
+    pub max_wall_time: Duration,
     /// Time spent inside the ReAct engine.
     pub total_engine_time: Duration,
     /// Time spent waiting on retries and backoff.
@@ -56,6 +60,12 @@ impl MetricsCollector {
         output_tokens: u64,
     ) {
         let mut m = self.inner.lock().unwrap();
+        if m.llm_call_count == 0 || wall_time < m.min_wall_time {
+            m.min_wall_time = wall_time;
+        }
+        if wall_time > m.max_wall_time {
+            m.max_wall_time = wall_time;
+        }
         m.llm_call_count += 1;
         m.total_wall_time += wall_time;
         m.total_engine_time += engine_time;
@@ -119,5 +129,60 @@ impl MetricsCollector {
 impl Default for MetricsCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_call_tracks_min_and_max_wall_time() {
+        let collector = MetricsCollector::new();
+        collector.record_call(
+            Duration::from_millis(300),
+            Duration::ZERO,
+            Duration::ZERO,
+            1,
+            1,
+        );
+        collector.record_call(
+            Duration::from_millis(100),
+            Duration::ZERO,
+            Duration::ZERO,
+            1,
+            1,
+        );
+        collector.record_call(
+            Duration::from_millis(200),
+            Duration::ZERO,
+            Duration::ZERO,
+            1,
+            1,
+        );
+
+        let metrics = collector.snapshot();
+        assert_eq!(metrics.llm_call_count, 3);
+        assert_eq!(metrics.total_wall_time, Duration::from_millis(600));
+        assert_eq!(metrics.min_wall_time, Duration::from_millis(100));
+        assert_eq!(metrics.max_wall_time, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn reset_clears_min_and_max_wall_time() {
+        let collector = MetricsCollector::new();
+        collector.record_call(
+            Duration::from_millis(250),
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+        );
+        collector.reset();
+
+        let metrics = collector.snapshot();
+        assert_eq!(metrics.min_wall_time, Duration::ZERO);
+        assert_eq!(metrics.max_wall_time, Duration::ZERO);
+        assert_eq!(metrics.llm_call_count, 0);
     }
 }

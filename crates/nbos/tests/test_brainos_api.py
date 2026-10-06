@@ -534,6 +534,8 @@ class TestAgentAccessors:
             metrics = agent.metrics
             assert metrics["llm_call_count"] == 0
             assert "total_wall_time_us" in metrics
+            assert metrics["min_wall_time_us"] == 0
+            assert metrics["max_wall_time_us"] == 0
             assert agent.reset_metrics() is agent
 
     @pytest.mark.asyncio

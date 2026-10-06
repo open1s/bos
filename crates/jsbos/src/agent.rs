@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::RwLock;
 
-use crate::hooks::{HookContextData, HookEvent, HookRegistry};
+use crate::hooks::{HookContextData, HookEvent};
 use crate::jsany::JSAny;
 use agent::BashTool;
 use react::llm::{Content, ContentPart};
@@ -305,9 +305,6 @@ impl From<AgentConfig> for agent::AgentConfig {
 pub struct Agent {
   inner: Arc<RwLock<agent::Agent>>,
   bus_session: Option<Arc<crate::Session>>,
-  #[allow(dead_code)]
-  hooks: std::sync::Arc<std::sync::Mutex<HookRegistry>>,
-  perf: std::sync::Arc<crate::perf::PerformanceMetrics>,
   stop_flag: std::sync::Arc<AtomicBool>,
   is_running: std::sync::Arc<AtomicBool>,
 }
@@ -319,7 +316,6 @@ impl Agent {
   pub async fn create(config: AgentConfig) -> Result<Self> {
     let mut cfg: agent::AgentConfig = config.into();
     agent::agent::config::apply_model_defaults(&mut cfg);
-    let js_hooks = HookRegistry::new();
 
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
 
@@ -331,8 +327,7 @@ impl Agent {
     Ok(Agent {
       inner: Arc::new(RwLock::new(agent)),
       bus_session: None,
-      hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
-      perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
+
       stop_flag: std::sync::Arc::new(AtomicBool::new(false)),
       is_running: std::sync::Arc::new(AtomicBool::new(false)),
     })
@@ -346,7 +341,6 @@ impl Agent {
   ) -> Result<Self> {
     let mut cfg: agent::AgentConfig = config.into();
     agent::agent::config::apply_model_defaults(&mut cfg);
-    let js_hooks = HookRegistry::new();
 
     let mut llm_provider = agent::agent::agentic::LlmProvider::new();
 
@@ -360,8 +354,7 @@ impl Agent {
     Ok(Agent {
       inner: Arc::new(RwLock::new(agent)),
       bus_session: Some(_bus.as_ref().clone()),
-      hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
-      perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
+
       stop_flag: std::sync::Arc::new(AtomicBool::new(false)),
       is_running: std::sync::Arc::new(AtomicBool::new(false)),
     })
@@ -1034,8 +1027,8 @@ impl Agent {
       } else {
         0
       },
-      min_wall_time_us: 0,
-      max_wall_time_us: 0,
+      min_wall_time_us: cm.min_wall_time.as_micros() as i64,
+      max_wall_time_us: cm.max_wall_time.as_micros() as i64,
       total_engine_time_us: cm.total_engine_time.as_micros() as i64,
       total_resilience_time_us: cm.total_resilience_time.as_micros() as i64,
       rate_limit_waits: cm.rate_limit_waits as i64,
@@ -1054,7 +1047,6 @@ impl Agent {
   pub fn reset_perf_metrics(&self) {
     let guard = self.inner.blocking_read();
     guard.reset_metrics();
-    self.perf.reset();
   }
 }
 
