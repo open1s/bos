@@ -152,7 +152,7 @@ const result = await agent.ask('What is 2+2?');
 - Current green baselines:
   - Rust (excluding the binding crates): 379 passed, 0 failed, 8 ignored
   - Python (`cd crates/nbos && pytest -m "not llm"`): 194 passed, 4 deselected
-  - JS (`cd crates/jsbos && npx ava`): 37 tests (12 of them in the parity guard)
+  - JS (`cd crates/jsbos && npx ava`): 43 tests (12 in the parity guard, 3 in the native-binding guard)
 
 ---
 

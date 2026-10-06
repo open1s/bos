@@ -56,3 +56,30 @@ construction time instead.
 `crates/jsbos/test/bus.test.js` publishes to `sub.topic` while a receive is
 pending, so a regression fails the JS suite instead of silently dropping
 messages.
+
+## A run holds the lock for its whole duration
+
+The same hazard scales up in the agent. `react` and `runSimple` hold the
+agent lock across the entire LLM call, so every read-only method that called
+`blocking_lock` (`config`, `listTools`, `getPerfMetrics`, `getMessages`, and
+the rest) froze the Node event loop until the model answered. A probe
+measured `config()` blocking for 29,998 ms, the full agent timeout.
+
+The agent now stores its state in a `tokio::sync::RwLock` rather than a
+`Mutex`:
+
+- runs (`react`, `runSimple`, `stream`) and read-only methods take a **read**
+  guard, so they run concurrently;
+- mutating methods (`addTool`, `restoreSessionJson`, `close`, and the like)
+  take a **write** guard, so they still wait for a run to finish before
+  changing shared state.
+
+A read guard held across a run does not block another read, which is exactly
+what the getters need. Only state that a concurrent async method can hold
+across an await needs this split; state held behind no lock at all needs
+neither.
+
+`crates/jsbos/test/concurrency.test.js` points the agent at a local HTTP server
+that answers slowly, waits for the request to arrive, then asserts `config()`
+returns in under a second while the run is in flight. Without the read/write
+split the same assertion blocked for the full timeout.

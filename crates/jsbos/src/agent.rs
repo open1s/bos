@@ -7,7 +7,7 @@ use napi::Unknown;
 use napi_derive::napi;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use crate::hooks::{HookContextData, HookEvent, HookRegistry};
 use crate::jsany::JSAny;
@@ -303,7 +303,7 @@ impl From<AgentConfig> for agent::AgentConfig {
 #[napi]
 /// A JavaScript-facing agent.
 pub struct Agent {
-  inner: Arc<Mutex<agent::Agent>>,
+  inner: Arc<RwLock<agent::Agent>>,
   bus_session: Option<Arc<crate::Session>>,
   #[allow(dead_code)]
   hooks: std::sync::Arc<std::sync::Mutex<HookRegistry>>,
@@ -329,7 +329,7 @@ impl Agent {
     let agent = agent::Agent::new(cfg, Arc::new(llm_provider));
 
     Ok(Agent {
-      inner: Arc::new(Mutex::new(agent)),
+      inner: Arc::new(RwLock::new(agent)),
       bus_session: None,
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
       perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
@@ -358,7 +358,7 @@ impl Agent {
     let agent = agent::Agent::new(cfg, Arc::new(llm_provider)).with_bus(bus);
 
     Ok(Agent {
-      inner: Arc::new(Mutex::new(agent)),
+      inner: Arc::new(RwLock::new(agent)),
       bus_session: Some(_bus.as_ref().clone()),
       hooks: std::sync::Arc::new(std::sync::Mutex::new(js_hooks)),
       perf: std::sync::Arc::new(crate::perf::PerformanceMetrics::new()),
@@ -387,7 +387,7 @@ impl Agent {
     };
     self.is_running.store(true, Ordering::SeqCst);
     let result = {
-      let guard = self.inner.lock().await;
+      let guard = self.inner.read().await;
       guard.run_simple(task_content).await
     };
     self.is_running.store(false, Ordering::SeqCst);
@@ -415,7 +415,7 @@ impl Agent {
     };
     self.is_running.store(true, Ordering::SeqCst);
     let result = {
-      let guard = self.inner.lock().await;
+      let guard = self.inner.read().await;
       guard.react(task_content).await
     };
     self.is_running.store(false, Ordering::SeqCst);
@@ -426,7 +426,7 @@ impl Agent {
   #[napi]
   /// Return the effective agent configuration.
   pub fn config(&self) -> Result<serde_json::Value> {
-    let guard = self.inner.blocking_lock();
+    let guard = self.inner.blocking_read();
     let cfg = guard.config();
     Ok(serde_json::json!({
         "name": cfg.name,
@@ -444,7 +444,7 @@ impl Agent {
   #[napi]
   /// List registered tool names.
   pub fn list_tools(&self) -> Result<Vec<String>> {
-    let guard = self.inner.blocking_lock();
+    let guard = self.inner.blocking_read();
     if let Some(registry) = guard.registry() {
       // Tools added through the bindings are registered as async tools, so a
       // sync-only listing would hide every JS-registered tool.
@@ -463,7 +463,7 @@ impl Agent {
   #[napi]
   /// List registered async tool names.
   pub fn list_async_tools(&self) -> Result<Vec<String>> {
-    let guard = self.inner.blocking_lock();
+    let guard = self.inner.blocking_read();
     if let Some(registry) = guard.registry() {
       Ok(registry.async_tool_names())
     } else {
@@ -498,7 +498,7 @@ impl Agent {
       HookEvent::OnError => agent::agent::hooks::HookEvent::OnError,
     };
 
-    let guard = self.inner.blocking_lock();
+    let guard = self.inner.blocking_read();
     guard.hooks().register_blocking(event, Arc::new(hook));
     Ok(())
   }
@@ -531,7 +531,7 @@ impl Agent {
     let plugin_arc: std::sync::Arc<dyn agent::agent::plugin::AgentPlugin> =
       std::sync::Arc::new(js_plugin);
 
-    let mut guard = self.inner.blocking_lock();
+    let mut guard = self.inner.blocking_write();
     guard.add_plugin(plugin_arc);
     Ok(())
   }
@@ -539,7 +539,7 @@ impl Agent {
   #[napi]
   /// Close the agent and release resources.
   pub fn close(&self) -> Result<()> {
-    let mut guard = self.inner.blocking_lock();
+    let mut guard = self.inner.blocking_write();
     guard.clear_runtime_extensions();
     guard.stop();
     self.stop_flag.store(true, Ordering::SeqCst);
@@ -556,7 +556,7 @@ impl Agent {
 
     if let Some(opts) = options {
       if opts.clear_session.unwrap_or(false) {
-        let mut guard = self.inner.blocking_lock();
+        let mut guard = self.inner.blocking_write();
         guard.stop();
         guard.session_mut().clear();
       }
@@ -594,7 +594,7 @@ impl Agent {
       callback: callback.into(),
       cancel_callback: cancel_callback.map(Arc::new),
     };
-    let mut guard = self.inner.lock().await;
+    let mut guard = self.inner.write().await;
     guard
       .try_add_async_tool(std::sync::Arc::new(tool))
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
@@ -609,7 +609,7 @@ impl Agent {
     } else {
       BashTool::new(&name)
     };
-    let mut guard = self.inner.lock().await;
+    let mut guard = self.inner.write().await;
     guard
       .try_add_tool(std::sync::Arc::new(tool))
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
@@ -619,7 +619,7 @@ impl Agent {
   #[napi]
   /// Register skills discovered in `dir_path`.
   pub async fn register_skills_from_dir(&self, dir_path: String) -> Result<()> {
-    let mut guard = self.inner.lock().await;
+    let mut guard = self.inner.write().await;
     guard
       .register_skills_from_dir(std::path::PathBuf::from(dir_path))
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
@@ -645,7 +645,7 @@ impl Agent {
 
     let client = std::sync::Arc::new(client);
 
-    let mut guard = self.inner.lock().await;
+    let mut guard = self.inner.write().await;
     guard
       .register_mcp_tools_with_namespace(client, &namespace)
       .await
@@ -663,7 +663,7 @@ impl Agent {
       .await
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
 
-    let mut guard = self.inner.lock().await;
+    let mut guard = self.inner.write().await;
     guard
       .register_mcp_tools_with_namespace(client, &namespace)
       .await
@@ -673,7 +673,7 @@ impl Agent {
   #[napi]
   /// List tools across all MCP servers.
   pub async fn list_mcp_tools(&self) -> Result<Vec<serde_json::Value>> {
-    let guard = self.inner.lock().await;
+    let guard = self.inner.read().await;
     Ok(
       guard
         .registry()
@@ -685,7 +685,7 @@ impl Agent {
   #[napi]
   /// List resources for an MCP namespace.
   pub async fn list_mcp_resources(&self, namespace: String) -> Result<Vec<serde_json::Value>> {
-    let guard = self.inner.lock().await;
+    let guard = self.inner.read().await;
     Ok(
       guard
         .registry()
@@ -697,7 +697,7 @@ impl Agent {
   #[napi]
   /// List prompts across all MCP servers.
   pub async fn list_mcp_prompts(&self) -> Result<Vec<serde_json::Value>> {
-    let guard = self.inner.lock().await;
+    let guard = self.inner.read().await;
     Ok(
       guard
         .registry()
@@ -717,7 +717,7 @@ impl Agent {
       napi::Error::new(napi::Status::GenericFailure, "Agent not created with bus")
     })?;
     let agent = {
-      let guard = self.inner.lock().await;
+      let guard = self.inner.read().await;
       guard.clone()
     };
     let client = agent.rpc_client(endpoint.clone(), session);
@@ -737,7 +737,7 @@ impl Agent {
       napi::Error::new(napi::Status::GenericFailure, "Agent not created with bus")
     })?;
     let agent = {
-      let guard = self.inner.lock().await;
+      let guard = self.inner.read().await;
       guard.clone()
     };
     let mut server = agent.as_callable_server(endpoint.clone(), session);
@@ -782,7 +782,7 @@ impl Agent {
     self.is_running.store(true, Ordering::SeqCst);
 
     let result = async {
-      let guard = self.inner.lock().await;
+      let guard = self.inner.read().await;
       let start = std::time::Instant::now();
 
       let stream = guard.stream(task_content);
@@ -876,7 +876,7 @@ impl Agent {
   #[napi]
   /// Return the session history as JSON.
   pub fn get_session_json(&self) -> Result<String> {
-    let guard = self.inner.blocking_lock();
+    let guard = self.inner.blocking_read();
     let session = guard.session();
     let value = serde_json::to_value(&*session)
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
@@ -893,7 +893,7 @@ impl Agent {
   #[napi]
   /// Restore the session from JSON.
   pub fn restore_session_json(&self, json: String) -> Result<()> {
-    let mut guard = self.inner.blocking_lock();
+    let mut guard = self.inner.blocking_write();
     let result = guard.session_mut().restore_from_json(&json);
     match result {
       Ok(()) => Ok(()),
@@ -919,7 +919,7 @@ impl Agent {
   #[napi]
   /// Clear the session history.
   pub fn clear_session(&self) -> Result<()> {
-    let mut guard = self.inner.blocking_lock();
+    let mut guard = self.inner.blocking_write();
     guard.session_mut().clear();
     Ok(())
   }
@@ -927,7 +927,7 @@ impl Agent {
   #[napi]
   /// Compact the session, keeping recent turns.
   pub fn compact_session(&self, keep_recent: u32, max_summary_chars: u32) -> Result<()> {
-    let mut guard = self.inner.blocking_lock();
+    let mut guard = self.inner.blocking_write();
     guard
       .session_mut()
       .compact(keep_recent as usize, max_summary_chars as usize);
@@ -949,7 +949,7 @@ impl Agent {
   /// The conversation messages, serialized as JSON.
   #[napi]
   pub fn get_messages(&self) -> Result<serde_json::Value> {
-    let guard = self.inner.blocking_lock();
+    let guard = self.inner.blocking_read();
     let messages = guard.session().messages().to_vec();
     serde_json::to_value(messages)
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
@@ -979,7 +979,7 @@ impl Agent {
         ))
       }
     };
-    let mut guard = self.inner.blocking_lock();
+    let mut guard = self.inner.blocking_write();
     guard.add_message(msg);
     Ok(())
   }
@@ -987,7 +987,7 @@ impl Agent {
   #[napi]
   /// Return a snapshot of performance metrics.
   pub fn get_perf_metrics(&self) -> crate::perf::PerfSnapshot {
-    let guard = self.inner.blocking_lock();
+    let guard = self.inner.blocking_read();
     let cm = guard.metrics();
     crate::perf::PerfSnapshot {
       llm_call_count: cm.llm_call_count as i64,
@@ -1015,7 +1015,7 @@ impl Agent {
   #[napi]
   /// Reset all performance metrics.
   pub fn reset_perf_metrics(&self) {
-    let guard = self.inner.blocking_lock();
+    let guard = self.inner.blocking_read();
     guard.reset_metrics();
     self.perf.reset();
   }
@@ -1083,7 +1083,7 @@ impl AgentCallableServer {
 
 impl Drop for Agent {
   fn drop(&mut self) {
-    if let Ok(mut guard) = self.inner.try_lock() {
+    if let Ok(mut guard) = self.inner.try_write() {
       guard.clear_runtime_extensions();
       guard.stop();
     }
