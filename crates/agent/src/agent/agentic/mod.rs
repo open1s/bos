@@ -3,6 +3,7 @@
 use crate::agent::context::{AgentReActApp, AgentReactContext, AgentSession};
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
 use crate::agent::plugin::{AgentPlugin, PluginRegistry, StreamTokenWrapper};
+use crate::memory::MemoryStore;
 use crate::session::AgentState;
 use crate::tools::FunctionTool;
 use crate::{AgentError, LlmClient, StreamToken, Tool, ToolRegistry};
@@ -35,6 +36,10 @@ pub use llm::{build_vendor, LlmProvider};
 // ============================================================================
 // Simplified Agent API - Builder Pattern
 // ============================================================================
+
+/// Default number of memories a single run recalls when a [`MemoryStore`]
+/// is attached with [`Agent::with_memory`].
+pub const DEFAULT_MEMORY_RECALL_LIMIT: usize = 5;
 
 /// Agent builder for fluent configuration.
 #[derive(Debug, Clone)]
@@ -186,6 +191,10 @@ pub struct Agent {
     #[rkyv(with = qserde::rkyv::with::Skip)]
     bus: Option<Bus>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
+    memory: Option<Arc<dyn MemoryStore>>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    memory_recall_limit: usize,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
     engine_cache: std::sync::Mutex<Option<ReActEngine<AgentReActApp>>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     context_cache: std::sync::Mutex<Option<AgentReactContext>>,
@@ -214,6 +223,8 @@ impl Agent {
             hooks: HookRegistry::new(),
             plugins: PluginRegistry::new(),
             bus: None,
+            memory: None,
+            memory_recall_limit: DEFAULT_MEMORY_RECALL_LIMIT,
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
@@ -243,6 +254,51 @@ impl Agent {
     pub fn with_bus(mut self, bus: Bus) -> Self {
         self.bus = Some(bus);
         self
+    }
+
+    /// Attach a [`MemoryStore`] the agent recalls from on every run.
+    ///
+    /// Matching items are appended to the system prompt before the model
+    /// is called; see [`Agent::recalled_context`].
+    #[must_use]
+    pub fn with_memory(mut self, memory: Arc<dyn MemoryStore>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// The attached memory store, if any.
+    #[must_use]
+    pub fn memory(&self) -> Option<&Arc<dyn MemoryStore>> {
+        self.memory.as_ref()
+    }
+
+    /// Set how many memories a run recalls, defaulting to
+    /// [`DEFAULT_MEMORY_RECALL_LIMIT`].
+    pub fn set_memory_recall_limit(&mut self, limit: usize) {
+        self.memory_recall_limit = limit;
+    }
+
+    /// Recall memories relevant to `query`, formatted as a block to
+    /// append to the system prompt.
+    ///
+    /// Returns `None` when no memory is attached, the query is blank, the
+    /// recall limit is zero, or nothing matches. The returned text is
+    /// deterministic for a given store order so prompt assembly is stable.
+    pub async fn recalled_context(&self, query: &str) -> Option<String> {
+        let memory = self.memory.as_ref()?;
+        if self.memory_recall_limit == 0 || query.trim().is_empty() {
+            return None;
+        }
+        let hits = memory.search(query, self.memory_recall_limit).await;
+        if hits.is_empty() {
+            return None;
+        }
+        let mut block = String::from("Relevant memory:");
+        for item in &hits {
+            block.push_str("\n- ");
+            block.push_str(item.content.trim());
+        }
+        Some(block)
     }
 
     /// Get the config.
@@ -628,6 +684,8 @@ impl Clone for Agent {
             hooks: self.hooks.clone(),
             plugins: self.plugins.clone(),
             bus: self.bus.clone(),
+            memory: self.memory.clone(),
+            memory_recall_limit: self.memory_recall_limit,
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),

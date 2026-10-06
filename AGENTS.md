@@ -150,7 +150,7 @@ const result = await agent.ask('What is 2+2?');
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
 - Current green baselines:
-  - Rust (excluding the binding crates): 393 passed, 0 failed, 8 ignored
+  - Rust (excluding the binding crates): 397 passed, 0 failed, 8 ignored
   - Python (`cd crates/nbos && pytest -m "not llm"`): 212 passed, 4 deselected
   - JS (`cd crates/jsbos && npx ava`): 77 tests (12 parity, 3 native-binding, 19 API-doc, 9 content)
 
@@ -173,7 +173,9 @@ const result = await agent.ask('What is 2+2?');
 - **Memory**: `agent::memory::MemoryStore` stores and recalls text across
   turns; `InMemoryMemory` ranks items by keyword overlap and breaks ties
   toward recency. The trait is object-safe, so a vector or file backend
-  implements the same seam.
+  implements the same seam. Attach one with `Agent::with_memory` and
+  matching items are appended to the system prompt on each run;
+  `Agent::recalled_context` exposes the block on its own.
 - **Bindings**: Python and JS share one canonical vocabulary — `publish_text`/
   `publish_json`, `ask`/`ask_json`, `call`/`call_json`, `handle`/`start`/`run`/
   `run_json`, `recv`/`recv_json`. Python keeps the legacy `create_*`/`publish_*`

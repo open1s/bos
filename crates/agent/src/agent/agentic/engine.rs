@@ -179,6 +179,22 @@ impl Agent {
             .map_err(|e| AgentError::Session(format!("ReAct build error: {}", e)))
     }
 
+    /// Compose the system prompt for a run, appending recalled memories.
+    ///
+    /// Non-text input (images/audio only) has no query to match against, so
+    /// it uses the configured prompt unchanged.
+    async fn system_prompt_for(&self, task: &Content) -> String {
+        let base = self.config.system_prompt.clone();
+        let Some(query) = task.as_text() else {
+            return base;
+        };
+        match self.recalled_context(query).await {
+            Some(memory) if base.is_empty() => memory,
+            Some(memory) => format!("{base}\n\n{memory}"),
+            None => base,
+        }
+    }
+
     /// Run the agent using ReAct engine. Uses the agent's existing session
     /// and writes results back after completion. Session is not locked during
     /// engine execution to avoid deadlocks with hooks.
@@ -217,6 +233,7 @@ impl Agent {
         };
         let mut agent_session = AgentSession::new();
         agent_session.restore_messages(messages);
+        let system_prompt = self.system_prompt_for(&task_content).await;
 
         let request = LlmRequest {
             model: self.config.model.clone(),
@@ -237,7 +254,7 @@ impl Agent {
             .as_mut()
             .unwrap()
             .react(
-                Some(self.config.system_prompt.clone()),
+                Some(system_prompt),
                 request,
                 &mut agent_session,
                 &mut *context.as_mut().unwrap(),
@@ -377,6 +394,7 @@ impl Agent {
             let mut engine = engine;
             let mut context = context;
 
+            let system_prompt = self.system_prompt_for(&task_content).await;
             let request = LlmRequest {
                 model: self.config.model.clone(),
                 input: task_content,
@@ -392,7 +410,7 @@ impl Agent {
             };
 
             {
-                let react_stream = engine.react_stream(Some(self.config.system_prompt.clone()), request, &mut agent_session, &mut context);
+                let react_stream = engine.react_stream(Some(system_prompt), request, &mut agent_session, &mut context);
                 futures::pin_mut!(react_stream);
                 let plugins = self.plugins.clone();
                 let hooks = self.hooks.clone();

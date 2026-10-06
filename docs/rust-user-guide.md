@@ -455,6 +455,24 @@ most recent items. `all`, `remove`, `clear`, `len`, and `is_empty` round out the
 API. `MemoryStore` is object-safe, so it can live behind an
 `Arc<dyn MemoryStore>` and be swapped without touching call sites.
 
+Attach a store to an agent and every run recalls matching items and
+appends them to the system prompt:
+
+```rust
+let memory = std::sync::Arc::new(InMemoryMemory::new());
+memory.add("The staging deploy needs VPN".to_string(), None).await;
+
+let mut agent = Agent::from_config(AgentConfig::default()).with_memory(memory);
+agent.set_memory_recall_limit(4); // defaults to DEFAULT_MEMORY_RECALL_LIMIT
+
+// The block recalled for the next run is available on its own:
+let context = agent.recalled_context("deploy to staging").await;
+assert!(context.unwrap().contains("VPN"));
+```
+
+Non-text input (images or audio only) has no query to match, so recall is
+skipped and the configured system prompt is used unchanged.
+
 ---
 
 ## Bus Communication
