@@ -19,7 +19,7 @@ pub use crate::session::manager::SessionError;
 pub use crate::session::{SessionConfig, SessionManager, SessionSummary};
 pub use crate::skills::{SkillContent, SkillError, SkillInjector, SkillLoader, SkillMetadata};
 pub use crate::tools::bash::BashExecutionResult;
-pub use crate::tools::{BashTool, Tool, ToolRegistry};
+pub use crate::tools::{AsyncFunctionTool, AsyncTool, BashTool, Tool, ToolRegistry};
 pub use react::llm::vendor::OpenAiVendor;
 pub use react::llm::{LlmClient, LlmMessage, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
 pub use react::{CircuitBreakerConfig, RateLimiterConfig};

@@ -150,7 +150,7 @@ const result = await agent.ask('What is 2+2?');
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
 - Current green baselines:
-  - Rust (excluding the binding crates): 413 passed, 0 failed, 8 ignored
+  - Rust (excluding the binding crates): 417 passed, 0 failed, 8 ignored
   - Python (`cd crates/nbos && pytest -m "not llm"`): 229 passed, 4 deselected
   - JS (`cd crates/jsbos && npx ava`): 94 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 14 memory)
 
@@ -158,7 +158,9 @@ const result = await agent.ask('What is 2+2?');
 
 ## Key Patterns
 
-- **Tools**: Implement `Tool`/`AsyncTool`, register via `ToolRegistry`; the agent
+- **Tools**: Wrap a closure with `FunctionTool` (sync) or `AsyncFunctionTool`
+  (async, may await I/O), or implement `Tool`/`AsyncTool` directly; register
+  with `ToolRegistry::register`/`register_async`; the agent
   invokes them through the `react` seam (`LlmClient`, `Tool`), never the bus.
 - **Bus**: Build a primitive and attach a session.
   - Publisher: `Publisher::new(topic).with_session(session)?.publish(&payload)`

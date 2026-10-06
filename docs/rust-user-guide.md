@@ -325,48 +325,40 @@ while let Some(token) = stream.next().await {
 
 ## Tool Registration
 
-### Implementing the Tool Trait
+### Implementing a Tool
+
+The quickest path is a closure adapter. `FunctionTool` wraps a
+synchronous function; `AsyncFunctionTool` wraps an async one and may
+await I/O. Both take a name, a description, and a JSON schema:
 
 ```rust
-use async_trait::async_trait;
-use serde_json::Value;
-use agent::{Tool, ToolDescription, ToolError};
+use agent::tools::{AsyncFunctionTool, FunctionTool};
+use serde_json::json;
+use std::sync::Arc;
 
-struct MyTool;
+let add = FunctionTool::numeric("add", "Add two numbers", 2, |args| {
+    let a = args["a"].as_f64().unwrap_or_default();
+    let b = args["b"].as_f64().unwrap_or_default();
+    Ok(json!(a + b))
+});
 
-#[async_trait]
-impl Tool for MyTool {
-    fn name(&self) -> &str {
-        "my_tool"
-    }
-
-    fn description(&self) -> ToolDescription {
-        ToolDescription {
-            short: "Description of my tool".to_string(),
-            parameters: "param1: string, param2: integer".to_string(),
-        }
-    }
-
-    fn json_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "param1": { "type": "string" },
-                "param2": { "type": "integer" }
-            },
-            "required": ["param1"]
+let delayed = AsyncFunctionTool::new(
+    "delayed",
+    "Echo a value after a delay",
+    json!({"type": "object", "properties": {"value": {"type": "string"}}}),
+    |args| {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(args.get("value").cloned().unwrap_or(json!(null)))
         })
-    }
-
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let param1 = args.get("param1")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default");
-        
-        Ok(serde_json::json!({ "result": param1 }))
-    }
-}
+    },
+);
 ```
+
+Implement `Tool` or `AsyncTool` directly when you need cancellation or
+streaming: alongside `name`, `description`, `json_schema`, and `run`, a
+tool declares `is_cancelable`/`cancel` and (for `AsyncTool`)
+`run_streaming`.
 
 ### Registering Tools
 
@@ -375,7 +367,8 @@ use agent::tools::ToolRegistry;
 use std::sync::Arc;
 
 let mut registry = ToolRegistry::new();
-registry.add(Arc::new(MyTool)).await?;
+registry.register(Arc::new(add))?;          // sync tool
+registry.register_async(Arc::new(delayed))?; // async tool
 ```
 
 ### MCP Tools (Model Context Protocol)
