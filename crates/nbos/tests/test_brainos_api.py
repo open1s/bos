@@ -506,6 +506,27 @@ class TestAgentAccessors:
             assert "remoteEcho" in agent.tool_names
 
     @pytest.mark.asyncio
+    async def test_agent_starts_without_a_config_or_api_key(self, monkeypatch, tmp_path):
+        # CI has no ~/.bos/conf/config.toml and no API key, so construction
+        # must succeed with an empty key.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        from nbos import BrainOS
+
+        async with BrainOS() as brain:
+            agent = await brain.agent("no-key-test").start()
+            assert agent.config["name"] == "no-key-test"
+
+    @pytest.mark.asyncio
+    async def test_agent_reads_openai_api_key_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+        from nbos import BrainOS
+
+        async with BrainOS() as brain:
+            agent = await brain.agent("env-key-test").start()
+            assert agent.config["name"] == "env-key-test"
+
+    @pytest.mark.asyncio
     async def test_agent_metrics(self):
         from nbos import BrainOS
         async with BrainOS() as brain:

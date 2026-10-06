@@ -606,7 +606,7 @@ class AgentBuilder {
       name: options.name || 'assistant',
       model: options.model || DEFAULT_MODEL,
       baseUrl: options.baseUrl || DEFAULT_BASE_URL,
-      apiKey: options.apiKey,
+      apiKey: options.apiKey || '',
       systemPrompt: options.systemPrompt || 'You are a helpful assistant.',
       temperature: options.temperature ?? 0.7,
       timeoutSecs: options.timeoutSecs || 120,
@@ -1501,7 +1501,10 @@ class BrainOS {
     const config = Config.load();
     const gm = config.globalModel;
 
-    this._apiKey = this._options.apiKey || gm.api_key;
+    // Explicit option beats the standard environment variable, which beats the
+    // discovered config file. The empty-string default keeps agent construction
+    // working on machines with no BOS config at all.
+    this._apiKey = this._options.apiKey || process.env.OPENAI_API_KEY || gm.api_key || '';
     this._baseUrl = this._options.baseUrl || gm.base_url || DEFAULT_BASE_URL;
     this._model = this._options.model || gm.model || DEFAULT_MODEL;
     this._config = config;

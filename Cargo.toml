@@ -22,7 +22,9 @@ serde_yaml = "0.9"
 dashmap = "6.1.0"
 anyhow = "1.0"
 thiserror = "2.0"
-async-trait = "0.1"
+# 0.1.92 removed the #[must_use] it used to inject into async trait
+# methods, which trips clippy 1.99 double_must_use under -D warnings.
+async-trait = "0.1.92"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.23", features = ["v4"] }

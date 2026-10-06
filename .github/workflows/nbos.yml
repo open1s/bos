@@ -16,9 +16,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release:
+    name: Detect a version commit
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.check.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # A push only builds wheels for a bare x.y.z commit; pull requests and
+      # manual runs always build so the pipeline still smoke-tests them. The
+      # publish job consumes this flag, so a non-release push skips the
+      # expensive matrix instead of failing it.
+      - id: check
+        name: Check version commit
+        shell: bash
+        run: |
+          msg=$(git log -1 --pretty=%B)
+          if [ "${{ github.event_name }}" != "push" ] || echo "$msg" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not a version commit. Commit: $msg"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build bindings for ${{ matrix.target }}
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: release
+    if: needs.release.outputs.is_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -36,16 +61,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
-
-      - name: Check version commit
-        if: github.event_name == 'push'
-        run: |
-          msg=$(git log -1 --pretty=%B)
-          if ! echo "$msg" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Not a version commit. Commit: $msg"
-            exit 1
-          fi
-        shell: bash
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -92,7 +107,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install maturin and pytest
-        run: pip install maturin pytest pytest-asyncio
+        run: pip install maturin pytest pytest-asyncio pyee
 
       - name: Build and install the wheel
         run: |
@@ -104,9 +119,9 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [build, test]
+    needs: [release, build, test]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.event.ref == 'refs/heads/main'
+    if: needs.release.outputs.is_release == 'true' && github.event_name == 'push' && github.event.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v6
 

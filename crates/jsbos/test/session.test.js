@@ -1,7 +1,7 @@
 import test from 'ava'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { rmSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { BrainOS, ToolDef, HookEvent } from '../index.js'
 
 async function startAgent(t) {
@@ -170,4 +170,43 @@ test.serial('builder aliases chain and expose the mirrored surface', async (t) =
   t.is(typeof agent.chat, 'function')
   t.is(agent.plugins({ name: 'parity' }), agent)
   t.is(agent.skillsDir('/tmp/parity-skills'), agent)
+})
+
+// CI has no ~/.bos/conf/config.toml, so agent construction must not depend on
+// a config file providing the API key.
+test.serial('BrainOS builds an agent with no config file or api key', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'bos-home-'))
+  t.teardown(() => rmSync(home, { recursive: true, force: true }))
+  const prevHome = process.env.HOME
+  const prevKey = process.env.OPENAI_API_KEY
+  process.env.HOME = home
+  delete process.env.OPENAI_API_KEY
+  t.teardown(() => {
+    process.env.HOME = prevHome
+    if (prevKey === undefined) delete process.env.OPENAI_API_KEY
+    else process.env.OPENAI_API_KEY = prevKey
+  })
+
+  const brain = new BrainOS()
+  await brain.start()
+  t.teardown(() => brain.stop())
+  const agent = await brain.agent('no-key-test').start()
+  t.is(agent.config.name, 'no-key-test')
+})
+
+test.serial('BrainOS reads OPENAI_API_KEY from the environment', async (t) => {
+  const prev = process.env.OPENAI_API_KEY
+  process.env.OPENAI_API_KEY = 'env-key'
+  t.teardown(() => {
+    if (prev === undefined) delete process.env.OPENAI_API_KEY
+    else process.env.OPENAI_API_KEY = prev
+  })
+
+  const brain = new BrainOS()
+  await brain.start()
+  t.teardown(() => brain.stop())
+  const builder = brain.agent('env-key-test')
+  t.is(builder._config.apiKey, 'env-key')
+  const agent = await builder.start()
+  t.is(agent.config.name, 'env-key-test')
 })

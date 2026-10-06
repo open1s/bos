@@ -19,6 +19,9 @@ classifiers = [
   "Intended Audience :: Developers",
 ]
 
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio", "pyee"]
+
 [project.urls]
 Homepage = "https://github.com/open1s/bos"
 Documentation = "https://github.com/open1s/bos/wiki"

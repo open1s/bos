@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Callable
 from contextlib import AbstractAsyncContextManager
 
@@ -192,7 +193,7 @@ class AgentBuilder:
         self._config.name = opts.get("name", "assistant")
         self._config.model = opts.get("model", DEFAULT_MODEL)
         self._config.base_url = opts.get("base_url", DEFAULT_BASE_URL)
-        self._config.api_key = opts.get("api_key", "")
+        self._config.api_key = opts.get("api_key") or ""
         self._config.system_prompt = opts.get("system_prompt", "You are a helpful assistant.")
         self._config.temperature = opts.get("temperature", 0.7)
         self._config.timeout_secs = opts.get("timeout_secs", 120)
@@ -570,7 +571,16 @@ class BrainOS(AbstractAsyncContextManager):
         global_model = self._config.global_model
         overrides = config or {}
 
-        self._api_key = api_key or overrides.get("api_key") or global_model.get("api_key")
+        # Explicit option beats the standard environment variable, which beats
+        # the discovered config file. The empty-string default keeps agent
+        # construction working on machines with no BOS config at all.
+        self._api_key = (
+            api_key
+            or overrides.get("api_key")
+            or os.environ.get("OPENAI_API_KEY")
+            or global_model.get("api_key")
+            or ""
+        )
         self._base_url = (
             base_url
             or overrides.get("base_url")
