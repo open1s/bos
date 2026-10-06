@@ -198,6 +198,11 @@ class BusManager:
             raise RuntimeError("Bus not started. Use 'async with' context.")
         return self._bus
 
+    @property
+    def session_id(self) -> str:
+        """Return the identifier of the underlying session."""
+        return self.bus.session_id()
+
 
 # ── Publisher wrapper ──────────────────────────────────────────────
 

@@ -1096,7 +1096,10 @@ class BusManager {
   }
 
   async stop() {
-    this._bus = null;
+    if (this._bus) {
+      await this._bus.close();
+      this._bus = null;
+    }
   }
 
   mode(mode) {
@@ -1163,6 +1166,11 @@ class BusManager {
   get bus() {
     if (!this._bus) throw new Error('Bus not started');
     return this._bus;
+  }
+
+  get sessionId() {
+    if (!this._bus) throw new Error('Bus not started');
+    return this._bus.sessionId();
   }
 }
 

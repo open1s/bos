@@ -2,7 +2,7 @@
 // exercise at all: publish/subscribe round-trips through the native Bus and
 // through the Publisher and Subscriber objects it hands out.
 import test from 'ava'
-import { Bus } from '../index.js'
+import { Bus, BusManager } from '../index.js'
 
 let seq = 0
 function topic(name) {
@@ -35,6 +35,25 @@ test.serial('bus exposes a stable per-bus session id', async (t) => {
 
   const other = await newBus(t)
   t.not(other.sessionId(), id)
+})
+
+test.serial('BusManager exposes the session id and closes on stop', async (t) => {
+  const manager = await BusManager.create()
+  t.teardown(async () => {
+    try {
+      await manager.stop()
+    } catch {
+      // Already stopped by the assertion below.
+    }
+  })
+
+  const id = manager.sessionId
+  t.is(typeof id, 'string')
+  t.true(id.length > 0)
+  t.is(id, manager.bus.sessionId())
+
+  await manager.stop()
+  t.throws(() => manager.bus, { message: /Bus not started/ })
 })
 
 // Publishing to sub.topic is deliberate: the getter must not block on the

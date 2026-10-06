@@ -284,6 +284,14 @@ class TestBusManager:
             assert bus is not None
 
     @pytest.mark.asyncio
+    async def test_bus_manager_session_id(self):
+        from nbos.bus import BusManager
+        async with BusManager() as bus:
+            assert isinstance(bus.session_id, str)
+            assert bus.session_id
+            assert bus.session_id == bus.bus.session_id()
+
+    @pytest.mark.asyncio
     async def test_bus_manager_publish_text(self):
         from nbos.bus import BusManager
         async with BusManager() as bus:
