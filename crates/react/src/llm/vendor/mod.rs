@@ -1,15 +1,11 @@
-#[warn(missing_docs)]
+//! Vendor clients and wire types for the supported LLM providers.
+
 pub mod deepseek;
-#[warn(missing_docs)]
 pub mod nvidia;
-#[warn(missing_docs)]
 pub mod openai;
-#[warn(missing_docs)]
 pub mod openaicompatible;
-#[warn(missing_docs)]
 pub mod openrouter;
 pub mod responses;
-#[warn(missing_docs)]
 pub mod router;
 pub use deepseek::{DeepSeekVendor, DeepSeekVendorBuilder};
 pub use nvidia::NvidiaVendor;

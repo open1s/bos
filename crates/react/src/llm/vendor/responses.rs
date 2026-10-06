@@ -36,91 +36,140 @@ use crate::utils::{JsonExtractor, StreamExtractor};
 // =============================================================================
 
 #[derive(Debug, Serialize)]
+/// A Responses API request.
 pub struct ResponsesRequest {
+    /// Model identifier.
     pub model: String,
+    /// System-level instructions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Typed input items.
     pub input: Vec<ResponsesInputItem>,
+    /// Serialized tool definitions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Value>>,
+    /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Nucleus sampling probability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    /// Output token cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// Reasoning configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponsesReasoning>,
+    /// Whether to stream the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
+/// Reasoning configuration for a Responses request.
 pub struct ResponsesReasoning {
+    /// Requested reasoning effort.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<crate::llm::ReasoningEffort>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// One typed item in a Responses request `input` array.
 pub enum ResponsesInputItem {
+    /// A conversation message.
     #[serde(rename = "message")]
     Message {
+        /// Message role.
         role: String,
+        /// Message content parts.
         content: Vec<ResponsesContentPart>,
     },
+    /// A function call made by the model.
     #[serde(rename = "function_call")]
     FunctionCall {
+        /// Provider call id.
         #[serde(rename = "call_id")]
         call_id: String,
+        /// Function name.
         name: String,
+        /// JSON-encoded arguments.
         arguments: String,
     },
+    /// The output of a function call.
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
+        /// Id of the call this answers.
         #[serde(rename = "call_id")]
         call_id: String,
+        /// Function output.
         output: String,
     },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// One typed content part in a Responses item.
 pub enum ResponsesContentPart {
+    /// Input text.
     #[serde(rename = "input_text")]
-    InputText { text: String },
+    InputText {
+        /// The text.
+        text: String,
+    },
+    /// Output text.
     #[serde(rename = "output_text")]
     OutputText {
+        /// The text.
         text: String,
+        /// Inline annotations.
         #[serde(default)]
         annotations: Vec<Value>,
     },
+    /// An input image.
     #[serde(rename = "input_image")]
-    InputImage { image_url: String },
+    InputImage {
+        /// Image URL or data URL.
+        image_url: String,
+    },
+    /// Input audio.
     #[serde(rename = "input_audio")]
-    InputAudio { input_audio: ResponsesInputAudio },
+    InputAudio {
+        /// The audio payload.
+        input_audio: ResponsesInputAudio,
+    },
+    /// An output image.
     #[serde(rename = "output_image")]
     OutputImage {
+        /// Image URL.
         #[serde(default)]
         image_url: String,
     },
+    /// Output audio.
     #[serde(rename = "output_audio")]
     OutputAudio {
+        /// Transcript of the audio.
         #[serde(default)]
         transcript: String,
     },
+    /// A model refusal.
     #[serde(rename = "refusal")]
     Refusal {
+        /// The refusal text.
         #[serde(default)]
         refusal: String,
     },
+    /// An unrecognized part type.
     #[serde(other)]
     Other,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+/// An audio payload for a Responses input item.
 pub struct ResponsesInputAudio {
+    /// Base64-encoded audio data.
     pub data: String,
+    /// Audio format, for example `wav`.
     pub format: String,
 }
 
@@ -129,86 +178,124 @@ pub struct ResponsesInputAudio {
 // =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A Responses API response.
 pub struct ResponsesResponse {
+    /// Response id.
     pub id: String,
+    /// Object type.
     pub object: String,
+    /// Unix creation timestamp.
     pub created_at: u64,
+    /// Completion status.
     pub status: String,
+    /// Model that served the request.
     pub model: String,
+    /// Typed output items.
     #[serde(default)]
     pub output: Vec<ResponsesItem>,
+    /// Token usage.
     #[serde(default)]
     pub usage: Option<ResponsesUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// One typed item in a Responses response `output` array.
 pub enum ResponsesItem {
+    /// An assistant message.
     #[serde(rename = "message")]
     Message {
+        /// Item id.
         #[serde(default)]
         id: String,
+        /// Message role.
         #[serde(default)]
         role: String,
+        /// Message content parts.
         #[serde(default)]
         content: Vec<ResponsesContentPart>,
     },
+    /// A function call.
     #[serde(rename = "function_call")]
     FunctionCall {
+        /// Item id.
         #[serde(default)]
         id: String,
+        /// Provider call id.
         #[serde(rename = "call_id", default)]
         call_id: String,
+        /// Function name.
         #[serde(default)]
         name: String,
+        /// JSON-encoded arguments.
         #[serde(default)]
         arguments: String,
     },
+    /// A function call output.
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
+        /// Id of the call this answers.
         #[serde(rename = "call_id", default)]
         call_id: String,
+        /// Function output.
         #[serde(default)]
         output: String,
     },
+    /// Reasoning output.
     #[serde(rename = "reasoning")]
     Reasoning {
+        /// Reasoning summary parts.
         #[serde(default)]
         summary: Vec<ResponsesReasoningSummary>,
     },
+    /// A hosted web-search call.
     #[serde(rename = "web_search_call")]
     WebSearchCall {
+        /// Item id.
         #[serde(default)]
         id: String,
     },
+    /// A hosted file-search call.
     #[serde(rename = "file_search_call")]
     FileSearchCall {
+        /// Item id.
         #[serde(default)]
         id: String,
     },
+    /// A hosted computer-use call.
     #[serde(rename = "computer_call")]
     ComputerCall {
+        /// Item id.
         #[serde(default)]
         id: String,
     },
+    /// An unrecognized item type.
     #[serde(other)]
     Other,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A summary of a reasoning item.
 pub struct ResponsesReasoningSummary {
+    /// Summary text.
     #[serde(default)]
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Token usage for a Responses call.
 pub struct ResponsesUsage {
+    /// Input tokens.
     pub input_tokens: u32,
+    /// Breakdown of input tokens.
     #[serde(default)]
     pub input_tokens_details: Option<Value>,
+    /// Output tokens.
     pub output_tokens: u32,
+    /// Breakdown of output tokens.
     #[serde(default)]
     pub output_tokens_details: Option<Value>,
+    /// Input plus output tokens.
     pub total_tokens: u32,
 }
 
@@ -448,6 +535,7 @@ fn build_instructions(
     }
 }
 
+/// Build a [`ResponsesRequest`] from a generic request and history.
 pub fn build_request(
     persona: Option<String>,
     req: &LlmRequest,
@@ -476,66 +564,119 @@ pub fn build_request(
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// One typed SSE event from a streamed Responses call.
 pub enum ResponsesStreamEvent {
+    /// An output-text delta.
     #[serde(rename = "response.output_text.delta")]
     OutputTextDelta {
+        /// Item id.
         item_id: String,
+        /// Index of the output item.
         output_index: u32,
+        /// Index of the content part.
         content_index: u32,
+        /// Text delta.
         delta: String,
     },
+    /// Output text completed.
     #[serde(rename = "response.output_text.done")]
     OutputTextDone {
+        /// Item id.
         item_id: String,
+        /// Index of the output item.
         output_index: u32,
+        /// The complete text.
         text: String,
     },
+    /// A reasoning-summary delta.
     #[serde(rename = "response.reasoning_summary_text.delta")]
     ReasoningSummaryDelta {
+        /// Item id.
         item_id: String,
+        /// Index of the output item.
         output_index: u32,
+        /// Text delta.
         delta: String,
     },
-    /// DeepSeek's Responses API streams the same progress under
-    /// `response.reasoning_text.delta`.
+    /// A reasoning-text delta (DeepSeek variant).
     #[serde(rename = "response.reasoning_text.delta")]
     ReasoningTextDelta {
+        /// Item id.
         item_id: String,
+        /// Index of the output item.
         output_index: u32,
+        /// Text delta.
         delta: String,
     },
+    /// An output item was added.
     #[serde(rename = "response.output_item.added")]
-    OutputItemAdded { output_index: u32, item: Value },
+    OutputItemAdded {
+        /// Index of the output item.
+        output_index: u32,
+        /// The raw item.
+        item: Value,
+    },
+    /// An output item completed.
     #[serde(rename = "response.output_item.done")]
-    OutputItemDone { output_index: u32, item: Value },
+    OutputItemDone {
+        /// Index of the output item.
+        output_index: u32,
+        /// The raw item.
+        item: Value,
+    },
+    /// A function-call arguments delta.
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta {
+        /// Item id.
         item_id: String,
+        /// Index of the output item.
         output_index: u32,
+        /// Arguments delta.
         delta: String,
     },
+    /// Function-call arguments completed.
     #[serde(rename = "response.function_call_arguments.done")]
     FunctionCallArgumentsDone {
+        /// Item id.
         item_id: String,
+        /// Index of the output item.
         output_index: u32,
+        /// The complete JSON arguments.
         arguments: String,
     },
+    /// The response completed.
     #[serde(rename = "response.completed")]
-    Completed { response: ResponsesResponse },
+    Completed {
+        /// The full response.
+        response: ResponsesResponse,
+    },
+    /// The response was incomplete.
     #[serde(rename = "response.incomplete")]
-    Incomplete { response: ResponsesResponse },
+    Incomplete {
+        /// The full response.
+        response: ResponsesResponse,
+    },
+    /// The response failed.
     #[serde(rename = "response.failed")]
-    Failed { response: ResponsesResponse },
+    Failed {
+        /// The full response.
+        response: ResponsesResponse,
+    },
+    /// A stream error.
     #[serde(rename = "error")]
     Error {
+        /// Error message.
         message: String,
+        /// Provider error code.
         code: Option<String>,
     },
+    /// An unrecognized event.
     #[serde(other)]
     Other,
 }
 
 impl ResponsesStreamEvent {
+    /// Whether this event ends the stream.
     pub fn is_final(&self) -> bool {
         matches!(
             self,
@@ -547,11 +688,13 @@ impl ResponsesStreamEvent {
     }
 }
 
+/// Extracts typed Responses events from an SSE stream.
 pub struct ResponsesExtractor {
     inner: JsonExtractor,
 }
 
 impl ResponsesExtractor {
+    /// Wrap a JSON extractor.
     pub fn new(inner: JsonExtractor) -> Self {
         Self { inner }
     }
@@ -612,6 +755,7 @@ struct PendingResponsesFunctionCall {
 }
 
 impl ResponsesFunctionCallAccumulator {
+    /// Create an empty accumulator.
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
@@ -639,6 +783,7 @@ impl ResponsesFunctionCallAccumulator {
         }
     }
 
+    /// Append a function-call arguments delta for `item_id`.
     pub fn push_args_delta(&mut self, item_id: &str, delta: &str) {
         self.pending
             .entry(item_id.to_string())
@@ -702,6 +847,7 @@ pub struct ResponsesTransport {
 }
 
 impl ResponsesTransport {
+    /// Create a transport from a client, key, and endpoint.
     pub fn new(client: Arc<Client>, api_key: Arc<String>, endpoint: Arc<String>) -> Self {
         Self {
             client,
@@ -710,6 +856,7 @@ impl ResponsesTransport {
         }
     }
 
+    /// Run a non-streaming Responses call.
     pub async fn complete(
         &self,
         persona: Option<String>,
@@ -766,6 +913,7 @@ impl ResponsesTransport {
         Ok(resp)
     }
 
+    /// Run a streaming Responses call.
     pub async fn stream_complete(
         &self,
         persona: Option<String>,

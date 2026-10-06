@@ -1,3 +1,5 @@
+//! Convenience re-exports for `use react::prelude::*`.
+
 pub use crate::engine::{BuilderError, ReActEngine, ReActEngineBuilder, ReactError};
 pub use crate::llm::StreamResponseAccumulator;
 pub use crate::llm::{
