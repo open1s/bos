@@ -7,6 +7,7 @@ pub mod prelude;
 pub mod resilience;
 pub mod runtime;
 pub mod telemetry;
+pub mod template;
 pub mod tool;
 pub mod utils;
 

@@ -188,11 +188,8 @@ impl Agent {
         let Some(query) = task.as_text() else {
             return base;
         };
-        match self.recalled_context(query).await {
-            Some(memory) if base.is_empty() => memory,
-            Some(memory) => format!("{base}\n\n{memory}"),
-            None => base,
-        }
+        let memory = self.recalled_context(query).await;
+        react::template::with_memory(&base, memory.as_deref())
     }
 
     /// Run the agent using ReAct engine. Uses the agent's existing session

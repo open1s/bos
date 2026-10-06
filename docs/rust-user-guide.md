@@ -514,6 +514,32 @@ assert!(context.unwrap().contains("VPN"));
 Non-text input (images or audio only) has no query to match, so recall is
 skipped and the configured system prompt is used unchanged.
 
+### Placing Recall in the Prompt
+
+By default the memory block is appended to the system prompt. Put a
+`{{memory}}` placeholder in the configured prompt to choose where it
+goes; the placeholder is removed when nothing is recalled:
+
+```rust
+let mut agent = Agent::from_config(
+    AgentConfig::default().system_prompt("Rules.\n\n{{memory}}\n\nAct."),
+);
+```
+
+`react::template` also renders general `{{name}}` placeholders, which
+is useful for building prompts from configuration:
+
+```rust
+use react::prelude::PromptTemplate;
+use std::collections::BTreeMap;
+
+let template = PromptTemplate::new("You are {{name}}, a {{role}}.");
+let mut vars = BTreeMap::new();
+vars.insert("name", "Ada");
+vars.insert("role", "pair programmer");
+assert_eq!(template.render(&vars)?, "You are Ada, a pair programmer.");
+```
+
 ---
 
 ## Bus Communication

@@ -14,6 +14,9 @@ pub use crate::telemetry::{
     BudgetStatus, Telemetry, TelemetryEvent, TokenBudgetConfig, TokenBudgetReport, TokenCounter,
     TokenUsage,
 };
+pub use crate::template::{
+    render_template, with_memory, PromptTemplate, TemplateError, MEMORY_PLACEHOLDER,
+};
 pub use crate::tool::{Tool, ToolError, ToolRegistry};
 pub use crate::utils::Arena as StreamArena;
 pub use crate::utils::Span as StreamSpan;

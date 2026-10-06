@@ -150,7 +150,7 @@ const result = await agent.ask('What is 2+2?');
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
 - Current green baselines:
-  - Rust (excluding the binding crates): 424 passed, 0 failed, 8 ignored
+  - Rust (excluding the binding crates): 429 passed, 0 failed, 8 ignored
   - Python (`cd crates/nbos && pytest -m "not llm"`): 229 passed, 4 deselected
   - JS (`cd crates/jsbos && npx ava`): 94 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 14 memory)
 
@@ -189,6 +189,10 @@ const result = await agent.ask('What is 2+2?');
   bounded by a recall limit. `Memory.search` accepts a metadata filter and
   `with_max_items`/`withMaxItems` caps the store. `Memory.save`/`Memory.load`
   read and write the same JSON-lines format as the Rust `FileMemory`.
+- **Templates**: `react::template` renders `{{name}}` prompts with
+  `PromptTemplate`/`render_template` and places recall with `with_memory`;
+  the agent substitutes a `{{memory}}` placeholder in the system prompt and
+  appends the block when there is none.
 - **Bindings**: Python and JS share one canonical vocabulary — `publish_text`/
   `publish_json`, `ask`/`ask_json`, `call`/`call_json`, `handle`/`start`/`run`/
   `run_json`, `recv`/`recv_json`. Python keeps the legacy `create_*`/`publish_*`
