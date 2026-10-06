@@ -1,3 +1,9 @@
+//! Node.js bindings for the bos agent framework.
+//!
+//! Exposes the agent, bus, configuration, MCP, and plugin surfaces as napi
+//! classes so JavaScript programs can build agents and message over the bus.
+#![warn(missing_docs)]
+
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi::Unknown;
 use napi_derive::napi;
@@ -42,16 +48,19 @@ pub use perf::PerfSnapshot;
 // Note: logging is a dependency but used in binaries
 
 #[napi]
+/// Return the binding version.
 pub fn version() -> String {
   env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[napi]
+/// Initialize tracing for the process.
 pub fn init_tracing() {
   logging::auto_init_tracing();
 }
 
 #[napi]
+/// Emit a test log message.
 pub fn log_test_message(message: String) {
   logging::log_test_message(&message);
 }

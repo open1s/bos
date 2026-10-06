@@ -3,6 +3,7 @@ use napi_derive::napi;
 use std::sync::Mutex;
 
 #[napi]
+/// Loads layered configuration.
 pub struct ConfigLoader {
   inner: Mutex<config::loader::ConfigLoader>,
 }
@@ -10,6 +11,7 @@ pub struct ConfigLoader {
 #[napi]
 impl ConfigLoader {
   #[napi(constructor)]
+  /// Create a loader with default discovery.
   pub fn new() -> Result<Self> {
     Ok(ConfigLoader {
       inner: Mutex::new(config::loader::ConfigLoader::new()),
@@ -17,6 +19,7 @@ impl ConfigLoader {
   }
 
   #[napi]
+  /// Discover configuration files.
   pub fn discover(&self) -> Result<()> {
     let mut guard = self
       .inner
@@ -27,6 +30,7 @@ impl ConfigLoader {
   }
 
   #[napi]
+  /// Add a configuration file.
   pub fn add_file(&self, path: String) -> Result<()> {
     let mut guard = self
       .inner
@@ -37,6 +41,7 @@ impl ConfigLoader {
   }
 
   #[napi]
+  /// Add a configuration directory.
   pub fn add_directory(&self, path: String) -> Result<()> {
     let mut guard = self
       .inner
@@ -49,6 +54,7 @@ impl ConfigLoader {
   }
 
   #[napi]
+  /// Merge an inline JSON object.
   pub fn add_inline(&self, data: serde_json::Value) -> Result<()> {
     let mut guard = self
       .inner
@@ -59,6 +65,7 @@ impl ConfigLoader {
   }
 
   #[napi]
+  /// Reset the loader to an empty state.
   pub fn reset(&self) -> Result<()> {
     let mut guard = self
       .inner
@@ -69,6 +76,7 @@ impl ConfigLoader {
   }
 
   #[napi]
+  /// Load and return the merged config as JSON.
   pub fn load_sync(&self) -> Result<String> {
     let mut guard = self
       .inner
@@ -81,6 +89,7 @@ impl ConfigLoader {
   }
 
   #[napi]
+  /// Reload sources and return the merged config as JSON.
   pub fn reload_sync(&self) -> Result<String> {
     let mut guard = self
       .inner

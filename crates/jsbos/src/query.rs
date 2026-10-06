@@ -32,6 +32,7 @@ fn call_string_handler(
 }
 
 #[napi]
+/// Runs queries against a queryable.
 pub struct Query {
   pub(crate) inner: bus::Query,
 }
@@ -39,6 +40,7 @@ pub struct Query {
 #[napi]
 impl Query {
   #[napi(factory)]
+  /// Create a query for `topic`.
   pub async fn new(topic: String) -> Result<Self> {
     Ok(Query {
       inner: bus::Query::new(topic),
@@ -46,6 +48,7 @@ impl Query {
   }
 
   #[napi(factory)]
+  /// Create a query bound to `session`.
   pub async fn with_session(topic: String, session: &External<bus::Session>) -> Result<Self> {
     let query = bus::Query::new(topic)
       .with_session(Arc::new((**session).clone()))
@@ -55,11 +58,13 @@ impl Query {
   }
 
   #[napi(getter)]
+  /// The queried topic.
   pub fn topic(&self) -> String {
     self.inner.topic().to_string()
   }
 
   #[napi]
+  /// Query the handler and return its text result.
   pub async fn query_text(&self, payload: String) -> Result<String> {
     let out = self
       .inner
@@ -70,6 +75,7 @@ impl Query {
   }
 
   #[napi]
+  /// Query the handler, waiting up to `timeout_ms`.
   pub async fn query_text_timeout_ms(&self, payload: String, timeout_ms: i64) -> Result<String> {
     let out = self
       .inner
@@ -85,6 +91,7 @@ impl Query {
 
 #[allow(dead_code)]
 #[napi]
+/// Serves queries over the bus.
 pub struct Queryable {
   pub(crate) inner: Arc<tokio::sync::Mutex<bus::QueryableWrapper<String, String>>>,
   pub(crate) handler: crate::StringHandlerSlot,
@@ -94,6 +101,7 @@ pub struct Queryable {
 #[napi]
 impl Queryable {
   #[napi(factory)]
+  /// Create a queryable for `topic`.
   pub async fn new(topic: String) -> Result<Self> {
     let mut wrapper = bus::QueryableWrapper::<String, String>::new(topic);
     wrapper
@@ -107,6 +115,7 @@ impl Queryable {
   }
 
   #[napi]
+  /// Set the handler invoked for each query.
   pub fn set_handler(
     &self,
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
@@ -117,6 +126,7 @@ impl Queryable {
   }
 
   #[napi]
+  /// Start serving with the configured handler.
   pub async fn start(&self) -> Result<()> {
     let mut guard = self.inner.lock().await;
 
@@ -136,6 +146,7 @@ impl Queryable {
   }
 
   #[napi]
+  /// Set `handler` and start serving.
   pub async fn run(
     &self,
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
@@ -157,6 +168,7 @@ impl Queryable {
   }
 
   #[napi]
+  /// Set `handler` and start serving JSON.
   pub async fn run_json(
     &self,
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
@@ -173,6 +185,7 @@ impl Queryable {
   }
 
   #[napi]
+  /// Set `handler` and start serving streaming results.
   pub async fn run_stream(
     &self,
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,

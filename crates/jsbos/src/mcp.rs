@@ -2,6 +2,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 #[napi]
+/// A client for a Model Context Protocol server.
 pub struct McpClient {
   inner: std::sync::Arc<agent::mcp::McpClient>,
 }
@@ -9,6 +10,7 @@ pub struct McpClient {
 #[napi]
 impl McpClient {
   #[napi(factory)]
+  /// Spawn a stdio MCP server.
   pub async fn spawn(command: String, args: Vec<String>) -> Result<Self> {
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let client = agent::mcp::McpClient::spawn(&command, &args_ref)
@@ -20,6 +22,7 @@ impl McpClient {
   }
 
   #[napi(factory)]
+  /// Create a client for an HTTP MCP endpoint.
   pub fn connect_http(url: String) -> Self {
     let client = agent::mcp::McpClient::connect_http(&url);
     McpClient {
@@ -28,6 +31,7 @@ impl McpClient {
   }
 
   #[napi]
+  /// Initialize the session and return server capabilities.
   pub async fn initialize(&self) -> Result<serde_json::Value> {
     let caps = self
       .inner
@@ -38,6 +42,7 @@ impl McpClient {
   }
 
   #[napi]
+  /// List the tools the server exposes.
   pub async fn list_tools(&self) -> Result<Vec<serde_json::Value>> {
     let tools = self
       .inner
@@ -58,6 +63,7 @@ impl McpClient {
   }
 
   #[napi]
+  /// Call a tool by name.
   pub async fn call_tool(&self, name: String, args_json: String) -> Result<serde_json::Value> {
     let args: serde_json::Value = serde_json::from_str(&args_json)
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
@@ -70,6 +76,7 @@ impl McpClient {
   }
 
   #[napi]
+  /// List the prompts the server exposes.
   pub async fn list_prompts(&self) -> Result<Vec<serde_json::Value>> {
     let prompts = self.inner.list_prompts().await;
     let prompts_json: Vec<serde_json::Value> = prompts
@@ -86,6 +93,7 @@ impl McpClient {
   }
 
   #[napi]
+  /// List the resources the server exposes.
   pub async fn list_resources(&self) -> Result<Vec<serde_json::Value>> {
     let resources = self
       .inner
@@ -107,6 +115,7 @@ impl McpClient {
   }
 
   #[napi]
+  /// Read a resource by URI.
   pub async fn read_resource(&self, uri: String) -> Result<serde_json::Value> {
     let result = self
       .inner

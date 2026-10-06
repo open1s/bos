@@ -32,6 +32,7 @@ fn call_string_handler(
 }
 
 #[napi]
+/// Issues request/response calls over the bus.
 pub struct Caller {
   pub(crate) inner: bus::Caller,
 }
@@ -39,6 +40,7 @@ pub struct Caller {
 #[napi]
 impl Caller {
   #[napi(factory)]
+  /// Create a caller without a session.
   pub async fn new(name: String) -> Result<Self> {
     Ok(Caller {
       inner: bus::Caller::new(name, None),
@@ -46,6 +48,7 @@ impl Caller {
   }
 
   #[napi(factory)]
+  /// Create a caller bound to `session`.
   pub async fn with_session(name: String, session: &External<Arc<bus::Session>>) -> Result<Self> {
     Ok(Caller {
       inner: bus::Caller::new(name, Some(Arc::clone(&**session))),
@@ -53,6 +56,7 @@ impl Caller {
   }
 
   #[napi]
+  /// Call the handler and return its text result.
   pub async fn call_text(&self, payload: String) -> Result<String> {
     let out = self
       .inner
@@ -64,6 +68,7 @@ impl Caller {
 }
 
 #[napi]
+/// Serves callable requests over the bus.
 pub struct Callable {
   inner: Arc<tokio::sync::Mutex<Option<bus::Callable<String, String>>>>,
   pub(crate) handler: crate::StringHandlerSlot,
@@ -81,6 +86,7 @@ impl Callable {
   }
 
   #[napi]
+  /// Set the handler invoked for each call.
   pub fn set_handler(
     &self,
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
@@ -91,11 +97,13 @@ impl Callable {
   }
 
   #[napi]
+  /// Whether the callable has started.
   pub fn is_started(&self) -> bool {
     self.is_started.load(std::sync::atomic::Ordering::Relaxed)
   }
 
   #[napi]
+  /// Start serving with the configured handler.
   pub async fn start(&self) -> Result<()> {
     if self.is_started.load(std::sync::atomic::Ordering::Relaxed) {
       return Err(napi::Error::new(
@@ -131,6 +139,7 @@ impl Callable {
   }
 
   #[napi]
+  /// Set `handler` and start serving.
   pub async fn run(
     &self,
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
@@ -143,6 +152,7 @@ impl Callable {
   }
 
   #[napi]
+  /// Set `handler` and start serving JSON.
   pub async fn run_json(
     &self,
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,

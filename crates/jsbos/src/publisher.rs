@@ -3,6 +3,7 @@ use napi_derive::napi;
 use std::sync::Arc;
 
 #[napi]
+/// Publishes messages to a topic.
 pub struct Publisher {
   pub(crate) inner: bus::Publisher,
 }
@@ -10,6 +11,7 @@ pub struct Publisher {
 #[napi]
 impl Publisher {
   #[napi(factory)]
+  /// Create a publisher for `topic`.
   pub async fn new(topic: String) -> Result<Self> {
     Ok(Publisher {
       inner: bus::Publisher::new(topic),
@@ -17,6 +19,7 @@ impl Publisher {
   }
 
   #[napi(factory)]
+  /// Create a publisher bound to `session`.
   pub async fn with_session(topic: String, session: &External<bus::Session>) -> Result<Self> {
     Ok(Publisher {
       inner: bus::Publisher::new(topic)
@@ -26,11 +29,13 @@ impl Publisher {
   }
 
   #[napi(getter)]
+  /// The published topic.
   pub fn topic(&self) -> String {
     self.inner.topic().to_string()
   }
 
   #[napi]
+  /// Publish a text payload.
   pub async fn publish_text(&self, payload: String) -> Result<()> {
     self
       .inner
@@ -41,6 +46,7 @@ impl Publisher {
   }
 
   #[napi]
+  /// Publish a JSON payload.
   pub async fn publish_json(&self, data: serde_json::Value) -> Result<()> {
     let json_str = data.to_string();
     self

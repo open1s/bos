@@ -10,20 +10,32 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[napi]
+/// Agent lifecycle events hooks can observe.
 pub enum HookEvent {
+  /// Before a tool call.
   BeforeToolCall,
+  /// After a tool call.
   AfterToolCall,
+  /// Before an LLM call.
   BeforeLlmCall,
+  /// After an LLM call.
   AfterLlmCall,
+  /// When a message is added.
   OnMessage,
+  /// When a run completes.
   OnComplete,
+  /// When an error occurs.
   OnError,
 }
 
 #[napi]
+/// A hook verdict.
 pub enum HookDecision {
+  /// Continue the run.
   Continue,
+  /// Abort the run.
   Abort,
+  /// Fail the run.
   Error,
 }
 
@@ -38,8 +50,11 @@ impl From<HookDecision> for agent::agent::hooks::HookDecision {
 }
 
 #[napi(object)]
+/// Context passed to a hook.
 pub struct HookContextData {
+  /// Agent the hook is running for.
   pub agent_id: String,
+  /// Arbitrary string data.
   pub data: HashMap<String, String>,
 }
 
@@ -126,6 +141,7 @@ impl AgentHook for JSHook {
 }
 
 #[napi]
+/// Registry of agent hooks.
 pub struct HookRegistry {
   inner: InnerHookRegistry,
 }
@@ -139,21 +155,25 @@ impl Default for HookRegistry {
 #[napi]
 impl HookRegistry {
   #[napi(constructor)]
+  /// Create an empty registry.
   pub fn new() -> Self {
     Self {
       inner: InnerHookRegistry::new(),
     }
   }
 
+  /// Clone the underlying registry.
   pub fn clone_inner(&self) -> InnerHookRegistry {
     self.inner.clone()
   }
 
+  /// Mutable access to the underlying registry.
   pub fn inner_mut(&mut self) -> &mut InnerHookRegistry {
     &mut self.inner
   }
 
   #[napi]
+  /// Register `callback` for `event`.
   pub async fn register(
     &self,
     event: HookEvent,

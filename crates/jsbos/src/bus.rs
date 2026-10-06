@@ -5,10 +5,15 @@ use std::sync::Arc;
 pub use bus::Session;
 
 #[napi(object)]
+/// JavaScript-facing bus configuration.
 pub struct BusConfig {
+  /// Transport mode.
   pub mode: String,
+  /// Endpoints to connect to.
   pub connect: Option<Vec<String>>,
+  /// Endpoints to listen on.
   pub listen: Option<Vec<String>>,
+  /// Peer endpoint for peer mode.
   pub peer: Option<String>,
 }
 
@@ -58,6 +63,7 @@ impl From<BusConfig> for bus::BusConfig {
 }
 
 #[napi]
+/// A handle to the message bus.
 pub struct Bus {
   inner: Arc<tokio::sync::Mutex<bus::Bus>>,
 }
@@ -65,6 +71,7 @@ pub struct Bus {
 #[napi]
 impl Bus {
   #[napi(factory)]
+  /// Create a bus from an optional configuration.
   pub async fn create(config: Option<BusConfig>) -> Result<Bus> {
     let cfg: BusConfig = config.unwrap_or_default();
     let bus = bus::Bus::from(cfg.into()).await;
@@ -75,17 +82,20 @@ impl Bus {
   }
 
   #[napi]
+  /// Return a handle to the bus session.
   pub async fn session(&self) -> External<Arc<bus::Session>> {
     let guard = self.inner.lock().await;
     External::new(Arc::clone(&guard.session()))
   }
 
   #[napi]
+  /// Return the session identifier.
   pub fn session_id(&self) -> String {
     "session".to_string()
   }
 
   #[napi]
+  /// Publish a text payload to `topic`.
   pub async fn publish_text(&self, topic: String, payload: String) -> Result<()> {
     let mut guard = self.inner.lock().await;
     guard
@@ -96,6 +106,7 @@ impl Bus {
   }
 
   #[napi]
+  /// Publish a JSON payload to `topic`.
   pub async fn publish_json(&self, topic: String, data: serde_json::Value) -> Result<()> {
     let json_str = data.to_string();
     let mut guard = self.inner.lock().await;
@@ -107,6 +118,7 @@ impl Bus {
   }
 
   #[napi]
+  /// Create a publisher bound to the bus session.
   pub async fn create_publisher(&self, topic: String) -> Result<crate::Publisher> {
     let session = {
       let guard = self.inner.lock().await;
@@ -119,6 +131,7 @@ impl Bus {
   }
 
   #[napi]
+  /// Create a subscriber bound to the bus session.
   pub async fn create_subscriber(&self, topic: String) -> Result<crate::Subscriber> {
     let session = {
       let guard = self.inner.lock().await;
@@ -135,6 +148,7 @@ impl Bus {
   }
 
   #[napi]
+  /// Create a query bound to the bus session.
   pub async fn create_query(&self, topic: String) -> Result<crate::Query> {
     let session = {
       let guard = self.inner.lock().await;
@@ -148,6 +162,7 @@ impl Bus {
   }
 
   #[napi]
+  /// Create a queryable bound to the bus session.
   pub async fn create_queryable(&self, topic: String) -> Result<crate::Queryable> {
     let session = {
       let guard = self.inner.lock().await;
@@ -169,6 +184,7 @@ impl Bus {
   }
 
   #[napi]
+  /// Create a caller bound to the bus session.
   pub async fn create_caller(&self, name: String) -> Result<crate::Caller> {
     let session = {
       let guard = self.inner.lock().await;
@@ -180,6 +196,7 @@ impl Bus {
   }
 
   #[napi]
+  /// Create a callable bound to the bus session.
   pub async fn create_callable(&self, uri: String) -> Result<crate::Callable> {
     let session = {
       let guard = self.inner.lock().await;

@@ -17,10 +17,15 @@ use std::sync::Arc;
 use crate::jsany::JSAny;
 
 #[napi]
+/// The stage at which a plugin runs.
 pub enum PluginStage {
+  /// Before a request is sent.
   PreRequest,
+  /// After a response is received.
   PostResponse,
+  /// Before a tool executes.
   PreExecute,
+  /// After a tool executes.
   PostExecute,
 }
 
@@ -39,15 +44,25 @@ fn json_to_content(json: &serde_json::Value) -> Content {
 }
 
 #[napi(object)]
+/// View of an outgoing LLM request.
 pub struct PluginLlmRequest {
+  /// Prompt input.
   pub input: String,
+  /// Model identifier.
   pub model: String,
+  /// Sampling temperature.
   pub temperature: Option<f64>,
+  /// Completion token cap.
   pub max_tokens: Option<u32>,
+  /// Nucleus sampling probability.
   pub top_p: Option<f64>,
+  /// Top-k sampling cutoff.
   pub top_k: Option<u32>,
+  /// Reasoning effort, if any.
   pub reasoning_effort: Option<String>,
+  /// API protocol.
   pub api_mode: String,
+  /// Arbitrary metadata.
   pub metadata: HashMap<String, String>,
 }
 
@@ -98,17 +113,28 @@ impl From<LlmRequestWrapper> for PluginLlmRequest {
 }
 
 #[napi]
+/// An LLM response seen by a plugin.
 pub enum PluginLlmResponse {
+  /// An OpenAI chat-completions response.
   OpenAI {
+    /// Response id.
     id: String,
+    /// Model identifier.
     model: String,
+    /// Text content, if any.
     content: Option<String>,
+    /// Response kind.
     response_type: Option<String>,
   },
+  /// An OpenAI Responses API response.
   Responses {
+    /// Response id.
     id: String,
+    /// Model identifier.
     model: String,
+    /// Text content, if any.
     content: Option<String>,
+    /// Response kind.
     response_type: Option<String>,
   },
 }
@@ -221,10 +247,15 @@ impl From<LlmResponseWrapper> for PluginLlmResponse {
 }
 
 #[napi(object)]
+/// View of a tool call.
 pub struct PluginToolCall {
+  /// Tool name.
   pub name: String,
+  /// JSON-encoded arguments.
   pub args: String,
+  /// Provider call id.
   pub id: Option<String>,
+  /// Arbitrary metadata.
   pub metadata: HashMap<String, String>,
 }
 
@@ -252,10 +283,15 @@ impl From<ToolCallWrapper> for PluginToolCall {
 }
 
 #[napi(object)]
+/// View of a tool result.
 pub struct PluginToolResult {
+  /// Serialized tool result.
   pub result: String,
+  /// Whether the call succeeded.
   pub success: bool,
+  /// Error message, if the call failed.
   pub error: Option<String>,
+  /// Arbitrary metadata.
   pub metadata: HashMap<String, String>,
 }
 
@@ -622,6 +658,7 @@ impl AgentPlugin for JSPlugin {
 }
 
 #[napi]
+/// Registry of agent plugins.
 pub struct PluginRegistry {
   inner: InnerPluginRegistry,
 }
@@ -635,21 +672,25 @@ impl Default for PluginRegistry {
 #[napi]
 impl PluginRegistry {
   #[napi(constructor)]
+  /// Create an empty registry.
   pub fn new() -> Self {
     Self {
       inner: InnerPluginRegistry::new(),
     }
   }
 
+  /// Clone the underlying registry.
   pub fn clone_inner(&self) -> InnerPluginRegistry {
     self.inner.clone()
   }
 
+  /// The underlying registry.
   pub fn inner(&self) -> &InnerPluginRegistry {
     &self.inner
   }
 
   #[napi]
+  /// Remove all registered plugins.
   pub fn clear(&self) {
     self.inner.clear();
   }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::jsany::JSAny;
 
 #[napi]
+/// Subscribes to a topic.
 pub struct Subscriber {
   pub(crate) inner: Arc<tokio::sync::Mutex<bus::Subscriber<String>>>,
   pub(crate) running: Arc<AtomicBool>,
@@ -15,6 +16,7 @@ pub struct Subscriber {
 #[napi]
 impl Subscriber {
   #[napi(factory)]
+  /// Create a subscriber for `topic`.
   pub async fn new(topic: String) -> Result<Self> {
     Ok(Subscriber {
       inner: Arc::new(tokio::sync::Mutex::new(bus::Subscriber::new(topic))),
@@ -23,6 +25,7 @@ impl Subscriber {
   }
 
   #[napi(factory)]
+  /// Create a subscriber bound to `session`.
   pub async fn with_session(topic: String, session: &External<bus::Session>) -> Result<Self> {
     let sub = bus::Subscriber::<String>::new(topic)
       .with_session(Arc::new((**session).clone()))
@@ -35,17 +38,20 @@ impl Subscriber {
   }
 
   #[napi(getter)]
+  /// The subscribed topic.
   pub fn topic(&self) -> String {
     self.inner.blocking_lock().topic().to_string()
   }
 
   #[napi]
+  /// Receive the next message.
   pub async fn recv(&self) -> Result<Option<String>> {
     let mut guard = self.inner.lock().await;
     Ok(guard.recv().await)
   }
 
   #[napi]
+  /// Receive the next message, waiting up to `timeout_ms`.
   pub async fn recv_with_timeout_ms(&self, timeout_ms: i64) -> Result<Option<String>> {
     let mut guard = self.inner.lock().await;
     Ok(
@@ -56,6 +62,7 @@ impl Subscriber {
   }
 
   #[napi]
+  /// Receive the next message parsed as JSON.
   pub async fn recv_json_with_timeout_ms(
     &self,
     timeout_ms: i64,
@@ -75,6 +82,7 @@ impl Subscriber {
   }
 
   #[napi]
+  /// Deliver messages to `handler` until stopped.
   pub async fn run(&self, handler: ThreadsafeFunction<JSAny>) -> Result<()> {
     let inner = self.inner.clone();
     let tsfn = Arc::new(handler);
@@ -116,6 +124,7 @@ impl Subscriber {
   }
 
   #[napi]
+  /// Deliver messages parsed as JSON to `handler`.
   pub async fn run_json(&self, handler: ThreadsafeFunction<JSAny>) -> Result<()> {
     let inner = self.inner.clone();
     let tsfn = Arc::new(handler);
@@ -159,6 +168,7 @@ impl Subscriber {
   }
 
   #[napi]
+  /// Stop the delivery loop.
   pub async fn stop(&self) -> Result<()> {
     self.running.store(false, Ordering::SeqCst);
     let mut guard = self.inner.lock().await;

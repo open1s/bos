@@ -166,38 +166,57 @@ pub struct StopOptions {
 }
 
 #[napi(object)]
+/// Configuration for an agent.
 pub struct AgentConfig {
+  /// Agent name.
   pub name: String,
+  /// Model identifier.
   pub model: String,
+  /// LLM API base URL.
   #[napi(js_name = "baseUrl")]
   pub base_url: String,
+  /// LLM API key.
   #[napi(js_name = "apiKey")]
   pub api_key: String,
+  /// System prompt.
   #[napi(js_name = "systemPrompt")]
   pub system_prompt: String,
+  /// Sampling temperature.
   pub temperature: f64,
+  /// Completion token cap.
   #[napi(js_name = "maxTokens")]
   pub max_tokens: Option<i32>,
+  /// Per-request timeout in seconds.
   #[napi(js_name = "timeoutSecs")]
   pub timeout_secs: i64,
+  /// Maximum ReAct steps.
   #[napi(js_name = "maxSteps")]
   pub max_steps: Option<i64>,
+  /// API protocol.
   #[napi(js_name = "apiMode")]
   pub api_mode: Option<String>,
+  /// Reasoning effort, if any.
   #[napi(js_name = "reasoningEffort")]
   pub reasoning_effort: Option<String>,
+  /// Circuit breaker failure threshold.
   #[napi(js_name = "circuitBreakerMaxFailures")]
   pub circuit_breaker_max_failures: Option<i32>,
+  /// Circuit breaker cooldown in seconds.
   #[napi(js_name = "circuitBreakerCooldownSecs")]
   pub circuit_breaker_cooldown_secs: Option<i64>,
+  /// Rate limiter burst capacity.
   #[napi(js_name = "rateLimitCapacity")]
   pub rate_limit_capacity: Option<i32>,
+  /// Rate limiter window in seconds.
   #[napi(js_name = "rateLimitWindowSecs")]
   pub rate_limit_window_secs: Option<i64>,
+  /// Maximum retries when rate limited.
   #[napi(js_name = "rateLimitMaxRetries")]
   pub rate_limit_max_retries: Option<i32>,
+  /// Retry backoff in seconds.
   #[napi(js_name = "rateLimitRetryBackoffSecs")]
   pub rate_limit_retry_backoff_secs: Option<i64>,
+  /// Whether to wait automatically when rate limited.
   #[napi(js_name = "rateLimitAutoWait")]
   pub rate_limit_auto_wait: Option<bool>,
 }
@@ -282,6 +301,7 @@ impl From<AgentConfig> for agent::AgentConfig {
 }
 
 #[napi]
+/// A JavaScript-facing agent.
 pub struct Agent {
   inner: Arc<Mutex<agent::Agent>>,
   bus_session: Option<Arc<crate::Session>>,
@@ -295,6 +315,7 @@ pub struct Agent {
 #[napi]
 impl Agent {
   #[napi(factory)]
+  /// Create an agent from `config`.
   pub async fn create(config: AgentConfig) -> Result<Self> {
     let mut cfg: agent::AgentConfig = config.into();
     agent::agent::config::apply_model_defaults(&mut cfg);
@@ -318,6 +339,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Create an agent from `config`, using `bus`.
   pub async fn create_with_bus(
     config: AgentConfig,
     _bus: &External<Arc<crate::Session>>,
@@ -346,6 +368,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Run a single task and return the answer.
   pub async fn run_simple(&self, task: Either<String, Vec<JsContent>>) -> Result<String> {
     if self.is_running.load(Ordering::SeqCst) {
       return Err(Error::new(
@@ -373,6 +396,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Run the ReAct loop for `task`.
   pub async fn react(&self, task: Either<String, Vec<JsContent>>) -> Result<String> {
     if self.is_running.load(Ordering::SeqCst) {
       return Err(Error::new(
@@ -400,6 +424,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Return the effective agent configuration.
   pub fn config(&self) -> Result<serde_json::Value> {
     let guard = self.inner.blocking_lock();
     let cfg = guard.config();
@@ -417,6 +442,7 @@ impl Agent {
   }
 
   #[napi]
+  /// List registered tool names.
   pub fn list_tools(&self) -> Result<Vec<String>> {
     let guard = self.inner.blocking_lock();
     if let Some(registry) = guard.registry() {
@@ -435,6 +461,7 @@ impl Agent {
   }
 
   #[napi]
+  /// List registered async tool names.
   pub fn list_async_tools(&self) -> Result<Vec<String>> {
     let guard = self.inner.blocking_lock();
     if let Some(registry) = guard.registry() {
@@ -445,6 +472,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Register `hook` for `event`.
   pub fn register_hook(
     &self,
     event: HookEvent,
@@ -476,6 +504,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Register `plugin` with the agent.
   pub fn register_plugin(
     &self,
     name: String,
@@ -508,6 +537,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Close the agent and release resources.
   pub fn close(&self) -> Result<()> {
     let mut guard = self.inner.blocking_lock();
     guard.clear_runtime_extensions();
@@ -518,6 +548,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Stop the running agent.
   pub fn stop(&self, options: Option<StopOptions>) -> Result<serde_json::Value> {
     let was_running = self.is_running.load(Ordering::SeqCst);
     self.stop_flag.store(true, Ordering::SeqCst);
@@ -535,12 +566,14 @@ impl Agent {
   }
 
   #[napi]
+  /// Whether the agent is running.
   pub fn is_running(&self) -> Result<bool> {
     Ok(self.is_running.load(Ordering::SeqCst))
   }
 
   #[allow(clippy::too_many_arguments)] // positional JS arguments; a struct would change the JS API
   #[napi]
+  /// Register a tool implemented in JavaScript.
   pub async fn add_tool(
     &self,
     name: String,
@@ -569,6 +602,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Register a sandboxed bash tool.
   pub async fn add_bash_tool(&self, name: String, workspace_root: Option<String>) -> Result<()> {
     let tool = if let Some(root) = workspace_root {
       BashTool::new(&name).with_workspace(&root)
@@ -583,6 +617,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Register skills discovered in `dir_path`.
   pub async fn register_skills_from_dir(&self, dir_path: String) -> Result<()> {
     let mut guard = self.inner.lock().await;
     guard
@@ -591,6 +626,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Add a stdio MCP server.
   pub async fn add_mcp_server(
     &self,
     namespace: String,
@@ -617,6 +653,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Add an HTTP MCP server under `namespace`.
   pub async fn add_mcp_server_http(&self, namespace: String, url: String) -> Result<()> {
     let client = agent::mcp::McpClient::connect_http(&url);
     let client = std::sync::Arc::new(client);
@@ -634,6 +671,7 @@ impl Agent {
   }
 
   #[napi]
+  /// List tools across all MCP servers.
   pub async fn list_mcp_tools(&self) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
     Ok(
@@ -645,6 +683,7 @@ impl Agent {
   }
 
   #[napi]
+  /// List resources for an MCP namespace.
   pub async fn list_mcp_resources(&self, namespace: String) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
     Ok(
@@ -656,6 +695,7 @@ impl Agent {
   }
 
   #[napi]
+  /// List prompts across all MCP servers.
   pub async fn list_mcp_prompts(&self) -> Result<Vec<serde_json::Value>> {
     let guard = self.inner.lock().await;
     Ok(
@@ -667,6 +707,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Build an RPC client for this agent.
   pub async fn rpc_client(
     &self,
     endpoint: String,
@@ -686,6 +727,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Serve this agent as a callable server.
   pub async fn as_callable_server(
     &self,
     endpoint: String,
@@ -709,6 +751,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Run `task` and stream tokens to `callback`.
   pub async fn stream(
     &self,
     task: Either<String, Vec<JsContent>>,
@@ -831,6 +874,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Return the session history as JSON.
   pub fn get_session_json(&self) -> Result<String> {
     let guard = self.inner.blocking_lock();
     let session = guard.session();
@@ -841,11 +885,13 @@ impl Agent {
   }
 
   #[napi]
+  /// Export the session as JSON.
   pub fn export_session(&self) -> Result<String> {
     self.get_session_json()
   }
 
   #[napi]
+  /// Restore the session from JSON.
   pub fn restore_session_json(&self, json: String) -> Result<()> {
     let mut guard = self.inner.blocking_lock();
     let result = guard.session_mut().restore_from_json(&json);
@@ -856,12 +902,14 @@ impl Agent {
   }
 
   #[napi]
+  /// Save the session to `path`.
   pub fn save_session(&self, path: String) -> Result<()> {
     let json = self.get_session_json()?;
     std::fs::write(&path, json).map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
   #[napi]
+  /// Restore the session from `path`.
   pub fn restore_session_from_file(&self, path: String) -> Result<()> {
     let json = std::fs::read_to_string(&path)
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
@@ -869,6 +917,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Clear the session history.
   pub fn clear_session(&self) -> Result<()> {
     let mut guard = self.inner.blocking_lock();
     guard.session_mut().clear();
@@ -876,6 +925,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Compact the session, keeping recent turns.
   pub fn compact_session(&self, keep_recent: u32, max_summary_chars: u32) -> Result<()> {
     let mut guard = self.inner.blocking_lock();
     guard
@@ -935,6 +985,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Return a snapshot of performance metrics.
   pub fn get_perf_metrics(&self) -> crate::perf::PerfSnapshot {
     let guard = self.inner.blocking_lock();
     let cm = guard.metrics();
@@ -962,6 +1013,7 @@ impl Agent {
   }
 
   #[napi]
+  /// Reset all performance metrics.
   pub fn reset_perf_metrics(&self) {
     let guard = self.inner.blocking_lock();
     guard.reset_metrics();
@@ -970,18 +1022,21 @@ impl Agent {
 }
 
 #[napi]
+/// Client for calling a remote agent.
 pub struct AgentRpcClient {
   inner: std::sync::Arc<agent::bus::AgentRpcClient>,
 }
 
 #[napi]
 impl AgentRpcClient {
+  /// The RPC endpoint.
   #[napi(getter)]
   pub fn endpoint(&self) -> String {
     self.inner.endpoint().to_string()
   }
 
   #[napi]
+  /// List the remote tools.
   pub async fn list(&self) -> Result<serde_json::Value> {
     let tools = self
       .inner
@@ -992,6 +1047,7 @@ impl AgentRpcClient {
   }
 
   #[napi]
+  /// Call a remote tool.
   pub async fn call(&self, tool_name: String, args_json: String) -> Result<serde_json::Value> {
     let args: serde_json::Value = serde_json::from_str(&args_json)
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
@@ -1005,18 +1061,21 @@ impl AgentRpcClient {
 }
 
 #[napi]
+/// Serves calls for a JavaScript agent.
 pub struct AgentCallableServer {
   inner: std::sync::Arc<agent::bus::AgentCallableServer>,
 }
 
 #[napi]
 impl AgentCallableServer {
+  /// The server endpoint.
   #[napi(getter)]
   pub fn endpoint(&self) -> String {
     self.inner.endpoint().to_string()
   }
 
   #[napi]
+  /// Whether the server has started.
   pub fn is_started(&self) -> bool {
     true
   }
