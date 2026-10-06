@@ -473,6 +473,26 @@ Writes go through a sibling temporary file and an atomic rename, and a
 corrupt line makes `open` fail with `InvalidData` instead of silently
 dropping data.
 
+Recall can be scoped by metadata, and a file store can cap itself so it
+cannot grow without bound:
+
+```rust
+use agent::memory::MetadataFilter;
+use serde_json::json;
+
+// Only items whose metadata has {"env": "staging"} are recalled:
+let filter = MetadataFilter::new("env", json!("staging"));
+let scoped = memory.search_filtered("deploy", 5, Some(&filter)).await;
+
+// Or scope an attached agent's automatic recall (pass `None` to clear):
+agent.set_memory_filter(Some(filter));
+
+// A file store evicts its oldest items once it exceeds the cap:
+let bounded = FileMemory::open("./agent-memory.jsonl")
+    .await?
+    .with_max_items(1_000);
+```
+
 Attach a store to an agent and every run recalls matching items and
 appends them to the system prompt:
 

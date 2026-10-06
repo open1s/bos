@@ -62,6 +62,37 @@ fn now_millis() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Restrict recall to items whose metadata holds `key: value`.
+///
+/// Comparison is exact JSON equality, so a number filter does not match
+/// a string of the same digits. Items without metadata never match.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetadataFilter {
+    /// Metadata key to look up.
+    pub key: String,
+    /// Value the key must equal.
+    pub value: Value,
+}
+
+impl MetadataFilter {
+    /// Build a filter that matches `key == value`.
+    #[must_use]
+    pub fn new(key: impl Into<String>, value: Value) -> Self {
+        Self {
+            key: key.into(),
+            value,
+        }
+    }
+
+    /// Whether `item` carries this key with the expected value.
+    fn matches(&self, item: &MemoryItem) -> bool {
+        item.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(&self.key))
+            == Some(&self.value)
+    }
+}
+
 /// Pluggable storage for [`MemoryItem`]s.
 ///
 /// Implementations must be safe to share across tasks (`Send + Sync`) because
@@ -81,6 +112,27 @@ pub trait MemoryStore: Send + Sync {
     /// Implementations may return fewer than `limit` items, and an empty query
     /// means "most recent".
     async fn search(&self, query: &str, limit: usize) -> Vec<MemoryItem>;
+
+    /// Like [`MemoryStore::search`], but only considers items whose
+    /// metadata matches `filter`. `None` behaves like
+    /// [`MemoryStore::search`].
+    ///
+    /// The default implementation filters [`MemoryStore::all`] and ranks
+    /// the survivors, so backends override it only to filter more cheaply.
+    async fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: Option<&MetadataFilter>,
+    ) -> Vec<MemoryItem> {
+        let items: Vec<MemoryItem> = self
+            .all()
+            .await
+            .into_iter()
+            .filter(|item| filter.is_none_or(|filter| filter.matches(item)))
+            .collect();
+        rank(&items, query, limit)
+    }
 
     /// Remove the item with `id`, returning whether it existed.
     async fn remove(&self, id: &str) -> bool;
@@ -141,35 +193,22 @@ impl MemoryStore for InMemoryMemory {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Vec<MemoryItem> {
-        if limit == 0 {
-            return Vec::new();
-        }
+        self.search_filtered(query, limit, None).await
+    }
+
+    async fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: Option<&MetadataFilter>,
+    ) -> Vec<MemoryItem> {
         let items = self.items.read().unwrap_or_else(|e| e.into_inner());
-        let query_tokens = tokenize(query);
-        if query_tokens.is_empty() {
-            return items.iter().rev().take(limit).cloned().collect();
-        }
-        let mut scored: Vec<(usize, &MemoryItem)> = items
+        let filtered: Vec<MemoryItem> = items
             .iter()
-            .map(|item| {
-                let content_tokens = tokenize(&item.content);
-                let score = query_tokens
-                    .iter()
-                    .filter(|token| content_tokens.contains(*token))
-                    .count();
-                (score, item)
-            })
-            .filter(|(score, _)| *score > 0)
+            .filter(|item| filter.is_none_or(|filter| filter.matches(item)))
+            .cloned()
             .collect();
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then(b.1.created_at_ms.cmp(&a.1.created_at_ms))
-        });
-        scored
-            .into_iter()
-            .take(limit)
-            .map(|(_, item)| item.clone())
-            .collect()
+        rank(&filtered, query, limit)
     }
 
     async fn remove(&self, id: &str) -> bool {
@@ -189,6 +228,40 @@ impl MemoryStore for InMemoryMemory {
     async fn len(&self) -> usize {
         self.items.read().unwrap_or_else(|e| e.into_inner()).len()
     }
+}
+
+/// Rank `items` for `query`: one point per query token present in the
+/// content, ties toward the more recently created item, and a blank query
+/// yields the most recent `limit` items.
+fn rank(items: &[MemoryItem], query: &str, limit: usize) -> Vec<MemoryItem> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let query_tokens = tokenize(query);
+    if query_tokens.is_empty() {
+        return items.iter().rev().take(limit).cloned().collect();
+    }
+    let mut scored: Vec<(usize, &MemoryItem)> = items
+        .iter()
+        .map(|item| {
+            let content_tokens = tokenize(&item.content);
+            let score = query_tokens
+                .iter()
+                .filter(|token| content_tokens.contains(*token))
+                .count();
+            (score, item)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.created_at_ms.cmp(&a.1.created_at_ms))
+    });
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, item)| item.clone())
+        .collect()
 }
 
 /// Split text into lowercase alphanumeric tokens.

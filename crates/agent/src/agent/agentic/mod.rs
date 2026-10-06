@@ -3,7 +3,7 @@
 use crate::agent::context::{AgentReActApp, AgentReactContext, AgentSession};
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
 use crate::agent::plugin::{AgentPlugin, PluginRegistry, StreamTokenWrapper};
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryStore, MetadataFilter};
 use crate::session::AgentState;
 use crate::tools::FunctionTool;
 use crate::{AgentError, LlmClient, StreamToken, Tool, ToolRegistry};
@@ -194,6 +194,9 @@ pub struct Agent {
     memory: Option<Arc<dyn MemoryStore>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     memory_recall_limit: usize,
+    /// Metadata filter applied to memory recall, if any.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    memory_filter: Option<MetadataFilter>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     engine_cache: std::sync::Mutex<Option<ReActEngine<AgentReActApp>>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
@@ -225,6 +228,7 @@ impl Agent {
             bus: None,
             memory: None,
             memory_recall_limit: DEFAULT_MEMORY_RECALL_LIMIT,
+            memory_filter: None,
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
@@ -278,6 +282,14 @@ impl Agent {
         self.memory_recall_limit = limit;
     }
 
+    /// Restrict recall to items whose metadata matches `filter`.
+    ///
+    /// Build one with [`MetadataFilter::new`] to scope memory to a user,
+    /// project, or source; pass `None` to clear the restriction.
+    pub fn set_memory_filter(&mut self, filter: Option<MetadataFilter>) {
+        self.memory_filter = filter;
+    }
+
     /// Recall memories relevant to `query`, formatted as a block to
     /// append to the system prompt.
     ///
@@ -289,7 +301,9 @@ impl Agent {
         if self.memory_recall_limit == 0 || query.trim().is_empty() {
             return None;
         }
-        let hits = memory.search(query, self.memory_recall_limit).await;
+        let hits = memory
+            .search_filtered(query, self.memory_recall_limit, self.memory_filter.as_ref())
+            .await;
         if hits.is_empty() {
             return None;
         }
@@ -686,6 +700,7 @@ impl Clone for Agent {
             bus: self.bus.clone(),
             memory: self.memory.clone(),
             memory_recall_limit: self.memory_recall_limit,
+            memory_filter: self.memory_filter.clone(),
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
