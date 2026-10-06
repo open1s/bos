@@ -734,6 +734,24 @@ accepted anywhere a prompt string is (`run`, `runSimple`, `react`, `stream`).
 | `content.toString()` | The JSON string form |
 | `content.isMultimodal()` | Whether the content holds binary parts |
 
+## Memory
+
+`Memory` is an in-process, keyword-ranked store that mirrors the Rust
+`agent::memory::InMemoryMemory`. Recall earlier facts and re-inject them
+into a prompt.
+
+| Member | Description |
+|--------|-------------|
+| `new Memory()` | Create an empty store |
+| `memory.add(content, metadata)` | Store text and return the item object |
+| `memory.all()` | Every item, oldest first |
+| `memory.search(query, limit)` | Up to `limit` relevant items, best first; a blank query returns the most recent |
+| `memory.remove(id)` | Remove by id, returning whether it existed |
+| `memory.clear()` | Remove every item |
+| `memory.len()` | Number of stored items |
+| `memory.isEmpty()` | Whether the store is empty |
+| `memory.toJSON()` | Every item, for `JSON.stringify` |
+
 ## Best Practices
 
 - Use `BrainOS.create()` for one-line initialization

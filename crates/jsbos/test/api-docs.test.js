@@ -99,6 +99,7 @@ for (const name of [
   'Binary',
   'ContentPart',
   'Content',
+  'Memory',
 ]) {
   test('jsbos-api.md documents every member of ' + name, (t) => {
     const missing = undocumented(jsRef, jsMembers(jsClassBody(name)))
@@ -114,6 +115,7 @@ for (const name of [
   'Binary',
   'ContentPart',
   'Content',
+  'Memory',
 ]) {
   test('nbos-api.md documents every member of ' + name, (t) => {
     const missing = undocumented(pyRef, pyMembers(pyClassBody(name)))

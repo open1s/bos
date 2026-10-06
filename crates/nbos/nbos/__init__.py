@@ -33,6 +33,7 @@ from nbos.query import Query as QueryWrapper, Queryable as QueryableWrapper
 from nbos.caller import Caller as CallerWrapper, Callable as CallableWrapper
 from nbos.config import Config
 from nbos.content import Content, ContentPart, Binary
+from nbos.memory import Memory
 from nbos_native import (
     Agent as PyAgent,
     AgentCallableServer,
@@ -142,6 +143,7 @@ __all__ = [
     "init_tracing",
     "Content",
     "ContentPart",
+    "Memory",
     "Binary",
 ]
 # Keep in sync with pyproject.toml; tests/test_public_api.py enforces this.

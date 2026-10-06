@@ -837,6 +837,24 @@ binding hands to the Rust backend.
 | `content.to_json()` | JSON string of a text object or a parts array |
 | `content.is_multimodal()` | Whether the content holds binary parts |
 
+## Memory
+
+`Memory` is an in-process, keyword-ranked store that mirrors the Rust
+`agent::memory::InMemoryMemory`. Recall earlier facts and re-inject them
+into a prompt.
+
+| Member | Description |
+|--------|-------------|
+| `Memory()` | Create an empty store |
+| `memory.add(content, metadata=None)` | Store text and return the item dict |
+| `memory.all()` | Every item, oldest first |
+| `memory.search(query, limit=5)` | Up to `limit` relevant items, best first; a blank query returns the most recent |
+| `memory.remove(id)` | Remove by id, returning whether it existed |
+| `memory.clear()` | Remove every item |
+| `memory.len()` | Number of stored items |
+| `memory.is_empty()` | Whether the store is empty |
+| `memory.to_json()` | JSON array of every item |
+
 ## Best Practices
 
 - Use `async with BrainOS()` for automatic bus lifecycle management

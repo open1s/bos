@@ -1,4 +1,5 @@
 import * as jsbos from './jsbos.js';
+import { randomUUID } from 'node:crypto';
 
 const {
   Bus,
@@ -1584,6 +1585,78 @@ class BrainOS {
   }
 }
 
+// Lexical long-term memory. Mirrors agent::memory::InMemoryMemory: text is
+// tokenized into lowercase alphanumeric runs, an item scores one point per
+// query token it contains, and ties break toward the more recently added item.
+function memoryTokens(text) {
+  return String(text)
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+}
+
+class Memory {
+  constructor() {
+    this._items = [];
+  }
+
+  add(content, metadata = null) {
+    const item = {
+      id: randomUUID(),
+      content: String(content),
+      metadata: metadata ?? null,
+      created_at_ms: Date.now(),
+    };
+    this._items.push(item);
+    return { ...item };
+  }
+
+  all() {
+    return this._items.map((item) => ({ ...item }));
+  }
+
+  search(query, limit = 5) {
+    if (limit <= 0) return [];
+    const tokens = memoryTokens(query);
+    if (tokens.length === 0) {
+      return [...this._items].reverse().slice(0, limit).map((item) => ({ ...item }));
+    }
+    const scored = [];
+    for (const item of this._items) {
+      const contentTokens = new Set(memoryTokens(item.content));
+      let score = 0;
+      for (const token of tokens) if (contentTokens.has(token)) score += 1;
+      if (score > 0) scored.push({ score, item });
+    }
+    scored.sort(
+      (a, b) => b.score - a.score || b.item.created_at_ms - a.item.created_at_ms,
+    );
+    return scored.slice(0, limit).map(({ item }) => ({ ...item }));
+  }
+
+  remove(id) {
+    const before = this._items.length;
+    this._items = this._items.filter((item) => item.id !== id);
+    return this._items.length !== before;
+  }
+
+  clear() {
+    this._items = [];
+  }
+
+  len() {
+    return this._items.length;
+  }
+
+  isEmpty() {
+    return this._items.length === 0;
+  }
+
+  toJSON() {
+    return this.all();
+  }
+}
+
 export * from './jsbos.js';
 
 export {
@@ -1613,4 +1686,5 @@ export {
   Binary,
   Content,
   ContentPart,
+  Memory,
 };

@@ -155,6 +155,17 @@ test('multimodal and tool value types match across bindings', (t) => {
   }
 })
 
+test('memory surface matches across bindings', (t) => {
+  assertNoDrift(
+    t,
+    'Memory',
+    norm(jsMembers(jsSrc, 'Memory')),
+    norm(pyMembers(pySrc, 'Memory')),
+    new Set(),
+    new Set(),
+  )
+})
+
 test('ToolRegistry surface matches across bindings', (t) => {
   assertNoDrift(
     t,
