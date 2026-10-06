@@ -493,6 +493,16 @@ let bounded = FileMemory::open("./agent-memory.jsonl")
     .with_max_items(1_000);
 ```
 
+The agent itself can store and manage memories without reaching for
+the store:
+
+```rust
+let item = agent.remember("the runbook lives in the wiki").await.unwrap();
+let hits = agent.recall("runbook").await;
+agent.forget(&item.id).await;   // remove one item
+agent.forget_all().await;       // clear the store
+```
+
 Attach a store to an agent and every run recalls matching items and
 appends them to the system prompt:
 

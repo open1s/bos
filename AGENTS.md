@@ -150,7 +150,7 @@ const result = await agent.ask('What is 2+2?');
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
 - Current green baselines:
-  - Rust (excluding the binding crates): 409 passed, 0 failed, 8 ignored
+  - Rust (excluding the binding crates): 413 passed, 0 failed, 8 ignored
   - Python (`cd crates/nbos && pytest -m "not llm"`): 229 passed, 4 deselected
   - JS (`cd crates/jsbos && npx ava`): 94 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 14 memory)
 
@@ -177,7 +177,8 @@ const result = await agent.ask('What is 2+2?');
   JSON-lines file so memories survive a restart. Attach one with
   `Agent::with_memory` and
   matching items are appended to the system prompt on each run;
-  `Agent::recalled_context` exposes the block on its own.
+  `Agent::recalled_context` exposes the block on its own, and
+  `Agent::remember`/`forget`/`recall` are the ergonomic path to the store.
   `MetadataFilter` scopes recall to a metadata key/value and
   `FileMemory::with_max_items` caps a file store. Python and JS
   expose the same store as a `Memory` class, pinned to the Rust ranking

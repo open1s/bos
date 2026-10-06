@@ -175,6 +175,19 @@ impl InMemoryMemory {
             items: RwLock::new(items),
         }
     }
+
+    /// Insert an existing [`MemoryItem`], preserving its id and
+    /// timestamp. Used when replicating items from another store.
+    ///
+    /// Returns `false` when an item with the same id is already stored.
+    pub fn insert(&self, item: MemoryItem) -> bool {
+        let mut items = self.items.write().unwrap_or_else(|e| e.into_inner());
+        if items.iter().any(|existing| existing.id == item.id) {
+            return false;
+        }
+        items.push(item);
+        true
+    }
 }
 
 #[async_trait]

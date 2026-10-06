@@ -3,7 +3,7 @@
 use crate::agent::context::{AgentReActApp, AgentReactContext, AgentSession};
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
 use crate::agent::plugin::{AgentPlugin, PluginRegistry, StreamTokenWrapper};
-use crate::memory::{MemoryStore, MetadataFilter};
+use crate::memory::{MemoryItem, MemoryStore, MetadataFilter};
 use crate::session::AgentState;
 use crate::tools::FunctionTool;
 use crate::{AgentError, LlmClient, StreamToken, Tool, ToolRegistry};
@@ -288,6 +288,56 @@ impl Agent {
     /// project, or source; pass `None` to clear the restriction.
     pub fn set_memory_filter(&mut self, filter: Option<MetadataFilter>) {
         self.memory_filter = filter;
+    }
+
+    /// Store `content` in the attached memory and return the new item.
+    ///
+    /// Returns `None` when no memory is attached.
+    pub async fn remember(&self, content: impl Into<String>) -> Option<MemoryItem> {
+        self.remember_with(content, None).await
+    }
+
+    /// Store `content` with `metadata` in the attached memory.
+    pub async fn remember_with(
+        &self,
+        content: impl Into<String>,
+        metadata: Option<serde_json::Value>,
+    ) -> Option<MemoryItem> {
+        let memory = self.memory.as_ref()?;
+        Some(memory.add(content.into(), metadata).await)
+    }
+
+    /// Remove the memory item with `id`, returning whether it existed.
+    pub async fn forget(&self, id: &str) -> bool {
+        match self.memory.as_ref() {
+            Some(memory) => memory.remove(id).await,
+            None => false,
+        }
+    }
+
+    /// Clear the attached memory, returning whether anything was removed.
+    pub async fn forget_all(&self) -> bool {
+        match self.memory.as_ref() {
+            Some(memory) => {
+                let had_items = !memory.is_empty().await;
+                memory.clear().await;
+                had_items
+            }
+            None => false,
+        }
+    }
+
+    /// Items the attached memory recalls for `query`, honouring the
+    /// configured recall limit and metadata filter.
+    pub async fn recall(&self, query: &str) -> Vec<MemoryItem> {
+        match self.memory.as_ref() {
+            Some(memory) if self.memory_recall_limit > 0 => {
+                memory
+                    .search_filtered(query, self.memory_recall_limit, self.memory_filter.as_ref())
+                    .await
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Recall memories relevant to `query`, formatted as a block to
