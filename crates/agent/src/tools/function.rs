@@ -24,9 +24,11 @@ pub struct FunctionTool {
 }
 
 impl FunctionTool {
-    /// Create a new FunctionTool from an async function.
+    /// Create a new `FunctionTool` from a synchronous function.
     ///
-    /// The function will receive arguments as JSON and must return a JSON-serializable result
+    /// The function receives arguments as JSON and must return a
+    /// JSON-serializable result without awaiting. Use
+    /// [`AsyncFunctionTool`] when the body needs to await I/O.
     pub fn new<F>(name: &str, description: &str, schema: serde_json::Value, func: F) -> Self
     where
         F: Fn(&serde_json::Value) -> Result<serde_json::Value, ToolError> + Send + Sync + 'static,
@@ -168,6 +170,45 @@ impl AsyncFunctionTool {
             skill: false,
             category: "general".to_string(),
         }
+    }
+
+    /// Create a tool from an async closure that takes owned arguments.
+    ///
+    /// [`new`](Self::new) accepts a closure that *borrows* its arguments
+    /// and returns a future tied to that borrow, which forces the caller to
+    /// satisfy a `for<'a>` bound. When the closure moves its arguments into
+    /// the future instead, `from_fn` states that directly:
+    ///
+    /// ```
+    /// use agent::tools::{AsyncFunctionTool, AsyncTool};
+    /// use serde_json::json;
+    ///
+    /// let tool = AsyncFunctionTool::from_fn(
+    ///     "double",
+    ///     "Double a number",
+    ///     json!({"type": "object", "properties": {"n": {"type": "number"}}}),
+    ///     |args| async move {
+    ///         Ok(json!(args["n"].as_f64().unwrap_or_default() * 2.0))
+    ///     },
+    /// );
+    /// assert_eq!(tool.name(), "double");
+    /// ```
+    pub fn from_fn<F, Fut>(
+        name: &str,
+        description: &str,
+        schema: serde_json::Value,
+        func: F,
+    ) -> Self
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, ToolError>> + Send + 'static,
+    {
+        Self::new(
+            name,
+            description,
+            schema,
+            move |args: &serde_json::Value| -> BoxedToolFuture<'_> { Box::pin(func(args.clone())) },
+        )
     }
 
     /// Create a tool marked as a skill, with category `skill`.

@@ -31,6 +31,27 @@ async fn async_function_tool_runs_a_borrowing_closure() {
 }
 
 #[tokio::test]
+async fn async_function_tool_from_fn_owns_its_arguments() {
+    let tool = AsyncFunctionTool::from_fn(
+        "sum",
+        "Sum two numbers",
+        json!({"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}),
+        |args| async move {
+            let a = args["a"].as_f64().unwrap_or_default();
+            let b = args["b"].as_f64().unwrap_or_default();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Ok(json!(a + b))
+        },
+    );
+
+    assert_eq!(tool.name(), "sum");
+    assert_eq!(
+        tool.run(&json!({"a": 2.0, "b": 3.0})).await.unwrap(),
+        json!(5.0)
+    );
+}
+
+#[tokio::test]
 async fn async_function_tool_registers_and_runs_through_the_registry() {
     let tool = AsyncFunctionTool::new(
         "now",
