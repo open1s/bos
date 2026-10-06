@@ -428,6 +428,35 @@ let content = agent.get_skills_content();
 
 ---
 
+## Memory
+
+Agents can remember text across turns through a pluggable
+[`MemoryStore`](../crates/agent/src/memory/mod.rs). The framework ships
+`InMemoryMemory`, a dependency-free store that ranks items by keyword overlap;
+a vector database or file store implements the same trait.
+
+```rust
+use agent::prelude::*;
+use serde_json::json;
+
+let memory = InMemoryMemory::new();
+memory.add("The staging deploy needs VPN".to_string(), None).await;
+memory.add(
+    "Production runs on Kubernetes".to_string(),
+    Some(json!({ "source": "runbook" })),
+).await;
+
+let hits = memory.search("deploy vpn", 3).await;
+assert_eq!(hits.len(), 1);
+```
+
+`search` returns the most relevant items best-first; an empty query returns the
+most recent items. `all`, `remove`, `clear`, `len`, and `is_empty` round out the
+API. `MemoryStore` is object-safe, so it can live behind an
+`Arc<dyn MemoryStore>` and be swapped without touching call sites.
+
+---
+
 ## Bus Communication
 
 The Bus provides pub/sub messaging between components.

@@ -5,6 +5,7 @@ pub mod agent;
 pub mod bus;
 pub mod error;
 pub mod mcp;
+pub mod memory;
 pub mod metrics;
 pub mod prelude;
 pub mod security;
