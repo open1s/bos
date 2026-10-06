@@ -47,10 +47,20 @@ pub fn handler_for(uri: &str) -> Option<Box<dyn ResourceHandler>> {
 #[derive(Debug)]
 pub enum Row {
     /// A registered resource (came out of `resolve`).
-    Resource { depth: usize, info: ResourceInfo },
+    Resource {
+        /// Depth of this row in the tree.
+        depth: usize,
+        /// The resource metadata.
+        info: ResourceInfo,
+    },
     /// A listing entry inside a resource (folder entry, mem key, …) that is
     /// not itself a registered resource — shown as a leaf.
-    Child { depth: usize, name: String },
+    Child {
+        /// Depth of this row in the tree.
+        depth: usize,
+        /// The entry name.
+        name: String,
+    },
 }
 
 /// Read-only explorer over a [`ResourceClient`]. The SAME code explores local

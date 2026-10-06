@@ -49,9 +49,13 @@ impl std::fmt::Display for ResourceType {
 )]
 #[rkyv(derive(Debug))]
 pub enum ResourceStateLabel {
+    /// Being provisioned.
     Provisioning,
+    /// Open and usable.
     Open,
+    /// Closed.
     Closed,
+    /// Failed.
     Error,
 }
 
@@ -75,8 +79,12 @@ pub struct ResourceMeta {
 /// Lightweight snapshot for discovery (`list`/`resolve`).
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct ResourceInfo {
+    /// Canonical URI.
     pub uri: String,
+    /// The resource class.
     pub kind: ResourceType,
+    /// Current runtime state.
     pub state: ResourceStateLabel,
+    /// Owning agent identity.
     pub owner: String,
 }

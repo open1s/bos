@@ -26,6 +26,8 @@
 //! A [`Resource`] handle pins a single URI to a client for repeated operations
 //! without re-passing the address — again identical for local and remote.
 
+#![warn(missing_docs)]
+
 pub mod action;
 pub mod client;
 pub mod debug;

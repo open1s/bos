@@ -30,15 +30,22 @@ pub struct PolicyDoc {
 /// A single authorization rule (legacy format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
+    /// Agent identities this rule applies to.
     pub agents: Vec<String>,
+    /// URI patterns this rule applies to.
     pub uris: Vec<String>,
+    /// Action names this rule applies to.
     pub actions: Vec<String>,
+    /// Effect when the rule matches.
     pub effect: Effect,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// The effect of a matching rule.
 pub enum Effect {
+    /// The action is allowed.
     Allow,
+    /// The action is denied.
     Deny,
 }
 
@@ -169,6 +176,7 @@ impl Default for SharedPolicy {
 }
 
 impl SharedPolicy {
+    /// Create a shared policy from `doc`.
     pub fn new(doc: PolicyDoc) -> Self {
         Self {
             inner: Arc::new(RwLock::new(doc)),

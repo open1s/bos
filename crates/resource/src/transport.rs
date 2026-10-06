@@ -28,7 +28,9 @@ pub type ChunkStream = Pin<Box<dyn Stream<Item = Chunk> + Send>>;
 /// `finish` flushes, closes, and returns the total bytes accepted.
 #[async_trait]
 pub trait ChunkWriter: Send {
+    /// Write one chunk.
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()>;
+    /// Flush and close, returning the total bytes accepted.
     async fn finish(&mut self) -> Result<u64>;
 }
 

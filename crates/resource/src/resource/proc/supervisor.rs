@@ -50,6 +50,7 @@ pub enum RestartPolicy {
 /// Supervision group configuration.
 #[derive(Debug, Clone)]
 pub struct SupPolicy {
+    /// How children are restarted.
     pub restart: RestartPolicy,
     /// Respawns allowed within `window` per child before escalation.
     pub max_restarts: u32,
@@ -70,7 +71,9 @@ impl Default for SupPolicy {
 /// One supervised program.
 #[derive(Debug, Clone)]
 pub struct ChildSpec {
+    /// Command and arguments.
     pub args: Vec<String>,
+    /// Environment variables as key/value pairs.
     pub env: Vec<(String, String)>,
 }
 

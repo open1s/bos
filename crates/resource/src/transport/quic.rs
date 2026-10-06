@@ -561,6 +561,7 @@ pub struct QuicServer {
 }
 
 impl QuicServer {
+    /// Create a server around `dispatcher`.
     pub fn new(dispatcher: Arc<dyn Dispatcher>) -> Self {
         Self {
             dispatcher,

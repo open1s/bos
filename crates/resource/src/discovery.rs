@@ -36,6 +36,7 @@ pub struct LoadSnapshot {
 }
 
 impl LoadSnapshot {
+    /// A zeroed snapshot.
     pub fn zero() -> Self {
         Self {
             num_resources: 0,

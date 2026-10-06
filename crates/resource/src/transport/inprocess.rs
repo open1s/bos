@@ -21,6 +21,7 @@ pub struct InProcessTransport {
 }
 
 impl InProcessTransport {
+    /// Create a transport that acts as `agent`.
     pub fn new(dispatcher: Arc<dyn Dispatcher>, agent: impl Into<String>) -> Self {
         Self {
             dispatcher,

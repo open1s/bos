@@ -14,8 +14,11 @@
 /// care about how each is implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Os {
+    /// Linux.
     Linux,
+    /// macOS.
     Macos,
+    /// Windows.
     Windows,
     /// Any other unix-like OS.
     Unix,
