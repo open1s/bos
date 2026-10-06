@@ -103,11 +103,11 @@ mod tests {
             .await
             .unwrap();
         subscriber
-            .run(|mesage| {
-                println!("RE: {:?}", mesage);
+            .run(|message| {
+                println!("RE: {:?}", message);
             })
             .await
-            .expect("TODO: panic message");
+            .expect("subscriber run should not fail");
 
         let _a = publisher
             .publish(&String::from("This is from publisher"))

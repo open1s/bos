@@ -59,15 +59,22 @@ jj rebase -r <change_id> -d <destination>
 ## Essential Commands
 
 ```bash
-# Build all
-cargo build --all
+# Build the workspace
+cargo build --workspace
 
-# Test single crate
+# Test single crate / whole workspace
 cargo test -p <crate>
+cargo test --workspace
 
-# Lint
-cargo clippy --all
+# Lint (warnings are errors) and format
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+
+# API docs (fails on any missing-docs warning)
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+# Standalone resource CLI
+cargo run -p rex -- --help
 
 # Python binding (crates/nbos)
 cd crates/nbos && maturin develop
@@ -86,7 +93,8 @@ Each layer depends only on the layers to its right:
 nbos / jsbos  →  agent  →  react  →  bus  →  logging  →  config
 ```
 
-- `qserde_derive` is the proc-macro half of `qserde`.
+- `qserde` / `qserde_derive` provide the rkyv-backed wire format that `bus`
+  serializes payloads with.
 - `resource` is an independent subsystem; nothing in the agent stack depends on
   it (it pulls `bus`/`config`/`logging` only for its optional `cli` feature).
 
@@ -141,14 +149,36 @@ const result = await agent.ask('What is 2+2?');
 - Use `#[tokio::test]` for async tests
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
+- Current green baselines:
+  - Rust (excluding the binding crates): 379 passed, 0 failed, 8 ignored
+  - Python (`cd crates/nbos && pytest -m "not llm"`): 194 passed, 4 deselected
+  - JS (`cd crates/jsbos && npx ava`): 34 tests; parity guard: 12 tests
 
 ---
 
 ## Key Patterns
 
-- **Tools**: Implement `Tool` trait, register via `ToolRegistry`
-- **Bus**: `create_publisher()`, `create_subscriber()`, `create_query()`, `create_caller()`
+- **Tools**: Implement `Tool`/`AsyncTool`, register via `ToolRegistry`; the agent
+  invokes them through the `react` seam (`LlmClient`, `Tool`), never the bus.
+- **Bus**: Build a primitive and attach a session.
+  - Publisher: `Publisher::new(topic).with_session(session)?.publish(&payload)`
+  - Subscriber: `Subscriber::new(topic).with_session(session)` then
+    `recv()` / `recv_with_timeout(d)` / `run(handler)`
+  - Query: `Query::new(topic).with_session(session)?.query(&req)` against a
+    `Queryable::new(topic).with_handler(..)` or `with_stream_handler(..)`
+  - RPC: `Caller::new(name, session).call(&req)` against a
+    `Callable::new(uri, session).with_handler(..)` then `start()`
+  - Raw topic access: `session.publish(topic, &payload)` /
+    `session.subscribe(topic, handler)`
+- **Bindings**: Python and JS share one canonical vocabulary — `publish_text`/
+  `publish_json`, `ask`/`ask_json`, `call`/`call_json`, `handle`/`start`/`run`/
+  `run_json`, `recv`/`recv_json`. Python keeps the legacy `create_*`/`publish_*`
+  names as deprecated aliases for backward compatibility; never remove them.
 - **Config**: Use `ConfigLoader.discover()` for auto-loading `~/.bos/conf/config.toml`
+- **Documentation**: Every crate carries `#![warn(missing_docs)]` at its root, so
+  the workspace must stay at zero missing docs. Document new public items in the
+  same change. The sole exception is `resource/src/action.rs`, which suppresses
+  the lint for the rkyv-generated resolver enum.
 - **Solutions**: `docs/solutions/` — documented solutions (bugs, best practices, patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`)
 
 ---
