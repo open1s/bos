@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   parity:
-    name: Python/JS binding surface parity
+    name: Python/JS binding surface guards
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -32,9 +32,9 @@ jobs:
       - name: Install dependencies
         run: yarn install --no-immutable
 
-      # The guard reads both binding sources statically, so it needs no Rust
-      # toolchain and no native addon. Running it on every pull request keeps
-      # the Python and JavaScript surfaces from drifting before merge instead
-      # of only on main-branch builds.
-      - name: Run the binding parity guard
-        run: npx ava test/parity.test.js
+      # Both guards read the binding sources statically, so they need no Rust
+      # toolchain and no native addon. Running them on every pull request keeps
+      # the Python and JavaScript surfaces from drifting before merge; the
+      # heavier jsbos pipeline only runs on pushes to main.
+      - name: Run the static binding guards
+        run: npx ava test/parity.test.js test/native-bindings.test.js
