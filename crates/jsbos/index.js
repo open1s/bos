@@ -1,5 +1,6 @@
 import * as jsbos from './jsbos.js';
 import { randomUUID } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
 
 const {
   Bus,
@@ -604,6 +605,7 @@ class AgentBuilder {
     this._skills = [];
     this._mcpServers = [];
     this._memory = options.memory || null;
+    this._recallLimit = options.memoryRecallLimit || 5;
     this._config = {
       name: options.name || 'assistant',
       model: options.model || DEFAULT_MODEL,
@@ -695,8 +697,9 @@ class AgentBuilder {
     return this;
   }
 
-  withMemory(memory) {
+  withMemory(memory, limit = 5) {
     this._memory = memory;
+    this._recallLimit = limit;
     return this;
   }
 
@@ -879,7 +882,7 @@ class AgentBuilder {
 
   _withMemory(prompt, content) {
     if (!this._memory || typeof prompt !== 'string') return content;
-    const block = this._memory.recallBlock(prompt);
+    const block = this._memory.recallBlock(prompt, this._recallLimit);
     if (!block) return content;
     if (Array.isArray(content) && content.length > 0 && content[0].type === 'text') {
       return [{ ...content[0], text: block + '\n\n' + content[0].text }, ...content.slice(1)];
@@ -1660,6 +1663,22 @@ class Memory {
 
   clear() {
     this._items = [];
+  }
+
+  save(path) {
+    const body = this._items.map((item) => JSON.stringify(item)).join('\n')
+      + (this._items.length > 0 ? '\n' : '');
+    writeFileSync(path, body, 'utf8');
+    return this._items.length;
+  }
+
+  static load(path) {
+    const memory = new Memory();
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) memory._items.push(JSON.parse(trimmed));
+    }
+    return memory;
   }
 
   len() {

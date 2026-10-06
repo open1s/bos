@@ -116,7 +116,7 @@ AgentBuilder(bus, options=None)
 | `with_mcp(ns, cmd, args)` | Add MCP server (process) | `AgentBuilder` |
 | `with_mcp_http(ns, url)` | Add MCP server (HTTP) | `AgentBuilder` |
 | `with_bash(name, workspace_root)` | Add bash tool | `AgentBuilder` |
-| `with_memory(memory)` | Recall from a `Memory` store on each text run | `AgentBuilder` |
+| `with_memory(memory, limit=5)` | Recall up to `limit` items from a `Memory` store on each text run | `AgentBuilder` |
 
 #### Execution Methods
 
@@ -156,7 +156,7 @@ High-level agent wrapper with fluent API. Created via `BrainOS.agent()` or `Agen
 |--------|-------------|---------|
 | `ask(prompt)` | Run simple task | `str` |
 | `run_simple(message)` | Alias for `ask` | `str` |
-| `with_memory(memory)` | Attach a `Memory` store used to recall context | `Agent` |
+| `with_memory(memory, limit=5)` | Attach a store that recalls up to `limit` items per text run | `Agent` |
 | `chat(message)` | Alias for `ask` | `str` |
 | `react(task)` | Run with ReAct reasoning | `str` |
 | `stream(task)` | Stream response tokens | `AsyncIterator` |
@@ -857,6 +857,8 @@ into a prompt.
 | `memory.is_empty()` | Whether the store is empty |
 | `memory.to_json()` | JSON array of every item |
 | `memory.recall_block(query, limit=5)` | Prompt preamble of the best matches, or `""` |
+| `memory.save(path)` | Write every item as JSON lines; returns the count |
+| `Memory.load(path)` | New store from a JSON-lines file written by `save` |
 
 ## Best Practices
 

@@ -734,6 +734,29 @@ asyncio.run(main())
 
 ---
 
+## Memory
+
+`Memory` is an in-process, keyword-ranked store. Attach one to an agent
+and matching items are prepended to every text run.
+
+```python
+from nbos import AgentBuilder, Memory
+
+memory = Memory()
+memory.add("The staging deploy needs VPN", {"source": "runbook"})
+
+agent = await AgentBuilder(None).with_memory(memory, limit=3).start()
+# ask/react/stream now recall up to 3 items for the prompt.
+
+# Persist across processes as JSON lines (same format as Rust FileMemory):
+memory.save("./agent-memory.jsonl")
+restored = Memory.load("./agent-memory.jsonl")
+```
+
+`search(query, limit)` returns the best matches, `all`/`remove`/`clear`
+manage the store, and a blank query returns the most recent items.
+Multimodal `Content` is passed through without recall.
+
 ## API Reference
 
 For the complete API reference, see [Python API Reference](./api-reference/nbos-api.md).

@@ -8,6 +8,7 @@ from nbos import Agent, AgentBuilder, Content, Memory, ToolRegistry
 
 REPO = Path(__file__).resolve().parents[3]
 FIXTURE = REPO / "crates" / "agent" / "tests" / "fixtures" / "memory_ranking.json"
+LINES_FIXTURE = REPO / "crates" / "agent" / "tests" / "fixtures" / "memory_lines.jsonl"
 
 
 def test_add_assigns_identity():
@@ -128,3 +129,33 @@ def test_builder_with_memory_is_chainable():
     memory = Memory()
     assert builder.with_memory(memory) is builder
     assert builder._memory is memory
+
+
+def test_save_and_load_round_trip(tmp_path):
+    memory = Memory()
+    memory.add("first", {"source": "test"})
+    memory.add("second")
+    path = tmp_path / "memory.jsonl"
+    assert memory.save(str(path)) == 2
+    loaded = Memory.load(str(path))
+    assert [i["content"] for i in loaded.all()] == ["first", "second"]
+    assert loaded.all()[0]["metadata"] == {"source": "test"}
+
+
+def test_loads_the_shared_json_lines_fixture():
+    loaded = Memory.load(str(LINES_FIXTURE))
+    assert [i["content"] for i in loaded.all()] == [
+        "rust ownership and borrowing",
+        "the staging deploy needs VPN",
+    ]
+    assert loaded.all()[1]["metadata"] == {"source": "runbook"}
+
+
+def test_recall_limit_bounds_injection():
+    memory = Memory()
+    memory.add("rust async runtimes")
+    memory.add("rust ownership and borrowing")
+    inner = _FakeInner()
+    agent = Agent(inner, ToolRegistry(), memory, recall_limit=1)
+    asyncio.run(agent.ask("rust"))
+    assert inner.seen[0].count("\n- ") == 1

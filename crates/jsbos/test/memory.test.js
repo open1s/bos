@@ -1,12 +1,14 @@
 // Tests for the JavaScript memory store, including the shared Rust fixture.
 import test from 'ava'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { Memory, AgentBuilder } from '../index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const FIXTURE = join(here, '..', '..', 'agent', 'tests', 'fixtures', 'memory_ranking.json')
+const LINES_FIXTURE = join(here, '..', '..', 'agent', 'tests', 'fixtures', 'memory_lines.jsonl')
 
 test('add assigns identity', (t) => {
   const memory = new Memory()
@@ -90,4 +92,37 @@ test('withMemory is chainable', (t) => {
   const memory = new Memory()
   t.is(builder.withMemory(memory), builder)
   t.is(builder._memory, memory)
+})
+
+test('save and load round-trip', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'bos-memory-'))
+  const path = join(dir, 'memory.jsonl')
+  const memory = new Memory()
+  memory.add('first', { source: 'test' })
+  memory.add('second')
+  t.is(memory.save(path), 2)
+  const loaded = Memory.load(path)
+  t.deepEqual(loaded.all().map((i) => i.content), ['first', 'second'])
+  t.deepEqual(loaded.all()[0].metadata, { source: 'test' })
+})
+
+test('loads the shared JSON-lines fixture', (t) => {
+  const loaded = Memory.load(LINES_FIXTURE)
+  t.deepEqual(loaded.all().map((i) => i.content), [
+    'rust ownership and borrowing',
+    'the staging deploy needs VPN',
+  ])
+  t.deepEqual(loaded.all()[1].metadata, { source: 'runbook' })
+})
+
+test('recallLimit bounds injection', async (t) => {
+  const memory = new Memory()
+  memory.add('rust async runtimes')
+  memory.add('rust ownership and borrowing')
+  const seen = []
+  const builder = new AgentBuilder(null)
+  builder.withMemory(memory, 1)
+  builder._inner = { runSimple: async (content) => { seen.push(content); return 'ok' } }
+  await builder.ask('rust')
+  t.is((seen[0][0].text.match(/\n- /g) || []).length, 1)
 })

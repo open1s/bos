@@ -191,6 +191,7 @@ class AgentBuilder:
 
         opts = options or {}
         self._memory = opts.get("memory")
+        self._recall_limit = opts.get("memory_recall_limit", 5)
         self._config = PyAgentConfig()
         self._config.name = opts.get("name", "assistant")
         self._config.model = opts.get("model", DEFAULT_MODEL)
@@ -261,9 +262,10 @@ class AgentBuilder:
         self._config.reasoning_effort = effort
         return self
 
-    def with_memory(self, memory: Memory) -> "AgentBuilder":
-        """Recall from ``memory`` and prepend matches to each text run."""
+    def with_memory(self, memory: Memory, limit: int = 5) -> "AgentBuilder":
+        """Recall up to ``limit`` matches from ``memory`` on each text run."""
         self._memory = memory
+        self._recall_limit = limit
         return self
 
     def with_tools(self, *tools: ToolDef) -> "AgentBuilder":
@@ -428,7 +430,7 @@ class AgentBuilder:
             else:
                 await self._inner.add_mcp_server_http(m["namespace"], m["url"])
 
-        return Agent(self._inner, self._tools, self._memory)
+        return Agent(self._inner, self._tools, self._memory, self._recall_limit)
 
     def _resolve_content(self, input_val: str | NbosContent) -> str:
         """Convert input to string for Rust backend.
@@ -443,7 +445,7 @@ class AgentBuilder:
     async def ask(self, prompt: str | NbosContent) -> str:
         if not self._inner:
             await self.start()
-        return await Agent(self._inner, self._tools, self._memory).ask(prompt)
+        return await Agent(self._inner, self._tools, self._memory, self._recall_limit).ask(prompt)
 
     async def chat(self, message: str | NbosContent) -> str:
         return await self.ask(message)
@@ -451,12 +453,12 @@ class AgentBuilder:
     async def react(self, task: str | NbosContent) -> str:
         if not self._inner:
             await self.start()
-        return await Agent(self._inner, self._tools, self._memory).react(task)
+        return await Agent(self._inner, self._tools, self._memory, self._recall_limit).react(task)
 
     async def stream(self, task: str | NbosContent):
         if not self._inner:
             await self.start()
-        return await Agent(self._inner, self._tools, self._memory).stream(task)
+        return await Agent(self._inner, self._tools, self._memory, self._recall_limit).stream(task)
 
 
 class Agent:
@@ -465,10 +467,17 @@ class Agent:
     Created via nbos.agent() or AgentBuilder.
     """
 
-    def __init__(self, inner: PyAgent, tools: ToolRegistry, memory: Memory | None = None) -> None:
+    def __init__(
+        self,
+        inner: PyAgent,
+        tools: ToolRegistry,
+        memory: Memory | None = None,
+        recall_limit: int = 5,
+    ) -> None:
         self._inner = inner
         self._tools = tools
         self._memory = memory
+        self._recall_limit = recall_limit
 
     def _resolve_content(self, input_val: str | NbosContent) -> str:
         """Convert input to string for Rust backend.
@@ -484,12 +493,13 @@ class Agent:
         """Prepend recalled memory to text prompts; leave multimodal untouched."""
         if self._memory is None or isinstance(prompt, NbosContent):
             return content
-        block = self._memory.recall_block(prompt)
+        block = self._memory.recall_block(prompt, self._recall_limit)
         return f"{block}\n\n{content}" if block else content
 
-    def with_memory(self, memory: Memory) -> "Agent":
-        """Attach a memory store used to recall context on each text run."""
+    def with_memory(self, memory: Memory, limit: int = 5) -> "Agent":
+        """Attach a store that recalls up to ``limit`` items per text run."""
         self._memory = memory
+        self._recall_limit = limit
         return self
 
     async def ask(self, prompt: str | NbosContent) -> str:

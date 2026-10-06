@@ -84,6 +84,27 @@ async fn file_memory_works_behind_a_trait_object() {
 }
 
 #[tokio::test]
+async fn loads_the_shared_json_lines_fixture() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.jsonl");
+    tokio::fs::write(&path, include_str!("fixtures/memory_lines.jsonl"))
+        .await
+        .unwrap();
+
+    let memory = FileMemory::open(&path).await.unwrap();
+    let items = memory.all().await;
+    let contents: Vec<&str> = items.iter().map(|item| item.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec![
+            "rust ownership and borrowing",
+            "the staging deploy needs VPN"
+        ]
+    );
+    assert_eq!(memory.len().await, 2);
+}
+
+#[tokio::test]
 async fn blank_lines_are_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("memory.jsonl");

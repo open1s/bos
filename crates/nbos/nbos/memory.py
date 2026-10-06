@@ -69,6 +69,28 @@ class Memory:
         """Remove every item."""
         self._items.clear()
 
+    def save(self, path: str) -> int:
+        """Write every item to ``path`` as JSON lines and return the count.
+
+        The layout matches the Rust ``FileMemory``, so files are portable
+        between the core and this binding.
+        """
+        with open(path, "w", encoding="utf-8") as handle:
+            for item in self._items:
+                handle.write(json.dumps(item) + "\n")
+        return len(self._items)
+
+    @classmethod
+    def load(cls, path: str) -> "Memory":
+        """Read items from a JSON-lines ``path`` written by :meth:`save`."""
+        memory = cls()
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    memory._items.append(json.loads(line))
+        return memory
+
     def len(self) -> int:
         """Number of stored items."""
         return len(self._items)

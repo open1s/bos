@@ -807,6 +807,29 @@ logTestMessage('Test trace message');
 
 ---
 
+## Memory
+
+`Memory` is an in-process, keyword-ranked store. Attach one to an agent
+and matching items are prepended to every text run.
+
+```javascript
+const { AgentBuilder, Memory } = require('brainos');
+
+const memory = new Memory();
+memory.add('The staging deploy needs VPN', { source: 'runbook' });
+
+const agent = new AgentBuilder(null).withMemory(memory, 3);
+await agent.start();
+// ask/react/stream now recall up to 3 items for the prompt.
+
+// Persist across processes as JSON lines (same format as Rust FileMemory):
+memory.save('./agent-memory.jsonl');
+const restored = Memory.load('./agent-memory.jsonl');
+```
+
+`search(query, limit)` returns the best matches, `all`/`remove`/`clear`
+manage the store, and a blank query returns the most recent items.
+
 ## API Reference
 
 For the complete API reference, see [JavaScript API Reference](./api-reference/jsbos-api.md).
