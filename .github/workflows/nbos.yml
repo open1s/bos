@@ -139,3 +139,7 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Re-runs and duplicate triggers must not fail the job when
+          # this version is already on PyPI.
+          skip-existing: true

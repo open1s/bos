@@ -242,6 +242,16 @@ jobs:
       - name: Publish
         run: |
           npm config set provenance true
+          # Publishing must be idempotent: a version commit and its v* tag
+          # both trigger this workflow for the same commit, and a re-run
+          # repeats it. Without this guard the second attempt fails the
+          # release on an already-published version instead of no-oping.
+          pkg=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "${pkg}@${version}" version >/dev/null 2>&1; then
+            echo "${pkg}@${version} is already published; skipping publish."
+            exit 0
+          fi
           if git log -1 --pretty=%s | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$"; then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --access public
