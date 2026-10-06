@@ -151,8 +151,8 @@ const result = await agent.ask('What is 2+2?');
 - Set `RUST_LOG=debug` for tracing output
 - Current green baselines:
   - Rust (excluding the binding crates): 398 passed, 0 failed, 8 ignored
-  - Python (`cd crates/nbos && pytest -m "not llm"`): 218 passed, 4 deselected
-  - JS (`cd crates/jsbos && npx ava`): 86 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 6 memory)
+  - Python (`cd crates/nbos && pytest -m "not llm"`): 223 passed, 4 deselected
+  - JS (`cd crates/jsbos && npx ava`): 89 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 9 memory)
 
 ---
 
@@ -177,7 +177,8 @@ const result = await agent.ask('What is 2+2?');
   matching items are appended to the system prompt on each run;
   `Agent::recalled_context` exposes the block on its own. Python and JS
   expose the same store as a `Memory` class, pinned to the Rust ranking
-  by the shared `memory_ranking.json` fixture.
+  by the shared `memory_ranking.json` fixture; `AgentBuilder.with_memory`
+  (Python) / `withMemory` (JS) prepends recalled matches to each text run.
 - **Bindings**: Python and JS share one canonical vocabulary — `publish_text`/
   `publish_json`, `ask`/`ask_json`, `call`/`call_json`, `handle`/`start`/`run`/
   `run_json`, `recv`/`recv_json`. Python keeps the legacy `create_*`/`publish_*`

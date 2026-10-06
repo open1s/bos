@@ -1,9 +1,10 @@
 """Tests for the high-level Python memory store."""
 
+import asyncio
 import json
 from pathlib import Path
 
-from nbos import Memory
+from nbos import Agent, AgentBuilder, Content, Memory, ToolRegistry
 
 REPO = Path(__file__).resolve().parents[3]
 FIXTURE = REPO / "crates" / "agent" / "tests" / "fixtures" / "memory_ranking.json"
@@ -65,3 +66,65 @@ def test_matches_the_shared_rust_fixture():
         memory.add(content)
     hits = memory.search(data["query"], data["limit"])
     assert [h["content"] for h in hits] == data["expected"]
+
+
+class _FakeInner:
+    """Stands in for the native agent so injection is testable offline."""
+
+    def __init__(self) -> None:
+        self.seen: list = []
+
+    async def run_simple(self, content):
+        self.seen.append(content)
+        return "ok"
+
+    async def react(self, content):
+        self.seen.append(content)
+        return "ok"
+
+    async def stream(self, content):
+        self.seen.append(content)
+        return None
+
+
+def test_agent_ask_injects_recalled_memory():
+    memory = Memory()
+    memory.add("the deploy key lives in 1password")
+    memory.add("the office plant is a fern")
+    inner = _FakeInner()
+    agent = Agent(inner, ToolRegistry(), memory)
+    asyncio.run(agent.ask("where is the deploy key"))
+    assert inner.seen
+    assert "Relevant memory:" in inner.seen[0]
+    assert "the deploy key lives in 1password" in inner.seen[0]
+
+
+def test_agent_without_memory_is_untouched():
+    inner = _FakeInner()
+    agent = Agent(inner, ToolRegistry())
+    asyncio.run(agent.ask("hello"))
+    assert inner.seen == ["hello"]
+
+
+def test_agent_skips_memory_for_multimodal_content():
+    memory = Memory()
+    memory.add("the deploy key lives in 1password")
+    inner = _FakeInner()
+    agent = Agent(inner, ToolRegistry(), memory)
+    asyncio.run(agent.ask(Content.text("where is the deploy key")))
+    assert inner.seen
+    assert "Relevant memory:" not in inner.seen[0]
+
+
+def test_agent_with_memory_is_chainable():
+    agent = Agent(_FakeInner(), ToolRegistry())
+    memory = Memory()
+    assert agent.with_memory(memory) is agent
+    assert agent._memory is memory
+
+
+def test_builder_with_memory_is_chainable():
+    builder = AgentBuilder(None)
+    memory = Memory()
+    assert builder.with_memory(memory) is builder
+    assert builder._memory is memory

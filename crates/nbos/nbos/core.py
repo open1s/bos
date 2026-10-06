@@ -25,6 +25,7 @@ from nbos_native import HookEvent, HookDecision, HookContext
 from nbos.tool import ToolDef
 from nbos.content import Content as NbosContent
 from nbos.config import DEFAULT_BASE_URL, DEFAULT_MODEL, Config
+from nbos.memory import Memory
 
 # Import ContentPart for convenience
 from nbos.content import ContentPart, Binary
@@ -189,6 +190,7 @@ class AgentBuilder:
         self._mcp_servers: list[dict] = []
 
         opts = options or {}
+        self._memory = opts.get("memory")
         self._config = PyAgentConfig()
         self._config.name = opts.get("name", "assistant")
         self._config.model = opts.get("model", DEFAULT_MODEL)
@@ -257,6 +259,11 @@ class AgentBuilder:
 
     def with_reasoning_effort(self, effort: str) -> "AgentBuilder":
         self._config.reasoning_effort = effort
+        return self
+
+    def with_memory(self, memory: Memory) -> "AgentBuilder":
+        """Recall from ``memory`` and prepend matches to each text run."""
+        self._memory = memory
         return self
 
     def with_tools(self, *tools: ToolDef) -> "AgentBuilder":
@@ -421,7 +428,7 @@ class AgentBuilder:
             else:
                 await self._inner.add_mcp_server_http(m["namespace"], m["url"])
 
-        return Agent(self._inner, self._tools)
+        return Agent(self._inner, self._tools, self._memory)
 
     def _resolve_content(self, input_val: str | NbosContent) -> str:
         """Convert input to string for Rust backend.
@@ -436,8 +443,7 @@ class AgentBuilder:
     async def ask(self, prompt: str | NbosContent) -> str:
         if not self._inner:
             await self.start()
-        content = self._resolve_content(prompt)
-        return await self._inner.run_simple(content)
+        return await Agent(self._inner, self._tools, self._memory).ask(prompt)
 
     async def chat(self, message: str | NbosContent) -> str:
         return await self.ask(message)
@@ -445,14 +451,12 @@ class AgentBuilder:
     async def react(self, task: str | NbosContent) -> str:
         if not self._inner:
             await self.start()
-        content = self._resolve_content(task)
-        return await self._inner.react(content)
+        return await Agent(self._inner, self._tools, self._memory).react(task)
 
     async def stream(self, task: str | NbosContent):
         if not self._inner:
             await self.start()
-        content = self._resolve_content(task)
-        return await self._inner.stream(content)
+        return await Agent(self._inner, self._tools, self._memory).stream(task)
 
 
 class Agent:
@@ -461,9 +465,10 @@ class Agent:
     Created via nbos.agent() or AgentBuilder.
     """
 
-    def __init__(self, inner: PyAgent, tools: ToolRegistry) -> None:
+    def __init__(self, inner: PyAgent, tools: ToolRegistry, memory: Memory | None = None) -> None:
         self._inner = inner
         self._tools = tools
+        self._memory = memory
 
     def _resolve_content(self, input_val: str | NbosContent) -> str:
         """Convert input to string for Rust backend.
@@ -475,9 +480,21 @@ class Agent:
             return input_val.to_json()
         return input_val
 
+    def _with_memory(self, prompt: str | NbosContent, content: str) -> str:
+        """Prepend recalled memory to text prompts; leave multimodal untouched."""
+        if self._memory is None or isinstance(prompt, NbosContent):
+            return content
+        block = self._memory.recall_block(prompt)
+        return f"{block}\n\n{content}" if block else content
+
+    def with_memory(self, memory: Memory) -> "Agent":
+        """Attach a memory store used to recall context on each text run."""
+        self._memory = memory
+        return self
+
     async def ask(self, prompt: str | NbosContent) -> str:
         content = self._resolve_content(prompt)
-        return await self._inner.run_simple(content)
+        return await self._inner.run_simple(self._with_memory(prompt, content))
 
     async def run_simple(self, message: str | NbosContent) -> str:
         return await self.ask(message)
@@ -487,11 +504,11 @@ class Agent:
 
     async def react(self, task: str | NbosContent) -> str:
         content = self._resolve_content(task)
-        return await self._inner.react(content)
+        return await self._inner.react(self._with_memory(task, content))
 
     async def stream(self, task: str | NbosContent):
         content = self._resolve_content(task)
-        return await self._inner.stream(content)
+        return await self._inner.stream(self._with_memory(task, content))
 
     async def stream_collect(self, task: str | NbosContent) -> list:
         """Collect all stream tokens into a list (matches JS streamCollect)."""

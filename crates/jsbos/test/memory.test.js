@@ -3,7 +3,7 @@ import test from 'ava'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { Memory } from '../index.js'
+import { Memory, AgentBuilder } from '../index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const FIXTURE = join(here, '..', '..', 'agent', 'tests', 'fixtures', 'memory_ranking.json')
@@ -63,4 +63,31 @@ test('matches the shared Rust fixture', (t) => {
     memory.search(data.query, data.limit).map((hit) => hit.content),
     data.expected,
   )
+})
+
+test('ask injects recalled memory', async (t) => {
+  const memory = new Memory()
+  memory.add('the deploy key lives in 1password')
+  const seen = []
+  const builder = new AgentBuilder(null)
+  builder.withMemory(memory)
+  builder._inner = { runSimple: async (content) => { seen.push(content); return 'ok' } }
+  await builder.ask('where is the deploy key')
+  t.true(seen[0][0].text.includes('Relevant memory:'))
+  t.true(seen[0][0].text.includes('the deploy key lives in 1password'))
+})
+
+test('ask without memory is untouched', async (t) => {
+  const seen = []
+  const builder = new AgentBuilder(null)
+  builder._inner = { runSimple: async (content) => { seen.push(content); return 'ok' } }
+  await builder.ask('hello')
+  t.is(seen[0][0].text, 'hello')
+})
+
+test('withMemory is chainable', (t) => {
+  const builder = new AgentBuilder(null)
+  const memory = new Memory()
+  t.is(builder.withMemory(memory), builder)
+  t.is(builder._memory, memory)
 })

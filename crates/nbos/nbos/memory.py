@@ -81,5 +81,12 @@ class Memory:
         """Serialize every item to a JSON array."""
         return json.dumps(self.all())
 
+    def recall_block(self, query: str, limit: int = 5) -> str:
+        """Format up to ``limit`` relevant items as a prompt preamble."""
+        hits = self.search(query, limit)
+        if not hits:
+            return ""
+        return "Relevant memory:" + "".join("\n- " + h["content"] for h in hits)
+
     def __len__(self) -> int:
         return len(self._items)

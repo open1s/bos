@@ -603,6 +603,7 @@ class AgentBuilder {
     this._plugins = [];
     this._skills = [];
     this._mcpServers = [];
+    this._memory = options.memory || null;
     this._config = {
       name: options.name || 'assistant',
       model: options.model || DEFAULT_MODEL,
@@ -691,6 +692,11 @@ class AgentBuilder {
 
   reasoningEffort(effort) {
     this._config.reasoningEffort = effort;
+    return this;
+  }
+
+  withMemory(memory) {
+    this._memory = memory;
     return this;
   }
 
@@ -871,9 +877,20 @@ class AgentBuilder {
     return this._contentPartsToJsContentArray(input);
   }
 
+  _withMemory(prompt, content) {
+    if (!this._memory || typeof prompt !== 'string') return content;
+    const block = this._memory.recallBlock(prompt);
+    if (!block) return content;
+    if (Array.isArray(content) && content.length > 0 && content[0].type === 'text') {
+      return [{ ...content[0], text: block + '\n\n' + content[0].text }, ...content.slice(1)];
+    }
+    return content;
+  }
+
   async ask(prompt) {
     if (!this._inner) await this.start();
-    return this._inner.runSimple(this._resolveContent(prompt));
+    const content = this._resolveContent(prompt);
+    return this._inner.runSimple(this._withMemory(prompt, content));
   }
 
   async chat(message) {
@@ -881,18 +898,19 @@ class AgentBuilder {
   }
 
   async runSimple(prompt) {
-    if (!this._inner) await this.start();
-    return this._inner.runSimple(this._resolveContent(prompt));
+    return this.ask(prompt);
   }
 
   async react(task) {
     if (!this._inner) await this.start();
-    return this._inner.react(this._resolveContent(task));
+    const content = this._resolveContent(task);
+    return this._inner.react(this._withMemory(task, content));
   }
 
   async stream(task, onToken) {
     if (!this._inner) await this.start();
-    return this._inner.stream(this._resolveContent(task), (err, token) => {
+    const content = this._resolveContent(task);
+    return this._inner.stream(this._withMemory(task, content), (err, token) => {
       onToken(err, token);
     });
   }
@@ -1650,6 +1668,12 @@ class Memory {
 
   isEmpty() {
     return this._items.length === 0;
+  }
+
+  recallBlock(query, limit = 5) {
+    const hits = this.search(query, limit);
+    if (hits.length === 0) return '';
+    return 'Relevant memory:' + hits.map((hit) => '\n- ' + hit.content).join('');
   }
 
   toJSON() {

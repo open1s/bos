@@ -100,6 +100,7 @@ new AgentBuilder(bus, options = {})
 | `skillsDir(dirPath)` | Load skills from directory | `AgentBuilder` |
 | `mcp(ns, cmd, args)` | Add MCP server (process) | `AgentBuilder` |
 | `mcpHttp(ns, url)` | Add MCP server (HTTP) | `AgentBuilder` |
+| `withMemory(memory)` | Recall from a `Memory` store on each text run | `AgentBuilder` |
 
 #### Execution Methods
 
@@ -751,6 +752,7 @@ into a prompt.
 | `memory.len()` | Number of stored items |
 | `memory.isEmpty()` | Whether the store is empty |
 | `memory.toJSON()` | Every item, for `JSON.stringify` |
+| `memory.recallBlock(query, limit)` | Prompt preamble of the best matches, or `""` |
 
 ## Best Practices
 
