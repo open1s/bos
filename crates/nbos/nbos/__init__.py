@@ -145,4 +145,4 @@ __all__ = [
     "Binary",
 ]
 # Keep in sync with pyproject.toml; tests/test_public_api.py enforces this.
-__version__ = "2.4.1"
+__version__ = "2.4.2"

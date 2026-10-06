@@ -47,7 +47,7 @@ pprof = { version = "0.15", features = ["criterion", "flamegraph"] }
 bus = { path = "crates/bus" }
 
 [workspace.package]
-version = "2.4.1"
+version = "2.4.2"
 edition = "2021"
 rust-version = "1.88"
 authors = ["BrickOS Team"]
