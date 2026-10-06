@@ -161,7 +161,7 @@ async for token in await agent.stream("Tell me a story"):
 | Method | Description |
 |--------|-------------|
 | `ContentPart.text(text)` | Create text part |
-| `ContentPart.image(url, detail=None, name=None)` | Create image part (URL) |
+| `ContentPart.image(url, name=None)` | Create image part (URL) |
 | `ContentPart.audio(data, format="mp3")` | Create audio part (base64 or bytes) |
 | `ContentPart.audio_url(url, format="mp3")` | Create audio part (URL) |
 | `ContentPart.binary(content_type, data, name=None)` | Create binary part |

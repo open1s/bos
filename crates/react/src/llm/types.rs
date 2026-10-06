@@ -163,7 +163,7 @@ impl Content {
 
     /// Create content holding one image URL.
     pub fn image(url: impl Into<String>) -> Self {
-        Content::binary("image url".to_string(), url.into())
+        Content::binary_url("image/jpeg".to_string(), url)
     }
 
     /// Create content holding base64 audio of `format`.

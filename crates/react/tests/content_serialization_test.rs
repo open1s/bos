@@ -3,7 +3,7 @@
 //! These tests verify that Content types (including multimodal with images/audio)
 //! are correctly serialized to the format expected by LLM APIs.
 
-use react::llm::types::{Binary, BinarySource, Content, ContentPart};
+use react::llm::types::{Binary, BinarySource, Content, ContentPart, LlmMessage};
 
 /// Test that serialize_content in vendor modules correctly handles multimodal content.
 /// This is a compile-time verification that the types work correctly.
@@ -173,5 +173,74 @@ mod content_serialization_tests {
         assert!(!binary.is_image());
         assert!(binary.is_audio());
         assert!(binary.url().starts_with("data:audio/wav;base64,"));
+    }
+
+    #[test]
+    fn test_content_image_builds_a_url_image() {
+        // Content::image used to build a base64 binary typed "image url", which
+        // is_image() rejects, so the vendors never emitted an image part.
+        let content = Content::image("https://example.com/photo.jpg");
+        match content {
+            Content::Parts(parts) => match &parts[0] {
+                ContentPart::Binary { binary } => {
+                    assert!(binary.is_image());
+                    assert_eq!(binary.content_type, "image/jpeg");
+                    assert_eq!(
+                        binary.source,
+                        BinarySource::Url("https://example.com/photo.jpg".to_string())
+                    );
+                    assert_eq!(binary.url(), "https://example.com/photo.jpg");
+                }
+                other => panic!("expected a binary part, got {other:?}"),
+            },
+            other => panic!("expected parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_message_user_image_carries_an_image() {
+        let message = LlmMessage::user_image("https://example.com/photo.jpg");
+        match message {
+            LlmMessage::User { content } => match content {
+                Content::Parts(parts) => match &parts[0] {
+                    ContentPart::Binary { binary } => assert!(binary.is_image()),
+                    other => panic!("expected a binary part, got {other:?}"),
+                },
+                other => panic!("expected parts, got {other:?}"),
+            },
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_binding_content_json_decodes_to_parts() {
+        // The exact shape both bindings emit for Content.image(url). It must
+        // decode to parts, because a decode failure degrades to a text message.
+        let json = r#"[{"type":"binary","binary":{"content_type":"image/jpeg","source":{"url":"https://example.com/photo.jpg"}}}]"#;
+        match Content::from(json.to_string()) {
+            Content::Parts(parts) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    ContentPart::Binary { binary } => {
+                        assert!(binary.is_image());
+                        assert_eq!(binary.url(), "https://example.com/photo.jpg");
+                    }
+                    other => panic!("expected a binary part, got {other:?}"),
+                }
+            }
+            other => panic!("expected parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_adjacently_tagged_source_does_not_decode() {
+        // BinarySource is externally tagged. The adjacent {"type","data"} shape
+        // used to come out of the Python binding and silently turned the whole
+        // payload into a text message instead of an image.
+        let json = r#"[{"type":"binary","binary":{"content_type":"image/jpeg","source":{"type":"url","data":"https://example.com/photo.jpg"}}}]"#;
+        match Content::from(json.to_string()) {
+            Content::Text(text) => assert_eq!(text, json),
+            other => panic!("expected the text fallback, got {other:?}"),
+        }
     }
 }

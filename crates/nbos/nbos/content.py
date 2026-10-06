@@ -33,7 +33,16 @@ class Binary:
         return f"data:{self.content_type};base64,{self.source['data']}"
 
     def to_dict(self) -> dict[str, Any]:
-        result: dict[str, Any] = {"content_type": self.content_type, "source": self.source}
+        # BinarySource is externally tagged in Rust, so the key names the
+        # source kind: {"url": ...} or {"base64": ...}. An adjacent
+        # {"type": ..., "data": ...} shape does not decode, and the backend
+        # then degrades the whole payload to a text message.
+        source = (
+            {"url": self.source["data"]}
+            if self.source["type"] == "url"
+            else {"base64": self.source["data"]}
+        )
+        result: dict[str, Any] = {"content_type": self.content_type, "source": source}
         if self.name:
             result["name"] = self.name
         return result
@@ -75,9 +84,13 @@ class ContentPart:
         )
 
     @staticmethod
-    def image(url: str, detail: str | None = None, name: str | None = None) -> "ContentPart":
-        """Create an image binary content part."""
-        return ContentPart.binary_url("image/url", url, name)
+    def image(url: str, name: str | None = None) -> "ContentPart":
+        """Create an image binary content part from a URL.
+
+        The type is only materialized when the source is base64, so this
+        matches the JS binding on the shape that reaches the backend.
+        """
+        return ContentPart.binary_url("image/jpeg", url, name)
 
     @staticmethod
     def audio(data: str | bytes, format: str = "mp3") -> "ContentPart":
@@ -132,9 +145,9 @@ class Content:
         return Content(parts=parts)
 
     @staticmethod
-    def image(url: str, detail: str | None = None, name: str | None = None) -> "Content":
+    def image(url: str, name: str | None = None) -> "Content":
         """Create content with a single image."""
-        return Content.parts([ContentPart.image(url, detail, name)])
+        return Content.parts([ContentPart.image(url, name)])
 
     @staticmethod
     def audio(data: str, format: str = "mp3") -> "Content":

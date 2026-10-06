@@ -150,9 +150,9 @@ const result = await agent.ask('What is 2+2?');
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
 - Current green baselines:
-  - Rust (excluding the binding crates): 379 passed, 0 failed, 8 ignored
-  - Python (`cd crates/nbos && pytest -m "not llm"`): 201 passed, 4 deselected
-  - JS (`cd crates/jsbos && npx ava`): 49 tests (12 in the parity guard, 3 in the native-binding guard)
+  - Rust (excluding the binding crates): 383 passed, 0 failed, 8 ignored
+  - Python (`cd crates/nbos && pytest -m "not llm"`): 211 passed, 4 deselected
+  - JS (`cd crates/jsbos && npx ava`): 70 tests (12 parity, 3 native-binding, 13 API-doc, 8 content)
 
 ---
 
@@ -174,10 +174,11 @@ const result = await agent.ask('What is 2+2?');
   `publish_json`, `ask`/`ask_json`, `call`/`call_json`, `handle`/`start`/`run`/
   `run_json`, `recv`/`recv_json`. Python keeps the legacy `create_*`/`publish_*`
   names as deprecated aliases for backward compatibility; never remove them.
-  Two static guards in `crates/jsbos/test/` keep the surfaces honest:
-  `parity.test.js` compares the wrapper classes across languages, and
+  Three static guards in `crates/jsbos/test/` keep the surfaces honest:
+  `parity.test.js` compares the wrapper classes across languages,
   `native-bindings.test.js` checks that every wrapper call on a native object
-  resolves to a real member of the generated interface.
+  resolves to a real member of the generated interface, and `api-docs.test.js`
+  checks that every public binding member is documented in `docs/api-reference/`.
 - **Config**: Use `ConfigLoader.discover()` for auto-loading `~/.bos/conf/config.toml`
 - **Documentation**: Every crate carries `#![warn(missing_docs)]` at its root, so
   the workspace must stay at zero missing docs. Document new public items in the
