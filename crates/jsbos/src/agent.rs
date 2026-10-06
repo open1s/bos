@@ -925,6 +925,30 @@ impl Agent {
   }
 
   #[napi]
+  /// Return the opaque session context value.
+  pub fn session_context(&self) -> Result<serde_json::Value> {
+    let guard = self.inner.blocking_read();
+    let context = guard.session().session_context();
+    Ok(context)
+  }
+
+  #[napi]
+  /// Replace the opaque session context value.
+  pub fn set_session_context(&self, context: serde_json::Value) -> Result<()> {
+    let mut guard = self.inner.blocking_write();
+    guard.session_mut().set_session_context(context);
+    Ok(())
+  }
+
+  #[napi]
+  /// Reset the opaque session context to null.
+  pub fn clear_session_context(&self) -> Result<()> {
+    let mut guard = self.inner.blocking_write();
+    guard.session_mut().clear_session_context();
+    Ok(())
+  }
+
+  #[napi]
   /// Compact the session, keeping recent turns.
   pub fn compact_session(&self, keep_recent: u32, max_summary_chars: u32) -> Result<()> {
     let mut guard = self.inner.blocking_write();

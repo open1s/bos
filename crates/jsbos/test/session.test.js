@@ -70,6 +70,19 @@ test.serial('context exposes the session context', async (t) => {
   t.deepEqual(agent.session.context, { topic: 'math' })
 })
 
+test.serial('setContext and clearContext round-trip without touching messages', async (t) => {
+  const agent = await startAgent(t)
+  agent.session.addMessage('user', 'keep me')
+  t.is(agent.session.context, null)
+
+  agent.session.setContext({ topic: 'physics' })
+  t.deepEqual(agent.session.context, { topic: 'physics' })
+
+  agent.session.clearContext()
+  t.is(agent.session.context, null)
+  t.is(agent.session.getMessages().length, 1)
+})
+
 test.serial('config exposes the resolved agent config', async (t) => {
   const agent = await startAgent(t)
   t.is(agent.config.name, 'session-test')

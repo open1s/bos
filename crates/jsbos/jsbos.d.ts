@@ -37,6 +37,9 @@ export declare class Agent {
   saveSession(path: string): void
   restoreSessionFromFile(path: string): void
   clearSession(): void
+  sessionContext(): any
+  setSessionContext(context: any): void
+  clearSessionContext(): void
   compactSession(keepRecent: number, maxSummaryChars: number): void
   saveMessageLog(path: string): void
   restoreMessageLog(path: string): void

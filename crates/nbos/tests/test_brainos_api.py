@@ -433,6 +433,17 @@ class TestSessionManager:
             )
 
     @pytest.mark.asyncio
+    async def test_session_context_round_trip(self):
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = await brain.agent("test-agent").start()
+            assert agent.session.context is None
+            agent.session.set_context({"topic": "math"})
+            assert agent.session.context == {"topic": "math"}
+            agent.session.clear_context()
+            assert agent.session.context is None
+
+    @pytest.mark.asyncio
     async def test_session_export_import(self):
         from nbos import BrainOS
         async with BrainOS() as brain:
