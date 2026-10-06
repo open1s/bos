@@ -691,6 +691,49 @@ brain.agent('assistant').with_hooks({
 
 ---
 
+## Multimodal Content
+
+`Content`, `ContentPart`, and `Binary` describe a multimodal message so an
+agent can send images or audio alongside text. A `Content` instance is
+accepted anywhere a prompt string is (`run`, `runSimple`, `react`, `stream`).
+
+### Binary
+
+| Member | Description |
+|--------|-------------|
+| `new Binary(contentType, source, name = null)` | Build from a `{ type: 'url' or 'base64', data }` source |
+| `Binary.fromBase64(contentType, data, name = null)` | Build from base64-encoded bytes |
+| `Binary.fromUrl(contentType, url, name = null)` | Build from a URL |
+| `binary.isImage()` | Whether `contentType` starts with `image/` |
+| `binary.isAudio()` | Whether `contentType` starts with `audio/` |
+| `binary.url()` | The raw URL, or a `data:` URL for base64 sources |
+| `binary.toJSON()` | `{ content_type, source: { url or base64 }, name? }` |
+
+### ContentPart
+
+| Member | Description |
+|--------|-------------|
+| `ContentPart.text(text)` | A text part |
+| `ContentPart.binary(contentType, data, name = null)` | A base64 binary part |
+| `ContentPart.binaryUrl(contentType, url, name = null)` | A URL binary part |
+| `ContentPart.image(url, name = null)` | A URL image part typed `image/jpeg` |
+| `ContentPart.audio(data, format = 'mp3')` | A base64 audio part |
+| `ContentPart.audioUrl(url, format = 'mp3')` | A URL audio part |
+| `part.toJSON()` | `{ type: 'text', text }` or `{ type: 'binary', binary }` |
+
+### Content
+
+| Member | Description |
+|--------|-------------|
+| `Content.text(text)` | Plain text content |
+| `Content.parts(parts)` | Content from an array of `ContentPart` |
+| `Content.image(url, name = null)` | One URL image part typed `image/jpeg` |
+| `Content.audio(data, format = 'mp3')` | One base64 audio part |
+| `Content.audioUrl(url, format = 'mp3')` | One URL audio part |
+| `content.toJSON()` | A part object for text, or an array of parts |
+| `content.toString()` | The JSON string form |
+| `content.isMultimodal()` | Whether the content holds binary parts |
+
 ## Best Practices
 
 - Use `BrainOS.create()` for one-line initialization

@@ -796,6 +796,47 @@ await agent._inner.add_tool(tool)
 
 ---
 
+## Multimodal Content
+
+`Content`, `ContentPart`, and `Binary` describe a multimodal message so an
+agent can send images or audio alongside text. `Content.to_json()` is what the
+binding hands to the Rust backend.
+
+### Binary
+
+| Member | Description |
+|--------|-------------|
+| `Binary.from_base64(content_type, data, name=None)` | Build from base64-encoded bytes |
+| `Binary.from_url(content_type, url, name=None)` | Build from a URL |
+| `binary.is_image()` | Whether `content_type` starts with `image/` |
+| `binary.is_audio()` | Whether `content_type` starts with `audio/` |
+| `binary.url()` | The raw URL, or a `data:` URL for base64 sources |
+| `binary.to_dict()` | `{ content_type, source: { url or base64 }, name? }` |
+
+### ContentPart
+
+| Member | Description |
+|--------|-------------|
+| `ContentPart.text(text)` | A text part |
+| `ContentPart.binary(content_type, data, name=None)` | A base64 binary part; `bytes` are base64-encoded |
+| `ContentPart.binary_url(content_type, url, name=None)` | A URL binary part |
+| `ContentPart.image(url, name=None)` | A URL image part typed `image/jpeg` |
+| `ContentPart.audio(data, format="mp3")` | A base64 audio part |
+| `ContentPart.audio_url(url, format="mp3")` | A URL audio part |
+| `part.to_dict()` | `{ type: "text", text }` or `{ type: "binary", binary }` |
+
+### Content
+
+| Member | Description |
+|--------|-------------|
+| `Content.text(text)` | Plain text content |
+| `Content.parts(parts)` | Content from a list of `ContentPart` |
+| `Content.image(url, name=None)` | One URL image part typed `image/jpeg` |
+| `Content.audio(data, format="mp3")` | One base64 audio part |
+| `Content.audio_url(url, format="mp3")` | One URL audio part |
+| `content.to_json()` | JSON string of a text object or a parts array |
+| `content.is_multimodal()` | Whether the content holds binary parts |
+
 ## Best Practices
 
 - Use `async with BrainOS()` for automatic bus lifecycle management
