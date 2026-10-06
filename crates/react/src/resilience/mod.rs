@@ -395,6 +395,33 @@ pub struct ReActResilience {
     rate_limit_config: RateLimiterConfig,
 }
 
+/// Classify an error as transient by matching its debug text.
+///
+/// This is the default classifier for [`ReActResilience::execute`]. It
+/// only looks for a status code or a known phrase in the formatted error,
+/// so it can miss or misclassify errors; prefer
+/// [`ReActResilience::execute_with`] with a classifier over your own
+/// error type.
+#[must_use]
+pub fn is_transient_debug<E: std::fmt::Debug>(error: &E) -> bool {
+    let text = format!("{error:?}").to_ascii_lowercase();
+    [
+        "429",
+        "too many requests",
+        "rate limit",
+        "timeout",
+        "timed out",
+        "connection refused",
+        "connection reset",
+        "service unavailable",
+        "502",
+        "503",
+        "504",
+    ]
+    .iter()
+    .any(|fragment| text.contains(fragment))
+}
+
 impl ReActResilience {
     /// Create a new resilience wrapper with the given config.
     pub fn new(config: ResilienceConfig) -> Self {
@@ -415,13 +442,36 @@ impl ReActResilience {
     }
 
     /// Execute an async function with resilience checks.
-    /// Checks rate limiter first (with auto-wait), then circuit breaker, then executes the function.
-    /// Automatically retries on transient errors (429, timeout).
-    pub async fn execute<F, Fut, T, E>(&self, mut op: F) -> Result<T, ResilienceError<E>>
+    ///
+    /// Checks the rate limiter first (with auto-wait), then the circuit
+    /// breaker, then runs the operation. Transient errors are retried up
+    /// to `max_retries` times, classified by [`is_transient_debug`]; prefer
+    /// [`ReActResilience::execute_with`] to classify precisely.
+    pub async fn execute<F, Fut, T, E>(&self, op: F) -> Result<T, ResilienceError<E>>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
         E: std::fmt::Debug,
+    {
+        self.execute_with(is_transient_debug::<E>, op).await
+    }
+
+    /// Execute an async function, classifying retryable errors with `classify`.
+    ///
+    /// `classify` returns `true` when an error is transient and the
+    /// operation should be retried. Passing an explicit classifier avoids
+    /// the text matching in [`is_transient_debug`], which can retry a
+    /// permanent failure whose message merely mentioned a transient word.
+    pub async fn execute_with<F, Fut, T, E, C>(
+        &self,
+        classify: C,
+        mut op: F,
+    ) -> Result<T, ResilienceError<E>>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        E: std::fmt::Debug,
+        C: Fn(&E) -> bool,
     {
         let max_retries = self.rate_limit_config.max_retries;
         let base_backoff = Duration::from_millis(500);
@@ -476,13 +526,8 @@ impl ReActResilience {
 
             // 4) Check for transient error and retry
             let is_transient = match &result {
-                Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    err_str.contains("429")
-                        || err_str.contains("Too Many Requests")
-                        || err_str.contains("timeout")
-                }
-                _ => false,
+                Err(error) => classify(error),
+                Ok(_) => false,
             };
 
             if is_transient && attempt < max_retries {
@@ -683,5 +728,53 @@ mod tests {
         // Should always succeed (no checks)
         let result = resilience.execute(|| async { Ok::<_, ()>(100) }).await;
         assert_eq!(result.unwrap(), 100);
+    }
+
+    #[tokio::test]
+    async fn execute_with_honours_a_custom_classifier() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let resilience = ReActResilience::none();
+        let attempts = AtomicUsize::new(0);
+        let result: Result<u32, ResilienceError<&'static str>> = resilience
+            .execute_with(
+                |error: &&'static str| *error == "transient",
+                || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            Err("transient")
+                        } else {
+                            Ok(9)
+                        }
+                    }
+                },
+            )
+            .await;
+
+        assert_eq!(result.unwrap(), 9);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_with_does_not_retry_when_the_classifier_says_no() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let resilience = ReActResilience::none();
+        let attempts = AtomicUsize::new(0);
+        // "timeout" and "503" would trip the default heuristic; the
+        // explicit classifier overrides it and stops after one attempt.
+        let result: Result<u32, ResilienceError<&'static str>> = resilience
+            .execute_with(
+                |_error: &&'static str| false,
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async move { Err("timeout 503") }
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

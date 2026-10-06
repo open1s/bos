@@ -6,8 +6,8 @@ pub use crate::llm::{
     LlmClient, LlmContext, LlmError, LlmMessage, LlmMessage as Message, LlmRequest, LlmSession,
 };
 pub use crate::resilience::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitState, RateLimiter, RateLimiterConfig,
-    ReActResilience, ResilienceConfig, ResilienceError,
+    is_transient_debug, CircuitBreaker, CircuitBreakerConfig, CircuitState, RateLimiter,
+    RateLimiterConfig, ReActResilience, ResilienceConfig, ResilienceError,
 };
 pub use crate::runtime::{NoopApp, ReActApp};
 pub use crate::telemetry::{
