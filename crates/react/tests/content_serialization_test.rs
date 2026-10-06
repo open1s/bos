@@ -233,6 +233,36 @@ mod content_serialization_tests {
     }
 
     #[test]
+    fn test_shared_multimodal_fixture_decodes() {
+        // crates/nbos and crates/jsbos build this same JSON and both
+        // binding tests compare against this file, so a divergent shape
+        // fails here instead of degrading content to text at runtime.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/content_parts.json"
+        );
+        let json = std::fs::read_to_string(path).expect("fixture is checked in");
+        let parts: Vec<ContentPart> =
+            serde_json::from_str(&json).expect("fixture decodes to content parts");
+        assert_eq!(parts.len(), 3);
+        match &parts[1] {
+            ContentPart::Binary { binary } => {
+                assert!(binary.is_image());
+                assert_eq!(binary.name.as_deref(), Some("photo.jpg"));
+                assert_eq!(binary.url(), "https://example.com/photo.jpg");
+            }
+            other => panic!("expected the image binary, got {other:?}"),
+        }
+        match &parts[2] {
+            ContentPart::Binary { binary } => {
+                assert!(binary.is_audio());
+                assert_eq!(binary.content_type, "audio/mp3");
+            }
+            other => panic!("expected the audio binary, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_adjacently_tagged_source_does_not_decode() {
         // BinarySource is externally tagged. The adjacent {"type","data"} shape
         // used to come out of the Python binding and silently turned the whole

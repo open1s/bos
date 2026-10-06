@@ -3,6 +3,7 @@
 // asserts the same shapes, so the two bindings cannot drift on what reaches the
 // Rust backend.
 import test from 'ava'
+import { readFileSync } from 'node:fs'
 import { Binary, Content, ContentPart } from '../index.js'
 
 test('Content.text serializes to a text object', (t) => {
@@ -63,4 +64,18 @@ test('Binary.toJSON omits an absent name', (t) => {
     content_type: 'image/png',
     source: { url: 'https://example.com/a.png' },
   })
+})
+
+test("Content.parts matches the shared Rust fixture", (t) => {
+  // The Rust and Python tests read this same file, so a shape change on
+  // either side fails the build instead of silently degrading content.
+  const fixture = JSON.parse(
+    readFileSync(new URL('../../react/tests/fixtures/content_parts.json', import.meta.url), 'utf8')
+  )
+  const built = Content.parts([
+    ContentPart.text('What is in this image?'),
+    ContentPart.image('https://example.com/photo.jpg', 'photo.jpg'),
+    ContentPart.audio('QUJD', 'mp3'),
+  ]).toJSON()
+  t.deepEqual(built, fixture)
 })

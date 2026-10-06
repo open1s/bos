@@ -7,8 +7,12 @@ shape, and crates/jsbos/test/content.test.js asserts the same shapes for JS.
 """
 
 import json
+from pathlib import Path
 
 from nbos.content import Binary, Content, ContentPart
+
+REPO = Path(__file__).resolve().parents[3]
+FIXTURE = REPO / "crates" / "react" / "tests" / "fixtures" / "content_parts.json"
 
 
 def test_binary_from_url_keeps_the_url_source():
@@ -80,3 +84,19 @@ def test_content_image_wraps_a_single_part():
     parts = json.loads(Content.image("https://example.com/photo.jpg").to_json())
     assert len(parts) == 1
     assert parts[0]["binary"]["content_type"] == "image/jpeg"
+
+
+def test_parts_match_the_shared_rust_fixture():
+    # The Rust and JS tests read this same file, so a shape change on
+    # either side fails the build instead of silently degrading content.
+    expected = json.loads(FIXTURE.read_text())
+    built = json.loads(
+        Content.parts(
+            [
+                ContentPart.text("What is in this image?"),
+                ContentPart.image("https://example.com/photo.jpg", "photo.jpg"),
+                ContentPart.audio("QUJD", "mp3"),
+            ]
+        ).to_json()
+    )
+    assert built == expected
