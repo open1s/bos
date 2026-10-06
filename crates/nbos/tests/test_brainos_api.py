@@ -444,6 +444,18 @@ class TestSessionManager:
             assert agent.session.context is None
 
     @pytest.mark.asyncio
+    async def test_session_clear_drops_messages_and_context(self):
+        from nbos import BrainOS
+        async with BrainOS() as brain:
+            agent = await brain.agent("test-agent").start()
+            agent.session.add_message("user", "drop me")
+            agent.session.set_context({"topic": "trig"})
+
+            agent.session.clear()
+            assert agent.session.get_messages() == []
+            assert agent.session.context is None
+
+    @pytest.mark.asyncio
     async def test_session_export_import(self):
         from nbos import BrainOS
         async with BrainOS() as brain:

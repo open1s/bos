@@ -545,9 +545,7 @@ class SessionManager {
   }
 
   clear() {
-    // Full clear: drops every non-system message and resets the context.
-    // Python clear() only resets the context until its native agent gains a
-    // full-clear method; see nbos/nbos/core.py.
+    // Drops every non-system message and resets the context.
     this._inner.clearSession();
     return this;
   }

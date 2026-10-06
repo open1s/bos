@@ -1518,6 +1518,15 @@ impl PyAgent {
         Ok(())
     }
 
+    fn clear_session(&self) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.session_mut().clear();
+        Ok(())
+    }
+
     fn session_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let guard = self
             .inner

@@ -129,9 +129,7 @@ class SessionManager:
         return self
 
     def clear(self) -> "SessionManager":
-        # Context-only clear. The JS SessionManager.clear also drops messages;
-        # unify once the native agent exposes a full-clear method.
-        self._agent.clear_session_context()
+        self._agent.clear_session()
         return self
 
     def get_messages(self) -> list[dict]:

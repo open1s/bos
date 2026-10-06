@@ -83,6 +83,16 @@ test.serial('setContext and clearContext round-trip without touching messages', 
   t.is(agent.session.getMessages().length, 1)
 })
 
+test.serial('clear drops messages and resets the context in both bindings', async (t) => {
+  const agent = await startAgent(t)
+  agent.session.addMessage('user', 'drop me')
+  agent.session.setContext({ topic: 'trig' })
+
+  agent.session.clear()
+  t.is(agent.session.getMessages().length, 0)
+  t.is(agent.session.context, null)
+})
+
 test.serial('config exposes the resolved agent config', async (t) => {
   const agent = await startAgent(t)
   t.is(agent.config.name, 'session-test')
