@@ -17,6 +17,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release:
+    name: Detect a version commit
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.check.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Publishing builds npm packages and creates a GitHub release, so it must
+      # only run for a version commit or a version tag. Gating the job keeps a
+      # normal push from touching the registry or an existing release.
+      - id: check
+        name: Check version commit
+        shell: bash
+        run: |
+          subject=$(git log -1 --pretty=%s)
+          if [ "${{ github.ref_type }}" = "tag" ] || echo "$subject" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not a version commit. Commit: $subject"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build bindings for ${{ matrix.target }}
     strategy:
@@ -179,9 +202,11 @@ jobs:
       contents: write
       id-token: write
     needs:
+      - release
       - build
       - test-macos-windows
       - test-linux
+    if: needs.release.outputs.is_release == 'true'
     defaults:
       run:
         working-directory: ./crates/jsbos
@@ -217,10 +242,10 @@ jobs:
       - name: Publish
         run: |
           npm config set provenance true
-          if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$"; then
+          if git log -1 --pretty=%s | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$"; then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --access public
-          elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+"; then
+          elif git log -1 --pretty=%s | grep "^[0-9]\+\.[0-9]\+"; then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --tag next --access public
           else

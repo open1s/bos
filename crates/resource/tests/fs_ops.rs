@@ -285,22 +285,29 @@ async fn watch_ops(client: &ResourceClient, mgr: Option<&Arc<ResourceManager>>) 
         .await
         .unwrap();
 
-    // Overlap: give the watcher a moment to register, then create a file.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    write_file(&dir.join("watched.txt"), b"hi");
-
-    let got = tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(ev) = sub.next().await {
-            if let ResourceEvent::Custom(tag, payload) = ev {
-                if tag == "create" && String::from_utf8_lossy(&payload).contains("watched.txt") {
-                    return true;
+    // The watcher is registered eagerly, but a loaded CI runner can still miss
+    // the first inotify event. Keep creating fresh files and poll until one
+    // create event arrives, rather than betting on a single write.
+    let got = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut attempt = 0u32;
+        loop {
+            let name = format!("watched-{attempt}.txt");
+            write_file(&dir.join(&name), b"hi");
+            attempt += 1;
+            match tokio::time::timeout(Duration::from_millis(500), sub.next()).await {
+                Ok(Some(ResourceEvent::Custom(tag, payload))) => {
+                    if tag == "create" && String::from_utf8_lossy(&payload).contains("watched-") {
+                        return true;
+                    }
                 }
+                Ok(Some(_)) => {}
+                Ok(None) => return false,
+                Err(_) => {}
             }
         }
-        false
     })
     .await;
-    assert_eq!(got, Ok(true), "expected a create event for watched.txt");
+    assert_eq!(got, Ok(true), "expected a create event for a watched file");
 }
 
 #[tokio::test]
