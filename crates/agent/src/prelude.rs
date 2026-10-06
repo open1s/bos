@@ -12,7 +12,7 @@ pub use crate::mcp::{
     McpClient, McpError, McpPrompt, McpPromptArgument, McpResource, McpToolAdapter,
     ReadResourceResult, ResourceContents, ServerCapabilities, StdioTransport, ToolDefinition,
 };
-pub use crate::memory::{InMemoryMemory, MemoryItem, MemoryStore};
+pub use crate::memory::{FileMemory, InMemoryMemory, MemoryItem, MemoryStore};
 pub use crate::metrics::{CallMetrics, MetricsCollector};
 pub use crate::security::{SecurityError, WorkspaceValidator};
 pub use crate::session::manager::SessionError;

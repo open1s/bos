@@ -455,6 +455,24 @@ most recent items. `all`, `remove`, `clear`, `len`, and `is_empty` round out the
 API. `MemoryStore` is object-safe, so it can live behind an
 `Arc<dyn MemoryStore>` and be swapped without touching call sites.
 
+For memory that outlives the process, `FileMemory` persists the same
+ranking to a JSON-lines file and reloads it on open:
+
+```rust
+use agent::memory::FileMemory;
+
+let memory = FileMemory::open("./agent-memory.jsonl").await?;
+memory.add("The staging deploy needs VPN".to_string(), None).await;
+
+// A later process sees the same items:
+let reopened = FileMemory::open("./agent-memory.jsonl").await?;
+assert_eq!(reopened.len().await, 1);
+```
+
+Writes go through a sibling temporary file and an atomic rename, and a
+corrupt line makes `open` fail with `InvalidData` instead of silently
+dropping data.
+
 Attach a store to an agent and every run recalls matching items and
 appends them to the system prompt:
 

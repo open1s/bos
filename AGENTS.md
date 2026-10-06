@@ -150,7 +150,7 @@ const result = await agent.ask('What is 2+2?');
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
 - Current green baselines:
-  - Rust (excluding the binding crates): 398 passed, 0 failed, 8 ignored
+  - Rust (excluding the binding crates): 404 passed, 0 failed, 8 ignored
   - Python (`cd crates/nbos && pytest -m "not llm"`): 223 passed, 4 deselected
   - JS (`cd crates/jsbos && npx ava`): 89 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 9 memory)
 
@@ -173,7 +173,9 @@ const result = await agent.ask('What is 2+2?');
 - **Memory**: `agent::memory::MemoryStore` stores and recalls text across
   turns; `InMemoryMemory` ranks items by keyword overlap and breaks ties
   toward recency. The trait is object-safe, so a vector or file backend
-  implements the same seam. Attach one with `Agent::with_memory` and
+  implements the same seam. `FileMemory` persists the same ranking to a
+  JSON-lines file so memories survive a restart. Attach one with
+  `Agent::with_memory` and
   matching items are appended to the system prompt on each run;
   `Agent::recalled_context` exposes the block on its own. Python and JS
   expose the same store as a `Memory` class, pinned to the Rust ranking

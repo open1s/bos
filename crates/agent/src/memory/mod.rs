@@ -3,8 +3,13 @@
 //! [`MemoryStore`] is the seam: an agent can remember text across turns and
 //! recall the most relevant items for a query. [`InMemoryMemory`] is the
 //! dependency-free implementation shipped with the framework; backends such
-//! as a vector database or a file store implement the same trait and can be
-//! substituted wherever the agent accepts a `MemoryStore`.
+//! as a vector database implement the same trait and can be substituted
+//! wherever the agent accepts a `MemoryStore`; [`FileMemory`] persists to
+//! a JSON-lines file so memories survive a restart.
+
+mod file;
+
+pub use file::FileMemory;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -108,6 +113,15 @@ impl InMemoryMemory {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a store from already-constructed items, preserving their ids
+    /// and timestamps. Used when loading a persisted store.
+    #[must_use]
+    pub fn from_items(items: Vec<MemoryItem>) -> Self {
+        Self {
+            items: RwLock::new(items),
+        }
     }
 }
 
