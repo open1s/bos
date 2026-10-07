@@ -1,5 +1,20 @@
 # Changelog
 
+## v3.0.2 (2026-10-07)
+
+- **Fix**: rate-limiter and retry waits are now recorded on the live
+  LLM path — `rate_limit_waits`, `total_rate_limit_wait` and
+  `total_resilience_time` no longer stay at zero in production runs
+- **Fix**: `react()`/`stream()` record per-run token, tool-call and
+  tool-time deltas instead of engine-lifetime cumulative totals; the
+  `total_tokens` hook reports the run's real token sum and
+  `last_stream_*` values reset at the start of each stream
+- **Fix**: jsbos publish workflow serializes concurrent publishes,
+  refuses mismatched tags, repairs a stranded `latest` dist-tag, and
+  stays idempotent for the root and per-platform packages
+- **Docs**: root, nbos and jsbos READMEs refreshed for the 3.0.2
+  baseline release
+
 ## v3.0.1 (2026-10-07)
 
 - **Memory**: in-memory and file-backed memory store with metadata
