@@ -224,6 +224,18 @@ impl Agent {
             }
         };
 
+        // A cached engine's counters span its whole lifetime; snapshot them
+        // before the run so metrics record only what this run added.
+        let (pre_prompt_tokens, pre_completion_tokens) = engine
+            .as_ref()
+            .map(|e| e.cumulative_token_usage())
+            .unwrap_or((0, 0));
+        let pre_tool_calls = engine.as_ref().map(|e| e.tool_call_count()).unwrap_or(0);
+        let pre_tool_time = engine
+            .as_ref()
+            .map(|e| e.tool_time())
+            .unwrap_or(std::time::Duration::ZERO);
+
         let messages = {
             let mut session = self.session.lock().unwrap();
             session.take_messages()
@@ -266,8 +278,15 @@ impl Agent {
 
         match result {
             Ok(answer) => {
-                let tokens = engine.as_ref().map(|e| e.token_usage());
+                let cumulative_tokens = engine
+                    .as_ref()
+                    .map(|e| e.cumulative_token_usage())
+                    .unwrap_or((0, 0));
                 let tool_calls = engine.as_ref().map(|e| e.tool_call_count()).unwrap_or(0);
+                let tool_time = engine
+                    .as_ref()
+                    .map(|e| e.tool_time())
+                    .unwrap_or(std::time::Duration::ZERO);
                 {
                     let mut ec = self.engine_cache.lock().unwrap();
                     *ec = engine.take();
@@ -275,32 +294,29 @@ impl Agent {
                     *cc = context.take();
                 }
                 let wall_time = wall_start.elapsed();
-                if let Some(usage) = tokens {
-                    self.metrics.record_call(
-                        wall_time,
-                        engine_time,
-                        std::time::Duration::ZERO,
-                        usage.prompt_tokens as u64,
-                        usage.completion_tokens as u64,
-                    );
-                } else {
-                    self.metrics.record_call(
-                        wall_time,
-                        engine_time,
-                        std::time::Duration::ZERO,
-                        0,
-                        0,
-                    );
-                }
-                if tool_calls > 0 {
+                // Counters on a cached engine accumulate; record this run's delta.
+                let input_delta = cumulative_tokens.0.saturating_sub(pre_prompt_tokens);
+                let output_delta = cumulative_tokens.1.saturating_sub(pre_completion_tokens);
+                self.metrics.record_call(
+                    wall_time,
+                    engine_time,
+                    std::time::Duration::ZERO,
+                    input_delta,
+                    output_delta,
+                );
+                let tool_calls_delta = tool_calls.saturating_sub(pre_tool_calls);
+                let tool_time_delta = tool_time
+                    .checked_sub(pre_tool_time)
+                    .unwrap_or(std::time::Duration::ZERO);
+                if tool_calls_delta > 0 || tool_time_delta > std::time::Duration::ZERO {
                     self.metrics
-                        .record_tool_calls(tool_calls, std::time::Duration::ZERO);
+                        .record_tool_calls(tool_calls_delta, tool_time_delta);
                 }
                 self.hooks
                     .trigger_all(HookEvent::OnMessage, HookContext::new(&self.config.name))
                     .await;
                 let mut ctx = HookContext::new(&self.config.name);
-                ctx.set("total_tokens", "0");
+                ctx.set("total_tokens", (input_delta + output_delta).to_string());
                 self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
                 Ok(answer)
             }
@@ -380,6 +396,12 @@ impl Agent {
             None => self.prepare_context(),
         };
 
+        // Snapshot engine counters before the run so the values stored for
+        // this stream describe this run, not the engine's whole lifetime.
+        let (pre_prompt_tokens, pre_completion_tokens) = engine.cumulative_token_usage();
+        let pre_tool_calls = engine.tool_call_count();
+        let pre_tool_time = engine.tool_time();
+
         let messages = {
             let mut session = self.session.lock().unwrap();
             session.take_messages()
@@ -390,6 +412,17 @@ impl Agent {
         let stream = async_stream::stream! {
             let mut engine = engine;
             let mut context = context;
+
+            // Reset the per-stream readings first: a run that aborts early
+            // must not replay the previous stream's values.
+            {
+                let mut ts = self.last_stream_tokens.lock().unwrap();
+                *ts = Some((0, 0));
+                let mut tc = self.last_stream_tool_calls.lock().unwrap();
+                *tc = 0;
+                let mut tt = self.last_stream_tool_time.lock().unwrap();
+                *tt = std::time::Duration::ZERO;
+            }
 
             let system_prompt = self.system_prompt_for(&task_content).await;
             let request = LlmRequest {
@@ -451,19 +484,27 @@ impl Agent {
             }
 
             {
-                let usage = engine.token_usage();
-                let tokens = (usage.prompt_tokens as u64, usage.completion_tokens as u64);
-                let tool_calls = engine.tool_call_count();
+                let cumulative = engine.cumulative_token_usage();
+                let tokens = (
+                    cumulative.0.saturating_sub(pre_prompt_tokens),
+                    cumulative.1.saturating_sub(pre_completion_tokens),
+                );
+                let tool_calls = engine.tool_call_count().saturating_sub(pre_tool_calls);
+                let tool_time = engine.tool_time().saturating_sub(pre_tool_time);
                 let mut ts = self.last_stream_tokens.lock().unwrap();
                 *ts = Some(tokens);
                 let mut tc = self.last_stream_tool_calls.lock().unwrap();
                 *tc = tool_calls;
+                let mut tt = self.last_stream_tool_time.lock().unwrap();
+                *tt = tool_time;
             }
 
             {
-                let usage = engine.token_usage();
+                let cumulative = engine.cumulative_token_usage();
+                let total = cumulative.0.saturating_sub(pre_prompt_tokens)
+                    + cumulative.1.saturating_sub(pre_completion_tokens);
                 let mut ctx = HookContext::new(&self.config.name);
-                ctx.set("total_tokens", (usage.prompt_tokens as u64).to_string());
+                ctx.set("total_tokens", total.to_string());
                 self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
             }
 

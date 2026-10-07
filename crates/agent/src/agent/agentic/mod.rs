@@ -205,6 +205,8 @@ pub struct Agent {
     last_stream_tokens: std::sync::Mutex<Option<(u64, u64)>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     last_stream_tool_calls: std::sync::Mutex<u64>,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    last_stream_tool_time: std::sync::Mutex<std::time::Duration>,
 }
 
 impl Agent {
@@ -238,6 +240,7 @@ impl Agent {
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0),
+            last_stream_tool_time: std::sync::Mutex::new(std::time::Duration::ZERO),
         }
     }
 
@@ -463,6 +466,11 @@ impl Agent {
     /// Number of tool calls seen in the most recent stream.
     pub fn last_stream_tool_calls(&self) -> u64 {
         *self.last_stream_tool_calls.lock().unwrap()
+    }
+
+    /// Tool execution time recorded by the most recent stream.
+    pub fn last_stream_tool_time(&self) -> std::time::Duration {
+        *self.last_stream_tool_time.lock().unwrap()
     }
 
     /// Number of tool invocations recorded by the ReAct engine.
@@ -760,6 +768,7 @@ impl Clone for Agent {
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0),
+            last_stream_tool_time: std::sync::Mutex::new(std::time::Duration::ZERO),
         }
     }
 }

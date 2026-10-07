@@ -868,7 +868,7 @@ impl Agent {
       );
       let tool_calls = guard.last_stream_tool_calls();
       if tool_calls > 0 {
-        guard.record_tool_calls(tool_calls, std::time::Duration::ZERO);
+        guard.record_tool_calls(tool_calls, guard.last_stream_tool_time());
       }
 
       let status = if was_stopped { "stopped" } else { "completed" };

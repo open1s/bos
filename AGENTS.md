@@ -150,7 +150,7 @@ const result = await agent.ask('What is 2+2?');
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
 - Current green baselines:
-  - Rust (excluding the binding crates): 436 passed, 0 failed, 8 ignored
+  - Rust (excluding the binding crates): 443 passed, 0 failed, 8 ignored
   - Python (`cd crates/nbos && pytest -m "not llm"`): 229 passed, 4 deselected
   - JS (`cd crates/jsbos && npx ava`): 94 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 14 memory)
 
@@ -211,4 +211,4 @@ const result = await agent.ask('What is 2+2?');
 
 ---
 
-## Last Updated: 2026-10-06
+## Last Updated: 2026-10-07
