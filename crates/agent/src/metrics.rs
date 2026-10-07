@@ -1,6 +1,6 @@
 //! Call and token metrics collected while running an agent.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Aggregated counters and timings for an agent run.
@@ -79,6 +79,13 @@ impl MetricsCollector {
         let mut m = self.inner.lock().unwrap();
         m.rate_limit_waits += 1;
         m.total_rate_limit_wait += wait;
+        m.total_resilience_time += wait;
+    }
+
+    /// Record time spent waiting on retry backoff.
+    pub fn record_resilience_time(&self, time: Duration) {
+        let mut m = self.inner.lock().unwrap();
+        m.total_resilience_time += time;
     }
 
     /// Record one circuit-breaker trip.
@@ -132,9 +139,54 @@ impl Default for MetricsCollector {
     }
 }
 
+/// Bridges [`react::ResilienceObserver`] events into a [`MetricsCollector`].
+#[derive(Debug)]
+pub(crate) struct MetricsResilienceObserver {
+    metrics: Arc<MetricsCollector>,
+}
+
+impl MetricsResilienceObserver {
+    /// Wrap `metrics`.
+    pub(crate) fn new(metrics: Arc<MetricsCollector>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl react::ResilienceObserver for MetricsResilienceObserver {
+    fn on_rate_limit_wait(&self, wait: Duration) {
+        self.metrics.record_rate_limit_wait(wait);
+    }
+
+    fn on_retry_wait(&self, wait: Duration) {
+        self.metrics.record_resilience_time(wait);
+    }
+
+    fn on_circuit_trip(&self) {
+        self.metrics.record_circuit_trip();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observer_forwards_events_to_the_collector() {
+        use react::ResilienceObserver;
+
+        let collector = Arc::new(MetricsCollector::new());
+        let observer = MetricsResilienceObserver::new(Arc::clone(&collector));
+
+        observer.on_rate_limit_wait(Duration::from_millis(40));
+        observer.on_retry_wait(Duration::from_millis(10));
+        observer.on_circuit_trip();
+
+        let metrics = collector.snapshot();
+        assert_eq!(metrics.rate_limit_waits, 1);
+        assert_eq!(metrics.total_rate_limit_wait, Duration::from_millis(40));
+        assert_eq!(metrics.total_resilience_time, Duration::from_millis(50));
+        assert_eq!(metrics.circuit_trips, 1);
+    }
 
     #[test]
     fn record_call_tracks_min_and_max_wall_time() {

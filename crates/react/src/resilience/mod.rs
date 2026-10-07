@@ -117,6 +117,26 @@ impl<E: std::fmt::Debug> From<ResilienceError<E>> for String {
     }
 }
 
+/// Receives resilience events so callers can instrument retries and trips.
+///
+/// Every method defaults to doing nothing, so an implementation only
+/// overrides the events it cares about. Attach one with
+/// [`ReActResilience::with_observer`].
+pub trait ResilienceObserver: Send + Sync + std::fmt::Debug {
+    /// A rate-limit wait of `wait` occurred.
+    fn on_rate_limit_wait(&self, wait: Duration) {
+        let _ = wait;
+    }
+
+    /// A retry backoff of `wait` is about to be taken.
+    fn on_retry_wait(&self, wait: Duration) {
+        let _ = wait;
+    }
+
+    /// The circuit breaker opened.
+    fn on_circuit_trip(&self) {}
+}
+
 /// Thread-safe circuit breaker implementation.
 #[derive(Debug)]
 #[qserde::Archive]
@@ -391,6 +411,8 @@ pub struct ReActResilience {
     #[rkyv(with = qserde::rkyv::with::Skip)]
     rate_limiter: Option<RateLimiter>,
     rate_limit_config: RateLimiterConfig,
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    observer: Option<Arc<dyn ResilienceObserver>>,
 }
 
 /// Classify an error as transient by matching its debug text.
@@ -427,6 +449,7 @@ impl ReActResilience {
             circuit_breaker: Some(CircuitBreaker::new(config.circuit_breaker)),
             rate_limiter: Some(RateLimiter::new(config.rate_limiter.clone())),
             rate_limit_config: config.rate_limiter,
+            observer: None,
         }
     }
 
@@ -436,6 +459,7 @@ impl ReActResilience {
             circuit_breaker: None,
             rate_limiter: None,
             rate_limit_config: RateLimiterConfig::default(),
+            observer: None,
         }
     }
 
@@ -482,7 +506,11 @@ impl ReActResilience {
                     attempt + 1,
                     max_retries + 1
                 );
-                if limiter.acquire().await.is_err() {
+                let started = Instant::now();
+                let acquired = limiter.acquire().await;
+                let waited = started.elapsed();
+                if acquired.is_err() {
+                    self.notify_rate_limit_wait(Duration::ZERO);
                     log::warn!(
                         "[Resilience] Rate limited, attempt {}/{}",
                         attempt + 1,
@@ -490,11 +518,16 @@ impl ReActResilience {
                     );
                     if attempt < max_retries {
                         let duration = base_backoff * (1 << attempt).min(6);
+                        self.notify_retry_wait(duration);
                         log::info!("[Resilience] Retrying in {:?}", duration);
                         tokio::time::sleep(duration).await;
                         continue;
                     }
                     return Err(ResilienceError::RateLimited);
+                }
+                if waited > Duration::from_millis(1) {
+                    // acquire() waited internally for the window to slide.
+                    self.notify_rate_limit_wait(waited);
                 }
             }
 
@@ -512,6 +545,7 @@ impl ReActResilience {
                     }
                     Err(ResilienceError::RateLimited) => {
                         let duration = base_backoff * (1 << attempt).min(6);
+                        self.notify_retry_wait(duration);
                         tokio::time::sleep(duration).await;
                         continue;
                     }
@@ -530,20 +564,21 @@ impl ReActResilience {
 
             if is_transient && attempt < max_retries {
                 let duration = base_backoff * (1 << attempt).min(6);
+                self.notify_retry_wait(duration);
                 tokio::time::sleep(duration).await;
                 continue;
             }
 
             // 5) Record outcome in circuit breaker
-            if let Some(breaker) = &self.circuit_breaker {
+            if self.circuit_breaker.is_some() {
                 match &result {
                     Ok(_) => {
                         log::debug!("[Resilience] Success, closing circuit if open");
-                        breaker.record_success();
+                        self.record_success();
                     }
                     Err(e) => {
                         log::warn!("[Resilience] Failure recorded: {:?}", e);
-                        breaker.record_failure();
+                        self.record_failure();
                     }
                 }
             }
@@ -578,7 +613,11 @@ impl ReActResilience {
     /// Record failure with circuit breaker.
     pub fn record_failure(&self) {
         if let Some(breaker) = &self.circuit_breaker {
+            let was_open = breaker.get_state() == CircuitState::Open;
             breaker.record_failure();
+            if !was_open && breaker.get_state() == CircuitState::Open {
+                self.notify_circuit_trip();
+            }
         }
     }
 
@@ -590,6 +629,31 @@ impl ReActResilience {
     /// Get the rate limiter configuration.
     pub fn rate_limit_config(&self) -> &RateLimiterConfig {
         &self.rate_limit_config
+    }
+
+    /// Attach an observer notified of retries, waits and circuit trips.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn ResilienceObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    fn notify_rate_limit_wait(&self, wait: Duration) {
+        if let Some(observer) = &self.observer {
+            observer.on_rate_limit_wait(wait);
+        }
+    }
+
+    fn notify_retry_wait(&self, wait: Duration) {
+        if let Some(observer) = &self.observer {
+            observer.on_retry_wait(wait);
+        }
+    }
+
+    fn notify_circuit_trip(&self) {
+        if let Some(observer) = &self.observer {
+            observer.on_circuit_trip();
+        }
     }
 
     /// Try to acquire a rate limit slot without executing anything.
@@ -618,6 +682,7 @@ impl Clone for ReActResilience {
             circuit_breaker: self.circuit_breaker.clone(),
             rate_limiter: self.rate_limiter.clone(),
             rate_limit_config: self.rate_limit_config.clone(),
+            observer: self.observer.clone(),
         }
     }
 }
@@ -625,6 +690,73 @@ impl Clone for ReActResilience {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct RecordingObserver {
+        rate_limit_waits: AtomicUsize,
+        retry_waits: AtomicUsize,
+        circuit_trips: AtomicUsize,
+    }
+
+    impl ResilienceObserver for RecordingObserver {
+        fn on_rate_limit_wait(&self, _wait: Duration) {
+            self.rate_limit_waits.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_retry_wait(&self, _wait: Duration) {
+            self.retry_waits.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_circuit_trip(&self) {
+            self.circuit_trips.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_sees_a_rate_limit_wait_and_retry() {
+        let observer = Arc::new(RecordingObserver::default());
+        let resilience = ReActResilience::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                max_failures: 10,
+                cooldown: Duration::from_secs(30),
+            },
+            rate_limiter: RateLimiterConfig {
+                capacity: 1,
+                window: Duration::from_millis(5),
+                max_retries: 2,
+                retry_backoff: Duration::from_millis(10),
+                auto_wait: false,
+            },
+        })
+        .with_observer(observer.clone());
+
+        let run = || async { Ok::<_, &str>(()) };
+        assert!(resilience.execute_with(|_| false, run).await.is_ok());
+        assert!(resilience.execute_with(|_| false, run).await.is_ok());
+
+        assert!(observer.rate_limit_waits.load(Ordering::Relaxed) >= 1);
+        assert!(observer.retry_waits.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test]
+    async fn observer_sees_a_circuit_trip() {
+        let observer = Arc::new(RecordingObserver::default());
+        let resilience = ReActResilience::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                max_failures: 1,
+                cooldown: Duration::from_secs(30),
+            },
+            rate_limiter: RateLimiterConfig::default(),
+        })
+        .with_observer(observer.clone());
+
+        let result = resilience
+            .execute_with(|_| false, || async { Err::<(), &str>("boom") })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(observer.circuit_trips.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn test_circuit_breaker_closed_to_open() {

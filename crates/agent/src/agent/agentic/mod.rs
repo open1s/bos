@@ -210,10 +210,15 @@ pub struct Agent {
 impl Agent {
     /// Create a new Agent with the given config and LLM client.
     pub fn new(config: AgentConfig, llm: Arc<LlmProvider>) -> Self {
+        let metrics = Arc::new(crate::metrics::MetricsCollector::new());
+        let observer = Arc::new(crate::metrics::MetricsResilienceObserver::new(Arc::clone(
+            &metrics,
+        )));
         let resilience = ReActResilience::new(react::ResilienceConfig {
             circuit_breaker: config.circuit_breaker.clone().unwrap_or_default(),
             rate_limiter: config.rate_limit.clone().unwrap_or_default(),
-        });
+        })
+        .with_observer(observer);
         Self {
             config,
             llm,
@@ -222,7 +227,7 @@ impl Agent {
             skills: Vec::new(),
             resilience,
             session: std::sync::Mutex::new(AgentSession::new()),
-            metrics: std::sync::Arc::new(crate::metrics::MetricsCollector::new()),
+            metrics,
             hooks: HookRegistry::new(),
             plugins: PluginRegistry::new(),
             bus: None,

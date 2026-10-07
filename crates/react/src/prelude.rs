@@ -7,7 +7,7 @@ pub use crate::llm::{
 };
 pub use crate::resilience::{
     is_transient_debug, CircuitBreaker, CircuitBreakerConfig, CircuitState, RateLimiter,
-    RateLimiterConfig, ReActResilience, ResilienceConfig, ResilienceError,
+    RateLimiterConfig, ReActResilience, ResilienceConfig, ResilienceError, ResilienceObserver,
 };
 pub use crate::runtime::{NoopApp, ReActApp};
 pub use crate::telemetry::{
