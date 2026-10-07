@@ -198,6 +198,15 @@ jobs:
   publish:
     name: Publish
     runs-on: ubuntu-latest
+    # The workflow-level group is per-ref, so a version commit on main and
+    # its v* tag run concurrently. Publishes must not: the second run would
+    # race this job past the already-published guard and fail on an
+    # EPUBLISHCONFLICT. Serialize publish jobs across every ref, and never
+    # cancel one in progress — a cancelled publish leaves a half-published
+    # release behind.
+    concurrency:
+      group: ${{ github.workflow }}-publish
+      cancel-in-progress: false
     permissions:
       contents: write
       id-token: write
@@ -248,37 +257,74 @@ jobs:
       - name: Publish
         run: |
           npm config set provenance true
-          # Publishing must be idempotent: a version commit and its v* tag
-          # both trigger this workflow for the same commit, and a re-run
-          # repeats it. Without this guard the second attempt fails the
-          # release on an already-published version instead of no-oping.
           pkg=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
-          if npm view "${pkg}@${version}" version >/dev/null 2>&1; then
-            echo "${pkg}@${version} is already published; skipping publish."
-            exit 0
-          fi
-          # Publish only when this push is a release: a v* tag (the tag
-          # name picks the dist-tag) or a bare version commit. Auth comes
-          # from npm Trusted Publishing -- npm exchanges the OIDC identity
-          # of this workflow for registry access, so no _authToken is
-          # written and no OTP is ever prompted. Every package published
-          # from here (this one plus the per-platform ones emitted by
-          # `napi prepublish`) must list this workflow as a trusted
-          # publisher on npmjs.com.
           subject=$(git log -1 --pretty=%s)
+
+          # 1. Decide the dist-tag this push would publish under: `latest`
+          #    for a full release, `next` for a pre-release, nothing at
+          #    all when the push is not a release.
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             if echo "$GITHUB_REF_NAME" | grep -qE "^v?[0-9]+\.[0-9]+\.[0-9]+$"; then
-              npm publish --access public
+              dist_tag=latest
             else
-              npm publish --tag next --access public
+              dist_tag=next
             fi
           elif echo "$subject" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+$"; then
-            npm publish --access public
+            dist_tag=latest
           elif echo "$subject" | grep -qE "^[0-9]+\.[0-9]+"; then
-            npm publish --tag next --access public
+            dist_tag=next
           else
+            echo "Not a version commit. Commit: ${subject}"
             echo "Not a release, skipping publish"
+            exit 0
+          fi
+
+          # 2. The push's version identity must equal package.json. A stray
+          #    or stale tag (or a mislabeled version commit) would publish
+          #    whatever version happens to be checked out — possibly an old
+          #    version over `latest`.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            push_version="${GITHUB_REF_NAME#v}"
+          else
+            push_version=$(echo "$subject" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' || true)
+          fi
+          if [ "$push_version" != "$version" ]; then
+            echo "Push version (${push_version:-none}) does not match package.json ${version}; skipping publish."
+            exit 0
+          fi
+
+          # 3. Publishing must be idempotent: a version commit and its v*
+          #    tag both trigger this workflow for the same commit, and a
+          #    re-run repeats it. Without this guard the second attempt
+          #    fails the release on an already-published version instead
+          #    of no-oping. The per-platform packages are equally safe:
+          #    `napi prepublish` skips any platform package the registry
+          #    reports as already published.
+          if npm view "${pkg}@${version}" version >/dev/null 2>&1; then
+            echo "${pkg}@${version} is already published."
+            # The version may have first landed under `next` (a
+            # pre-release push beat this one to the registry); a full
+            # release must still move `latest` onto it or npm users
+            # never receive this version.
+            if [ "$dist_tag" = "latest" ] && [ "$(npm view "${pkg}" version 2>/dev/null)" != "$version" ]; then
+              echo "latest does not point at ${version}; moving it."
+              npm dist-tag add "${pkg}@${version}" latest
+            fi
+            exit 0
+          fi
+
+          # 4. Publish only from this workflow. Auth comes from npm Trusted
+          #    Publishing -- npm exchanges the OIDC identity of this
+          #    workflow for registry access, so no _authToken is written
+          #    and no OTP is ever prompted. Every package published from
+          #    here (this one plus the per-platform ones emitted by
+          #    `napi prepublish`) must list this workflow as a trusted
+          #    publisher on npmjs.com.
+          if [ "$dist_tag" = "latest" ]; then
+            npm publish --access public
+          else
+            npm publish --tag next --access public
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
