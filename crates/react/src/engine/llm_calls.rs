@@ -100,7 +100,10 @@ impl<A: ReActApp> ReActEngine<A> {
                 .unwrap_or(std::time::Duration::from_millis(500));
             let delay = backoff * (1u32 << (attempt - 1)).min(6);
             info!("[TIMING] call_llm retrying after {:?} delay", delay);
-            tokio::time::sleep(delay).await;
+            match &self.resilience {
+                Some(resilience) => resilience.backoff(delay).await,
+                None => tokio::time::sleep(delay).await,
+            }
         }
     }
 

@@ -149,6 +149,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             resilience: self.resilience,
             skill_cache: self.skill_cache,
             tool_call_count: AtomicU64::new(0),
+            tool_time_nanos: AtomicU64::new(0),
             stop_flag: Arc::new(AtomicBool::new(false)),
             run_manager,
         })

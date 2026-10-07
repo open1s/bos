@@ -46,6 +46,7 @@ pub struct ReActEngine<A: ReActApp> {
     resilience: Option<ReActResilience>,
     skill_cache: SkillCache,
     tool_call_count: AtomicU64,
+    tool_time_nanos: AtomicU64,
     stop_flag: Arc<AtomicBool>,
     run_manager: Arc<ToolRunManager>,
 }
@@ -227,8 +228,13 @@ impl<A: ReActApp> ReActEngine<A> {
                                     }
                                 }
 
+                                let tool_started = Instant::now();
                                 let mut result = self.call_tool(&name, &mut args, &call_id).await;
                                 self.tool_call_count.fetch_add(1, Ordering::Relaxed);
+                                self.tool_time_nanos.fetch_add(
+                                    tool_started.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
 
                                 match self
                                     .react_app
@@ -396,8 +402,13 @@ impl<A: ReActApp> ReActEngine<A> {
                                     }
                                 }
 
+                                let tool_started = Instant::now();
                                 let mut result = self.call_tool(&name, &mut args, &call_id).await;
                                 self.tool_call_count.fetch_add(1, Ordering::Relaxed);
+                                self.tool_time_nanos.fetch_add(
+                                    tool_started.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
 
                                 match self
                                     .react_app
@@ -634,6 +645,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 }
                             }
 
+                            let tool_started = Instant::now();
                             let mut result = if name == "load_skill" {
                                 let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                 if let Some((instructions, skill_dir)) = loaded_skills.get(skill_name) {
@@ -650,6 +662,8 @@ impl<A: ReActApp> ReActEngine<A> {
                                 self.call_tool(&name, &mut args, &call_id).await
                             };
                             self.tool_call_count.fetch_add(1, Ordering::Relaxed);
+                            self.tool_time_nanos
+                                .fetch_add(tool_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                             match self.react_app
                                 .after_tool_result(&name, &mut result, &call_id, session, context)
@@ -727,9 +741,22 @@ impl<A: ReActApp> ReActEngine<A> {
         Box::pin(stream)
     }
 
-    /// Get current token usage for this session
+    /// Usage reported by the most recent LLM call (the current request).
+    ///
+    /// For lifetime sums across every call, see
+    /// [`ReActEngine::cumulative_token_usage`].
     pub fn token_usage(&self) -> TokenUsage {
         self.token_counter.usage()
+    }
+
+    /// Lifetime prompt and completion totals across every LLM call this
+    /// engine has made.
+    ///
+    /// Unlike [`ReActEngine::token_usage`], these accumulate across runs
+    /// that share a cached engine; take a difference between snapshots for
+    /// a per-run value.
+    pub fn cumulative_token_usage(&self) -> (u64, u64) {
+        self.token_counter.lifetime_totals()
     }
 
     /// Get a budget report showing usage vs limits
@@ -745,6 +772,15 @@ impl<A: ReActApp> ReActEngine<A> {
     /// Get the number of tool calls made during this session.
     pub fn tool_call_count(&self) -> u64 {
         self.tool_call_count.load(Ordering::Relaxed)
+    }
+
+    /// Total wall time spent executing tools during this engine's lifetime.
+    ///
+    /// Like [`ReActEngine::tool_call_count`], this accumulates across runs
+    /// that share a cached engine; take a difference between snapshots for
+    /// a per-run value.
+    pub fn tool_time(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.tool_time_nanos.load(Ordering::Relaxed))
     }
 
     /// Reset the tool call counter.

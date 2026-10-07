@@ -209,6 +209,8 @@ pub struct TokenCounter {
     current_usage: AtomicTokenUsage,
     total_requests: AtomicU64,
     session_start_tokens: u64,
+    total_prompt_tokens: AtomicU64,
+    total_completion_tokens: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -266,6 +268,8 @@ impl TokenCounter {
             current_usage: AtomicTokenUsage::new(),
             total_requests: AtomicU64::new(0),
             session_start_tokens: 0,
+            total_prompt_tokens: AtomicU64::new(0),
+            total_completion_tokens: AtomicU64::new(0),
         }
     }
 
@@ -276,6 +280,10 @@ impl TokenCounter {
 
     /// Record exact usage from a response and count the request.
     pub fn update_from_response(&self, usage: TokenUsage) {
+        self.total_prompt_tokens
+            .fetch_add(u64::from(usage.prompt_tokens), Ordering::Relaxed);
+        self.total_completion_tokens
+            .fetch_add(u64::from(usage.completion_tokens), Ordering::Relaxed);
         self.current_usage.set(usage);
         self.total_requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -284,10 +292,23 @@ impl TokenCounter {
     pub fn estimate_and_update(&self, prompt_text: &str) {
         let estimated = TokenUsage::estimate_from_text(prompt_text);
         let current = self.current_usage.get();
+        self.total_prompt_tokens
+            .fetch_add(u64::from(estimated), Ordering::Relaxed);
         let new_usage =
             TokenUsage::new(current.prompt_tokens + estimated, current.completion_tokens);
         self.current_usage.set(new_usage);
         self.total_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lifetime prompt and completion totals across every recorded request.
+    ///
+    /// Unlike [`TokenCounter::usage`], which reports only the current
+    /// request, these sums accumulate for as long as the counter exists.
+    pub fn lifetime_totals(&self) -> (u64, u64) {
+        (
+            self.total_prompt_tokens.load(Ordering::Relaxed),
+            self.total_completion_tokens.load(Ordering::Relaxed),
+        )
     }
 
     /// Classify current usage against the budget.

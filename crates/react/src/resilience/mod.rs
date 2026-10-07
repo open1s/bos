@@ -237,7 +237,11 @@ impl CircuitBreaker {
     }
 
     /// Record a failed call. Increments failure count and may open the circuit.
-    pub fn record_failure(&self) {
+    ///
+    /// Returns `true` exactly when this failure transitioned the breaker into
+    /// `[CircuitState::Open]`, so callers can report a trip once without a
+    /// separate state read racing concurrent failures.
+    pub fn record_failure(&self) -> bool {
         let mut state = self.lock_state();
         let now = Instant::now();
 
@@ -251,17 +255,20 @@ impl CircuitBreaker {
                         "[CircuitBreaker] Failure threshold reached ({}), opening circuit",
                         count
                     );
+                    return true;
                 }
             }
             CircuitState::HalfOpen => {
                 *state = CircuitState::Open;
                 *self.lock_last_failure_time() = Some(now);
                 log::warn!("[CircuitBreaker] Probe failed, reopening circuit");
+                return true;
             }
             CircuitState::Open => {
                 *self.lock_last_failure_time() = Some(now);
             }
         }
+        false
     }
 
     /// Get current state (for observability).
@@ -510,7 +517,9 @@ impl ReActResilience {
                 let acquired = limiter.acquire().await;
                 let waited = started.elapsed();
                 if acquired.is_err() {
-                    self.notify_rate_limit_wait(Duration::ZERO);
+                    // Report the measured wait: auto_wait may have slept for
+                    // some or all of it before the limiter gave up.
+                    self.notify_rate_limit_wait(waited);
                     log::warn!(
                         "[Resilience] Rate limited, attempt {}/{}",
                         attempt + 1,
@@ -613,9 +622,7 @@ impl ReActResilience {
     /// Record failure with circuit breaker.
     pub fn record_failure(&self) {
         if let Some(breaker) = &self.circuit_breaker {
-            let was_open = breaker.get_state() == CircuitState::Open;
-            breaker.record_failure();
-            if !was_open && breaker.get_state() == CircuitState::Open {
+            if breaker.record_failure() {
                 self.notify_circuit_trip();
             }
         }
@@ -667,12 +674,31 @@ impl ReActResilience {
     }
 
     /// Acquire a rate limit slot with automatic waiting.
+    ///
+    /// The wall time spent blocked in the limiter is reported to the
+    /// observer, whether the slot was eventually granted or the wait ended
+    /// in a rejection: the sleep happened either way and belongs in
+    /// `total_rate_limit_wait`.
     pub async fn acquire(&self) -> Result<(), ResilienceError<()>> {
-        if let Some(limiter) = &self.rate_limiter {
-            limiter.acquire().await
-        } else {
-            Ok(())
+        let Some(limiter) = &self.rate_limiter else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let acquired = limiter.acquire().await;
+        let waited = started.elapsed();
+        if acquired.is_err() || waited > Duration::from_millis(1) {
+            self.notify_rate_limit_wait(waited);
         }
+        acquired
+    }
+
+    /// Sleep for `delay`, reporting the wait to the observer first.
+    ///
+    /// The engine's retry loop calls this instead of sleeping directly so
+    /// retry backoffs reach the metrics collector.
+    pub async fn backoff(&self, delay: Duration) {
+        self.notify_retry_wait(delay);
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -694,17 +720,33 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingObserver {
         rate_limit_waits: AtomicUsize,
+        rate_limit_wait_nanos: AtomicU64,
         retry_waits: AtomicUsize,
+        retry_wait_nanos: AtomicU64,
         circuit_trips: AtomicUsize,
     }
 
-    impl ResilienceObserver for RecordingObserver {
-        fn on_rate_limit_wait(&self, _wait: Duration) {
-            self.rate_limit_waits.fetch_add(1, Ordering::Relaxed);
+    impl RecordingObserver {
+        fn rate_limit_wait_total(&self) -> Duration {
+            Duration::from_nanos(self.rate_limit_wait_nanos.load(Ordering::Relaxed))
         }
 
-        fn on_retry_wait(&self, _wait: Duration) {
+        fn retry_wait_total(&self) -> Duration {
+            Duration::from_nanos(self.retry_wait_nanos.load(Ordering::Relaxed))
+        }
+    }
+
+    impl ResilienceObserver for RecordingObserver {
+        fn on_rate_limit_wait(&self, wait: Duration) {
+            self.rate_limit_waits.fetch_add(1, Ordering::Relaxed);
+            self.rate_limit_wait_nanos
+                .fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        fn on_retry_wait(&self, wait: Duration) {
             self.retry_waits.fetch_add(1, Ordering::Relaxed);
+            self.retry_wait_nanos
+                .fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
         }
 
         fn on_circuit_trip(&self) {
@@ -755,6 +797,88 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+        assert_eq!(observer.circuit_trips.load(Ordering::Relaxed), 1);
+    }
+
+    fn test_resilience(rate_limiter: RateLimiterConfig, max_failures: usize) -> ReActResilience {
+        ReActResilience::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                max_failures,
+                cooldown: Duration::from_secs(30),
+            },
+            rate_limiter,
+        })
+    }
+
+    #[tokio::test]
+    async fn acquire_reports_the_wait_it_really_slept() {
+        let observer = Arc::new(RecordingObserver::default());
+        let resilience = test_resilience(
+            RateLimiterConfig {
+                capacity: 1,
+                window: Duration::from_millis(150),
+                max_retries: 3,
+                retry_backoff: Duration::from_millis(20),
+                auto_wait: true,
+            },
+            10,
+        )
+        .with_observer(observer.clone());
+
+        // The first call consumes the single slot; the second blocks until
+        // the window slides, and that real sleep must reach the observer.
+        assert!(resilience.acquire().await.is_ok());
+        assert!(resilience.acquire().await.is_ok());
+
+        assert!(observer.rate_limit_waits.load(Ordering::Relaxed) >= 1);
+        assert!(
+            observer.rate_limit_wait_total() > Duration::from_millis(1),
+            "the observed wait must be the real sleep, not zero: {:?}",
+            observer.rate_limit_wait_total()
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_reports_a_retry_wait() {
+        let observer = Arc::new(RecordingObserver::default());
+        let resilience = test_resilience(
+            RateLimiterConfig {
+                capacity: 1,
+                window: Duration::from_secs(1),
+                max_retries: 1,
+                retry_backoff: Duration::from_millis(10),
+                auto_wait: false,
+            },
+            10,
+        )
+        .with_observer(observer.clone());
+
+        resilience.backoff(Duration::from_millis(5)).await;
+
+        assert_eq!(observer.retry_waits.load(Ordering::Relaxed), 1);
+        assert!(observer.retry_wait_total() >= Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn a_trip_is_reported_exactly_once() {
+        let observer = Arc::new(RecordingObserver::default());
+        let resilience = test_resilience(
+            RateLimiterConfig {
+                capacity: 1,
+                window: Duration::from_secs(1),
+                max_retries: 1,
+                retry_backoff: Duration::from_millis(10),
+                auto_wait: false,
+            },
+            1,
+        )
+        .with_observer(observer.clone());
+
+        // Closed -> Open trips; the second failure lands on an already-open
+        // breaker and must not trip again.
+        resilience.record_failure();
+        resilience.record_failure();
+
         assert_eq!(observer.circuit_trips.load(Ordering::Relaxed), 1);
     }
 
