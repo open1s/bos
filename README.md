@@ -34,7 +34,7 @@ print(asyncio.run(BrainOS().agent('assistant').ask('say hi')))
 
 ## Quick Start
 
-### Python (brainos)
+### Python (nbos)
 
 ```python
 from nbos import BrainOS, tool
@@ -63,7 +63,7 @@ async with BrainOS() as brain:
     result = await agent.ask(audio_content)
 ```
 
-### JavaScript (@open1s/jsbos / brainos-js)
+### JavaScript (@open1s/jsbos)
 
 ```javascript
 import { BrainOS, ToolDef, Content, ContentPart } from '@open1s/jsbos';
@@ -185,6 +185,8 @@ bos/
 │   ├── config/         # TOML/YAML config loading
 │   ├── logging/        # Tracing and instrumentation
 │   ├── react/          # ReAct reasoning engine
+│   ├── qserde/         # rkyv-backed wire format (+ qserde_derive)
+│   ├── resource/       # Resource subsystem + `rex` CLI
 │   ├── nbos/           # Python bindings (nbos package)
 │   └── jsbos/          # Node.js bindings (@open1s/jsbos)
 ├── docs/               # User guides
@@ -205,6 +207,8 @@ bos/
 | `config` | Config loading from TOML, YAML, env vars | `cargo add config` |
 | `logging` | Tracing and observability | `cargo add logging` |
 | `react` | ReAct reasoning + acting engine | `cargo add react` |
+| `qserde` | rkyv-backed archive + wire format for bus payloads | `cargo add qserde` |
+| `resource` | Resource subsystem with `rex` CLI | `cargo add resource` |
 | `nbos` | Python bindings | `pip install nbos` |
 | `jsbos` | Node.js bindings | `npm install @open1s/jsbos` |
 
@@ -398,6 +402,19 @@ MIT OR Apache-2.0
 
 ## Changelog
 
+### v3.0.2 (2026-10-07)
+
+- **Fixed**: rate-limit/retry waits and per-run token, tool-call and tool-time metrics now recorded on the live LLM path
+- **Fixed**: npm publish pipeline hardened — serialized publishes, dist-tag repair, stray-tag guard, idempotent re-runs
+- **Docs**: READMEs refreshed for the 3.0.2 baseline release
+
+### v3.0.1 (2026-10-07)
+
+- **Added**: Memory store (in-memory/file-backed) with metadata filters, `{{memory}}` prompt placeholder, and a `Memory` class in Python/JS
+- **Added**: `react::template` prompt templates; `AsyncFunctionTool::from_fn`
+- **Added**: Retry classification by error type; rate limiter honours `retry_backoff`/`auto_wait`
+- **Added**: Per-call min/max LLM wall time in metrics, surfaced by both bindings
+
 ### v2.3.6 (2026-07-01)
 
 - **Added**: `skill_dir` to `load_skill` tool result — LLM receives the parent path of `SKILL.md` for accessing bundled resources
@@ -442,4 +459,4 @@ MIT OR Apache-2.0
 
 ---
 
-**Version**: 2.3.6 | **Last Updated**: 2026-07-01
+**Version**: 3.0.2 | **Last Updated**: 2026-10-07
