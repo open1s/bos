@@ -321,10 +321,29 @@ jobs:
           #    here (this one plus the per-platform ones emitted by
           #    `napi prepublish`) must list this workflow as a trusted
           #    publisher on npmjs.com.
+          # A concurrent run can finish this same version between step 3's
+          # guard and this publish: npm serves a brief read-after-write
+          # staleness, so the guard misses, `napi prepublish` hits E409
+          # re-publishing an already-published platform package, and the run
+          # fails on a race instead of no-oping. If the registry now
+          # confirms the release landed, the outcome this job wanted has
+          # happened — accept it rather than failing the release.
           if [ "$dist_tag" = "latest" ]; then
-            npm publish --access public
+            publish=(npm publish --access public)
           else
-            npm publish --tag next --access public
+            publish=(npm publish --tag next --access public)
+          fi
+          if ! "${publish[@]}"; then
+            if npm view "${pkg}@${version}" version >/dev/null 2>&1; then
+              echo "${pkg}@${version} is on the registry; a concurrent run published it first."
+              if [ "$dist_tag" = "latest" ] && [ "$(npm view "${pkg}" version 2>/dev/null)" != "$version" ]; then
+                echo "latest does not point at ${version}; moving it."
+                npm dist-tag add "${pkg}@${version}" latest
+              fi
+              exit 0
+            fi
+            echo "Publish failed and ${pkg}@${version} is not on the registry."
+            exit 1
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
