@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BOS</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="sidebar-head">
+        <span class="brand">BOS</span>
+        <button id="new-chat" class="btn btn-accent" title="New chat">+ New</button>
+      </div>
+      <div id="session-list" class="session-list"></div>
+      <div class="sidebar-foot">
+        <button id="open-settings" class="btn btn-ghost" title="Settings">&#9881; Settings</button>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header id="chat-head">
+        <span id="chat-title">BOS</span>
+        <span id="stream-chip" class="chip idle">idle</span>
+      </header>
+
+      <div id="messages"></div>
+
+      <div id="composer">
+        <textarea id="input" rows="1" placeholder="Send a message&#10;Enter = send · Shift+Enter = newline"></textarea>
+        <button id="send" class="btn btn-accent" disabled>Send</button>
+      </div>
+
+      <footer id="statusbar">
+        <span id="status-left"></span>
+        <span id="status-right"></span>
+      </footer>
+    </main>
+  </div>
+
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-card">
+      <h2>Settings</h2>
+      <form id="settings-form">
+        <label>Model
+          <input id="set-model" type="text" spellcheck="false"
+                 placeholder="model name or [llm.<name>] profile" />
+        </label>
+        <label>Base URL
+          <input id="set-base-url" type="text" spellcheck="false"
+                 placeholder="https://api.example.com/v1" />
+        </label>
+        <label>API key
+          <input id="set-api-key" type="password" spellcheck="false"
+                 placeholder="leave blank to use discovered config / env" />
+        </label>
+        <label>System prompt
+          <textarea id="set-system" rows="4" spellcheck="false"></textarea>
+        </label>
+        <div class="row">
+          <label class="grow">Temperature
+            <input id="set-temperature" type="number" min="0" max="2" step="0.1" />
+          </label>
+          <label class="grow">Reasoning effort
+            <select id="set-effort">
+              <option value="">none</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label class="row-check grow"><input id="set-bash" type="checkbox" /> bash tool</label>
+          <label class="row-check grow"><input id="set-files" type="checkbox" /> file tools</label>
+          <label class="row-check grow"><input id="set-approval" type="checkbox" /> approval gate</label>
+        </div>
+        <label>Workspace root
+          <input id="set-workspace" type="text" spellcheck="false"
+                 placeholder="~/Projects/my-repo (empty = unrestricted)" />
+        </label>
+        <label>Skills directory
+          <input id="set-skills-dir" type="text" spellcheck="false"
+                 placeholder="~/.bos/skills" />
+        </label>
+        <div class="cap-section">
+          <div class="cap-title">MCP servers (plugins)
+            <span id="mcp-conn" class="mcp-conn" role="status" aria-live="polite"></span>
+          </div>
+          <ul id="mcp-list" class="mcp-list" aria-label="Configured MCP servers"></ul>
+          <div class="mcp-add">
+            <input id="mcp-name" type="text" spellcheck="false" aria-label="Server name"
+                   placeholder="name (e.g. files)" />
+            <select id="mcp-transport" aria-label="Transport">
+              <option value="stdio">stdio</option>
+              <option value="http">http</option>
+            </select>
+            <input id="mcp-cmd" type="text" spellcheck="false" aria-label="Command and arguments"
+                   placeholder="command with args (stdio)" />
+            <input id="mcp-url" type="text" spellcheck="false" aria-label="Server URL"
+                   placeholder="http://host:port/mcp (http)" />
+            <button type="button" id="mcp-add-btn" class="btn btn-ghost">Add</button>
+            <button type="button" id="mcp-reconnect-btn" class="btn btn-ghost"
+                    title="Reconnect every enabled server">Reconnect</button>
+          </div>
+          <p id="mcp-msg" class="mcp-msg" role="status" aria-live="polite"></p>
+        </div>
+        <div class="cap-section">
+          <div class="cap-title">Registered capabilities</div>
+          <div id="cap-list" class="cap-list"></div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="settings-cancel" class="btn btn-ghost">Cancel</button>
+          <button type="submit" id="settings-save" class="btn btn-accent">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="approval-modal" class="modal hidden">
+    <div class="modal-card approval-card">
+      <h2>Approval required</h2>
+      <p class="approval-desc">
+        The agent wants to run <span id="approval-tool" class="approval-tool"></span>.
+        Review the input before allowing it to execute.
+      </p>
+      <pre id="approval-args" class="approval-args"></pre>
+      <div class="modal-actions">
+        <button type="button" id="approval-deny" class="btn btn-ghost">Deny</button>
+        <button type="button" id="approval-allow" class="btn btn-accent">Allow once</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

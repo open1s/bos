@@ -662,34 +662,14 @@ impl Agent {
         self.register_mcp_tools_with_namespace(client, "mcp").await
     }
 
-    /// Register MCP tools under a namespace (tool names become `{namespace}/{tool}`).
+    /// Register MCP tools under a namespace (tool names become `{namespace}_{tool}`).
     pub async fn register_mcp_tools_with_namespace(
         &mut self,
         client: std::sync::Arc<crate::mcp::McpClient>,
         namespace: &str,
     ) -> Result<(), crate::mcp::McpError> {
         use crate::mcp::McpToolAdapter;
-        let namespace = namespace.trim();
-        if namespace.is_empty() {
-            return Err(crate::mcp::McpError::Protocol(
-                "MCP namespace must not be empty".to_string(),
-            ));
-        }
-        if namespace.contains('/') {
-            return Err(crate::mcp::McpError::Protocol(format!(
-                "Invalid MCP namespace '{}': '/' is not allowed",
-                namespace
-            )));
-        }
-        if !namespace
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        {
-            return Err(crate::mcp::McpError::Protocol(format!(
-                "Invalid MCP namespace '{}': allowed chars are [A-Za-z0-9._-]",
-                namespace
-            )));
-        }
+        let namespace = check_mcp_namespace(namespace)?;
 
         if client.get_capabilities().await.is_none() {
             client.initialize().await?;
@@ -744,6 +724,86 @@ impl Agent {
         self.context_cache.lock().unwrap().take();
         Ok(())
     }
+
+    /// Attach one already-listed MCP tool under `{namespace}_{tool_name}`.
+    ///
+    /// [`Agent::register_mcp_tools_with_namespace`] performs the handshake and
+    /// tool listing itself, which needs the network while the agent is mutably
+    /// borrowed. Callers that must list tools outside that borrow (the GUI
+    /// holds its agent behind a `std::sync::Mutex`) can `initialize`/`list_tools`
+    /// first and then attach each tool with this synchronous method.
+    ///
+    /// `tool` is usually an [`crate::mcp::McpToolAdapter`], optionally wrapped
+    /// by the caller (for example in an approval gate that delegates `name()`).
+    /// Its [`react::tool::registry::AsyncTool::name`] must return exactly
+    /// `{namespace}_{tool_name}`; the name is what the registry keys on and
+    /// what gets marked as MCP-originated.
+    pub fn add_mcp_tool(
+        &mut self,
+        namespace: &str,
+        tool_name: &str,
+        tool: std::sync::Arc<dyn react::tool::registry::AsyncTool>,
+    ) -> Result<(), crate::mcp::McpError> {
+        let namespace = check_mcp_namespace(namespace)?;
+        if tool_name.trim().is_empty() {
+            return Err(crate::mcp::McpError::Protocol(
+                "MCP tool name must not be empty".to_string(),
+            ));
+        }
+        let namespaced_name = format!("{namespace}_{tool_name}");
+        if tool.name() != namespaced_name {
+            return Err(crate::mcp::McpError::Protocol(format!(
+                "MCP tool name mismatch: expected '{namespaced_name}', got '{}'",
+                tool.name()
+            )));
+        }
+        let registry = self
+            .registry
+            .get_or_insert_with(|| Arc::new(ToolRegistry::new()));
+        if registry.get(&namespaced_name).is_some() {
+            return Err(crate::mcp::McpError::Protocol(format!(
+                "Failed to register MCP tool '{tool_name}': duplicate tool '{namespaced_name}'"
+            )));
+        }
+        Arc::make_mut(registry).mark_mcp_tool(&namespaced_name);
+        let registry = self.registry.as_mut().expect("registry just created");
+        Arc::make_mut(registry).register_async(tool).map_err(|e| {
+            crate::mcp::McpError::Protocol(format!(
+                "Failed to register MCP tool '{namespaced_name}': {e}"
+            ))
+        })?;
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        Ok(())
+    }
+}
+
+/// Validate an MCP namespace: trimmed, non-empty, `[A-Za-z0-9._-]` only.
+///
+/// Returns the trimmed namespace on success. Shared by the one-shot
+/// registration path and [`Agent::add_mcp_tool`] so both reject the same
+/// shapes.
+fn check_mcp_namespace(namespace: &str) -> Result<&str, crate::mcp::McpError> {
+    let namespace = namespace.trim();
+    if namespace.is_empty() {
+        return Err(crate::mcp::McpError::Protocol(
+            "MCP namespace must not be empty".to_string(),
+        ));
+    }
+    if namespace.contains('/') {
+        return Err(crate::mcp::McpError::Protocol(format!(
+            "Invalid MCP namespace '{namespace}': '/' is not allowed"
+        )));
+    }
+    if !namespace
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(crate::mcp::McpError::Protocol(format!(
+            "Invalid MCP namespace '{namespace}': allowed chars are [A-Za-z0-9._-]"
+        )));
+    }
+    Ok(namespace)
 }
 
 /// Clone implementation for stateless agent.

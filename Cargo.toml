@@ -9,7 +9,8 @@ members = [
     "crates/jsbos",
     "crates/qserde",
     "crates/qserde_derive",
-    "crates/resource"
+    "crates/resource",
+    "crates/gui"
 ]
 resolver = "2"
 
@@ -42,6 +43,7 @@ rkyv = { version = "0.8.16", features = ["unaligned"] }
 rkyv_derive = "0.8.16"
 notify = "8"
 async-channel = "2.5"
+shellexpand = "3.1"
 criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
 pprof = { version = "0.15", features = ["criterion", "flamegraph"] }
 bus = { path = "crates/bus" }

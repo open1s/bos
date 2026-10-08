@@ -800,3 +800,79 @@ async fn react_records_per_run_tool_deltas() {
         m.total_tool_time
     );
 }
+
+/* ---- MCP attach (Agent::add_mcp_tool) ---- */
+
+/// A lazily-created HTTP client: no network I/O happens until a request is
+/// made, which these registration tests never do.
+fn lazy_mcp_client() -> Arc<crate::mcp::McpClient> {
+    Arc::new(crate::mcp::McpClient::connect_http("http://127.0.0.1:9"))
+}
+
+/// Build an adapter whose registry name is `{namespace}_{tool}`.
+fn mcp_adapter(
+    client: &Arc<crate::mcp::McpClient>,
+    namespace: &str,
+    tool: &str,
+) -> Arc<dyn react::tool::registry::AsyncTool> {
+    Arc::new(crate::mcp::McpToolAdapter::new(
+        client.clone(),
+        format!("{namespace}_{tool}"),
+        tool.to_string(),
+        "test tool".to_string(),
+        serde_json::json!({"type": "object"}),
+    ))
+}
+
+#[test]
+fn add_mcp_tool_rejects_invalid_names() {
+    let mut agent = Agent::from_config(AgentConfig::default());
+    let client = lazy_mcp_client();
+
+    let empty_ns = agent.add_mcp_tool("  ", "t", mcp_adapter(&client, "x", "t"));
+    assert!(empty_ns.is_err(), "blank namespace must be rejected");
+
+    let slash_ns = agent.add_mcp_tool("bad/ns", "t", mcp_adapter(&client, "x", "t"));
+    assert!(slash_ns.is_err(), "'/' must be rejected");
+
+    let space_ns = agent.add_mcp_tool("bad ns", "t", mcp_adapter(&client, "x", "t"));
+    assert!(space_ns.is_err(), "spaces must be rejected");
+
+    let empty_tool = agent.add_mcp_tool("ok", " ", mcp_adapter(&client, "ok", "t"));
+    assert!(empty_tool.is_err(), "blank tool name must be rejected");
+
+    // The adapter's own name must match `{namespace}_{tool_name}`.
+    let mismatch = agent.add_mcp_tool("ns", "other", mcp_adapter(&client, "ns", "t"));
+    assert!(mismatch.is_err(), "name mismatch must be rejected");
+
+    assert!(
+        agent
+            .registry()
+            .is_none_or(|reg| reg.async_tool_names().is_empty()),
+        "no failed attempt may register a tool"
+    );
+}
+
+#[test]
+fn add_mcp_tool_registers_marks_and_lists() {
+    let mut agent = Agent::from_config(AgentConfig::default());
+    let client = lazy_mcp_client();
+
+    agent
+        .add_mcp_tool("files", "read", mcp_adapter(&client, "files", "read"))
+        .expect("registration must succeed");
+
+    let reg = agent.registry().expect("registry exists after attach");
+    let full = "files_read";
+    assert!(reg.async_tool_names().contains(&full.to_string()));
+    assert!(reg.is_mcp_tool(full), "{full} must be marked MCP");
+    assert!(
+        reg.mcp_tool_entries()
+            .iter()
+            .any(|e| e.get("name").and_then(|n| n.as_str()) == Some(full)),
+        "mcp_tool_entries must project {full}"
+    );
+
+    let dup = agent.add_mcp_tool("files", "read", mcp_adapter(&client, "files", "read"));
+    assert!(dup.is_err(), "re-attaching the same tool must fail");
+}
