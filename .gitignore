@@ -69,6 +69,7 @@ __pycache__/
 # Temporary files
 *.tmp
 *.temp
+.tmp-gui-home/
 
 # Jupyter Notebook
 .ipynb_checkpoints

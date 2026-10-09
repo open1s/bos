@@ -876,3 +876,346 @@ fn add_mcp_tool_registers_marks_and_lists() {
     let dup = agent.add_mcp_tool("files", "read", mcp_adapter(&client, "files", "read"));
     assert!(dup.is_err(), "re-attaching the same tool must fail");
 }
+
+// =========================================================================
+// Auto-remember Tests
+// =========================================================================
+
+#[test]
+fn auto_remember_is_off_by_default() {
+    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    assert!(!agent.auto_remember(), "off unless explicitly enabled");
+}
+
+/// A run finished through `react` with auto-remember on lands in the
+/// attached file store and is recalled by a fresh agent on the same file.
+#[tokio::test]
+async fn auto_remember_persists_completed_exchange() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("bos-auto-remember-{}-{nanos}", std::process::id()));
+    let path = dir.join("memory.jsonl");
+
+    {
+        let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+        let memory = crate::memory::FileMemory::open(&path).await.expect("open");
+        agent = agent.with_memory(Arc::new(memory));
+        agent.set_auto_remember(true);
+        assert!(agent.auto_remember());
+        let _ = agent
+            .react("remember the codename is zephyr".to_string())
+            .await
+            .expect("react succeeds");
+    }
+
+    // A fresh agent (new process equivalent) reads the same file back.
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let memory = crate::memory::FileMemory::open(&path)
+        .await
+        .expect("reopen");
+    agent = agent.with_memory(Arc::new(memory));
+    let recalled = agent
+        .recalled_context("codename zephyr")
+        .await
+        .expect("the stored exchange must recall");
+    assert!(recalled.contains("zephyr"), "prompt half: {recalled}");
+    assert!(recalled.contains("mock response"), "reply half: {recalled}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With auto-remember off (the default), a completed run writes nothing.
+#[tokio::test]
+async fn auto_remember_off_leaves_memory_empty() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let memory = crate::memory::InMemoryMemory::new();
+    agent = agent.with_memory(Arc::new(memory));
+    let _ = agent
+        .react("task".to_string())
+        .await
+        .expect("react succeeds");
+
+    let items = agent
+        .memory()
+        .expect("memory attached")
+        .search("task", 5)
+        .await;
+    assert!(items.is_empty(), "nothing stored unless enabled: {items:?}");
+}
+
+/// The streaming entry point records the exchange too, so chat UIs (which
+/// only ever call `stream`) get persistence without doing it themselves.
+#[tokio::test]
+async fn auto_remember_records_streamed_exchange() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let memory = crate::memory::InMemoryMemory::new();
+    agent = agent.with_memory(Arc::new(memory));
+    agent.set_auto_remember(true);
+
+    let mut stream = agent.stream("stream this".to_string());
+    use futures::StreamExt;
+    let mut text = String::new();
+    while let Some(item) = stream.next().await {
+        if let Ok(StreamToken::Text(chunk)) = item {
+            text.push_str(&chunk);
+        }
+    }
+    assert!(!text.is_empty(), "the mock stream must yield text");
+
+    let items = agent
+        .memory()
+        .expect("memory attached")
+        .search("stream", 5)
+        .await;
+    assert_eq!(items.len(), 1, "exactly one exchange note: {items:?}");
+    assert!(
+        items[0].content.contains("stream this"),
+        "{}",
+        items[0].content
+    );
+    assert!(items[0].content.contains(&text), "reply captured verbatim");
+}
+
+// ============================================================================
+// Working-plan (update_plan) Tests
+
+/// The plan store is shared: a `PlanTool` built from `agent.plan()` is
+/// immediately visible through `agent.plan_items()`.
+#[test]
+fn plan_tool_shares_the_agents_store() {
+    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let tool = crate::tools::PlanTool::new(agent.plan());
+    let out = tool
+        .run(&serde_json::json!({
+            "items": [
+                {"text": "explore the repo", "status": "completed"},
+                {"text": "write the fix", "status": "in_progress"}
+            ]
+        }))
+        .expect("plan update");
+    assert_eq!(out["total"], 2);
+
+    let items = agent.plan_items();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].text, "explore the repo");
+    assert_eq!(items[0].status, crate::tools::PlanStatus::Completed);
+    assert_eq!(items[1].status, crate::tools::PlanStatus::InProgress);
+}
+
+/// Hosts restore a persisted plan with `set_plan`; an empty list clears it.
+#[test]
+fn set_plan_restores_and_clears() {
+    use crate::tools::{PlanItem, PlanStatus};
+    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    agent.set_plan(vec![PlanItem {
+        text: "restored".to_string(),
+        status: PlanStatus::Completed,
+    }]);
+    assert_eq!(agent.plan_items().len(), 1);
+
+    agent.set_plan(Vec::new());
+    assert!(agent.plan_items().is_empty());
+}
+
+/// The stateless clone keeps the same plan store, so a rebuilt agent in a
+/// restarted host still shares in-flight planning state.
+#[test]
+fn cloned_agent_shares_the_plan() {
+    use crate::tools::{PlanItem, PlanStatus};
+    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let clone = agent.clone();
+    clone.set_plan(vec![PlanItem {
+        text: "shared".to_string(),
+        status: PlanStatus::Pending,
+    }]);
+    assert_eq!(agent.plan_items().len(), 1);
+}
+
+// =========================================================================
+// Multi-provider failover tests (the ordered fallback chain)
+// =========================================================================
+
+/// Mock LLM that always fails, standing in for a dead endpoint.
+struct DeadLlm;
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for DeadLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        Err(LlmError::RateLimited)
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        Err(LlmError::Timeout)
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "dead"
+    }
+}
+
+/// Mock LLM that records the model id it received, so a test can verify
+/// both that a fallback ran and that the vendor prefix was stripped.
+struct ModelEchoLlm {
+    seen: Arc<std::sync::Mutex<String>>,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for ModelEchoLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        *self.seen.lock().unwrap() = req.model.clone();
+        Ok(make_text_response("fallback ok".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        *self.seen.lock().unwrap() = req.model.clone();
+        Ok(Box::pin(futures::stream::iter(vec![Ok(StreamToken::Done)])))
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "echo"
+    }
+}
+
+/// A dead primary must transparently fail over to the registered fallback,
+/// which receives the vendor-stripped model id just like the primary would.
+#[tokio::test]
+async fn failover_sends_to_fallback_when_primary_fails() {
+    let mut provider = LlmProvider::new();
+    provider.register_vendor("dead".to_string(), Box::new(DeadLlm));
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    provider.register_fallback(
+        "vendor-b/local-model".to_string(),
+        Box::new(ModelEchoLlm { seen: seen.clone() }),
+    );
+
+    let mut session = AgentSession::default();
+    let mut context = AgentReactContext::new("failover-1".to_string());
+    let response = provider
+        .complete(
+            None,
+            LlmRequest::new("dead/primary-model"),
+            &mut session,
+            &mut context,
+        )
+        .await;
+
+    assert!(
+        response.is_ok(),
+        "the fallback must answer when the primary fails: {response:?}"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        "local-model",
+        "the fallback must receive the vendor-stripped model id"
+    );
+}
+
+/// When every provider in the chain fails, one aggregated error names each
+/// attempt so the operator can see which endpoints broke.
+#[tokio::test]
+async fn failover_reports_every_provider_when_all_fail() {
+    let mut provider = LlmProvider::new();
+    provider.register_vendor("dead".to_string(), Box::new(DeadLlm));
+    provider.register_fallback("also-dead/local-model".to_string(), Box::new(DeadLlm));
+
+    let mut session = AgentSession::default();
+    let mut context = AgentReactContext::new("failover-2".to_string());
+    let err = provider
+        .complete(
+            None,
+            LlmRequest::new("dead/primary-model"),
+            &mut session,
+            &mut context,
+        )
+        .await
+        .expect_err("an all-dead chain must surface an error");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("all 2 provider(s) failed"),
+        "the aggregate must count every attempt: {msg}"
+    );
+}
+
+/// A healthy primary must never touch the fallbacks.
+#[tokio::test]
+async fn failover_skips_fallback_when_primary_succeeds() {
+    let mut provider = LlmProvider::new();
+    provider.register_vendor("mock".to_string(), Box::new(MockLlm::new()));
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    provider.register_fallback(
+        "other/should-not-run".to_string(),
+        Box::new(ModelEchoLlm { seen: seen.clone() }),
+    );
+
+    let mut session = AgentSession::default();
+    let mut context = AgentReactContext::new("failover-3".to_string());
+    let response = provider
+        .complete(
+            None,
+            LlmRequest::new("mock/primary-model"),
+            &mut session,
+            &mut context,
+        )
+        .await;
+
+    assert!(
+        response.is_ok(),
+        "the primary answers on its own: {response:?}"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the fallback must not run when the primary succeeds"
+    );
+}
+
+/// The config surface: fallbacks default to an empty chain and the fluent
+/// setter appends entries in order.
+#[test]
+fn test_agent_config_fallbacks_default_empty_and_setter() {
+    let config = AgentConfig::default();
+    assert!(config.fallbacks.is_empty());
+
+    let config = config.fallback(FallbackProvider {
+        base_url: "http://127.0.0.1:1/v1".to_string(),
+        api_key: String::new(),
+        model: "local/backup".to_string(),
+    });
+    assert_eq!(config.fallbacks.len(), 1);
+    assert_eq!(config.fallbacks[0].model, "local/backup");
+    assert_eq!(config.fallbacks[0].base_url, "http://127.0.0.1:1/v1");
+}

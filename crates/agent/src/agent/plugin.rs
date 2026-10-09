@@ -104,6 +104,15 @@ pub enum StreamTokenWrapper {
         /// Optional provider-assigned call id.
         id: Option<String>,
     },
+    /// A tool call finished executing, with its output and duration.
+    ToolResult {
+        /// Tool name.
+        name: String,
+        /// Tool output text.
+        output: String,
+        /// Wall-clock execution time in milliseconds.
+        ms: u64,
+    },
     /// Token usage reported by the provider.
     Usage(react::llm::vendor::openaicompatible::Usage),
     /// The stream completed normally.
@@ -122,6 +131,13 @@ impl StreamTokenWrapper {
                 args: args.clone(),
                 id: id.clone(),
             },
+            react::llm::StreamToken::ToolResult { name, output, ms } => {
+                StreamTokenWrapper::ToolResult {
+                    name: name.clone(),
+                    output: output.clone(),
+                    ms: *ms,
+                }
+            }
             react::llm::StreamToken::ReasoningContent(s) => {
                 StreamTokenWrapper::ReasoningContent(s.clone())
             }
@@ -137,6 +153,9 @@ impl StreamTokenWrapper {
             StreamTokenWrapper::Text(s) => react::llm::StreamToken::Text(s),
             StreamTokenWrapper::ToolCall { name, args, id } => {
                 react::llm::StreamToken::ToolCall { name, args, id }
+            }
+            StreamTokenWrapper::ToolResult { name, output, ms } => {
+                react::llm::StreamToken::ToolResult { name, output, ms }
             }
             StreamTokenWrapper::ReasoningContent(s) => react::llm::StreamToken::ReasoningContent(s),
             StreamTokenWrapper::Usage(u) => react::llm::StreamToken::Usage(u),

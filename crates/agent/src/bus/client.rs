@@ -177,6 +177,23 @@ impl AgentRpcClient {
                                         .map(|s| s.to_string());
                                     yield Ok(crate::StreamToken::ToolCall { name, args, id });
                                 }
+                                Some("tool_result") => {
+                                    let name = event
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let output = event
+                                        .get("output")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let ms = event
+                                        .get("ms")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or_default();
+                                    yield Ok(crate::StreamToken::ToolResult { name, output, ms });
+                                }
                                 Some("done") => {
                                     yield Ok(crate::StreamToken::Done);
                                     break;
@@ -239,6 +256,9 @@ impl AgentRpcClient {
                     id.unwrap_or_default(),
                     args
                 )),
+                crate::StreamToken::ToolResult { name, ms, .. } => {
+                    chunks.push(format!("[tool_result] name={} ms={}", name, ms))
+                }
                 crate::StreamToken::Done => break,
                 crate::StreamToken::Stopped => break,
             }

@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 /// Default skills directory (`~` expands at agent build time).
 pub(crate) const DEFAULT_SKILLS_DIR: &str = "~/.bos/skills";
 
+/// Default persistent-memory file (`~` expands at agent build time).
+pub(crate) const DEFAULT_MEMORY_PATH: &str = "~/.bos/gui/memory.jsonl";
+
 /// Editable connection and prompt settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,6 +28,10 @@ pub(crate) struct Settings {
     pub(crate) api_key: String,
     /// System prompt prepended to every conversation.
     pub(crate) system_prompt: String,
+    /// Fold the workspace's `AGENTS.md`-style instruction files into the
+    /// system prompt of every agent built for [`Self::bash_workspace`]
+    /// (codex/harness parity; empty workspace stays a no-op).
+    pub(crate) project_instructions: bool,
     /// Sampling temperature.
     pub(crate) temperature: f32,
     /// Optional reasoning effort for reasoning models (`low`/`medium`/`high`).
@@ -41,8 +48,18 @@ pub(crate) struct Settings {
     pub(crate) skills_dir: String,
     /// Require one-click user approval before `bash` and `write_file` run.
     pub(crate) require_approval: bool,
+    /// Send-side context budget in tokens: transcripts estimated over this
+    /// are compacted into a summary before each turn; 0 disables it.
+    pub(crate) context_budget: usize,
+    /// Attach a persistent memory store so the agent learns across sessions.
+    pub(crate) memory_enabled: bool,
+    /// Memory JSON-lines file; empty means `~/.bos/gui/memory.jsonl`.
+    pub(crate) memory_path: String,
     /// User-configured MCP servers ("plugins") whose tools join the agent.
     pub(crate) mcp_servers: Vec<McpServerEntry>,
+    /// User-configured fallback LLM providers, tried in order after the
+    /// primary endpoint when a request fails.
+    pub(crate) providers: Vec<ProviderEntry>,
 
     /// API key discovered from the BOS config at load time (never serialized).
     #[serde(skip)]
@@ -157,6 +174,71 @@ pub(crate) fn validate_mcp_servers(entries: &[McpServerEntry]) -> Result<(), Str
     Ok(())
 }
 
+/// One fallback LLM endpoint tried after the primary provider errors.
+///
+/// Persisted as `[[providers]]` entries in `settings.toml`. Entries are
+/// tried in list order, each at most once per request, so a dead cloud
+/// endpoint can fall through to a local one without losing the session.
+/// Disabled entries persist but are never tried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ProviderEntry {
+    /// Unique display name (e.g. `local`, `backup`).
+    pub(crate) name: String,
+    /// OpenAI-compatible base URL of the fallback endpoint.
+    pub(crate) base_url: String,
+    /// API key of the fallback endpoint; empty inherits the primary key.
+    pub(crate) api_key: String,
+    /// Model identifier in `vendor/model` form.
+    pub(crate) model: String,
+    /// Disabled entries persist but are never tried.
+    pub(crate) enabled: bool,
+}
+
+impl Default for ProviderEntry {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            enabled: true,
+        }
+    }
+}
+
+impl ProviderEntry {
+    /// Validate this entry on its own: name plus required endpoint fields.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("provider name must not be empty".to_string());
+        }
+        if self.base_url.trim().is_empty() {
+            return Err(format!("provider '{name}': base URL must not be empty"));
+        }
+        if self.model.trim().is_empty() {
+            return Err(format!("provider '{name}': model must not be empty"));
+        }
+        Ok(())
+    }
+}
+
+/// Validate a whole provider list: every entry valid and names unique.
+///
+/// Names must be unique so the settings UI and logs can point at one
+/// endpoint unambiguously.
+pub(crate) fn validate_providers(entries: &[ProviderEntry]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        entry.validate()?;
+        if !seen.insert(entry.name.trim().to_string()) {
+            return Err(format!("duplicate provider name '{}'", entry.name.trim()));
+        }
+    }
+    Ok(())
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self::from_config_value(&serde_json::Value::Null).with_env_overrides()
@@ -211,6 +293,7 @@ impl Settings {
                 .to_string(),
             api_key: String::new(),
             system_prompt: fallback.system_prompt.clone(),
+            project_instructions: true,
             temperature: fallback.temperature,
             reasoning_effort: global
                 .and_then(|v| v.get("reasoning_effort"))
@@ -227,7 +310,11 @@ impl Settings {
             bash_workspace: String::new(),
             skills_dir: DEFAULT_SKILLS_DIR.to_string(),
             require_approval: true,
+            context_budget: 32_768,
+            memory_enabled: true,
+            memory_path: String::new(),
             mcp_servers: Vec::new(),
+            providers: Vec::new(),
         };
 
         settings.resolve_profile();
@@ -320,18 +407,53 @@ impl Settings {
     }
 
     /// Build the [`AgentConfig`] used to create agents for chat sessions.
+    ///
+    /// The effective system prompt is the base prompt plus, when
+    /// [`Self::project_instructions`] is on, the workspace's instruction
+    /// files ([`crate::instructions`]), so a session created after the
+    /// user edits `AGENTS.md` picks the new rules up immediately. An
+    /// empty workspace keeps the prompt untouched.
+    ///
+    /// Enabled [`ProviderEntry`]s become an ordered fallback chain: each
+    /// one is retried after the primary endpoint errors (invalid or
+    /// disabled entries are skipped, never sent).
     pub(crate) fn agent_config(&self) -> AgentConfig {
-        let config = AgentConfig::default()
+        let mut prompt = self.system_prompt.clone();
+        if self.project_instructions {
+            let ws = self.bash_workspace.trim();
+            if !ws.is_empty() {
+                let root = PathBuf::from(shellexpand::tilde(ws).into_owned());
+                if let Some(extra) = crate::instructions::load(&root) {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&extra);
+                }
+            }
+        }
+        let mut config = AgentConfig::default()
             .model(self.model.clone())
             .base_url(self.base_url.clone())
             .api_key(self.effective_api_key())
-            .system_prompt(self.system_prompt.clone())
+            .system_prompt(prompt)
             .temperature(self.temperature);
         if let Some(effort) = &self.reasoning_effort {
-            config.reasoning_effort(effort.clone())
-        } else {
-            config
+            config = config.reasoning_effort(effort.clone());
         }
+        for entry in &self.providers {
+            if !entry.enabled || entry.validate().is_err() {
+                continue;
+            }
+            let api_key = if entry.api_key.is_empty() {
+                self.effective_api_key()
+            } else {
+                entry.api_key.clone()
+            };
+            config = config.fallback(agent::FallbackProvider {
+                base_url: entry.base_url.trim().to_string(),
+                api_key,
+                model: entry.model.trim().to_string(),
+            });
+        }
+        config
     }
 
     fn merge_discovered_config(&mut self) {
@@ -380,6 +502,28 @@ mod tests {
         assert_eq!(settings.effective_api_key(), "sk-cfg");
         assert_eq!(settings.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(settings.system_prompt, "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn memory_defaults_to_enabled_file_store() {
+        let settings = Settings::from_config_value(&serde_json::Value::Null);
+        assert!(settings.memory_enabled, "persistence on by default");
+        assert_eq!(
+            settings.memory_path, "",
+            "empty means DEFAULT_MEMORY_PATH (~/.bos/gui/memory.jsonl)"
+        );
+        assert_eq!(DEFAULT_MEMORY_PATH, "~/.bos/gui/memory.jsonl");
+
+        // The toggle and path survive a save/load round trip.
+        let path = tmp_path("memory");
+        let mut custom = settings;
+        custom.memory_enabled = false;
+        custom.memory_path = "/tmp/bos-mem-test.jsonl".to_string();
+        custom.save_to(&path).expect("save");
+        let loaded = Settings::load_from(&path);
+        assert!(!loaded.memory_enabled);
+        assert_eq!(loaded.memory_path, "/tmp/bos-mem-test.jsonl");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -546,5 +690,140 @@ mod tests {
         validate_mcp_servers(&[mk("a"), mk("b")]).expect("distinct names pass");
         let dup = validate_mcp_servers(&[mk("a"), mk(" a ")]);
         assert!(dup.is_err(), "trimmed-duplicate names must fail");
+    }
+
+    #[test]
+    fn agent_config_folds_workspace_instructions_and_honors_toggle() {
+        let dir =
+            std::env::temp_dir().join(format!("bos-gui-settings-instr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "always answer in French").unwrap();
+
+        let mut settings = Settings {
+            system_prompt: "base prompt".into(),
+            bash_workspace: dir.to_string_lossy().into_owned(),
+            ..Settings::default()
+        };
+
+        let folded = settings.agent_config().system_prompt;
+        assert!(
+            folded.starts_with("base prompt"),
+            "base prompt stays first: {folded}"
+        );
+        assert!(folded.contains("always answer in French"));
+
+        settings.project_instructions = false;
+        let plain = settings.agent_config().system_prompt;
+        assert!(!plain.contains("French"), "toggle must disable folding");
+        assert_eq!(plain, "base prompt");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_config_leaves_prompt_alone_without_workspace() {
+        let settings = Settings::default();
+        assert!(settings.bash_workspace.trim().is_empty());
+        // Even with an AGENTS.md on the real disk, no workspace means no
+        // folding: the composed prompt equals the configured one.
+        assert_eq!(
+            settings.agent_config().system_prompt,
+            settings.system_prompt
+        );
+    }
+
+    /* ---- Fallback providers ---- */
+
+    fn provider(name: &str, model: &str) -> ProviderEntry {
+        ProviderEntry {
+            name: name.to_string(),
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            api_key: String::new(),
+            model: model.to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn provider_entries_validate_and_dedupe() {
+        let good = provider("local", "vendor/model");
+        assert!(good.validate().is_ok());
+
+        let mut no_url = good.clone();
+        no_url.base_url = "  ".to_string();
+        assert!(no_url.validate().is_err(), "blank url is rejected");
+
+        let mut no_model = good.clone();
+        no_model.model = String::new();
+        assert!(no_model.validate().is_err(), "blank model is rejected");
+
+        assert!(
+            validate_providers(&[ProviderEntry::default()]).is_err(),
+            "blank name is rejected"
+        );
+        assert!(validate_providers(&[good.clone(), good.clone()])
+            .unwrap_err()
+            .contains("duplicate provider"));
+        assert!(validate_providers(&[good]).is_ok());
+    }
+
+    #[test]
+    fn agent_config_maps_enabled_valid_providers_in_order() {
+        let mut settings = Settings::from_config_value(&serde_json::Value::Null);
+        let disabled = ProviderEntry {
+            enabled: false,
+            ..provider("off", "skip/me")
+        };
+        let mut broken = provider("broken", " ");
+        broken.model = " ".to_string();
+        settings.providers = vec![
+            provider("first", "vendor-a/model"),
+            disabled,
+            broken,
+            ProviderEntry {
+                api_key: "other-key".to_string(),
+                ..provider("second", "vendor-b/model")
+            },
+        ];
+
+        let config = settings.agent_config();
+        assert_eq!(
+            config.fallbacks.len(),
+            2,
+            "disabled and invalid entries must be skipped, never sent"
+        );
+        assert_eq!(config.fallbacks[0].model, "vendor-a/model");
+        assert_eq!(
+            config.fallbacks[0].api_key,
+            settings.effective_api_key(),
+            "a blank key inherits the primary key"
+        );
+        assert_eq!(config.fallbacks[1].model, "vendor-b/model");
+        assert_eq!(config.fallbacks[1].api_key, "other-key");
+        assert_eq!(
+            config.fallbacks[1].base_url, "http://127.0.0.1:9/v1",
+            "trailing whitespace is trimmed before dispatch"
+        );
+    }
+
+    #[test]
+    fn provider_entries_serde_roundtrip_and_legacy_toml_defaults_empty() {
+        assert!(Settings::from_config_value(&serde_json::Value::Null)
+            .providers
+            .is_empty());
+
+        let entry = provider("local", "nvidia/z-ai/glm-5.3-flash");
+        let toml = toml::to_string(&Settings {
+            providers: vec![entry.clone()],
+            ..Settings::from_config_value(&serde_json::Value::Null)
+        })
+        .expect("serialize");
+        let parsed: Settings = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(parsed.providers, vec![entry]);
+
+        // A settings file written before failover support loads unchanged.
+        let legacy: Settings = toml::from_str(r#"model = "m1""#).expect("parse");
+        assert!(legacy.providers.is_empty());
     }
 }

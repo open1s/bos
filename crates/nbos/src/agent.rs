@@ -547,6 +547,7 @@ impl From<PyAgentConfig> for AgentConfig {
             reasoning_effort: value.reasoning_effort,
             circuit_breaker,
             rate_limit,
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -1015,6 +1016,13 @@ impl PyAgent {
                             "name": name,
                             "args": args,
                             "id": id
+                        })
+                        .to_string()),
+                        Ok(StreamToken::ToolResult { name, output, ms }) => Ok(serde_json::json!({
+                            "type": "tool_result",
+                            "name": name,
+                            "output": output,
+                            "ms": ms
                         })
                         .to_string()),
                         Ok(StreamToken::Usage(usage)) => Ok(serde_json::json!({

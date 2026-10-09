@@ -80,6 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 agent::StreamToken::ToolCall { name, args, .. } => {
                     print!("[ Tool: {} args: {} ]", name, args)
                 }
+                agent::StreamToken::ToolResult { name, ms, .. } => {
+                    print!("[ ToolResult: {} {}ms ]", name, ms)
+                }
                 agent::StreamToken::Done => println!("\n[ Done ]"),
                 agent::StreamToken::Usage(u) => println!(
                     "\n[ Usage ] prompt={} completion={} total={}",

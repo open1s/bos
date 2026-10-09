@@ -78,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Use the Responses API (`/v1/responses`) with `high` reasoning effort.
         api_mode: "responses".to_string(),
         reasoning_effort: Some("high".to_string()),
+        fallbacks: Vec::new(),
         circuit_breaker: Some(react::CircuitBreakerConfig {
             max_failures: 3,
             cooldown: Duration::from_secs(30),
@@ -129,6 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 agent::StreamToken::ReasoningContent(text) => print!("[ Reasoning: {} ]", text),
                 agent::StreamToken::ToolCall { name, args, .. } => {
                     print!("[ Tool: {} args: {} ]", name, args)
+                }
+                agent::StreamToken::ToolResult { name, ms, .. } => {
+                    print!("[ ToolResult: {} {}ms ]", name, ms)
                 }
                 agent::StreamToken::Done => println!("\n[ Done ]"),
                 agent::StreamToken::Usage(u) => println!(

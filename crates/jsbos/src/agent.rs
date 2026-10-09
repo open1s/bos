@@ -296,6 +296,7 @@ impl From<AgentConfig> for agent::AgentConfig {
       reasoning_effort: value.reasoning_effort,
       circuit_breaker,
       rate_limit,
+      fallbacks: Vec::new(),
     }
   }
 }
@@ -816,6 +817,14 @@ impl Agent {
                     "name": name,
                     "args": args,
                     "id": id
+                })
+              }
+              agent::StreamToken::ToolResult { name, output, ms } => {
+                serde_json::json!({
+                    "type": "ToolResult",
+                    "name": name,
+                    "output": output,
+                    "ms": ms
                 })
               }
               agent::StreamToken::Usage(usage) => {

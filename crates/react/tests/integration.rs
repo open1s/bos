@@ -176,3 +176,117 @@ async fn test_react_engine_no_tool() {
         .await;
     assert!(result.is_ok());
 }
+
+/// Drives `react_stream` with native tool-call tokens (like a real provider
+/// stream) to prove the loop yields `StreamToken::ToolResult` — output plus
+/// duration — right after the `ToolCall` it answers.
+struct StreamingToolLlm {
+    index: Arc<AtomicUsize>,
+}
+
+impl StreamingToolLlm {
+    fn new() -> Self {
+        Self {
+            index: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient<LlmSession, LlmContext> for StreamingToolLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> LlmResponseResult {
+        Ok(make_text_response("Final Answer: 4".to_string(), true))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> Result<TokenStream, LlmError> {
+        let i = self.index.fetch_add(1, Ordering::SeqCst);
+        let tokens: Vec<Result<react::llm::StreamToken, LlmError>> = if i == 0 {
+            vec![
+                Ok(react::llm::StreamToken::Text("Need a calculator.\n".into())),
+                Ok(react::llm::StreamToken::ToolCall {
+                    name: "calculator".into(),
+                    args: serde_json::json!({ "expression": "2+2" }),
+                    id: Some("call_1".into()),
+                }),
+            ]
+        } else {
+            vec![
+                Ok(react::llm::StreamToken::Text("Final Answer: 4".into())),
+                Ok(react::llm::StreamToken::Done),
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(tokens)))
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn provider_name(&self) -> &'static str {
+        "mock-stream"
+    }
+}
+
+#[tokio::test]
+async fn test_react_stream_yields_tool_result() {
+    use futures::StreamExt;
+    use react::llm::StreamToken;
+
+    let llm = StreamingToolLlm::new();
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
+        .llm(Box::new(llm))
+        .with_tool(ToolVariant::Sync(Box::new(TestCalculator)))
+        .max_steps(3)
+        .build()
+        .unwrap();
+
+    let mut session = LlmSession::default();
+    let mut context = LlmContext::default();
+    let mut request = LlmRequest::new("test");
+    request.input = react::llm::Content::text("What is 2+2?");
+
+    let stream = engine.react_stream(None, request, &mut session, &mut context);
+    futures::pin_mut!(stream);
+
+    let mut saw_call = false;
+    let mut saw_result = false;
+    let mut done = false;
+    while let Some(item) = stream.next().await {
+        match item.expect("stream item") {
+            StreamToken::ToolCall { name, .. } => {
+                assert_eq!(name, "calculator");
+                assert!(!saw_call, "only one tool call expected");
+                saw_call = true;
+            }
+            StreamToken::ToolResult {
+                name,
+                output,
+                ms: _,
+            } => {
+                assert!(saw_call, "ToolResult must arrive after its ToolCall");
+                assert_eq!(name, "calculator", "result pairs with its call by name");
+                assert!(!output.is_empty(), "result carries the tool output");
+                assert!(!saw_result, "only one tool result expected");
+                saw_result = true;
+            }
+            StreamToken::Done => {
+                done = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(done, "stream must finish with Done");
+    assert!(saw_call, "tool call observed");
+    assert!(saw_result, "tool result observed");
+}

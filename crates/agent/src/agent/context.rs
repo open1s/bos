@@ -324,6 +324,121 @@ impl AgentSession {
     }
 }
 
+/// Rough token estimate for `text`: ASCII averages ~4 characters per token,
+/// while CJK and other non-ASCII characters average closer to one each.
+///
+/// The estimate intentionally runs a little high so a budget trips before the
+/// provider rejects the request. It is a heuristic for [`ContextBudget`],
+/// not a billing-grade count.
+pub fn estimate_tokens(text: &str) -> usize {
+    let ascii = text.chars().filter(|c| c.is_ascii()).count();
+    let other = text.chars().count().saturating_sub(ascii);
+    if ascii + other == 0 {
+        0
+    } else {
+        ascii.div_ceil(4) + other
+    }
+}
+
+/// What changed when a [`ContextBudget`] trimmed a session's outgoing context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReport {
+    /// Estimated prompt tokens before compaction.
+    pub before_tokens: usize,
+    /// Estimated prompt tokens after compaction.
+    pub after_tokens: usize,
+    /// How many messages were folded into the summary before the turn.
+    pub dropped_messages: usize,
+}
+
+/// Send-side context budget: when the estimated outgoing prompt would exceed
+/// `max_tokens`, the oldest messages are compacted before the turn starts.
+///
+/// `max_tokens == 0` disables compaction entirely. [`AgentSession::compact`]
+/// folds dropped messages into one summary system message while callers keep
+/// their full transcript, so the budget is re-applied deterministically on
+/// every turn from the same history — nothing is ever destroyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBudget {
+    /// Token ceiling for the estimated outgoing prompt (0 = never compact).
+    pub max_tokens: usize,
+    /// Most recent messages kept verbatim after compaction.
+    pub keep_recent: usize,
+    /// Cap on the mechanical summary that replaces dropped messages.
+    pub max_summary_chars: usize,
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        Self {
+            max_tokens: 32_768,
+            keep_recent: 8,
+            max_summary_chars: 4_096,
+        }
+    }
+}
+
+impl ContextBudget {
+    /// A budget with the given token ceiling and default trimming policy.
+    pub fn with_max_tokens(max_tokens: usize) -> Self {
+        Self {
+            max_tokens,
+            ..Self::default()
+        }
+    }
+
+    /// Estimate the tokens a session's messages contribute to the next prompt.
+    pub fn estimate_session(&self, session: &AgentSession) -> usize {
+        session
+            .messages()
+            .iter()
+            .map(|msg| {
+                let body = match msg {
+                    Message::System { content } => content.clone(),
+                    Message::User { content } => content_to_summary_string(content),
+                    Message::Assistant { content } => content.clone(),
+                    Message::AssistantToolCall { name, args, .. } => format!("{name} {args}"),
+                    Message::ToolResult { content, .. } => content.clone(),
+                };
+                // +4 per message covers role framing and message delimiters.
+                estimate_tokens(&body) + 4
+            })
+            .sum()
+    }
+
+    /// Whether the next send would exceed the budget.
+    pub fn needs_compaction(&self, session: &AgentSession) -> bool {
+        self.max_tokens > 0 && self.estimate_session(session) > self.max_tokens
+    }
+
+    /// Compact `session` when it is over budget, reporting what changed.
+    ///
+    /// Returns `None` when the budget is disabled, the session already fits,
+    /// or trimming had nothing left to remove (the process always converges:
+    /// each pass reduces the message count toward `keep_recent`).
+    pub fn apply(&self, session: &mut AgentSession) -> Option<CompactionReport> {
+        if !self.needs_compaction(session) {
+            return None;
+        }
+        let before_messages = session.messages().len();
+        let before_tokens = self.estimate_session(session);
+        session.compact(self.keep_recent, self.max_summary_chars);
+        let after_messages = session.messages().len();
+        // Net-shrink gate: `compact` leaves the session unchanged when there
+        // is nothing left to trim, so repeated applications converge.
+        if after_messages >= before_messages {
+            return None;
+        }
+        Some(CompactionReport {
+            before_tokens,
+            after_tokens: self.estimate_session(session),
+            // Everything folded into the summary system message, which is the
+            // one new message compact() inserts.
+            dropped_messages: before_messages + 1 - after_messages,
+        })
+    }
+}
+
 impl Default for AgentSession {
     fn default() -> Self {
         Self::new()
@@ -811,5 +926,93 @@ impl MessageContext {
     /// Whether there are no messages.
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// A session of `messages` alternating user/assistant turns of `body`
+    /// ASCII characters each.
+    fn chat(messages: usize, body: usize) -> AgentSession {
+        let mut session = AgentSession::new();
+        for i in 0..messages {
+            let filler = "x".repeat(body);
+            if i % 2 == 0 {
+                session.add_user(format!("u{i} {filler}"));
+            } else {
+                session.add_assistant(format!("a{i} {filler}"));
+            }
+        }
+        session
+    }
+
+    #[test]
+    fn estimate_tokens_splits_ascii_and_non_ascii() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("hello"), 2); // 5 ascii → ceil(5/4)
+        assert_eq!(estimate_tokens("你好"), 2); // CJK ≈ one token each
+        assert_eq!(estimate_tokens("a你"), 2);
+        assert_eq!(estimate_tokens("ab你cd"), 2); // 4 ascii → 1, CJK → 1
+    }
+
+    #[test]
+    fn disabled_budget_never_trims() {
+        let mut session = chat(4, 32);
+        let budget = ContextBudget {
+            max_tokens: 0,
+            ..ContextBudget::default()
+        };
+        assert!(!budget.needs_compaction(&session));
+        assert!(budget.apply(&mut session).is_none());
+        assert_eq!(session.messages().len(), 4);
+    }
+
+    #[test]
+    fn generous_budget_leaves_session_untouched() {
+        let mut session = chat(6, 16);
+        assert!(ContextBudget::default().apply(&mut session).is_none());
+        assert_eq!(session.messages().len(), 6);
+    }
+
+    #[test]
+    fn over_budget_compacts_reports_and_converges() {
+        let mut session = chat(20, 400);
+        let budget = ContextBudget::with_max_tokens(400);
+        assert!(budget.needs_compaction(&session));
+
+        let report = budget.apply(&mut session).expect("budget trips");
+        assert!(report.dropped_messages > 0);
+        assert!(report.after_tokens < report.before_tokens);
+        // The oldest messages collapse into one summary; the recent window
+        // plus that summary is what gets sent.
+        assert_eq!(session.messages().len(), budget.keep_recent + 1);
+
+        // Further passes converge instead of looping forever.
+        let mut passes = 0;
+        while budget.apply(&mut session).is_some() {
+            passes += 1;
+            assert!(passes < 10, "compaction failed to converge");
+        }
+    }
+
+    #[test]
+    fn compaction_never_touches_the_stored_history_semantics() {
+        // The summary message carries what was dropped.
+        let mut session = chat(10, 200);
+        let budget = ContextBudget::with_max_tokens(100);
+        let report = budget.apply(&mut session).expect("budget trips");
+        // The 2 oldest messages were folded into the summary system message.
+        assert_eq!(report.dropped_messages, 10 - budget.keep_recent);
+        let summary = session
+            .messages()
+            .first()
+            .and_then(|m| match m {
+                Message::System { content } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("summary system message");
+        assert!(summary.contains("compacted"));
     }
 }

@@ -24,6 +24,20 @@ impl LlmProvider {
         self.inner.register_vendor(name, vendor);
     }
 
+    /// Register a fallback endpoint tried whenever the primary vendor errors.
+    ///
+    /// `model` may carry a `vendor/` prefix; the router strips it with the
+    /// same rule as dispatch, so the fallback receives the bare model id its
+    /// endpoint expects. Fallbacks run in registration order, each at most
+    /// once per request.
+    pub fn register_fallback(
+        &mut self,
+        model: String,
+        client: Box<dyn LlmClient<AgentSession, AgentReactContext>>,
+    ) {
+        self.inner.register_fallback(model, client);
+    }
+
     /// Convert this provider into a trait-object client.
     pub fn as_dyn(self: Arc<Self>) -> Box<dyn LlmClient<AgentSession, AgentReactContext>> {
         Box::new(ArcLlmClient(self))

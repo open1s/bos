@@ -5,7 +5,7 @@ use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookR
 use crate::agent::plugin::{AgentPlugin, PluginRegistry, StreamTokenWrapper};
 use crate::memory::{MemoryItem, MemoryStore, MetadataFilter};
 use crate::session::AgentState;
-use crate::tools::FunctionTool;
+use crate::tools::{FunctionTool, PlanItem, PlanStore};
 use crate::{AgentError, LlmClient, StreamToken, Tool, ToolRegistry};
 use async_trait::async_trait;
 use bus::Bus;
@@ -41,6 +41,22 @@ pub use llm::{build_vendor, LlmProvider};
 /// is attached with [`Agent::with_memory`].
 pub const DEFAULT_MEMORY_RECALL_LIMIT: usize = 5;
 
+/// One alternate LLM endpoint tried when the primary provider fails.
+///
+/// A fallback carries its own endpoint, key and model, so one session can
+/// span providers (cloud → local, vendor A → vendor B) without touching the
+/// primary config. Fallbacks run in the order they were added.
+#[derive(Debug, Clone)]
+#[qserde::Archive]
+pub struct FallbackProvider {
+    /// LLM API base URL of the fallback endpoint.
+    pub base_url: String,
+    /// API key for the fallback endpoint (empty when it needs none).
+    pub api_key: String,
+    /// Model identifier in `vendor/model` form, like [`AgentConfig::model`].
+    pub model: String,
+}
+
 /// Agent builder for fluent configuration.
 #[derive(Debug, Clone)]
 #[qserde::Archive]
@@ -74,6 +90,9 @@ pub struct AgentConfig {
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Rate limiter configuration for resilience
     pub rate_limit: Option<RateLimiterConfig>,
+    /// Fallback endpoints tried in order when the primary provider errors.
+    /// Empty by default: each request goes to the primary alone.
+    pub fallbacks: Vec<FallbackProvider>,
 }
 
 impl Default for AgentConfig {
@@ -92,6 +111,7 @@ impl Default for AgentConfig {
             reasoning_effort: None,
             circuit_breaker: None,
             rate_limit: None,
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -164,6 +184,11 @@ impl AgentConfig {
         self.rate_limit = Some(config);
         self
     }
+    /// Append a fallback endpoint tried when the primary provider errors.
+    pub fn fallback(mut self, provider: FallbackProvider) -> Self {
+        self.fallbacks.push(provider);
+        self
+    }
 }
 
 /// Agent is the main abstraction for AI agents with LLM integration,
@@ -197,6 +222,12 @@ pub struct Agent {
     /// Metadata filter applied to memory recall, if any.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     memory_filter: Option<MetadataFilter>,
+    /// Whether each completed exchange is stored in memory automatically.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    auto_remember: bool,
+    /// Shared working plan maintained through the `update_plan` tool.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    plan: PlanStore,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     engine_cache: std::sync::Mutex<Option<ReActEngine<AgentReActApp>>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
@@ -236,6 +267,8 @@ impl Agent {
             memory: None,
             memory_recall_limit: DEFAULT_MEMORY_RECALL_LIMIT,
             memory_filter: None,
+            auto_remember: false,
+            plan: PlanStore::default(),
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
@@ -259,6 +292,21 @@ impl Agent {
         let mut llm = LlmProvider::new();
         let (vendor_name, vendor) = build_vendor(&config);
         llm.register_vendor(vendor_name, vendor);
+        // Each fallback is built with the same vendor-selection rules as the
+        // primary, so `vendor/model` prefixes resolve identically per
+        // endpoint. Incomplete entries are skipped rather than registered
+        // as unreachable chain links.
+        for provider in &config.fallbacks {
+            if provider.model.trim().is_empty() || provider.base_url.trim().is_empty() {
+                continue;
+            }
+            let mut fb_config = config.clone();
+            fb_config.model = provider.model.clone();
+            fb_config.base_url = provider.base_url.clone();
+            fb_config.api_key = provider.api_key.clone();
+            let (_, vendor) = build_vendor(&fb_config);
+            llm.register_fallback(provider.model.clone(), vendor);
+        }
         Self::new(config, Arc::new(llm))
     }
 
@@ -296,6 +344,61 @@ impl Agent {
     /// project, or source; pass `None` to clear the restriction.
     pub fn set_memory_filter(&mut self, filter: Option<MetadataFilter>) {
         self.memory_filter = filter;
+    }
+
+    /// Enable or disable automatic remembering of completed exchanges.
+    ///
+    /// When on, every run that finishes through [`Agent::react`] or
+    /// [`Agent::stream`] stores one `User: … / Assistant: …` note in the
+    /// attached memory (a no-op when none is attached), so later runs recall
+    /// it through the system prompt. Off by default.
+    pub fn set_auto_remember(&mut self, enabled: bool) {
+        self.auto_remember = enabled;
+    }
+
+    /// Whether completed exchanges are remembered automatically.
+    #[must_use]
+    pub fn auto_remember(&self) -> bool {
+        self.auto_remember
+    }
+
+    /// The shared working-plan store; tool calls and host reads observe the
+    /// same plan.
+    ///
+    /// Hand a clone to [`crate::tools::PlanTool::new`] when registering the
+    /// `update_plan` tool, and read results back with [`Agent::plan_items`].
+    #[must_use]
+    pub fn plan(&self) -> PlanStore {
+        self.plan.clone()
+    }
+
+    /// Snapshot of the current working-plan items, in order.
+    #[must_use]
+    pub fn plan_items(&self) -> Vec<PlanItem> {
+        self.plan.items()
+    }
+
+    /// Replace the working plan; hosts use this to restore a persisted plan
+    /// (an empty list clears it).
+    pub fn set_plan(&self, items: Vec<PlanItem>) {
+        self.plan.replace(items);
+    }
+
+    /// Store one completed exchange when auto-remember is on.
+    ///
+    /// Blank prompts or replies are skipped and the reply is truncated to
+    /// keep a single note from dominating the store. Failures stay silent:
+    /// a run must succeed even when its memory cannot be written.
+    async fn remember_exchange(&self, prompt: &str, reply: &str) {
+        if !self.auto_remember || prompt.trim().is_empty() || reply.trim().is_empty() {
+            return;
+        }
+        let note = format!(
+            "User: {}\nAssistant: {}",
+            prompt.trim(),
+            reply.chars().take(4000).collect::<String>()
+        );
+        let _ = self.remember(note).await;
     }
 
     /// Store `content` in the attached memory and return the new item.
@@ -824,6 +927,8 @@ impl Clone for Agent {
             memory: self.memory.clone(),
             memory_recall_limit: self.memory_recall_limit,
             memory_filter: self.memory_filter.clone(),
+            auto_remember: self.auto_remember,
+            plan: self.plan.clone(),
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),

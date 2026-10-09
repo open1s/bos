@@ -243,6 +243,7 @@ impl Agent {
         let mut agent_session = AgentSession::new();
         agent_session.restore_messages(messages);
         let system_prompt = self.system_prompt_for(&task_content).await;
+        let prompt_text = task_content.as_text().unwrap_or_default().to_string();
 
         let request = LlmRequest {
             model: self.config.model.clone(),
@@ -318,6 +319,7 @@ impl Agent {
                 let mut ctx = HookContext::new(&self.config.name);
                 ctx.set("total_tokens", (input_delta + output_delta).to_string());
                 self.hooks.trigger_all(HookEvent::OnComplete, ctx).await;
+                self.remember_exchange(&prompt_text, &answer).await;
                 Ok(answer)
             }
             Err(e) => {
@@ -412,6 +414,7 @@ impl Agent {
         let stream = async_stream::stream! {
             let mut engine = engine;
             let mut context = context;
+            let mut reply = String::new();
 
             // Reset the per-stream readings first: a run that aborts early
             // must not replay the previous stream's values.
@@ -425,6 +428,7 @@ impl Agent {
             }
 
             let system_prompt = self.system_prompt_for(&task_content).await;
+            let prompt_text = task_content.as_text().unwrap_or_default().to_string();
             let request = LlmRequest {
                 model: self.config.model.clone(),
                 input: task_content,
@@ -458,6 +462,9 @@ impl Agent {
                             } else {
                                 token
                             };
+                            if let StreamToken::Text(text) = &final_token {
+                                reply.push_str(text);
+                            }
                             yield Ok(final_token);
                         }
                         Err(e) => {
@@ -477,6 +484,10 @@ impl Agent {
                     }
                 }
             }
+
+            // Remember the exchange only after the run completed cleanly: an
+            // aborted stream returns from inside the loop above.
+            self.remember_exchange(&prompt_text, &reply).await;
 
             {
                 let mut session = self.session.lock().unwrap();

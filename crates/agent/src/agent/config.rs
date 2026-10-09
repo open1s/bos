@@ -98,6 +98,9 @@ impl From<TomlAgentConfig> for AgentConfig {
             reasoning_effort: t.reasoning_effort,
             circuit_breaker: None,
             rate_limit: None,
+            // TOML-configured agents run single-endpoint for now; the
+            // fallback chain is added programmatically or via Settings.
+            fallbacks: Vec::new(),
         }
     }
 }

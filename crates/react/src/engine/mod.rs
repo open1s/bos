@@ -609,6 +609,11 @@ impl<A: ReActApp> ReActEngine<A> {
                         Ok(StreamToken::ReasoningContent(text)) => {
                             yield Ok(StreamToken::ReasoningContent(text));
                         }
+                        Ok(StreamToken::ToolResult { name, output, ms }) => {
+                            // Providers never emit this; pass through for
+                            // callers that replay recorded token streams.
+                            yield Ok(StreamToken::ToolResult { name, output, ms });
+                        }
                         Ok(StreamToken::Usage(usage)) => {
                             let token_usage = TokenUsage::new(
                                 usage.prompt_tokens,
@@ -701,6 +706,14 @@ impl<A: ReActApp> ReActEngine<A> {
                                 }
                                 Err(ref e) => format!("Error: {}", e),
                             };
+
+                            // Surface the finished call to stream observers
+                            // (GUI timeline) with its wall-clock duration.
+                            yield Ok(StreamToken::ToolResult {
+                                name: name.clone(),
+                                output: result_text.clone(),
+                                ms: tool_started.elapsed().as_millis() as u64,
+                            });
 
                             session.push(LlmMessage::assistant_tool_call(call_id.clone(), name.clone(), Self::strip_call_id(&args)));
                             session.push(LlmMessage::tool_result(call_id.clone(), result_text));

@@ -10,7 +10,11 @@
 mod app;
 mod approval;
 mod caps;
+mod compact;
+mod init;
+mod instructions;
 mod mcp;
+mod mentions;
 mod runner;
 mod session;
 mod settings;

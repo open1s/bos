@@ -56,6 +56,9 @@ pub(crate) async fn handle_rpc_request(
                             args
                         ));
                     }
+                    Some(Ok(crate::StreamToken::ToolResult { name, ms, .. })) => {
+                        chunks.push(format!("[tool_result] name={} ms={}", name, ms));
+                    }
                     Some(Ok(crate::StreamToken::Done)) => break,
                     Some(Ok(crate::StreamToken::Stopped)) => break,
                     Some(Err(e)) => {
@@ -268,6 +271,25 @@ pub(crate) async fn handle_incoming_query(
                                     "name": name,
                                     "args": args,
                                     "id": id
+                                }
+                            })),
+                            error: None,
+                        },
+                    )
+                    .await?;
+                }
+                Ok(crate::StreamToken::ToolResult { name, output, ms }) => {
+                    reply_response(
+                        &query,
+                        endpoint,
+                        AgentRpcResponse {
+                            ok: true,
+                            result: Some(serde_json::json!({
+                                "event": {
+                                    "type": "tool_result",
+                                    "name": name,
+                                    "output": output,
+                                    "ms": ms
                                 }
                             })),
                             error: None,
@@ -702,6 +724,7 @@ mod tests {
                 crate::StreamToken::Text(t) => out.push_str(&t),
                 crate::StreamToken::Done => break,
                 crate::StreamToken::ToolCall { .. } => {}
+                crate::StreamToken::ToolResult { .. } => {}
                 crate::StreamToken::ReasoningContent(_) => {}
                 crate::StreamToken::Usage(_) => {}
                 crate::StreamToken::Stopped => break,

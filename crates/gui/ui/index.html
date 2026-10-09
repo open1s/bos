@@ -13,6 +13,8 @@
         <span class="brand">BOS</span>
         <button id="new-chat" class="btn btn-accent" title="New chat">+ New</button>
       </div>
+      <input id="session-search" class="session-search" type="search"
+             placeholder="Search chats…" aria-label="Search chats" spellcheck="false" />
       <div id="session-list" class="session-list"></div>
       <div class="sidebar-foot">
         <button id="open-settings" class="btn btn-ghost" title="Settings">&#9881; Settings</button>
@@ -27,8 +29,26 @@
 
       <div id="messages"></div>
 
+      <section id="plan-panel" class="plan-panel hidden" aria-live="polite">
+        <div class="plan-head">
+          <span id="plan-title">Plan</span>
+          <span id="plan-count" class="plan-count"></span>
+          <button id="plan-edit" class="mini-btn plan-edit-btn" type="button">Edit</button>
+        </div>
+        <ol id="plan-list" class="plan-list" aria-label="Working plan"></ol>
+      </section>
+
       <div id="composer">
-        <textarea id="input" rows="1" placeholder="Send a message&#10;Enter = send · Shift+Enter = newline"></textarea>
+        <div id="cmd-palette" class="cmd-palette hidden" role="listbox"
+             aria-label="Commands and skills">
+          <ul id="cmd-list" class="cmd-list"></ul>
+        </div>
+        <div id="mention-pop" class="mention-pop hidden" role="listbox"
+             aria-label="File mentions">
+          <ul id="mention-list" class="cmd-list"></ul>
+        </div>
+        <div id="queue-list" class="queue-list hidden" aria-label="Queued messages"></div>
+        <textarea id="input" rows="1" placeholder="Send a message&#10;/ = commands &amp; skills · @ = file mentions · Enter = send (queued while streaming) · Shift+Enter = newline"></textarea>
         <button id="send" class="btn btn-accent" disabled>Send</button>
       </div>
 
@@ -80,9 +100,24 @@
           <input id="set-workspace" type="text" spellcheck="false"
                  placeholder="~/Projects/my-repo (empty = unrestricted)" />
         </label>
+        <div class="row">
+          <label class="row-check grow"><input id="set-instructions" type="checkbox" />
+            fold AGENTS.md / CLAUDE.md / .bos/instructions.md into the prompt</label>
+        </div>
         <label>Skills directory
           <input id="set-skills-dir" type="text" spellcheck="false"
                  placeholder="~/.bos/skills" />
+        </label>
+        <div class="row">
+          <label class="row-check grow"><input id="set-memory" type="checkbox" /> long-term memory</label>
+        </div>
+        <label>Memory file
+          <input id="set-memory-path" type="text" spellcheck="false"
+                 placeholder="~/.bos/gui/memory.jsonl (empty = default)" />
+        </label>
+        <label>Context budget (tokens, 0 = off)
+          <input id="set-context-budget" type="number" min="0" step="1024"
+                 placeholder="32768" />
         </label>
         <div class="cap-section">
           <div class="cap-title">MCP servers (plugins)
@@ -107,6 +142,22 @@
           <p id="mcp-msg" class="mcp-msg" role="status" aria-live="polite"></p>
         </div>
         <div class="cap-section">
+          <div class="cap-title">Failover providers (tried in order after the primary)</div>
+          <ul id="prov-list" class="mcp-list" aria-label="Configured fallback providers"></ul>
+          <div class="mcp-add">
+            <input id="prov-name" type="text" spellcheck="false" aria-label="Provider name"
+                   placeholder="name (e.g. local)" />
+            <input id="prov-model" type="text" spellcheck="false" aria-label="Provider model"
+                   placeholder="vendor/model" />
+            <input id="prov-url" type="text" spellcheck="false" aria-label="Provider base URL"
+                   placeholder="http://host:port/v1" />
+            <input id="prov-key" type="password" spellcheck="false" aria-label="Provider API key"
+                   placeholder="API key (empty = primary key)" />
+            <button type="button" id="prov-add-btn" class="btn btn-ghost">Add</button>
+          </div>
+          <p id="prov-msg" class="mcp-msg" role="status" aria-live="polite"></p>
+        </div>
+        <div class="cap-section">
           <div class="cap-title">Registered capabilities</div>
           <div id="cap-list" class="cap-list"></div>
         </div>
@@ -123,9 +174,10 @@
       <h2>Approval required</h2>
       <p class="approval-desc">
         The agent wants to run <span id="approval-tool" class="approval-tool"></span>.
-        Review the input before allowing it to execute.
+        Review the pending changes before allowing it to execute.
       </p>
       <pre id="approval-args" class="approval-args"></pre>
+      <div id="approval-diff" class="approval-diff hidden"></div>
       <div class="modal-actions">
         <button type="button" id="approval-deny" class="btn btn-ghost">Deny</button>
         <button type="button" id="approval-allow" class="btn btn-accent">Allow once</button>
@@ -133,6 +185,7 @@
     </div>
   </div>
 
+  <script src="prompt-nav.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

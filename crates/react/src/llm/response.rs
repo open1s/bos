@@ -55,6 +55,19 @@ pub enum StreamToken {
         /// Provider-assigned tool call id.
         id: Option<String>,
     },
+    /// A tool call finished executing in the ReAct loop.
+    ///
+    /// Yielded by the engine immediately after the [`ToolCall`](Self::ToolCall)
+    /// it answers and once `after_tool_result` hooks approved the result, so
+    /// observers can pair call and result (both arrive with the same `name`).
+    ToolResult {
+        /// Tool name.
+        name: String,
+        /// Tool output text as handed back to the model.
+        output: String,
+        /// Wall-clock execution time in milliseconds.
+        ms: u64,
+    },
     /// Final token usage for the response.
     Usage(super::vendor::openaicompatible::Usage),
     /// The stream finished normally.

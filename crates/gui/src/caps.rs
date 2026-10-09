@@ -1,10 +1,13 @@
 //! Capability layer: what the chat agent can actually do.
 //!
 //! [`build_agent`] turns the user's [`Settings`] into a fully-equipped
-//! [`Agent`] — a bash tool, filesystem tools, and skills discovered from the
-//! skills directory — so the GUI chat is a working coding agent rather than a
-//! bare LLM chat. [`capabilities_of`] reports what an agent carries so the
-//! frontend can display tools, skills, and plugins.
+//! [`Agent`] — a bash tool, filesystem tools, an always-on `update_plan`
+//! tool whose shared store backs the plan panel, skills discovered from the
+//! skills directory, and (when enabled) a persistent [`agent::memory::FileMemory`]
+//! with auto-remember, so the GUI chat is a working coding agent with
+//! long-term memory rather than a bare LLM chat. [`capabilities_of`] reports
+//! what an agent carries so the frontend can display tools, skills, and
+//! plugins.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,7 +62,10 @@ fn expand_tilde(raw: &str) -> PathBuf {
 /// a root, relative paths join the root and the result must stay inside it —
 /// the containment check canonicalizes the existing prefix so `..` and
 /// symlinks cannot escape a locked-down workspace.
-fn resolve_path(root: &Option<PathBuf>, raw: &str) -> Result<PathBuf, String> {
+///
+/// `pub(crate)` so the approval gate can resolve the same path the write
+/// tool will target and show a before/after diff of it.
+pub(crate) fn resolve_path(root: &Option<PathBuf>, raw: &str) -> Result<PathBuf, String> {
     let raw_path = Path::new(raw);
     let Some(root) = root else {
         let abs = if raw_path.is_absolute() {
@@ -238,6 +244,9 @@ pub(crate) fn build_agent(
 
     let ws = settings.bash_workspace.trim();
     let root: Option<PathBuf> = (!ws.is_empty()).then(|| expand_tilde(ws));
+    // The approval gate resolves write targets against this root to show
+    // before/after review diffs in the webview.
+    broker.set_workspace(root.clone());
 
     if settings.bash_enabled {
         let tool: Arc<dyn agent::tools::Tool> = match &root {
@@ -266,13 +275,61 @@ pub(crate) fn build_agent(
         agent.add_tool(list);
     }
 
+    // Planning is always on: the model tracks its steps in the agent's own
+    // shared plan store (`Agent::plan`), which the plan panel renders and
+    // sessions persist — read-only state, so no approval gate.
+    let plan: Arc<dyn agent::tools::Tool> = Arc::new(agent::tools::PlanTool::new(agent.plan()));
+    agent.add_tool(plan);
+
     let skills = settings.skills_dir.trim();
     if !skills.is_empty() {
         // A missing directory discovers nothing; that is not an error.
         let _ = agent.register_skills_from_dir(expand_tilde(skills));
     }
 
+    if settings.memory_enabled {
+        let raw = settings.memory_path.trim();
+        let path = if raw.is_empty() {
+            expand_tilde(crate::settings::DEFAULT_MEMORY_PATH)
+        } else {
+            expand_tilde(raw)
+        };
+        if let Some(memory) = open_file_memory(&path) {
+            agent = agent.with_memory(Arc::new(memory));
+            // The low-level agent stores each completed exchange itself
+            // (Agent::remember_exchange), so the GUI stream path stays thin.
+            agent.set_auto_remember(true);
+        }
+    }
+
     Arc::new(agent)
+}
+
+/// Open (and cap) a persistent [`agent::memory::FileMemory`] at `path`.
+///
+/// A missing file opens empty and the parent directory is created lazily by
+/// the store's first write, so opening never touches the filesystem beyond
+/// reading. Any failure returns `None`: a chat agent without memory is still
+/// fully functional, so a broken path degrades instead of aborting the build.
+/// The open runs on a short-lived worker thread with its own current-thread
+/// runtime because `FileMemory::open` is async while `build_agent` is sync
+/// and may itself be called from inside an async context (the MCP rebuild
+/// path does), where blocking on a nested runtime would panic.
+fn open_file_memory(path: &Path) -> Option<agent::memory::FileMemory> {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        let memory = runtime
+            .block_on(agent::memory::FileMemory::open(&path))
+            .ok()?;
+        Some(memory.with_max_items(500))
+    })
+    .join()
+    .ok()
+    .flatten()
 }
 
 /// Describe an agent's registered tools, skills, and plugins.
@@ -385,7 +442,40 @@ mod tests {
             &settings,
             Arc::new(crate::approval::ApprovalBroker::default()),
         );
-        assert!(tool_names(&agent).is_empty());
+        // The plan tool is the one always-on capability: it only mutates
+        // in-memory state, so no flag turns it off.
+        assert_eq!(
+            tool_names(&agent),
+            vec!["update_plan".to_string()],
+            "only the plan tool should remain"
+        );
+    }
+
+    /// Planning is registered on every build and shares the agent's store:
+    /// driving the tool like the model would is visible through `plan_items`.
+    #[test]
+    fn plan_tool_is_registered_and_shares_the_store() {
+        let settings = Settings::from_config_value(&serde_json::Value::Null);
+        let agent = build_agent(
+            &settings,
+            Arc::new(crate::approval::ApprovalBroker::default()),
+        );
+        let names = tool_names(&agent);
+        assert!(
+            names.contains(&"update_plan".to_string()),
+            "update_plan missing: {names:?}"
+        );
+
+        let reg = agent.registry().expect("registry");
+        let tool = reg.get("update_plan").expect("plan tool registered");
+        tool.run(&serde_json::json!({
+            "items": [{"text": "check capabilities", "status": "in_progress"}]
+        }))
+        .expect("plan update");
+
+        let items = agent.plan_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "check capabilities");
     }
 
     #[test]
@@ -423,6 +513,39 @@ mod tests {
         assert!(all.iter().any(|t| t.name == "bash"));
         assert!(all.iter().any(|t| t.name == "write_file"));
         assert!(all.iter().any(|t| t.name == "read_file"));
+    }
+
+    #[test]
+    fn memory_attaches_with_auto_remember() {
+        let mut settings = Settings::from_config_value(&serde_json::Value::Null);
+        let dir = std::env::temp_dir().join(format!(
+            "bos-gui-caps-mem-{}-{}",
+            std::process::id(),
+            "attach"
+        ));
+        settings.memory_path = dir.join("memory.jsonl").to_string_lossy().into();
+        let agent = build_agent(
+            &settings,
+            Arc::new(crate::approval::ApprovalBroker::default()),
+        );
+        assert!(agent.memory().is_some(), "file memory must attach");
+        assert!(
+            agent.auto_remember(),
+            "chat exchanges store themselves via the low-level agent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_disabled_leaves_agent_bare() {
+        let mut settings = Settings::from_config_value(&serde_json::Value::Null);
+        settings.memory_enabled = false;
+        let agent = build_agent(
+            &settings,
+            Arc::new(crate::approval::ApprovalBroker::default()),
+        );
+        assert!(agent.memory().is_none());
+        assert!(!agent.auto_remember());
     }
 
     #[test]

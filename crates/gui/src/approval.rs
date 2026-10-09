@@ -7,6 +7,7 @@
 //! requests never execute the inner tool.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -33,6 +34,9 @@ pub(crate) struct ApprovalRequest {
     pub(crate) tool: String,
     /// Pretty-printed JSON input shown to the user.
     pub(crate) args: String,
+    /// Line diff of the pending write (old file vs new content), folded to
+    /// a few context lines; `None` for tools without a reviewable change.
+    pub(crate) diff: Option<String>,
 }
 
 /// A pending approval waiting on the user.
@@ -53,6 +57,8 @@ pub(crate) struct ApprovalBroker {
     handle: OnceLock<AppHandle>,
     /// Per-request wait budget (overridden in tests).
     timeout: Mutex<Duration>,
+    /// Workspace root used to resolve write targets for review diffs.
+    workspace: Mutex<Option<PathBuf>>,
 }
 
 impl Default for ApprovalBroker {
@@ -63,6 +69,7 @@ impl Default for ApprovalBroker {
             handle: OnceLock::new(),
             // NOTE: `Duration::default()` is zero, which would expire instantly.
             timeout: Mutex::new(APPROVAL_TIMEOUT),
+            workspace: Mutex::new(None),
         }
     }
 }
@@ -78,6 +85,11 @@ impl ApprovalBroker {
         *self.active.lock().unwrap() = (session_id.to_string(), gen);
     }
 
+    /// Set the workspace root used to resolve `write_file` review diffs.
+    pub(crate) fn set_workspace(&self, root: Option<PathBuf>) {
+        *self.workspace.lock().unwrap() = root;
+    }
+
     /// (session, gen) of the current stream.
     fn active_context(&self) -> (String, u64) {
         self.active.lock().unwrap().clone()
@@ -89,12 +101,21 @@ impl ApprovalBroker {
         let (session_id, gen) = self.active_context();
         let id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // Writes are reviewable: resolve the same target the tool will use
+        // and attach a line diff of old vs proposed content.
+        let diff = if tool == "write_file" {
+            let root = self.workspace.lock().unwrap().clone();
+            write_file_diff(&root, args)
+        } else {
+            None
+        };
         let request = ApprovalRequest {
             id: id.clone(),
             session_id,
             gen,
             tool: tool.to_string(),
             args: format_args_preview(args),
+            diff,
         };
         self.pending.lock().unwrap().insert(
             id.clone(),
@@ -143,6 +164,140 @@ impl ApprovalBroker {
     fn timeout(&self) -> Duration {
         *self.timeout.lock().unwrap()
     }
+}
+
+/// Max lines per side for the review diff (LCS is O(n·m)).
+const MAX_DIFF_LINES: usize = 1500;
+/// Max source size considered for a review diff (matches `read_file`).
+const MAX_DIFF_INPUT: usize = 256 * 1024;
+/// Context lines kept beside each change before runs fold.
+const DIFF_CONTEXT: usize = 3;
+/// Cap on the composed preview text.
+const MAX_DIFF_BYTES: usize = 24 * 1024;
+
+/// Compute the line diff shown in the approval dialog for a `write_file`.
+///
+/// Resolves `path` exactly like the tool will (workspace containment
+/// included) and reads the current bytes as the old side: a missing file
+/// diffs as an all-add, while a non-UTF-8 or oversized file skips the diff
+/// (`None` → the dialog falls back to the plain argument preview).
+fn write_file_diff(root: &Option<PathBuf>, args: &Value) -> Option<String> {
+    let path = args.get("path")?.as_str()?;
+    let content = args.get("content")?.as_str()?;
+    if content.len() > MAX_DIFF_INPUT {
+        return None;
+    }
+    let target = crate::caps::resolve_path(root, path).ok()?;
+    let old = match std::fs::read(&target) {
+        Ok(bytes) => {
+            if bytes.len() > MAX_DIFF_INPUT || bytes.contains(&0) {
+                return None; // oversized or binary: no readable review
+            }
+            String::from_utf8(bytes).ok()?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return None,
+    };
+    line_diff(&old, content)
+}
+
+/// Line-based LCS diff of `old` vs `new`.
+///
+/// Each output line is prefixed with `' '` (context), `'-'` (old) or `'+'`
+/// (new); unchanged runs longer than twice [`DIFF_CONTEXT`] fold into
+/// `⋯ N unchanged lines`. Returns `None` when the sides are identical or
+/// either exceeds [`MAX_DIFF_LINES`].
+fn line_diff(old: &str, new: &str) -> Option<String> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    if a.len() > MAX_DIFF_LINES || b.len() > MAX_DIFF_LINES || a == b {
+        return None;
+    }
+    let (n, m) = (a.len(), b.len());
+    // Full LCS table (≤ ~2.25M cells ≈ 9 MiB at the line cap).
+    let mut table = vec![0u32; (n + 1) * (m + 1)];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            table[i * (m + 1) + j] = if a[i] == b[j] {
+                table[(i + 1) * (m + 1) + j + 1] + 1
+            } else {
+                table[(i + 1) * (m + 1) + j].max(table[i * (m + 1) + j + 1])
+            };
+        }
+    }
+    let mut ops: Vec<(u8, &str)> = Vec::with_capacity(n + m);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push((b' ', a[i]));
+            i += 1;
+            j += 1;
+        } else if table[(i + 1) * (m + 1) + j] >= table[i * (m + 1) + j + 1] {
+            ops.push((b'-', a[i]));
+            i += 1;
+        } else {
+            ops.push((b'+', b[j]));
+            j += 1;
+        }
+    }
+    ops.extend((i..n).map(|k| (b'-', a[k])));
+    ops.extend((j..m).map(|k| (b'+', b[k])));
+
+    fn push(out: &mut String, prefix: char, text: &str) -> bool {
+        if out.len() + text.len() + 2 > MAX_DIFF_BYTES {
+            out.push_str("… [diff truncated]\n");
+            return false;
+        }
+        out.push(prefix);
+        out.push_str(text);
+        out.push('\n');
+        true
+    }
+
+    // Fold long unchanged runs, keeping DIFF_CONTEXT lines on each side.
+    let mut out = String::new();
+    let mut k = 0;
+    'outer: while k < ops.len() {
+        if ops[k].0 != b' ' {
+            let (tag, text) = ops[k];
+            if !push(&mut out, tag as char, text) {
+                break;
+            }
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while k < ops.len() && ops[k].0 == b' ' {
+            k += 1;
+        }
+        let run = k - start;
+        if run > 2 * DIFF_CONTEXT {
+            let front = if start == 0 { 0 } else { DIFF_CONTEXT };
+            let back = if k == ops.len() { 0 } else { DIFF_CONTEXT };
+            for (_, text) in &ops[start..start + front] {
+                if !push(&mut out, ' ', text) {
+                    break 'outer;
+                }
+            }
+            if out.len() + 64 <= MAX_DIFF_BYTES {
+                out.push_str(&format!("⋯ {} unchanged lines\n", run - front - back));
+            } else {
+                break;
+            }
+            for (_, text) in &ops[k - back..k] {
+                if !push(&mut out, ' ', text) {
+                    break 'outer;
+                }
+            }
+        } else {
+            for (_, text) in &ops[start..k] {
+                if !push(&mut out, ' ', text) {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Short preview of a tool's JSON input for the approval dialog.
@@ -513,5 +668,82 @@ mod tests {
         assert_eq!(gate.name(), "files_read");
         assert_eq!(gate.json_schema()["type"], "object");
         assert!(!gate.description().is_empty());
+    }
+
+    /// The diff marks changed lines and folds distant context into a marker.
+    #[test]
+    fn line_diff_marks_changes_and_folds_context() {
+        let old = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old.replace("line 10", "LINE 10");
+        let diff = line_diff(&old, &new).expect("one changed line");
+        assert!(diff.contains("-line 10"), "old side: {diff}");
+        assert!(diff.contains("+LINE 10"), "new side: {diff}");
+        assert!(
+            diff.contains("unchanged lines"),
+            "distant context must fold: {diff}"
+        );
+        assert_eq!(line_diff(&old, &old), None, "identical sides have no diff");
+        let huge = "x\n".repeat(MAX_DIFF_LINES + 1);
+        assert_eq!(line_diff(&huge, "y\n"), None, "oversized sides skip");
+    }
+
+    /// The write preview reads the old side from disk under the root.
+    #[test]
+    fn write_file_diff_uses_old_side_and_all_adds_for_new_files() {
+        let root = std::env::temp_dir().join(format!("bos-gui-apprdiff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "old line\n").unwrap();
+
+        let diff = write_file_diff(
+            &Some(root.clone()),
+            &serde_json::json!({"path": "f.txt", "content": "new line\n"}),
+        )
+        .expect("existing file diffs");
+        assert!(diff.contains("-old line"), "{diff}");
+        assert!(diff.contains("+new line"), "{diff}");
+
+        let fresh = write_file_diff(
+            &Some(root.clone()),
+            &serde_json::json!({"path": "fresh.txt", "content": "only add\n"}),
+        )
+        .expect("missing file diffs as all-add");
+        assert!(fresh.starts_with('+'), "{fresh}");
+        assert!(!fresh.contains('-'), "nothing to delete: {fresh}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only write_file requests carry a diff; other tools stay preview-only.
+    #[test]
+    fn request_attaches_diff_only_for_writes() {
+        let root =
+            std::env::temp_dir().join(format!("bos-gui-apprdiff-req-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "before\n").unwrap();
+
+        let broker = ApprovalBroker::default();
+        broker.set_workspace(Some(root.clone()));
+        let (id, _rx) = broker.request(
+            "write_file",
+            &serde_json::json!({"path": "f.txt", "content": "after\n"}),
+        );
+        let pending = broker.pending.lock().unwrap();
+        let req = &pending[&id].request;
+        assert!(req.diff.as_deref().is_some(), "write carries a diff");
+        drop(pending);
+
+        let (id2, _rx2) = broker.request("bash", &serde_json::json!({"command": "ls"}));
+        let pending = broker.pending.lock().unwrap();
+        assert!(
+            pending[&id2].request.diff.is_none(),
+            "bash stays preview-only"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
