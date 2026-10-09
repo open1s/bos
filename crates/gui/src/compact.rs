@@ -105,17 +105,42 @@ pub(crate) fn apply(record: &mut SessionRecord, summary: String) -> Result<(usiz
     if summary.is_empty() {
         return Err("the summarizer returned no text — history kept".to_string());
     }
-    let anchor = record
+    let anchor_index = record
         .messages
         .iter()
-        .find(|m| m.role == Role::User && !m.text.trim().is_empty())
-        .map(|m| m.text.clone())
+        .position(|m| m.role == Role::User && !m.text.trim().is_empty())
         .ok_or_else(|| "no user message to anchor the compacted history".to_string())?;
+    let anchor = record.messages[anchor_index].text.clone();
     let before = record.messages.len();
     let mut summary_msg = ChatMessage::assistant();
     summary_msg.text = format!("**Compacted** — earlier turns folded by `/compact`:\n\n{summary}");
+    // Keep what is being folded, so `/compact` can be undone. The anchor is not
+    // archived: it stays in the live history, so archiving it would put the same
+    // turn in the transcript twice on a restore.
+    record.archived = record
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != anchor_index)
+        .map(|(_, m)| m.clone())
+        .collect();
     record.messages = vec![ChatMessage::user(anchor), summary_msg];
     Ok((before, record.messages.len()))
+}
+
+/// Put a folded history back, keeping anything that came after it.
+///
+/// The archived turns are older than the current ones, so they go in front; a
+/// plain restore would silently delete every turn since the compaction.
+pub(crate) fn restore(record: &mut SessionRecord) -> Result<usize, String> {
+    if record.archived.is_empty() {
+        return Err("nothing to restore — this chat has no folded history".to_string());
+    }
+    let mut merged = std::mem::take(&mut record.archived);
+    let restored = merged.len();
+    merged.append(&mut record.messages);
+    record.messages = merged;
+    Ok(restored)
 }
 
 /// Run one tool-less summarization turn over `messages` and return the
@@ -256,5 +281,51 @@ mod tests {
         ];
         let err = apply(&mut record, "s".to_string()).expect_err("no anchor");
         assert!(err.contains("anchor"), "{err}");
+    }
+    #[test]
+    fn compaction_keeps_what_it_folds() {
+        let mut record = SessionRecord::new();
+        record.messages = vec![
+            user("task"),
+            assistant("one"),
+            user("two"),
+            assistant("three"),
+        ];
+        apply(&mut record, "condensed".to_string()).expect("apply");
+        assert_eq!(record.messages.len(), 2, "anchor plus summary");
+        assert_eq!(record.archived.len(), 3, "everything else is kept");
+        assert_eq!(record.archived[0].text, "one", "the anchor is not archived");
+    }
+
+    #[test]
+    fn restore_puts_the_folded_turns_back_in_front() {
+        let mut record = SessionRecord::new();
+        record.messages = vec![user("task"), assistant("one"), user("two")];
+        apply(&mut record, "condensed".to_string()).expect("apply");
+        // The chat goes on after the compaction, and those turns must survive.
+        record.messages.push(user("a new question"));
+        record.messages.push(assistant("a new answer"));
+        let restored = restore(&mut record).expect("restore");
+        assert_eq!(restored, 2, "the two folded turns came back");
+        assert!(record.archived.is_empty(), "nothing stays archived");
+        let texts: Vec<&str> = record.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts[0], "one", "older turns go in front: {texts:?}");
+        assert_eq!(texts[1], "two", "{texts:?}");
+        assert_eq!(texts[2], "task", "the anchor was never archived: {texts:?}");
+        assert_eq!(
+            texts[4], "a new question",
+            "later turns are kept: {texts:?}"
+        );
+        assert_eq!(texts[5], "a new answer", "{texts:?}");
+        assert_eq!(texts.len(), 6, "two folded plus four live: {texts:?}");
+    }
+
+    #[test]
+    fn restore_refuses_when_nothing_was_folded() {
+        let mut record = SessionRecord::new();
+        record.messages = vec![user("a")];
+        let err = restore(&mut record).expect_err("nothing folded");
+        assert!(err.contains("nothing to restore"), "{err}");
+        assert_eq!(record.messages.len(), 1, "history untouched");
     }
 }

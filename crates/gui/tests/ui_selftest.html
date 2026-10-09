@@ -1,4 +1,46 @@
 <!doctype html>
+<script>
+// An uncaught load-time error would otherwise leave the runner with only
+// "result block missing". Write the real message into the result block so a
+// broken page reports *why* it is broken.
+const reportLoadFailure = (msg) => {
+  window.__dshLoadError = msg;
+  const put = () => {
+    const pre = document.getElementById("result");
+    if (!pre) return false;
+    pre.textContent = JSON.stringify({
+      page: "transcript",
+      failures: 1,
+      checks: [{ name: "load error: " + msg, ok: false }],
+    });
+    return true;
+  };
+  if (!put()) document.addEventListener("DOMContentLoaded", put);
+};
+// An uncaught error and an unhandled rejection are different events, and this
+// harness's flow is async: a rejected promise used to reach the runner as
+// "result block missing", i.e. with no reason at all.
+window.addEventListener("error", (e) => reportLoadFailure(`${e.message} @ ${e.filename}:${e.lineno}`));
+window.addEventListener("unhandledrejection", (e) =>
+  reportLoadFailure(
+    `unhandled rejection: ${(e.reason && (e.reason.stack || e.reason.message)) || e.reason}`,
+  ),
+);
+window.addEventListener("error", (e) => {
+  window.__dshLoadError = `${e.message} @ ${e.filename}:${e.lineno}`;
+  const put = () => {
+    const pre = document.getElementById("result");
+    if (!pre) return false;
+    pre.textContent = JSON.stringify({
+      page: "transcript",
+      failures: 1,
+      checks: [{ name: "load error: " + window.__dshLoadError, ok: false }],
+    });
+    return true;
+  };
+  if (!put()) document.addEventListener("DOMContentLoaded", put);
+});
+</script>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -96,6 +138,10 @@
         });
         let msgs = [];
         for (let i = 0; i < N; i++) msgs.push(make(i));
+        // The structural phases below read `rowCache` as if a row exists per
+        // message, which a window deliberately does not do. They run with the
+        // window open, and the windowed contract gets its own phase at the end.
+        state.windowExtra = N;
         state.activeId = "selftest";
         state.cache["selftest"] = msgs;
         state.streams = {};
@@ -372,6 +418,1179 @@
           "sidebar navigation is wired",
           !!document.getElementById("nav-plugins") && !!document.getElementById("nav-mcp"),
         );
+
+        // ---- 8. sessions group by workspace -----------------------------
+        const wsGroups = groupSessions(
+          [
+            { id: "a", title: "a", workspace: "w1" },
+            { id: "b", title: "b", workspace: "w2" },
+            { id: "c", title: "c", workspace: "" },
+          ],
+          [
+            { id: "w1", name: "bos", root: "/p/bos", model: "m1" },
+            { id: "w2", name: "notes", root: "/notes", model: "" },
+          ],
+          "w1",
+        );
+        assert(
+          "a session with no workspace joins the active one",
+          wsGroups.length === 2 && wsGroups[0].sessions.length === 2,
+          `groups=${wsGroups.length} first=${(wsGroups[0] || {}).sessions?.length}`,
+        );
+        assert(
+          "a group carries the name, root and bound model",
+          wsGroups[0].name === "bos" && wsGroups[0].root === "/p/bos" && wsGroups[0].model === "m1",
+          JSON.stringify({ n: wsGroups[0].name, r: wsGroups[0].root, m: wsGroups[0].model }),
+        );
+        assert(
+          "an unknown workspace still lists its chats",
+          groupSessions([{ id: "d", title: "d", workspace: "gone" }], [], "w1")[0].name === "gone",
+        );
+
+        // ---- 9. workspace management in the panel -----------------------
+        renderSidebar();
+        assert(
+          "the panel offers a way to add a workspace",
+          !!sessionList.querySelector(".ws-add"),
+          "no .ws-add in the rendered panel",
+        );
+        openWorkspaceForm("create", "");
+        assert(
+          "the add form replaces the add button",
+          !!document.querySelector(".ws-form") && !document.querySelector(".ws-add"),
+        );
+        assert(
+          "the create form asks for a name and a root",
+          !!document.querySelector(".ws-form .ws-name") &&
+            !!document.querySelector(".ws-form .ws-root"),
+        );
+        state.workspaces = [{ id: "w1", name: "bos", root: "/p/bos", model: "m1" }];
+        openWorkspaceForm("edit", "w1");
+        const editName = document.querySelector(".ws-form .ws-name");
+        assert(
+          "the edit form is prefilled from the workspace",
+          !!editName && editName.value === "bos",
+          editName ? `name=${editName.value}` : "no field",
+        );
+        openWorkspaceForm("remove", "w1");
+        assert(
+          "removing a workspace asks what to do with its chats",
+          !!document.querySelector(".ws-del-chats") && !document.querySelector(".ws-name"),
+        );
+        closeWorkspaceForm();
+        assert("closing the form brings the add button back", !!sessionList.querySelector(".ws-add"));
+
+        // ---- 10. per-workspace tool selection ---------------------------
+        state.workspaces = [
+          { id: "w1", name: "bos", root: "/p/bos", model: "m1", disabled_tools: ["list_dir"] },
+        ];
+        state.wsEdit = { mode: "edit", id: "w1" };
+        renderSidebar();
+        const toolForm = sessionList.querySelector(".ws-form");
+        const boxes = toolForm ? [...toolForm.querySelectorAll(".ws-tool")] : [];
+        assert(
+          "the workspace form lists every built-in tool",
+          boxes.length === BUILTIN_TOOLS.length,
+          `boxes=${boxes.length}`,
+        );
+        assert(
+          "a tool the workspace denies opens unchecked",
+          (boxes.find((b) => b.value === "list_dir") || {}).checked === false,
+        );
+        assert(
+          "and the others open checked",
+          (boxes.find((b) => b.value === "bash") || {}).checked === true,
+        );
+        boxes.forEach((b) => {
+          b.checked = b.value !== "bash";
+        });
+        assert(
+          "switching a tool off yields a deny-list, not a full snapshot",
+          JSON.stringify(disabledToolsFromForm(toolForm)) === JSON.stringify(["bash"]),
+          JSON.stringify(disabledToolsFromForm(toolForm)),
+        );
+        closeWorkspaceForm();
+
+        // ---- 11. MCP servers are opt-in per workspace --------------------
+        state.workspaces = [
+          {
+            id: "w1",
+            name: "bos",
+            root: "/p/bos",
+            model: "m1",
+            disabled_tools: [],
+            mcp_servers: [
+              { name: "fs", enabled: true, command: "npx" },
+              { name: "git", enabled: false, command: "git-mcp" },
+            ],
+          },
+        ];
+        state.wsEdit = { mode: "edit", id: "w1" };
+        renderSidebar();
+        const mcpForm = sessionList.querySelector(".ws-form");
+        const mcpBoxes = mcpForm ? [...mcpForm.querySelectorAll(".ws-mcp")] : [];
+        assert(
+          "the workspace form lists the configured MCP servers",
+          mcpBoxes.length === 2,
+          `boxes=${mcpBoxes.length}`,
+        );
+        assert(
+          "an enabled server opens ticked",
+          (mcpBoxes.find((b) => b.value === "fs") || {}).checked === true,
+        );
+        assert(
+          "a disabled server opens unticked",
+          (mcpBoxes.find((b) => b.value === "git") || {}).checked === false,
+        );
+        // Untick "fs" and leave "git" as rendered: the payload must carry both
+        // entries with their transports, only the flag changed.
+        mcpBoxes.forEach((b) => {
+          if (b.value === "fs") b.checked = false;
+        });
+        const picked = mcpSelectionFromForm(mcpForm, state.workspaces[0]);
+        assert(
+          "switching a server off keeps its definition and only flips enabled " +
+            JSON.stringify(picked).slice(0, 160),
+          picked.length === 2 &&
+            picked[0].command === "npx" &&
+            picked[0].enabled === false &&
+            picked[1].enabled === false,
+          JSON.stringify(picked),
+        );
+        closeWorkspaceForm();
+
+        // ---- 12. per-workspace skill selection ---------------------------
+        state.skills = [{ name: "calculator" }, { name: "code-review" }];
+        state.workspaces = [
+          {
+            id: "w1",
+            name: "bos",
+            root: "/p/bos",
+            model: "m1",
+            disabled_skills: ["code-review"],
+            mcp_servers: [],
+          },
+        ];
+        state.wsEdit = { mode: "edit", id: "w1" };
+        renderSidebar();
+        const skillForm = sessionList.querySelector(".ws-form");
+        const skillBoxes = skillForm ? [...skillForm.querySelectorAll(".ws-skill")] : [];
+        assert(
+          "the workspace form lists the skills " + JSON.stringify(skillBoxes.map((b) => b.value)),
+          skillBoxes.length === 2,
+        );
+        assert(
+          "a denied skill opens unticked",
+          (skillBoxes.find((b) => b.value === "code-review") || {}).checked === false,
+        );
+        assert(
+          "an allowed skill opens ticked",
+          (skillBoxes.find((b) => b.value === "calculator") || {}).checked === true,
+        );
+        skillBoxes.forEach((b) => {
+          if (b.value === "calculator") b.checked = false;
+        });
+        assert(
+          "denying a skill yields exactly that name",
+          JSON.stringify(disabledSkillsFromForm(skillForm)) ===
+            JSON.stringify(["calculator", "code-review"]),
+          JSON.stringify(disabledSkillsFromForm(skillForm)),
+        );
+        // A denied skill stays listed even before the capability listing loads.
+        state.skills = [];
+        assert(
+          "a stored denial is still visible with no listing loaded",
+          JSON.stringify(skillNamesFor(state.workspaces[0])) === JSON.stringify(["code-review"]),
+        );
+        closeWorkspaceForm();
+
+        // ---- 13. presets are offered where a workspace is created --------
+        state.wsEdit = null;
+        state.presets = [{ id: "p1", name: "Strict" }];
+        renderSidebar();
+        const presetBtns = [...sessionList.querySelectorAll(".ws-add-preset")];
+        assert(
+          "a preset is offered by name",
+          presetBtns.length === 1 && presetBtns[0].textContent.includes("Strict"),
+          JSON.stringify(presetBtns.map((b) => b.textContent)),
+        );
+        assert("and the create button is still there", !!sessionList.querySelector(".ws-add"));
+        state.presets = [];
+        renderSidebar();
+        assert(
+          "no presets means no preset buttons",
+          sessionList.querySelectorAll(".ws-add-preset").length === 0,
+        );
+
+        // ---- 14. a workspace can be promoted to a preset ------------------
+        state.presets = [];
+        state.wsEdit = { mode: "edit", id: "w1" };
+        renderSidebar();
+        assert(
+          "an existing workspace offers \"Save as preset\"",
+          !!sessionList.querySelector(".ws-preset"),
+        );
+        state.wsEdit = { mode: "create", id: "" };
+        renderSidebar();
+        assert(
+          "a workspace that does not exist yet offers no preset",
+          !sessionList.querySelector(".ws-preset"),
+        );
+        closeWorkspaceForm();
+
+        // ---- 15. windowed transcript: the tail, and its cost ------------
+        // Two questions, one fixture each: does a window draw only the tail, and
+        // does streaming stay bounded when it does. The second is the claim the
+        // requirements document still leaves open, so it is measured against the
+        // same loop with the window open — same frames, same mutation, one flag.
+        const frames = 120;
+        // `append` is the other half of streaming: a message arrives at the cap,
+        // which slides the window by one and must therefore drop a row and sign a
+        // row rather than redraw everything.
+        const streamCost = (extra, append) => {
+          const arr = [];
+          for (let i = 0; i < N; i++) arr.push(make(i));
+          state.cache["selftest"] = arr;
+          state.activeId = "selftest";
+          state.windowExtra = extra;
+          markDirtyAll();
+          renderMessages();
+          // Rows, not children: the scroller also holds the spacer that stands
+          // in for the rows above the window, and counting that as a row made
+          // this phase fail the moment the spacer was added.
+          const rows = rowCache.size;
+          const t0 = performance.now();
+          for (let f = 0; f < frames; f++) {
+            if (append) arr.push(make(N + f));
+            else arr[arr.length - 1].text = `tail ${f} ${"x".repeat(f % 40)}`;
+            markDirty(arr.length - 1);
+            renderMessages();
+          }
+          return { ms: +((performance.now() - t0) / frames).toFixed(3), rows };
+        };
+        const windowed = streamCost(0);
+        R.windowedStreamMsPerFrame = windowed.ms;
+        R.windowedRows = windowed.rows;
+        const unwindowed = streamCost(N);
+        R.unwindowedStreamMsPerFrame = unwindowed.ms;
+        const appendWindowed = streamCost(0, true);
+        const appendUnwindowed = streamCost(N, true);
+        R.appendWindowedMsPerFrame = appendWindowed.ms;
+        R.appendUnwindowedMsPerFrame = appendUnwindowed.ms;
+        assert(
+          `appending at the cap is bounded too (N=${N} windowed=${appendWindowed.ms}ms unwindowed=${appendUnwindowed.ms}ms rows=${appendWindowed.rows})`,
+          appendWindowed.rows === Math.min(N, 200) &&
+            appendWindowed.ms <= appendUnwindowed.ms * 1.25 + 0.05,
+        );
+        R.windowedSpeedup = +(unwindowed.ms / (windowed.ms || 0.001)).toFixed(1);
+        assert(
+          `a window draws only the tail (rows=${windowed.rows} of ${N})`,
+          windowed.rows === Math.min(N, 200),
+        );
+        assert(
+          `streaming at the cap is bounded by the window (N=${N} windowed=${windowed.ms}ms unwindowed=${unwindowed.ms}ms speedup=${R.windowedSpeedup}x)`,
+          windowed.ms <= unwindowed.ms * 1.25 + 0.05,
+        );
+        state.windowExtra = N;
+
+        // ---- 16. the workspace panel carries its runtime settings --------
+        // The panel is where a workspace's model is chosen, so this walks the
+        // form: what it shows, what it refuses to show, and what it sends.
+        const savedWorkspaces = state.workspaces;
+        const savedWsEdit = state.wsEdit;
+        const savedActive = state.activeWorkspace;
+        state.workspaces = [
+          {
+            id: "w1", name: "W", root: "", model: "big/model", base_url: "https://x/v1",
+            api_key: "secret-key", system_prompt: "be terse", temperature: 0,
+            reasoning_effort: "high", disabled_tools: [], disabled_skills: [], mcp_servers: [],
+          },
+        ];
+        state.activeWorkspace = "w1";
+        state.wsEdit = { mode: "edit", id: "w1" };
+        renderSidebar();
+        const wform = sessionList.querySelector(".ws-form");
+        const fieldValue = (cls) => {
+          const field = wform && wform.querySelector(cls);
+          return field ? field.value : "missing";
+        };
+        R.wsFormModel = fieldValue(".ws-model");
+        R.wsFormTemp = fieldValue(".ws-temperature");
+        R.wsFormEffort = fieldValue(".ws-reasoning");
+        R.wsFormKeyShown = !!(wform && wform.innerHTML.includes("secret-key"));
+        assert(
+          `the workspace panel shows the model it runs (model=${R.wsFormModel} temp=${R.wsFormTemp} effort=${R.wsFormEffort} keyShown=${R.wsFormKeyShown})`,
+          R.wsFormModel === "big/model" && R.wsFormTemp === "0" && R.wsFormEffort === "high" &&
+            R.wsFormKeyShown === false,
+        );
+        const seen = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          seen.push([cmd, args]);
+          return new Promise(() => {}); // never settles: the form's then-chain stays inert
+        };
+        wform.querySelector(".ws-model").value = "bigger/model";
+        submitWorkspaceForm(wform);
+        const call = seen[0] || ["none", {}];
+        R.wsUpdateArgs = `${call[0]} model=${call[1].model} temp=${JSON.stringify(call[1].temperature)} effort=${call[1].reasoningEffort} key=${call[1].apiKey}`;
+        assert(
+          `saving a workspace sends its runtime settings (${R.wsUpdateArgs})`,
+          call[0] === "update_workspace" &&
+            call[1].model === "bigger/model" &&
+            call[1].temperature === 0 &&
+            call[1].reasoningEffort === "high" &&
+            call[1].apiKey === "secret-key",
+        );
+        window.__TAURI__.core.invoke = never;
+        state.workspaces = savedWorkspaces;
+        state.wsEdit = savedWsEdit;
+        state.activeWorkspace = savedActive;
+        renderSidebar();
+
+        // ---- 17. a chat can move house --------------------------------
+        const keptSessions = state.sessions;
+        const keptWorkspaces2 = state.workspaces;
+        const keptActive2 = state.activeWorkspace;
+        const keptActiveId = state.activeId;
+        state.workspaces = [
+          { id: "w1", name: "One", root: "", disabled_tools: [], disabled_skills: [], mcp_servers: [] },
+          { id: "w2", name: "Two", root: "", disabled_tools: [], disabled_skills: [], mcp_servers: [] },
+        ];
+        state.sessions = [{ id: "s1", title: "chat", workspace: "w1", updated_at: 1, messages: [] }];
+        state.activeWorkspace = "w1";
+        state.activeId = "s1";
+        renderSidebar();
+        const picker = sessionList.querySelector(".sess-ws");
+        R.movePickerOptions = picker ? picker.options.length : 0;
+        R.movePickerValue = picker ? picker.value : "none";
+        const moved = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          moved.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        if (picker) {
+          picker.value = "w2";
+          picker.dispatchEvent(new Event("change"));
+        }
+        const moveCall = moved[0] || ["none", {}];
+        R.moveCall = `${moveCall[0]} id=${moveCall[1].id} to=${moveCall[1].workspaceId}`;
+        assert(
+          `a chat can be moved to another workspace (${R.moveCall} options=${R.movePickerOptions} selected=${R.movePickerValue})`,
+          picker !== null &&
+            R.movePickerOptions === 2 &&
+            moveCall[0] === "move_session" &&
+            moveCall[1].id === "s1" &&
+            moveCall[1].workspaceId === "w2",
+        );
+        window.__TAURI__.core.invoke = never;
+        state.sessions = keptSessions;
+        state.workspaces = keptWorkspaces2;
+        state.activeWorkspace = keptActive2;
+        state.activeId = keptActiveId;
+        renderSidebar();
+
+        // ---- 18. a workspace group folds away --------------------------
+        const kept3 = {
+          workspaces: state.workspaces, sessions: state.sessions,
+          activeWorkspace: state.activeWorkspace, activeId: state.activeId,
+          collapsed: state.collapsed,
+        };
+        state.workspaces = [
+          { id: "w1", name: "One", root: "", disabled_tools: [], disabled_skills: [], mcp_servers: [] },
+          { id: "w2", name: "Two", root: "", disabled_tools: [], disabled_skills: [], mcp_servers: [] },
+        ];
+        state.sessions = [{ id: "s1", title: "chat", workspace: "w1", updated_at: 1, messages: [] }];
+        state.activeWorkspace = "w1";
+        state.activeId = "s1";
+        state.collapsed = {};
+        renderSidebar();
+        R.foldRowsBefore = sessionList.querySelectorAll(".session-row").length;
+        const foldButton = sessionList.querySelector(".ws-fold");
+        if (foldButton) foldButton.dispatchEvent(new Event("click"));
+        R.foldRowsAfter = sessionList.querySelectorAll(".session-row").length;
+        R.foldMarker = (sessionList.querySelector(".ws-fold") || {}).textContent || "none";
+        // A repaint (a stream tick, a search keystroke) must not spring it open.
+        renderSidebar();
+        R.foldRowsRepaint = sessionList.querySelectorAll(".session-row").length;
+        assert(
+          `a workspace group folds away and stays folded (rows=${R.foldRowsBefore}->${R.foldRowsAfter}, after repaint=${R.foldRowsRepaint}, marker=${R.foldMarker})`,
+          R.foldRowsBefore === 1 &&
+            R.foldRowsAfter === 0 &&
+            R.foldRowsRepaint === 0 &&
+            R.foldMarker === "▸",
+        );
+        state.workspaces = kept3.workspaces;
+        state.sessions = kept3.sessions;
+        state.activeWorkspace = kept3.activeWorkspace;
+        state.activeId = kept3.activeId;
+        state.collapsed = kept3.collapsed;
+        renderSidebar();
+
+        // ---- 19. Settings lists the workspaces -------------------------
+        const kept4 = {
+          workspaces: state.workspaces, sessions: state.sessions,
+          activeWorkspace: state.activeWorkspace, activeId: state.activeId,
+        };
+        const host = document.createElement("div");
+        host.id = "ws-manage-list";
+        document.body.appendChild(host);
+        state.workspaces = [
+          { id: "w1", name: "One", root: "/tmp/one", model: "big/model", reasoning_effort: "high",
+            disabled_tools: [], disabled_skills: [], mcp_servers: [] },
+          { id: "w2", name: "Two", root: "", model: "",
+            disabled_tools: [], disabled_skills: [], mcp_servers: [] },
+        ];
+        state.sessions = [
+          { id: "s1", title: "a", workspace: "w1", updated_at: 1, messages: [] },
+          { id: "s2", title: "b", workspace: "w1", updated_at: 2, messages: [] },
+          { id: "s3", title: "c", workspace: "w2", updated_at: 3, messages: [] },
+        ];
+        state.activeWorkspace = "w1";
+        renderWorkspaceManager();
+        // `$` resolves by id, so read the node it would find rather than the one
+        // this phase appended.
+        const manager = document.getElementById("ws-manage-list") || host;
+        const cards = [...manager.querySelectorAll(".ws-tools")];
+        R.wsCards = cards.length;
+        R.wsFirstCard = cards[0] ? cards[0].textContent : "none";
+        R.wsSecondCard = cards[1] ? cards[1].textContent : "none";
+        assert(
+          `settings lists every workspace (cards=${R.wsCards} first="${R.wsFirstCard}" second="${R.wsSecondCard}")`,
+          cards.length === 2 &&
+            R.wsFirstCard.includes("One · in use") &&
+            R.wsFirstCard.includes("/tmp/one") &&
+            R.wsFirstCard.includes("big/model") &&
+            R.wsFirstCard.includes("2 chats") &&
+            R.wsSecondCard.includes("inherits the defaults"),
+        );
+        // "Use" on a workspace that is not in use switches to it.
+        const switched = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          switched.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        const secondUse = cards[1] && cards[1].querySelector("button.ws-form-go");
+        if (secondUse) secondUse.dispatchEvent(new Event("click"));
+        const useCall = switched[0] || ["none", {}];
+        R.wsUseCall = `${useCall[0]} id=${useCall[1].id}`;
+        assert(
+          `settings can switch the active workspace (${R.wsUseCall})`,
+          useCall[0] === "set_active_workspace" && useCall[1].id === "w2",
+        );
+        window.__TAURI__.core.invoke = never;
+        host.remove();
+        state.workspaces = kept4.workspaces;
+        state.sessions = kept4.sessions;
+        state.activeWorkspace = kept4.activeWorkspace;
+        state.activeId = kept4.activeId;
+        renderSidebar();
+
+        // ---- 20. searching inside the chats ----------------------------
+        const kept5 = { search: state.search, hits: state.hits, sessions: state.sessions };
+        state.search = "quick";
+        state.hits = [
+          { session: "s1", title: "about foxes", workspace: "w1", index: 0,
+            snippet: "…The Quick brown fox…" },
+          { session: "s9", title: "another", workspace: "w2", index: 3,
+            snippet: "quickly then…" },
+        ];
+        renderSidebar();
+        const hitRows = [...sessionList.querySelectorAll(".hit-row")];
+        R.hitRows = hitRows.length;
+        R.hitText = hitRows[0] ? hitRows[0].textContent : "none";
+        R.hitHeader = (sessionList.querySelector(".ws-head") || {}).textContent || "none";
+        assert(
+          `search shows matches from inside chats (rows=${R.hitRows} header="${R.hitHeader}" first="${R.hitText}")`,
+          R.hitRows === 2 &&
+            R.hitText.includes("about foxes") &&
+            R.hitText.includes("The Quick brown fox") &&
+            R.hitHeader.includes("2 matches"),
+        );
+        // From two characters on, the server is asked; below that, not at all.
+        const asked = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          asked.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        refreshSearchHits();
+        const askCall = asked[0] || ["none", {}];
+        R.hitCall = `${askCall[0]} query=${askCall[1].query} limit=${askCall[1].limit}`;
+        state.search = "q";
+        refreshSearchHits();
+        R.hitShortQueryClears = state.hits.length === 0 && asked.length === 1;
+        assert(
+          `search asks the server from two characters (${R.hitCall}, shortQueryClears=${R.hitShortQueryClears})`,
+          askCall[0] === "search_sessions" &&
+            askCall[1].query === "quick" &&
+            R.hitShortQueryClears === true,
+        );
+        window.__TAURI__.core.invoke = never;
+        state.search = kept5.search;
+        state.hits = kept5.hits;
+        state.sessions = kept5.sessions;
+        renderSidebar();
+
+        // ---- 21. a hit knows where it came from ------------------------
+        const kept6 = {
+          search: state.search, hits: state.hits, workspaces: state.workspaces,
+          sessions: state.sessions, activeWorkspace: state.activeWorkspace,
+          activeId: state.activeId,
+        };
+        state.workspaces = [
+          { id: "w1", name: "One", root: "", disabled_tools: [], disabled_skills: [], mcp_servers: [] },
+          { id: "w2", name: "Two", root: "", disabled_tools: [], disabled_skills: [], mcp_servers: [] },
+        ];
+        state.sessions = [{ id: "s1", title: "here", workspace: "w1", updated_at: 1, messages: [] }];
+        state.activeWorkspace = "w1";
+        state.activeId = "s1";
+        state.search = "quick";
+        state.hits = [
+          { session: "s1", title: "here", workspace: "w1", index: 0, snippet: "quick one" },
+          { session: "s9", title: "elsewhere", workspace: "w2", index: 2, snippet: "quick two" },
+        ];
+        renderSidebar();
+        const rows2 = [...sessionList.querySelectorAll(".hit-row")];
+        R.hitWorkspaceLabels = rows2.map((r) => (r.querySelector(".time") || {}).textContent).join("|");
+        assert(
+          `a hit says which workspace it came from (labels=${R.hitWorkspaceLabels})`,
+          rows2.length === 2 && R.hitWorkspaceLabels === "One|Two",
+        );
+        // A hit in the workspace already in use just opens the chat.
+        state.activeId = "s1";
+        if (rows2[0]) rows2[0].dispatchEvent(new Event("click"));
+        R.hitSameWorkspaceSwitch = state.activeId;
+        assert(
+          `a hit in the current workspace opens its chat (activeId=${R.hitSameWorkspaceSwitch})`,
+          R.hitSameWorkspaceSwitch === "s1",
+        );
+        // A hit elsewhere moves the workspace first.
+        const moved2 = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          moved2.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        if (rows2[1]) rows2[1].dispatchEvent(new Event("click"));
+        const firstMove = moved2[0] || ["none", {}];
+        R.hitCrossWorkspace = `${firstMove[0]} id=${firstMove[1].id}`;
+        assert(
+          `a hit elsewhere moves the workspace first (${R.hitCrossWorkspace})`,
+          firstMove[0] === "set_active_workspace" && firstMove[1].id === "w2",
+        );
+        window.__TAURI__.core.invoke = never;
+        state.search = kept6.search;
+        state.hits = kept6.hits;
+        state.workspaces = kept6.workspaces;
+        state.sessions = kept6.sessions;
+        state.activeWorkspace = kept6.activeWorkspace;
+        state.activeId = kept6.activeId;
+        renderSidebar();
+
+        // ---- 22. the token meter ---------------------------------------
+        const kept7 = { usage: state.usage, budget: state.budget };
+        let statusRight = document.getElementById("status-right");
+        if (!statusRight) {
+          statusRight = document.createElement("span");
+          statusRight.id = "status-right";
+          document.body.appendChild(statusRight);
+        }
+        state.budget = 0;
+        state.usage = { prompt: 12345, completion: 678 };
+        renderUsage();
+        const meter = statusRight.querySelector(".usage-meter");
+        const noBudget = { text: meter ? meter.textContent : "none", near: meter ? meter.classList.contains("near-limit") : null };
+        state.budget = 14000;
+        renderUsage();
+        const withBudget = { text: meter ? meter.textContent : "none", near: meter ? meter.classList.contains("near-limit") : null };
+        state.usage = { prompt: 1200, completion: 40 };
+        renderUsage();
+        const calm = { near: meter ? meter.classList.contains("near-limit") : null };
+        assert(
+          `the status line meters tokens (noBudget="${noBudget.text}" near=${noBudget.near}; withBudget="${withBudget.text}" near=${withBudget.near}; calmNear=${calm.near})`,
+          noBudget.text === "in 12k · out 678" &&
+            noBudget.near === false &&
+            withBudget.text.includes("88% of 14k") &&
+            withBudget.text.includes("near the context limit") &&
+            withBudget.near === true &&
+            calm.near === false,
+        );
+        assert(
+          `token counts are read the way a status line reads (999=${fmtTokens(999)} 12500=${fmtTokens(12500)})`,
+          fmtTokens(999) === "999" && fmtTokens(12500) === "13k",
+        );
+        state.usage = kept7.usage;
+        state.budget = kept7.budget;
+        renderStatus();
+
+        // ---- 23. the memory panel --------------------------------------
+        const keepHost = document.createElement("div");
+        keepHost.id = "mem-items";
+        const keepField = document.createElement("input");
+        keepField.id = "mem-text";
+        document.body.appendChild(keepHost);
+        document.body.appendChild(keepField);
+        const keptWs = { workspaces: state.workspaces, activeWorkspace: state.activeWorkspace };
+        state.workspaces = [{ id: "w1", name: "One", root: "", disabled_tools: [],
+          disabled_skills: [], mcp_servers: [] }];
+        state.activeWorkspace = "w1";
+        state.memories = [
+          { id: "m2", content: "prefers short answers", created_at_ms: 2000 },
+          { id: "m1", content: "works in Rust", created_at_ms: 1000 },
+        ];
+        renderMemories();
+        const memRows = [...keepHost.querySelectorAll(".mem-row")];
+        R.memRows = memRows.length;
+        R.memText = memRows.map((r) => r.textContent.slice(0, 22)).join("|");
+        assert(
+          `the memory panel lists what is remembered (rows=${R.memRows} text="${R.memText}")`,
+          R.memRows === 2 &&
+            memRows[0].textContent.includes("prefers short answers") &&
+            memRows[1].textContent.includes("works in Rust"),
+        );
+        state.memories = [];
+        renderMemories();
+        R.memEmpty = keepHost.textContent;
+        R.memOwner = (keepHost.querySelector(".ws-head") || {}).textContent || "none";
+        assert(
+          `an empty memory store says so, and whose it is (owner="${R.memOwner}" text="${R.memEmpty}")`,
+          R.memEmpty.includes("Nothing remembered yet.") && R.memOwner === "Memory for One",
+        );
+        const memCalls = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          memCalls.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        // Nothing to remember: refused before the server is troubled.
+        keepField.value = "   ";
+        addMemoryButton.dispatchEvent(new Event("click"));
+        R.memBlankCalls = memCalls.length;
+        R.memBlankNote = keepHost.textContent;
+        // A real one is sent, trimmed by the server and shown as it answered.
+        keepField.value = "note this";
+        addMemoryButton.dispatchEvent(new Event("click"));
+        const rememberCall = memCalls[0] || ["none", {}];
+        R.memAddCall = `${rememberCall[0]} text=${rememberCall[1].text}`;
+        state.memories = [{ id: "m9", content: "do not forget me", created_at_ms: 3000 }];
+        renderMemories();
+        const forgetButton = keepHost.querySelector(".mem-row .ws-form-go");
+        if (forgetButton) forgetButton.dispatchEvent(new Event("click"));
+        const forgetCall = memCalls[1] || ["none", {}];
+        R.memForgetCall = `${forgetCall[0]} id=${forgetCall[1].id}`;
+        assert(
+          `remembering and forgetting go through the server (blankCalls=${R.memBlankCalls} note="${R.memBlankNote}" ${R.memAddCall} ${R.memForgetCall})`,
+          R.memBlankCalls === 0 &&
+            R.memBlankNote === "a memory needs some text" &&
+            rememberCall[0] === "remember_memory" &&
+            rememberCall[1].text === "note this" &&
+            forgetCall[0] === "forget_memory" &&
+            forgetCall[1].id === "m9",
+        );
+        window.__TAURI__.core.invoke = never;
+        keepHost.remove();
+        keepField.remove();
+        state.memories = [];
+        state.workspaces = keptWs.workspaces;
+        state.activeWorkspace = keptWs.activeWorkspace;
+
+        // ---- 24. a workspace carries its own memory file ---------------
+        const kept9 = { wsEdit: state.wsEdit, workspaces: state.workspaces, activeWorkspace: state.activeWorkspace };
+        state.workspaces = [{ id: "w1", name: "One", root: "", model: "", memory_path: "~/w1.jsonl",
+          disabled_tools: [], disabled_skills: [], mcp_servers: [] }];
+        state.activeWorkspace = "w1";
+        state.wsEdit = { mode: "edit", id: "w1" };
+        const mkField = (cls, value) => {
+          const field = document.createElement("input");
+          field.className = cls;
+          field.value = value;
+          return field;
+        };
+        const wsForm = document.createElement("form");
+        wsForm.appendChild(mkField("ws-name", "One"));
+        wsForm.appendChild(mkField("ws-root", ""));
+        wsForm.appendChild(mkField("ws-memory", "~/w1.jsonl"));
+        const formCalls = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          formCalls.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        submitWorkspaceForm(wsForm);
+        const ownCall = formCalls[0] || ["none", {}];
+        R.formMemory = `${ownCall[0]} memoryPath=${ownCall[1].memoryPath}`;
+        // Blank means the shared file, exactly like every other runtime field.
+        wsForm.querySelector(".ws-memory").value = "";
+        submitWorkspaceForm(wsForm);
+        const inheritCall = formCalls[1] || ["none", {}];
+        R.formMemoryInherit = `memoryPath="${inheritCall[1].memoryPath}"`;
+        assert(
+          `the workspace form carries the memory file (${R.formMemory} then ${R.formMemoryInherit})`,
+          ownCall[0] === "update_workspace" &&
+            ownCall[1].memoryPath === "~/w1.jsonl" &&
+            inheritCall[1].memoryPath === "",
+        );
+        window.__TAURI__.core.invoke = never;
+        state.wsEdit = kept9.wsEdit;
+        state.workspaces = kept9.workspaces;
+        state.activeWorkspace = kept9.activeWorkspace;
+
+        // ---- 25. the extension surface is visible ----------------------
+        const capHost = document.createElement("div");
+        document.body.appendChild(capHost);
+        renderCapabilities(capHost, {
+          tools: [{ name: "bash", description: "run a command", category: "builtin" }],
+          async_tools: [{ name: "fetch", description: "web", category: "mcp" }],
+          skills: [],
+          plugins: ["weather"],
+          hook_events: ["before_llm_call", "after_llm_call", "before_tool_call",
+                        "after_tool_call", "on_message", "on_complete", "on_error"],
+        });
+        const groups = [...capHost.querySelectorAll(".cap-group")].map((g) => g.textContent);
+        const hookLine = (capHost.querySelector(".cap-hooks") || {}).textContent || "none";
+        assert(
+          `the panel shows tools, MCP tools, plugins and the hook surface (groups=${groups.join("|")} hooks="${hookLine}")`,
+          groups.includes("Tools") && groups.includes("MCP tools") && groups.includes("Plugins") &&
+            groups.includes("Hook events (Rust extensions)") &&
+            hookLine.includes("before_tool_call") && hookLine.includes("on_error") &&
+            hookLine.split(" · ").length === 7,
+        );
+        renderCapabilities(capHost, { tools: [], async_tools: [], skills: [], plugins: [], hook_events: ["on_error"] });
+        const emptyText = capHost.textContent;
+        assert(
+          `an empty agent still answers what can be built against (text="${emptyText}")`,
+          emptyText.includes("No capabilities registered yet.") && emptyText.includes("on_error"),
+        );
+        capHost.remove();
+
+        // ---- 26. a workspace carries its own skills directory -----------
+        const kept10 = { wsEdit: state.wsEdit, workspaces: state.workspaces, activeWorkspace: state.activeWorkspace };
+        state.workspaces = [{ id: "w1", name: "One", root: "", model: "", memory_path: "",
+          skills_dir: "~/w1-skills", disabled_tools: [], disabled_skills: [], mcp_servers: [] }];
+        state.activeWorkspace = "w1";
+        state.wsEdit = { mode: "edit", id: "w1" };
+        const mkWsSkillField = (cls, value) => {
+          const field = document.createElement("input");
+          field.className = cls;
+          field.value = value;
+          return field;
+        };
+        const wsSkillForm = document.createElement("form");
+        wsSkillForm.appendChild(mkWsSkillField("ws-name", "One"));
+        wsSkillForm.appendChild(mkWsSkillField("ws-root", ""));
+        wsSkillForm.appendChild(mkWsSkillField("ws-skills", "~/w1-skills"));
+        const wsSkillCalls = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          wsSkillCalls.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        submitWorkspaceForm(wsSkillForm);
+        const ownSkillsCall = wsSkillCalls[0] || ["none", {}];
+        R.formSkills = `${ownSkillsCall[0]} skillsDir=${ownSkillsCall[1].skillsDir}`;
+        wsSkillForm.querySelector(".ws-skills").value = "";
+        submitWorkspaceForm(wsSkillForm);
+        const inheritSkillsCall = wsSkillCalls[1] || ["none", {}];
+        R.formSkillsInherit = `skillsDir="${inheritSkillsCall[1].skillsDir}"`;
+        assert(
+          `the workspace form carries the skills directory (${R.formSkills} then ${R.formSkillsInherit})`,
+          ownSkillsCall[0] === "update_workspace" &&
+            ownSkillsCall[1].skillsDir === "~/w1-skills" &&
+            inheritSkillsCall[1].skillsDir === "",
+        );
+        window.__TAURI__.core.invoke = never;
+        state.wsEdit = kept10.wsEdit;
+        state.workspaces = kept10.workspaces;
+        state.activeWorkspace = kept10.activeWorkspace;
+
+        // ---- 27. an approval can be allowed beyond once ----------------
+        const allowCalls = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          allowCalls.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        state.approvals = [{ id: "ap-1", tool: "bash", args: "{}", diff: null }];
+        showNextApproval();
+        $("approval-always").click();
+        // The allowance command is issued synchronously; the answer that follows
+        // it is awaited, and a never-settling promise keeps this check honest
+        // about what it did and did not observe.
+        R.approvalAlways = `${allowCalls[0] ? allowCalls[0][0] : "none"} scope=${
+          allowCalls[0] ? allowCalls[0][1].scope : "none"
+        } tool=${allowCalls[0] ? allowCalls[0][1].tool : "none"}`;
+        assert(
+          `"Always allow" records a persistent allowance for that tool (${R.approvalAlways})`,
+          allowCalls[0] && allowCalls[0][0] === "allow_tool" &&
+            allowCalls[0][1].scope === "always" && allowCalls[0][1].tool === "bash",
+        );
+        const sessionCalls = allowCalls.length;
+        $("approval-session").click();
+        R.approvalSession = `sessionCalls=${sessionCalls} second=${
+          allowCalls[sessionCalls] ? allowCalls[sessionCalls][1].scope : "none"
+        }`;
+        assert(
+          `"Allow for this session" asks the server for a session scope (${R.approvalSession})`,
+          allowCalls[sessionCalls] && allowCalls[sessionCalls][1].scope === "session",
+        );
+        window.__TAURI__.core.invoke = never;
+        state.approvals = [];
+        $("approval-modal").classList.add("hidden");
+        currentApproval = null;
+
+        // ---- 28. permanent allowances are visible and removable ---------
+        const permHost = document.createElement("div");
+        document.body.appendChild(permHost);
+        renderAllowedTools(permHost, []);
+        const permNoneText = permHost.textContent;
+        renderAllowedTools(permHost, ["bash", "write_file"]);
+        const permRows = [...permHost.querySelectorAll(".cap-item")].map((r) => r.textContent);
+        const permRemove = permHost.querySelector(".mini-btn");
+        const permRemoved = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          permRemoved.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        permRemove.click();
+        R.allowedRows = `permRows=${permRows.length} none="${permNoneText}" permRemoved=${
+          permRemoved[0] ? `${permRemoved[0][0]}:${permRemoved[0][1].tool}` : "none"
+        }`;
+        assert(
+          `the settings list shows each allowed tool with a Remove that asks the server (${R.allowedRows})`,
+          permNoneText.includes("Approvals are asked every time.") &&
+            permRows.length === 2 && permRemove.textContent === "Remove" &&
+            permRemoved[0] && permRemoved[0][0] === "forget_allowed_tool" &&
+            permRemoved[0][1].tool === "bash",
+        );
+        window.__TAURI__.core.invoke = never;
+        permHost.remove();
+
+        // ---- 29. the workspace memory switch travels with the form -----
+        const keepSw = { wsEdit: state.wsEdit, workspaces: state.workspaces, activeWorkspace: state.activeWorkspace };
+        state.workspaces = [{ id: "w1", name: "One", root: "", model: "", memory_enabled: true,
+          disabled_tools: [], disabled_skills: [], mcp_servers: [] }];
+        state.activeWorkspace = "w1";
+        state.wsEdit = { mode: "edit", id: "w1" };
+        const swName = document.createElement("input");
+        swName.className = "ws-name";
+        swName.value = "One";
+        const swBox = document.createElement("input");
+        swBox.type = "checkbox";
+        swBox.className = "ws-memory-on";
+        swBox.checked = false;
+        const swForm = document.createElement("form");
+        swForm.appendChild(swName);
+        swForm.appendChild(swBox);
+        const swCalls = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          swCalls.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        submitWorkspaceForm(swForm);
+        const swOff = swCalls[0] || ["none", {}];
+        swForm.querySelector(".ws-memory-on").remove();
+        submitWorkspaceForm(swForm);
+        const swSilent = swCalls[1] || ["none", {}];
+        R.switchOff = `off=${swOff[1].memoryEnabled}`;
+        R.switchSilent = `memoryEnabled=${swSilent[1].memoryEnabled}`;
+        assert(
+          `unchecking memory turns it off, and a form with no box restates the value it already had (${R.switchOff} then ${R.switchSilent})`,
+          swOff[0] === "update_workspace" && swOff[1].memoryEnabled === false &&
+            swSilent[1].memoryEnabled === true,
+        );
+        window.__TAURI__.core.invoke = never;
+        state.wsEdit = keepSw.wsEdit;
+        state.workspaces = keepSw.workspaces;
+        state.activeWorkspace = keepSw.activeWorkspace;
+
+        // ---- 30. the workspace form covers the policy it owns ----------
+        const keepPol = { wsEdit: state.wsEdit, workspaces: state.workspaces, activeWorkspace: state.activeWorkspace };
+        const polKnown = { id: "w1", name: "One", root: "", model: "", context_budget: 7,
+          bash_enabled: false, file_tools_enabled: true, require_approval: true,
+          project_instructions: true, memory_enabled: true,
+          disabled_tools: [], disabled_skills: [], mcp_servers: [] };
+        state.workspaces = [polKnown];
+        state.activeWorkspace = "w1";
+        state.wsEdit = { mode: "edit", id: "w1" };
+        const polForm = document.createElement("form");
+        const polName = document.createElement("input");
+        polName.className = "ws-name";
+        polName.value = "One";
+        polForm.appendChild(polName);
+        const polBoxes = { "ws-bash": false, "ws-files": true, "ws-approval": true, "ws-instructions": false };
+        for (const cls of Object.keys(polBoxes)) {
+          const b = document.createElement("input");
+          b.type = "checkbox";
+          b.className = cls;
+          b.checked = polBoxes[cls];
+          polForm.appendChild(b);
+        }
+        // An unusable budget must restate the old count, not send zero.
+        const polBudget = document.createElement("input");
+        polBudget.className = "ws-budget";
+        polBudget.value = "";
+        polForm.appendChild(polBudget);
+        const polCalls = [];
+        window.__TAURI__.core.invoke = (cmd, args) => {
+          polCalls.push([cmd, args]);
+          return new Promise(() => {});
+        };
+        submitWorkspaceForm(polForm);
+        const polStated = (polCalls[0] || ["none", {}])[1];
+        const polBare = document.createElement("form");
+        const polBareName = document.createElement("input");
+        polBareName.className = "ws-name";
+        polBareName.value = "One";
+        polBare.appendChild(polBareName);
+        submitWorkspaceForm(polBare);
+        const polRestated = (polCalls[1] || ["none", {}])[1];
+        R.policyStated = `stated=${polStated.bashEnabled},${polStated.fileToolsEnabled},${
+          polStated.requireApproval},${polStated.projectInstructions} budget=${polStated.contextBudget}`;
+        R.policyRestated = `absent=${polRestated.bashEnabled},${polRestated.requireApproval} budget=${
+          polRestated.contextBudget}`;
+        assert(
+          `the form states the policy it owns and a bare form restates it (${R.policyStated}; ${R.policyRestated})`,
+          polStated.bashEnabled === false && polStated.fileToolsEnabled === true &&
+            polStated.requireApproval === true && polStated.projectInstructions === false &&
+            polStated.contextBudget === 7 &&
+            polRestated.bashEnabled === false && polRestated.requireApproval === true &&
+            polRestated.contextBudget === 7,
+        );
+        window.__TAURI__.core.invoke = never;
+        state.wsEdit = keepPol.wsEdit;
+        state.workspaces = keepPol.workspaces;
+        state.activeWorkspace = keepPol.activeWorkspace;
+
+        // ---- 31. config profiles are offered as names, key-free ---------
+        const prHost = document.createElement("div");
+        document.body.appendChild(prHost);
+        renderProfiles(prHost, [], () => {});
+        const prEmpty = prHost.textContent;
+        const prPicked = [];
+        renderProfiles(
+          prHost,
+          [
+            { name: "local", model: "small/model", base_url: "http://127.0.0.1:8080/v1", has_key: false },
+            { name: "remote", model: "big/model", base_url: "https://example.test/v1", has_key: true },
+          ],
+          (pr) => prPicked.push(pr.name),
+        );
+        const prChips = [...prHost.querySelectorAll(".profile-chip")];
+        prChips[1].click();
+        R.profileChips = `chips=${prChips.map((c) => c.textContent).join("+")} picked=${prPicked.join(",")}`;
+        assert(
+          `profiles are offered as names with a hint, and a click picks one (${R.profileChips})`,
+          prEmpty.includes("No [llm.<name>] profiles") &&
+            prChips.length === 2 && prChips[0].textContent === "local" &&
+            prChips[1].title.includes("big/model") && !prChips[1].title.includes("no key") &&
+            prChips[0].title.includes("no key") &&
+            prPicked.join(",") === "remote" &&
+            !prChips.some((c) => c.textContent.includes("sk-")),
+        );
+        prHost.remove();
+
+        // ---- 32. a compacted chat offers its folded turns back --------
+        const arHost = document.createElement("div");
+        document.body.appendChild(arHost);
+        renderArchived(arHost, 0, () => {}, () => {});
+        const arEmpty = arHost.textContent;
+        let arViews = 0;
+        let arRestores = 0;
+        renderArchived(
+          arHost,
+          3,
+          () => {
+            arViews += 1;
+          },
+          () => {
+            arRestores += 1;
+          },
+        );
+        const arChips = [...arHost.querySelectorAll(".archived-chip")];
+        arChips[0].click();
+        arChips[1].click();
+        R.archivedChip = `zero=${JSON.stringify(arEmpty)} chips=${arChips
+          .map((c) => c.textContent)
+          .join("+")} views=${arViews} restores=${arRestores}`;
+        assert(
+          `a compacted chat offers its folded turns back, and shows nothing at zero (${R.archivedChip})`,
+          arEmpty === "" && arChips.length === 2 && arChips[0].textContent.includes("3 folded") &&
+            arChips[1].textContent.includes("restore") && arViews === 1 && arRestores === 1 &&
+            arChips[0].title.includes("/compact") && arChips[1].title.includes("back") &&
+            arChips.every((c) => c.tagName === "BUTTON"),
+        );
+        arHost.remove();
+
+        // ---- 33. the folded turns can be read before restoring --------
+        const apText = archivedPreviewText([
+          { role: "user", text: "the original task" },
+          { role: "assistant", text: "x".repeat(1300) },
+          { role: "assistant", text: "   " },
+        ]);
+        const apEmpty = archivedPreviewText([]);
+        R.archivedPreview = `hasUser=${apText.includes("1. user")} clipped=${apText.includes(
+          "100 more characters",
+        )} empty=${JSON.stringify(apEmpty)}`;
+        assert(
+          `the folded turns can be read before restoring (${R.archivedPreview})`,
+          apText.includes("These 3 turns") && apText.includes("--- 1. user ---") &&
+            apText.includes("the original task") && apText.includes("2. assistant") &&
+            apText.includes("(100 more characters)") && apText.includes("3. assistant") &&
+            apText.includes("(empty)") && apEmpty === "Nothing is folded in this chat." &&
+            !apText.includes("x".repeat(1300)),
+        );
+
+        // ---- 34. deleted chats are listed and can be brought back -----
+        const trHost = document.createElement("div");
+        document.body.appendChild(trHost);
+        renderTrash(trHost, [], () => {});
+        const trEmpty = trHost.textContent;
+        const trCalls = [];
+        renderTrash(
+          trHost,
+          [
+            { id: "a1", title: "about foxes" },
+            { id: "b2", title: "" },
+          ],
+          (id) => trCalls.push(id),
+        );
+        const trRows = [...trHost.querySelectorAll(".trash-row")];
+        const trBacks = [...trHost.querySelectorAll(".trash-restore")];
+        trBacks[1].click();
+        R.trash = `empty=${JSON.stringify(trEmpty)} rows=${trRows.length} text=${trRows
+          .map((r) => r.textContent)
+          .join("+")} calls=${trCalls.join(",")}`;
+        assert(
+          `deleted chats are listed by title and can be brought back (${R.trash})`,
+          trEmpty.includes("Nothing in the trash") && trRows.length === 2 &&
+            trRows[0].textContent.includes("about foxes") &&
+            trRows[1].textContent.includes("untitled") &&
+            trBacks.every((b) => b.tagName === "BUTTON") && trCalls.join(",") === "b2",
+        );
+        trHost.remove();
+
+        // ---- 36. a chat can state what it amounts to ------------------
+        const soHost = document.createElement("div");
+        document.body.appendChild(soHost);
+        renderSessionStats(soHost, null);
+        const soEmpty = soHost.textContent;
+        renderSessionStats(soHost, { messages: 12, tool_calls: 4, characters: 3210 });
+        const soChip = soHost.textContent;
+        const soText = overviewLines({
+          messages: 12,
+          asks: 6,
+          replies: 6,
+          tool_calls: 4,
+          errors: 1,
+          characters: 3210,
+          reasoning_characters: 900,
+          archived: 3,
+          created_at: 1700000000,
+          updated_at: 1700100000,
+          outline: [
+            { n: 1, preview: "first ask", characters: 9 },
+            { n: 2, preview: "测测…", characters: 100 },
+          ],
+        });
+        const soNoAsks = overviewLines({
+          messages: 0,
+          asks: 0,
+          replies: 0,
+          tool_calls: 0,
+          errors: 0,
+          characters: 0,
+          reasoning_characters: 0,
+          archived: 0,
+          created_at: 1700000000,
+          updated_at: 1700000000,
+          outline: [],
+        });
+        R.stats = `chip=${JSON.stringify(soChip)} fmt=${fmtCount(999)}/${fmtCount(3210)}/${fmtCount(
+          2500000,
+        )} empty=${JSON.stringify(soEmpty)}`;
+        assert(
+          `a chat states what it amounts to, and shows nothing before it knows (${R.stats})`,
+          soEmpty === "" &&
+            soChip === "12 msgs · 4 tools · 3.2k chars" &&
+            fmtCount(999) === "999" &&
+            fmtCount(3210) === "3.2k" &&
+            fmtCount(2500000) === "2.5m" &&
+            soText.includes("12 messages (3 folded) · 6 asks · 6 replies") &&
+            soText.includes("4 tool calls · 1 turns ended in an error") &&
+            soText.includes("3210 characters · 900 characters of reasoning") &&
+            soText.includes("Outline (2 asks)") &&
+            soText.includes(" 1. first ask (9 chars)") &&
+            soText.includes(" 2. 测测… (100 chars)") &&
+            soNoAsks.includes("(this chat has no asks yet)"),
+        );
+        soHost.remove();
+
+        // ---- 37. a long chat can be read backwards by scrolling --------
+        {
+          const growN = 1000;
+          const growMsgs = [];
+          for (let i = 0; i < growN; i++) growMsgs.push(make(i));
+          state.cache["selftest"] = growMsgs;
+          state.windowExtra = 0;
+          // A scroll offset only exists when the transcript is a scrolling box;
+          // the shipped layout makes it one, so the fixture does too.
+          const priorHeight = msgsEl.style.height;
+          const priorOverflow = msgsEl.style.overflowY;
+          msgsEl.style.height = "400px";
+          msgsEl.style.overflowY = "auto";
+          markDirtyAll();
+          renderMessages();
+          const spacer0 = msgsEl.querySelector(".spacer-top");
+          const h0 = spacer0 ? parseFloat(spacer0.style.height) || 0 : 0;
+          const rows0 = rowCache.size;
+          const scrollH = msgsEl.scrollHeight;
+          const before = lastWindowStart;
+
+          // Scrolling to the top asks for the older rows. `followTail` is a
+          // module-level binding in the shipped script, so the harness can put
+          // the reader in the state a scroll-up produces: not following the tail.
+          followTail = false;
+          msgsEl.scrollTop = 0;
+          msgsEl.dispatchEvent(new Event("scroll"));
+          const extraMid = state.windowExtra;
+          renderMessages();
+          const spacer1 = msgsEl.querySelector(".spacer-top");
+          const h1 = spacer1 ? parseFloat(spacer1.style.height) || 0 : 0;
+          const rows1 = rowCache.size;
+          // Read the offset now: a later render would have moved it again.
+          const moved = msgsEl.scrollTop;
+          R.windowScroll = `rows=${rows0}->${rows1} spacer=${h0}->${h1} gave=${
+            h0 - h1
+          } moved=${Math.round(moved)} extra=${extraMid} client=${msgsEl.clientHeight}`;
+
+          assert(
+            `a long chat draws only the tail before the scroll (rows0=${rows0} before=${before})`,
+            rows0 === 200 && before === growN - 200,
+          );
+          assert(
+            `a spacer stands in for the rows above the window (top=${h0} scrollHeight=${scrollH})`,
+            h0 > 0 && scrollH > 0,
+          );
+          assert(
+            `scrolling to the top asks for one more window (rows=${rows0}->${rows1} extra=${extraMid})`,
+            rows1 === 400 && h1 > 0 && h1 < h0 && extraMid === 200,
+          );
+          assert(
+            `growing the window does not move the reader (gave=${h0 - h1} moved=${Math.round(
+              moved,
+            )})`,
+            Math.abs(moved - (h0 - h1)) <= 1,
+          );
+
+          // ---- 38. the spacer goes away when the whole chat is drawn -----
+          state.windowExtra = growN;
+          markDirtyAll();
+          renderMessages();
+          const spacerGone = msgsEl.querySelector(".spacer-top");
+          assert(
+            `the spacer disappears once the window covers the whole chat (present=${!!spacerGone})`,
+            !spacerGone && rowCache.size === growN,
+          );
+
+          msgsEl.style.height = priorHeight;
+          msgsEl.style.overflowY = priorOverflow;
+          state.windowExtra = N;
+          markDirtyAll();
+          renderMessages();
+        }
 
         R.failures = Object.values(R.checks).filter((v) => v.startsWith("FAIL")).length;
         const pre = document.createElement("pre");

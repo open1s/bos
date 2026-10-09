@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::tools::PlanItem;
@@ -93,12 +94,25 @@ pub(crate) struct SessionRecord {
     pub(crate) created_at: u64,
     /// Unix seconds of the last update, used for ordering.
     pub(crate) updated_at: u64,
+    /// Workspace this conversation belongs to (§24). Empty means "written before
+    /// workspaces existed", which the summaries resolve to the workspace in use.
+    #[serde(default)]
+    pub(crate) workspace: String,
     /// The conversation, oldest first.
     pub(crate) messages: Vec<ChatMessage>,
     /// Working-plan snapshot from the agent's most recent turn, so the plan
     /// panel survives restarts (older session files simply have none).
     #[serde(default)]
     pub(crate) plan: Vec<PlanItem>,
+    /// The turns the last compaction folded away, oldest first.
+    ///
+    /// Compaction rewrites the history into an anchor plus a summary, and a
+    /// summary is lossy, so without this the folded turns are gone. Keeping them
+    /// makes compaction recoverable rather than destructive; a later compaction
+    /// replaces this, since it folds the current history including any earlier
+    /// summary. Older session files simply have none.
+    #[serde(default)]
+    pub(crate) archived: Vec<ChatMessage>,
 }
 
 impl SessionRecord {
@@ -110,8 +124,10 @@ impl SessionRecord {
             title: "New chat".to_string(),
             created_at: now,
             updated_at: now,
+            workspace: String::new(),
             messages: Vec::new(),
             plan: Vec::new(),
+            archived: Vec::new(),
         }
     }
 
@@ -141,8 +157,13 @@ impl SessionRecord {
             title: format!("{} (branch)", self.title),
             created_at: now,
             updated_at: now,
+            // A branch stays in the workspace its parent was written in, so the
+            // fork cannot silently change the agent's tools or model.
+            workspace: self.workspace.clone(),
             messages: self.messages[..index].to_vec(),
             plan: self.plan.clone(),
+            // A branch starts with nothing folded of its own.
+            archived: Vec::new(),
         })
     }
 
@@ -178,6 +199,21 @@ impl SessionRecord {
 }
 
 /// Current time in unix seconds.
+/// One place a search phrase was found.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SearchHit {
+    /// Session the match belongs to.
+    pub(crate) session: String,
+    /// Its title, so a result is readable without a second lookup.
+    pub(crate) title: String,
+    /// Workspace it is filed under.
+    pub(crate) workspace: String,
+    /// Message index the match is in (0 when the title matched).
+    pub(crate) index: usize,
+    /// Text around the match, with ellipses where it was cut.
+    pub(crate) snippet: String,
+}
+
 pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -331,13 +367,50 @@ impl SessionStore {
     }
 }
 
+/// Cached parses of session files, so a keystroke does not re-read the store.
+///
+/// `search` runs on every keystroke — the UI asks from two characters — and
+/// re-reading and re-parsing every file dominated it. An entry is keyed by the
+/// file's `(modified, length)`, so a rewritten session is re-read. The one case
+/// that can serve stale data is a same-length rewrite inside the filesystem's
+/// timestamp granularity; the invalidation test pins the behaviour that matters,
+/// that differently sized rewrites are seen.
+#[derive(Debug, Default)]
+struct SearchCache {
+    /// Parsed sessions by path, with the stamp they were parsed from.
+    records: std::collections::HashMap<PathBuf, ((std::time::SystemTime, u64), Arc<CachedSession>)>,
+}
+
+/// A parsed session plus the lowercase copies search would otherwise rebuild.
+///
+/// The copies are what make a keystroke cheap: the pre-filter is then an exact
+/// `str::contains` on text that is already lowered, for every needle including
+/// CJK, instead of a scan that re-lowers every message. Memory is roughly the
+/// session's text again, and the cache holds at most the live sessions.
+#[derive(Debug)]
+struct CachedSession {
+    /// The parsed session.
+    record: SessionRecord,
+    /// `(text, reasoning)` lowercased, index-aligned with `record.messages`.
+    lower: Vec<(String, String)>,
+}
+
 /// Directory-backed store of session JSON files.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionStore {
     dir: PathBuf,
+    /// Candidate filter for search, refreshed from file stamps.
+    index: Arc<Mutex<crate::fts::Index>>,
+    /// Only the interactive path uses this; `load_all` stays a plain read.
+    cache: Arc<Mutex<SearchCache>>,
 }
 
 impl SessionStore {
+    /// Where sessions live, and therefore where anything kept beside them goes.
+    pub(crate) fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     /// The conventional per-user location: `~/.bos/gui/sessions`.
     pub(crate) fn default_dir() -> PathBuf {
         PathBuf::from(shellexpand::tilde("~/.bos/gui/sessions").into_owned())
@@ -345,7 +418,69 @@ impl SessionStore {
 
     /// Create a store rooted at an explicit directory (used by tests).
     pub(crate) fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            cache: Arc::new(Mutex::new(SearchCache::default())),
+            index: Arc::new(Mutex::new(crate::fts::Index::new())),
+        }
+    }
+
+    /// Every session, parsed from the cache when its file has not changed.
+    ///
+    /// The cache holds at most the live sessions: a file that is gone from the
+    /// directory is dropped from it, so it cannot grow without bound.
+    /// Sessions with the `(modified, length)` stamp each was loaded from.
+    ///
+    /// The stamp is handed back rather than recomputed because the index needs
+    /// exactly this and recomputing it with a separate `fs::metadata` per file
+    /// measured ~2.4 ms for 300 sessions — twice the entire cost of the plain
+    /// scan it was supposed to beat.
+    fn cached_sessions(&self) -> Vec<((SystemTime, u64), Arc<CachedSession>)> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return out;
+        };
+        let mut found: Vec<(PathBuf, (std::time::SystemTime, u64))> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let stamp = (meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len());
+            found.push((path, stamp));
+        }
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        for (path, stamp) in &found {
+            if let Some((cached, session)) = cache.records.get(path) {
+                if cached == stamp {
+                    out.push((*cached, Arc::clone(session)));
+                    continue;
+                }
+            }
+            let Ok(bytes) = fs::read(path) else { continue };
+            match serde_json::from_slice::<SessionRecord>(&bytes) {
+                Ok(record) => {
+                    let lower = record
+                        .messages
+                        .iter()
+                        .map(|m| (m.text.to_lowercase(), m.reasoning.to_lowercase()))
+                        .collect();
+                    let session = Arc::new(CachedSession { record, lower });
+                    cache
+                        .records
+                        .insert(path.clone(), (*stamp, Arc::clone(&session)));
+                    out.push((*stamp, session));
+                }
+                // A file that stopped parsing must not keep being served.
+                Err(_) => {
+                    cache.records.remove(path);
+                }
+            }
+        }
+        let live: std::collections::HashSet<&PathBuf> = found.iter().map(|(p, _)| p).collect();
+        cache.records.retain(|path, _| live.contains(path));
+        out
     }
 
     /// A store at the conventional per-user location.
@@ -387,8 +522,274 @@ impl SessionStore {
     }
 
     /// Delete a session file if it exists.
+    /// Re-home a session into another workspace. Everything else is kept —
+    /// its messages, its id, its title — because a move changes which
+    /// configuration runs the chat, not what was said in it (§24.6).
+    pub(crate) fn move_to(&self, id: &str, workspace: &str) -> std::io::Result<SessionRecord> {
+        let mut record = self.load(id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown session '{id}'"),
+            )
+        })?;
+        record.workspace = workspace.to_string();
+        self.save(&record)?;
+        Ok(record)
+    }
+
+    /// Find a phrase in any stored chat — titles and message text (§17 parity: the
+    /// harness keeps an FTS index; this scans, which is honest at these sizes and
+    /// needs no second store that could drift out of step with the session files).
+    /// Candidate ids for `needle`, refreshing the index as it goes.
+    ///
+    /// `None` means the index has no opinion — a query shorter than one token,
+    /// such as a single CJK character — and the caller then scans everything,
+    /// which is what keeps such a query working at all.
+    fn index_candidates(
+        &self,
+        records: &[((SystemTime, u64), Arc<CachedSession>)],
+        needle: &str,
+    ) -> Option<std::collections::BTreeSet<String>> {
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        if !index.is_loaded() {
+            *index = crate::fts::Index::load(&crate::fts::index_path(&self.dir));
+        }
+        let mut synced = Vec::with_capacity(records.len());
+        for ((modified, len), session) in records {
+            let id = session.record.id.clone();
+            // The stamp came from the pass that read the directory, so this
+            // costs nothing beyond a conversion.
+            let stamp = (
+                modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                *len,
+            );
+            // Only changed sessions pay to be tokenized.
+            let text = if index.is_current(&id, stamp) {
+                String::new()
+            } else {
+                crate::fts::indexable_text(&session.record)
+            };
+            synced.push(crate::fts::Synced { id, stamp, text });
+        }
+        let t0 = std::time::Instant::now(); // DIAG
+        index.sync(&synced);
+        let t1 = std::time::Instant::now(); // DIAG
+        let due = index.save_is_due(); // DIAG
+        if index.reindexed() > 0 && due {
+            // A failed save costs a rebuild next time, never a wrong answer.
+            let saved = index.save(&crate::fts::index_path(&self.dir)); // DIAG
+            eprintln!("DIAG saved={:?} due={due}", saved.is_ok()); // DIAG
+        } else {
+            eprintln!("DIAG no-save due={due} reindexed={}", index.reindexed()); // DIAG
+        }
+        let t2 = std::time::Instant::now(); // DIAG
+        let ids = index.candidate_ids(needle);
+        eprintln!(
+            "DIAG sync={:?} save={:?} cand={:?}",
+            t1 - t0,
+            t2 - t1,
+            t2.elapsed()
+        ); // DIAG
+        ids
+    }
+
+    pub(crate) fn search(&self, needle: &str, limit: usize) -> Vec<SearchHit> {
+        let needle = needle.trim();
+        if needle.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let lower_needle: Vec<char> = needle.to_lowercase().chars().collect();
+        let mut records = self.cached_sessions();
+        // A filter, not a verdict: everything it allows is still checked exactly.
+        let candidates = self.index_candidates(&records, needle);
+        // Newest first, then by id: a search result list that reshuffles between
+        // identical queries is a result list nobody can use.
+        records.sort_by(|a, b| {
+            b.1.record
+                .updated_at
+                .cmp(&a.1.record.updated_at)
+                .then_with(|| a.1.record.id.cmp(&b.1.record.id))
+        });
+        let mut hits = Vec::new();
+        let lower_needle_text = needle.to_lowercase();
+        for (_, session) in records {
+            let record = &session.record;
+            if hits.len() >= limit {
+                break;
+            }
+            // The index covers the title, every message's text and every
+            // message's reasoning — exactly what this loop can match — so a
+            // session it excludes cannot have matched.
+            if let Some(ids) = &candidates {
+                if !ids.contains(&record.id) {
+                    continue;
+                }
+            }
+            if let Some(hit) = Self::hit_for(record, &lower_needle, needle, None) {
+                hits.push(hit);
+                continue;
+            }
+            for (index, message) in record.messages.iter().enumerate() {
+                if hits.len() >= limit {
+                    break;
+                }
+                // The cached lowercase makes this an exact test, not merely a
+                // necessary one: it is the same condition `hit_for` checks, done
+                // without re-lowering the message. An earlier filter here was a
+                // hand-rolled ASCII window scan that could only skip work; it was
+                // sound, but slower than `str::contains` and useless for CJK.
+                let (lower_text, lower_reasoning) = &session.lower[index];
+                if !lower_text.contains(&lower_needle_text)
+                    && (lower_reasoning.is_empty() || !lower_reasoning.contains(&lower_needle_text))
+                {
+                    continue;
+                }
+                let mut hit =
+                    Self::hit_for(record, &lower_needle, needle, Some((index, &message.text)));
+                if hit.is_none() && !message.reasoning.is_empty() {
+                    hit = Self::hit_for(
+                        record,
+                        &lower_needle,
+                        needle,
+                        Some((index, &message.reasoning)),
+                    );
+                }
+                if let Some(hit) = hit {
+                    hits.push(hit);
+                }
+            }
+        }
+        hits
+    }
+
+    /// One match, or none. `title` matching reports index 0 with the title as the
+    /// snippet, so a chat can be found by name from the same box.
+    fn hit_for(
+        record: &SessionRecord,
+        lower_needle: &[char],
+        needle: &str,
+        body: Option<(usize, &str)>,
+    ) -> Option<SearchHit> {
+        let (index, text) = match body {
+            Some((index, text)) => (index, text),
+            None => (0usize, record.title.as_str()),
+        };
+        let chars: Vec<char> = text.chars().collect();
+        let lower: Vec<char> = text.to_lowercase().chars().collect();
+        // Lowercasing can change the length for a few scripts; when it does, the
+        // character offsets no longer describe the original, so this says nothing
+        // rather than pointing at the wrong characters.
+        if lower.len() != chars.len() {
+            return None;
+        }
+        if lower.windows(lower_needle.len()).all(|w| w != lower_needle) {
+            return None;
+        }
+        let start = lower
+            .windows(lower_needle.len())
+            .position(|w| w == lower_needle)?
+            .saturating_sub(40);
+        let end = (start + lower_needle.len() + needle.chars().count() + 40).min(chars.len());
+        let mut snippet: String = chars[start..end].iter().collect();
+        if start > 0 {
+            snippet.insert(0, '…');
+        }
+        if end < chars.len() {
+            snippet.push('…');
+        }
+        Some(SearchHit {
+            session: record.id.clone(),
+            title: record.title.clone(),
+            workspace: record.workspace.clone(),
+            index,
+            snippet,
+        })
+    }
+
+    /// Where deleted sessions go, beside the store rather than into it.
+    ///
+    /// The name has no `.json` extension, so `load_all` and the search cache
+    /// skip it exactly as they skip any other non-session entry.
+    pub(crate) fn trash_dir(&self) -> PathBuf {
+        self.dir.join(".trash")
+    }
+
+    /// Delete a session by moving it to the trash, so it can be brought back.
+    ///
+    /// Deleting a chat used to unlink the file, which made a mis-click
+    /// irreversible and contradicted the rule this project already holds for
+    /// workspaces, that removing one must never silently destroy sessions.
     pub(crate) fn delete(&self, id: &str) {
-        let _ = fs::remove_file(self.path_for(id));
+        let path = self.path_for(id);
+        if !path.is_file() {
+            return;
+        }
+        let trash = self.trash_dir();
+        if fs::create_dir_all(&trash).is_err() {
+            return;
+        }
+        let _ = fs::rename(&path, trash.join(format!("{id}.json")));
+    }
+
+    /// The sessions in the trash, newest first.
+    ///
+    /// Parsed rather than listed by filename, because the title and the time
+    /// are what a person needs in order to recognise the chat they deleted
+    /// (a bare UUID is not recognition).
+    pub(crate) fn trashed(&self) -> Vec<SessionRecord> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(self.trash_dir()) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else { continue };
+            if let Ok(record) = serde_json::from_slice::<SessionRecord>(&bytes) {
+                out.push(record);
+            }
+        }
+        out.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+        out
+    }
+
+    /// Bring a trashed session back into the store, returning its title.
+    pub(crate) fn restore(&self, id: &str) -> Result<String, String> {
+        let from = self.trash_dir().join(format!("{id}.json"));
+        let Ok(bytes) = fs::read(&from) else {
+            return Err("that chat is not in the trash".to_string());
+        };
+        let record: SessionRecord = serde_json::from_slice(&bytes)
+            .map_err(|err| format!("the trashed chat is unreadable: {err}"))?;
+        fs::create_dir_all(&self.dir).map_err(|err| format!("cannot create the store: {err}"))?;
+        fs::rename(&from, self.path_for(id)).map_err(|err| format!("restore failed: {err}"))?;
+        Ok(record.title)
+    }
+
+    /// Empty the trash for good, returning how many sessions were purged.
+    ///
+    /// This is the only place a session file is unlinked; everything else that
+    /// removes one moves it here first.
+    pub(crate) fn purge_trash(&self) -> usize {
+        let mut purged = 0;
+        let Ok(entries) = fs::read_dir(self.trash_dir()) else {
+            return purged;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                purged += 1;
+            }
+        }
+        purged
     }
 
     fn path_for(&self, id: &str) -> PathBuf {
@@ -396,9 +797,104 @@ impl SessionStore {
     }
 }
 
+/// What one chat amounts to at a glance.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SessionOverview {
+    /// Messages the file holds, including turns a compaction folded.
+    pub(crate) messages: usize,
+    /// Turns written by the user.
+    pub(crate) asks: usize,
+    /// Turns written by the assistant.
+    pub(crate) replies: usize,
+    /// Tool calls recorded across every turn.
+    pub(crate) tool_calls: usize,
+    /// Turns that ended in an error.
+    pub(crate) errors: usize,
+    /// Visible characters across every turn.
+    pub(crate) characters: usize,
+    /// Reasoning characters, counted apart because the transcript hides them
+    /// until asked, so folding them into the size would mislead.
+    pub(crate) reasoning_characters: usize,
+    /// Turns the last compaction folded away.
+    pub(crate) archived: usize,
+    /// Unix seconds when the chat was created.
+    pub(crate) created_at: u64,
+    /// Unix seconds of the last update.
+    pub(crate) updated_at: u64,
+    /// One entry per user turn, oldest first.
+    pub(crate) outline: Vec<OutlineEntry>,
+}
+
+/// One user turn in a chat's outline.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct OutlineEntry {
+    /// 1-based position among the user turns.
+    pub(crate) n: usize,
+    /// The ask, clipped for display.
+    pub(crate) preview: String,
+    /// Characters in the full ask.
+    pub(crate) characters: usize,
+}
+
+/// Clip to `max` characters, marking that anything was dropped.
+///
+/// By characters, not bytes: a byte slice of a multi-byte character would
+/// either panic on a non-boundary or produce mojibake, and the transcript is
+/// explicitly multi-lingual.
+fn clip_chars(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let mut out: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+impl SessionRecord {
+    /// Summarise this chat: counts, size, and one outline entry per ask.
+    ///
+    /// Every count includes the turns a compaction folded, because "how big is
+    /// this chat" means the whole file, not just what survived the last fold;
+    /// `archived` says how many of them are folded, so the reader can tell.
+    pub(crate) fn overview(&self) -> SessionOverview {
+        let all = || self.messages.iter().chain(self.archived.iter());
+        SessionOverview {
+            messages: self.messages.len() + self.archived.len(),
+            asks: all().filter(|m| matches!(m.role, Role::User)).count(),
+            replies: all().filter(|m| matches!(m.role, Role::Assistant)).count(),
+            tool_calls: all().map(|m| m.tools.len()).sum(),
+            errors: all().filter(|m| m.error.is_some()).count(),
+            characters: all().map(|m| m.text.chars().count()).sum(),
+            reasoning_characters: all().map(|m| m.reasoning.chars().count()).sum(),
+            archived: self.archived.len(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            outline: all()
+                .filter(|m| matches!(m.role, Role::User))
+                .enumerate()
+                .map(|(i, m)| OutlineEntry {
+                    n: i + 1,
+                    preview: clip_chars(&m.text, 80),
+                    characters: m.text.chars().count(),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_session_file_loads_without_a_workspace() {
+        // A file written before workspaces existed must still load; the field
+        // defaults to empty, which summaries resolve to the workspace in use.
+        let json = r#"{"id":"s1","title":"t","created_at":1,"updated_at":2,"messages":[]}"#;
+        let record: SessionRecord = serde_json::from_str(json).expect("legacy file loads");
+        assert!(record.workspace.is_empty());
+        assert!(SessionRecord::new().workspace.is_empty());
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bos-gui-test-{name}-{}", std::process::id()));
@@ -682,5 +1178,312 @@ mod tests {
         assert_eq!(reloaded.messages.len(), 2);
         assert_eq!(reloaded.title, "Base chat (branch)");
         let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn deleting_a_session_moves_it_to_the_trash() {
+        let dir = tmp_dir("trash");
+        let store = SessionStore::new(&dir);
+        let mut record = SessionRecord::new();
+        record.title = "keep me maybe".to_string();
+        store.save(&record).expect("saved");
+        assert_eq!(store.load_all().len(), 1, "the store starts with it");
+
+        store.delete(&record.id);
+        assert!(store.load_all().is_empty(), "it left the store");
+        let trashed = store.trashed();
+        assert_eq!(trashed.len(), 1, "but it is in the trash");
+        assert_eq!(trashed[0].title, "keep me maybe", "with its title intact");
+
+        let title = store.restore(&record.id).expect("restore");
+        assert_eq!(title, "keep me maybe");
+        assert!(store.trashed().is_empty(), "the trash is empty again");
+        assert_eq!(store.load_all().len(), 1, "and it is back in the store");
+    }
+
+    #[test]
+    fn trashed_sessions_stay_out_of_the_store_and_its_search() {
+        let dir = tmp_dir("trash-search");
+        let store = SessionStore::new(&dir);
+        let mut record = SessionRecord::new();
+        record.messages.push(ChatMessage::user("findable phrase"));
+        store.save(&record).expect("saved");
+        store.search("findable", 10);
+        store.delete(&record.id);
+        assert!(
+            store.search("findable", 10).is_empty(),
+            "a deleted chat must not come back through search"
+        );
+        assert_eq!(store.load_all().len(), 0);
+    }
+
+    #[test]
+    fn purge_is_the_only_permanent_removal() {
+        let dir = tmp_dir("purge");
+        let store = SessionStore::new(&dir);
+        let record = SessionRecord::new();
+        store.save(&record).expect("saved");
+        store.delete(&record.id);
+        assert_eq!(store.purge_trash(), 1, "one session purged");
+        assert!(store.trashed().is_empty());
+        assert!(
+            store.restore(&record.id).is_err(),
+            "a purged chat cannot be restored"
+        );
+        assert_eq!(store.purge_trash(), 0, "purging an empty trash is a no-op");
+    }
+
+    #[test]
+    fn restoring_something_that_was_never_trashed_says_so() {
+        let dir = tmp_dir("restore-missing");
+        let store = SessionStore::new(&dir);
+        let err = store.restore("no-such-id").expect_err("must refuse");
+        assert!(err.contains("not in the trash"), "{err}");
+    }
+    #[test]
+    fn overview_counts_every_turn_including_folded_ones() {
+        let mut record = SessionRecord::new();
+        record.messages.push(ChatMessage::user("first ask"));
+        let mut answer = ChatMessage::assistant();
+        answer.reasoning = "thinking".to_string();
+        answer.tools.push(ToolEvent {
+            name: "search".into(),
+            args: "{}".into(),
+            output: None,
+            ms: Some(3),
+        });
+        record.messages.push(answer);
+        let mut failed = ChatMessage::assistant();
+        failed.text = "failed reply".to_string();
+        failed.error = Some("boom".to_string());
+        record.messages.push(failed);
+        record.archived.push(ChatMessage::user("folded ask"));
+
+        let o = record.overview();
+        assert_eq!(o.messages, 4, "the folded turn counts as a message");
+        assert_eq!((o.asks, o.replies), (2, 2));
+        assert_eq!(o.tool_calls, 1);
+        assert_eq!(o.errors, 1);
+        assert_eq!(o.archived, 1);
+        assert_eq!(
+            o.characters,
+            9 + 12 + 10,
+            "visible text only: the empty reply adds nothing"
+        );
+        assert_eq!(o.reasoning_characters, 8, "reasoning is counted apart");
+        assert_eq!(o.outline.len(), 2, "one entry per ask");
+        assert_eq!(
+            (o.outline[0].n, o.outline[0].preview.as_str()),
+            (1, "first ask")
+        );
+        assert_eq!(o.outline[1].n, 2);
+    }
+
+    #[test]
+    fn overview_of_an_empty_chat_is_all_zeroes() {
+        let o = SessionRecord::new().overview();
+        assert_eq!(
+            (o.messages, o.asks, o.replies, o.tool_calls, o.errors),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            (o.characters, o.reasoning_characters, o.archived),
+            (0, 0, 0)
+        );
+        assert!(o.outline.is_empty());
+    }
+
+    #[test]
+    fn outline_previews_are_clipped_by_characters_not_bytes() {
+        let mut record = SessionRecord::new();
+        let long = "测".repeat(100);
+        record.messages.push(ChatMessage::user(long.clone()));
+        let o = record.overview();
+        assert_eq!(o.outline[0].characters, 100, "the full ask is counted");
+        assert_eq!(
+            o.outline[0].preview.chars().count(),
+            81,
+            "80 characters plus the ellipsis"
+        );
+        assert!(o.outline[0].preview.ends_with('…'));
+        assert!(long.starts_with(&o.outline[0].preview[..o.outline[0].preview.len() - 3]));
+    }
+
+    #[test]
+    fn a_single_cjk_character_still_searches_through_the_index() {
+        // One CJK character has no bigram, so the index has no opinion and the
+        // scan has to answer. That fallback is the reason such a query works.
+        let dir = std::env::temp_dir().join(format!("bos-gui-test-{}-{}", "one-cjk-char", std::process::id()));
+        let store = SessionStore::new(&dir);
+        let mut record = SessionRecord::new();
+        record.id = "cjk".to_string();
+        record.title = "窗口".to_string();
+        record.messages.push(ChatMessage::user("会话窗口的滚动条"));
+        store.save(&record).expect("save");
+        assert_eq!(store.search("滚", 10).len(), 1, "one character still finds it");
+        assert_eq!(store.search("滚动", 10).len(), 1, "two characters too");
+        assert!(store.search("滚x", 10).is_empty(), "and a miss stays a miss");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_index_does_not_change_what_search_returns() {
+        // Build a store, search, then add and rewrite sessions and search again:
+        // the answers must be the scan's answers at every step, because the
+        // index is only allowed to skip work.
+        let dir = std::env::temp_dir().join(format!("bos-gui-test-{}-{}", "index-parity", std::process::id()));
+        let store = SessionStore::new(&dir);
+        for (id, title, body) in [
+            ("a", "Deploy Notes", "How do I ship the GUI?"),
+            ("b", "长会话窗口", "滚动条与 spacer"),
+            ("c", "Mixed", "Cargo Build Insensitive"),
+        ] {
+            let mut record = SessionRecord::new();
+            record.id = id.to_string();
+            record.title = title.to_string();
+            record.messages.push(ChatMessage::user(body));
+            record.updated_at = 1_700_000_000 + id.len() as u64;
+            store.save(&record).expect("save");
+        }
+        for needle in ["ship", "SHIP", "滚动", "spacer", "cargo build", "absent"] {
+            let hits = store.search(needle, 10);
+            assert_eq!(
+                hits.len(),
+                if needle == "absent" { 0 } else { 1 },
+                "query {needle:?} through the index"
+            );
+        }
+        // Rewrite one session: the index must notice and stop matching the old
+        // text, which is the one failure mode that would hide a result.
+        let mut rewritten = SessionRecord::new();
+        rewritten.id = "a".to_string();
+        rewritten.title = "Deploy Notes".to_string();
+        rewritten.messages.push(ChatMessage::user("nothing about that verb"));
+        store.save(&rewritten).expect("save");
+        let _ = store.search("ship", 10);
+        assert!(
+            store.search("ship", 10).is_empty(),
+            "the rewritten session stops matching"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_cost_is_reported_for_the_record() {
+        // Timing is printed, never asserted: a timing assertion is a flaky test,
+        // and the claim that matters structurally — candidates proportional to
+        // matches, not to corpus size — is asserted in `fts`. Run with
+        // --nocapture to see the numbers this test reports.
+        //
+        // The comparison against a scan is indicative rather than like-for-like:
+        // the scan below re-lowers each message on every query, which the shipped
+        // cached path does not, and it parses the store rather than reusing it.
+        let dir = std::env::temp_dir().join(format!("bos-gui-test-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::new(&dir);
+        let body = "the quick brown fox jumps over the lazy dog ".repeat(6);
+        for i in 0..300 {
+            let mut record = SessionRecord::new();
+            record.id = format!("cost-{i}");
+            record.title = format!("session {i}");
+            record.messages.push(ChatMessage::user(&body));
+            store.save(&record).expect("save");
+        }
+        // Cold: every file parsed and every session tokenized into the index.
+        let cold = std::time::Instant::now();
+        let _ = store.search("brown", 10);
+        let cold = cold.elapsed();
+        // Warm: stamps unchanged, so nothing is retokenized.
+        let warm = std::time::Instant::now();
+        let hits = store.search("brown", 10);
+        let warm = warm.elapsed();
+        assert_eq!(hits.len(), 10, "the limit is honoured");
+        // A token no session holds skips every session instead of scanning them.
+        let miss = std::time::Instant::now();
+        assert!(store.search("kangaroo", 10).is_empty(), "and a miss is a miss");
+        let miss = miss.elapsed();
+        let records = store.load_all();
+        let scan = std::time::Instant::now();
+        let found = records
+            .iter()
+            .filter(|r| {
+                r.messages
+                    .iter()
+                    .any(|m| m.text.to_lowercase().contains("brown"))
+            })
+            .count();
+        let scan = scan.elapsed();
+        assert!(found >= 10, "the scan agrees there are matches");
+        println!(
+            "[search-cost] sessions=300 cold={cold:?} warm={warm:?} miss={miss:?} scan={scan:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn measure_index_crossover_sizes() {
+        // TEMPORARY diagnostic. The fair baseline is the path this round
+        // replaced: `cached_sessions` plus `contains` on its cached lowercase.
+        // `load_all` inside the timed region would be unfair to the scan, and
+        // omitting the per-file stats would be unfair to the index.
+        for repeat in [6usize, 32, 128, 512] {
+            let dir = std::env::temp_dir().join(format!(
+                "bos-gui-test-crossover-{}-{}",
+                repeat,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = SessionStore::new(&dir);
+            let body = "the quick brown fox jumps over the lazy dog ".repeat(repeat);
+            for i in 0..300 {
+                let mut record = SessionRecord::new();
+                record.id = format!("cost-{i}");
+                record.title = format!("session {i}");
+                record.messages.push(ChatMessage::user(&body));
+                store.save(&record).expect("save");
+            }
+            let _ = store.search("brown", 10); // warm both paths once
+            let needle = "brown";
+
+            let warm = std::time::Instant::now();
+            let hits = store.search(needle, 10);
+            let warm = warm.elapsed();
+
+            // The pre-round path, measured exactly as it was written.
+            let prev = std::time::Instant::now();
+            let records = store.cached_sessions();
+            let mut seen = 0usize;
+            for (_, session) in &records {
+                if session.record.title.to_lowercase().contains(needle) {
+                    seen += 1;
+                    continue;
+                }
+                for (index, message) in session.record.messages.iter().enumerate() {
+                    let (lower_text, _) = &session.lower[index];
+                    if lower_text.contains(needle) {
+                        seen += 1;
+                        break;
+                    }
+                    let _ = message;
+                }
+            }
+            let prev = prev.elapsed();
+
+            let bytes: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum();
+            println!(
+                "[crossover] body={:>7} total={:>9} indexed={:>11?} prev_path={:>11?} ratio={:.2} hits={} seen={}",
+                body.len(),
+                bytes,
+                warm,
+                prev,
+                warm.as_secs_f64() / prev.as_secs_f64().max(f64::MIN_POSITIVE),
+                hits.len(),
+                seen,
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

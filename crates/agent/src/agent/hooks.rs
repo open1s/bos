@@ -50,6 +50,24 @@ impl std::fmt::Display for HookEvent {
     }
 }
 
+impl HookEvent {
+    /// Every hook event, in the order an execution raises them.
+    ///
+    /// This is the one list a host may read to describe the extension surface,
+    /// so it has to be kept in step with the enum by hand. The test below pins
+    /// the names: adding a variant without adding it here fails the suite rather
+    /// than silently shrinking the surface a host advertises.
+    pub const ALL: [HookEvent; 7] = [
+        HookEvent::BeforeLlmCall,
+        HookEvent::AfterLlmCall,
+        HookEvent::BeforeToolCall,
+        HookEvent::AfterToolCall,
+        HookEvent::OnMessage,
+        HookEvent::OnComplete,
+        HookEvent::OnError,
+    ];
+}
+
 /// Hook event payload for bus publishing
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[qserde::Archive]
@@ -392,6 +410,33 @@ fn block_on_future<F: Future>(future: F) -> F::Output {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_hook_event_is_listed_once() {
+        let names: Vec<String> = HookEvent::ALL.iter().map(|e| e.to_string()).collect();
+        assert_eq!(names.len(), 7, "{names:?}");
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "a hook event is listed twice: {names:?}"
+        );
+        // Pinned, so a new variant has to be added here and in `ALL` together.
+        assert_eq!(
+            unique,
+            vec![
+                "after_llm_call",
+                "after_tool_call",
+                "before_llm_call",
+                "before_tool_call",
+                "on_complete",
+                "on_error",
+                "on_message",
+            ]
+        );
+    }
     use super::*;
 
     #[derive(Debug, Clone)]

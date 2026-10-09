@@ -6,7 +6,7 @@
 //! waits for [`ApprovalBroker::resolve`] from the UI. Denied or expired
 //! requests never execute the inner tool.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -51,6 +51,12 @@ struct Pending {
 pub(crate) struct ApprovalBroker {
     /// Pending requests by correlation id.
     pending: Mutex<HashMap<String, Pending>>,
+    /// Tools the user allowed permanently. The broker holds no settings, so the
+    /// command that records an "always" is what persists it.
+    allowed: Mutex<HashSet<String>>,
+    /// Tools the user allowed for the session that is running. Cleared when a
+    /// different session becomes active, so "this session" means what it says.
+    session_allowed: Mutex<HashSet<String>>,
     /// Session/generation that owns the current stream.
     active: Mutex<(String, u64)>,
     /// Webview handle, installed once during app setup.
@@ -65,6 +71,8 @@ impl Default for ApprovalBroker {
     fn default() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
+            allowed: Mutex::new(HashSet::new()),
+            session_allowed: Mutex::new(HashSet::new()),
             active: Mutex::new((String::new(), 0)),
             handle: OnceLock::new(),
             // NOTE: `Duration::default()` is zero, which would expire instantly.
@@ -82,7 +90,47 @@ impl ApprovalBroker {
 
     /// Tag subsequent requests with the session/stream that is running.
     pub(crate) fn set_active(&self, session_id: &str, gen: u64) {
+        let previous = self.active.lock().unwrap().0.clone();
+        if previous != session_id {
+            // "Allow for this session" ends with the session, not with the turn:
+            // a new stream in the same session keeps it, another session does not.
+            self.session_allowed.lock().unwrap().clear();
+        }
         *self.active.lock().unwrap() = (session_id.to_string(), gen);
+    }
+
+    /// Permit `tool` for the rest of the session that is running.
+    pub(crate) fn allow_for_session(&self, tool: &str) {
+        self.session_allowed
+            .lock()
+            .unwrap()
+            .insert(tool.to_string());
+    }
+
+    /// Permit `tool` until it is removed. Persisting it is the caller's job,
+    /// because the broker deliberately holds no settings.
+    pub(crate) fn allow_always(&self, tool: &str) {
+        self.allowed.lock().unwrap().insert(tool.to_string());
+    }
+
+    /// Adopt the persistent allowances when a broker is built.
+    pub(crate) fn seed_allowed<I: IntoIterator<Item = String>>(&self, tools: I) {
+        let mut allowed = self.allowed.lock().unwrap();
+        for tool in tools {
+            allowed.insert(tool);
+        }
+    }
+
+    /// Whether `tool` may run right now without asking.
+    pub(crate) fn is_allowed(&self, tool: &str) -> bool {
+        self.allowed.lock().unwrap().contains(tool)
+            || self.session_allowed.lock().unwrap().contains(tool)
+    }
+
+    /// Take `tool` off both allowance lists, so it asks again.
+    pub(crate) fn disallow(&self, tool: &str) {
+        self.allowed.lock().unwrap().remove(tool);
+        self.session_allowed.lock().unwrap().remove(tool);
     }
 
     /// Set the workspace root used to resolve `write_file` review diffs.
@@ -98,6 +146,14 @@ impl ApprovalBroker {
     /// Register a pending request, notify the webview, and return its id and
     /// the receiver the gate awaits on.
     fn request(&self, tool: &str, args: &Value) -> (String, tokio::sync::oneshot::Receiver<bool>) {
+        // An allowance short-circuits the question rather than answering it, so
+        // an allowed tool never reaches the user at all. The empty id says the
+        // same thing to the caller: there is nothing for the UI to answer.
+        if self.is_allowed(tool) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(true);
+            return (String::new(), rx);
+        }
         let (session_id, gen) = self.active_context();
         let id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -613,6 +669,42 @@ mod tests {
     }
 
     /// An MCP tool behind the gate must wait for approval before it runs.
+    #[tokio::test]
+    async fn an_allowed_tool_never_raises_a_request() {
+        let broker = ApprovalBroker::default();
+        broker.seed_allowed(vec!["bash".to_string()]);
+        let (id, rx) = broker.request("bash", &Value::Null);
+        assert!(id.is_empty(), "an allowed tool mints no request id: {id:?}");
+        assert!(rx.await.expect("resolved"), "it runs without asking");
+        assert!(
+            broker.pending.lock().unwrap().is_empty(),
+            "nothing is left waiting for the user"
+        );
+    }
+
+    #[test]
+    fn a_session_allowance_ends_with_the_session() {
+        let broker = ApprovalBroker::default();
+        broker.set_active("s1", 1);
+        broker.allow_for_session("bash");
+        assert!(broker.is_allowed("bash"));
+        broker.set_active("s1", 2);
+        assert!(
+            broker.is_allowed("bash"),
+            "a new turn in the same session keeps it"
+        );
+        broker.set_active("s2", 3);
+        assert!(!broker.is_allowed("bash"), "another session starts clean");
+    }
+
+    #[test]
+    fn seeding_carries_the_allowances_into_a_new_broker() {
+        let broker = ApprovalBroker::default();
+        broker.seed_allowed(vec!["write_file".to_string(), "bash".to_string()]);
+        broker.allow_for_session("other");
+        assert!(broker.is_allowed("bash") && broker.is_allowed("write_file"));
+    }
+
     #[tokio::test]
     async fn gated_async_tool_waits_then_runs() {
         let broker = Arc::new(ApprovalBroker::default());

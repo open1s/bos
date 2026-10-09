@@ -43,6 +43,10 @@ pub(crate) struct Capabilities {
     pub(crate) skills: Vec<CapInfo>,
     /// Registered agent plugin names.
     pub(crate) plugins: Vec<String>,
+    /// The hook events a Rust-side extension can attach to, read from the agent's
+    /// own list rather than a copy kept here, so the panel cannot advertise a
+    /// surface the agent does not have.
+    pub(crate) hook_events: Vec<String>,
     /// The skills directory the agent was built from.
     pub(crate) skills_dir: String,
     /// Whether the bash tool is enabled.
@@ -248,7 +252,11 @@ pub(crate) fn build_agent(
     // before/after review diffs in the webview.
     broker.set_workspace(root.clone());
 
-    if settings.bash_enabled {
+    // A workspace may switch individual built-in tools off (§24.8). The names
+    // are the ones the model sees, so the deny-list reads like the tool list.
+    let off = |name: &str| settings.disabled_tools.iter().any(|d| d == name);
+
+    if settings.bash_enabled && !off("bash") {
         let tool: Arc<dyn agent::tools::Tool> = match &root {
             Some(r) => Arc::new(BashTool::new("bash").with_workspace(&r.to_string_lossy())),
             None => Arc::new(BashTool::new("bash")),
@@ -262,29 +270,40 @@ pub(crate) fn build_agent(
     }
     if settings.file_tools_enabled {
         // Read-only tools never need approval; writes and commands do.
-        let read: Arc<dyn agent::tools::Tool> = Arc::new(read_file_tool(root.clone()));
-        agent.add_tool(read);
-        let write: Arc<dyn agent::tools::Tool> = Arc::new(write_file_tool(root.clone()));
-        crate::approval::add_gated_tool(
-            &mut agent,
-            write,
-            settings.require_approval,
-            broker.clone(),
-        );
-        let list: Arc<dyn agent::tools::Tool> = Arc::new(list_dir_tool(root.clone()));
-        agent.add_tool(list);
+        if !off("read_file") {
+            let read: Arc<dyn agent::tools::Tool> = Arc::new(read_file_tool(root.clone()));
+            agent.add_tool(read);
+        }
+        if !off("write_file") {
+            let write: Arc<dyn agent::tools::Tool> = Arc::new(write_file_tool(root.clone()));
+            crate::approval::add_gated_tool(
+                &mut agent,
+                write,
+                settings.require_approval,
+                broker.clone(),
+            );
+        }
+        if !off("list_dir") {
+            let list: Arc<dyn agent::tools::Tool> = Arc::new(list_dir_tool(root.clone()));
+            agent.add_tool(list);
+        }
     }
 
     // Planning is always on: the model tracks its steps in the agent's own
     // shared plan store (`Agent::plan`), which the plan panel renders and
     // sessions persist — read-only state, so no approval gate.
-    let plan: Arc<dyn agent::tools::Tool> = Arc::new(agent::tools::PlanTool::new(agent.plan()));
-    agent.add_tool(plan);
+    if !off("plan") {
+        let plan: Arc<dyn agent::tools::Tool> = Arc::new(agent::tools::PlanTool::new(agent.plan()));
+        agent.add_tool(plan);
+    }
 
     let skills = settings.skills_dir.trim();
     if !skills.is_empty() {
         // A missing directory discovers nothing; that is not an error.
-        let _ = agent.register_skills_from_dir(expand_tilde(skills));
+        // A workspace may switch individual skills off (§24.8); the deny-list is
+        // what makes that real rather than stored.
+        let _ =
+            agent.register_skills_from_dir_denying(expand_tilde(skills), &settings.disabled_skills);
     }
 
     if settings.memory_enabled {
@@ -393,6 +412,10 @@ pub(crate) fn capabilities_of(agent: &Agent, settings: &Settings) -> Capabilitie
         async_tools,
         skills,
         plugins: agent.plugins().plugin_names_blocking(),
+        hook_events: agent::agent::HookEvent::ALL
+            .iter()
+            .map(|event| event.to_string())
+            .collect(),
         skills_dir: settings.skills_dir.clone(),
         bash_enabled: settings.bash_enabled,
         file_tools_enabled: settings.file_tools_enabled,

@@ -11,6 +11,8 @@ mod app;
 mod approval;
 mod caps;
 mod compact;
+mod export;
+mod fts;
 mod init;
 mod instructions;
 mod mcp;

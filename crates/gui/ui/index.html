@@ -31,6 +31,8 @@
 
     <main id="main">
       <header id="chat-head">
+        <button type="button" id="sidebar-toggle" class="mini-btn" aria-label="Chats and workspaces"
+                aria-expanded="false" title="Chats and workspaces">☰</button>
         <span id="chat-title">BOS</span>
         <span id="stream-chip" class="chip idle">idle</span>
       </header>
@@ -47,16 +49,16 @@
       </section>
 
       <div id="composer">
-        <div id="cmd-palette" class="cmd-palette hidden" role="listbox"
-             aria-label="Commands and skills">
-          <ul id="cmd-list" class="cmd-list"></ul>
+        <div id="cmd-palette" class="cmd-palette hidden">
+          <ul id="cmd-list" class="cmd-list" role="listbox"
+              aria-label="Commands and skills"></ul>
         </div>
-        <div id="mention-pop" class="mention-pop hidden" role="listbox"
-             aria-label="File mentions">
-          <ul id="mention-list" class="cmd-list"></ul>
+        <div id="mention-pop" class="mention-pop hidden">
+          <ul id="mention-list" class="cmd-list" role="listbox"
+              aria-label="File mentions"></ul>
         </div>
         <div id="queue-list" class="queue-list hidden" aria-label="Queued messages"></div>
-        <textarea id="input" rows="1" placeholder="Send a message&#10;/ = commands &amp; skills · @ = file mentions · Enter = send (queued while streaming) · Shift+Enter = newline"></textarea>
+        <textarea id="input" rows="1" aria-controls="cmd-list" aria-expanded="false" placeholder="Send a message&#10;/ = commands &amp; skills · @ = file mentions · Enter = send (queued while streaming) · Shift+Enter = newline"></textarea>
         <button id="send" class="btn btn-accent" disabled>Send</button>
       </div>
 
@@ -67,12 +69,15 @@
     </main>
   </div>
 
-  <div id="settings-modal" class="modal hidden">
+  <div id="settings-modal" class="modal hidden" role="dialog"
+       aria-modal="true" aria-labelledby="settings-title">
     <div class="modal-card">
-      <h2>Settings</h2>
+      <h2 id="settings-title">Settings</h2>
       <form id="settings-form">
         <nav class="set-nav" aria-label="Settings sections">
           <button type="button" class="set-tab" data-section="settings-form">General</button>
+          <button type="button" class="set-tab" data-section="ws-list">Workspaces</button>
+          <button type="button" class="set-tab" data-section="mem-list">Memory</button>
           <button type="button" class="set-tab" data-section="cap-list">Tools &amp; skills</button>
           <button type="button" class="set-tab" data-section="mcp-list">MCP servers</button>
           <button type="button" class="set-tab" data-section="prov-list">Providers</button>
@@ -81,6 +86,8 @@
           <input id="set-model" type="text" spellcheck="false"
                  placeholder="model name or [llm.<name>] profile" />
         </label>
+        <div class="cap-group">Config profiles</div>
+        <div id="profiles-list"></div>
         <label>Base URL
           <input id="set-base-url" type="text" spellcheck="false"
                  placeholder="https://api.example.com/v1" />
@@ -114,6 +121,13 @@
           <input id="set-workspace" type="text" spellcheck="false"
                  placeholder="~/Projects/my-repo (empty = unrestricted)" />
         </label>
+        <div class="cap-group">Always allowed tools</div>
+        <div id="allowed-list"></div>
+        <div class="cap-group">Deleted chats</div>
+        <div id="trash-list"></div>
+        <div class="row">
+          <button id="trash-purge" type="button">Empty the trash</button>
+        </div>
         <div class="row">
           <label class="row-check grow"><input id="set-instructions" type="checkbox" />
             fold AGENTS.md / CLAUDE.md / .bos/instructions.md into the prompt</label>
@@ -173,6 +187,29 @@
         </div>
         <div class="cap-section">
           <div class="cap-title">Registered capabilities</div>
+          <section id="mem-list">
+            <h3>Memory</h3>
+            <p class="set-hint">
+              What the agent remembers across chats. One store serves every workspace
+              and is written by hand here or by the agent as it works.
+            </p>
+            <div class="row">
+              <input id="mem-text" type="text" class="grow" spellcheck="false"
+                     placeholder="Something worth remembering" />
+              <button type="button" id="mem-add" class="ws-form-go">Remember</button>
+            </div>
+            <div id="mem-items" class="ws-manage-list"></div>
+          </section>
+          <section id="ws-list">
+            <h3>Workspaces</h3>
+            <p class="set-hint">
+              A workspace is a root folder, a model and a set of tools; every chat belongs to one.
+            </p>
+            <div id="ws-manage-list" class="ws-manage-list"></div>
+            <div class="row">
+              <button type="button" id="ws-manage-add" class="ws-form-go">New workspace</button>
+            </div>
+          </section>
           <div id="cap-list" class="cap-list"></div>
         </div>
         <div class="modal-actions">
@@ -183,9 +220,10 @@
     </div>
   </div>
 
-  <div id="approval-modal" class="modal hidden">
+  <div id="approval-modal" class="modal hidden" role="dialog"
+       aria-modal="true" aria-labelledby="approval-title">
     <div class="modal-card approval-card">
-      <h2>Approval required</h2>
+      <h2 id="approval-title">Approval required</h2>
       <p class="approval-desc">
         The agent wants to run <span id="approval-tool" class="approval-tool"></span>.
         Review the pending changes before allowing it to execute.
@@ -194,6 +232,8 @@
       <div id="approval-diff" class="approval-diff hidden"></div>
       <div class="modal-actions">
         <button type="button" id="approval-deny" class="btn btn-ghost">Deny</button>
+        <button type="button" id="approval-session" class="btn btn-ghost">Allow for this session</button>
+        <button type="button" id="approval-always" class="btn btn-ghost">Always allow</button>
         <button type="button" id="approval-allow" class="btn btn-accent">Allow once</button>
       </div>
     </div>

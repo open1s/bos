@@ -742,10 +742,28 @@ impl Agent {
         &mut self,
         dir: std::path::PathBuf,
     ) -> Result<(), crate::skills::SkillError> {
+        self.register_skills_from_dir_denying(dir, &[])
+    }
+
+    /// Register skills from a directory, skipping every skill whose name appears
+    /// in `deny`.
+    ///
+    /// The caller passes what it does **not** want rather than a list of what it
+    /// does, so a skill added to the directory later is picked up without anyone
+    /// having to opt in — the same reading of "who owns this choice" that MCP
+    /// servers invert, because those are configured by hand one at a time.
+    pub fn register_skills_from_dir_denying(
+        &mut self,
+        dir: std::path::PathBuf,
+        deny: &[String],
+    ) -> Result<(), crate::skills::SkillError> {
         use crate::skills::SkillLoader;
         let mut loader = SkillLoader::new(dir.clone());
         loader.discover()?;
         for skill_meta in loader.list() {
+            if deny.iter().any(|name| name == &skill_meta.name) {
+                continue;
+            }
             let content = loader
                 .load(&skill_meta.name)
                 .ok_or_else(|| crate::skills::SkillError::NotFound(skill_meta.name.clone()))?;

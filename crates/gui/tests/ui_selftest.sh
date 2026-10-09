@@ -31,32 +31,7 @@ run_page() {
     --disable-dev-shm-usage --window-size=1440,900 \
     --user-data-dir="$PROFILE" --allow-file-access-from-files \
     --dump-dom "$url" > "$OUT" 2>/dev/null || true
-  python3 - "$page" "$OUT" <<'PY' || rc=1
-import html as H, json, re, sys
-
-page, path = sys.argv[1], sys.argv[2]
-raw = open(path, encoding="utf-8", errors="replace").read()
-m = re.search(r'<pre id="result">(.*?)</pre>', raw, re.S)
-if not m:
-    print(f"[{page}] result block missing (script threw at load?)")
-    raise SystemExit(1)
-d = json.loads(H.unescape(m.group(1)))
-for k, v in d.items():
-    if k not in ("checks", "failures", "total", "page"):
-        print(f"[{page}] {k}: {v}")
-checks = d.get("checks")
-rows = (
-    [(k, str(v).startswith("PASS")) for k, v in checks.items()]
-    if isinstance(checks, dict)
-    else [(c["name"], bool(c["ok"])) for c in (checks or [])]
-)
-for name, ok in rows:
-    print(f"[{page}] " + ("  ok  " if ok else " FAIL ") + name)
-failures = int(d.get("failures") or 0)
-print(f"[{page}] failures: {failures} / {len(rows)}\n")
-raise SystemExit(1 if failures else 0)
-PY
-  return "$rc"
+  python3 "$HERE/read_result.py" "$page" "$OUT" || rc=1
 }
 
 status=0

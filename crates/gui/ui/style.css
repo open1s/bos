@@ -1292,3 +1292,161 @@ body.resizing #doc-panel { transition: none; }
 }
 .set-tab:hover { color: var(--fg); background: var(--hover, rgba(255,255,255,.06)); }
 .set-tab:focus-visible { outline: 2px solid var(--focus-ring, #6c8ebf); outline-offset: 1px; }
+
+/* Workspace headers in the left panel: the name, its bound model, the chat count. */
+.ws-head {
+  display: flex; align-items: center; gap: 6px; padding: 8px 10px 4px;
+  color: var(--muted); font-size: 11px; letter-spacing: .02em; text-transform: none;
+}
+.ws-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-model {
+  max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 1px 6px; border-radius: 999px; background: var(--hover, rgba(255,255,255,.06));
+}
+.ws-count { opacity: .6; }
+[data-sidebar="rail"] .ws-head { display: none; }
+.ws-head { cursor: pointer; }
+.ws-head:hover { color: var(--fg); }
+.ws-head.active .ws-name { color: var(--fg); font-weight: 600; }
+.ws-head.active .ws-count::before { content: "●"; margin-right: 4px; font-size: 8px; }
+
+/* Workspace actions and the inline workspace form (no native dialogs). */
+.ws-act {
+  display: none; border: 0; background: transparent; color: var(--muted);
+  cursor: pointer; font-size: 11px; padding: 0 2px; line-height: 1;
+}
+.ws-head:hover .ws-act { display: inline; }
+.ws-act:hover { color: var(--fg); }
+.ws-add {
+  display: block; width: calc(100% - 16px); margin: 8px; padding: 6px 8px;
+  border: 1px dashed var(--border, rgba(255,255,255,.18)); border-radius: 6px;
+  background: transparent; color: var(--muted); cursor: pointer; font-size: 12px;
+}
+.ws-add:hover { color: var(--fg); border-style: solid; }
+.ws-form { display: flex; flex-direction: column; gap: 6px; margin: 8px; padding: 8px;
+  border: 1px solid var(--border, rgba(255,255,255,.18)); border-radius: 8px; }
+.ws-form-title { font-size: 12px; color: var(--fg); }
+.ws-form input[type="text"], .ws-form input:not([type]) {
+  width: 100%; box-sizing: border-box; padding: 5px 6px; font-size: 12px;
+  border-radius: 5px; border: 1px solid var(--border, rgba(255,255,255,.18));
+  background: var(--input-bg, rgba(0,0,0,.2)); color: inherit;
+}
+.ws-form-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.ws-form-go, .ws-form-cancel {
+  padding: 5px 8px; border-radius: 5px; font-size: 12px; cursor: pointer;
+  border: 1px solid var(--border, rgba(255,255,255,.18));
+  background: var(--hover, rgba(255,255,255,.06)); color: inherit;
+}
+.ws-form-go.danger { color: #ff8f8f; border-color: rgba(255,120,120,.4); }
+.ws-tools { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; }
+.ws-form-hint { font-size: 11px; color: var(--muted); }
+.ws-tool-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg); }
+.ws-tool { margin: 0; }
+.ws-add-preset { margin-top: 0; }
+.load-earlier { margin: 6px 0; padding: 4px 8px; font-size: 12px; cursor: pointer;
+  border: 1px dashed var(--border, rgba(255,255,255,.18)); border-radius: 6px;
+  background: transparent; color: var(--muted); }
+.load-earlier:hover { color: var(--fg); }
+
+/* Narrow windows: below this width the sidebar is not squeezed into the chat
+   area, it slides over it on purpose, and this button is the way back. A
+   squeezed sidebar keeps every element inside the viewport — which is why the
+   layout guard measures the box's width against its rows, not its overflow — and
+   leaves a chat list that cannot be read or clicked. */
+#sidebar-toggle { display: none; }
+@media (max-width: 720px) {
+  #sidebar-toggle { display: inline-flex; align-items: center; }
+  #sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0; width: 280px; max-width: 82vw;
+    z-index: 40; transform: translateX(-101%); transition: transform .16s ease;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, .45);
+  }
+  #sidebar.open { transform: none; }
+  /* `min-width: 0` lets main take the window, and clipping here stops the
+     main's min-content width from turning the whole app into something that can
+     be panned sideways — the guard caught exactly that when the drawer landed. */
+  #main { min-width: 0; }
+  #app { overflow-x: hidden; }
+  /* The parked drawer hangs off the left edge, and a parked element is still
+     scrollable area: without this, the whole app can be panned sideways into
+     empty space. The guard asks the browser to scroll rather than reading
+     `scrollWidth`, which is how this was found. */
+  html, body { overflow-x: clip; }
+}
+
+/* Config-profile chips: a name is typed by clicking, never remembered. */
+.profile-chip {
+  margin: 0 6px 6px 0;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid #4a4a55;
+  border-radius: 10px;
+  background: #2b2b33;
+  color: inherit;
+}
+.profile-chip:hover { border-color: #7a7a8a; }
+
+/* The affordance that puts a compaction's folded turns back. It is a button,
+   because unlike the other status chips it does something when clicked. */
+.archived-chip {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid #4a4a55;
+  border-radius: 999px;
+  padding: 1px 8px;
+  background: #2b2b33;
+  color: var(--muted, #b9b9c4);
+}
+.archived-chip:hover {
+  border-color: #7a7a8a;
+  color: #e8e8ef;
+}
+
+/* Putting turns back changes the chat, so it reads as the stronger action. */
+.archived-restore {
+  border-color: #6a5a3a;
+  color: #e6d3a3;
+}
+.archived-restore:hover {
+  border-color: #b99a5b;
+  color: #ffe9b8;
+}
+
+/* Deleted chats in the settings panel: a row per chat with its way back. */
+.trash-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+.trash-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trash-restore {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid #4a4a55;
+  border-radius: 999px;
+  padding: 1px 8px;
+  background: #2b2b33;
+  color: var(--muted, #b9b9c4);
+}
+.trash-restore:hover {
+  border-color: #b99a5b;
+  color: #ffe9b8;
+}
+.cap-empty {
+  color: var(--muted, #8a8a95);
+}
+
+/* Stands in for the rows above the window so the scrollbar describes the whole
+   conversation. aria-hidden because it is not content, only space. */
+.spacer-top {
+  flex: 0 0 auto;
+  width: 100%;
+}

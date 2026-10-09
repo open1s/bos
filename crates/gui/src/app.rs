@@ -103,14 +103,20 @@ impl Inner {
             }
         }
         let broker = Arc::new(crate::approval::ApprovalBroker::default());
+        // Allowances the user made permanent outlive the app, so every broker
+        // adopts them and an allowed tool is never asked about again.
+        broker.seed_allowed(self.settings.allowed_tools.iter().cloned());
         if let Some(handle) = &self.app_handle {
             broker.set_handle(handle.clone());
         }
-        let base = caps::build_agent(&self.settings, Arc::clone(&broker));
+        // The agent is built from the active workspace's choices, not from the
+        // globals: model, tools, approval and budget all come from one place.
+        let effective = self.settings.effective();
+        let base = caps::build_agent(&effective, Arc::clone(&broker));
         let mut agent = base.as_ref().clone();
         // Connected MCP tools ride along with fresh builds (and the connect
         // pass re-attaches them to entries that already exist).
-        self.attach_mcp_tools(&mut agent, &broker);
+        self.attach_mcp_tools(&mut agent, &broker, &effective);
         let agent = Arc::new(agent);
         let settings_gen = self.settings_gen;
         self.agent_cache
@@ -147,10 +153,18 @@ impl Inner {
         &self,
         agent: &mut Agent,
         broker: &Arc<crate::approval::ApprovalBroker>,
+        settings: &Settings,
     ) -> Vec<(String, String)> {
-        let gate = self.settings.require_approval.then(|| Arc::clone(broker));
+        // Approval policy and the allowed servers are the workspace's, not the
+        // globals': the handshake may exist because the server is configured,
+        // while this workspace is one that switched it off.
+        let gate = settings.require_approval.then(|| Arc::clone(broker));
+        let allowed = enabled_mcp_servers(settings);
         let mut errors = Vec::new();
         for (namespace, handshake) in &self.mcp_ready {
+            if !allowed.iter().any(|name| name == namespace) {
+                continue;
+            }
             for def in &handshake.tools {
                 let tool = crate::mcp::tool_for(handshake, namespace, def, gate.clone());
                 if let Err(err) = agent.add_mcp_tool(namespace, &def.name, tool) {
@@ -309,9 +323,10 @@ fn spawn_mcp_connect(state: Arc<GuiState>, gen: u64) {
             .iter()
             .map(|(id, e)| (id.clone(), Arc::clone(&e.agent), Arc::clone(&e.broker)))
             .collect();
+        let effective = inner.settings.effective();
         for (id, agent, broker) in jobs {
             let mut fresh = agent.as_ref().clone();
-            let errors = inner.attach_mcp_tools(&mut fresh, &broker);
+            let errors = inner.attach_mcp_tools(&mut fresh, &broker, &effective);
             for (namespace, err) in &errors {
                 if let Some(status) = statuses.iter_mut().find(|s| s.name == *namespace) {
                     status.connected = false;
@@ -383,13 +398,21 @@ struct SessionSummary {
     title: String,
     /// Unix time of the last activity.
     updated_at: u64,
+    /// Workspace this session belongs to; never empty in the UI, because a
+    /// session written before workspaces existed is reported as the active one.
+    workspace: String,
 }
 
-fn summary(record: &SessionRecord) -> SessionSummary {
+fn summary(record: &SessionRecord, active: &str) -> SessionSummary {
     SessionSummary {
         id: record.id.clone(),
         title: record.title.clone(),
         updated_at: record.updated_at,
+        workspace: if record.workspace.is_empty() {
+            active.to_string()
+        } else {
+            record.workspace.clone()
+        },
     }
 }
 
@@ -467,13 +490,23 @@ struct StreamFinished {
     session_id: String,
     /// Stream generation that ended.
     gen: u64,
+    /// Prompt tokens the provider reported for the last call, when it reported any.
+    prompt_tokens: Option<u64>,
+    /// Completion tokens likewise.
+    completion_tokens: Option<u64>,
 }
 
 /// List all sessions, most recently active first.
 #[tauri::command]
 fn list_sessions(state: State<'_, Arc<GuiState>>) -> Result<Vec<SessionSummary>, String> {
     let inner = state.lock()?;
-    Ok(inner.store.load_all().iter().map(summary).collect())
+    let active = inner.settings.active_workspace.clone();
+    Ok(inner
+        .store
+        .load_all()
+        .iter()
+        .map(|r| summary(r, &active))
+        .collect())
 }
 
 /// Create an empty session and return its summary.
@@ -482,9 +515,12 @@ fn create_session(state: State<'_, Arc<GuiState>>) -> Result<SessionSummary, Str
     let inner = state.lock()?;
     // Sessions own their agent (and plan) from the first build — nothing to
     // reset on a brand-new id.
-    let record = SessionRecord::new();
+    let mut record = SessionRecord::new();
+    // A new session belongs to the workspace in use, recorded at creation so the
+    // assignment survives a later switch away from that workspace (§24.6).
+    record.workspace = inner.settings.active_workspace.clone();
     inner.store.save(&record).map_err(|e| e.to_string())?;
-    Ok(summary(&record))
+    Ok(summary(&record, &inner.settings.active_workspace))
 }
 
 /// Delete a session's stored file, stopping its stream if it is running.
@@ -504,6 +540,138 @@ fn delete_session(state: State<'_, Arc<GuiState>>, id: String) -> Result<(), Str
     }
     inner.store.delete(&id);
     Ok(())
+}
+
+/// Move a chat into another workspace (§24.6). A session's workspace decides the
+/// model, tools and skills that run it, so the move drops the cached agent and the
+/// next turn is built from the workspace it now belongs to. A streaming chat is
+/// refused rather than moved mid-flight, because the stream's forwarder is bound
+/// to the configuration it started with.
+#[tauri::command]
+fn move_session(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    workspace_id: String,
+) -> Result<Vec<SessionRecord>, String> {
+    let mut inner = state.lock()?;
+    if inner.streaming.contains_key(&id) {
+        return Err("this chat is streaming; stop it before moving it".to_string());
+    }
+    if !inner
+        .settings
+        .workspaces
+        .iter()
+        .any(|w| w.id == workspace_id)
+    {
+        return Err(format!("unknown workspace '{workspace_id}'"));
+    }
+    inner
+        .store
+        .move_to(&id, &workspace_id)
+        .map_err(|e| e.to_string())?;
+    inner.agent_cache.remove(&id);
+    Ok(inner.store.load_all())
+}
+
+/// A remembered line has to be worth storing and has to be bounded: an empty
+/// string is a mistake, and an unbounded one would push the store's own budget
+/// out of the way one paste at a time.
+const MAX_MEMORY_CHARS: usize = 2000;
+
+/// Trim and check a memory before it is stored. Split out from the command so the
+/// rule can be tested without a running app.
+fn clean_memory_text(raw: &str) -> Result<String, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err("a memory needs some text".to_string());
+    }
+    if text.chars().count() > MAX_MEMORY_CHARS {
+        return Err(format!(
+            "a memory is capped at {MAX_MEMORY_CHARS} characters"
+        ));
+    }
+    Ok(text.to_string())
+}
+
+/// The memory store behind a session's agent, cloned out so the caller can await
+/// on it without holding the state lock across a suspension point.
+fn memory_store(
+    state: &Arc<GuiState>,
+    session_id: &str,
+) -> Result<Arc<dyn agent::memory::MemoryStore>, String> {
+    let mut inner = state.lock()?;
+    let agent = inner.agent(session_id);
+    agent
+        .memory()
+        .cloned()
+        .ok_or_else(|| "memory is switched off; turn it on in Settings before using it".to_string())
+}
+
+/// Everything the store holds, newest first: the order a person reads a memory
+/// list in, and stable between identical calls.
+async fn memories_of(
+    store: &Arc<dyn agent::memory::MemoryStore>,
+) -> Vec<agent::memory::MemoryItem> {
+    let mut items = store.all().await;
+    items.sort_by(|a, b| {
+        b.created_at_ms
+            .cmp(&a.created_at_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    items
+}
+
+/// List what the GUI remembers (§20). Memory is one file shared by every chat in
+/// this app (`caps::open_file_memory`), so any session's agent answers for all.
+#[tauri::command]
+async fn list_memories(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+) -> Result<Vec<agent::memory::MemoryItem>, String> {
+    let store = memory_store(state.inner(), &session_id)?;
+    Ok(memories_of(&store).await)
+}
+
+/// Add one memory by hand. The agent also remembers exchanges by itself when
+/// auto-remember is on; this is the deliberate kind.
+#[tauri::command]
+async fn remember_memory(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+    text: String,
+) -> Result<Vec<agent::memory::MemoryItem>, String> {
+    let text = clean_memory_text(&text)?;
+    let store = memory_store(state.inner(), &session_id)?;
+    store.add(text, None).await;
+    Ok(memories_of(&store).await)
+}
+
+/// Forget one memory by id, and answer with the list as it now stands — the
+/// caller's next question is always "what is left?".
+#[tauri::command]
+async fn forget_memory(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+    id: String,
+) -> Result<Vec<agent::memory::MemoryItem>, String> {
+    let store = memory_store(state.inner(), &session_id)?;
+    if !store.remove(&id).await {
+        return Err("that memory is already gone".to_string());
+    }
+    Ok(memories_of(&store).await)
+}
+
+/// Search every stored chat — titles and message text (§17). Hits come back
+/// newest chat first and are capped, because this box is for finding a chat, not
+/// for reading the archive.
+#[tauri::command]
+fn search_sessions(
+    state: State<'_, Arc<GuiState>>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<crate::session::SearchHit>, String> {
+    let inner = state.lock()?;
+    Ok(inner.store.search(&query, limit.unwrap_or(50).min(200)))
 }
 
 /// Load a session's messages (pure read; no shared-state side effects —
@@ -586,6 +754,19 @@ fn set_plan(
         .save(&record)
         .map_err(|err| format!("failed to persist: {err}"))?;
     Ok(record.plan)
+}
+
+/// The `[llm.<name>]` profiles discovered in the config file.
+///
+/// A profile is selected by typing its name into the model field, which is not
+/// discoverable without this: the names live in the config file and the settings
+/// payload never serializes them.
+#[tauri::command]
+fn list_profiles(
+    state: State<'_, Arc<GuiState>>,
+) -> Result<Vec<crate::settings::ProfileInfo>, String> {
+    let inner = state.lock()?;
+    Ok(inner.settings.profile_infos())
 }
 
 /// Export a session as portable Markdown under `~/.bos/gui/exports/`,
@@ -720,6 +901,146 @@ fn truncate_session(
         .save(&record)
         .map_err(|err| format!("failed to persist: {err}"))?;
     Ok(record.messages.len())
+}
+
+/// How many turns this chat's last compaction folded away.
+///
+/// Zero means there is nothing to restore, which is what the UI checks before
+/// offering the affordance at all.
+#[tauri::command]
+fn compacted_archive(state: State<'_, Arc<GuiState>>, session_id: String) -> Result<usize, String> {
+    let inner = state.lock()?;
+    let record = inner
+        .store
+        .load_all()
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+    Ok(record.archived.len())
+}
+
+/// The turns this chat's last compaction folded, for reading before restoring.
+///
+/// Read-only: the UI shows them in the document panel so the reader can see
+/// what a summary replaced, and restoring stays a separate, deliberate act.
+#[tauri::command]
+fn archived_messages(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+) -> Result<Vec<ChatMessage>, String> {
+    let inner = state.lock()?;
+    let record = inner
+        .store
+        .load_all()
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+    Ok(record.archived)
+}
+
+/// Counts, size and turn outline for one chat, computed from its stored record.
+///
+/// Read-only, like the other inspection commands: it answers "what is in here"
+/// without touching the conversation.
+#[tauri::command]
+fn session_overview(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+) -> Result<crate::session::SessionOverview, String> {
+    let inner = state.lock()?;
+    let record = inner
+        .store
+        .load_all()
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+    Ok(record.overview())
+}
+
+/// Keep one chat as a ZIP beside the session store, returning where it landed.
+///
+/// The archive is written by the core so the shell only reports the path: an
+/// export is a file the user owns, not a view the shell renders.
+#[tauri::command]
+fn export_chat(state: State<'_, Arc<GuiState>>, session_id: String) -> Result<String, String> {
+    let inner = state.lock()?;
+    let record = inner
+        .store
+        .load_all()
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+    let path = crate::export::export_chat(inner.store.dir(), &record)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// A chat in the trash, as the settings panel needs to show it.
+#[derive(Clone, Serialize)]
+pub(crate) struct TrashedChat {
+    /// Stable identifier, used to bring the chat back.
+    pub(crate) id: String,
+    /// Title, so a person can recognise which chat it was.
+    pub(crate) title: String,
+    /// Unix seconds when it was last touched before being deleted.
+    pub(crate) updated_at: u64,
+}
+
+/// The chats that were deleted and can still be brought back, newest first.
+#[tauri::command]
+fn trashed_chats(state: State<'_, Arc<GuiState>>) -> Result<Vec<TrashedChat>, String> {
+    let inner = state.lock()?;
+    Ok(inner
+        .store
+        .trashed()
+        .into_iter()
+        .map(|record| TrashedChat {
+            id: record.id,
+            title: record.title,
+            updated_at: record.updated_at,
+        })
+        .collect())
+}
+
+/// Bring a deleted chat back, returning its title.
+///
+/// The record's workspace field was never changed on the way out, so a restored
+/// chat rejoins the workspace it belonged to.
+#[tauri::command]
+fn restore_session(state: State<'_, Arc<GuiState>>, id: String) -> Result<String, String> {
+    let inner = state.lock()?;
+    inner.store.restore(&id)
+}
+
+/// Empty the trash for good, returning how many chats were purged.
+#[tauri::command]
+fn purge_trash(state: State<'_, Arc<GuiState>>) -> Result<usize, String> {
+    let inner = state.lock()?;
+    Ok(inner.store.purge_trash())
+}
+
+/// Put a compacted chat's folded turns back, in front of everything since.
+#[tauri::command]
+fn restore_compacted(state: State<'_, Arc<GuiState>>, session_id: String) -> Result<usize, String> {
+    let inner = state.lock()?;
+    if inner.streaming.contains_key(&session_id) {
+        return Err("a turn is in progress — wait for it to finish".to_string());
+    }
+    if inner.compacting.contains(&session_id) {
+        return Err("a compaction is running for this chat".to_string());
+    }
+    let mut record = inner
+        .store
+        .load_all()
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+    let restored = crate::compact::restore(&mut record)?;
+    record.touch();
+    inner
+        .store
+        .save(&record)
+        .map_err(|err| format!("failed to persist the restored history: {err}"))?;
+    Ok(restored)
 }
 
 /// Clone the transcript prefix (messages before `index`) into a brand-new
@@ -1226,6 +1547,51 @@ fn init_agents(app: AppHandle, state: State<'_, Arc<GuiState>>, force: bool) -> 
 
 /// Answer a pending approval request (`approval-request` event payload id).
 #[tauri::command]
+/// Record an approval allowance for a tool. `scope` is `"session"` (until the
+/// session changes) or `"always"` (persisted). Returns the persistent list, so
+/// the caller can show it without a second round trip.
+fn allow_tool(
+    state: State<'_, Arc<GuiState>>,
+    tool: String,
+    scope: String,
+) -> Result<Vec<String>, String> {
+    let mut inner = state.lock()?;
+    let tool = tool.trim().to_string();
+    if tool.is_empty() {
+        return Err("no tool name given".to_string());
+    }
+    // Every broker ever built, so an allowance reaches cached sessions too.
+    for broker in &inner.brokers {
+        if scope == "always" {
+            broker.allow_always(&tool);
+        } else {
+            broker.allow_for_session(&tool);
+        }
+    }
+    if scope == "always" && !inner.settings.allowed_tools.contains(&tool) {
+        inner.settings.allowed_tools.push(tool);
+        inner.settings.allowed_tools.sort();
+        inner.settings.save().map_err(|e| e.to_string())?;
+    }
+    Ok(inner.settings.allowed_tools.clone())
+}
+
+#[tauri::command]
+/// Take a tool off the permanent allow-list, so it asks again.
+fn forget_allowed_tool(
+    state: State<'_, Arc<GuiState>>,
+    tool: String,
+) -> Result<Vec<String>, String> {
+    let mut inner = state.lock()?;
+    inner.settings.allowed_tools.retain(|name| name != &tool);
+    for broker in &inner.brokers {
+        broker.disallow(&tool);
+    }
+    inner.settings.save().map_err(|e| e.to_string())?;
+    Ok(inner.settings.allowed_tools.clone())
+}
+
+#[tauri::command]
 fn respond_approval(
     state: State<'_, Arc<GuiState>>,
     id: String,
@@ -1246,7 +1612,226 @@ fn respond_approval(
 /// Read the current settings for the settings dialog.
 #[tauri::command]
 fn get_settings(state: State<'_, Arc<GuiState>>) -> Result<Settings, String> {
-    Ok(state.lock()?.settings.clone())
+    // The dialog reads what will actually run, so it cannot show a value the
+    // active workspace overrides (§24.4).
+    Ok(state.lock()?.settings.effective())
+}
+
+/// Validate a workspace root the way file reads are validated: it must exist and
+/// be a directory, and what gets stored is canonical, so `~`, `..` and symlinks
+/// cannot turn one folder into two workspaces (§24.7). An empty root means the
+/// process working directory and is always acceptable.
+fn normalize_workspace_root(root: &str) -> Result<String, String> {
+    let root = root.trim();
+    if root.is_empty() {
+        return Ok(String::new());
+    }
+    let path = std::path::PathBuf::from(shellexpand::tilde(root).into_owned());
+    let meta = std::fs::metadata(&path).map_err(|e| format!("{root}: {e}"))?;
+    if !meta.is_dir() {
+        return Err(format!("{root} is not a directory"));
+    }
+    let canon = path.canonicalize().map_err(|e| format!("{root}: {e}"))?;
+    Ok(canon.to_string_lossy().into_owned())
+}
+
+/// Create a workspace. It starts from the current defaults, so a new workspace
+/// behaves like today's installation until it is configured otherwise.
+#[tauri::command]
+fn create_workspace(
+    state: State<'_, Arc<GuiState>>,
+    name: String,
+    root: String,
+) -> Result<Settings, String> {
+    let mut inner = state.lock()?;
+    let root = normalize_workspace_root(&root)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::session::unix_now();
+    let mut w = crate::settings::Workspace::adopted_from(&inner.settings, &id, now);
+    w.name = if name.trim().is_empty() {
+        if root.is_empty() {
+            "Default".to_string()
+        } else {
+            root.clone()
+        }
+    } else {
+        name.trim().to_string()
+    };
+    w.root = root;
+    inner.settings.workspaces.push(w);
+    inner.settings.active_workspace = id;
+    inner.settings.save().map_err(|e| e.to_string())?;
+    inner.settings_gen = inner.settings_gen.wrapping_add(1);
+    inner.agent_cache.clear();
+    Ok(inner.settings.effective())
+}
+
+/// Rename a workspace or move its root. Sessions stay put: a chat recorded in the
+/// old folder keeps saying so, because its approvals and tool calls happened there.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_workspace(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    name: String,
+    root: String,
+    disabled_tools: Vec<String>,
+    disabled_skills: Vec<String>,
+    mcp_servers: Vec<crate::settings::McpServerEntry>,
+    model: String,
+    base_url: String,
+    api_key: String,
+    system_prompt: String,
+    temperature: Option<f32>,
+    reasoning_effort: String,
+    memory_path: String,
+    skills_dir: String,
+    memory_enabled: Option<bool>,
+    bash_enabled: Option<bool>,
+    file_tools_enabled: Option<bool>,
+    require_approval: Option<bool>,
+    context_budget: Option<usize>,
+    project_instructions: Option<bool>,
+) -> Result<Settings, String> {
+    // The panel round-trips the entries the server gave it, changing only
+    // `enabled`, so revalidating them costs nothing and keeps the invariant that
+    // a stored server is a valid one.
+    crate::settings::validate_mcp_servers(&mcp_servers)?;
+    let mut inner = state.lock()?;
+    let root = normalize_workspace_root(&root)?;
+    inner.settings.set_workspace_runtime(
+        &id,
+        &crate::settings::WorkspaceRuntime {
+            bash_enabled,
+            file_tools_enabled,
+            require_approval,
+            context_budget,
+            project_instructions,
+            memory_enabled,
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            system_prompt: system_prompt.to_string(),
+            temperature,
+            reasoning_effort: reasoning_effort.to_string(),
+            memory_path: memory_path.to_string(),
+            skills_dir: skills_dir.to_string(),
+        },
+    )?;
+    let now = crate::session::unix_now();
+    let Some(w) = inner.settings.workspaces.iter_mut().find(|w| w.id == id) else {
+        return Err(format!("unknown workspace '{id}'"));
+    };
+    if !name.trim().is_empty() {
+        w.name = name.trim().to_string();
+    }
+    w.root = root;
+    // The deny-lists are the workspace's own selection (§24.8), and the names are
+    // the ones the model sees, so the panel hands back exactly what it showed.
+    w.disabled_tools = disabled_tools;
+    w.disabled_skills = disabled_skills;
+    // Which MCP servers this workspace may use. A handshake that exists does not
+    // attach unless its server is enabled here (§24.8, enforced at attach time).
+    w.mcp_servers = mcp_servers;
+    w.updated_at = now;
+    inner.settings.save().map_err(|e| e.to_string())?;
+    inner.settings_gen = inner.settings_gen.wrapping_add(1);
+    inner.agent_cache.clear();
+    Ok(inner.settings.effective())
+}
+
+/// Remove a workspace. The last one cannot go — the GUI always needs one to work
+/// in — and its sessions are either deleted with it or re-homed to the workspace
+/// that takes over, which the caller chooses explicitly (§24.6).
+#[tauri::command]
+fn remove_workspace(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    delete_sessions: bool,
+) -> Result<Settings, String> {
+    let mut inner = state.lock()?;
+    if !inner.settings.workspaces.iter().any(|w| w.id == id) {
+        return Err(format!("unknown workspace '{id}'"));
+    }
+    if inner.settings.workspaces.len() <= 1 {
+        return Err("the last workspace cannot be removed".to_string());
+    }
+    inner.settings.workspaces.retain(|w| w.id != id);
+    inner.settings.active_workspace = inner.settings.workspaces[0].id.clone();
+    let fallback = inner.settings.active_workspace.clone();
+    for mut record in inner.store.load_all() {
+        if record.workspace != id {
+            continue;
+        }
+        if delete_sessions {
+            inner.store.delete(&record.id);
+        } else {
+            record.workspace = fallback.clone();
+            let _ = inner.store.save(&record);
+        }
+    }
+    inner.settings.save().map_err(|e| e.to_string())?;
+    inner.settings_gen = inner.settings_gen.wrapping_add(1);
+    inner.agent_cache.clear();
+    Ok(inner.settings.effective())
+}
+
+/// Save a workspace as a reusable preset, for offering when a workspace is
+/// created. It copies the configuration, so the preset and the workspace it came
+/// from drift apart from that moment on (§24.9).
+#[tauri::command]
+fn save_preset(
+    state: State<'_, Arc<GuiState>>,
+    workspace_id: String,
+    name: String,
+) -> Result<Settings, String> {
+    let mut inner = state.lock()?;
+    inner.settings.save_preset(&workspace_id, &name)?;
+    inner.settings.save().map_err(|e| e.to_string())?;
+    // No generation bump: presets are a catalogue, not a capability of the agent
+    // currently running, so no agent needs rebuilding.
+    Ok(inner.settings.effective())
+}
+
+/// Create a workspace from a preset and switch to it. The result is a copy, so
+/// editing it never rewrites the preset or any other workspace made from it.
+#[tauri::command]
+fn apply_preset(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    name: String,
+) -> Result<Settings, String> {
+    let mut inner = state.lock()?;
+    inner.settings.apply_preset(&id, &name)?;
+    inner.settings.save().map_err(|e| e.to_string())?;
+    inner.settings_gen = inner.settings_gen.wrapping_add(1);
+    inner.agent_cache.clear();
+    Ok(inner.settings.effective())
+}
+
+/// Switch the workspace the GUI is using. Sessions, the LLM binding, tools,
+/// skills, MCP servers and memory all follow it, because the agents are rebuilt
+/// from the effective settings of the newly active workspace (§24).
+#[tauri::command]
+fn set_active_workspace(state: State<'_, Arc<GuiState>>, id: String) -> Result<Settings, String> {
+    let mut inner = state.lock()?;
+    let id = id.trim().to_string();
+    if !inner.settings.workspaces.iter().any(|w| w.id == id) {
+        return Err(format!("unknown workspace '{id}'"));
+    }
+    if inner.settings.active_workspace == id {
+        return Ok(inner.settings.clone());
+    }
+    inner.settings.active_workspace = id;
+    inner.settings.save().map_err(|e| e.to_string())?;
+    // Approvals belong to the agents of the old workspace: deny them before the
+    // rebuild, exactly as a settings save does.
+    for broker in &inner.brokers {
+        broker.reject_all();
+    }
+    inner.settings_gen = inner.settings_gen.wrapping_add(1);
+    inner.agent_cache.clear();
+    Ok(inner.settings.clone())
 }
 
 /// Apply and persist settings; the agent cache is invalidated and any MCP
@@ -1304,6 +1889,45 @@ fn save_settings(
     inner.settings.context_budget = context_budget;
     inner.settings.mcp_servers = mcp_servers;
     inner.settings.providers = providers;
+    // The dialog edits the workspace in use. The globals above are refreshed too,
+    // because they are what a *new* workspace starts from; these values are what
+    // this workspace actually runs with.
+    if let Some(idx) = inner
+        .settings
+        .workspaces
+        .iter()
+        .position(|w| w.id == inner.settings.active_workspace)
+    {
+        let g = inner.settings.clone();
+        let now = crate::session::unix_now();
+        let w = &mut inner.settings.workspaces[idx];
+        // A workspace named after its folder follows the folder when it moves.
+        let follows_root = w.name == w.root;
+        w.model = g.model.clone();
+        w.base_url = g.base_url.clone();
+        w.api_key = g.api_key.clone();
+        w.system_prompt = g.system_prompt.clone();
+        w.temperature = Some(g.temperature);
+        w.reasoning_effort = g.reasoning_effort.clone();
+        w.project_instructions = g.project_instructions;
+        w.bash_enabled = g.bash_enabled;
+        w.file_tools_enabled = g.file_tools_enabled;
+        w.root = g.bash_workspace.clone();
+        w.skills_dir = g.skills_dir.clone();
+        w.memory_enabled = g.memory_enabled;
+        w.memory_path = g.memory_path.clone();
+        w.require_approval = g.require_approval;
+        w.context_budget = g.context_budget;
+        w.mcp_servers = g.mcp_servers.clone();
+        w.providers = g.providers.clone();
+        // The tool and skill deny-lists are not in this dialog: they are the
+        // workspace's own selection, and overwriting them here would silently
+        // re-enable what the user switched off.
+        if follows_root {
+            w.name = w.root.clone();
+        }
+        w.updated_at = now;
+    }
     inner.settings.save().map_err(|e| e.to_string())?;
     // Pending approvals belong to the old agents: deny them before rebuild.
     for broker in &inner.brokers {
@@ -1341,6 +1965,18 @@ fn save_settings(
     Ok(saved)
 }
 
+/// Names of the MCP servers a workspace allows. A server is added by hand, so it
+/// is opt-in per workspace: a handshake that exists globally does not ride into a
+/// workspace that switched it off (§24.8).
+fn enabled_mcp_servers(settings: &Settings) -> Vec<String> {
+    settings
+        .mcp_servers
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| s.name.clone())
+        .collect()
+}
+
 /// List the registered tools, skills, and plugins for the current settings.
 ///
 /// The panel is settings-scoped, so this reports from a fresh throwaway
@@ -1349,10 +1985,13 @@ fn save_settings(
 fn list_capabilities(state: State<'_, Arc<GuiState>>) -> Result<Capabilities, String> {
     let inner = state.lock()?;
     let broker = Arc::new(crate::approval::ApprovalBroker::default());
-    let base = caps::build_agent(&inner.settings, Arc::clone(&broker));
+    let effective = inner.settings.effective();
+    let base = caps::build_agent(&effective, Arc::clone(&broker));
     let mut agent = base.as_ref().clone();
-    inner.attach_mcp_tools(&mut agent, &broker);
-    Ok(caps::capabilities_of(&Arc::new(agent), &inner.settings))
+    inner.attach_mcp_tools(&mut agent, &broker, &effective);
+    // Describe the effective set, so the panel reports what this workspace will
+    // actually run with.
+    Ok(caps::capabilities_of(&Arc::new(agent), &effective))
 }
 
 /// Report MCP connection progress for the settings dialog and status bar.
@@ -1418,6 +2057,8 @@ fn spawn_forwarder(
         let mut reasoning_buf = String::new();
         let mut tools_buf = Vec::new();
         let mut error_buf: Option<String> = None;
+        // What the provider said the turn cost, carried to `stream-finished`.
+        let mut usage: Option<(u64, u64)> = None;
         loop {
             let Ok(event) = rx.recv().await else {
                 break;
@@ -1520,6 +2161,10 @@ fn spawn_forwarder(
                     // Persist this session's working plan from its own agent.
                     let agent = inner.agent(&session_id);
                     record.plan = agent.plan_items();
+                    // What the provider said this turn cost. It is the only honest
+                    // source: a local estimate would drift from the provider's own
+                    // count exactly when the context is close to its limit.
+                    usage = agent.last_token_usage();
                     let _ = inner.store.save(&record);
                 }
                 if inner
@@ -1532,7 +2177,19 @@ fn spawn_forwarder(
             }
         }
 
-        let _ = app.emit("stream-finished", StreamFinished { session_id, gen });
+        let (prompt_tokens, completion_tokens) = match usage {
+            Some((prompt, completion)) => (Some(prompt), Some(completion)),
+            None => (None, None),
+        };
+        let _ = app.emit(
+            "stream-finished",
+            StreamFinished {
+                session_id,
+                gen,
+                prompt_tokens,
+                completion_tokens,
+            },
+        );
     });
 }
 
@@ -1569,6 +2226,14 @@ pub(crate) fn run() -> anyhow::Result<()> {
             send_message,
             retry_last,
             truncate_session,
+            compacted_archive,
+            archived_messages,
+            session_overview,
+            export_chat,
+            trashed_chats,
+            restore_session,
+            purge_trash,
+            restore_compacted,
             fork_session,
             open_url,
             search_files,
@@ -1579,9 +2244,23 @@ pub(crate) fn run() -> anyhow::Result<()> {
             init_agents,
             get_settings,
             save_settings,
+            set_active_workspace,
+            create_workspace,
+            apply_preset,
+            save_preset,
+            update_workspace,
+            remove_workspace,
             list_capabilities,
             mcp_status,
-            reconnect_mcp
+            reconnect_mcp,
+            move_session,
+            search_sessions,
+            list_memories,
+            remember_memory,
+            forget_memory,
+            allow_tool,
+            forget_allowed_tool,
+            list_profiles,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1590,6 +2269,347 @@ pub(crate) fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_memory_has_to_say_something_and_fit() {
+        assert_eq!(clean_memory_text("  hello  ").unwrap(), "hello");
+        assert!(clean_memory_text("   ").is_err());
+        assert!(clean_memory_text("").is_err());
+        // The cap counts characters, not bytes: a CJK memory may hold a full
+        // 2000 of them, and a byte cap would reject most of it.
+        let cjk = "记".repeat(MAX_MEMORY_CHARS);
+        assert_eq!(
+            clean_memory_text(&cjk).unwrap().chars().count(),
+            MAX_MEMORY_CHARS
+        );
+        assert!(clean_memory_text(&"记".repeat(MAX_MEMORY_CHARS + 1)).is_err());
+    }
+
+    /// The fast paths must not change what is found, so this attacks the two
+    /// cases they are not allowed to handle: a cased non-ASCII needle, and an
+    /// ASCII needle against non-ASCII text where Unicode folding can match.
+    #[test]
+    fn a_case_insensitive_search_survives_the_fast_paths() {
+        let dir = std::env::temp_dir().join(format!("bos-fold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::session::SessionStore::new(&dir);
+        let mut record = crate::session::SessionRecord::new();
+        record.title = "folding".to_string();
+        record.workspace = "w1".to_string();
+        record
+            .messages
+            .push(crate::session::ChatMessage::user("Grüße aus Köln, ÄÖÜ"));
+        record
+            .messages
+            .push(crate::session::ChatMessage::user("中文检索应当命中"));
+        store.save(&record).expect("saved");
+
+        // Cased non-ASCII needle: the allocating path must still be used.
+        assert_eq!(store.search("grüße", 10).len(), 1, "non-ASCII case folding");
+        assert_eq!(store.search("köln", 10).len(), 1, "non-ASCII case folding");
+        // An uncased needle takes the byte path, and must still find CJK.
+        assert_eq!(store.search("中文检索", 10).len(), 1, "uncased byte path");
+        // And plain ASCII, the case the fast path is for.
+        assert_eq!(store.search("aus", 10).len(), 1, "ascii ignore-case");
+        assert!(
+            store.search("gruse", 10).is_empty(),
+            "no false match from folding"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_search_cache_notices_a_rewritten_session() {
+        let dir = std::env::temp_dir().join(format!("bos-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::session::SessionStore::new(&dir);
+        let mut record = crate::session::SessionRecord::new();
+        record.title = "first".to_string();
+        record.workspace = "w1".to_string();
+        record
+            .messages
+            .push(crate::session::ChatMessage::user("alpha only"));
+        store.save(&record).expect("saved");
+        assert_eq!(store.search("alpha", 10).len(), 1, "this warms the cache");
+
+        // Rewrite the same session. Any rewrite changes the file's length, so
+        // the stamp catches it even when both writes land in the same tick.
+        record.title = "second".to_string();
+        record.messages = vec![crate::session::ChatMessage::user("beta only, and longer")];
+        store.save(&record).expect("saved");
+        assert!(
+            store.search("alpha", 10).is_empty(),
+            "a rewritten session must not be served from the cache"
+        );
+        assert_eq!(store.search("beta", 10).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Prints what one keystroke costs with and without the parse cache.
+    ///
+    /// Ignored rather than asserted: a timing is evidence for a person, not a
+    /// gate, because a busy machine would make it flaky. Run it with
+    /// `cargo test -p gui search_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn search_benchmark_prints_cold_and_warm_costs() {
+        let dir = std::env::temp_dir().join(format!("bos-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::session::SessionStore::new(&dir);
+        const SESSIONS: usize = 200;
+        const MESSAGES: usize = 30;
+        for n in 0..SESSIONS {
+            let mut record = crate::session::SessionRecord::new();
+            record.title = format!("session {n}");
+            record.workspace = "w1".to_string();
+            for m in 0..MESSAGES {
+                record
+                    .messages
+                    .push(crate::session::ChatMessage::user(format!(
+                        "message {m} of {n} with some words to scan over"
+                    )));
+            }
+            if n == SESSIONS - 1 {
+                record
+                    .messages
+                    .push(crate::session::ChatMessage::user("消息 检索 命中"));
+            }
+            store.save(&record).expect("saved");
+        }
+        // A needle that matches one message, so every query scans everything.
+        // The CJK needle is here because the ASCII fast path cannot serve it:
+        // it is the case that proves the cached lowercase is what pays.
+        println!("[bench] {SESSIONS} sessions x {MESSAGES} messages, 50-hit cap");
+        for needle in ["message 29 of 199", "消息"] {
+            let first = std::time::Instant::now();
+            let expected = store.search(needle, 50).len();
+            let first = first.elapsed();
+            let rest = std::time::Instant::now();
+            for _ in 0..20 {
+                assert_eq!(store.search(needle, 50).len(), expected);
+            }
+            let rest = rest.elapsed() / 20;
+            println!(
+                "[bench] {needle:?}: {expected} hit(s); first {first:?}; following {rest:?} ({:.1}x)",
+                first.as_secs_f64() / rest.as_secs_f64().max(f64::EPSILON)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_finds_a_phrase_across_sessions() {
+        let dir = std::env::temp_dir().join(format!("bos-search-{}", std::process::id()));
+        let store = crate::session::SessionStore::new(&dir);
+        let mut first = crate::session::SessionRecord::new();
+        first.title = "about foxes".to_string();
+        first.workspace = "w1".to_string();
+        first
+            .messages
+            .push(crate::session::ChatMessage::user("The Quick brown fox"));
+        store.save(&first).expect("saved");
+        let mut second = crate::session::SessionRecord::new();
+        second.title = "unrelated".to_string();
+        second.workspace = "w2".to_string();
+        second
+            .messages
+            .push(crate::session::ChatMessage::user("nothing to see"));
+        store.save(&second).expect("saved");
+
+        // Case-insensitive, and the snippet quotes the original casing.
+        let hits = store.search("quick", 10);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].session, first.id);
+        assert_eq!(hits[0].workspace, "w1");
+        assert_eq!(hits[0].index, 0);
+        assert!(hits[0].snippet.contains("Quick"), "{}", hits[0].snippet);
+
+        // A title is findable from the same box.
+        let by_title = store.search("foxes", 10);
+        assert_eq!(by_title.len(), 1);
+        assert!(by_title[0].snippet.contains("foxes"));
+
+        // Nothing, and the cap and the empty query all behave.
+        assert!(store.search("platypus", 10).is_empty());
+        assert!(store.search("", 10).is_empty());
+        assert!(store.search("nothing", 0).is_empty());
+        assert_eq!(store.search("e", 1).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_can_be_moved_between_workspaces() {
+        let dir = std::env::temp_dir().join(format!("bos-move-{}", std::process::id()));
+        let store = crate::session::SessionStore::new(&dir);
+        let mut record = crate::session::SessionRecord::new();
+        record
+            .messages
+            .push(crate::session::ChatMessage::user("hello"));
+        store.save(&record).expect("saved");
+        let id = record.id.clone();
+
+        let moved = store.move_to(&id, "workspace-b").expect("moved");
+        assert_eq!(moved.workspace, "workspace-b");
+        // A move changes who runs the chat, not what was said in it.
+        assert_eq!(moved.messages.len(), 1);
+        let reloaded = store.load(&id).expect("reloaded");
+        assert_eq!(reloaded.workspace, "workspace-b");
+        assert_eq!(reloaded.messages.len(), 1);
+
+        assert!(store.move_to("missing-session", "workspace-b").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_workspace_can_be_pointed_at_its_own_model() {
+        let mut s = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        s.migrate();
+        let id = s.workspaces[0].id.clone();
+        s.set_workspace_runtime(
+            &id,
+            &crate::settings::WorkspaceRuntime {
+                model: "big/model".to_string(),
+                base_url: "https://x/v1".to_string(),
+                api_key: "k".to_string(),
+                system_prompt: "be terse".to_string(),
+                temperature: Some(0.0),
+                reasoning_effort: "high".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("configured");
+        let w = s.workspaces.iter().find(|w| w.id == id).expect("workspace");
+        assert_eq!(w.model, "big/model");
+        assert_eq!(w.base_url, "https://x/v1");
+        assert_eq!(w.system_prompt, "be terse");
+        // 0.0 is a setting, not an absence: `Option` is what keeps that true.
+        assert_eq!(w.temperature, Some(0.0));
+        assert_eq!(w.reasoning_effort.as_deref(), Some("high"));
+        // Blanks fall back to the globals, and a blank effort is an absence again.
+        s.set_workspace_runtime(
+            &id,
+            &crate::settings::WorkspaceRuntime {
+                reasoning_effort: "  ".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("configured");
+        let w = s.workspaces.iter().find(|w| w.id == id).expect("workspace");
+        assert_eq!(w.model, "");
+        assert_eq!(w.temperature, None);
+        assert_eq!(w.reasoning_effort, None);
+        // And the overlay is what the agent would see.
+        let eff = s.effective();
+        assert_eq!(
+            eff.model,
+            crate::settings::Settings::from_config_value(&serde_json::Value::Null).model
+        );
+        assert!(s
+            .set_workspace_runtime("nope", &crate::settings::WorkspaceRuntime::default())
+            .is_err());
+    }
+
+    #[test]
+    fn saving_a_preset_copies_the_workspace_and_refuses_a_duplicate_name() {
+        let mut s = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        s.migrate();
+        s.workspaces[0].model = "m/x".to_string();
+        let ws_id = s.workspaces[0].id.clone();
+        let id = s.save_preset(&ws_id, "Strict").expect("saved");
+        assert_eq!(s.presets.len(), 1);
+        assert_eq!(s.presets[0].name, "Strict");
+        assert_eq!(s.presets[0].workspace.model, "m/x");
+        assert_eq!(s.presets[0].id, id);
+        assert_ne!(
+            s.presets[0].workspace.id, ws_id,
+            "a copy, not the workspace"
+        );
+        // Editing the workspace afterwards must not reach the preset.
+        s.workspaces[0].model = "changed".to_string();
+        assert_eq!(s.presets[0].workspace.model, "m/x");
+        // Names are how a preset is picked: a duplicate would be ambiguous.
+        assert!(s.save_preset(&ws_id, "Strict").is_err());
+        assert!(s.save_preset("nope", "x").is_err());
+    }
+
+    #[test]
+    fn applying_a_preset_creates_a_divergent_workspace() {
+        let mut s = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        s.migrate();
+        let mut w = s.workspaces[0].clone();
+        w.model = "preset/model".to_string();
+        w.root = "/preset".to_string();
+        s.presets.push(crate::settings::Preset {
+            id: "p1".to_string(),
+            name: "Strict".to_string(),
+            workspace: w,
+        });
+        let before = s.workspaces.len();
+        let id = s.apply_preset("p1", "").expect("preset applies");
+        assert_eq!(s.workspaces.len(), before + 1);
+        assert_eq!(s.active_workspace, id);
+        let applied = s.workspaces.iter().find(|w| w.id == id).expect("applied");
+        assert_eq!(applied.name, "Strict");
+        assert_eq!(applied.model, "preset/model");
+        assert_ne!(
+            applied.id, s.presets[0].workspace.id,
+            "a copy, not the preset"
+        );
+        // Divergence: editing what we made must leave the preset untouched.
+        s.workspaces
+            .iter_mut()
+            .find(|w| w.id == id)
+            .expect("applied")
+            .model = "changed".to_string();
+        assert_eq!(s.presets[0].workspace.model, "preset/model");
+        assert!(s.apply_preset("nope", "").is_err());
+    }
+
+    #[test]
+    fn a_workspace_root_must_be_a_directory_and_is_stored_canonical() {
+        let dir = std::env::temp_dir();
+        let rooted = normalize_workspace_root(&dir.to_string_lossy()).expect("temp dir");
+        // Canonical, so `~`, symlinks and `..` cannot make two workspaces of one
+        // folder (on macOS /tmp is itself a symlink, which this asserts).
+        assert_eq!(rooted, dir.canonicalize().unwrap().to_string_lossy());
+        assert!(normalize_workspace_root("")
+            .expect("empty means cwd")
+            .is_empty());
+        assert!(normalize_workspace_root("/nope/not/here-2971").is_err());
+
+        let file = dir.join("bos-workspace-root-probe.txt");
+        std::fs::write(&file, "x").expect("probe file");
+        assert!(
+            normalize_workspace_root(&file.to_string_lossy()).is_err(),
+            "a file is not a root"
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_workspace_only_attaches_the_servers_it_switched_on() {
+        let mut settings = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        settings.mcp_servers = vec![
+            crate::settings::McpServerEntry {
+                name: "on".to_string(),
+                enabled: true,
+                ..crate::settings::McpServerEntry::default()
+            },
+            crate::settings::McpServerEntry {
+                name: "off".to_string(),
+                enabled: false,
+                ..crate::settings::McpServerEntry::default()
+            },
+        ];
+        assert_eq!(
+            enabled_mcp_servers(&settings),
+            vec!["on".to_string()],
+            "a switched-off server does not attach"
+        );
+        // Nothing configured means nothing attaches, rather than everything.
+        settings.mcp_servers.clear();
+        assert!(enabled_mcp_servers(&settings).is_empty());
+    }
     use super::*;
 
     fn record_with(messages: Vec<ChatMessage>) -> SessionRecord {

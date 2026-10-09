@@ -1,10 +1,26 @@
 /* BOS chat frontend: bridges Tauri IPC (invoke + events) to the DOM. */
 "use strict";
 
-const { invoke } = window.__TAURI__.core;
+// Late-bound on purpose: the runtime injects `__TAURI__`, and reading it per
+// call means a harness (or a test double) can observe what a form sends.
+const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
 const { listen } = window.__TAURI__.event;
 
 /* ---------- state ---------- */
+
+/* Only the tail of a long transcript is drawn: a 10 000-message chat should cost
+   what a 200-message one does. "Load earlier" grows the window explicitly, so the
+   transcript never grows sideways under a scroll position the user did not pick. */
+const WINDOW = 200;
+let lastWindowLen = -1;
+let lastWindowStart = -1;
+let loadEarlierEl = null;
+let topSpacerEl = null;    // stands in for the un-rendered rows above the window
+let spacerCredit = 0;      // px the spacer gave up, so a grown window can stay put
+let lastSpacerPx = 0;      // what the spacer was last rendered at
+let avgRowPx = 64;         // measured from rendered rows, off the streaming path
+let scrollGrowBound = false;
+let lastChildCount = -1;   // messagesEl.childElementCount after the last pass
 
 const state = {
   sessions: [],          // [{id, title, updated_at}] newest first
@@ -15,10 +31,26 @@ const state = {
   toolCount: 0,
   error: null,
   model: "",
+  workspaces: [],       // [{id,name,root,model}] from the server (§24)
+  presets: [],          // [{id,name}] reusable workspace configurations (§24.9)
+  activeWorkspace: "",
+  wsEdit: null,         // {mode:'create'|'edit'|'remove', id} | null — inline form
+  wsBusy: false,        // a workspace command is in flight
+  windowExtra: 0,       // extra rows kept above the tail window
+  collapsed: {},        // workspace groups whose chats are hidden
+  hits: [],             // content matches for the current search
+  usage: { prompt: 0, completion: 0 }, // what the provider said the last turn cost
+  memories: [],         // what the agent remembers across chats
   budget: 32768,        // context-budget meter ceiling (tokens; 0 = off)
   approvals: [],         // queued approval-request payloads
+  allowedTools: [],      // tools allowed permanently ("always allow")
+  profiles: [],          // discovered [llm.<name>] profiles, key-free
   queue: {},             // sessionId -> [text] follow-ups waiting for the stream
-  compacting: {},        // sessionId -> true while /compact summarizes in the background
+  compacting: {},
+  archived: 0,          // turns the last compaction folded, restorable
+  trashed: [],          // chats in the trash, newest first
+  overview: null,       // counts and outline for the active chat
+  overviewId: null,     // which chat that overview describes        // sessionId -> true while /compact summarizes in the background
   initializing: false,   // true while /init drafts AGENTS.md in the background
   editing: null,         // {sessionId, index} | null — inline message editor open
   plan: [],              // last server-side plan of the active session (draft source)
@@ -64,6 +96,7 @@ const statusRight = $("status-right");
 const modal = $("settings-modal");
 const settingsForm = $("settings-form");
 const setModel = $("set-model");
+const profilesHost = $("profiles-list");
 const setBaseUrl = $("set-base-url");
 const setApiKey = $("set-api-key");
 const setSystem = $("set-system");
@@ -98,6 +131,10 @@ const approvalModal = $("approval-modal");
 const approvalTool = $("approval-tool");
 const approvalArgs = $("approval-args");
 const approvalDiff = $("approval-diff");
+const allowedList = $("allowed-list");
+const trashList = $("trash-list");
+const trashPurge = $("trash-purge");
+trashPurge.addEventListener("click", () => void purgeTrash());
 const sessionSearch = $("session-search");
 const paletteEl = $("cmd-palette");
 const paletteList = $("cmd-list");
@@ -168,27 +205,467 @@ function fmtTokens(v) {
   return v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v);
 }
 
+/* Sessions belong to a workspace, so the panel shows them that way: one header per
+   workspace (name, root, the model bound to it) with its chats underneath. Pure, so
+   the grouping can be tested without a DOM. */
+function groupSessions(sessions, workspaces, activeId) {
+  const byId = new Map((workspaces || []).map((w) => [w.id, w]));
+  const groups = new Map();
+  for (const s of sessions) {
+    const id = s.workspace || activeId || "";
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(s);
+  }
+  return [...groups.entries()].map(([id, items]) => {
+    const w = byId.get(id);
+    return {
+      id,
+      name: (w && (w.name || w.root)) || id || "Default",
+      root: (w && w.root) || "",
+      model: (w && w.model) || "",
+      sessions: items,
+    };
+  });
+}
+
+/* Every workspace command returns the newly effective settings, because the
+   server bumps its settings generation when the choice changes (each cached agent
+   is then rebuilt from the new model and tool set). One applier keeps that
+   invariant in a single place. */
+async function applyWorkspaceSnapshot(s) {
+  state.workspaces = s.workspaces || [];
+  state.presets = s.presets || [];
+  state.activeWorkspace = s.active_workspace || "";
+  state.model = s.model || state.model;
+  state.budget = s.context_budget ?? state.budget;
+  const list = await invoke("list_sessions");
+  state.sessions = Array.isArray(list) ? list : [];
+  renderSidebar();
+  renderTitle();
+}
+
+/* A workspace command, with the failure reported the same way the transcript
+   reports one: in the status line, not silently swallowed. */
+async function workspaceCommand(promise) {
+  try {
+    state.wsBusy = true;
+    await applyWorkspaceSnapshot(await promise);
+    state.wsEdit = null;
+  } catch (e) {
+    state.error = String(e);
+  } finally {
+    state.wsBusy = false;
+    renderSidebar();
+    scheduleRepaint();
+  }
+}
+
+async function switchWorkspace(id) {
+  if (!id || id === state.activeWorkspace) return;
+  await workspaceCommand(invoke("set_active_workspace", { id }));
+}
+
+/* Skills the panel can offer: the ones the capability listing knows about, plus any
+   the workspace already denies — so a denied skill stays visible (and can be turned
+   back on) even before that listing has been loaded. */
+function skillNamesFor(workspace) {
+  const names = (state.skills || []).map((s) => s && s.name).filter(Boolean);
+  for (const denied of (workspace && workspace.disabled_skills) || []) {
+    if (!names.includes(denied)) names.push(denied);
+  }
+  return names;
+}
+
+/* Which skills the form has switched off, same deny-list shape as the tools. */
+function disabledSkillsFromForm(form) {
+  return [...form.querySelectorAll(".ws-skill")]
+    .filter((box) => !box.checked)
+    .map((box) => box.value);
+}
+
+/* The MCP servers a workspace allows. Servers are opt-in: an entry is always
+   configured by hand with its own transport, so the panel sends the entries back
+   untouched apart from `enabled`, and a server nobody ticked simply does not
+   attach. */
+function mcpSelectionFromForm(form, known) {
+  const boxes = [...form.querySelectorAll(".ws-mcp")];
+  const ticked = new Map(boxes.map((box) => [box.value, box.checked]));
+  return (known.mcp_servers || []).map((server) => ({
+    ...server,
+    enabled: ticked.has(server.name) ? ticked.get(server.name) : server.enabled,
+  }));
+}
+
+/* The built-in tools a workspace may switch off. These are the names the model
+   sees, which is what `caps::build_agent` gates on, so the panel and the server
+   agree on the vocabulary by construction. */
+const BUILTIN_TOOLS = ["bash", "read_file", "write_file", "list_dir", "plan"];
+
+/* Which tools the form has switched off: the ones the workspace denies, so the
+   caller sends a deny-list rather than a snapshot of every tool that exists. A
+   tool added to the build later therefore appears for people with no opinion. */
+function disabledToolsFromForm(form) {
+  return [...form.querySelectorAll(".ws-tool")]
+    .filter((box) => !box.checked)
+    .map((box) => box.value);
+}
+
+/* Workspace editing is an inline form rather than a native dialog: a webview may
+   not implement prompt(), and an inline form is also the version the harness can
+   exercise. */
+function openWorkspaceForm(mode, id) {
+  state.wsEdit = { mode, id };
+  renderSidebar();
+  const first = sessionList.querySelector(".ws-form input");
+  if (first) first.focus();
+}
+
+function closeWorkspaceForm() {
+  state.wsEdit = null;
+  renderSidebar();
+}
+
+/* Save the workspace being edited as a reusable preset: a copy of its
+   configuration, offered next to "New workspace" from then on (§24.9). */
+function submitWorkspaceAsPreset(form) {
+  const id = state.wsEdit ? state.wsEdit.id : "";
+  const name = (form.querySelector(".ws-name") || {}).value || "";
+  return workspaceCommand(invoke("save_preset", { workspaceId: id, name }));
+}
+
+function submitWorkspaceForm(form) {
+  const mode = state.wsEdit ? state.wsEdit.mode : "create";
+  const id = state.wsEdit ? state.wsEdit.id : "";
+  const name = (form.querySelector(".ws-name") || {}).value || "";
+  const root = (form.querySelector(".ws-root") || {}).value || "";
+  if (mode === "remove") {
+    const del = form.querySelector(".ws-del-chats");
+    return workspaceCommand(invoke("remove_workspace", { id, deleteSessions: !!(del && del.checked) }));
+  }
+  if (mode === "create") {
+    return workspaceCommand(invoke("create_workspace", { name, root }));
+  }
+  const known = state.workspaces.find((w) => w.id === id) || {};
+  // A field the open form does not show is carried through rather than cleared,
+  // the same rule the skills follow: a rename must not repoint the model.
+  const shown = (cls, fallback) => {
+    const field = form.querySelector(cls);
+    return field ? field.value : fallback;
+  };
+  const tempField = form.querySelector(".ws-temperature");
+  const tempValue = tempField ? Number(tempField.value) : NaN;
+  const temperature = tempField
+    ? tempField.value.trim() !== "" && Number.isFinite(tempValue)
+      ? tempValue
+      : null
+    : known.temperature ?? null;
+  return workspaceCommand(
+    invoke("update_workspace", {
+      id,
+      name,
+      root,
+      model: shown(".ws-model", known.model || ""),
+      baseUrl: shown(".ws-base-url", known.base_url || ""),
+      // Never rendered, so always carried: the server keeps the key it has.
+      apiKey: known.api_key || "",
+      systemPrompt: shown(".ws-system-prompt", known.system_prompt || ""),
+      memoryPath: shown(".ws-memory", known.memory_path || ""),
+      skillsDir: shown(".ws-skills", known.skills_dir || ""),
+      // A form without the box leaves the switch as it was, rather than reading
+      // an absent checkbox as "off" — the one field here that can be unstated.
+      memoryEnabled: (() => {
+        const box = form.querySelector(".ws-memory-on");
+        return box ? box.checked : known.memory_enabled !== false;
+      })(),
+      bashEnabled: workspaceFlag(form, known, "ws-bash", "bash_enabled"),
+      fileToolsEnabled: workspaceFlag(form, known, "ws-files", "file_tools_enabled"),
+      requireApproval: workspaceFlag(form, known, "ws-approval", "require_approval"),
+      projectInstructions: workspaceFlag(form, known, "ws-instructions", "project_instructions"),
+      contextBudget: workspaceBudget(form, known),
+      temperature,
+      reasoningEffort: shown(".ws-reasoning", known.reasoning_effort || ""),
+      disabledTools: disabledToolsFromForm(form),
+      // Not exposed in the panel yet, so it is carried through rather than
+      // cleared: saving a rename must not silently re-enable a skill.
+      // Only a form that actually showed the skills may rewrite them; otherwise
+      // the stored deny-list is carried through rather than cleared.
+      disabledSkills: form.querySelectorAll(".ws-skill").length
+        ? disabledSkillsFromForm(form)
+        : known.disabled_skills || [],
+      mcpServers: mcpSelectionFromForm(form, known),
+    }),
+  );
+}
+
+/* Re-home a chat into another workspace. The command returns the session list,
+   so the sidebar re-groups from the server's answer rather than guessing. */
+async function moveSession(id, workspaceId) {
+  const list = await invoke("move_session", { id, workspaceId });
+  state.sessions = list;
+  renderSidebar();
+}
+
+/* The form is rebuilt from `state.wsEdit`, so it survives a re-render (a stream
+   tick, a search keystroke) without losing what the user is looking at. */
+function workspaceFormEl(workspace) {
+  const mode = state.wsEdit.mode;
+  const form = el("div", "ws-form");
+  if (mode === "remove") {
+    form.appendChild(el("div", "ws-form-title", `Remove “${workspace.name}”?`));
+    const label = el("label", "ws-form-row");
+    const del = el("input", "ws-del-chats");
+    del.type = "checkbox";
+    label.appendChild(del);
+    label.appendChild(el("span", "", "delete its chats too"));
+    form.appendChild(label);
+    const remove = el("button", "ws-form-go danger", state.wsBusy ? "…" : "Remove");
+    remove.addEventListener("click", () => submitWorkspaceForm(form));
+    form.appendChild(remove);
+  } else {
+    if (mode === "edit" && workspace) {
+      form.appendChild(el("div", "ws-form-title", "Edit workspace"));
+    }
+    const name = el("input", "ws-name");
+    name.placeholder = "Name";
+    name.value = (mode === "edit" && workspace && workspace.name) || "";
+    form.appendChild(name);
+    const root = el("input", "ws-root");
+    root.placeholder = "Root folder (empty = current folder)";
+    root.value = (mode === "edit" && workspace && workspace.root) || "";
+    form.appendChild(root);
+    if (mode === "edit" || mode === "create") {
+      const tools = el("div", "ws-tools");
+      tools.appendChild(el("div", "ws-form-hint", "Tools this workspace may use"));
+      const off = new Set((workspace && workspace.disabled_tools) || []);
+      for (const tool of BUILTIN_TOOLS) {
+        const row = el("label", "ws-tool-row");
+        const box = el("input", "ws-tool");
+        box.type = "checkbox";
+        box.value = tool;
+        box.checked = !off.has(tool);
+        row.appendChild(box);
+        row.appendChild(el("span", "", tool));
+        tools.appendChild(row);
+      }
+      form.appendChild(tools);
+      const skillNames = mode === "edit" ? skillNamesFor(workspace) : [];
+      if (skillNames.length) {
+        const skills = el("div", "ws-tools");
+        skills.appendChild(el("div", "ws-form-hint", "Skills this workspace may use"));
+        const denied = new Set((workspace && workspace.disabled_skills) || []);
+        for (const name of skillNames) {
+          const row = el("label", "ws-tool-row");
+          const box = el("input", "ws-skill");
+          box.type = "checkbox";
+          box.value = name;
+          box.checked = !denied.has(name);
+          row.appendChild(box);
+          row.appendChild(el("span", "", name));
+          skills.appendChild(row);
+        }
+        form.appendChild(skills);
+      }
+      // Servers are listed on an existing workspace: a new one is seeded from the
+      // defaults and can switch them off right after.
+      const servers = (workspace && workspace.mcp_servers) || [];
+      if (mode === "edit" && servers.length) {
+        const mcp = el("div", "ws-tools");
+        mcp.appendChild(el("div", "ws-form-hint", "MCP servers this workspace may use"));
+        for (const server of servers) {
+          const row = el("label", "ws-tool-row");
+          const box = el("input", "ws-mcp");
+          box.type = "checkbox";
+          box.value = server.name;
+          box.checked = !!server.enabled;
+          row.appendChild(box);
+          row.appendChild(el("span", "", server.name));
+          mcp.appendChild(row);
+        }
+        form.appendChild(mcp);
+      }
+    }
+    if (mode === "edit" && workspace) {
+      const runtime = el("div", "ws-tools");
+      runtime.appendChild(
+        el("div", "ws-form-hint", "Model for this workspace (empty = inherit the defaults)"),
+      );
+      const runtimeInput = (cls, placeholder, value) => {
+        // Styled like the name field and read by its own class: the key is
+        // deliberately absent, because a secret re-rendered into the DOM is a
+        // secret in a screenshot, and the server already has it.
+        const input = el("input", `ws-name ws-runtime ${cls}`);
+        input.placeholder = placeholder;
+        // `value || ""` would turn the legitimate temperature 0 into blank.
+        input.value = value === null || value === undefined ? "" : String(value);
+        return input;
+      };
+      runtime.appendChild(runtimeInput("ws-model", "model", workspace.model));
+      runtime.appendChild(runtimeInput("ws-base-url", "base url (empty = inherit)", workspace.base_url));
+      runtime.appendChild(runtimeInput("ws-reasoning", "reasoning effort: low | medium | high", workspace.reasoning_effort));
+      runtime.appendChild(runtimeInput("ws-temperature", "temperature (empty = inherit)", workspace.temperature === null || workspace.temperature === undefined ? "" : workspace.temperature));
+      runtime.appendChild(runtimeInput("ws-system-prompt", "system prompt", workspace.system_prompt));
+      runtime.appendChild(runtimeInput("ws-memory", "memory file (empty = inherit)", workspace.memory_path));
+      runtime.appendChild(runtimeInput("ws-skills", "skills dir (empty = inherit)", workspace.skills_dir));
+      const memoryBox = document.createElement("label");
+      memoryBox.className = "row-check";
+      const memoryInput = document.createElement("input");
+      memoryInput.type = "checkbox";
+      memoryInput.className = "ws-memory-on";
+      memoryInput.checked = workspace.memory_enabled !== false;
+      memoryBox.appendChild(memoryInput);
+      memoryBox.appendChild(document.createTextNode(" memory"));
+      runtime.appendChild(memoryBox);
+      // The workspace owns its policy too, so the form covers every field it
+      // owns rather than only the model half of them.
+      runtime.appendChild(
+        workspaceCheck(form, "ws-bash", "bash", workspace.bash_enabled !== false),
+      );
+      runtime.appendChild(
+        workspaceCheck(form, "ws-files", "file tools", workspace.file_tools_enabled !== false),
+      );
+      runtime.appendChild(
+        workspaceCheck(form, "ws-approval", "approval gate", workspace.require_approval !== false),
+      );
+      runtime.appendChild(
+        workspaceCheck(
+          form,
+          "ws-instructions",
+          "project instructions",
+          workspace.project_instructions !== false,
+        ),
+      );
+      runtime.appendChild(
+        runtimeInput("ws-budget", "context budget (tokens)", workspace.context_budget),
+      );
+      form.appendChild(runtime);
+    }
+    if (mode === "edit") {
+      const asPreset = el("button", "ws-form-go ws-preset", "Save as preset");
+      asPreset.title = "Reuse this configuration when creating a workspace";
+      asPreset.addEventListener("click", () => submitWorkspaceAsPreset(form));
+      form.appendChild(asPreset);
+    }
+    const go = el("button", "ws-form-go", state.wsBusy ? "…" : mode === "edit" ? "Save" : "Create");
+    go.addEventListener("click", () => submitWorkspaceForm(form));
+    form.appendChild(go);
+  }
+  const cancel = el("button", "ws-form-cancel", "Cancel");
+  cancel.addEventListener("click", closeWorkspaceForm);
+  form.appendChild(cancel);
+  return form;
+}
+
 function renderSidebar() {
   sessionList.textContent = "";
+  // renderSidebar is the sidebar's single re-render point and every session or
+  // workspace change already comes through it, so the Settings list is refreshed
+  // here rather than in a second place that could drift out of step.
+  renderWorkspaceManager();
+  renderSearchHits();
   const q = state.search.trim().toLowerCase();
-  for (const s of state.sessions) {
-    const title = s.title || "New chat";
-    if (q && !title.toLowerCase().includes(q)) continue;
+  const visible = state.sessions.filter(
+    (s) => !q || (s.title || "New chat").toLowerCase().includes(q),
+  );
+  for (const group of groupSessions(visible, state.workspaces, state.activeWorkspace)) {
+    // The header is the workspace switcher's anchor: root on hover, bound model
+    // beside the name so the panel answers "which model am I about to use?".
+    const head = el("div", "ws-head");
+    head.title = group.root
+      ? `${group.root} — click to switch`
+      : `${group.name} — click to switch`;
+    if (group.id === state.activeWorkspace) head.classList.add("active");
+    head.addEventListener("click", () => switchWorkspace(group.id));
+    const edit = el("button", "ws-act", "✎");
+    edit.setAttribute("aria-label", "Rename workspace");
+    edit.title = "Rename or move this workspace";
+    edit.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openWorkspaceForm("edit", group.id);
+    });
+    head.appendChild(edit);
+    const remove = el("button", "ws-act", "✕");
+    remove.setAttribute("aria-label", "Remove workspace");
+    remove.title = "Remove this workspace";
+    remove.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openWorkspaceForm("remove", group.id);
+    });
+    head.appendChild(remove);
+    const folded = !!state.collapsed[group.id];
+    const fold = el("button", "ws-act ws-fold", folded ? "▸" : "▾");
+    fold.title = folded ? "Show this workspace's chats" : "Hide them";
+    fold.addEventListener("click", (e) => {
+      // Otherwise the click would also switch the active workspace, which is the
+      // header's job, not the fold's.
+      e.stopPropagation();
+      state.collapsed[group.id] = !folded;
+      renderSidebar();
+    });
+    head.appendChild(fold);
+    head.appendChild(el("span", "ws-name", clip(group.name, 18)));
+    if (group.model) head.appendChild(el("span", "ws-model", clip(group.model, 16)));
+    head.appendChild(el("span", "ws-count", String(group.sessions.length)));
+    sessionList.appendChild(head);
+    // A collapsed group still counts its chats in the header; it just hides them.
+    if (folded) continue;
+    for (const s of group.sessions) {
     const row = el("div", "session-row" + (s.id === state.activeId ? " active" : ""));
-    row.appendChild(el("span", "title", clip(title, 24)));
+    row.appendChild(el("span", "title", clip(s.title, 24)));
     if (streamOf(s.id)) row.appendChild(el("span", "dot", "●"));
     const age = el("span", "time", fmtAge(s.updated_at));
     age.title = fmtTime(s.updated_at);
     row.appendChild(age);
     const del = el("button", "del", "✕");
+    del.setAttribute("aria-label", "Move this chat to the trash");
     del.title = "Delete chat";
     del.addEventListener("click", (e) => {
       e.stopPropagation();
       deleteSession(s.id);
     });
     row.appendChild(del);
+    // A chat's workspace decides the model and capabilities that run it, so it
+    // can move house without being re-created. Shown only when there is
+    // somewhere to move to.
+    if (state.workspaces.length > 1) {
+      const picker = el("select", "del sess-ws");
+      picker.title = "Move this chat to another workspace";
+      for (const w of state.workspaces) {
+        const option = el("option", "", clip(w.name, 18));
+        option.value = w.id;
+        if (w.id === s.workspace) option.selected = true;
+        picker.appendChild(option);
+      }
+      // Without this the click would also switch to the chat behind the menu.
+      picker.addEventListener("click", (e) => e.stopPropagation());
+      picker.addEventListener("change", (e) => {
+        e.stopPropagation();
+        moveSession(s.id, picker.value);
+      });
+      row.appendChild(picker);
+    }
     row.addEventListener("click", () => switchSession(s.id));
     sessionList.appendChild(row);
+    }
+  }
+  if (state.wsEdit) {
+    const known = state.workspaces.find((w) => w.id === state.wsEdit.id);
+    sessionList.appendChild(
+      workspaceFormEl(known || { id: state.wsEdit.id, name: state.wsEdit.id, root: "" }),
+    );
+  } else {
+    const add = el("button", "ws-add", "+ New workspace");
+    add.addEventListener("click", () => openWorkspaceForm("create", ""));
+    sessionList.appendChild(add);
+    // Presets sit next to "New workspace" because applying one is a way of
+    // creating a workspace — a copy of it, never a link to it (§24.9).
+    for (const preset of state.presets) {
+      const from = el("button", "ws-add ws-add-preset", `▸ ${preset.name || preset.id}`);
+      from.title = "Create a workspace from this preset (a copy, not a link)";
+      from.addEventListener("click", () =>
+        workspaceCommand(invoke("apply_preset", { id: preset.id, name: "" })),
+      );
+      sessionList.appendChild(from);
+    }
   }
 }
 
@@ -839,15 +1316,31 @@ function renderMessages() {
   // DOM row per message. Only then may the leading rows be trusted without being
   // looked at — a splice, a replacement, a load or compaction all fall back to
   // the full pass.
-  const sameShape =
+  const windowLen = Math.min(msgs.length, WINDOW + (state.windowExtra || 0));
+  const windowStart = msgs.length - windowLen;
+  const delta = lastWindowStart < 0 ? 0 : windowStart - lastWindowStart;
+  const slid =
     msgs === lastMsgsRef &&
-    msgs.length === lastMsgsLen &&
-    rowCache.size === msgs.length &&
-    messagesEl.childElementCount === msgs.length &&
+    lastWindowLen >= 0 &&
+    delta >= 0 &&
+    msgs.length - lastMsgsLen === delta &&
+    rowCache.size === lastWindowLen &&
+    messagesEl.childElementCount === lastChildCount &&
     (msgs.length === 0 || msgs[msgs.length - 1] === lastTailRef);
-  const from = sameShape ? Math.min(dirtyFrom, msgs.length) : 0;
+  if (slid && delta > 0) {
+    for (let k = 0; k < delta; k++) {
+      const key = msgKey(msgs[lastWindowStart + k]);
+      const gone = rowCache.get(key);
+      if (gone) {
+        gone.el.remove();
+        rowCache.delete(key);
+      }
+    }
+  }
+  const sameShape = slid && windowLen === lastWindowLen + delta;
+  const from = sameShape ? Math.max(0, Math.min(dirtyFrom - windowStart, windowLen)) : 0;
 
-  if (sameShape && from >= msgs.length) {
+  if (sameShape && dirtyFrom >= msgs.length) {
     // Nothing was marked and the shape is unchanged: the DOM already matches, so
     // the frame costs a scroll write and nothing else.
     if (followTail) stickToBottom();
@@ -860,16 +1353,17 @@ function renderMessages() {
   // row instead of one row per message in the transcript.
   const desired = [];
   const seen = from === 0 ? new Set() : null;
-  for (let i = from; i < msgs.length; i++) {
-    const m = msgs[i];
-    const showCaret = streamingHere && i === msgs.length - 1;
-    const editingHere = !!(editing && editing.index === i);
+  for (let i = from; i < windowLen; i++) {
+    const abs = windowStart + i;
+    const m = msgs[abs];
+    const showCaret = streamingHere && abs === msgs.length - 1;
+    const editingHere = !!(editing && editing.index === abs);
     const opts = {
-      index: i,
-      regen: idle && i === lastAssistant && !!m.text,
+      index: abs,
+      regen: idle && abs === lastAssistant && !!m.text,
       edit: idle && m.role === "User" && !!m.text,
       del: idle,
-      branch: idle && i > 0,
+      branch: idle && abs > 0,
     };
     const key = msgKey(m);
     if (seen) seen.add(key);
@@ -879,7 +1373,7 @@ function renderMessages() {
       const row = el("div", m.role === "User" ? "user" : "assistant");
       row.classList.add("msg");
       if (editingHere) {
-        row.appendChild(buildEditor(m, i));
+        row.appendChild(buildEditor(m, abs));
       } else {
         row.appendChild(buildBubble(m, showCaret, opts));
       }
@@ -908,6 +1402,9 @@ function renderMessages() {
   // moves nothing at all, because the growing row is already the last child.
   // With a trusted prefix the walk starts at the cursor instead of the top.
   let node = from > 0 ? desired[0] : messagesEl.firstChild;
+  // The spacer lives inside the scroller (that is the point of it) but is not a
+  // row, so the walk steps over it and the trim below never treats it as extra.
+  if (topSpacerEl && node === topSpacerEl) node = node.nextSibling;
   for (const want of desired) {
     if (node === want) {
       node = want.nextSibling;
@@ -925,21 +1422,125 @@ function renderMessages() {
   // dirty set, and only the tail is re-checked when a mutation marks it.
   lastMsgsRef = msgs;
   lastMsgsLen = msgs.length;
+  lastWindowLen = windowLen;
+  lastWindowStart = windowStart;
   lastTailRef = msgs.length ? msgs[msgs.length - 1] : null;
   dirtyFrom = msgs.length;
 
+  renderLoadEarlier(windowStart);
+  renderTopSpacer(windowStart);
+  lastChildCount = messagesEl.childElementCount;
   if (followTail) stickToBottom();
-  else messagesEl.scrollTop = prevTop;
+  else {
+    // Rows the spacer just handed back sit above the viewport, so add their
+    // estimated height: without this, growing the window would jump the reader.
+    messagesEl.scrollTop = prevTop + spacerCredit;
+  }
+  spacerCredit = 0;
+  // Height sampling forces layout, so it never happens while a response is
+  // streaming — that path is guarded at zero layout reads per frame.
+  if (!streamingHere) sampleRowHeight();
 }
 
+/* The un-rendered rows above the window still have to occupy scroll space, or
+   the scrollbar would describe only the window and the conversation above it
+   would be unreachable. The height is an estimate from measured rows, so the
+   bar is approximate while the window is partial and exact once it reaches the
+   start of the chat. */
+function renderTopSpacer(windowStart) {
+  if (!(windowStart > 0)) {
+    if (topSpacerEl) {
+      topSpacerEl.remove();
+      topSpacerEl = null;
+    }
+    return;
+  }
+  if (!topSpacerEl) {
+    topSpacerEl = el("div", "spacer-top", "");
+    topSpacerEl.setAttribute("aria-hidden", "true");
+  }
+  if (messagesEl.firstChild !== topSpacerEl) messagesEl.insertBefore(topSpacerEl, messagesEl.firstChild);
+  const px = Math.round(windowStart * avgRowPx);
+  const want = `${px}px`;
+  // Credit the exact height the spacer changes by, not an estimate: the row
+  // average is re-measured from what is on screen, so estimating here would
+  // credit 200 rows at the new average while the spacer gave up 200 rows at the
+  // old one, and the reader would jump by the difference.
+  spacerCredit += lastSpacerPx - px;
+  lastSpacerPx = px;
+  if (topSpacerEl.style.height !== want) topSpacerEl.style.height = want;
+}
+
+/* Average a few rows to size the spacer. A sample rather than every row, because
+   this is a layout read and the transcript is a hot path. */
+function sampleRowHeight() {
+  const rows = [...rowCache.values()].map((e) => e.el).filter((n) => n && n.isConnected);
+  if (rows.length < 2) return;
+  const step = Math.max(1, Math.floor(rows.length / 8));
+  let sum = 0;
+  let n = 0;
+  for (let i = 0; i < rows.length; i += step) {
+    const h = rows[i].offsetHeight;
+    if (h > 0) {
+      sum += h;
+      n += 1;
+    }
+  }
+  if (n) avgRowPx = sum / n;
+}
+
+/* Scrolling near the top grows the window, one window at a time, so reading
+   backwards off the start of a long chat needs no button. */
+function ensureScrollGrow() {
+  if (scrollGrowBound || !messagesEl) return;
+  scrollGrowBound = true;
+  messagesEl.addEventListener("scroll", () => {
+    if (messagesEl.scrollTop > 320 || lastWindowStart <= 0) return;
+    state.windowExtra = (state.windowExtra || 0) + WINDOW;
+    markDirtyAll();
+    scheduleRepaint();
+  });
+}
+
+function windowStartOfDebug() { return lastWindowStart; }
+
+function renderLoadEarlier(windowStart) {
+  if (!(windowStart > 0)) {
+    if (loadEarlierEl) {
+      loadEarlierEl.remove();
+      loadEarlierEl = null;
+    }
+    return;
+  }
+  if (!loadEarlierEl) {
+    loadEarlierEl = el("button", "load-earlier", "");
+    loadEarlierEl.addEventListener("click", () => {
+      state.windowExtra = (state.windowExtra || 0) + WINDOW;
+      markDirtyAll();
+      scheduleRepaint();
+    });
+    const host = messagesEl && messagesEl.parentNode;
+    if (!host) return;
+    host.insertBefore(loadEarlierEl, messagesEl);
+  }
+  const shown = Math.min(WINDOW, windowStart);
+  const label = `Load ${shown} earlier message${shown === 1 ? "" : "s"}`;
+  if (loadEarlierEl.textContent !== label) loadEarlierEl.textContent = label;
+}
+
+ensureScrollGrow();
+
 function renderStatus() {
+  renderUsage();
   statusLeft.textContent = "";
   statusLeft.appendChild(el("span", "", state.model || "no model"));
   statusLeft.appendChild(
     el("span", "", `${state.sessions.length} chat${state.sessions.length === 1 ? "" : "s"}`)
   );
+  renderSessionStats(statusLeft, state.overview);
 
   statusRight.textContent = "";
+  renderArchived(statusRight, state.archived, () => void openArchivedView(), restoreArchived);
   if (state.toolCount > 0) {
     statusRight.appendChild(
       el("span", "tools", `⚙ ${state.toolCount} tool call${state.toolCount === 1 ? "" : "s"}`)
@@ -1338,6 +1939,8 @@ async function loadActive() {
   } catch (_) {
     state.cache[state.activeId] = [];
   }
+  void loadArchived(state.activeId);
+  void loadOverview(state.activeId);
 }
 
 function ensureSessionCache(id) {
@@ -1377,7 +1980,8 @@ async function newChat() {
 }
 
 async function deleteSession(id) {
-  if (!window.confirm("Delete this chat?")) return;
+  if (!window.confirm("Move this chat to the trash? You can restore it from settings."))
+    return;
   await invoke("delete_session", { id }).catch(() => {});
   delete state.cache[id];
   delete state.streams[id]; // backend stopped it if it was streaming
@@ -1557,6 +2161,9 @@ function autosize() {
 const BUILTIN_COMMANDS = [
   { name: "/new", hint: "Start a new chat", run: () => newChat() },
   { name: "/export", hint: "Export this chat as Markdown", run: exportActive },
+  { name: "/restore", hint: "Put turns folded by /compact back", run: () => void restoreArchived() },
+  { name: "/stats", hint: "Counts and outline for this chat", run: () => void openStatsView() },
+  { name: "/export", hint: "Keep this chat as a ZIP file", run: () => void openExportView() },
   { name: "/settings", hint: "Open settings & capabilities", run: () => openSettings() },
   {
     name: "/compact",
@@ -1683,6 +2290,8 @@ function closePalette() {
   if (!state.palette) return;
   state.palette = null;
   paletteEl.classList.add("hidden");
+  input.setAttribute("aria-expanded", "false");
+  input.removeAttribute("aria-activedescendant");
 }
 
 function renderPalette() {
@@ -1694,11 +2303,15 @@ function renderPalette() {
   if (!p.entries.length) {
     paletteList.appendChild(el("li", "cmd-empty", "no matching command"));
     paletteEl.classList.remove("hidden");
+    input.setAttribute("aria-expanded", "true");
+    input.removeAttribute("aria-activedescendant");
     return;
   }
   p.entries.forEach((entry, i) => {
     const li = el("li", "cmd-item" + (i === p.index ? " sel" : ""));
     li.setAttribute("role", "option");
+    li.id = `cmd-opt-${i}`;
+    li.setAttribute("aria-selected", i === p.index ? "true" : "false");
     li.appendChild(el("span", "cmd-name", entry.item.name));
     const hint = entry.kind === "cmd"
       ? entry.item.hint
@@ -1709,6 +2322,10 @@ function renderPalette() {
       e.preventDefault();
       selectPalette(i);
     });
+  if (p.entries.length) {
+    input.setAttribute("aria-expanded", "true");
+    input.setAttribute("aria-activedescendant", `cmd-opt-${p.index}`);
+  }
     paletteList.appendChild(li);
   });
   paletteEl.classList.remove("hidden");
@@ -1886,61 +2503,258 @@ async function openFileInPanel(relPath) {
 
 /* Render the agent's registered tools, skills, and plugins as DOM text
    (never innerHTML — descriptions come from tool/plugin definitions). */
+/* Draw one capabilities snapshot into `host`. This is pure DOM work with the
+   snapshot passed in, so the harness can render a fixture without a backend —
+   which is the only way to check what the panel shows. */
+function renderCapabilities(host, caps) {
+  host.textContent = "";
+  const plugins = (caps.plugins || []).map((p) => ({
+    name: p,
+    description: "",
+    category: "plugin",
+  }));
+  const asyncTools = (caps.async_tools || []).filter((t) => t.category !== "mcp");
+  const mcpTools = (caps.async_tools || []).filter((t) => t.category === "mcp");
+  const groups = [
+    ["Tools", caps.tools || []],
+    ["Async tools", asyncTools],
+    ["MCP tools", mcpTools],
+    ["Skills", caps.skills || []],
+    ["Plugins", plugins],
+  ];
+  let any = false;
+  for (const [title, items] of groups) {
+    if (!items.length) continue;
+    any = true;
+    const head = document.createElement("div");
+    head.className = "cap-group";
+    head.textContent = title;
+    host.appendChild(head);
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "cap-item";
+      const name = document.createElement("span");
+      name.className = "cap-name";
+      name.textContent = item.name;
+      row.appendChild(name);
+      if (item.description) {
+        const desc = document.createElement("span");
+        desc.className = "cap-desc";
+        desc.textContent = item.description;
+        row.appendChild(desc);
+      }
+      host.appendChild(row);
+    }
+  }
+  if (!any) {
+    const empty = document.createElement("div");
+    empty.className = "cap-empty";
+    empty.textContent = "No capabilities registered yet.";
+    host.appendChild(empty);
+  }
+  // The hook surface is not a registered capability: it is what a Rust-side
+  // extension can attach to. It comes from the agent's own enumeration and is
+  // shown whether or not anything is registered, because "what can I build
+  // against?" has an answer even in an empty agent.
+  const hooks = caps.hook_events || [];
+  if (hooks.length) {
+    const head = document.createElement("div");
+    head.className = "cap-group";
+    head.textContent = "Hook events (Rust extensions)";
+    host.appendChild(head);
+    const row = document.createElement("div");
+    row.className = "cap-item";
+    const name = document.createElement("span");
+    name.className = "cap-name cap-hooks";
+    name.textContent = hooks.join(" · ");
+    row.appendChild(name);
+    host.appendChild(row);
+  }
+}
+
+/* Load and draw the capabilities for the active workspace. Descriptions come
+   from tool and plugin definitions, so this is DOM text, never innerHTML. */
 async function loadCapabilities() {
   capList.textContent = "loading…";
   try {
-    const caps = await invoke("list_capabilities");
-    capList.textContent = "";
-    const plugins = (caps.plugins || []).map((p) => ({
-      name: p,
-      description: "",
-      category: "plugin",
-    }));
-    const asyncTools = (caps.async_tools || []).filter((t) => t.category !== "mcp");
-    const mcpTools = (caps.async_tools || []).filter((t) => t.category === "mcp");
-    const groups = [
-      ["Tools", caps.tools || []],
-      ["Async tools", asyncTools],
-      ["MCP tools", mcpTools],
-      ["Skills", caps.skills || []],
-      ["Plugins", plugins],
-    ];
-    let any = false;
-    for (const [title, items] of groups) {
-      if (!items.length) continue;
-      any = true;
-      const head = document.createElement("div");
-      head.className = "cap-group";
-      head.textContent = title;
-      capList.appendChild(head);
-      for (const item of items) {
-        const row = document.createElement("div");
-        row.className = "cap-item";
-        const name = document.createElement("span");
-        name.className = "cap-name";
-        name.textContent = item.name;
-        row.appendChild(name);
-        if (item.description) {
-          const desc = document.createElement("span");
-          desc.className = "cap-desc";
-          desc.textContent = item.description;
-          row.appendChild(desc);
-        }
-        capList.appendChild(row);
-      }
-    }
-    if (!any) {
-      const empty = document.createElement("div");
-      empty.className = "cap-empty";
-      empty.textContent = "No capabilities registered yet.";
-      capList.appendChild(empty);
-    }
+    renderCapabilities(capList, await invoke("list_capabilities"));
   } catch (err) {
     capList.textContent = String(err);
   }
 }
 
+/* Counts, abbreviated, because the status bar is a glance and not a ledger. */
+function fmtCount(n) {
+  const v = Number(n) || 0;
+  if (v < 1000) return String(v);
+  if (v < 1000000) return `${(v / 1000).toFixed(1)}k`;
+  return `${(v / 1000000).toFixed(1)}m`;
+}
+
+/* What the active chat amounts to, in the status bar. Pure, so the harness can
+   render a fixture and read it; renders nothing until an overview arrives, so
+   switching chats never shows the previous chat's numbers. */
+function renderSessionStats(host, overview) {
+  if (!overview) return;
+  host.appendChild(
+    el(
+      "span",
+      "stats",
+      `${overview.messages} msgs · ${overview.tool_calls} tools · ${fmtCount(
+        overview.characters,
+      )} chars`,
+    ),
+  );
+}
+
+/* The full breakdown, for the document panel. Pure text: these are counts and
+   the user's own words, and neither belongs in an HTML sink. */
+function overviewLines(o) {
+  if (!o) return "No overview is available for this chat.";
+  const day = (sec) => new Date((Number(sec) || 0) * 1000).toISOString().slice(0, 10);
+  const lines = [
+    `${o.messages} messages (${o.archived} folded) · ${o.asks} asks · ${o.replies} replies`,
+    `${o.tool_calls} tool calls · ${o.errors} turns ended in an error`,
+    `${o.characters} characters · ${o.reasoning_characters} characters of reasoning`,
+    `created ${day(o.created_at)} · updated ${day(o.updated_at)}`,
+    "",
+    `Outline (${o.outline.length} asks)`,
+  ];
+  for (const entry of o.outline) {
+    lines.push(` ${entry.n}. ${entry.preview} (${entry.characters} chars)`);
+  }
+  if (!o.outline.length) lines.push(" (this chat has no asks yet)");
+  return lines.join("\n");
+}
+
+async function loadOverview(id) {
+  if (!id) {
+    state.overview = null;
+    return;
+  }
+  if (state.overviewId !== id) {
+    state.overviewId = id;
+    state.overview = null;
+    renderStatus();
+  }
+  try {
+    const o = await invoke("session_overview", { sessionId: id });
+    if (id !== state.activeId) return;
+    state.overview = o;
+    renderStatus();
+  } catch (err) {
+    // A missing overview is a convenience lost, not a broken shell.
+  }
+}
+
+/* Keep this chat as a file. The archive is written by the core, so this only
+   reports where it landed: an export is a file the user owns. */
+async function openExportView() {
+  const id = state.activeId;
+  if (!id) return;
+  try {
+    const path = await invoke("export_chat", { sessionId: id });
+    Shell.openDocument({
+      id: "export:" + id,
+      title: "Exported",
+      path,
+      text:
+        `Wrote ${path}\n\n` +
+        "It holds README.txt, chat.json and chat.md. The entries are stored, " +
+        "not compressed, so any ZIP tool can read the archive.\n",
+    });
+  } catch (err) {
+    Shell.openDocument({
+      id: "export:" + id,
+      title: "Export failed",
+      path: "unavailable",
+      error: String(err),
+    });
+  }
+}
+
+/* The counts and outline in the document panel: orientation for a long chat.
+   Read-only — the transcript already offers everything that changes state. */
+async function openStatsView() {
+  const id = state.activeId;
+  if (!id) return;
+  try {
+    const o = await invoke("session_overview", { sessionId: id });
+    Shell.openDocument({
+      id: "stats:" + id,
+      title: "This chat",
+      path: `${o.messages} messages · ${o.asks} asks`,
+      text: overviewLines(o),
+    });
+  } catch (err) {
+    Shell.openDocument({ id: "stats:" + id, title: "This chat", path: "unavailable", error: String(err) });
+  }
+}
+
+/* Chats that were deleted, each with a way back.
+   Deleting a chat moves it here instead of unlinking it, so a mis-click is
+   recoverable; emptying the trash is the only permanent removal. The list shows
+   titles, because a bare UUID is not something anyone can recognise. */
+function renderTrash(host, chats, onRestore) {
+  host.textContent = "";
+  const list = Array.isArray(chats) ? chats : [];
+  if (list.length === 0) {
+    host.appendChild(el("div", "cap-empty", "Nothing in the trash."));
+    return;
+  }
+  for (const chat of list) {
+    const row = el("div", "trash-row");
+    row.appendChild(el("span", "trash-title", chat.title || "untitled"));
+    const back = el("button", "trash-restore", "↺ restore");
+    back.title = "Bring this chat back";
+    back.addEventListener("click", () => onRestore(chat.id));
+    row.appendChild(back);
+    host.appendChild(row);
+  }
+}
+
+async function loadTrash() {
+  try {
+    const chats = await invoke("trashed_chats");
+    state.trashed = chats;
+    renderTrash(trashList, chats, restoreTrashed);
+  } catch (err) {
+    trashList.textContent = String(err);
+  }
+}
+
+async function restoreTrashed(id) {
+  try {
+    const title = await invoke("restore_session", { id });
+    toast(`Restored “${title}”`);
+    await loadTrash();
+    await refreshSessions();
+  } catch (err) {
+    toast(`Restore failed: ${err}`);
+  }
+}
+
+async function purgeTrash() {
+  const count = (state.trashed || []).length;
+  if (!count) {
+    toast("The trash is already empty.");
+    return;
+  }
+  const many = count === 1 ? "chat" : "chats";
+  if (!window.confirm(`Permanently delete ${count} ${many}? This cannot be undone.`)) return;
+  try {
+    const purged = await invoke("purge_trash");
+    toast(`Permanently deleted ${purged} ${purged === 1 ? "chat" : "chats"}`);
+    await loadTrash();
+  } catch (err) {
+    toast(`Purge failed: ${err}`);
+  }
+}
+
 async function openSettings() {
+  state.settingsOpener = document.activeElement;
+  loadMemories();
+  void loadTrash();
   try {
     const s = await invoke("get_settings");
     state.model = s.model;
@@ -1954,6 +2768,12 @@ async function openSettings() {
     setBash.checked = !!s.bash_enabled;
     setFiles.checked = !!s.file_tools_enabled;
     setApproval.checked = s.require_approval !== false;
+    // The permanent allowances are shown next to the gate they relax, so the
+    // reason a tool stopped asking is visible where the gate is configured.
+    state.allowedTools = s.allowed_tools || [];
+    if (allowedList) renderAllowedTools(allowedList, state.allowedTools);
+    // The profile names are not part of this payload; ask for them separately.
+    void loadProfiles();
     setWorkspace.value = s.bash_workspace || "";
     // Keep the document panel's Start page in step with saved settings.
     Shell.setContext({ workspace: s.bash_workspace || "", model: s.model || "" });
@@ -1980,6 +2800,11 @@ async function openSettings() {
 
 function closeSettings() {
   modal.classList.add("hidden");
+  // Hand focus back to whatever opened the dialog: leaving it on a hidden
+  // control strands keyboard users at the top of the document.
+  const back = state.settingsOpener;
+  state.settingsOpener = null;
+  if (back && typeof back.focus === "function" && document.contains(back)) back.focus();
 }
 
 settingsForm.addEventListener("submit", async (ev) => {
@@ -2339,6 +3164,188 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !modal.classList.contains("hidden")) closeSettings();
 });
 
+/* A labelled checkbox for the workspace form. */
+function workspaceCheck(form, cls, label, checked) {
+  const box = document.createElement("label");
+  box.className = "row-check";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.className = cls;
+  input.checked = checked;
+  box.appendChild(input);
+  box.appendChild(document.createTextNode(" " + label));
+  return box;
+}
+
+/* A flag the form can state: an absent control restates what the workspace had,
+   rather than reading the absence as "off". */
+function workspaceFlag(form, known, cls, field) {
+  const box = form.querySelector("." + cls);
+  return box ? box.checked : known[field] !== false;
+}
+
+/* The budget is a count, so an absent or unusable input restates the old value
+   instead of sending zero. */
+function workspaceBudget(form, known) {
+  const input = form.querySelector(".ws-budget");
+  const value = input ? Number(input.value) : Number.NaN;
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : known.context_budget;
+}
+
+/* The discovered config profiles. A profile is selected by putting its name in
+   the model field, so a chip is a one-click way to type it rather than a second
+   place where a model is configured. */
+/* How many turns a compaction folded away, with a way to put them back.
+   Zero renders nothing: a control that cannot do anything is worse than none.
+   The count comes from the backend, which keeps the folded turns in the
+   session file, so the affordance survives a reload. */
+function renderArchived(host, count, view, restore) {
+  host.textContent = "";
+  if (typeof count !== "number" || count <= 0) return;
+  const chip = el("button", "archived-chip", `⧉ ${count} folded`);
+  chip.title = "Read the turns /compact folded into the summary";
+  chip.addEventListener("click", () => view());
+  const back = el("button", "archived-chip archived-restore", "↺ restore");
+  back.title = "Put these turns back into this chat, in front of the summary";
+  back.addEventListener("click", () => restore());
+  host.appendChild(chip);
+  host.appendChild(back);
+}
+
+/* The folded turns as plain text for the document panel. Pure, so the harness
+   can check what a reader would see; each turn is clipped because a folded
+   history can be long and the panel is for recognition, not reading in full. */
+function archivedPreviewText(messages) {
+  const turns = Array.isArray(messages) ? messages : [];
+  if (turns.length === 0) return "Nothing is folded in this chat.";
+  const body = turns.map((m, i) => {
+    const text = String(m.text || "").trim();
+    const clipped =
+      text.length > 1200 ? text.slice(0, 1200) + `\n… (${text.length - 1200} more characters)` : text;
+    return `--- ${i + 1}. ${m.role || "unknown"} ---\n${clipped || "(empty)"}`;
+  });
+  return (
+    `These ${turns.length} turns were folded into the summary by /compact. ` +
+    `The summary is in the chat; these are the originals.\n\n` +
+    body.join("\n\n")
+  );
+}
+
+/* Show the folded turns in the document panel. Read-only on purpose: seeing
+   what was folded and putting it back are separate decisions. */
+async function openArchivedView() {
+  const id = state.activeId;
+  if (!id) return;
+  try {
+    const turns = await invoke("archived_messages", { sessionId: id });
+    Shell.openDocument({
+      id: "archived:" + id,
+      title: "Folded turns",
+      path: `${turns.length} turn${turns.length === 1 ? "" : "s"} folded by /compact`,
+      text: archivedPreviewText(turns),
+    });
+  } catch (err) {
+    Shell.openDocument({
+      id: "archived:" + id,
+      title: "Folded turns",
+      path: "unavailable",
+      error: String(err),
+    });
+  }
+}
+
+/* Ask the backend what this chat has folded, and offer it back if anything. */
+async function loadArchived(sessionId) {
+  if (!sessionId) return;
+  let count = 0;
+  try {
+    count = await invoke("compacted_archive", { sessionId });
+  } catch (err) {
+    return; // a chat with no archive is the ordinary case
+  }
+  if (sessionId !== state.activeId) return; // the user switched away meanwhile
+  state.archived = count;
+  renderStatus();
+}
+
+/* Put the folded turns back and show them. */
+async function restoreArchived() {
+  const id = state.activeId;
+  if (!id) return;
+  try {
+    const restored = await invoke("restore_compacted", { sessionId: id });
+    toast(`Restored ${restored} folded message${restored === 1 ? "" : "s"}`);
+    state.archived = 0;
+    await loadActive();
+  } catch (err) {
+    toast(`Restore failed: ${err}`);
+  }
+}
+
+function renderProfiles(host, profiles, pick) {
+  host.textContent = "";
+  if (!profiles || !profiles.length) {
+    host.appendChild(el("div", "cap-empty", "No [llm.<name>] profiles in the config file."));
+    return;
+  }
+  for (const profile of profiles) {
+    const chip = el("button", "profile-chip", profile.name);
+    chip.type = "button";
+    chip.title = `${profile.model} · ${profile.base_url}${profile.has_key ? "" : " · no key"}`;
+    chip.addEventListener("click", () => pick(profile));
+    host.appendChild(chip);
+  }
+}
+
+/* The names live in the config file, which is why this asks the backend for
+   them: the settings payload never serializes the profile list. */
+async function loadProfiles() {
+  const list = await invoke("list_profiles").catch(() => null);
+  state.profiles = Array.isArray(list) ? list : [];
+  if (profilesHost) {
+    renderProfiles(profilesHost, state.profiles, (profile) => {
+      setModel.value = profile.name;
+      toast(`Model set to profile "${profile.name}"`);
+    });
+  }
+}
+
+/* Draw the permanent allowances. Pure DOM work, so the harness can drive it
+   with a fixture rather than through a backend. */
+function renderAllowedTools(host, names) {
+  host.textContent = "";
+  if (!names || !names.length) {
+    const empty = document.createElement("div");
+    empty.className = "cap-empty";
+    empty.textContent = "Approvals are asked every time.";
+    host.appendChild(empty);
+    return;
+  }
+  for (const name of names) {
+    const row = document.createElement("div");
+    row.className = "cap-item";
+    const label = document.createElement("span");
+    label.className = "cap-name";
+    label.textContent = name;
+    row.appendChild(label);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "mini-btn";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => forgetAllowedTool(name));
+    row.appendChild(remove);
+    host.appendChild(row);
+  }
+}
+
+/* Asking to forget an allowance is server work: the broker has to let go of it
+   too, or it would keep waving the tool through until the next restart. */
+async function forgetAllowedTool(name) {
+  const left = await invoke("forget_allowed_tool", { tool: name }).catch(() => null);
+  if (Array.isArray(left)) state.allowedTools = left;
+  if (allowedList) renderAllowedTools(allowedList, state.allowedTools);
+}
+
 /* ---------- approval gate ---------- */
 
 let currentApproval = null; // request shown in the modal, if any
@@ -2353,6 +3360,10 @@ function showNextApproval() {
   approvalTool.textContent = currentApproval.tool;
   renderApprovalDiff(currentApproval.diff);
   approvalModal.classList.remove("hidden");
+  // Move focus to the explicit choice. Escape deliberately does not dismiss
+  // this dialog: an approval has to be answered, not skipped past.
+  const allow = $("approval-allow");
+  if (allow) allow.focus();
 }
 
 // Render a write preview as colored diff lines (one textContent per line, so
@@ -2408,6 +3419,23 @@ async function answerApproval(approved) {
     await invoke("respond_approval", { id: req.id, approved }).catch(() => {});
   }
   showNextApproval();
+}async function answerApproval(approved) {
+  const req = currentApproval;
+  currentApproval = null;
+  if (req) {
+    await invoke("respond_approval", { id: req.id, approved }).catch(() => {});
+  }
+  showNextApproval();
+}
+
+/* An allowance is recorded before the pending request is answered, so the tool
+   cannot run again in the gap, and the user sees the answer take effect now. */
+async function allowApproval(scope) {
+  const req = currentApproval;
+  if (!req) return;
+  const persistent = await invoke("allow_tool", { tool: req.tool, scope }).catch(() => null);
+  if (Array.isArray(persistent)) state.allowedTools = persistent;
+  await answerApproval(true);
 }
 
 listen("approval-request", (event) => {
@@ -2416,6 +3444,8 @@ listen("approval-request", (event) => {
 });
 
 $("approval-deny").addEventListener("click", () => answerApproval(false));
+$("approval-session").addEventListener("click", () => allowApproval("session"));
+$("approval-always").addEventListener("click", () => allowApproval("always"));
 $("approval-allow").addEventListener("click", () => answerApproval(true));
 
 /* ---------- streaming events ---------- */
@@ -2485,6 +3515,8 @@ listen("agent-event", (event) => {
         `Compacted context: ~${p.before} → ~${p.after} tokens ` +
           `(${p.dropped} message${p.dropped === 1 ? "" : "s"} summarized)`
       );
+      void loadArchived(state.activeId);
+  void loadOverview(state.activeId);
       break;
     case "error":
       if (last) last.error = p.message;
@@ -2506,6 +3538,11 @@ listen("agent-event", (event) => {
 
 listen("stream-finished", async (event) => {
   const p = event.payload;
+  // The provider's count for the turn that just ended; absent when it reported none.
+  if (p.session_id === state.activeId) {
+    state.usage = { prompt: p.prompt_tokens || 0, completion: p.completion_tokens || 0 };
+    renderStatus();
+  }
   // The server denied that chat's pending approvals when its stream ended.
   clearApprovals(p.session_id);
   try {
@@ -2603,6 +3640,186 @@ $("open-settings").addEventListener("click", () => openSettings());
 /* Settings is one surface with several sections. Both the sidebar shortcuts and
    the tabs inside the dialog route through here, so plugins, skills, MCP servers
    and providers never grow a second place to be edited. */
+/* The Workspaces section of Settings: what each workspace is, and the two
+   things the sidebar header does — make it active, or open its form. The form
+   itself stays in the sidebar, because that is where the chats are. */
+/* Content search (§17). The box filters titles locally as you type; from two
+   characters on, the server also looks inside the chats, and its hits are drawn
+   above the groups. A response that arrives after the query changed is dropped,
+   because a late answer must not repaint a search the user has moved on from. */
+async function refreshSearchHits() {
+  const query = state.search.trim();
+  if (query.length < 2) {
+    state.hits = [];
+    return;
+  }
+  const hits = await invoke("search_sessions", { query, limit: 20 });
+  if (state.search.trim() !== query) return;
+  state.hits = hits;
+  renderSidebar();
+}
+
+/* Open a search result. A hit is findable from any workspace, so the workspace
+   has to move first — awaiting it keeps the order right, since the command
+   re-lists sessions and the chat has to be switched after that, not during. */
+async function openHit(hit) {
+  if (hit.workspace && hit.workspace !== state.activeWorkspace) {
+    await workspaceCommand(invoke("set_active_workspace", { id: hit.workspace }));
+  }
+  switchSession(hit.session);
+}
+
+/* The memory panel (§20). The store is shared by every workspace, so these all
+   answer with the list as it stands and the panel simply draws that — no local
+   editing of a list the agent also writes to. */
+async function loadMemories() {
+  try {
+    state.memories = await invoke("list_memories", { sessionId: state.activeId });
+    renderMemories();
+  } catch (err) {
+    renderMemoryNote(String(err));
+  }
+}
+
+async function addMemory() {
+  const field = $("mem-text");
+  const text = field ? field.value : "";
+  // The server checks this too; refusing here just saves a round trip.
+  if (!text.trim()) {
+    renderMemoryNote("a memory needs some text");
+    return;
+  }
+  try {
+    state.memories = await invoke("remember_memory", { sessionId: state.activeId, text });
+    if (field) field.value = "";
+    renderMemories();
+  } catch (err) {
+    renderMemoryNote(String(err));
+  }
+}
+
+async function forgetMemory(id) {
+  try {
+    state.memories = await invoke("forget_memory", { sessionId: state.activeId, id });
+    renderMemories();
+  } catch (err) {
+    renderMemoryNote(String(err));
+  }
+}
+
+function renderMemoryNote(text) {
+  const host = $("mem-items");
+  if (!host) return;
+  host.textContent = "";
+  host.appendChild(el("div", "ws-form-hint", text));
+}
+
+function renderMemories() {
+  const host = $("mem-items");
+  if (!host) return;
+  host.textContent = "";
+  // Whose memory this is. The store follows the workspace, so a list without an
+  // owner line is a list that cannot be checked against the right file.
+  const owner = state.workspaces.find((w) => w.id === state.activeWorkspace);
+  host.appendChild(el("div", "ws-head", `Memory for ${owner ? owner.name : "this workspace"}`));
+  if (!state.memories.length) {
+    host.appendChild(el("div", "ws-form-hint", "Nothing remembered yet."));
+    return;
+  }
+  for (const item of state.memories) {
+    const row = el("div", "ws-tools mem-row");
+    row.appendChild(el("div", "", item.content));
+    const when = new Date(item.created_at_ms || 0);
+    row.appendChild(el("div", "ws-form-hint", Number.isNaN(when.getTime()) ? "" : when.toLocaleString()));
+    const forget = el("button", "ws-form-go", "Forget");
+    forget.type = "button";
+    forget.addEventListener("click", (e) => {
+      e.preventDefault();
+      forgetMemory(item.id);
+    });
+    row.appendChild(forget);
+    host.appendChild(row);
+  }
+}
+
+/* Token counts, shortened the way a status line is read: 999 stays exact, 12 345
+   is "12.3k", and past ten thousand the decimal is noise. */
+function fmtTokens(n) {
+  const value = Number(n) || 0;
+  if (value < 1000) return String(value);
+  return value < 10000 ? `${(value / 1000).toFixed(1)}k` : `${(value / 1000).toFixed(0)}k`;
+}
+
+/* The token meter. It reports the provider's own numbers rather than an estimate,
+   and warns at 80% of the context budget, which is the point where the next turn
+   is more likely to be compacted than answered. */
+function renderUsage() {
+  const host = $("status-right");
+  if (!host) return;
+  let meter = host.querySelector(".usage-meter");
+  if (!meter) {
+    meter = el("span", "usage-meter", "");
+    host.appendChild(meter);
+  }
+  const usage = state.usage || { prompt: 0, completion: 0 };
+  const parts = [`in ${fmtTokens(usage.prompt)}`, `out ${fmtTokens(usage.completion)}`];
+  const budget = Number(state.budget) || 0;
+  const near = budget > 0 && usage.prompt / budget >= 0.8;
+  if (budget > 0) parts.push(`${Math.round((usage.prompt / budget) * 100)}% of ${fmtTokens(budget)}`);
+  if (near) parts.push("near the context limit");
+  meter.textContent = parts.join(" · ");
+  meter.classList.toggle("near-limit", near);
+}
+
+function renderSearchHits() {
+  if (!state.hits || !state.hits.length) return;
+  sessionList.appendChild(el("div", "ws-head", `${state.hits.length} match${state.hits.length === 1 ? "" : "es"} inside chats`));
+  for (const hit of state.hits) {
+    const row = el("div", "session-row hit-row");
+    row.appendChild(el("span", "title", clip(hit.title || "(untitled)", 24)));
+    // Which workspace it came from, because a hit is findable from anywhere and
+    // the chat it belongs to may not be in the one that is in use.
+    const where = state.workspaces.find((w) => w.id === hit.workspace);
+    row.appendChild(el("span", "time", clip(where ? where.name : hit.workspace, 10)));
+    row.appendChild(el("div", "hit-snippet", hit.snippet));
+    row.addEventListener("click", () => openHit(hit));
+    sessionList.appendChild(row);
+  }
+}
+
+function renderWorkspaceManager() {
+  const host = $("ws-manage-list");
+  if (!host) return;
+  host.textContent = "";
+  for (const w of state.workspaces || []) {
+    const card = el("div", "ws-tools");
+    const active = w.id === state.activeWorkspace;
+    card.appendChild(el("div", "ws-form-hint", `${w.name || "(unnamed)"}${active ? " · in use" : ""}`));
+    card.appendChild(el("div", "", `root: ${w.root || "(current folder)"}`));
+    card.appendChild(el("div", "", `model: ${w.model || "inherits the defaults"}`));
+    if (w.reasoning_effort) card.appendChild(el("div", "", `effort: ${w.reasoning_effort}`));
+    const chats = (state.sessions || []).filter((s) => s.workspace === w.id).length;
+    card.appendChild(el("div", "", `${chats} chat${chats === 1 ? "" : "s"}`));
+    const use = el("button", "ws-form-go", active ? "In use" : "Use");
+    use.type = "button"; // inside the settings form, a bare button would submit it
+    use.disabled = active;
+    use.addEventListener("click", (e) => {
+      e.preventDefault();
+      switchWorkspace(w.id);
+    });
+    card.appendChild(use);
+    const edit = el("button", "ws-form-go", "Edit");
+    edit.type = "button";
+    edit.addEventListener("click", (e) => {
+      e.preventDefault();
+      closeSettings();
+      openWorkspaceForm("edit", w.id);
+    });
+    card.appendChild(edit);
+    host.appendChild(card);
+  }
+}
+
 function focusSection(sectionId) {
   const target = document.getElementById(sectionId);
   if (target) target.scrollIntoView({ block: "start" });
@@ -2620,6 +3837,36 @@ document.querySelectorAll(".set-tab").forEach((tab) => {
 
 $("nav-plugins").addEventListener("click", () => navTo("cap-list"));
 $("nav-mcp").addEventListener("click", () => navTo("mcp-list"));
+
+// Narrow windows turn the sidebar into a drawer (see the 720px rules): the
+// button opens it, and picking a chat closes it, because the point of that tap is
+// the chat rather than the list it came from.
+const sidebarToggle = $("sidebar-toggle");
+const sidebarEl = $("sidebar");
+if (sidebarToggle && sidebarEl) {
+  const setDrawer = (open) => {
+    sidebarEl.classList.toggle("open", open);
+    sidebarToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  };
+  sidebarToggle.addEventListener("click", () => setDrawer(!sidebarEl.classList.contains("open")));
+  sidebarEl.addEventListener("click", (event) => {
+    const row = event.target.closest ? event.target.closest(".session-row") : null;
+    if (row) setDrawer(false);
+  });
+}
+
+const addMemoryButton = $("mem-add");
+if (addMemoryButton) addMemoryButton.addEventListener("click", () => addMemory());
+
+// Guarded: the settings section exists in the app shell, and the harness page
+// loads this file without it.
+const addWorkspace = $("ws-manage-add");
+if (addWorkspace) {
+  addWorkspace.addEventListener("click", () => {
+    closeSettings();
+    openWorkspaceForm("create", "");
+  });
+}
 $("plan-edit").addEventListener("click", () => startPlanEdit());
 sendBtn.addEventListener("click", () =>
   streamOf(state.activeId) ? stopStream() : send(),
@@ -2627,6 +3874,7 @@ sendBtn.addEventListener("click", () =>
 sessionSearch.addEventListener("input", () => {
   state.search = sessionSearch.value;
   renderSidebar();
+  refreshSearchHits();
 });
 input.addEventListener("input", () => {
   autosize();
@@ -2743,6 +3991,11 @@ async function init() {
     const settings = await invoke("get_settings");
     state.model = settings.model;
     state.budget = settings.context_budget ?? 32768;
+    // Workspaces drive how the panel groups chats and which model each group
+    // will use, so the sidebar needs them even before settings are opened.
+    state.workspaces = settings.workspaces || [];
+    state.activeWorkspace = settings.active_workspace || "";
+    state.presets = settings.presets || [];
     // Start page context: what this app instance is pointed at.
     Shell.setContext({
       workspace: settings.bash_workspace || "",
