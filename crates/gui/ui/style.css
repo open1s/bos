@@ -920,6 +920,79 @@ body.resizing #doc-panel { transition: none; }
   text-decoration: line-through;
 }
 
+/* Run panel: bounded command output, deliberately not a terminal. */
+.run-panel {
+  margin: 0 20px 6px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  max-height: 40vh;
+}
+
+.run-panel.hidden { display: none; }
+
+.run-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.run-note {
+  flex: 1;
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.run-output {
+  margin: 0;
+  padding: 8px 10px;
+  flex: 1 1 auto;
+  min-height: 60px;
+  overflow-y: auto;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.run-output:empty::before {
+  content: "No runs yet. The output of a command streams in here and survives a reload.";
+  color: var(--faint);
+}
+
+.run-line.err { color: var(--error); }
+.run-line.note { color: var(--dim); }
+
+.run-form {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.run-form input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: var(--text);
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px;
+}
+
+.run-form input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 /* Plan editor (human-in-the-loop steering). */
 .plan-edit-row { align-items: center; }
 .plan-edit-input {
@@ -1277,8 +1350,31 @@ body.resizing #doc-panel { transition: none; }
 .nav-item:focus-visible { outline: 2px solid var(--focus-ring, #6c8ebf); outline-offset: -2px; }
 .nav-item[disabled] { opacity: .45; cursor: not-allowed; }
 
+/* The file sidebar: a lazy tree of the workspace, one directory per click. */
+.files-head { display: flex; align-items: center; gap: var(--space-1, 4px); padding: 0 8px; }
+.files-head .nav-item { flex: 1; }
+.file-tree {
+  flex: 0 1 auto; max-height: 40%; overflow-y: auto; padding: 2px 4px 6px;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, .07));
+}
+.file-row {
+  display: flex; align-items: center; gap: 6px; width: 100%; padding: 3px 6px;
+  border: none; border-radius: var(--radius-sm, 6px); background: transparent;
+  color: var(--fg, #e8e8e8); font: inherit; font-size: 12px; text-align: left;
+  cursor: pointer; white-space: nowrap; overflow: hidden;
+}
+.file-row:hover { background: var(--hover, rgba(255, 255, 255, .06)); }
+.file-row:focus-visible { outline: 2px solid var(--focus-ring, #6c8ebf); outline-offset: -2px; }
+.file-row .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.file-row .file-size { color: var(--muted, #9a9a9a); font-size: 11px; }
+.file-row.state-loading, .file-row.state-error { cursor: default; }
+.file-row.state-loading { color: var(--muted, #9a9a9a); }
+.file-row.state-error { color: var(--error, #ff6b6b); }
+.file-note { color: var(--muted, #9a9a9a); font-size: 11px; padding: 2px 8px; }
+
 /* The rail keeps only the brand, the new-chat button and the pane toggles. */
 [data-sidebar="rail"] .sidebar-nav { display: none; }
+[data-sidebar="rail"] .files-head, [data-sidebar="rail"] .file-tree { display: none; }
 
 /* Settings is one surface with several sections; the tab strip is its index. */
 .set-nav {

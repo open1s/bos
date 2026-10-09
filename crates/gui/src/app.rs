@@ -1278,6 +1278,108 @@ fn read_file(state: State<'_, Arc<GuiState>>, path: String) -> Result<FileView, 
     })
 }
 
+/// One expansion of the file sidebar: a single directory, sorted and sized.
+///
+/// Same confinement as `read_file` (an escape is refused, not sanitised) and
+/// the same display policy as the `@`-mention walker, because both now live
+/// in [`crate::filetree`] — what the sidebar shows and what `@` can mention
+/// are one list, so the two cannot drift apart.
+#[tauri::command]
+fn list_files(
+    state: State<'_, Arc<GuiState>>,
+    path: String,
+) -> Result<crate::filetree::FileList, String> {
+    let root = {
+        let inner = state.lock()?;
+        std::path::PathBuf::from(inner.settings.bash_workspace.trim())
+    };
+    crate::filetree::list_dir(&root, &path)
+}
+
+/// Result payload of the `run-line` event: one line of one run.
+#[derive(Clone, Serialize)]
+struct RunLineEvent {
+    /// The run the line belongs to, so two runs never mix in the panel.
+    run_id: String,
+    /// Which stream the line came from: `"stdout"` or `"stderr"`.
+    stream: String,
+    /// The line text, already clamped by the runner.
+    text: String,
+}
+
+/// Result payload of the `run-finished` event: the outcome of one run.
+#[derive(Clone, Serialize)]
+struct RunFinishedEvent {
+    /// The run this summarizes.
+    run_id: String,
+    /// The process exit code, when the child exited on its own.
+    exit_code: Option<i32>,
+    /// Wall-clock milliseconds from spawn to the last line.
+    duration_ms: u64,
+    /// How many lines were shown.
+    lines: usize,
+    /// Whether the run hit a budget (line cap or deadline) and was stopped.
+    truncated: bool,
+    /// Set when the child could not be started or did not exit cleanly.
+    error: Option<String>,
+}
+
+/// Run a shell command in the workspace and stream its output to the panel.
+///
+/// Deliberately **not** a terminal: the command runs against pipes, so there
+/// is no interactivity and no ANSI colour (a PTY backend is not available in
+/// this build, and the panel says as much). Output is bounded by
+/// [`crate::runs`]'s line budget, per-line clamp and deadline, and the panel
+/// keeps what it showed across a reload.
+#[tauri::command]
+fn run_command(
+    app: AppHandle,
+    state: State<'_, Arc<GuiState>>,
+    run_id: String,
+    command: String,
+) -> Result<(), String> {
+    let root = {
+        let inner = state.lock()?;
+        std::path::PathBuf::from(inner.settings.bash_workspace.trim())
+    };
+    if root.as_os_str().is_empty() {
+        return Err("no workspace configured".to_string());
+    }
+    let command = crate::runs::validate(&command)?;
+    let run_id = run_id.trim().to_string();
+    if run_id.is_empty() || run_id.len() > 128 {
+        return Err("bad run id".to_string());
+    }
+    std::thread::spawn(move || {
+        let line_app = app.clone();
+        let id = run_id.clone();
+        let summary = crate::runs::run_streaming(
+            &command,
+            &root,
+            Default::default(),
+            crate::runs::RUN_TIMEOUT,
+            move |line| {
+                let payload = RunLineEvent {
+                    run_id: id.clone(),
+                    stream: line.stream.to_string(),
+                    text: line.text,
+                };
+                let _ = line_app.emit("run-line", payload);
+            },
+        );
+        let payload = RunFinishedEvent {
+            run_id,
+            exit_code: summary.exit_code,
+            duration_ms: summary.duration_ms,
+            lines: summary.lines,
+            truncated: summary.truncated,
+            error: summary.error,
+        };
+        let _ = app.emit("run-finished", payload);
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod file_view_tests {
     use super::*;
@@ -2238,6 +2340,8 @@ pub(crate) fn run() -> anyhow::Result<()> {
             open_url,
             search_files,
             read_file,
+            list_files,
+            run_command,
             stop_streaming,
             respond_approval,
             compact_session,

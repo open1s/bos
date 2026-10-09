@@ -12,12 +12,13 @@ mod approval;
 mod caps;
 mod compact;
 mod export;
-mod fts;
+mod filetree;
 mod init;
 mod instructions;
 mod mcp;
 mod mentions;
 mod runner;
+mod runs;
 mod session;
 mod settings;
 #[cfg(test)]

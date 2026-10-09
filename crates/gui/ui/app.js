@@ -66,6 +66,7 @@ const state = {
   mention: null,         // {query, atStart, entries, index, fresh} | null — @file picker
   mentionDismissed: "",  // token query dismissed with Esc (reopens on change)
   promptNav: null,       // {pos, draft} | null — ↑/↓ prompt-history walk
+  runPanel: { open: false, activeId: null, lines: [] }, // run panel: streamed command output
 };
 
 /* ---------- multi-session streaming helpers ---------- */
@@ -2163,6 +2164,8 @@ const BUILTIN_COMMANDS = [
   { name: "/export", hint: "Export this chat as Markdown", run: exportActive },
   { name: "/restore", hint: "Put turns folded by /compact back", run: () => void restoreArchived() },
   { name: "/stats", hint: "Counts and outline for this chat", run: () => void openStatsView() },
+  { name: "/files", hint: "Show the workspace files in the sidebar", run: () => void toggleFilePanel() },
+  { name: "/run", hint: "Run a shell command, output streams into the run panel", run: () => void toggleRunPanel() },
   { name: "/export", hint: "Keep this chat as a ZIP file", run: () => void openExportView() },
   { name: "/settings", hint: "Open settings & capabilities", run: () => openSettings() },
   {
@@ -2775,6 +2778,9 @@ async function openSettings() {
     // The profile names are not part of this payload; ask for them separately.
     void loadProfiles();
     setWorkspace.value = s.bash_workspace || "";
+    // The file sidebar lists the same root, and keys its per-workspace
+    // memory by it.
+    state.workspaceRoot = s.bash_workspace || "";
     // Keep the document panel's Start page in step with saved settings.
     Shell.setContext({ workspace: s.bash_workspace || "", model: s.model || "" });
     setSkillsDir.value = s.skills_dir || "";
@@ -2832,6 +2838,14 @@ settingsForm.addEventListener("submit", async (ev) => {
     });
     state.model = s.model;
     state.budget = s.context_budget ?? 32768;
+    // A new workspace root makes every cached listing about the wrong
+    // directory, so the tree is dropped and refetched from the new root.
+    state.workspaceRoot = setWorkspace.value || "";
+    fileTree.cache = {};
+    if (fileTree.open) void restoreFileTree();
+    // The run output is stored per root, so the new root's history takes over.
+    restoreRunLines();
+    renderRunPanel();
     state.mcpServers = Array.isArray(s.mcp_servers) ? s.mcp_servers : [];
     state.providers = Array.isArray(s.providers) ? s.providers : [];
     state.error = null;
@@ -3977,6 +3991,400 @@ input.addEventListener("keydown", (e) => {
   }
 });
 
+/* ---------- file sidebar ----------
+   The workspace on disk, as a lazy tree in the left sidebar. One directory
+   per click: the Rust side lists a single level — contained in the
+   workspace, capped, sorted — and this keeps what came back, so expanding a
+   folder never walks the repository. A click on a file is the same
+   `read_file` the document panel already trusts, and the doc panel stays a
+   plain viewer: the tree is interactive, the panel is not. */
+
+/* cache[path] is missing (closed) or { status, entries, error }; "" is the
+   workspace root. `status` is "loading" | "ok" | "error". */
+const fileTree = { open: false, cache: {} };
+
+/* Flatten the lazy cache into the rows the tree paints, in paint order.
+   Pure — the harness feeds a fixture cache and checks order, depth,
+   expansion and the failure rows, so the drawing rules are testable without
+   a backend. */
+function fileRowsFrom(cache) {
+  const rows = [];
+  const walk = (path, depth) => {
+    const node = cache[path];
+    if (!node) return;
+    if (node.status === "loading") {
+      rows.push({ path, name: "", depth, isDir: true, bytes: 0, expanded: false, state: "loading" });
+      return;
+    }
+    if (node.status === "error") {
+      rows.push({
+        path,
+        name: path ? path.split("/").pop() : "workspace",
+        depth,
+        isDir: true,
+        bytes: 0,
+        expanded: false,
+        state: "error",
+        error: node.error || "unreadable",
+      });
+      return;
+    }
+    for (const entry of node.entries || []) {
+      // The backend sends snake_case like every other payload here, so the
+      // sidebar reads is_dir — reading a camelCase alias would make every
+      // folder look like a file.
+      const child = entry.is_dir ? cache[entry.path] : null;
+      const rowState = !entry.is_dir
+        ? "file"
+        : !child
+          ? "closed"
+          : child.status === "ok"
+            ? "open"
+            : child.status;
+      rows.push({
+        path: entry.path,
+        name: entry.name,
+        depth,
+        isDir: !!entry.is_dir,
+        bytes: Number(entry.bytes) || 0,
+        expanded: rowState === "open",
+        state: rowState,
+        // A failed folder says why on its own row: its children are never
+        // walked, so this row is the only place the reason can appear.
+        error: rowState === "error" && child ? child.error || "unreadable" : undefined,
+      });
+      if (rowState === "open") walk(entry.path, depth + 1);
+    }
+  };
+  walk("", 0);
+  return rows;
+}
+
+/* Human sizes for the sidebar: 512 → "512 B", 20480 → "20.0 kB". */
+function formatFileBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} kB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+/* Load one directory into the cache and repaint. A failure lands in the
+   cache as an error row, so a folder that will not open says why instead of
+   silently staying closed. */
+async function loadFileDir(path) {
+  fileTree.cache[path] = { status: "loading", entries: [] };
+  renderFileTree();
+  try {
+    const list = await invoke("list_files", { path });
+    fileTree.cache[path] = {
+      status: "ok",
+      entries: (list && list.entries) || [],
+      truncated: !!(list && list.truncated),
+    };
+  } catch (err) {
+    fileTree.cache[path] = { status: "error", error: String(err), entries: [] };
+  }
+  renderFileTree();
+  persistFileTree();
+}
+
+/* Open a folder, or collapse the one that is open. An error row retries on
+   the next click — the only affordance a failure has. */
+function toggleFileDir(path) {
+  const node = fileTree.cache[path];
+  if (node && node.status === "ok") {
+    delete fileTree.cache[path];
+    renderFileTree();
+    persistFileTree();
+    return;
+  }
+  if (!node || node.status === "error") void loadFileDir(path);
+}
+
+/* Paint the rows. textContent only: names come off disk and are untrusted. */
+function renderFileTree() {
+  const host = $("file-tree");
+  if (!host) return;
+  host.textContent = "";
+  if (!fileTree.open) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  for (const row of fileRowsFrom(fileTree.cache)) {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = `file-row state-${row.state}`;
+    el.style.paddingLeft = `${6 + row.depth * 14}px`;
+    el.setAttribute("role", "treeitem");
+    el.dataset.path = row.path;
+    el.dataset.dir = row.isDir ? "1" : "";
+    if (row.isDir) el.setAttribute("aria-expanded", String(row.expanded));
+    const glyph = document.createElement("span");
+    glyph.className = "file-glyph";
+    glyph.setAttribute("aria-hidden", "true");
+    glyph.textContent =
+      row.state === "loading"
+        ? "…"
+        : row.state === "error"
+          ? "⚠"
+          : row.isDir
+            ? row.expanded
+              ? "▾"
+              : "▸"
+            : "·";
+    const name = document.createElement("span");
+    name.className = "file-name";
+    name.textContent = row.name || row.path;
+    el.appendChild(glyph);
+    el.appendChild(name);
+    if (row.state === "error") {
+      // The reason a folder will not open, beside the folder that will not
+      // open; the full text is also on hover, since the row clips it.
+      el.title = row.error || "";
+      const why = document.createElement("span");
+      why.className = "file-size";
+      why.textContent = row.error || "";
+      el.appendChild(why);
+    } else if (row.state === "file") {
+      const size = document.createElement("span");
+      size.className = "file-size";
+      size.textContent = formatFileBytes(row.bytes);
+      el.appendChild(size);
+    }
+    host.appendChild(el);
+  }
+  // A directory the backend had to cut short says so, the way a truncated
+  // file read does, rather than looking like a complete listing.
+  const note = Object.values(fileTree.cache).some((node) => node.truncated);
+  if (note) {
+    const cut = document.createElement("div");
+    cut.className = "file-note";
+    cut.textContent = "Some entries are not shown — this folder is too large to list in full.";
+    host.appendChild(cut);
+  }
+}
+
+/* Open folders survive a restart: the open paths are stored per workspace
+   root and re-fetched on load — a fetch, not a snapshot, so what comes back
+   is the directory as it is now. */
+function fileTreeKey() {
+  return "bos.filetree." + (state.workspaceRoot || "default");
+}
+
+function persistFileTree() {
+  try {
+    const open = Object.keys(fileTree.cache)
+      .filter((path) => fileTree.cache[path].status === "ok")
+      .sort();
+    localStorage.setItem(fileTreeKey(), JSON.stringify(open));
+  } catch (_) {
+    /* private mode or a full quota: the tree still works, it just forgets */
+  }
+}
+
+async function restoreFileTree() {
+  let open = [];
+  try {
+    const saved = JSON.parse(localStorage.getItem(fileTreeKey()) || "[]");
+    if (Array.isArray(saved)) open = saved.filter((path) => typeof path === "string");
+  } catch (_) {
+    open = [];
+  }
+  if (!open.length) {
+    await loadFileDir("");
+    return;
+  }
+  // Each listing stands on its own, so they fill in as they arrive.
+  await Promise.all(open.map((path) => loadFileDir(path)));
+}
+
+/* Show or hide the panel; the first open loads the workspace root. */
+async function toggleFilePanel() {
+  fileTree.open = !fileTree.open;
+  const toggle = $("files-toggle");
+  if (toggle) toggle.setAttribute("aria-expanded", String(fileTree.open));
+  if (fileTree.open && !Object.keys(fileTree.cache).length) await restoreFileTree();
+  renderFileTree();
+}
+
+function refreshFileTree() {
+  fileTree.cache = {};
+  void restoreFileTree();
+}
+
+$("files-toggle").addEventListener("click", () => void toggleFilePanel());
+$("files-refresh").addEventListener("click", () => refreshFileTree());
+$("file-tree").addEventListener("click", (ev) => {
+  const row = ev.target && ev.target.closest ? ev.target.closest(".file-row") : null;
+  if (!row) return;
+  const path = row.dataset.path || "";
+  if (!path) return;
+  if (row.dataset.dir === "1") toggleFileDir(path);
+  else void openFileInPanel(path);
+});
+
+/* ---------- run panel ---------- */
+/* Bounded command output — deliberately not a terminal. The backend runs the
+   command against pipes (no PTY in this build), so there is no interactivity
+   and no ANSI colour; the header says so out loud. What the panel showed
+   survives a reload: kept lines are stored per workspace root, capped like
+   the file tree, and re-shown as they were — the next run appends below. */
+
+/* Cap on lines kept in the panel and in storage; past this the oldest scroll
+   off, exactly as they scrolled off the screen. */
+const MAX_RUN_LINES = 400;
+
+function runPanelKey() {
+  return "bos.runs." + (state.workspaceRoot || "default");
+}
+
+/** Keep the newest `max` lines — what fell off the front stays gone. */
+function trimRunLines(lines, max) {
+  return lines.length > max ? lines.slice(lines.length - max) : lines;
+}
+
+/** One-line receipt for a finished run: the honest bits — code, size, time. */
+function formatRunFooter(p) {
+  const exit = p.exit_code === null || p.exit_code === undefined ? "stopped" : `exit ${p.exit_code}`;
+  const secs = ((p.duration_ms || 0) / 1000).toFixed(1);
+  const notes = [];
+  if (p.truncated) notes.push("stopped by the budget");
+  if (p.error) notes.push(p.error);
+  return `[${exit} · ${p.lines} lines · ${secs}s${notes.map((n) => ` · ${n}`).join("")}]`;
+}
+
+function pushRunLine(stream, text) {
+  state.runPanel.lines.push({ stream, text });
+  state.runPanel.lines = trimRunLines(state.runPanel.lines, MAX_RUN_LINES);
+}
+
+function setRunChip(running) {
+  const el = $("run-chip");
+  if (!el) return;
+  el.textContent = running ? "running" : "idle";
+  el.className = "chip " + (running ? "streaming" : "idle");
+}
+
+function renderRunPanel() {
+  const panel = $("run-panel");
+  if (panel) panel.hidden = !state.runPanel.open;
+  const out = $("run-output");
+  if (!out) return;
+  const frag = document.createDocumentFragment();
+  for (const line of state.runPanel.lines) {
+    const span = document.createElement("span");
+    const kind = line.stream === "stderr" ? "err" : line.stream === "stdout" ? "out" : "note";
+    span.className = "run-line " + kind;
+    // Command text and file names are untrusted: textContent only.
+    span.textContent = line.text;
+    frag.appendChild(span);
+    frag.appendChild(document.createTextNode("\n"));
+  }
+  out.textContent = "";
+  out.appendChild(frag);
+  out.scrollTop = out.scrollHeight;
+}
+
+/* A chatty command must not repaint per line: the panel catches up once per
+   frame, the same trick the transcript uses. */
+let runPaintQueued = false;
+function scheduleRunPaint() {
+  if (runPaintQueued) return;
+  runPaintQueued = true;
+  requestAnimationFrame(() => {
+    runPaintQueued = false;
+    renderRunPanel();
+  });
+}
+
+function persistRunLines() {
+  state.runPanel.lines = trimRunLines(state.runPanel.lines, MAX_RUN_LINES);
+  try {
+    localStorage.setItem(runPanelKey(), JSON.stringify(state.runPanel.lines));
+  } catch (_) {
+    /* private mode or a full quota: the panel still works, it just forgets */
+  }
+}
+
+/** Load the lines the last session showed for this workspace root. */
+function restoreRunLines() {
+  let lines = [];
+  try {
+    const saved = JSON.parse(localStorage.getItem(runPanelKey()) || "[]");
+    if (Array.isArray(saved)) {
+      lines = saved.filter(
+        (l) => l && typeof l.text === "string" && typeof l.stream === "string"
+      );
+    }
+  } catch (_) {
+    lines = [];
+  }
+  state.runPanel.lines = lines;
+}
+
+async function toggleRunPanel() {
+  state.runPanel.open = !state.runPanel.open;
+  renderRunPanel();
+  if (state.runPanel.open) {
+    const field = $("run-input");
+    if (field) field.focus();
+  }
+}
+
+$("run-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const field = $("run-input");
+  const command = (field.value || "").trim();
+  // One run at a time: a second command would interleave its lines with the
+  // first, and the panel has no way to tell them apart on screen.
+  if (!command || state.runPanel.activeId) return;
+  field.value = "";
+  const runId = `run-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  state.runPanel.activeId = runId;
+  setRunChip(true);
+  pushRunLine("note", "$ " + command);
+  scheduleRunPaint();
+  try {
+    await invoke("run_command", { runId, command });
+  } catch (err) {
+    state.runPanel.activeId = null;
+    setRunChip(false);
+    pushRunLine("note", `[refused: ${err}]`);
+    scheduleRunPaint();
+    persistRunLines();
+  }
+});
+
+$("run-clear").addEventListener("click", () => {
+  state.runPanel.lines = [];
+  renderRunPanel();
+  persistRunLines();
+});
+
+$("run-close").addEventListener("click", () => {
+  state.runPanel.open = false;
+  renderRunPanel();
+});
+
+listen("run-line", (event) => {
+  const p = event.payload;
+  if (p.run_id !== state.runPanel.activeId) return;
+  pushRunLine(p.stream, p.text);
+  scheduleRunPaint();
+});
+
+listen("run-finished", (event) => {
+  const p = event.payload;
+  if (p.run_id !== state.runPanel.activeId) return;
+  state.runPanel.activeId = null;
+  setRunChip(false);
+  pushRunLine("note", formatRunFooter(p));
+  scheduleRunPaint();
+  persistRunLines();
+});
+
 /* ---------- init ---------- */
 
 async function init() {
@@ -3995,7 +4403,13 @@ async function init() {
     // will use, so the sidebar needs them even before settings are opened.
     state.workspaces = settings.workspaces || [];
     state.activeWorkspace = settings.active_workspace || "";
+    // The file sidebar lists this root and keys its per-workspace memory by
+    // it, so it needs it before the first open.
+    state.workspaceRoot = settings.bash_workspace || "";
     state.presets = settings.presets || [];
+    // The run panel keeps what it showed: reload that history for this root.
+    restoreRunLines();
+    renderRunPanel();
     // Start page context: what this app instance is pointed at.
     Shell.setContext({
       workspace: settings.bash_workspace || "",

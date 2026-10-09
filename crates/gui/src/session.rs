@@ -399,8 +399,6 @@ struct CachedSession {
 #[derive(Debug, Clone)]
 pub(crate) struct SessionStore {
     dir: PathBuf,
-    /// Candidate filter for search, refreshed from file stamps.
-    index: Arc<Mutex<crate::fts::Index>>,
     /// Only the interactive path uses this; `load_all` stays a plain read.
     cache: Arc<Mutex<SearchCache>>,
 }
@@ -421,7 +419,6 @@ impl SessionStore {
         Self {
             dir: dir.into(),
             cache: Arc::new(Mutex::new(SearchCache::default())),
-            index: Arc::new(Mutex::new(crate::fts::Index::new())),
         }
     }
 
@@ -429,13 +426,7 @@ impl SessionStore {
     ///
     /// The cache holds at most the live sessions: a file that is gone from the
     /// directory is dropped from it, so it cannot grow without bound.
-    /// Sessions with the `(modified, length)` stamp each was loaded from.
-    ///
-    /// The stamp is handed back rather than recomputed because the index needs
-    /// exactly this and recomputing it with a separate `fs::metadata` per file
-    /// measured ~2.4 ms for 300 sessions — twice the entire cost of the plain
-    /// scan it was supposed to beat.
-    fn cached_sessions(&self) -> Vec<((SystemTime, u64), Arc<CachedSession>)> {
+    fn cached_sessions(&self) -> Vec<Arc<CachedSession>> {
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return out;
@@ -454,7 +445,7 @@ impl SessionStore {
         for (path, stamp) in &found {
             if let Some((cached, session)) = cache.records.get(path) {
                 if cached == stamp {
-                    out.push((*cached, Arc::clone(session)));
+                    out.push(Arc::clone(session));
                     continue;
                 }
             }
@@ -470,7 +461,7 @@ impl SessionStore {
                     cache
                         .records
                         .insert(path.clone(), (*stamp, Arc::clone(&session)));
-                    out.push((*stamp, session));
+                    out.push(session);
                 }
                 // A file that stopped parsing must not keep being served.
                 Err(_) => {
@@ -540,62 +531,6 @@ impl SessionStore {
     /// Find a phrase in any stored chat — titles and message text (§17 parity: the
     /// harness keeps an FTS index; this scans, which is honest at these sizes and
     /// needs no second store that could drift out of step with the session files).
-    /// Candidate ids for `needle`, refreshing the index as it goes.
-    ///
-    /// `None` means the index has no opinion — a query shorter than one token,
-    /// such as a single CJK character — and the caller then scans everything,
-    /// which is what keeps such a query working at all.
-    fn index_candidates(
-        &self,
-        records: &[((SystemTime, u64), Arc<CachedSession>)],
-        needle: &str,
-    ) -> Option<std::collections::BTreeSet<String>> {
-        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
-        if !index.is_loaded() {
-            *index = crate::fts::Index::load(&crate::fts::index_path(&self.dir));
-        }
-        let mut synced = Vec::with_capacity(records.len());
-        for ((modified, len), session) in records {
-            let id = session.record.id.clone();
-            // The stamp came from the pass that read the directory, so this
-            // costs nothing beyond a conversion.
-            let stamp = (
-                modified
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                *len,
-            );
-            // Only changed sessions pay to be tokenized.
-            let text = if index.is_current(&id, stamp) {
-                String::new()
-            } else {
-                crate::fts::indexable_text(&session.record)
-            };
-            synced.push(crate::fts::Synced { id, stamp, text });
-        }
-        let t0 = std::time::Instant::now(); // DIAG
-        index.sync(&synced);
-        let t1 = std::time::Instant::now(); // DIAG
-        let due = index.save_is_due(); // DIAG
-        if index.reindexed() > 0 && due {
-            // A failed save costs a rebuild next time, never a wrong answer.
-            let saved = index.save(&crate::fts::index_path(&self.dir)); // DIAG
-            eprintln!("DIAG saved={:?} due={due}", saved.is_ok()); // DIAG
-        } else {
-            eprintln!("DIAG no-save due={due} reindexed={}", index.reindexed()); // DIAG
-        }
-        let t2 = std::time::Instant::now(); // DIAG
-        let ids = index.candidate_ids(needle);
-        eprintln!(
-            "DIAG sync={:?} save={:?} cand={:?}",
-            t1 - t0,
-            t2 - t1,
-            t2.elapsed()
-        ); // DIAG
-        ids
-    }
-
     pub(crate) fn search(&self, needle: &str, limit: usize) -> Vec<SearchHit> {
         let needle = needle.trim();
         if needle.is_empty() || limit == 0 {
@@ -603,30 +538,20 @@ impl SessionStore {
         }
         let lower_needle: Vec<char> = needle.to_lowercase().chars().collect();
         let mut records = self.cached_sessions();
-        // A filter, not a verdict: everything it allows is still checked exactly.
-        let candidates = self.index_candidates(&records, needle);
         // Newest first, then by id: a search result list that reshuffles between
         // identical queries is a result list nobody can use.
         records.sort_by(|a, b| {
-            b.1.record
+            b.record
                 .updated_at
-                .cmp(&a.1.record.updated_at)
-                .then_with(|| a.1.record.id.cmp(&b.1.record.id))
+                .cmp(&a.record.updated_at)
+                .then_with(|| a.record.id.cmp(&b.record.id))
         });
         let mut hits = Vec::new();
         let lower_needle_text = needle.to_lowercase();
-        for (_, session) in records {
+        for session in records {
             let record = &session.record;
             if hits.len() >= limit {
                 break;
-            }
-            // The index covers the title, every message's text and every
-            // message's reasoning — exactly what this loop can match — so a
-            // session it excludes cannot have matched.
-            if let Some(ids) = &candidates {
-                if !ids.contains(&record.id) {
-                    continue;
-                }
             }
             if let Some(hit) = Self::hit_for(record, &lower_needle, needle, None) {
                 hits.push(hit);
@@ -1309,28 +1234,43 @@ mod tests {
     }
 
     #[test]
-    fn a_single_cjk_character_still_searches_through_the_index() {
+    fn a_single_cjk_character_still_searches() {
         // One CJK character has no bigram, so the index has no opinion and the
         // scan has to answer. That fallback is the reason such a query works.
-        let dir = std::env::temp_dir().join(format!("bos-gui-test-{}-{}", "one-cjk-char", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "bos-gui-test-{}-{}",
+            "one-cjk-char",
+            std::process::id()
+        ));
         let store = SessionStore::new(&dir);
         let mut record = SessionRecord::new();
         record.id = "cjk".to_string();
         record.title = "窗口".to_string();
         record.messages.push(ChatMessage::user("会话窗口的滚动条"));
         store.save(&record).expect("save");
-        assert_eq!(store.search("滚", 10).len(), 1, "one character still finds it");
+        assert_eq!(
+            store.search("滚", 10).len(),
+            1,
+            "one character still finds it"
+        );
         assert_eq!(store.search("滚动", 10).len(), 1, "two characters too");
-        assert!(store.search("滚x", 10).is_empty(), "and a miss stays a miss");
+        assert!(
+            store.search("滚x", 10).is_empty(),
+            "and a miss stays a miss"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn the_index_does_not_change_what_search_returns() {
+    fn search_keeps_answering_the_same_way() {
         // Build a store, search, then add and rewrite sessions and search again:
         // the answers must be the scan's answers at every step, because the
         // index is only allowed to skip work.
-        let dir = std::env::temp_dir().join(format!("bos-gui-test-{}-{}", "index-parity", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "bos-gui-test-{}-{}",
+            "index-parity",
+            std::process::id()
+        ));
         let store = SessionStore::new(&dir);
         for (id, title, body) in [
             ("a", "Deploy Notes", "How do I ship the GUI?"),
@@ -1357,7 +1297,9 @@ mod tests {
         let mut rewritten = SessionRecord::new();
         rewritten.id = "a".to_string();
         rewritten.title = "Deploy Notes".to_string();
-        rewritten.messages.push(ChatMessage::user("nothing about that verb"));
+        rewritten
+            .messages
+            .push(ChatMessage::user("nothing about that verb"));
         store.save(&rewritten).expect("save");
         let _ = store.search("ship", 10);
         assert!(
@@ -1367,66 +1309,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// What a query costs on the real `search` path, at several corpus sizes.
+    ///
+    /// Timing is printed, never asserted: a timing assertion is a flaky test.
+    /// The `simplified-scan` row is **not** the shipped path — it skips
+    /// `hit_for` and therefore skips snippet extraction, which is the part that
+    /// grows with message size. It is kept only because round 76 compared an
+    /// index against exactly that row and drew a conclusion the comparison
+    /// could not support; printing all three together makes the difference
+    /// visible instead of argued.
     #[test]
     fn search_cost_is_reported_for_the_record() {
-        // Timing is printed, never asserted: a timing assertion is a flaky test,
-        // and the claim that matters structurally — candidates proportional to
-        // matches, not to corpus size — is asserted in `fts`. Run with
-        // --nocapture to see the numbers this test reports.
-        //
-        // The comparison against a scan is indicative rather than like-for-like:
-        // the scan below re-lowers each message on every query, which the shipped
-        // cached path does not, and it parses the store rather than reusing it.
-        let dir = std::env::temp_dir().join(format!("bos-gui-test-cost-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = SessionStore::new(&dir);
-        let body = "the quick brown fox jumps over the lazy dog ".repeat(6);
-        for i in 0..300 {
-            let mut record = SessionRecord::new();
-            record.id = format!("cost-{i}");
-            record.title = format!("session {i}");
-            record.messages.push(ChatMessage::user(&body));
-            store.save(&record).expect("save");
-        }
-        // Cold: every file parsed and every session tokenized into the index.
-        let cold = std::time::Instant::now();
-        let _ = store.search("brown", 10);
-        let cold = cold.elapsed();
-        // Warm: stamps unchanged, so nothing is retokenized.
-        let warm = std::time::Instant::now();
-        let hits = store.search("brown", 10);
-        let warm = warm.elapsed();
-        assert_eq!(hits.len(), 10, "the limit is honoured");
-        // A token no session holds skips every session instead of scanning them.
-        let miss = std::time::Instant::now();
-        assert!(store.search("kangaroo", 10).is_empty(), "and a miss is a miss");
-        let miss = miss.elapsed();
-        let records = store.load_all();
-        let scan = std::time::Instant::now();
-        let found = records
-            .iter()
-            .filter(|r| {
-                r.messages
-                    .iter()
-                    .any(|m| m.text.to_lowercase().contains("brown"))
-            })
-            .count();
-        let scan = scan.elapsed();
-        assert!(found >= 10, "the scan agrees there are matches");
-        println!(
-            "[search-cost] sessions=300 cold={cold:?} warm={warm:?} miss={miss:?} scan={scan:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    #[test]
-    fn measure_index_crossover_sizes() {
-        // TEMPORARY diagnostic. The fair baseline is the path this round
-        // replaced: `cached_sessions` plus `contains` on its cached lowercase.
-        // `load_all` inside the timed region would be unfair to the scan, and
-        // omitting the per-file stats would be unfair to the index.
         for repeat in [6usize, 32, 128, 512] {
             let dir = std::env::temp_dir().join(format!(
-                "bos-gui-test-crossover-{}-{}",
+                "bos-gui-test-cost-{}-{}",
                 repeat,
                 std::process::id()
             ));
@@ -1440,48 +1336,32 @@ mod tests {
                 record.messages.push(ChatMessage::user(&body));
                 store.save(&record).expect("save");
             }
-            let _ = store.search("brown", 10); // warm both paths once
-            let needle = "brown";
-
-            let warm = std::time::Instant::now();
-            let hits = store.search(needle, 10);
-            let warm = warm.elapsed();
-
-            // The pre-round path, measured exactly as it was written.
-            let prev = std::time::Instant::now();
-            let records = store.cached_sessions();
-            let mut seen = 0usize;
-            for (_, session) in &records {
-                if session.record.title.to_lowercase().contains(needle) {
-                    seen += 1;
-                    continue;
-                }
-                for (index, message) in session.record.messages.iter().enumerate() {
-                    let (lower_text, _) = &session.lower[index];
-                    if lower_text.contains(needle) {
-                        seen += 1;
-                        break;
-                    }
-                    let _ = message;
-                }
-            }
-            let prev = prev.elapsed();
-
-            let bytes: u64 = std::fs::read_dir(&dir)
-                .unwrap()
-                .flatten()
-                .filter_map(|e| e.metadata().ok())
-                .map(|m| m.len())
-                .sum();
+            let _ = store.search("brown", 10); // warm the parse cache
+            let hit = std::time::Instant::now();
+            let hits = store.search("brown", 10);
+            let hit = hit.elapsed();
+            let miss = std::time::Instant::now();
+            let misses = store.search("kangaroo", 10);
+            let miss = miss.elapsed();
+            let scan = std::time::Instant::now();
+            let seen = store
+                .cached_sessions()
+                .iter()
+                .filter(|s| {
+                    s.record.title.to_lowercase().contains("brown")
+                        || s.lower.iter().any(|(t, _)| t.contains("brown"))
+                })
+                .count();
+            let scan = scan.elapsed();
+            assert_eq!(hits.len(), 10, "the limit is honoured");
+            assert!(misses.is_empty(), "and the miss is a miss");
+            assert!(seen >= 10, "the simplified scan agrees matches exist");
             println!(
-                "[crossover] body={:>7} total={:>9} indexed={:>11?} prev_path={:>11?} ratio={:.2} hits={} seen={}",
+                "[search-cost] body={:>6} real-hit={:>11?} real-miss={:>11?} simplified-scan={:>11?}",
                 body.len(),
-                bytes,
-                warm,
-                prev,
-                warm.as_secs_f64() / prev.as_secs_f64().max(f64::MIN_POSITIVE),
-                hits.len(),
-                seen,
+                hit,
+                miss,
+                scan
             );
             let _ = std::fs::remove_dir_all(&dir);
         }

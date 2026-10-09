@@ -16,6 +16,13 @@
       <input id="session-search" class="session-search" type="search"
              placeholder="Search chats…" aria-label="Search chats" spellcheck="false" />
       <div id="session-list" class="session-list"></div>
+      <div class="files-head">
+        <button id="files-toggle" class="nav-item" type="button" aria-expanded="false"
+                aria-controls="file-tree" title="Browse the workspace on disk">&#128193; Files</button>
+        <button id="files-refresh" class="btn btn-ghost" type="button"
+                title="Reload the file list">&#8635;</button>
+      </div>
+      <div id="file-tree" class="file-tree" role="tree" aria-label="Workspace files" hidden></div>
       <nav class="sidebar-nav" aria-label="Workspace">
         <button id="nav-plugins" class="nav-item" type="button"
                 title="Plugins, skills and registered tools">&#9096; Plugins &amp; skills</button>
@@ -46,6 +53,26 @@
           <button id="plan-edit" class="mini-btn plan-edit-btn" type="button">Edit</button>
         </div>
         <ol id="plan-list" class="plan-list" aria-label="Working plan"></ol>
+      </section>
+
+      <section id="run-panel" class="run-panel hidden" aria-label="Run output">
+        <div class="run-head">
+          <span id="run-title">Run</span>
+          <span id="run-chip" class="chip idle">idle</span>
+          <span class="run-note">plain text, not a terminal</span>
+          <button id="run-clear" class="mini-btn" type="button"
+                  title="Clear the output shown here">Clear</button>
+          <button id="run-close" class="mini-btn" type="button"
+                  title="Hide the run panel">&#10005;</button>
+        </div>
+        <pre id="run-output" class="run-output" role="log"
+             aria-label="Command output"></pre>
+        <form id="run-form" class="run-form">
+          <input id="run-input" type="text" spellcheck="false" autocomplete="off"
+                 aria-label="Shell command"
+                 placeholder="Run a shell command in the workspace&#8203; — Enter to run, output streams in above">
+          <button id="run-send" class="btn" type="submit">Run</button>
+        </form>
       </section>
 
       <div id="composer">

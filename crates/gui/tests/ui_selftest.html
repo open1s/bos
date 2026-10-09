@@ -61,11 +61,14 @@ window.addEventListener("error", (e) => {
       const IDS = [
         "approval-allow", "approval-args", "approval-deny", "approval-diff",
         "approval-modal", "approval-tool", "cap-list", "chat-title", "cmd-list",
-        "cmd-palette", "input", "mcp-add-btn", "mcp-cmd", "mcp-conn", "mcp-list",
+        "cmd-palette", "file-tree", "files-refresh", "files-toggle", "input",
+        "mcp-add-btn", "mcp-cmd", "mcp-conn", "mcp-list",
         "mcp-msg", "mcp-name", "mcp-reconnect-btn", "mcp-transport", "mcp-url",
         "mention-list", "mention-pop", "messages", "new-chat", "open-settings",
         "plan-edit", "plan-panel", "prov-add-btn", "prov-key", "prov-list",
-        "prov-model", "prov-msg", "prov-name", "prov-url", "queue-list", "send",
+        "prov-model", "prov-msg", "prov-name", "prov-url", "queue-list",
+        "run-chip", "run-clear", "run-close", "run-form", "run-input",
+        "run-output", "run-panel", "run-send", "send",
         "session-list", "session-search", "set-api-key", "set-approval",
         "set-base-url", "set-bash", "set-context-budget", "set-effort",
         "set-files", "set-instructions", "set-memory", "set-memory-path",
@@ -1591,6 +1594,188 @@ window.addEventListener("error", (e) => {
           markDirtyAll();
           renderMessages();
         }
+
+        // ---- 39. the file sidebar flattens exactly what was listed ------
+        // fileRowsFrom carries the whole drawing rule: only folders the user
+        // opened are descended into, backend order is kept, and a folder
+        // that refused to open becomes a row that explains itself.
+        const treeFixture = {
+          "": {
+            status: "ok",
+            entries: [
+              { path: "crates", name: "crates", is_dir: true, bytes: 0 },
+              { path: "README.md", name: "README.md", is_dir: false, bytes: 20480 },
+            ],
+          },
+          crates: {
+            status: "ok",
+            entries: [
+              { path: "crates/gui", name: "gui", is_dir: true, bytes: 0 },
+              { path: "crates/agent.rs", name: "agent.rs", is_dir: false, bytes: 512 },
+            ],
+          },
+          "crates/gui": { status: "error", error: "not readable: nope", entries: [] },
+        };
+        const flat = fileRowsFrom(treeFixture);
+        assert(
+          `children follow their folder, depth first (paths=${flat.map((r) => r.path).join("|")})`,
+          flat.length === 4 &&
+            flat.map((r) => r.path).join("|") === "crates|crates/gui|crates/agent.rs|README.md",
+        );
+        assert(
+          `depth follows nesting (depths=${flat.map((r) => r.depth).join(",")})`,
+          flat.map((r) => r.depth).join(",") === "0,1,1,0",
+        );
+        assert(
+          `a folder that refused to open carries the reason on its row (state=${flat[1].state} error=${flat[1].error})`,
+          flat[1].state === "error" &&
+            flat[1].name === "gui" &&
+            flat[1].error === "not readable: nope",
+        );
+        assert(
+          `a file never expands and keeps its size (bytes=${flat[2].bytes} state=${flat[2].state})`,
+          !flat[2].isDir && flat[2].state === "file" && flat[2].bytes === 512,
+        );
+        const collapsed = fileRowsFrom({ "": treeFixture[""] });
+        assert(
+          `collapsing a folder removes its children (rows=${collapsed.length})`,
+          collapsed.length === 2,
+        );
+        const pending = fileRowsFrom({
+          "": treeFixture[""],
+          crates: { status: "loading", entries: [] },
+        });
+        assert(
+          `a folder still loading shows itself and nothing under it (rows=${pending.length} state=${pending[0].state})`,
+          pending.length === 2 && pending[0].state === "loading",
+        );
+        const noRoot = fileRowsFrom({
+          "": { status: "error", error: "no workspace configured", entries: [] },
+        });
+        assert(
+          `an unusable workspace root is a row that says so (rows=${noRoot.length} error=${noRoot[0] && noRoot[0].error})`,
+          noRoot.length === 1 &&
+            noRoot[0].state === "error" &&
+            noRoot[0].error === "no workspace configured",
+        );
+        assert(
+          `sizes read human (512=${formatFileBytes(512)} 20480=${formatFileBytes(
+            20480,
+          )} 3M=${formatFileBytes(3 * 1024 * 1024)})`,
+          formatFileBytes(512) === "512 B" &&
+            formatFileBytes(20480) === "20.0 kB" &&
+            formatFileBytes(3 * 1024 * 1024) === "3.0 MB",
+        );
+
+        // ---- 40. the panel itself opens, asks once, and closes ----------
+        // The harness's invoke never settles, so the first paint is the
+        // loading row: enough to prove the toggle drives the DOM and the
+        // backend is asked for the root exactly when the tree opens.
+        const treeHost = $("file-tree");
+        const treeToggle = $("files-toggle");
+        treeToggle.click();
+        assert(
+          `opening the tree shows its one loading row (hidden=${treeHost.hidden} rows=${treeHost.querySelectorAll(
+            ".file-row",
+          ).length} aria=${treeToggle.getAttribute("aria-expanded")})`,
+          !treeHost.hidden &&
+            treeHost.querySelectorAll(".file-row").length === 1 &&
+            treeToggle.getAttribute("aria-expanded") === "true",
+        );
+        treeToggle.click();
+        assert(
+          `closing it hides the tree (hidden=${treeHost.hidden} aria=${treeToggle.getAttribute(
+            "aria-expanded",
+          )})`,
+          treeHost.hidden && treeToggle.getAttribute("aria-expanded") === "false",
+        );
+
+        // ---- 41. the run panel keeps bounded, honest, plain-text output --
+        // Pure bits first: the cap keeps the newest lines, and the footer is
+        // the whole receipt — exit code, line count, seconds, and the two
+        // things that must never be swallowed: a budget cut, and the reason.
+        const capKept = trimRunLines([{ i: 1 }, { i: 2 }, { i: 3 }], 2);
+        assert(
+          "run lines are capped to the newest N",
+          capKept.length === 2 && capKept[0].i === 2 && capKept[1].i === 3,
+        );
+        const cleanFooter = formatRunFooter({
+          exit_code: 0,
+          lines: 3,
+          duration_ms: 1234,
+          truncated: false,
+          error: null,
+        });
+        assert(
+          `a clean run's footer reads exit 0 (${cleanFooter})`,
+          cleanFooter === "[exit 0 · 3 lines · 1.2s]",
+        );
+        const refusedFooter = formatRunFooter({
+          exit_code: null,
+          lines: 0,
+          duration_ms: 0,
+          truncated: true,
+          error: "could not start: nope",
+        });
+        assert(
+          `a refused run and a budget cut both say so (${refusedFooter})`,
+          refusedFooter ===
+            "[stopped · 0 lines · 0.0s · stopped by the budget · could not start: nope]",
+        );
+
+        // The panel follows open state in both directions...
+        const runPanel = $("run-panel");
+        const runOut = $("run-output");
+        const savedRunPanel = JSON.parse(JSON.stringify(state.runPanel));
+        toggleRunPanel();
+        assert(
+          `the run panel opens on demand (open=${state.runPanel.open} hidden=${runPanel.hidden})`,
+          state.runPanel.open === true && runPanel.hidden === false,
+        );
+        toggleRunPanel();
+        assert(
+          `the run panel closes again (open=${state.runPanel.open} hidden=${runPanel.hidden})`,
+          state.runPanel.open === false && runPanel.hidden === true,
+        );
+        toggleRunPanel();
+        assert(
+          `...and reopens (open=${state.runPanel.open} hidden=${runPanel.hidden})`,
+          state.runPanel.open === true && runPanel.hidden === false,
+        );
+
+        // ...and repaints kept lines as labelled text: stderr marked, an
+        // angle-bracket payload rendered literally, never parsed as HTML.
+        state.runPanel.lines = [];
+        pushRunLine("stdout", "hello");
+        pushRunLine("stderr", "<b>not html</b>");
+        pushRunLine("note", "[exit 0 · 2 lines · 0.1s]");
+        renderRunPanel();
+        assert(
+          "output renders as three labelled text lines (no HTML sink)",
+          runOut.querySelectorAll(".run-line.err").length === 1 &&
+            runOut.querySelector(".run-line.err").textContent ===
+              "<b>not html</b>" &&
+            runOut.querySelector("b") === null &&
+            runOut.textContent.includes("hello") &&
+            runOut.textContent.includes("[exit 0 · 2 lines · 0.1s]"),
+        );
+
+        setRunChip(true);
+        assert(
+          `the chip announces a run in flight (text=${$("run-chip").textContent} class=${$(
+            "run-chip",
+          ).className})`,
+          $("run-chip").textContent === "running" &&
+            $("run-chip").className === "chip streaming",
+        );
+        setRunChip(false);
+        assert(
+          "the palette carries /run",
+          BUILTIN_COMMANDS.some((c) => c.name === "/run"),
+        );
+
+        state.runPanel = savedRunPanel;
+        renderRunPanel();
 
         R.failures = Object.values(R.checks).filter((v) => v.startsWith("FAIL")).length;
         const pre = document.createElement("pre");

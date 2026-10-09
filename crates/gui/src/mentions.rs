@@ -17,12 +17,12 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use super::filetree::SKIP_DIRS;
+
 /// Max bytes attached from a single mentioned file (UTF-8 safe cut).
 pub(crate) const MENTION_MAX_BYTES: usize = 32 * 1024;
 /// Max distinct files expanded in one prompt.
 pub(crate) const MENTION_MAX_FILES: usize = 4;
-/// Directory names never walked while listing the workspace.
-const SKIP_DIRS: [&str; 3] = [".git", "target", "node_modules"];
 /// Hard cap on walker depth relative to the workspace root.
 const MAX_DEPTH: usize = 10;
 
