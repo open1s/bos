@@ -847,6 +847,175 @@ fn search_files(
     Ok(crate::mentions::search_files(root, query.trim(), limit))
 }
 
+/// Largest file the document panel reads in one go (2 MiB).
+///
+/// The panel is for reading, not for loading whole trees into memory, so the
+/// cap stays explicit and the read is bounded rather than post-truncated.
+const VIEW_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// One bounded, workspace-confined file read for the document panel.
+#[derive(serde::Serialize)]
+struct FileView {
+    /// Workspace-relative path, `/`-separated.
+    path: String,
+    /// File text; a prefix of the file when `truncated` is set.
+    text: String,
+    /// Size on disk in bytes.
+    bytes: u64,
+    /// Whether `text` is shorter than the file.
+    truncated: bool,
+}
+
+/// Resolve a workspace-relative path to a readable file.
+///
+/// Escapes are refused rather than sanitised: `..`, absolute paths and symlinks
+/// that point outside the workspace all fail, as do directories and missing
+/// files. Returns the canonical path and its size on disk.
+fn resolve_workspace_file(
+    root: &std::path::Path,
+    rel: &str,
+) -> Result<(std::path::PathBuf, u64), String> {
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Err("no path given".into());
+    }
+    if root.as_os_str().is_empty() {
+        return Err("no workspace configured".into());
+    }
+    if rel.split(['/', '\\']).any(|part| part == "..") {
+        return Err("path escapes the workspace".into());
+    }
+    let canon_root = root
+        .canonicalize()
+        .map_err(|err| format!("workspace unavailable: {err}"))?;
+    let canon = canon_root
+        .join(rel)
+        .canonicalize()
+        .map_err(|_| format!("not found: {rel}"))?;
+    if !canon.starts_with(&canon_root) {
+        return Err("path escapes the workspace".into());
+    }
+    let meta = std::fs::metadata(&canon).map_err(|err| format!("not readable: {err}"))?;
+    if !meta.is_file() {
+        return Err("not a file".into());
+    }
+    Ok((canon, meta.len()))
+}
+
+/// Read a workspace file for the right-hand document panel.
+///
+/// The path is workspace-relative and confined to the configured workspace:
+/// escapes, directories, missing files, binary payloads and non-UTF-8 data are
+/// refused with a message the UI can show. At most [`VIEW_MAX_BYTES`] are
+/// returned, with an explicit `truncated` flag — an omission the UI states
+/// rather than hides. The panel renders the text inertly.
+#[tauri::command]
+fn read_file(state: State<'_, Arc<GuiState>>, path: String) -> Result<FileView, String> {
+    let root = {
+        let inner = state.lock()?;
+        std::path::PathBuf::from(inner.settings.bash_workspace.trim())
+    };
+    let (canon, bytes) = resolve_workspace_file(&root, &path)?;
+    let shown = {
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        canon
+            .strip_prefix(&canon_root)
+            .unwrap_or(&canon)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    use std::io::Read as _;
+    let file = std::fs::File::open(&canon).map_err(|err| format!("read failed: {err}"))?;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    file.take(VIEW_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|err| format!("read failed: {err}"))?;
+    if buf.iter().take(8192).any(|b| *b == 0) {
+        return Err(format!("{shown} looks binary; the panel shows text only"));
+    }
+    let truncated = buf.len() > VIEW_MAX_BYTES;
+    buf.truncate(VIEW_MAX_BYTES);
+    let text = match String::from_utf8(buf) {
+        Ok(text) => text,
+        Err(err) => {
+            // Keep the valid prefix: a multi-byte character cut by the cap must
+            // not turn the whole file into an encoding error.
+            let valid = err.utf8_error().valid_up_to();
+            if valid == 0 {
+                return Err(format!("{shown} is not UTF-8 text"));
+            }
+            let mut bytes = err.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    };
+    Ok(FileView {
+        path: shown,
+        text,
+        bytes,
+        truncated,
+    })
+}
+
+#[cfg(test)]
+mod file_view_tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("bos-gui-view-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp root");
+        root
+    }
+
+    #[test]
+    fn reads_a_workspace_file_and_reports_its_size() {
+        let root = temp_root("read");
+        std::fs::write(root.join("note.md"), "hello\nworld\n").unwrap();
+        let (canon, bytes) = resolve_workspace_file(&root, "note.md").expect("resolves");
+        assert!(canon.ends_with("note.md"));
+        assert_eq!(bytes, 12);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuses_escapes_absolute_paths_and_directories() {
+        let root = temp_root("escape");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/inner.txt"), "x").unwrap();
+        assert!(resolve_workspace_file(&root, "../etc/passwd").is_err());
+        assert!(resolve_workspace_file(&root, "sub/../../outside").is_err());
+        assert!(resolve_workspace_file(&root, "/etc/passwd").is_err());
+        assert!(resolve_workspace_file(&root, "sub").is_err());
+        assert!(resolve_workspace_file(&root, "").is_err());
+        // A legal nested relative path still works.
+        assert!(resolve_workspace_file(&root, "sub/inner.txt").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuses_missing_files_and_a_missing_workspace() {
+        let root = temp_root("missing");
+        assert!(resolve_workspace_file(&root, "nope.txt").is_err());
+        assert!(resolve_workspace_file(std::path::Path::new(""), "nope.txt").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_symlink_out_of_the_workspace_is_refused() {
+        let root = temp_root("symlink");
+        let outside = temp_root("symlink-outside");
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt")).unwrap();
+        #[cfg(unix)]
+        assert!(resolve_workspace_file(&root, "link.txt").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
 /// Abort in-flight streams; each forwarder persists its own partial turn.
 ///
 /// With `session_id` only that chat stops and only *its* pending approvals
@@ -1403,6 +1572,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             fork_session,
             open_url,
             search_files,
+            read_file,
             stop_streaming,
             respond_approval,
             compact_session,

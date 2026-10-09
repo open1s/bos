@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>shell selftest</title>
+<link rel="stylesheet" href="../ui/style.css" />
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="sidebar-head"><span class="brand">BOS</span><button id="new-chat">+ New</button></div>
+    <input id="session-search" type="search" />
+    <div id="session-list" class="session-list"></div>
+    <div class="sidebar-foot"><button id="open-settings" class="btn btn-ghost">Settings</button></div>
+  </aside>
+  <main id="main">
+    <header id="chat-head"><span id="chat-title">BOS</span><span id="stream-chip" class="chip idle">idle</span></header>
+    <div id="messages">
+      <div class="msg"><div class="tool-card"><div class="tool-head"><span class="tool-name">bash</span></div><div class="tool-body"><pre class="tool-output">+ added</pre></div></div></div>
+    </div>
+  </main>
+</div>
+<script src="../ui/shell.js"></script>
+<script>
+/* Shell contract harness: exercises the shipped shell.js against the real
+   stylesheet, so geometry, clamping, theming and the task-state machine are
+   verified in a browser instead of asserted in prose. */
+(() => {
+  const checks = [];
+  const check = (name, ok, detail) => checks.push({ name, ok: !!ok, detail: detail === undefined ? "" : String(detail) });
+  const css = (node, prop) => getComputedStyle(node).getPropertyValue(prop).trim();
+  const px = (v) => parseFloat(v) || 0;
+
+  const app = document.getElementById("app");
+  const sidebar = document.getElementById("sidebar");
+  const messages = document.getElementById("messages");
+  const toolBody = document.querySelector(".tool-body");
+  const chip = document.getElementById("stream-chip");
+
+  try {
+    // --- mount -------------------------------------------------------------
+    check("divider-left mounted", !!document.getElementById("divider-left"));
+    check("divider-right mounted", !!document.getElementById("divider-right"));
+    check("doc panel mounted", !!document.getElementById("doc-panel"));
+    check("pane toggles mounted", !!document.getElementById("sidebar-toggle") && !!document.getElementById("doc-toggle"));
+    check("sidebar expanded at 1440px", app.dataset.sidebar === "expanded", app.dataset.sidebar);
+    check("doc panel open at 1440px", app.dataset.doc === "open");
+    check("default sidebar 280px", px(app.style.getPropertyValue("--sidebar-w")) === 280, app.style.getPropertyValue("--sidebar-w"));
+
+    // --- clamping ----------------------------------------------------------
+    Shell.setSidebar(9999);
+    check("sidebar clamps high to 420", Shell.state.sidebar === 420, Shell.state.sidebar);
+    Shell.setSidebar(10);
+    check("sidebar clamps low to 264", Shell.state.sidebar === 264, Shell.state.sidebar);
+    Shell.setSidebar(300);
+    // Preferences go through the shell's one storage seam, so this holds whether
+    // the page has origin storage or falls back to memory (a file:// page has
+    // none, which is exactly the degraded case the seam must survive).
+    check("storage seam reports mode", typeof Shell.storage.durable === "boolean", Shell.storage.durable);
+    Shell.storage.set("bos.selftest", JSON.stringify({ probe: 1 }));
+    check("storage round-trips", JSON.parse(Shell.storage.get("bos.selftest") || "null").probe === 1);
+    check("layout persisted", JSON.parse(Shell.storage.get("bos.layout.v1") || "null").sidebar === 300);
+    Shell.setDoc(9999);
+    let doc = px(app.style.getPropertyValue("--doc-w"));
+    check("doc clamps to <=70%", doc <= Math.round(app.clientWidth * 0.7) + 1, doc);
+    check(
+      "centre keeps 400px",
+      app.clientWidth - Shell.state.sidebar - doc - 10 >= 400,
+      `${app.clientWidth} - ${Shell.state.sidebar} - ${doc}`,
+    );
+    Shell.setDoc(1);
+    check("doc clamps low to 280", px(app.style.getPropertyValue("--doc-w")) === 280);
+
+    // --- toggles -----------------------------------------------------------
+    Shell.toggleDoc();
+    check("toggle hides doc", Shell.state.docOpen === false && app.dataset.doc === "closed" && document.getElementById("doc-panel").hidden);
+    check("doc toggle aria", document.getElementById("doc-toggle").getAttribute("aria-pressed") === "false");
+    Shell.toggleDoc();
+    Shell.toggleSidebar();
+    check("rail collapses sidebar", px(app.style.getPropertyValue("--sidebar-w")) === 56);
+    check("rail hides session list", css(document.getElementById("session-list"), "display") === "none");
+    Shell.toggleSidebar();
+    check("sidebar restores width", px(app.style.getPropertyValue("--sidebar-w")) === 300);
+
+    // --- theming, typography, presentation ---------------------------------
+    Shell.setAppearance("light");
+    const lightBg = css(document.body, "background-color");
+    const lum = (lightBg.match(/\d+/g) || []).slice(0, 3).map(Number);
+    check("light theme applied", document.documentElement.dataset.theme === "light" && lum.length === 3 && (lum[0] + lum[1] + lum[2]) / 3 > 200, lightBg);
+    Shell.setAppearance("system");
+    check("system resolves to a known theme", ["light", "dark"].includes(document.documentElement.dataset.theme) && document.documentElement.dataset.appearance === "system");
+    Shell.setAppearance("dark");
+    Shell.setFontSize(18);
+    check("font size var", px(css(document.documentElement, "--content-font-size")) === 18, css(document.documentElement, "--content-font-size"));
+    check("font size reaches messages", css(messages, "font-size") === "18px", css(messages, "font-size"));
+    Shell.setFontSize(99);
+    check("font size clamps to 22", Shell.state.fontSize === 22);
+    Shell.setWorkDetails("compact");
+    check("compact hides tool body", css(toolBody, "display") === "none");
+    Shell.setWorkDetails("standard");
+    check("standard shows tool body", css(toolBody, "display") !== "none");
+    Shell.setCodingView(false);
+    check("coding view off hides tool body", css(toolBody, "display") === "none");
+    Shell.setCodingView(true);
+    check("coding view on shows tool body", css(toolBody, "display") !== "none");
+    Shell.setLanguage("zh");
+    check("language sets html lang", document.documentElement.lang === "zh-CN", document.documentElement.lang);
+    const before = JSON.stringify(Shell.state.permission);
+    Shell.setPermission("not-a-mode");
+    check("permission rejects unknown", JSON.stringify(Shell.state.permission) === before, Shell.state.permission);
+    const saved = JSON.parse(Shell.storage.get("bos.ui.v1") || "null") || {};
+    check("ui prefs persisted", saved.fontSize === 22 && saved.appearance === "dark" && saved.language === "zh", JSON.stringify(saved));
+
+    // --- task state machine ------------------------------------------------
+    check("starts idle", Shell.state.task.status === "Idle", Shell.state.task.status);
+    check("started -> Running", Shell.applyTaskEvent({ taskId: "t1", type: "started", seq: 1 }) && Shell.state.task.status === "Running");
+    check("duplicate seq ignored", Shell.applyTaskEvent({ taskId: "t1", type: "progress", seq: 1 }) === false);
+    check("stale seq ignored", Shell.applyTaskEvent({ taskId: "t1", type: "progress", seq: 0 }) === false);
+    check("approval state", Shell.applyTaskEvent({ taskId: "t1", type: "approval", seq: 2 }) && Shell.state.task.status === "WaitingForApproval");
+    check("completed", Shell.applyTaskEvent({ taskId: "t1", type: "completed", seq: 3 }) && Shell.state.task.status === "Completed");
+    check("terminal is sticky", Shell.applyTaskEvent({ taskId: "t1", type: "progress", seq: 4 }) === false && Shell.state.task.status === "Completed");
+    check("new task resets", Shell.applyTaskEvent({ taskId: "t2", type: "started", seq: 1 }) && Shell.state.task.status === "Running");
+    Shell.setTaskDetail("streaming \u00b7 3s");
+    check("chip renders detail", chip.textContent === "streaming \u00b7 3s" && chip.className.includes("streaming"), chip.textContent);
+    Shell.applyTaskEvent({ taskId: "t2", type: "failed", seq: 2, phase: "tool" });
+    check("failed is terminal", Shell.state.task.status === "Failed" && chip.className.includes("failed"), chip.className);
+
+    // --- document panel ----------------------------------------------------
+    // The injected text is assembled from fragments so this page's own script
+    // block is not terminated by the literal; document text must stay inert.
+    const SCRIPT_TAG = "<scr" + "ipt>alert(1)</scr" + "ipt>";
+    Shell.openDocument({ id: "d1", title: "note", path: "/tmp/note.md", text: SCRIPT_TAG + "\nplain text" });
+    const body = document.getElementById("doc-body");
+    check("doc text is inert", body.querySelectorAll("script").length === 0 && body.textContent.includes(SCRIPT_TAG));
+    check("doc path shown", document.getElementById("doc-path").textContent === "/tmp/note.md");
+    check("tabs: start + doc", document.querySelectorAll(".doc-tab").length === 2, document.querySelectorAll(".doc-tab").length);
+    check("active tab selected", document.querySelector(".doc-tab.active").textContent.includes("note"));
+    // Tool cards key their artifact by the tool entry, so re-opening the same id
+    // must update in place instead of piling up tabs.
+    Shell.openDocument({ id: "d1", title: "note", path: "/tmp/note.md", text: "updated output" });
+    check(
+      "reopening an id updates in place",
+      document.querySelectorAll(".doc-tab").length === 2 && body.textContent.includes("updated output"),
+      document.querySelectorAll(".doc-tab").length,
+    );
+    Shell.closeDocument("d1");
+    check("closing doc restores start", document.querySelectorAll(".doc-tab").length === 1 && body.textContent.includes("No document open"));
+    Shell.setAppearance("system");
+    Shell.setFontSize(14);
+  } catch (err) {
+    check("harness completed", false, err && err.stack ? err.stack : String(err));
+  }
+
+  const failures = checks.filter((c) => !c.ok).length;
+  const out = document.createElement("pre");
+  out.id = "result";
+  out.textContent = JSON.stringify({ page: "shell", failures, total: checks.length, checks }, null, 2);
+  document.body.appendChild(out);
+})();
+</script>
+</body>
+</html>

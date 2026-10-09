@@ -273,6 +273,7 @@ fn verify_live_plan_tool() {
     });
 
     eprintln!("plan calls: {plan_calls}");
+    eprintln!("plan result: {plan_result:?} (bytes, ms)");
     eprintln!("reply      : {}", text.trim());
     assert!(
         error.is_none(),
@@ -280,6 +281,10 @@ fn verify_live_plan_tool() {
         error.unwrap_or_default()
     );
     assert!(plan_calls > 0, "the model never invoked update_plan");
+    assert!(
+        plan_result.is_some(),
+        "the stream never reported the finished update_plan call"
+    );
     let items = agent.plan_items();
     assert!(
         !items.is_empty(),

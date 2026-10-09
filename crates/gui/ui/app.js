@@ -119,6 +119,17 @@ function fmtTime(unix) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/* Session ages read better as relative labels; the exact stamp stays available on
+   hover. `now` is injectable so the shape is testable without a clock. */
+function fmtAge(unix, now = Date.now() / 1000) {
+  const secs = Math.max(0, Math.round(now - unix));
+  if (secs < 45) return "now";
+  if (secs < 3600) return `${Math.round(secs / 60)}m`;
+  if (secs < 86400) return `${Math.round(secs / 3600)}h`;
+  if (secs < 7 * 86400) return `${Math.round(secs / 86400)}d`;
+  return fmtTime(unix).slice(0, 5);
+}
+
 /* ---------- rendering ---------- */
 
 function activeMsgs() {
@@ -166,7 +177,9 @@ function renderSidebar() {
     const row = el("div", "session-row" + (s.id === state.activeId ? " active" : ""));
     row.appendChild(el("span", "title", clip(title, 24)));
     if (streamOf(s.id)) row.appendChild(el("span", "dot", "●"));
-    row.appendChild(el("span", "time", fmtTime(s.updated_at)));
+    const age = el("span", "time", fmtAge(s.updated_at));
+    age.title = fmtTime(s.updated_at);
+    row.appendChild(age);
     const del = el("button", "del", "✕");
     del.title = "Delete chat";
     del.addEventListener("click", (e) => {
@@ -181,7 +194,10 @@ function renderSidebar() {
 
 function renderTitle() {
   const active = state.sessions.find((s) => s.id === state.activeId);
-  chatTitle.textContent = active ? clip(active.title || "New chat", 48) : "BOS";
+  const title = active ? clip(active.title || "New chat", 48) : "BOS";
+  chatTitle.textContent = title;
+  // The document panel's Start page shows the shell's view of the session.
+  Shell.setContext({ session: active ? active.title || "New chat" : "" });
 }
 
 /* ---------- markdown (escape-first, then fixed-tag templating) ----------
@@ -435,12 +451,35 @@ function buildToolCard(t) {
   if (t.open) {
     const body = el("div", "tool-body");
     body.appendChild(el("div", "tool-args-full", toolArgsFull(t.args)));
-    if (done) body.appendChild(renderToolOutput(t.output));
-    else body.appendChild(el("div", "tool-pending", "waiting for result…"));
+    if (done) {
+      body.appendChild(renderToolOutput(t.output));
+      // The card stays a summary; the right panel is where a full artifact is
+      // read. Tool output is untrusted, so the panel renders it inert.
+      const open = el("button", "mini-btn tool-open", "Open in panel");
+      open.type = "button";
+      open.title = "Open this result in the document panel";
+      open.addEventListener("click", () => {
+        Shell.openDocument({
+          id: "tool:" + toolKey(t),
+          title: t.name,
+          path: toolPath(t),
+          text:
+            typeof t.output === "string"
+              ? t.output
+              : JSON.stringify(t.output, null, 2),
+        });
+      });
+      body.appendChild(open);
+    } else {
+      body.appendChild(el("div", "tool-pending", "waiting for result…"));
+    }
     card.appendChild(body);
   }
   head.addEventListener("click", () => {
     t.open = !t.open;
+    // Expanding a card changes that row's signature and the row does not know
+    // its own index, so a click invalidates the whole validation cursor.
+    markDirtyAll();
     scheduleRepaint();
   });
   return card;
@@ -614,20 +653,162 @@ function buildEditor(m, i) {
   return box;
 }
 
+/* ---- incremental transcript ----
+
+   Streaming delivers dozens of token events per frame. Rebuilding every row
+   on each repaint is what made the transcript expensive; instead rows are
+   cached per message identity and reused unless their content signature
+   changed, so one token patches one row. */
+
+const MSG_KEY = Symbol("msgKey");
+let msgKeySeq = 0;
+
+/* Stable identity for a message object (non-enumerable so it never leaks into
+   payloads). Renamed/loaded objects simply get fresh keys and rebuild once. */
+function msgKey(m) {
+  let key = m[MSG_KEY];
+  if (key === undefined) {
+    key = ++msgKeySeq;
+    Object.defineProperty(m, MSG_KEY, { value: key, enumerable: false });
+  }
+  return key;
+}
+
+/* Cheap content signature: length plus a short tail, so a same-length
+   replacement (an edit, a tool result overwrite) still invalidates the row. */
+function sigOf(s) {
+  const t = s || "";
+  return `${t.length}:${t.slice(-24)}`;
+}
+
+function messageSignature(m, opts, editingHere) {
+  let tools = "";
+  for (const t of m.tools || []) {
+    tools += `${sigOf(t.name)}|${sigOf(t.args)}|${
+      t.output == null ? "-" : sigOf(t.output)
+    }|${t.ms == null ? "-" : t.ms}|${t.open ? "o" : "c"};`;
+  }
+  return [
+    m.role,
+    sigOf(m.text),
+    sigOf(m.reasoning),
+    sigOf(m.error),
+    tools,
+    opts.showCaret ? 1 : 0,
+    opts.regen ? 1 : 0,
+    opts.edit ? 1 : 0,
+    opts.del ? 1 : 0,
+    opts.branch ? 1 : 0,
+    editingHere ? 1 : 0,
+  ].join("~");
+}
+
+/* Stable identity for one tool entry, used as the document id when its result
+   is opened in the right panel (same non-enumerable trick as messages). */
+const TOOL_KEY = Symbol("toolKey");
+let toolKeySeq = 0;
+
+function toolKey(t) {
+  let key = t[TOOL_KEY];
+  if (key === undefined) {
+    key = ++toolKeySeq;
+    Object.defineProperty(t, TOOL_KEY, { value: key, enumerable: false });
+  }
+  return key;
+}
+
+/* Best-effort display path for a tool call. The value is agent-authored and is
+   only ever shown as text; it is never used to read anything on its own. */
+function toolPath(t) {
+  const args = t.args && typeof t.args === "object" ? t.args : null;
+  const p = args && (args.path || args.file || args.filename || args.target);
+  return typeof p === "string" ? p : "";
+}
+
+/* Cached rows between repaints: message key -> { el, sig }. */
+const rowCache = new Map();
+let emptyRendered = false;
+
+/* Validation cursor: rows above `dirtyFrom` are reused without recomputing their
+   signatures. A streaming token only touches the tail, so the per-frame cost stops
+   growing with the transcript. Any in-place mutation of an older row must call
+   `markDirty` (which only ever moves the cursor backwards). */
+let dirtyFrom = 0;
+let lastEpoch = null;
+/* The last rendered transcript identity, used to decide whether the leading
+   rows may be trusted without looking at them. */
+let lastMsgsRef = null;
+let lastMsgsLen = -1;
+let lastTailRef = null;
+
+function markDirty(index) {
+  if (index < dirtyFrom) dirtyFrom = index;
+}
+
+function markDirtyAll() {
+  dirtyFrom = 0;
+}
+
+/* Tail-follow is maintained from scroll events instead of being measured on
+   every repaint: asking "is the reader at the bottom?" with `scrollHeight`
+   forces a layout, and the streaming repaint is the hot path. Sticking to the
+   bottom writes an out-of-range value that the browser clamps — a write, so no
+   read either. */
+const TAIL_SLACK = 24;
+let followTail = true;
+let followSession = null;
+let scrollFromUs = false;
+let scrollClearTimer = 0;
+
+messagesEl.addEventListener(
+  "scroll",
+  () => {
+    // Our own stick-to-bottom write also lands here; ignore it rather than
+    // measure the geometry we just moved.
+    if (scrollFromUs) return;
+    followTail =
+      messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <=
+      TAIL_SLACK;
+  },
+  { passive: true },
+);
+
+function stickToBottom() {
+  followTail = true;
+  scrollFromUs = true;
+  messagesEl.scrollTop = Number.MAX_SAFE_INTEGER;
+  // Clear the mark even if the write produced no scroll event at all.
+  if (!scrollClearTimer) {
+    scrollClearTimer = setTimeout(() => {
+      scrollClearTimer = 0;
+      scrollFromUs = false;
+    }, 120);
+  }
+}
+
 function renderMessages() {
   const msgs = activeMsgs();
-  const nearBottom =
-    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
-  const prevTop = messagesEl.scrollTop;
+  // A session swap opens at the newest message, like a chat client should.
+  if (followSession !== state.activeId) {
+    followSession = state.activeId;
+    followTail = true;
+    markDirtyAll();
+  }
+  const prevTop = followTail ? 0 : messagesEl.scrollTop;
 
-  messagesEl.textContent = "";
   if (msgs.length === 0) {
-    const hint = el("div", "empty-hint");
-    hint.appendChild(el("div", "", "New conversation"));
-    hint.appendChild(el("div", "", "Type a message below to begin."));
-    messagesEl.appendChild(hint);
+    if (!emptyRendered) {
+      emptyRendered = true;
+      rowCache.clear();
+      messagesEl.textContent = "";
+      const hint = el("div", "empty-hint");
+      hint.appendChild(el("div", "", "New conversation"));
+      hint.appendChild(el("div", "", "Type a message below to begin."));
+      messagesEl.appendChild(hint);
+    }
     return;
   }
+  emptyRendered = false;
 
   const activeStream = streamOf(state.activeId);
   const streamingHere = !!activeStream;
@@ -647,26 +828,107 @@ function renderMessages() {
     }
   }
 
-  msgs.forEach((m, i) => {
-    const row = el("div", m.role === "User" ? "user" : "assistant");
-    row.classList.add("msg");
-    if (editing && editing.index === i) {
-      row.appendChild(buildEditor(m, i));
-    } else {
-      row.appendChild(
-        buildBubble(m, streamingHere && i === msgs.length - 1, {
-          index: i,
-          regen: idle && i === lastAssistant && !!m.text,
-          edit: idle && m.role === "User" && !!m.text,
-          del: idle,
-          branch: idle && i > 0,
-        })
-      );
-    }
-    messagesEl.appendChild(row);
-  });
+  // Presentation flags decide per-row affordances (regenerate, edit, delete,
+  // branch) and the caret, so a change in any of them invalidates every row.
+  const epoch = `${idle ? 1 : 0}${streamingHere ? 1 : 0}${editing ? editing.index : -1}`;
+  if (epoch !== lastEpoch) {
+    lastEpoch = epoch;
+    markDirtyAll();
+  }
+  // Shape check: same array, same length, same tail object, a cache entry and a
+  // DOM row per message. Only then may the leading rows be trusted without being
+  // looked at — a splice, a replacement, a load or compaction all fall back to
+  // the full pass.
+  const sameShape =
+    msgs === lastMsgsRef &&
+    msgs.length === lastMsgsLen &&
+    rowCache.size === msgs.length &&
+    messagesEl.childElementCount === msgs.length &&
+    (msgs.length === 0 || msgs[msgs.length - 1] === lastTailRef);
+  const from = sameShape ? Math.min(dirtyFrom, msgs.length) : 0;
 
-  if (nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+  if (sameShape && from >= msgs.length) {
+    // Nothing was marked and the shape is unchanged: the DOM already matches, so
+    // the frame costs a scroll write and nothing else.
+    if (followTail) stickToBottom();
+    else messagesEl.scrollTop = prevTop;
+    return;
+  }
+
+  // Reuse cached rows, rebuilding only the ones whose signature changed. With a
+  // trusted prefix the walk starts at the cursor, so a streamed token costs one
+  // row instead of one row per message in the transcript.
+  const desired = [];
+  const seen = from === 0 ? new Set() : null;
+  for (let i = from; i < msgs.length; i++) {
+    const m = msgs[i];
+    const showCaret = streamingHere && i === msgs.length - 1;
+    const editingHere = !!(editing && editing.index === i);
+    const opts = {
+      index: i,
+      regen: idle && i === lastAssistant && !!m.text,
+      edit: idle && m.role === "User" && !!m.text,
+      del: idle,
+      branch: idle && i > 0,
+    };
+    const key = msgKey(m);
+    if (seen) seen.add(key);
+    const sig = messageSignature(m, { ...opts, showCaret }, editingHere);
+    let entry = rowCache.get(key);
+    if (!entry || entry.sig !== sig) {
+      const row = el("div", m.role === "User" ? "user" : "assistant");
+      row.classList.add("msg");
+      if (editingHere) {
+        row.appendChild(buildEditor(m, i));
+      } else {
+        row.appendChild(buildBubble(m, showCaret, opts));
+      }
+      // Swap the rebuilt row in place, so a change mid-transcript cannot
+      // shift every row after it (a tool result landing in message 2 of 5000).
+      if (entry && entry.el.parentNode === messagesEl) entry.el.replaceWith(row);
+      entry = { el: row, sig };
+      rowCache.set(key, entry);
+    }
+    desired.push(entry.el);
+  }
+
+  // Forget rows whose message left the transcript (edit/delete/fork/compaction
+  // or a session swap); their DOM nodes go with them. A trusted prefix cannot
+  // have lost a message, so this only runs on a full pass.
+  if (seen && rowCache.size > seen.size) {
+    for (const [key, entry] of rowCache) {
+      if (!seen.has(key)) {
+        entry.el.remove();
+        rowCache.delete(key);
+      }
+    }
+  }
+
+  // Reconcile order with as few moves as possible: a streaming frame normally
+  // moves nothing at all, because the growing row is already the last child.
+  // With a trusted prefix the walk starts at the cursor instead of the top.
+  let node = from > 0 ? desired[0] : messagesEl.firstChild;
+  for (const want of desired) {
+    if (node === want) {
+      node = want.nextSibling;
+      continue;
+    }
+    messagesEl.insertBefore(want, node);
+  }
+  while (node) {
+    const next = node.nextSibling;
+    node.remove();
+    node = next;
+  }
+
+  // Everything on screen is validated now; the next frame starts with an empty
+  // dirty set, and only the tail is re-checked when a mutation marks it.
+  lastMsgsRef = msgs;
+  lastMsgsLen = msgs.length;
+  lastTailRef = msgs.length ? msgs[msgs.length - 1] : null;
+  dirtyFrom = msgs.length;
+
+  if (followTail) stickToBottom();
   else messagesEl.scrollTop = prevTop;
 }
 
@@ -771,23 +1033,31 @@ function renderQueue() {
 function tick() {
   const here = streamOf(state.activeId);
   const others = otherStreams();
+  // The shell owns the status chip; the app supplies the live detail and the
+  // task identity (session + generation) so state transitions stay ordered.
+  let detail = "";
   if (here) {
     const secs = Math.max(0, Math.floor(Date.now() / 1000) - here.started_at);
-    chip.textContent =
+    detail =
       others.length > 0
         ? `streaming · ${secs}s · +${others.length} chat${others.length === 1 ? "" : "s"}`
         : `streaming · ${secs}s`;
-    chip.className = "chip streaming";
+    Shell.applyTaskEvent({
+      taskId: here.session_id,
+      type: "progress",
+      seq: here.gen,
+      timestamp: Date.now(),
+    });
   } else if (others.length > 0) {
-    chip.textContent =
+    detail =
       others.length === 1
         ? "another chat is streaming"
         : `${others.length} chats streaming`;
-    chip.className = "chip";
+    Shell.setTaskStatus("Running");
   } else {
-    chip.textContent = "idle";
-    chip.className = "chip idle";
+    Shell.setTaskStatus("Idle");
   }
+  Shell.setTaskDetail(detail);
 }
 
 function renderAll() {
@@ -1584,6 +1854,32 @@ function insertMention(i) {
   autosize();
   renderSend();
   syncPalette();
+  // Mentioning a file is also a request to read it: show it in the right panel.
+  openFileInPanel(path);
+}
+
+/* Show a workspace file in the right-hand document panel.
+
+   The Rust command owns the policy (workspace confinement, bounded read,
+   binary and encoding refusal); failures surface inside the panel rather than
+   as a toast, so the reader sees exactly what happened. */
+async function openFileInPanel(relPath) {
+  const id = "file:" + relPath;
+  const title = relPath.split("/").pop() || relPath;
+  try {
+    const view = await invoke("read_file", { path: relPath });
+    const notice = view.truncated
+      ? ` — showing the first ${view.text.length} of ${view.bytes} bytes`
+      : "";
+    Shell.openDocument({
+      id,
+      title,
+      path: (view.path || relPath) + notice,
+      text: view.text,
+    });
+  } catch (err) {
+    Shell.openDocument({ id, title, path: relPath, error: String(err) });
+  }
 }
 
 /* ---------- settings modal ---------- */
@@ -1659,6 +1955,8 @@ async function openSettings() {
     setFiles.checked = !!s.file_tools_enabled;
     setApproval.checked = s.require_approval !== false;
     setWorkspace.value = s.bash_workspace || "";
+    // Keep the document panel's Start page in step with saved settings.
+    Shell.setContext({ workspace: s.bash_workspace || "", model: s.model || "" });
     setSkillsDir.value = s.skills_dir || "";
     setMemory.checked = s.memory_enabled !== false;
     setMemoryPath.value = s.memory_path || "";
@@ -2142,6 +2440,9 @@ listen("agent-event", (event) => {
   const msgs = ensureSessionCache(p.session_id);
   if (!msgs) return;
   const last = msgs[msgs.length - 1];
+  // Every event below lands on the tail row (text, reasoning, tool, tool_result),
+  // so the cursor only has to reach it.
+  markDirty(msgs.length - 1);
   switch (p.kind) {
     case "text":
       if (last) last.text += p.text;
@@ -2217,6 +2518,14 @@ listen("stream-finished", async (event) => {
   // newer stream's entry.
   const s = state.streams[p.session_id];
   if (s && s.gen === p.gen) delete state.streams[p.session_id];
+  // Terminal task event: `gen` orders it, so a stale finish for a superseded
+  // turn cannot regress a newer task's state (Part II §12.3).
+  Shell.applyTaskEvent({
+    taskId: p.session_id,
+    type: p.cancelled ? "cancelled" : p.error ? "failed" : "completed",
+    seq: p.gen,
+    timestamp: Date.now(),
+  });
   await refreshSessions();
   renderAll();
   // Turn over: hand the baton to whatever this chat queued meanwhile.
@@ -2287,6 +2596,30 @@ messagesEl.addEventListener("click", async (ev) => {
 
 $("new-chat").addEventListener("click", () => newChat().catch(() => {}));
 $("open-settings").addEventListener("click", () => openSettings());
+
+/* Sidebar navigation opens the panel that owns the thing instead of inventing a
+   second surface for it. Automation stays disabled until background jobs land
+   (milestone M7), which is more honest than a button that does nothing. */
+/* Settings is one surface with several sections. Both the sidebar shortcuts and
+   the tabs inside the dialog route through here, so plugins, skills, MCP servers
+   and providers never grow a second place to be edited. */
+function focusSection(sectionId) {
+  const target = document.getElementById(sectionId);
+  if (target) target.scrollIntoView({ block: "start" });
+}
+
+function navTo(sectionId) {
+  Promise.resolve(openSettings())
+    .catch(() => {})
+    .then(() => focusSection(sectionId));
+}
+
+document.querySelectorAll(".set-tab").forEach((tab) => {
+  tab.addEventListener("click", () => focusSection(tab.dataset.section));
+});
+
+$("nav-plugins").addEventListener("click", () => navTo("cap-list"));
+$("nav-mcp").addEventListener("click", () => navTo("mcp-list"));
 $("plan-edit").addEventListener("click", () => startPlanEdit());
 sendBtn.addEventListener("click", () =>
   streamOf(state.activeId) ? stopStream() : send(),
@@ -2410,6 +2743,11 @@ async function init() {
     const settings = await invoke("get_settings");
     state.model = settings.model;
     state.budget = settings.context_budget ?? 32768;
+    // Start page context: what this app instance is pointed at.
+    Shell.setContext({
+      workspace: settings.bash_workspace || "",
+      model: settings.model || "",
+    });
   } catch (err) {
     state.error = String(err);
   }

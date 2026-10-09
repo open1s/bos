@@ -1,4 +1,5 @@
 :root {
+  /* Palette. Dark is the default; [data-theme="light"] overrides below. */
   --bg: #171717;
   --sidebar: #1f1f1f;
   --hover: #2a2a2a;
@@ -14,6 +15,43 @@
   --success: #5fd08a;
   --warn: #e6b84c;
   --user-bubble: #2c3a5c;
+
+  /* Semantic layer: new components use these, never raw values (Part II §14.2). */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 14px;
+  --control-h: 30px;
+  --font-ui: 13px;
+  --content-font-size: 14px;
+  --divider-w: 5px;
+  --focus-ring: #4176e6;
+  --shadow-panel: 0 8px 26px rgba(0, 0, 0, 0.4);
+  --sidebar-w: 280px;
+  --doc-w: 0px;
+}
+
+[data-theme="light"] {
+  --bg: #ffffff;
+  --sidebar: #f6f7f9;
+  --hover: #eceef2;
+  --active: #e2e6ee;
+  --card: #ffffff;
+  --input: #ffffff;
+  --border: #d8dbe2;
+  --accent: #3558d6;
+  --text: #1b1d21;
+  --dim: #5c6270;
+  --faint: #8a90a0;
+  --error: #c62828;
+  --success: #1b7f4b;
+  --warn: #9a6b00;
+  --user-bubble: #e6ecff;
+  --shadow-panel: 0 8px 26px rgba(20, 24, 40, 0.16);
 }
 
 * { box-sizing: border-box; }
@@ -39,11 +77,30 @@ html, body {
 #sidebar {
   display: flex;
   flex-direction: column;
-  width: 260px;
-  min-width: 260px;
+  flex: 0 0 var(--sidebar-w);
+  width: var(--sidebar-w);
+  min-width: 0;
+  overflow: hidden;
   background: var(--sidebar);
   border-right: 1px solid var(--border);
 }
+
+/* Collapsed rail: navigation stays reachable, labels step aside (§12.1). */
+[data-sidebar="rail"] .session-list,
+[data-sidebar="rail"] #session-search,
+[data-sidebar="rail"] .sidebar-foot .btn-ghost {
+  display: none;
+}
+[data-sidebar="rail"] .sidebar-head {
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-1);
+}
+[data-sidebar="rail"] .brand { font-size: 12px; }
+body.resizing,
+body.resizing * { cursor: col-resize !important; }
+body.resizing #sidebar,
+body.resizing #doc-panel { transition: none; }
 
 .sidebar-head {
   display: flex;
@@ -1043,3 +1100,195 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ---------- pane dividers (Part II §12 / GUI-01) ---------- */
+
+.divider {
+  position: relative;
+  flex: 0 0 var(--divider-w);
+  cursor: col-resize;
+  background: transparent;
+}
+
+.divider::after {
+  content: "";
+  position: absolute;
+  inset: 0 2px;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.divider:hover::after,
+.divider:focus-visible::after,
+.divider.dragging::after {
+  background: var(--accent);
+}
+
+.divider:focus-visible { outline: none; }
+.divider[hidden] { display: none; }
+
+/* ---------- document panel (Part II §12.3) ---------- */
+
+.doc-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 var(--doc-w);
+  width: var(--doc-w);
+  min-width: 0;
+  overflow: hidden;
+  background: var(--sidebar);
+  border-left: 1px solid var(--border);
+}
+
+.doc-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.doc-tabs {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: var(--space-1);
+  overflow-x: auto;
+}
+
+.doc-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 180px;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--dim);
+  font-size: var(--font-ui);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.doc-tab:hover { background: var(--hover); color: var(--text); }
+.doc-tab.active { background: var(--active); color: var(--text); border-color: var(--border); }
+
+.doc-close {
+  padding: 0 2px;
+  border-radius: 3px;
+  font-size: 13px;
+  opacity: 0.6;
+}
+
+.doc-close:hover { opacity: 1; background: var(--hover); }
+.doc-actions { display: flex; align-items: center; gap: var(--space-1); }
+
+.doc-path {
+  padding: 6px var(--space-3);
+  border-bottom: 1px solid var(--border);
+  color: var(--faint);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.doc-body {
+  flex: 1;
+  overflow: auto;
+  padding: var(--space-3);
+}
+
+.doc-text {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.doc-start { display: flex; flex-direction: column; gap: var(--space-2); }
+.doc-row { display: flex; gap: var(--space-3); font-size: var(--font-ui); }
+.doc-key { flex: 0 0 84px; color: var(--faint); }
+
+.doc-value {
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.doc-hint { color: var(--dim); font-size: var(--font-ui); line-height: 1.5; }
+.doc-error { color: var(--error); font-size: var(--font-ui); }
+.head-toggle { padding: 2px 6px; font-size: 14px; }
+
+/* ---------- settings: general rows (Part II §13.3) ---------- */
+
+.ui-general .ui-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 6px 0;
+}
+
+.ui-row-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text);
+  font-size: var(--font-ui);
+}
+
+.ui-row-hint { color: var(--faint); font-size: 11px; }
+.ui-row select, .ui-row input[type="number"] { min-width: 140px; }
+.ui-row button[disabled] { opacity: 0.55; cursor: not-allowed; }
+
+/* ---------- UI preferences drive presentation ---------- */
+
+#messages, #messages .bubble { font-size: var(--content-font-size); }
+
+[data-work-details="compact"] .tool-body { display: none; }
+[data-coding-view="off"] .tool-card .tool-body,
+[data-coding-view="off"] .approval-diff { display: none; }
+
+/* A narrow window closes the document pane first, then rails the sidebar;
+   both stay reachable from the centre toolbar toggles. */
+@media (max-width: 1023px) {
+  #doc-panel, #divider-right { display: none; }
+}
+
+@media (max-width: 859px) {
+  #doc-toggle { display: none; }
+}
+
+/* Sidebar navigation: a short list of surfaces that open the panel owning the
+   data. Automation is disabled until jobs ship, and says so in its title. */
+.sidebar-nav { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; }
+.nav-item {
+  text-align: left; padding: 6px 8px; border: none; border-radius: var(--radius-sm, 6px);
+  background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer;
+}
+.nav-item:hover:not([disabled]) { background: var(--hover, rgba(255,255,255,.06)); color: var(--fg); }
+.nav-item:focus-visible { outline: 2px solid var(--focus-ring, #6c8ebf); outline-offset: -2px; }
+.nav-item[disabled] { opacity: .45; cursor: not-allowed; }
+
+/* The rail keeps only the brand, the new-chat button and the pane toggles. */
+[data-sidebar="rail"] .sidebar-nav { display: none; }
+
+/* Settings is one surface with several sections; the tab strip is its index. */
+.set-nav {
+  position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 4px;
+  margin: 8px 0 4px; padding: 6px 0; background: var(--panel, #1b1d21);
+  border-bottom: 1px solid var(--line, rgba(255,255,255,.08));
+}
+.set-tab {
+  padding: 4px 10px; border: 1px solid transparent; border-radius: 999px;
+  background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer;
+}
+.set-tab:hover { color: var(--fg); background: var(--hover, rgba(255,255,255,.06)); }
+.set-tab:focus-visible { outline: 2px solid var(--focus-ring, #6c8ebf); outline-offset: 1px; }

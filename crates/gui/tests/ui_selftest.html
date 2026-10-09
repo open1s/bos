@@ -1,0 +1,384 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>BOS gui — transcript render selftest</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      /* Headless harness for the shipped ui/app.js. Run with:
+         pnpm run selftest:ui   (or the Chrome command in AGENTS/docs)
+         It measures the real renderer against a synthetic transcript, so
+         performance claims about the transcript are numbers, not assertions.
+         Everything below is synchronous: --dump-dom then sees the result
+         block without needing the browser to wait on timers. */
+
+      /* Every element app.js binds at load time. Anything else it asks for is
+         auto-created, so the harness never depends on index.html. */
+      const IDS = [
+        "approval-allow", "approval-args", "approval-deny", "approval-diff",
+        "approval-modal", "approval-tool", "cap-list", "chat-title", "cmd-list",
+        "cmd-palette", "input", "mcp-add-btn", "mcp-cmd", "mcp-conn", "mcp-list",
+        "mcp-msg", "mcp-name", "mcp-reconnect-btn", "mcp-transport", "mcp-url",
+        "mention-list", "mention-pop", "messages", "new-chat", "open-settings",
+        "plan-edit", "plan-panel", "prov-add-btn", "prov-key", "prov-list",
+        "prov-model", "prov-msg", "prov-name", "prov-url", "queue-list", "send",
+        "session-list", "session-search", "set-api-key", "set-approval",
+        "set-base-url", "set-bash", "set-context-budget", "set-effort",
+        "set-files", "set-instructions", "set-memory", "set-memory-path",
+        "set-model", "set-skills-dir", "set-system", "set-temperature",
+        "set-workspace", "settings-cancel", "settings-form", "settings-modal",
+        "status-left", "status-right", "stream-chip",
+      ];
+      const root = document.getElementById("root");
+      for (const id of IDS) {
+        const n = document.createElement("div");
+        n.id = id;
+        root.appendChild(n);
+      }
+      const realGet = document.getElementById("root").constructor
+        ? document.getElementById.bind(document)
+        : null;
+      document.getElementById = (id) => {
+        let n = realGet(id);
+        if (!n) {
+          n = document.createElement("div");
+          n.id = id;
+          document.body.appendChild(n);
+        }
+        return n;
+      };
+
+      /* The Tauri bridge: boot promises never settle, so app.js's init()
+         cannot race the measurements below. */
+      const never = () => new Promise(() => {});
+      window.__TAURI__ = { core: { invoke: never }, event: { listen: never } };
+    </script>
+    <script src="../ui/shell.js"></script>
+    <script src="../ui/app.js"></script>
+    <script>
+      (() => {
+        const R = { checks: {} };
+        const assert = (name, ok, detail) => {
+          R.checks[name] = (ok ? "PASS" : "FAIL") + (detail ? " " + detail : "");
+        };
+        const msgsEl = document.getElementById("messages");
+        const rows = () => Array.from(msgsEl.children);
+
+        // Count layout reads on the transcript: a streaming repaint must not ask
+        // the DOM for geometry merely to decide whether to follow the tail.
+        const layout = { scrollHeight: 0, clientHeight: 0 };
+        for (const prop of ["scrollHeight", "clientHeight"]) {
+          const desc = Object.getOwnPropertyDescriptor(Element.prototype, prop);
+          Object.defineProperty(msgsEl, prop, {
+            configurable: true,
+            get() {
+              layout[prop]++;
+              return desc.get.call(this);
+            },
+          });
+        }
+        const resetLayout = () => {
+          layout.scrollHeight = 0;
+          layout.clientHeight = 0;
+        };
+        const layoutReads = () => layout.scrollHeight + layout.clientHeight;
+
+        // ---- synthetic transcript -------------------------------------
+        const N = Number(new URLSearchParams(location.search).get("n")) || 5000;
+        const make = (i) => ({
+          role: i % 2 ? "Assistant" : "User",
+          text: i % 2 ? `assistant reply ${i} with some **markdown** body` : `user question ${i}`,
+          reasoning: "",
+          tools: [],
+          error: null,
+        });
+        let msgs = [];
+        for (let i = 0; i < N; i++) msgs.push(make(i));
+        state.activeId = "selftest";
+        state.cache["selftest"] = msgs;
+        state.streams = {};
+        state.compacting = {};
+
+        // Count bubble rebuilds so "one row changed" is measured, not assumed.
+        const builds = { n: 0 };
+        const realBubble = buildBubble;
+        buildBubble = function (...a) {
+          builds.n++;
+          return realBubble.apply(this, a);
+        };
+        // Signature computations are the per-frame cost that used to scale with
+        // the transcript, so count them too.
+        const sigs = { n: 0 };
+        const realSignature = messageSignature;
+        messageSignature = function (...a) {
+          sigs.n++;
+          return realSignature.apply(this, a);
+        };
+        const observeOneFrame = (fn) => {
+          const mo = new MutationObserver(() => {});
+          mo.observe(msgsEl, { childList: true, subtree: true, characterData: true });
+          fn();
+          const recs = mo.takeRecords();
+          mo.disconnect();
+          return {
+            childList: recs.filter((r) => r.type === "childList").length,
+            characterData: recs.filter((r) => r.type === "characterData").length,
+          };
+        };
+
+        // ---- 1. first paint -------------------------------------------
+        let t = performance.now();
+        renderMessages();
+        R.firstRenderMs = +(performance.now() - t).toFixed(1);
+        R.rowsFirstPaint = msgsEl.childElementCount;
+        assert("first paint renders every message", R.rowsFirstPaint === N, `rows=${R.rowsFirstPaint}`);
+
+        // ---- 2. streaming frame (append a token to the last message) ---
+        const last = msgs[N - 1];
+        const firstRow = msgsEl.firstChild;
+        builds.n = 0;
+        sigs.n = 0;
+        resetLayout();
+        t = performance.now();
+        const FRAMES = 200;
+        for (let i = 0; i < FRAMES; i++) {
+          last.text += " tok";
+          // The app's agent-event handler marks the tail; mirror that here.
+          markDirty(N - 1);
+          renderMessages();
+        }
+        R.streamingRepaintMs = +((performance.now() - t) / FRAMES).toFixed(2);
+        R.buildBubbleCallsPerFrame = +(builds.n / FRAMES).toFixed(2);
+        R.layoutReadsPerStreamFrame = +(layoutReads() / FRAMES).toFixed(2);
+        R.signaturesPerStreamFrame = +(sigs.n / FRAMES).toFixed(2);
+        assert(
+          "streaming frame validates only the tail",
+          R.signaturesPerStreamFrame <= 5,
+          `signatures/frame=${R.signaturesPerStreamFrame} for N=${N}`,
+        );
+        // A frame with nothing marked must not walk the transcript at all.
+        sigs.n = 0;
+        resetLayout();
+        t = performance.now();
+        const IDLE_FRAMES = 200;
+        for (let i = 0; i < IDLE_FRAMES; i++) renderMessages();
+        R.idleRepaintMs = +((performance.now() - t) / IDLE_FRAMES).toFixed(3);
+        R.idleSignaturesPerFrame = +(sigs.n / IDLE_FRAMES).toFixed(2);
+        assert(
+          "an unmarked frame walks nothing",
+          R.idleRepaintMs < R.streamingRepaintMs && R.idleSignaturesPerFrame === 0,
+          `idle=${R.idleRepaintMs}ms streaming=${R.streamingRepaintMs}ms sigs=${R.idleSignaturesPerFrame}`,
+        );
+        assert(
+          "streaming frame reads no layout",
+          R.layoutReadsPerStreamFrame === 0,
+          `reads/frame=${R.layoutReadsPerStreamFrame}`,
+        );
+        // Control: a reader who scrolled up is no longer pinned to the tail, and
+        // that path is allowed to read the position it must preserve.
+        followTail = false;
+        resetLayout();
+        last.text += " tok";
+        markDirty(N - 1);
+        renderMessages();
+        R.layoutReadsWhenDetached = layoutReads();
+        followTail = true;
+
+        // ---- 2b. the validation cursor is a real fast path -------------
+        // An in-place change below the cursor stays invisible until the mutator
+        // says so — that is exactly what keeps a streamed token O(1).
+        msgs[2].text = "changed in place, unmarked";
+        builds.n = 0;
+        t = performance.now();
+        renderMessages();
+        R.unmarkedInPlaceMs = +(performance.now() - t).toFixed(2);
+        R.unmarkedInPlaceRebuilds = builds.n;
+        assert(
+          "unmarked in-place change below the cursor is not rebuilt",
+          R.unmarkedInPlaceRebuilds === 0,
+          `rebuilds=${R.unmarkedInPlaceRebuilds}`,
+        );
+        markDirty(2);
+        builds.n = 0;
+        t = performance.now();
+        renderMessages();
+        R.markedInPlaceRebuilds = builds.n;
+        R.markedInPlaceMs = +(performance.now() - t).toFixed(2);
+        assert(
+          "marking a row makes it rebuild",
+          R.markedInPlaceRebuilds === 1,
+          `rebuilds=${R.markedInPlaceRebuilds}`,
+        );
+        assert(
+          "the marked rebuild shows the new text",
+          rowCache
+            .get(msgKey(msgs[2]))
+            .el.textContent.includes("changed in place"),
+        );
+
+        builds.n = 0;
+        last.text += " tail";
+        markDirty(N - 1);
+        const streamFrame = observeOneFrame(() => renderMessages());
+        R.streamFrameChildListMutations = streamFrame.childList;
+        R.streamFrameBubbleRebuilds = builds.n;
+        R.firstRowNodePreserved = msgsEl.firstChild === firstRow;
+        R.rowsAfterStreaming = msgsEl.childElementCount;
+        R.streamedTextVisible = msgsEl.lastChild.textContent.includes("tail");
+        assert("one row rebuilt per streaming frame",
+          R.buildBubbleCallsPerFrame <= 1.001, `calls/frame=${R.buildBubbleCallsPerFrame}`);
+        assert("streaming frame only touches the growing row",
+          streamFrame.childList <= 2 && R.streamFrameBubbleRebuilds === 1,
+          `childList=${streamFrame.childList} rebuilds=${R.streamFrameBubbleRebuilds}`);
+        assert("untouched rows keep their DOM nodes", R.firstRowNodePreserved);
+        assert("transcript still shows the streamed text", R.streamedTextVisible);
+        assert("row count unchanged while streaming", R.rowsAfterStreaming === N,
+          `rows=${R.rowsAfterStreaming}`);
+
+        // ---- 3. update early in the transcript (a tool result landing) --
+        // This must cost O(1) DOM work, not a shift of every later row.
+        const sibling = rows()[100];
+        const beforeRows = msgsEl.childElementCount;
+        msgs[2] = {
+          role: "Assistant",
+          text: "early reply",
+          reasoning: "",
+          tools: [{ name: "bash", args: '{"command":"ls"}', output: "out", ms: 3 }],
+          error: null,
+        };
+        // A replacement is a new message object (a new key), which the cursor
+        // contract requires the mutator to announce.
+        markDirtyAll();
+        builds.n = 0;
+        t = performance.now();
+        const midFrame = observeOneFrame(() => renderMessages());
+        R.earlyUpdateMs = +(performance.now() - t).toFixed(2);
+        R.earlyUpdateChildListMutations = midFrame.childList;
+        R.earlyUpdateBubbleRebuilds = builds.n;
+        R.laterSiblingNodePreserved = rows()[100] === sibling;
+        R.rowsAfterEarlyUpdate = msgsEl.childElementCount;
+        assert("early update rebuilds exactly one row", R.earlyUpdateBubbleRebuilds === 1,
+          `rebuilds=${R.earlyUpdateBubbleRebuilds}`);
+        assert("early update does not shift later rows",
+          R.earlyUpdateChildListMutations <= 2 && R.laterSiblingNodePreserved,
+          `childList=${R.earlyUpdateChildListMutations} siblingPreserved=${R.laterSiblingNodePreserved}`);
+        assert("early update keeps the row count", R.rowsAfterEarlyUpdate === beforeRows,
+          `rows=${R.rowsAfterEarlyUpdate}`);
+
+        // ---- 4. control: the previous wipe-and-rebuild renderer ---------
+        const CTRL = 5;
+        builds.n = 0;
+        t = performance.now();
+        for (let f = 0; f < CTRL; f++) {
+          msgsEl.textContent = "";
+          msgs.forEach((m, i) => {
+            const row = el("div", "msg " + (m.role === "User" ? "user" : "assistant"));
+            row.appendChild(buildBubble(m, false, { index: i }));
+            msgsEl.appendChild(row);
+          });
+        }
+        R.fullRebuildMsPerFrame = +((performance.now() - t) / CTRL).toFixed(1);
+        R.fullRebuildBubblesPerFrame = +(builds.n / CTRL).toFixed(1);
+        R.speedupVsFullRebuild = +(R.fullRebuildMsPerFrame / R.streamingRepaintMs).toFixed(0);
+        buildBubble = realBubble;
+        rowCache.clear();          // the control loop orphaned the cached rows
+        renderMessages();
+
+        // ---- 5. structural correctness --------------------------------
+        msgs = state.cache["selftest"];
+        const extra = make(N);
+        msgs.push(extra);
+        renderMessages();
+        R.afterAppendRows = msgsEl.childElementCount;
+        assert("append adds exactly one row at the tail",
+          R.afterAppendRows === N + 1 && msgsEl.lastChild.textContent.includes(`${N}`),
+          `rows=${R.afterAppendRows}`);
+
+        msgs.splice(3, 1);
+        renderMessages();
+        R.afterDeleteRows = msgsEl.childElementCount;
+        assert("delete removes exactly one row", R.afterDeleteRows === N, `rows=${R.afterDeleteRows}`);
+
+        const swapped = msgs.slice();
+        const tmp = swapped[0];
+        swapped[0] = swapped[swapped.length - 1];
+        swapped[swapped.length - 1] = tmp;
+        state.cache["selftest"] = swapped;
+        renderMessages();
+        R.orderFollowsModel = msgsEl.firstChild.textContent.includes(`${N}`) &&
+          msgsEl.childElementCount === swapped.length;
+        assert("row order follows the message order", R.orderFollowsModel);
+
+        // ---- 6. tool cards, diff coloring, and its safety gate ---------
+        state.cache["selftest"] = [{
+          role: "Assistant",
+          text: "done",
+          reasoning: "thinking",
+          tools: [{
+            name: "bash",
+            args: '{"command":"git diff"}',
+            output: "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n keep\n-removed\n+added",
+            ms: 12,
+            open: true,
+          }],
+          error: null,
+        }];
+        renderMessages();
+        R.toolCards = msgsEl.querySelectorAll(".tool-card").length;
+        R.diffAdds = msgsEl.querySelectorAll(".d-add").length;
+        R.diffDels = msgsEl.querySelectorAll(".d-del").length;
+        R.diffCtx = msgsEl.querySelectorAll(".d-ctx").length;
+        assert("tool card renders", R.toolCards === 1, `cards=${R.toolCards}`);
+        assert("unified diff is colored",
+          R.diffAdds === 1 && R.diffDels === 1 && R.diffCtx === 3,
+          `add=${R.diffAdds} del=${R.diffDels} ctx=${R.diffCtx}`);
+
+        // Ordinary output that merely starts with +/- must stay uncolored:
+        // tool output is untrusted, so heuristic coloring needs a diff header.
+        state.cache["selftest"] = [{
+          role: "Assistant",
+          text: "",
+          reasoning: "",
+          tools: [{ name: "bash", args: "{}", output: "+ not a diff\n- still not", ms: 1, open: true }],
+          error: null,
+        }];
+        renderMessages();
+        R.plainOutputColored = msgsEl.querySelectorAll(".d-add, .d-del").length;
+        assert("non-diff output is not colored", R.plainOutputColored === 0,
+          `colored=${R.plainOutputColored}`);
+
+        // ---- 7. empty state -------------------------------------------
+        state.cache["selftest"] = [];
+        renderMessages();
+        R.emptyStateRows = msgsEl.childElementCount;
+        assert("empty transcript shows the hint", R.emptyStateRows === 1,
+          `rows=${R.emptyStateRows}`);
+
+        // ---- 7. relative ages + sidebar navigation ---------------------
+        const NOW = 1_800_000_000;
+        assert("age: just now", fmtAge(NOW - 5, NOW) === "now", fmtAge(NOW - 5, NOW));
+        assert("age: minutes", fmtAge(NOW - 90, NOW) === "2m", fmtAge(NOW - 90, NOW));
+        assert("age: hours", fmtAge(NOW - 3 * 3600, NOW) === "3h", fmtAge(NOW - 3 * 3600, NOW));
+        assert("age: days", fmtAge(NOW - 3 * 86400, NOW) === "3d", fmtAge(NOW - 3 * 86400, NOW));
+        assert(
+          "age: falls back to a date after a week",
+          fmtAge(NOW - 30 * 86400, NOW) === fmtTime(NOW - 30 * 86400).slice(0, 5),
+          fmtAge(NOW - 30 * 86400, NOW),
+        );
+        assert("navigation routes to a panel", typeof navTo === "function");
+        assert(
+          "sidebar navigation is wired",
+          !!document.getElementById("nav-plugins") && !!document.getElementById("nav-mcp"),
+        );
+
+        R.failures = Object.values(R.checks).filter((v) => v.startsWith("FAIL")).length;
+        const pre = document.createElement("pre");
+        pre.id = "result";
+        pre.textContent = JSON.stringify(R, null, 2);
+        document.body.appendChild(pre);
+      })();
+    </script>
+  </body>
+</html>
