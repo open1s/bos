@@ -8,6 +8,7 @@ pub mod plugin;
 
 pub use self::agentic::{Agent, AgentConfig, FallbackProvider};
 pub use context::{AgentReActApp, AgentReactContext, AgentSession, MessageContext};
+pub use hooks::external::{EventMatcher, ExternalHook, HookDispatcher, HookOutcome};
 pub use hooks::{AgentHook, HookContext, HookEvent, HookRegistry};
 pub use plugin::{
     AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, PluginRegistry, StreamTokenWrapper,

@@ -344,6 +344,49 @@
 
     Shell.setAppearance("system");
     Shell.setFontSize(14);
+
+    // ---- status-line item registry ---------------------------------------
+    // Any surface can own an item; the registry must keep one node per id, keep
+    // insertion order, and let a poller refresh a value in place.
+    // The fixture is deliberately minimal and has no footer, so build the one
+    // slot the registry targets; the shipped footer is asserted by the
+    // shipped-page harness instead.
+    let bar = document.getElementById("status-right");
+    if (!bar) {
+      bar = document.createElement("span");
+      bar.id = "status-right";
+      document.body.appendChild(bar);
+    }
+    Shell.addStatusItem("harness-a", { label: "jobs", value: 1 });
+    Shell.addStatusItem("harness-b", { label: "spill", value: "0 B", title: "spilled context" });
+    const items = () => Array.from(document.querySelectorAll("#status-items .status-item"));
+    const texts = () =>
+      items().map((n) => `${n.querySelector(".status-item-label").textContent}=${n.querySelector(".status-item-value").textContent}`);
+    check(
+      "a registered item renders its label and value",
+      items().length === 2 && texts().join(",") === "jobs=1,spill=0 B",
+      texts().join(","),
+    );
+    check(
+      "the item container is a live region and leads the footer",
+      document.getElementById("status-items").getAttribute("aria-live") === "polite" &&
+        bar.firstChild === document.getElementById("status-items"),
+      `${document.getElementById("status-items").getAttribute("aria-live")}`,
+    );
+    Shell.updateStatusItem("harness-a", { value: 2 });
+    check(
+      "updating an item refreshes in place instead of adding a node",
+      items().length === 2 && texts()[0] === "jobs=2",
+      texts().join(","),
+    );
+    Shell.removeStatusItem("harness-a");
+    check(
+      "removing one item leaves the other standing",
+      items().length === 1 && texts()[0] === "spill=0 B" && Shell.statusItemIds().join(",") === "harness-b",
+      texts().join(","),
+    );
+    Shell.removeStatusItem("harness-b");
+    check("removing the last item empties the container", items().length === 0, `${items().length}`);
   } catch (err) {
     check("harness completed", false, err && err.stack ? err.stack : String(err));
   }

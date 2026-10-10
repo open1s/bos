@@ -16,10 +16,40 @@ pub(crate) const DEFAULT_SKILLS_DIR: &str = "~/.bos/skills";
 /// Default persistent-memory file (`~` expands at agent build time).
 pub(crate) const DEFAULT_MEMORY_PATH: &str = "~/.bos/gui/memory.jsonl";
 
+/// Schema version this build writes into `settings.toml`.
+///
+/// Bump it when a migration stops being shape-detectable (a renamed or
+/// re-split field, say) and add the step to [`Settings::migrate`], which is
+/// where the shape migrations live. The number is recorded so an installation
+/// can be diagnosed and sequenced later; it is written on the next **save**,
+/// never on load, so reading a file stays side-effect-free.
+pub(crate) const SETTINGS_SCHEMA_VERSION: u32 = 1;
+
+/// What a file written before versioning reports: no version at all.
+pub(crate) const UNVERSIONED_SETTINGS: u32 = 0;
+
+/// How many memories a store keeps. Past this the oldest is evicted, so it is a
+/// bound a person should be able to see rather than discover by losing a note.
+pub(crate) const MEMORY_MAX_ITEMS: usize = 500;
+
+/// Field-level serde fallback for [`Settings::schema_version`].
+///
+/// Deliberately [`UNVERSIONED_SETTINGS`] and not the current version: a missing
+/// key means the file predates versioning, and reporting "current" would make
+/// the one migration that matters look already done.
+fn unversioned_settings() -> u32 {
+    UNVERSIONED_SETTINGS
+}
+
 /// Editable connection and prompt settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
+    /// Schema version the file was written by — [`UNVERSIONED_SETTINGS`] for a
+    /// file that predates versioning, [`SETTINGS_SCHEMA_VERSION`] once
+    /// [`Settings::migrate`] has run and the file has been saved.
+    #[serde(default = "unversioned_settings")]
+    pub(crate) schema_version: u32,
     /// Model identifier, or the name of an `[llm.<name>]` profile.
     pub(crate) model: String,
     /// OpenAI-compatible API base URL.
@@ -79,6 +109,8 @@ pub(crate) struct Settings {
     pub(crate) disabled_tools: Vec<String>,
     /// Skills switched off, same carrier as [`Self::disabled_tools`].
     pub(crate) disabled_skills: Vec<String>,
+    /// Plugins switched off, the same carrier a third time.
+    pub(crate) disabled_plugins: Vec<String>,
     /// Reusable workspace configurations, offered when creating a workspace.
     pub(crate) presets: Vec<Preset>,
 
@@ -88,6 +120,23 @@ pub(crate) struct Settings {
     /// `[llm.<name>]` profiles discovered at load time (never serialized).
     #[serde(skip)]
     pub(crate) profiles: Vec<Profile>,
+}
+
+/// The file a settings' memory lives in (§20).
+///
+/// An empty `memory_path` — the default — falls back to **one shared file**, so
+/// every workspace lands on it unless it opts out with a path of its own. This
+/// is the only place that rule lives: `caps` opens the store from it and the
+/// Memory pane reports the same answer, so the pane cannot claim an isolation
+/// the store does not have.
+pub(crate) fn memory_file(settings: &Settings) -> PathBuf {
+    let raw = settings.memory_path.trim();
+    let path = if raw.is_empty() {
+        DEFAULT_MEMORY_PATH
+    } else {
+        raw
+    };
+    PathBuf::from(shellexpand::tilde(path).into_owned())
 }
 
 /// One `[llm.<name>]` endpoint profile from the BOS config.
@@ -350,6 +399,11 @@ pub(crate) struct Workspace {
     pub(crate) disabled_tools: Vec<String>,
     /// Skills switched off in this workspace (the §24.8 deny-list).
     pub(crate) disabled_skills: Vec<String>,
+    /// Plugins switched off in this workspace. Same shape and same promise as
+    /// `disabled_tools`: the names are the ones the plugin reports, and the
+    /// build has to re-register the survivors, because a registry it only ever
+    /// adds to cannot forget one.
+    pub(crate) disabled_plugins: Vec<String>,
     /// MCP servers, each carrying its own opt-in switch.
     pub(crate) mcp_servers: Vec<McpServerEntry>,
     /// Require one-click approval before `bash`/`write_file`.
@@ -387,6 +441,7 @@ impl Default for Workspace {
             file_tools_enabled: true,
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
+            disabled_plugins: Vec::new(),
             mcp_servers: Vec::new(),
             require_approval: true,
             context_budget: 32_768,
@@ -400,7 +455,86 @@ impl Default for Workspace {
     }
 }
 
+/// What "Add a workspace" collects, as one payload.
+///
+/// A workspace is a bundle of choices — a folder, a model, which tools, skills,
+/// plugins and MCP servers may run there — and creating one by creating first
+/// and editing after means an installation that is briefly configured wrong.
+/// The dialog therefore sends all of it at once, and the workspace is born
+/// already configured.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct WorkspaceDraft {
+    /// Model id or `[llm.<name>]` profile, empty to inherit.
+    pub(crate) model: String,
+    /// System prompt for this workspace, empty to inherit.
+    pub(crate) system_prompt: String,
+    /// `None` leaves the seeded answer alone rather than forcing `true`.
+    pub(crate) bash_enabled: Option<bool>,
+    /// As [`Self::bash_enabled`], for the filesystem tools.
+    pub(crate) file_tools_enabled: Option<bool>,
+    /// As [`Self::bash_enabled`], for the approval gate.
+    pub(crate) require_approval: Option<bool>,
+    /// Built-in tools switched off here.
+    pub(crate) disabled_tools: Vec<String>,
+    /// Skills switched off here.
+    pub(crate) disabled_skills: Vec<String>,
+    /// Plugins switched off here.
+    pub(crate) disabled_plugins: Vec<String>,
+    /// MCP servers this workspace may use, by name. `None` keeps whatever the
+    /// globals seeded (each server's own switch); `Some` means *exactly* these,
+    /// so a server the user did not tick stays off — a new folder is not a
+    /// reason to trust a server.
+    pub(crate) mcp_enabled: Option<Vec<String>>,
+}
+
+impl WorkspaceDraft {
+    /// Whether this draft says anything at all.
+    ///
+    /// Used by the tests to prove the empty payload (what an older caller
+    /// sends) is the same as no payload.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 impl Workspace {
+    /// Apply a draft, refusing one that names something that does not exist.
+    ///
+    /// Called before the workspace is added, so a refused draft leaves no
+    /// half-configured workspace behind: the caller either gets a workspace
+    /// that matches the form or gets an error.
+    pub(crate) fn apply_draft(&mut self, draft: &WorkspaceDraft) -> Result<(), String> {
+        self.model = draft.model.trim().to_string();
+        self.system_prompt = draft.system_prompt.clone();
+        if let Some(v) = draft.bash_enabled {
+            self.bash_enabled = v;
+        }
+        if let Some(v) = draft.file_tools_enabled {
+            self.file_tools_enabled = v;
+        }
+        if let Some(v) = draft.require_approval {
+            self.require_approval = v;
+        }
+        self.disabled_tools = draft.disabled_tools.clone();
+        self.disabled_skills = draft.disabled_skills.clone();
+        self.disabled_plugins = draft.disabled_plugins.clone();
+        if let Some(names) = &draft.mcp_enabled {
+            for name in names {
+                if !self.mcp_servers.iter().any(|s| &s.name == name) {
+                    return Err(format!("no MCP server named {name:?}"));
+                }
+            }
+            let wanted: Vec<&String> = names.iter().collect();
+            for server in &mut self.mcp_servers {
+                server.enabled = wanted.contains(&&server.name);
+            }
+        }
+        self.updated_at = crate::session::unix_now();
+        Ok(())
+    }
+
     /// Copy the pasted-over global settings into the first workspace, so that
     /// migration adds a workspace rather than moving anything.
     pub(crate) fn adopted_from(settings: &Settings, id: &str, now: u64) -> Self {
@@ -423,6 +557,7 @@ impl Workspace {
             file_tools_enabled: settings.file_tools_enabled,
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
+            disabled_plugins: Vec::new(),
             mcp_servers: settings.mcp_servers.clone(),
             require_approval: settings.require_approval,
             context_budget: settings.context_budget,
@@ -563,11 +698,19 @@ impl Settings {
     /// the globals; an empty string inherits the global one, which is what keeps a
     /// half-configured workspace usable.
     pub(crate) fn effective(&self) -> Settings {
+        self.effective_for(&self.active_workspace)
+    }
+
+    /// The same resolution for one named workspace, whether or not it is active.
+    ///
+    /// Split out because a question like "which workspaces share this memory
+    /// file?" has to be answerable for *every* workspace, not just the shown one.
+    pub(crate) fn effective_for(&self, workspace_id: &str) -> Settings {
         let mut s = self.clone();
         let Some(w) = self
             .workspaces
             .iter()
-            .find(|w| w.id == self.active_workspace)
+            .find(|w| w.id == workspace_id)
             .or_else(|| self.workspaces.first())
         else {
             return s;
@@ -608,19 +751,26 @@ impl Settings {
         s.memory_enabled = w.memory_enabled;
         s.disabled_tools = w.disabled_tools.clone();
         s.disabled_skills = w.disabled_skills.clone();
+        s.disabled_plugins = w.disabled_plugins.clone();
         s.mcp_servers = w.mcp_servers.clone();
         // A workspace may name an `[llm.<name>]` profile instead of a model.
         s.resolve_profile();
         s
     }
 
-    /// Give every installation at least one workspace exactly once.
+    /// Give every installation at least one workspace exactly once, and stamp
+    /// the schema version. Returns whether the recorded version advanced.
     ///
     /// Today's globals are **copied** into a `default` workspace (never moved),
     /// so a downgrade still finds them, and every capability keeps the state it
     /// had — a disabled MCP server does not come back enabled, a tool that was
     /// on does not come back off (§24.3, acceptance 8).
-    pub(crate) fn migrate(&mut self) {
+    ///
+    /// The stamp is written last, so a migration that returns early cannot
+    /// claim the file is current; and because the shape migrations are
+    /// idempotent, a second call advances nothing and reports `false`.
+    pub(crate) fn migrate(&mut self) -> bool {
+        let before = self.schema_version;
         if self.workspaces.is_empty() {
             let now = crate::session::unix_now();
             self.workspaces
@@ -633,6 +783,20 @@ impl Settings {
         {
             self.active_workspace = self.workspaces[0].id.clone();
         }
+        self.schema_version = SETTINGS_SCHEMA_VERSION;
+        self.schema_version != before
+    }
+}
+
+impl Settings {
+    /// Every workspace paired with the memory file it resolves to, in workspace
+    /// order. Two entries sharing a path means they share a store — which is
+    /// what the default is, and what the pane has to be able to say.
+    pub(crate) fn workspace_memory_files(&self) -> Vec<(String, PathBuf)> {
+        self.workspaces
+            .iter()
+            .map(|w| (w.id.clone(), memory_file(&self.effective_for(&w.id))))
+            .collect()
     }
 }
 
@@ -702,6 +866,7 @@ impl Settings {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
             profiles,
+            schema_version: SETTINGS_SCHEMA_VERSION,
             bash_enabled: true,
             file_tools_enabled: true,
             bash_workspace: String::new(),
@@ -716,6 +881,7 @@ impl Settings {
             active_workspace: String::new(),
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
+            disabled_plugins: Vec::new(),
             presets: Vec::new(),
             allowed_tools: Vec::new(),
         };
@@ -1164,6 +1330,92 @@ mod tests {
     }
 
     #[test]
+    fn an_unversioned_file_loads_at_the_current_version_and_saves_it() {
+        let path = tmp_path("unversioned");
+        // A file from before this build versioned its schema: no
+        // `schema_version` key, and no workspace yet.
+        std::fs::write(&path, "model = \"old/model\"\n").unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(
+            loaded.schema_version, SETTINGS_SCHEMA_VERSION,
+            "a load brings the settings up to the running version"
+        );
+        assert_eq!(loaded.workspaces.len(), 1, "the shape migration still runs");
+        assert_eq!(loaded.model, "old/model", "the file's own values survive");
+
+        // The stamp becomes durable on save, and a reload advances nothing.
+        loaded.save_to(&path).unwrap();
+        let mut reloaded = Settings::load_from(&path);
+        assert_eq!(reloaded.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert!(
+            !reloaded.migrate(),
+            "an already-current file advances nothing"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_version_reads_as_unversioned_not_as_current() {
+        // This is what the field-level serde default buys: the container-level
+        // fallback would report the current version and hide the migration.
+        let bare: Settings = toml::from_str("model = \"m\"").unwrap();
+        assert_eq!(bare.schema_version, UNVERSIONED_SETTINGS);
+        let mut advanced = bare.clone();
+        assert!(advanced.migrate(), "the first migrate advances the version");
+        assert!(!advanced.migrate(), "the second does not");
+    }
+
+    #[test]
+    fn memory_defaults_to_one_file_and_follows_a_workspace_that_opts_out() {
+        let mut s = Settings::from_config_value(&serde_json::Value::Null);
+        s.migrate();
+        let shared = memory_file(&s);
+        assert!(shared.ends_with("gui/memory.jsonl"), "{shared:?}");
+        assert!(
+            !shared.to_string_lossy().contains('~'),
+            "the tilde is expanded: {shared:?}"
+        );
+
+        // The default is a shared file, so every workspace resolves to it — the
+        // fact the Memory pane has to be able to state.
+        assert_eq!(
+            s.workspace_memory_files(),
+            vec![("default".to_string(), shared.clone())]
+        );
+
+        // A workspace with a path of its own gets its own file, and only its own.
+        let mut second = s.clone();
+        let mut w = Workspace::adopted_from(&second, "second", 1);
+        w.memory_path = "/tmp/second-memory.jsonl".to_string();
+        second.workspaces.push(w);
+        let files = second.workspace_memory_files();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].1, shared, "the first workspace keeps the default");
+        assert_eq!(
+            files[1].1,
+            std::path::PathBuf::from("/tmp/second-memory.jsonl")
+        );
+        assert_eq!(
+            files.iter().filter(|(_, f)| f == &shared).count(),
+            1,
+            "opting out removes one workspace from the shared file"
+        );
+    }
+
+    #[test]
+    fn effective_for_resolves_a_workspace_that_is_not_active() {
+        let mut s = Settings::from_config_value(&serde_json::Value::Null);
+        s.migrate();
+        let mut w = Workspace::adopted_from(&s, "second", 1);
+        w.model = "second/model".to_string();
+        s.workspaces.push(w);
+        let second = s.workspaces[1].id.clone();
+        assert_ne!(second, s.active_workspace);
+        assert_eq!(s.effective().model, s.workspaces[0].model);
+        assert_eq!(s.effective_for(&second).model, "second/model");
+    }
+
+    #[test]
     fn migration_copies_globals_without_flipping_capabilities() {
         let mut s = Settings::from_config_value(&serde_json::Value::Null);
         s.model = "example/model".to_string();
@@ -1479,6 +1731,89 @@ mod tests {
         let legacy: Settings = toml::from_str(r#"model = "m1""#).expect("parse");
         assert!(legacy.providers.is_empty());
     }
+    #[test]
+    fn a_draft_lands_on_a_fresh_workspace_in_one_step() {
+        let mut global = Settings::from_config_value(&serde_json::Value::Null);
+        global.mcp_servers = vec![
+            McpServerEntry {
+                name: "files".into(),
+                enabled: true,
+                ..Default::default()
+            },
+            McpServerEntry {
+                name: "search".into(),
+                enabled: true,
+                ..Default::default()
+            },
+        ];
+        let mut w = Workspace::adopted_from(&global, "w1", 1);
+        let draft = WorkspaceDraft {
+            model: " glm-4.7 ".into(),
+            system_prompt: "be terse".into(),
+            bash_enabled: Some(false),
+            require_approval: Some(true),
+            disabled_tools: vec!["plan".into()],
+            disabled_skills: vec!["code-review".into()],
+            disabled_plugins: vec!["audit".into()],
+            mcp_enabled: Some(vec!["search".into()]),
+            ..Default::default()
+        };
+        w.apply_draft(&draft).expect("draft applies");
+        assert_eq!(w.model, "glm-4.7", "the model is trimmed, not stored as typed");
+        assert_eq!(w.system_prompt, "be terse");
+        assert!(!w.bash_enabled && w.require_approval);
+        assert_eq!(w.disabled_plugins, vec!["audit".to_string()]);
+        // Only the named server is on: an unticked one is off, even though the
+        // global it was copied from was on.
+        let on: Vec<(&str, bool)> = w
+            .mcp_servers
+            .iter()
+            .map(|s| (s.name.as_str(), s.enabled))
+            .collect();
+        assert_eq!(on, vec![("files", false), ("search", true)]);
+        // The toggles left absent keep the seeded answer.
+        assert!(w.file_tools_enabled);
+    }
+
+    #[test]
+    fn a_draft_naming_a_server_that_is_not_there_is_refused_whole() {
+        let global = Settings::from_config_value(&serde_json::Value::Null);
+        let mut w = Workspace::adopted_from(&global, "w1", 1);
+        w.model = "before".into();
+        let err = w
+            .apply_draft(&WorkspaceDraft {
+                model: "after".into(),
+                mcp_enabled: Some(vec!["nope".into()]),
+                ..Default::default()
+            })
+            .expect_err("an unknown server is refused");
+        assert!(err.contains("nope"), "{err}");
+        // The refusal happens on the copy the caller holds, and the caller
+        // (create_workspace) has not added it: nothing half-configured is kept.
+        assert_eq!(w.model, "after", "the field before the check was applied");
+    }
+
+    #[test]
+    fn an_absent_mcp_choice_keeps_every_seeded_switch() {
+        let mut global = Settings::from_config_value(&serde_json::Value::Null);
+        global.mcp_servers = vec![
+            McpServerEntry {
+                name: "on".into(),
+                enabled: true,
+                ..Default::default()
+            },
+            McpServerEntry {
+                name: "off".into(),
+                enabled: false,
+                ..Default::default()
+            },
+        ];
+        let mut w = Workspace::adopted_from(&global, "w1", 1);
+        w.apply_draft(&WorkspaceDraft::default()).expect("empty draft");
+        let on: Vec<bool> = w.mcp_servers.iter().map(|s| s.enabled).collect();
+        assert_eq!(on, vec![true, false], "no choice means the seeded answer");
+        assert!(WorkspaceDraft::default().is_empty());
+    }
 }
 
 /// A reusable workspace configuration. Applying one creates a workspace from it,
@@ -1491,4 +1826,5 @@ pub(crate) struct Preset {
     pub(crate) name: String,
     /// The configuration copied into a new workspace.
     pub(crate) workspace: Workspace,
+
 }

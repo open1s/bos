@@ -156,6 +156,181 @@ const result = await agent.ask('What is 2+2?');
 
 ---
 
+## GUI Testing (crates/gui)
+
+The GUI is guarded in layers. **Pick the lowest layer that can see the behavior** — a
+render bug belongs in a fixture guard, not e2e. All guards are shell scripts under
+`crates/gui/tests/` and must stay green; each ends with a `failures: N / M` line.
+
+| Guard | Runs against | Sees | Use for |
+|---|---|---|---|
+| `ui_selftest.sh` / `shell_selftest.sh` | own fixture DOM (`ui_selftest.html`, `shell_selftest.html`) | pure render functions, repaint timings, shell contract | renderer logic, keybindings, panel registration |
+| `markup_selftest.sh` | shipped `index.html`/`app.js` as text | structure, a11y attributes, i18n marks, duplicate ids, CSS custom properties, `#` selectors handed to `$` (which is `getElementById`) | structural invariants no fixture can reach |
+| `layout_selftest.sh` | shipped page, probe-injected | geometry at widths 1440/900/560/500 | overflow, off-screen, drawer, squeeze |
+| `package_selftest.sh` | `tauri.conf.json` + `icons/` as files | identifier/product agreement, `frontendDist` and `index.html` present, no build step, every listed icon exists and carries its format's magic bytes, one icon per platform | the install artifact — a renamed or truncated icon fails the bundle silently otherwise |
+| `wiring_selftest.sh` | source text, both directions | `#[tauri::command]` ↔ `invoke()` names, and the plan status vocabulary (`PLAN_ICONS` vs the tool's JSON schema) | every command reachable, no phantom calls, no cross-crate vocabulary drift |
+| `page_selftest.sh` | shipped page + **settled-fixture** bridge | handler → invoke → render, one microtask pass | static wiring of a panel/dialog on the real markup |
+| `live_selftest.sh` | shipped page + **stateful async** bridge (`tests/live/bridge.js`) | streams that end, queues that flush, approvals, rollbacks, PTY attach/write/kill, compaction splits, job tails, self-inspection, replay, scoped approval rules, durable reminders (add → tick → deliver-late → cancel → clear), knowledge curation (add → refuse a blank title → search → edit in place → delete), a per-tool MCP policy (deny → the row, the server badge and the self-inspection inventory all follow; ask → the default select; clear a rule), authoring a skill (the pane's listing against the double's directory → Use prefills the composer → a save lands in the pane, the capability list and the double's disk → a second save refuses by path → Replace overwrites in place), reading a server's published resources (the catalog listing → a row read into the pane → a body cut at its cap with both numbers → a URI the server does not hold → a resource with no text) | behaviors that only exist against a live backend |
+| `perf_selftest.sh` | shipped page + the same bridge, asked for a heavy workspace via `window.__PERF_SCALE__` | frames requested, repaints run, DOM mutations, rows drawn, round trips, line caps held, per-turn cost across a soak | what a behavior costs — work-per-burst budgets for the streaming hot path and the shell's output flood, plus a 10-turn soak proving the drawn window and the per-turn cost do not grow with the session |
+| `e2e/` (WDIO + `tauri-driver`) | **the real app binary** | everything, including the Rust side | Linux/Windows only — tauri-driver has **no macOS backend**; the preflight blocks it |
+
+**Skipping work needs an exact comparison.** The transcript's per-row signature
+is deliberately lossy — `length` + the last 24 characters — because a full hash on
+every streaming frame would be O(n²), and that is enough to notice a new token.
+It is *not* enough to notice a rewrite of the same length and tail, which is
+exactly what a backend finalizing a reply does; pairing reloaded messages by that
+signature silently kept the draft on screen. Compare content when the decision is
+"is this the same message", and reserve the signature for "did the streamed tail
+change".
+
+**A test that asserts a count must own its file.** A store test that adds a
+record, saves, edits the file by hand and asserts "exactly one entry survives
+load" passed when run alone and failed after any earlier run, because it read
+whatever an earlier run had left in the temp directory — the failure surfaced
+during a falsification batch, in the *restored* state, which is what gave it
+away. Delete the file first (and at the end); an assertion about a number is an
+assertion about the whole file.
+
+**A re-attach that clones can only add.** A policy change has to reach the
+agents a session is already running, and the first version of that code cloned
+each cached agent and attached the survivors to the clone — which left a tool the
+policy had just denied sitting in the registry, because the clone still held the
+old wrapper. It was written, documented as reaching existing agents, and would
+have shipped silently: nothing drove it, and the tests that existed only built
+*fresh* agents. Build the new agent from the base (`Inner::build_agent_for` is
+now the single construction path for a first build, a re-attach and the connect
+pass), because only a from-scratch build can remove. The general shape: when a
+function's promise is "this reaches what already exists", the test has to look at
+what already existed.
+
+**A settled fixture answers the same thing before and after.** Three checks for
+the skill pane's cache invalidation were written, a falsification batch removed
+the invalidation, and all three stayed green: the page guard's fixtures are
+static, so the capability list and the palette answered with the same skill
+list whether or not the save had re-read them. Asserting on the render cannot
+detect a cache drop — the *round trips* are the observable, so the check counts
+`list_capabilities` calls around the save and around the palette's next open
+(`2→3 then 3→3` with the invalidation removed). One of the three had a second
+flaw of the same family in the other direction: the palette caches on its first
+open since the last close, and the check had never opened it before the save, so
+there was no stale cache to keep and the check could not have failed for the
+right reason. A falsification that stays green is a finding about the check, not
+about the code — write the precondition down too. And a batch mutates the
+machine, not only the source: removing the containment rule during this batch
+left a real `SKILL.md` at `../evil` and one in `crates/gui/nowhere`, which made
+the two tests asserting those paths are empty fail in the next *workspace* run
+while passing in a crate-only run. Name a path you own (or delete it first) when
+you assert about one.
+
+**A falsification batch mutates the machine, and a killed batch keeps mutating
+it.** This round's first batch was started with `nohup … &` inside an ordinary
+tool call; the harness reaped that process group when the call returned, and the
+last injections it had applied — a `take(MAX_ROWS + 1)` in `mcp_view.rs` and a
+row click that had lost its server in `app.js` — stayed in the tree. The *next*
+batch then measured a mixture of its own injection and that residue (the Rust
+results were nonsense: a test about `empty` failing under an injection about
+argument counting), and its own "restored clean: yes" line was vacuous because it
+searched `jj status` for a phrase that never appears there. Two habits fix it:
+long-running work goes in a **managed background job** (`run_in_background`, no
+`nohup`, no `&`), and the residue check **snapshots the bytes of every file the
+batch touches and compares them when it ends**, printing the names that differ.
+A check that cannot fail is worse than no check: `"restored clean" in status`
+was green while three defects sat in the source.
+
+**A check whose precondition makes both answers the same cannot fail.** Two of
+this round's checks passed their injections and had to be rewritten. Injecting a
+name-ignoring `read_target` left the Rust suite **green**, because the only test
+for that refusal built an `Inner` with *no* clients — where "the one that was
+named" and "the first one there" are identical answers; it now seeds two live
+clients and asserts the second is returned for the second name. On the page side,
+a row that read from the shared picker instead of from its own server was
+invisible while the fixture had a single connected server (the picker's default
+*was* the row's server); the fixture grew a fourth server and the check clicks
+*its* row while the picker names another. Write the precondition down next to the
+assertion: a fixture that cannot distinguish the defect is a fixture, not a test.
+
+**A mutation count must be drained in both places.** `takeRecords()` returns only
+what is *still queued*; records delivered to the observer's callback are gone by
+then, and an empty callback throws them away. Count in the callback **and** with
+`takeRecords()` — one path alone silently drops everything that spans an `await`,
+which is every turn, flood and post-frame repaint.
+
+**Why `perf_selftest.sh` counts work instead of timing it:** it needs
+`--virtual-time-budget` for the bridge's pushed events to land, and under virtual
+time the clock advances only on timers — a synchronous 201-row repaint measures
+`0.00 ms`, which is a lie about cost. So it counts frames, repaints, DOM
+mutations, rows drawn and round trips. Wall-clock milliseconds live in
+`ui_selftest.sh`, which runs a static fixture **without** virtual time and
+therefore reports real ones.
+
+### Writing a live e2e check (`live_selftest.sh`)
+
+This is the macOS-reachable end-to-end loop: the shipped page runs with a backend
+double that holds state across commands, delivers events on timers, and can fail a
+command on demand.
+
+1. **Backend** (`tests/live/bridge.js`):
+   - Add the command to `handlers` (return plain JSON in the Rust command's shape).
+     A command the UI calls with no handler is recorded as an error — the harness's
+     hygiene check fails, on purpose.
+   - Streamed turns are scripted in `scriptTurn`, keyed by the message text
+     (`/\bwrite\b/` → approval scenario, `/slow/` → long turn, else plain). Emit
+     `agent-event` / `approval-request` / `stream-finished` payloads in the exact
+     shapes app.js consumes (`args` is a JSON **string**), and write the final
+     assistant turn into `store.cache` at finish, because the UI reloads the
+     transcript from the backend when a stream ends.
+2. **Checks** (`tests/live/live_checks.js`):
+   - Assert on what a user would see (`#messages` text, `#status-right` spans,
+     `.session-row`), not on internals. Use `waitFor(fn, "what")` — it fails with
+     a readable name. Bridge assertions come from `LIVE.called(cmd)` /
+     `LIVE.lastArgs(cmd)`.
+   - Interact the way a user does: `type(text)` sets the composer value **and
+     dispatches the `input` event** (the value alone leaves the Send button
+     disabled). Queue a follow-up with **Enter** on the composer — clicking the
+     send button while streaming means *Stop*. Tool output lives behind the
+     collapsed `.tool-head`; click it, then `repaint()`, before asserting.
+   - Error paths: `LIVE.failNext(cmd, "message")` makes the next invoke reject;
+     assert the rollback (pair gone, prompt restored, `.err` span).
+   - The file must end by appending `<pre id="result">` with
+     `{checks: {desc: "PASS"|"FAIL"}, failures}` — `read_result.py` parses that
+     convention, and the `catch` writes it too (with page state in the message),
+     so a red run says what the transcript showed.
+3. **Runner** (`tests/live_selftest.sh`): assembles the temp page — `<base>` as
+   the **first** child of `<head>` (URL resolution happens per parsed element),
+   bridge before `app.js` (it reads `__TAURI__.event` at module load), checks
+   before `</body>` — then drives headless Chrome with
+   `--virtual-time-budget=15000`. Timers fast-forward; **rAF starves after the
+   first frames** (a nested rAF never fires — measured), so after any interaction
+   that schedules a repaint, call `repaint()` (it runs `window.renderMessages()`,
+   the same work the frame would do).
+
+Conventions: check names read like the behavior they prove; never add comments to
+`bridge.js`/`live_checks.js` that restate the code; run `node --check` on both
+files; new checks must fail first if you want them trusted (drive the page wrong
+once and watch it go red).
+
+### Dev run on macOS (dock icon)
+
+A bare `target/debug/bsh` gets a second-class dock icon: the dock conforms
+runtime-set icons on its own (content is scaled to fill the standard
+squircle, canvas margins are cropped away), so resizing the artwork's tile
+changes nothing — and the icon cache (`/var/folders/…/C/com.apple.dock.iconcache`)
+keeps a stale render alive across rebuilds. The fix is a real bundle:
+`bash crates/gui/make-dev-app.sh && open target/debug/BOS.app` — it wraps the
+binary with Info.plist + icns so the icon goes through the same code path as
+every bundled app (verified pixel-identical to Docker/Chrome: 824/1024 hard
+extent, standard corner mask). Re-run the script after every `cargo build`.
+
+### The real-app suite (`e2e/`)
+
+`cd crates/gui && cargo build -p bsh && cd e2e && npm install`, then
+`xvfb-run --auto-servernum npm run e2e` (Linux) or `npm run e2e` (Windows,
+msedgedriver). `BOS_APP_BINARY` picks the build, `TAURI_DRIVER_URL` attaches to a
+running driver. Do not try to make it run on macOS — that is a documented
+platform limit, and `live_selftest.sh` covers the same intent here.
+
+---
+
 ## Key Patterns
 
 - **Tools**: Wrap a closure with `FunctionTool` (sync) or `AsyncFunctionTool`
@@ -211,4 +386,4 @@ const result = await agent.ask('What is 2+2?');
 
 ---
 
-## Last Updated: 2026-10-07
+## Last Updated: 2026-10-11

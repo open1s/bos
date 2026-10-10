@@ -8,6 +8,7 @@ pub mod goal;
 pub mod mcp;
 pub mod memory;
 pub mod metrics;
+pub mod plugins;
 pub mod prelude;
 pub mod security;
 pub mod session;

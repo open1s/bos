@@ -73,3 +73,27 @@ print(f'[wiring] registered={len(registered)} invoked={len(called_names)} from={
 print(f'[wiring] failures: {1 if (unreachable or phantom) else 0}')
 sys.exit(1 if (unreachable or phantom) else 0)
 PY
+
+# The plan status vocabulary exists twice - PLAN_ICONS in the UI and the planning
+# tool's JSON schema in Rust - with nothing pinning them together, and drift is
+# invisible: a status the UI cannot name renders with the pending fallback, and
+# one the backend never emits is dead code. Compare the two sets.
+REPO="$(cd "$PWD/../.." && pwd)"
+if [ -f "$REPO/crates/agent/src/tools/plan.rs" ]; then
+  python3 - "$PWD/ui/app.js" "$REPO/crates/agent/src/tools/plan.rs" <<'PYVOC'
+import pathlib, re, sys
+ui = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+rust = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+icons = set(re.findall(r"(\w+)\s*:",
+                       re.search(r"const PLAN_ICONS = \{([^}]*)\}", ui).group(1)))
+schema = set(re.findall(r'"(\w+)"',
+                        re.search(r'"enum":\s*\[([^\]]*)\]', rust).group(1)))
+missing, extra = sorted(schema - icons), sorted(icons - schema)
+print(f"[wiring] plan statuses ui={sorted(icons)} tool={sorted(schema)}")
+print(f"[wiring] plan vocabulary failures: {1 if (missing or extra) else 0}"
+      + (f" missing_in_ui={missing} never_emitted={extra}" if (missing or extra) else ""))
+sys.exit(1 if (missing or extra) else 0)
+PYVOC
+else
+  echo "[wiring] plan vocabulary: skipped (no sibling agent crate in this tree)"
+fi

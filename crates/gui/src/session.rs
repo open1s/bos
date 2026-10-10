@@ -110,6 +110,20 @@ pub(crate) struct SessionRecord {
     /// have none).
     #[serde(default)]
     pub(crate) goal: Option<Goal>,
+    /// Whether the sidebar floats this chat above the others in its workspace.
+    ///
+    /// A pin is presentation, not configuration: it changes no model, no tool
+    /// and no skill, so it is safe to set on a chat whose work is in flight.
+    #[serde(default)]
+    pub(crate) pinned: bool,
+    /// When the chat was archived (Unix seconds), or `None` while it is live.
+    ///
+    /// Archiving hides a chat from the sidebar without destroying anything: the
+    /// transcript, the plan and the goal all survive, and it can be restored.
+    /// Distinct from [`SessionRecord::archived`], which holds the turns a
+    /// compaction folded away — a chat has both, and neither implies the other.
+    #[serde(default)]
+    pub(crate) archived_at: Option<u64>,
     /// The turns the last compaction folded away, oldest first.
     ///
     /// Compaction rewrites the history into an anchor plus a summary, and a
@@ -134,6 +148,8 @@ impl SessionRecord {
             messages: Vec::new(),
             plan: Vec::new(),
             goal: None,
+            pinned: false,
+            archived_at: None,
             archived: Vec::new(),
         }
     }
@@ -173,6 +189,11 @@ impl SessionRecord {
             // the same work, and starting the branch at round zero would lie
             // about how far it has come.
             goal: self.goal.clone(),
+            // A branch is not pinned just because its parent was, and it is
+            // live even when its parent is archived: the point of branching is
+            // to keep working, and inheriting "hidden" would bury the new chat.
+            pinned: false,
+            archived_at: None,
             // A branch starts with nothing folded of its own.
             archived: Vec::new(),
         })
@@ -192,6 +213,37 @@ impl SessionRecord {
                 title
             };
         }
+    }
+
+    /// Rename the chat, returning the name it now carries.
+    ///
+    /// A name is trimmed, must not be empty, and is capped rather than clipped:
+    /// silently shortening what someone typed would make the sidebar disagree
+    /// with the field they typed it in.
+    pub(crate) fn rename(&mut self, title: &str) -> Result<String, String> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Err("a chat needs a name".to_string());
+        }
+        const MAX_TITLE: usize = 80;
+        let n = trimmed.chars().count();
+        if n > MAX_TITLE {
+            return Err(format!(
+                "a chat name is at most {MAX_TITLE} characters (this is {n})"
+            ));
+        }
+        self.title = trimmed.to_string();
+        self.touch();
+        Ok(self.title.clone())
+    }
+
+    /// Archive or restore the chat. Returns whether it is archived now.
+    pub(crate) fn set_archived(&mut self, archived: bool) -> bool {
+        self.archived_at = if archived { Some(unix_now()) } else { None };
+        if archived {
+            self.touch();
+        }
+        self.archived_at.is_some()
     }
 
     /// Drop every message from `index` onward (edit-and-resend and
@@ -1097,6 +1149,16 @@ mod tests {
         assert_eq!(fork.plan.len(), 1);
         assert!(record.messages.len() == 4, "source must be untouched");
 
+        // A pin is presentation *of that chat*, and a branch meant to be worked
+        // in must not inherit "hidden": both are reset, while the messages are
+        // what actually carries over.
+        record.pinned = true;
+        record.set_archived(true);
+        let branch = record.fork_from(2).expect("fork of a pinned, archived chat");
+        assert!(!branch.pinned, "a branch is not pinned because its parent was");
+        assert!(!branch.archived_at.is_some(), "a branch is live");
+        assert_eq!(branch.messages.len(), 2);
+
         // Degenerate and out-of-range indices are refused.
         assert!(record.fork_from(0).is_err());
         assert!(record.fork_from(5).is_err());
@@ -1115,6 +1177,50 @@ mod tests {
         assert_eq!(reloaded.title, "Base chat (branch)");
         let _ = fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn a_pin_and_an_archive_survive_the_store_and_older_files_are_live() {
+        let dir = tmp_dir("pinned-archived");
+        let store = SessionStore::new(&dir);
+        let mut record = SessionRecord::new();
+        record.title = "kept".to_string();
+        record.pinned = true;
+        assert!(record.set_archived(true));
+        store.save(&record).expect("save");
+
+        let mut reloaded = store.load(&record.id).expect("load");
+        assert!(reloaded.pinned);
+        assert!(reloaded.archived_at.is_some());
+        assert!(!reloaded.set_archived(false), "restoring clears the timestamp");
+        assert!(reloaded.archived_at.is_none());
+
+        // A session file written before either field existed is live and
+        // unpinned, not a failed load: the sidebar would otherwise drop every
+        // chat that predates the pin.
+        let legacy = dir.join("legacy.json");
+        fs::write(
+            &legacy,
+            r#"{"id":"legacy","title":"old","created_at":1,"updated_at":2,"messages":[]}"#,
+        )
+        .expect("write legacy");
+        let loaded = store.load("legacy").expect("legacy loads");
+        assert!(!loaded.pinned && loaded.archived_at.is_none());
+        assert_eq!(loaded.title, "old");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_is_trimmed_capped_and_never_empty() {
+        let mut record = SessionRecord::new();
+        record.title = "before".to_string();
+
+        assert!(record.rename("   ").is_err());
+        assert_eq!(record.title, "before", "a refused rename changes nothing");
+        assert!(record.rename(&"z".repeat(81)).is_err());
+        assert_eq!(record.title, "before");
+        assert_eq!(record.rename("  two words  ").expect("renamed"), "two words");
+        assert_eq!(record.title, "two words");
+    }
+
     #[test]
     fn deleting_a_session_moves_it_to_the_trash() {
         let dir = tmp_dir("trash");

@@ -355,6 +355,1681 @@
     tabChat.click();
     state.activeId = "";
     delete state.cache["page-checks-g"];
+
+    // ---- M13 polish: language, shortcut reference, theme, a11y -----------
+    // These read the *shipped* page, so they prove the marks and controls are
+    // wired to the shell's own preferences rather than to a private copy.
+    const polish = window.Polish;
+    assert(
+      `the polish module carries a shortcut table (${polish && polish.SHORTCUTS.length} entries)`,
+      !!polish &&
+        Array.isArray(polish.SHORTCUTS) &&
+        polish.SHORTCUTS.length >= 12 &&
+        polish.SHORTCUTS.every((s) => s.keys && s.action && s.group),
+    );
+
+    const tabLabel = () => d.getElementById("tab-chat").textContent.trim();
+    const shippedTab = tabLabel();
+    const navSpan = d.querySelector("#nav-plugins [data-i18n]");
+    if (polish) polish.setLang("zh");
+    const zhTab = tabLabel();
+    const zhNav = navSpan ? navSpan.textContent.trim() : "";
+    assert(
+      `choosing 中文 translates the chrome (${shippedTab}→${zhTab}, nav=${zhNav})`,
+      zhTab === "对话" &&
+        zhNav === "插件与技能" &&
+        /发送消息/.test(d.getElementById("input").placeholder) &&
+        /^zh/i.test(d.documentElement.lang),
+    );
+    // The claim is "one source of truth", so assert the choice reached the
+    // shell's own state and its persisted record — a module that only painted
+    // the DOM would pass a text-only check and still lose the setting.
+    const shell = typeof Shell !== "undefined" ? Shell : null;
+    const persisted = (() => {
+      try {
+        return d.defaultView.localStorage.getItem("bos.ui.v1") || "";
+      } catch (err) {
+        return "";
+      }
+    })();
+    assert(
+      `中文 is owned by the shell and persisted (state=${shell && shell.state.language}, stored=${
+        /"language":"zh"/.test(persisted)
+      })`,
+      !!shell && shell.state.language === "zh" && /"language":"zh"/.test(persisted),
+    );
+    if (polish) polish.setLang("en");
+    assert(
+      `switching back restores the shipped strings (${tabLabel()})`,
+      tabLabel() === shippedTab &&
+        /Send a message/.test(d.getElementById("input").placeholder) &&
+        /^en/i.test(d.documentElement.lang) &&
+        !!shell &&
+        shell.state.language === "en",
+    );
+
+    const shortcutOpener = d.getElementById("open-settings");
+    if (shortcutOpener) shortcutOpener.focus();
+    if (polish) polish.openShortcuts();
+    const smodal = d.getElementById("shortcuts-modal");
+    const srows = smodal ? smodal.querySelectorAll(".shortcut-row") : [];
+    const sTitle = smodal ? d.getElementById(smodal.getAttribute("aria-labelledby") || "") : null;
+    assert(
+      `? opens a labelled shortcut reference (${srows.length} rows, title=${
+        sTitle && sTitle.textContent.trim()
+      })`,
+      !!smodal &&
+        smodal.getAttribute("role") === "dialog" &&
+        smodal.getAttribute("aria-modal") === "true" &&
+        !smodal.classList.contains("hidden") &&
+        srows.length >= 12 &&
+        !!sTitle &&
+        sTitle.textContent.trim().length > 0,
+    );
+    const sclosed = polish ? polish.closeShortcuts() : false;
+    assert(
+      `closing the reference hands the keyboard back (active=${
+        d.activeElement && (d.activeElement.id || d.activeElement.tagName)
+      })`,
+      sclosed === true && !!smodal && smodal.classList.contains("hidden") && d.activeElement === shortcutOpener,
+    );
+
+    const themeBtn = d.getElementById("theme-toggle");
+    const modeBefore = d.documentElement.dataset.appearance;
+    if (themeBtn) themeBtn.click();
+    const modeAfter = d.documentElement.dataset.appearance;
+    assert(
+      `the theme control cycles the shell's appearance (${modeBefore}→${modeAfter}, state=${
+        shell && shell.state.appearance
+      })`,
+      !!themeBtn &&
+        !!modeAfter &&
+        modeAfter !== modeBefore &&
+        !!shell &&
+        shell.state.appearance === modeAfter,
+    );
+    assert(
+      "dark and light resolve to different backgrounds",
+      (() => {
+        if (!polish) return false;
+        polish.setTheme("dark");
+        const dark = getComputedStyle(d.body).backgroundColor;
+        polish.setTheme("light");
+        const light = getComputedStyle(d.body).backgroundColor;
+        return !!dark && !!light && dark !== light;
+      })(),
+    );
+    if (polish) polish.setTheme("system");
+
+    const skip = d.getElementById("skip-link");
+    const live = d.getElementById("stream-chip");
+    assert(
+      `the page offers a skip link and a live stream state (href=${
+        skip && skip.getAttribute("href")
+      }, live=${live && live.getAttribute("aria-live")})`,
+      !!skip &&
+        skip.getAttribute("href") === "#messages" &&
+        !!live &&
+        live.getAttribute("aria-live") === "polite",
+    );
+
+    // The binding, not just the API: a real `?` keydown opens it, Escape closes
+    // it, and typing `?` into the composer must not be hijacked.
+    const pressKey = (key) => d.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+    const composerInput = d.getElementById("input");
+    composerInput.focus();
+    composerInput.dispatchEvent(new KeyboardEvent("keydown", { key: "?", bubbles: true }));
+    const typedInField = !!smodal && !smodal.classList.contains("hidden");
+    composerInput.blur();
+    pressKey("?");
+    const afterQuestion = !!smodal && !smodal.classList.contains("hidden");
+    pressKey("Escape");
+    const afterEscape = !!smodal && !smodal.classList.contains("hidden");
+    assert(
+      `? opens the reference and Escape closes it (inField=${typedInField}, open=${afterQuestion}, afterEsc=${afterEscape})`,
+      typedInField === false && afterQuestion === true && afterEscape === false,
+    );
+
+    // Assistive tech can discover the two keys that are not clickable: the
+    // composer's send keys and the sidebar's Mod+B.
+    const railKey = d
+      .getElementById("sidebar-toggle")
+      .getAttribute("aria-keyshortcuts");
+    const inputKey = composerInput.getAttribute("aria-keyshortcuts");
+    assert(
+      `the non-clickable keys are announced (rail=${railKey}, input=${inputKey})`,
+      /Meta\+B/.test(railKey || "") && /Enter/.test(inputKey || ""),
+    );
+
+    // The shipped footer accepts an item from any surface, and removing it
+    // leaves the footer as it was.
+    const shippedBar = d.getElementById("status-right");
+    const added =
+      typeof Shell !== "undefined" &&
+      typeof Shell.addStatusItem === "function" &&
+      Shell.addStatusItem("page-check", { label: "checks", value: 36 });
+    const rendered = d.querySelector('#status-items [data-status-item="page-check"]');
+    const registryText = rendered
+      ? `${rendered.querySelector(".status-item-label").textContent}=${
+          rendered.querySelector(".status-item-value").textContent
+        }`
+      : "";
+    const dropped = typeof Shell !== "undefined" && Shell.removeStatusItem("page-check");
+    assert(
+      `the shipped footer takes a registered item (${registryText}, removed=${dropped})`,
+      !!shippedBar &&
+        added === true &&
+        registryText === "checks=36" &&
+        dropped === true &&
+        !d.querySelector('#status-items [data-status-item="page-check"]'),
+    );
+
+    // An id must be unique, and this one actually shipped twice: the static
+    // drawer button and the shell's injected rail button both claimed
+    // id="sidebar-toggle", so app.js's drawer handler bound to the shell's copy
+    // while the static one sat dead — and equally visible under 720 px, where
+    // the id selector shows every match.
+    assert(
+      `the header owns exactly one sidebar toggle (${d.querySelectorAll("#sidebar-toggle").length})`,
+      d.querySelectorAll("#sidebar-toggle").length === 1,
+    );
+
+    // `?` must not stack the reference on top of an already-open dialog.
+    const settingsModal = d.getElementById("settings-modal");
+    settingsModal.classList.remove("hidden");
+    pressKey("?");
+    const stacked = !!smodal && !smodal.classList.contains("hidden");
+    settingsModal.classList.add("hidden");
+    assert(
+      `? does not stack the reference over an open dialog (opened=${stacked})`,
+      stacked === false,
+    );
+
+    // ---- E2E: drive every run surface through a recording IPC double -------
+    // The shipped page is exercised for real: each panel's own refresh is
+    // awaited after the bridge is replaced with a recording double, so these
+    // checks prove the *whole* path — handler → invoke(name, args) → render —
+    // and assert both the arguments that crossed the bridge and the elements
+    // that appeared. `flush` yields only microtasks, which is all this harness
+    // may rely on (it has to finish before the load event).
+    const flush = async () => {
+      for (let i = 0; i < 16; i += 1) await Promise.resolve();
+    };
+    const calls = [];
+    const fixtures = {
+      jobs_list: [
+        { id: "j1", label: "cargo test", kind: "shell", state: "running", started_at: 100, finished_at: null, bytes: 2048, dropped_bytes: 0, error: null },
+        { id: "j2", label: "lint", kind: "run", state: "failed", started_at: 100, finished_at: 105, bytes: 512, dropped_bytes: 0, error: "exit 1" },
+      ],
+      job_output: { id: "j1", state: "running", text: "compiling…\ndone", bytes: 16, total_bytes: 16, truncated: false, dropped_bytes: 0 },
+      job_interrupt: { id: "j1", label: "cargo test", kind: "shell", state: "interrupted", started_at: 100, finished_at: 106, bytes: 2048, dropped_bytes: 0, error: null },
+      token_meter: { session_id: "e2e", messages: 4, estimated: 1234, archived_estimated: 56, provider: 1300, delta: 66, within_tolerance: true, per_message: [] },
+      compaction_status: { session_id: "e2e", title: "t", messages: 4, live_messages: 3, archived_messages: 1, estimated_tokens: 1234, budget_tokens: 8192, over_budget: false, can_compact: true, compacting: false, refusal: null },
+      spill_list: [{ id: "sp1", file: "/tmp/spill/sp1.txt", bytes: 40000, preview: "lots of output" }],
+      spill_read: { id: "sp1", file: "/tmp/spill/sp1.txt", bytes: 40000, truncated: true, text: "head of the output" },
+      approval_rules_list: { rules: [{ id: "r1", tool: "bash", arg: { key: "command", match_kind: "prefix", value: "git " }, scope: "global", effect: "allow" }], warnings: ["line 3: bad entry"], audit_cap: 200 },
+      approval_audit: [{ at: 1791631013, tool: "bash", args: "git status", decision: "ask", rule_id: null }],
+      approval_rule_revoke: { rules: [], warnings: [], audit_cap: 200 },
+      list_memories: [{ id: "m1", content: "the page harness remembers this", created_at_ms: 1791631000000 }],
+      memory_status: { enabled: true, path: "/home/e2e/.bos/gui/memory.jsonl", shared_workspaces: 2, cap: 500, max_chars: 2000 },
+      mcp_status: {
+        connecting: false,
+        servers: [
+          {
+            name: "filesystem", transport: "stdio", enabled: true, connected: true,
+            tools: 2, tool_names: ["read", "write", "list"], error: null,
+          },
+        ],
+      },
+      mcp_policy_status: {
+        now_ms: 1,
+        default: "allow",
+        rules: [{ server: "filesystem", tool: "write", effect: "deny" }],
+        max_rules: 200,
+        max_name_chars: 64,
+        servers: [
+          {
+            name: "filesystem",
+            attached: 2,
+            denied: 1,
+            tools: [
+              { name: "read", effect: "allow", by: "default" },
+              { name: "write", effect: "deny", by: "filesystem/write" },
+              { name: "list", effect: "allow", by: "default" },
+            ],
+          },
+        ],
+        attached: 2,
+        denied: 1,
+        asked: 0,
+        file_version: 1,
+        expected_version: 1,
+      },
+      mcp_policy_set: {
+        now_ms: 2,
+        default: "allow",
+        rules: [{ server: "filesystem", tool: "write", effect: "ask" }],
+        max_rules: 200,
+        max_name_chars: 64,
+        servers: [
+          {
+            name: "filesystem",
+            attached: 3,
+            denied: 0,
+            tools: [
+              { name: "read", effect: "allow", by: "default" },
+              { name: "write", effect: "ask", by: "filesystem/write" },
+              { name: "list", effect: "allow", by: "default" },
+            ],
+          },
+        ],
+        attached: 3,
+        denied: 0,
+        asked: 1,
+        file_version: 1,
+        expected_version: 1,
+      },
+      mcp_policy_clear: {
+        now_ms: 3,
+        default: "allow",
+        rules: [],
+        max_rules: 200,
+        max_name_chars: 64,
+        servers: [
+          {
+            name: "filesystem",
+            attached: 3,
+            denied: 0,
+            tools: [
+              { name: "read", effect: "allow", by: "default" },
+              { name: "write", effect: "allow", by: "default" },
+              { name: "list", effect: "allow", by: "default" },
+            ],
+          },
+        ],
+        attached: 3,
+        denied: 0,
+        asked: 0,
+        file_version: 1,
+        expected_version: 1,
+      },
+      mcp_policy_default: {
+        now_ms: 4,
+        default: "deny",
+        rules: [],
+        max_rules: 200,
+        max_name_chars: 64,
+        servers: [
+          {
+            name: "filesystem",
+            attached: 0,
+            denied: 3,
+            tools: [
+              { name: "read", effect: "deny", by: "default" },
+              { name: "write", effect: "deny", by: "default" },
+              { name: "list", effect: "deny", by: "default" },
+            ],
+          },
+        ],
+        attached: 0,
+        denied: 3,
+        asked: 0,
+        file_version: 1,
+        expected_version: 1,
+      },
+      list_capabilities: {
+        tools: [],
+        async_tools: [],
+        skills: [{ name: "pr-review", description: "Review a pull request" }],
+        plugins: [],
+        hook_events: ["pre_tool_use"],
+      },
+      mcp_catalog: {
+        now_ms: Date.now(),
+        servers: [
+          {
+            server: "filesystem", connected: true,
+            resources_supported: true, prompts_supported: true,
+            resources: [
+              {
+                uri: "file:///repo/schema.json", name: "schema",
+                description: "the repo's schema", mime_type: "application/json", clipped: false,
+              },
+              {
+                uri: "file:///repo/runbook.md", name: "runbook",
+                description: "on-call notes", mime_type: "text/markdown", clipped: false,
+              },
+            ],
+            prompts: [
+              { name: "review", description: "Review a diff", arguments: 2, required: 1, clipped: false },
+            ],
+            resources_total: 2, prompts_total: 1, error: null,
+          },
+          {
+            server: "gone", connected: false,
+            resources_supported: false, prompts_supported: false,
+            resources: [], prompts: [], resources_total: 0, prompts_total: 0, error: null,
+          },
+          {
+            server: "broken", connected: true,
+            resources_supported: true, prompts_supported: false,
+            resources: [], prompts: [], resources_total: 0, prompts_total: 0,
+            error: "resources/list: connection reset",
+          },
+          {
+            server: "second", connected: true,
+            resources_supported: true, prompts_supported: false,
+            resources: [
+              {
+                uri: "file:///notes/todo.md", name: "todo",
+                description: "what is left", mime_type: "text/markdown", clipped: false,
+              },
+            ],
+            prompts: [], resources_total: 1, prompts_total: 0, error: null,
+          },
+        ],
+        max_rows: 200, max_text_chars: 20000, max_desc_chars: 240,
+      },
+      mcp_read_resource: {
+        now_ms: Date.now(),
+        server: "filesystem", uri: "file:///repo/schema.json",
+        mime_type: "application/json", text: '{"type":"object"}',
+        chars: 17, source_chars: 17, truncated: false, parts: 1, empty: false,
+      },
+      skill_list: {
+        now_ms: Date.now(),
+        dir: "/home/e2e/.bos/skills",
+        exists: true,
+        skills: [
+          {
+            name: "code-review", description: "Review a diff",
+            path: "/home/e2e/.bos/skills/code-review/SKILL.md",
+            instructions_chars: 34, denied: false,
+          },
+          {
+            name: "release-notes", description: "Draft release notes",
+            path: "/home/e2e/.bos/skills/release-notes/SKILL.md",
+            instructions_chars: 12, denied: true,
+          },
+        ],
+        max_body_chars: 12000,
+        max_name_chars: 128,
+        max_description_chars: 1024,
+      },
+      list_folder: (args) => ({
+        path: args.path || "/home/e2e",
+        parent: "/home",
+        entries:
+          args.path === "/home/e2e/Documents"
+            ? []
+            : [
+                { name: "bos", path: "/home/e2e/bos" },
+                { name: "Documents", path: "/home/e2e/Documents" },
+              ],
+        truncated: 0,
+        unreadable: 0,
+      }),
+      create_workspace: {
+        workspaces: [
+          { id: "w1", name: "bos", root: "/tmp/bos", model: "" },
+          { id: "w2", name: "trino", root: "/tmp/trino", model: "" },
+          { id: "w3", name: "Documents", root: "/home/e2e/Documents", model: "glm-4.7" },
+        ],
+        active_workspace: "w3",
+        presets: [],
+        model: "glm-4.7",
+        context_budget: 8192,
+      },
+      list_sessions: [
+        { id: "s1", title: "pinned chat", updated_at: 300, workspace: "w1", pinned: true, archived: false },
+        { id: "s2", title: "plain chat", updated_at: 200, workspace: "w1", pinned: false, archived: false },
+        { id: "s3", title: "archived chat", updated_at: 100, workspace: "w1", pinned: false, archived: true },
+        { id: "s4", title: "elsewhere", updated_at: 150, workspace: "w2", pinned: false, archived: false },
+      ],
+      rename_session: { id: "s2", title: "renamed here", updated_at: 200, workspace: "w1", pinned: false, archived: false },
+      set_session_pinned: { id: "s1", title: "pinned chat", updated_at: 300, workspace: "w1", pinned: false, archived: false },
+      set_session_archived: { id: "s2", title: "plain chat", updated_at: 200, workspace: "w1", pinned: false, archived: true },
+      create_session: { id: "s9", title: "New chat", updated_at: 400, workspace: "w1", pinned: false, archived: false },
+      set_active_workspace: { workspaces: [{ id: "w1", name: "bos", root: "/tmp/bos", model: "" }], active_workspace: "w1", presets: [], model: "m", context_budget: 8192 },
+      skill_activation: {
+        now_ms: Date.now(),
+        session: "e2e",
+        explicit: false,
+        active: ["code-review"],
+        available: ["code-review"],
+        denied: ["release-notes"],
+        path: "/home/e2e/.bos/gui/skill-activation.json",
+        sessions_known: 0,
+        max_sessions: 500,
+      },
+      skill_set_active: {
+        now_ms: Date.now(),
+        session: "e2e",
+        explicit: true,
+        active: [],
+        available: ["code-review"],
+        denied: ["release-notes"],
+        path: "/home/e2e/.bos/gui/skill-activation.json",
+        sessions_known: 1,
+        max_sessions: 500,
+      },
+      skill_inherit: {
+        now_ms: Date.now(),
+        session: "e2e",
+        explicit: false,
+        active: ["code-review"],
+        available: ["code-review"],
+        denied: ["release-notes"],
+        path: "/home/e2e/.bos/gui/skill-activation.json",
+        sessions_known: 0,
+        max_sessions: 500,
+      },
+      skill_author: {
+        now_ms: Date.now(),
+        dir: "/home/e2e/.bos/skills",
+        exists: true,
+        skills: [
+          {
+            name: "code-review", description: "Review a diff",
+            path: "/home/e2e/.bos/skills/code-review/SKILL.md",
+            instructions_chars: 34, denied: false,
+          },
+          {
+            name: "pr-review", description: "Review a pull request",
+            path: "/home/e2e/.bos/skills/pr-review/SKILL.md",
+            instructions_chars: 41, denied: false,
+          },
+        ],
+        max_body_chars: 12000,
+        max_name_chars: 128,
+        max_description_chars: 1024,
+      },
+      knowledge_list: {
+        now_ms: Date.now(),
+        query: "",
+        total: 2,
+        matches: [
+          {
+            id: "kb-1", title: "Deploy ritual", tags: ["ops", "release"],
+            body: "Tag the commit\nThen push main and watch the workflow.",
+            created_ms: Date.now() - 86400000, updated_ms: Date.now() - 5 * 60000,
+          },
+          {
+            id: "kb-2", title: "House style", tags: [],
+            body: "Two-space indent, no semicolons.",
+            created_ms: Date.now() - 3600000, updated_ms: Date.now() - 3600000,
+          },
+        ],
+        caps: { max_entries: 500, max_title_chars: 120, max_body_chars: 4000, max_tags: 8, max_tag_chars: 32, tool_body_chars: 1200, tool_max_limit: 20 },
+      },
+      knowledge_search: {
+        now_ms: Date.now(), query: "deploy", total: 2,
+        matches: [{
+          id: "kb-1", title: "Deploy ritual", tags: ["ops", "release"],
+          body: "Tag the commit\nThen push main and watch the workflow.",
+          created_ms: Date.now() - 86400000, updated_ms: Date.now() - 5 * 60000,
+        }],
+        caps: { max_entries: 500, max_title_chars: 120, max_body_chars: 4000, max_tags: 8, max_tag_chars: 32, tool_body_chars: 1200, tool_max_limit: 20 },
+      },
+      knowledge_add: {
+        now_ms: Date.now(), query: "", total: 3,
+        matches: [{
+          id: "kb-3", title: "Rebase policy", tags: ["git"], body: "Never rewrite main.",
+          created_ms: Date.now(), updated_ms: Date.now(),
+        }],
+        caps: { max_entries: 500, max_title_chars: 120, max_body_chars: 4000, max_tags: 8, max_tag_chars: 32, tool_body_chars: 1200, tool_max_limit: 20 },
+      },
+      knowledge_update: {
+        now_ms: Date.now(), query: "", total: 1,
+        matches: [{
+          id: "kb-1", title: "Deploy ritual, edited", tags: ["ops"], body: "Copy the release notes first.",
+          created_ms: Date.now() - 86400000, updated_ms: Date.now(),
+        }],
+        caps: { max_entries: 500, max_title_chars: 120, max_body_chars: 4000, max_tags: 8, max_tag_chars: 32, tool_body_chars: 1200, tool_max_limit: 20 },
+      },
+      knowledge_delete: {
+        now_ms: Date.now(), query: "", total: 1,
+        matches: [{
+          id: "kb-2", title: "House style", tags: [], body: "Two-space indent, no semicolons.",
+          created_ms: Date.now() - 3600000, updated_ms: Date.now() - 3600000,
+        }],
+        caps: { max_entries: 500, max_title_chars: 120, max_body_chars: 4000, max_tags: 8, max_tag_chars: 32, tool_body_chars: 1200, tool_max_limit: 20 },
+      },
+      schedule_list: {
+        now_ms: 1791631000000,
+        schedules: [{
+          id: "s1", text: "stand up and stretch",
+          cadence: { kind: "every", every_minutes: 5, next_ms: 1791631300000 },
+          created_ms: 1791631000000, last_fired_ms: null, fired: 0,
+        }],
+        history: [{ schedule_id: "s0", text: "drink water", at_ms: 1791630900000, noticed_ms: 1791630900000 }],
+        fired: [],
+        caps: { min_every_minutes: 1, max_schedules: 50, max_history: 200, max_text_chars: 500 },
+      },
+      schedule_tick: {
+        now_ms: 1791631300000,
+        schedules: [{
+          id: "s1", text: "stand up and stretch",
+          cadence: { kind: "every", every_minutes: 5, next_ms: 1791631600000 },
+          created_ms: 1791631000000, last_fired_ms: 1791631300000, fired: 1,
+        }],
+        history: [
+          { schedule_id: "s1", text: "stand up and stretch", at_ms: 1791631300000, noticed_ms: 1791631300000 },
+          { schedule_id: "s0", text: "drink water", at_ms: 1791630900000, noticed_ms: 1791630900000 },
+        ],
+        fired: [{ schedule_id: "s1", text: "stand up and stretch", at_ms: 1791631300000, noticed_ms: 1791631300000 }],
+        caps: { min_every_minutes: 1, max_schedules: 50, max_history: 200, max_text_chars: 500 },
+      },
+      self_inspect: { tools: 9, async_tools: 3, skills: 2, plugins: 1, hook_events: 4, mcp_servers: 1, mcp_tools: 2, memories: 6, approval_rules: 1, active_goal: "ship it", goal_state: "active", goal_rounds: 7, goal_remaining: 20, model: "m", workspace: "/w", bash_enabled: true, file_tools_enabled: true, skills_dir: "~/.bos/skills" },
+      evaluate_transcript: { session_id: "e2e", score: 88, grade: "B+", reasons: ["2 blank assistant turns"], signals: { turns: 4 } },
+      replay_session: { session_id: "e2e", title: "t", workspace: "/w", entries: [{ order: 1, index: 0, role: "user", text: "hi", reasoning: "", tools: [{ name: "bash", args: "{}", failed: false, ms: 1200 }], error: null, archived: false }], metrics: { turns: 4, user_turns: 2, assistant_turns: 2, archived_turns: 0, tool_calls: 1, tool_failures: 0, tool_ms_total: 1200, tool_ms_missing: 0, errors: 0, blank_turns: 0, estimated_tokens: 1234 } },
+      export_bundle: { path: "/tmp/bos-bundle.zip", bytes: 4096, schema_version: 1, entries: 5, files: [{ name: "transcript.json", size: 100, crc32: "ab" }] },
+      compact_now: { session_id: "e2e", title: "t", messages: 4, live_messages: 0, archived_messages: 4, estimated_tokens: 10, budget_tokens: 8192, over_budget: false, can_compact: false, compacting: false, refusal: null },
+      restore_compacted: 4,
+    };
+    d.defaultView.__TAURI__.core.invoke = (cmd, args) => {
+      calls.push({ cmd, args: args || {} });
+      const answer = fixtures[cmd];
+      // A fixture may be a function: the settled guards answer one call at a
+      // time, and a command whose *answer depends on its argument* (a folder
+      // listing) cannot be checked with a single frozen value.
+      return Promise.resolve(
+        typeof answer === "function" ? answer(args || {}) : Object.prototype.hasOwnProperty.call(fixtures, cmd) ? answer : null,
+      );
+    };
+    const called = (cmd) => calls.filter((c) => c.cmd === cmd);
+    const lastArgs = (cmd) => {
+      const hits = called(cmd);
+      return hits.length ? hits[hits.length - 1].args : null;
+    };
+    // The Memory pane. `openSettings` loads it, so a pane nothing looks at here
+    // is a pane whose wiring can rot while this guard stays green.
+    await window.openSettings();
+    await flush();
+    const memPane = d.getElementById("mem-items");
+    assert(
+      `E2E: the memory pane lists what is remembered and names the file (${
+        memPane.textContent.replace(/\s+/g, " ").slice(0, 92)})`,
+      /the page harness remembers this/.test(memPane.textContent) &&
+        /home\/e2e\/\.bos\/gui\/memory\.jsonl/.test(memPane.textContent) &&
+        /shared by 2 workspaces/.test(memPane.textContent) &&
+        called("list_memories").length > 0 &&
+        called("memory_status").length > 0,
+    );
+
+    // The Schedule pane: a durable reminder, what it has delivered, and the
+    // bounds it enforces. The tick is driven by hand here because the page
+    // harness never reaches the 30 s interval.
+    // The pane is filled when Settings opens, whether or not it is the tab on
+    // screen — and a tick while it is *closed* must not repaint it, which is
+    // what makes a reminder cost nothing per interval until someone looks.
+    const schedPane = d.getElementById("sched-items");
+    const schedHistory = d.getElementById("sched-history");
+    const schedNote = d.getElementById("sched-note");
+    const beforeTick = `${schedPane.innerHTML}|${schedHistory.innerHTML}|${schedNote.innerHTML}`;
+    assert(
+      `E2E: the schedule pane lists a reminder, its next due and its bounds (${
+        schedPane.textContent.replace(/\s+/g, " ").slice(0, 80)})`,
+      window.schedulePaneOpen() === false &&
+        /stand up and stretch/.test(schedPane.textContent) &&
+        /every 5 min/.test(schedPane.textContent) &&
+        /in 5 min/.test(schedPane.textContent) &&
+        /drink water/.test(schedHistory.textContent) &&
+        /1 of 50 reminders/.test(schedNote.textContent) &&
+        /200 deliveries kept/.test(schedNote.textContent),
+    );
+    await window.tickSchedule();
+    await flush();
+    const toasts = [...d.querySelectorAll(".toast")].map((t) => t.textContent);
+    assert(
+      `E2E: a tick announces what it delivered without repainting a closed pane (${
+        toasts.join(" | ")})`,
+      toasts.includes("Reminder: stand up and stretch") &&
+        `${schedPane.innerHTML}|${schedHistory.innerHTML}|${schedNote.innerHTML}` ===
+          beforeTick &&
+        called("schedule_tick").length > 0 &&
+        typeof lastArgs("schedule_tick").nowMs === "number",
+    );
+
+    // Watching the list is what makes the next tick redraw it.
+    d.getElementById("set-tab-schedule-section").click();
+    await flush();
+    await window.tickSchedule();
+    await flush();
+    assert(
+      `E2E: an open pane catches up with what was delivered (${
+        schedPane.textContent.replace(/\s+/g, " ").slice(0, 72)})`,
+      window.schedulePaneOpen() === true &&
+        /delivered 1×/.test(schedPane.textContent) &&
+        /stand up and stretch/.test(schedHistory.textContent) &&
+        /2 of 200 deliveries kept/.test(schedNote.textContent),
+    );
+
+    // The Knowledge pane: the notes it lists, and each control reaching the
+    // command it names with the values the form actually holds.
+    d.getElementById("set-tab-knowledge-section").click();
+    await flush();
+    const kbHost = d.getElementById("kb-items");
+    const kbText = () => kbHost.textContent.replace(/\s+/g, " ");
+    assert(
+      `E2E: the knowledge pane lists notes with tags, age and a body preview (${
+        kbText().slice(0, 84)})`,
+      /Deploy ritual/.test(kbText()) &&
+        /ops · release/.test(kbText()) &&
+        /edited 5 min ago/.test(kbText()) &&
+        /Tag the commit Then push main and watch the workflow\./.test(kbText()) &&
+        /2 of 500 entries/.test(d.getElementById("kb-note").textContent) &&
+        /bodies 4000/.test(d.getElementById("kb-note").textContent) &&
+        d.querySelectorAll("#kb-items .kb-row").length === 2,
+    );
+
+    d.getElementById("kb-query").value = "deploy";
+    d.getElementById("kb-search").click();
+    await flush();
+    assert(
+      `E2E: searching asks the backend for matches and draws only them (${
+        called("knowledge_search").length} call, ${kbText().slice(0, 40)})`,
+      called("knowledge_search").length === 1 &&
+        lastArgs("knowledge_search").query === "deploy" &&
+        typeof lastArgs("knowledge_search").limit === "number" &&
+        typeof lastArgs("knowledge_search").nowMs === "number" &&
+        d.querySelectorAll("#kb-items .kb-row").length === 1 &&
+        !/House style/.test(kbText()),
+    );
+    d.getElementById("kb-all").click();
+    await flush();
+    assert("clearing the search asks for the whole list again", called("knowledge_list").length >= 2);
+
+    d.getElementById("kb-title").value = "Rebase policy";
+    d.getElementById("kb-tags").value = "git";
+    d.getElementById("kb-body").value = "Never rewrite main.";
+    d.getElementById("kb-save").click();
+    await flush();
+    assert(
+      "adding sends what the form holds, trimmed and unmangled",
+      called("knowledge_add").length === 1 &&
+        lastArgs("knowledge_add").title === "Rebase policy" &&
+        lastArgs("knowledge_add").tags === "git" &&
+        lastArgs("knowledge_add").body === "Never rewrite main." &&
+        typeof lastArgs("knowledge_add").nowMs === "number" &&
+        d.getElementById("kb-title").value === "",
+    );
+
+    d.querySelector("#kb-items .kb-row .kb-edit").click();
+    await flush();
+    assert(
+      `editing fills the form and turns Add into Save (${
+        d.getElementById("kb-save").textContent})`,
+      d.getElementById("kb-save").textContent === "Save" &&
+        d.getElementById("kb-title").value === "Rebase policy" &&
+        d.getElementById("kb-tags").value === "git" &&
+        d.getElementById("kb-body").value === "Never rewrite main." &&
+        d.getElementById("kb-cancel").hidden === false &&
+        state.kbEditing === "kb-3",
+    );
+    d.getElementById("kb-title").value = "Deploy ritual, edited";
+    d.getElementById("kb-save").click();
+    await flush();
+    assert(
+      "saving an edit sends the id it is editing, and the form is cleared",
+      called("knowledge_update").length === 1 &&
+        lastArgs("knowledge_update").id === "kb-3" &&
+        lastArgs("knowledge_update").title === "Deploy ritual, edited" &&
+        state.kbEditing === null &&
+        d.getElementById("kb-save").textContent === "Add" &&
+        d.getElementById("kb-cancel").hidden === true,
+    );
+
+    d.querySelector("#kb-items .kb-row .kb-del").click();
+    await flush();
+    assert(
+      "deleting sends the row's own id",
+      called("knowledge_delete").length === 1 &&
+        lastArgs("knowledge_delete").id === "kb-1" &&
+        typeof lastArgs("knowledge_delete").nowMs === "number",
+    );
+
+    // The MCP per-tool policy: what it lists, and each control reaching the
+    // command it names with the pair the row is about.
+    d.getElementById("set-tab-set-mcp").click();
+    await flush();
+    const polText = () => d.getElementById("pol-servers").textContent.replace(/\s+/g, " ");
+    const polRuleText = () => d.getElementById("pol-rules").textContent.replace(/\s+/g, " ");
+    const polNote = () => d.getElementById("pol-msg").textContent;
+    assert(
+      `E2E: the policy pane lists each tool with the rule that decided it (${
+        polText().slice(0, 78)})`,
+      /write/.test(polText()) &&
+        /by rule filesystem\/write/.test(polText()) &&
+        // Two unruled tools say where their answer comes from, twice.
+        (polText().match(/follows the default/g) || []).length === 2 &&
+        /2 of 3 tools · 1 denied/.test(polText()) &&
+        /3 of 3 tools attached/.test(polNote()) === false &&
+        /2 of 3 tools attached · 1 denied · 0 ask · 1 of 200 rules · default allow/.test(polNote()) &&
+        /filesystem\/write/.test(polRuleText()) &&
+        /Deny/.test(polRuleText()) &&
+        d.getElementById("pol-default").value === "allow",
+    );
+
+    const writeRow = [...d.querySelectorAll("#pol-servers .pol-row")].find((r) =>
+      /write/.test(r.textContent),
+    );
+    writeRow.querySelector('[aria-label="Ask filesystem/write"]').click();
+    await flush();
+    assert(
+      "asking about one tool sends that pair and the chosen effect",
+      called("mcp_policy_set").length === 1 &&
+        lastArgs("mcp_policy_set").server === "filesystem" &&
+        lastArgs("mcp_policy_set").tool === "write" &&
+        lastArgs("mcp_policy_set").effect === "ask" &&
+        typeof lastArgs("mcp_policy_set").nowMs === "number" &&
+        /1 ask/.test(polNote()),
+    );
+
+    d.getElementById("pol-server").value = "filesystem";
+    d.getElementById("pol-tool").value = "";
+    d.getElementById("pol-effect").value = "deny";
+    d.getElementById("pol-add").click();
+    await flush();
+    assert(
+      "a half-written rule is refused here, before any round trip",
+      called("mcp_policy_set").length === 1 &&
+        /needs a server and a tool/.test(polNote()) &&
+        d.getElementById("pol-msg").classList.contains("err"),
+    );
+
+    d.getElementById("pol-tool").value = "truncate";
+    d.getElementById("pol-add").click();
+    await flush();
+    assert(
+      "adding a rule sends both halves and the effect, then clears the form",
+      called("mcp_policy_set").length === 2 &&
+        lastArgs("mcp_policy_set").server === "filesystem" &&
+        lastArgs("mcp_policy_set").tool === "truncate" &&
+        lastArgs("mcp_policy_set").effect === "deny" &&
+        d.getElementById("pol-server").value === "" &&
+        d.getElementById("pol-tool").value === "" &&
+        /Rule saved: filesystem\/truncate → Deny\./.test(polNote()),
+    );
+
+    d.querySelector("#pol-rules .pol-clear").click();
+    await flush();
+    assert(
+      "clearing a rule sends the pair it was stored under",
+      called("mcp_policy_clear").length === 1 &&
+        lastArgs("mcp_policy_clear").server === "filesystem" &&
+        lastArgs("mcp_policy_clear").tool === "write" &&
+        !/filesystem\/write/.test(polRuleText()),
+    );
+
+    const defaultSelect = d.getElementById("pol-default");
+    defaultSelect.value = "deny";
+    defaultSelect.dispatchEvent(new d.defaultView.Event("change"));
+    await flush();
+    assert(
+      `changing the default sends it, and the line follows (${
+        polNote().slice(0, 46)})`,
+      called("mcp_policy_default").length === 1 &&
+        lastArgs("mcp_policy_default").effect === "deny" &&
+        /default deny/.test(polNote()) &&
+        /0 of 3 tools attached/.test(polNote()),
+    );
+
+    // M8 — authoring a skill: what the directory holds, a local refusal, the
+    // round trip's arguments, and the two readings of the same directory that
+    // have to agree (the skills pane and the capability list).
+    await loadSkills();
+    const skillRows = [...d.querySelectorAll("#skill-list .skill-row")];
+    const skillNote = () => d.getElementById("skill-note").textContent;
+    assert(
+      `M8: the skills pane lists what the loader would hand the agent (${skillRows.length} row(s))`,
+      called("skill_list").length > 0 &&
+        skillRows.length === 2 &&
+        /2 skills · 1 off for this workspace/.test(skillNote()) &&
+        /home\/e2e\/\.bos\/skills/.test(skillNote()) &&
+        /34 chars of instruction/.test(skillRows[0].textContent) &&
+        /release-notes/.test(skillRows[1].textContent),
+    );
+    skillRows[0].querySelector(".skill-use").click();
+    await flush();
+    assert(
+      `M8: Use prefills the composer with the skill's name (${d.getElementById("input").value})`,
+      d.getElementById("input").value === "Use the code-review skill: ",
+    );
+    // The palette caches the skill list on its first open since the last close,
+    // and that cache is what a save has to invalidate — so fill it first, or
+    // there is nothing for the check after the save to catch.
+    d.getElementById("input").value = "/c";
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    assert(
+      `M8: the palette cached the skill list before the save (${state.skills.length} cached)`,
+      state.skills.length > 0,
+    );
+    d.getElementById("input").value = "an ordinary message";
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    d.getElementById("skill-name").value = "pr-review";
+    d.getElementById("skill-desc").value = "Review a pull request";
+    d.getElementById("skill-body").value = "   ";
+    d.getElementById("skill-save").click();
+    await flush();
+    assert(
+      `M8: a skill with no body is refused without a round trip (${skillNote()})`,
+      called("skill_author").length === 0 && /needs a body/.test(skillNote()),
+    );
+    d.getElementById("skill-body").value = "Read the diff, then list findings.";
+    const capsCallsBeforeSave = called("list_capabilities").length;
+    d.getElementById("skill-save").click();
+    await flush();
+    assert(
+      `M8: saving sends the skill and clears the form (${JSON.stringify(
+        lastArgs("skill_author"),
+      ).slice(0, 72)})`,
+      called("skill_author").length === 1 &&
+        lastArgs("skill_author").name === "pr-review" &&
+        lastArgs("skill_author").description === "Review a pull request" &&
+        lastArgs("skill_author").body === "Read the diff, then list findings." &&
+        lastArgs("skill_author").overwrite === false &&
+        typeof lastArgs("skill_author").nowMs === "number" &&
+        d.getElementById("skill-name").value === "" &&
+        d.getElementById("skill-desc").value === "" &&
+        d.getElementById("skill-body").value === "" &&
+        /saved pr-review/.test(skillNote()),
+    );
+    // Both readings of the directory have to be *asked again*: the pane's
+    // capability list, and the palette's own cache. Counting the calls is the
+    // only way to see a cache drop through a settled fixture — the fixture
+    // answers the same thing before and after, so the effect is the re-read.
+    const capsCallsAfterSave = called("list_capabilities").length;
+    const paletteCallsBefore = capsCallsAfterSave;
+    d.getElementById("input").value = "/p";
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    const offered = [...d.querySelectorAll("#cmd-list [role=option]")].map((o) => o.textContent);
+    assert(
+      `M8: a save re-reads both views — the capability list and the palette's cache (${
+        capsCallsBeforeSave}→${capsCallsAfterSave} then ${paletteCallsBefore}→${
+        called("list_capabilities").length}, offered=${JSON.stringify(offered.slice(0, 3))})`,
+      /pr-review/.test(d.getElementById("cap-items").textContent) &&
+        capsCallsAfterSave > capsCallsBeforeSave &&
+        called("list_capabilities").length > paletteCallsBefore &&
+        state.skills.length > 0 &&
+        offered.some((text) => /pr-review/.test(text)),
+    );
+    d.getElementById("input").value = "an ordinary message";
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    d.getElementById("skill-name").value = "code-review";
+    d.getElementById("skill-desc").value = "Review a diff";
+    d.getElementById("skill-body").value = "Rewritten.";
+    d.getElementById("skill-overwrite").checked = true;
+    d.getElementById("skill-save").click();
+    await flush();
+    assert(
+      "M8: Replace reaches the command as overwrite",
+      called("skill_author").length === 2 && lastArgs("skill_author").overwrite === true,
+    );
+
+    // M8 — an MCP catalog: what each server publishes beyond tools, and a read
+    // that is a gesture rather than a side effect of being connected.
+    const catCallsBefore = called("mcp_catalog").length;
+    d.getElementById("set-tab-set-mcp").click();
+    await flush();
+    assert(
+      "M8: opening the MCP pane asks for the catalog",
+      called("mcp_catalog").length > catCallsBefore &&
+        typeof lastArgs("mcp_catalog").nowMs === "number",
+    );
+    const catHost = () => d.getElementById("mcp-catalog");
+    const catHeads = () =>
+      [...catHost().querySelectorAll(".cat-server")].map(
+        (block) => block.querySelector(".cat-head").textContent,
+      );
+    const catRows = () => [...catHost().querySelectorAll(".cat-row")];
+    const readMsg = () => d.getElementById("mcp-read-msg").textContent;
+    assert(
+      `M8: every server is drawn with what it publishes (${catHeads().join(" | ")})`,
+      catHeads().length === 4 &&
+        /filesystem/.test(catHeads()[0]) &&
+        /2 resources · 1 prompt/.test(catHeads()[0]) &&
+        /not connected this pass/.test(catHeads()[1]) &&
+        /broken/.test(catHeads()[2]) &&
+        /no prompts capability/.test(catHeads()[2]) &&
+        /second/.test(catHeads()[3]) &&
+        /1 resource · no prompts capability/.test(catHeads()[3]) &&
+        catRows().length === 4 &&
+        /application\/json/.test(catRows()[0].textContent) &&
+        /2 arguments · 1 required/.test(catRows()[2].textContent) &&
+        /file:\/\/\/notes\/todo\.md|todo/.test(catRows()[3].textContent) &&
+        /4 servers · rows up to 200 · a read is cut at 20000 chars/.test(
+          d.getElementById("mcp-cat-msg").textContent,
+        ),
+    );
+    assert(
+      "M8: a listing failure is that server's own line, and the picker offers only live servers",
+      /connection reset/.test(catHost().textContent) &&
+        [...d.getElementById("mcp-read-server").options].map((o) => o.value).join(",") ===
+          "filesystem,broken,second",
+    );
+    catRows()[0].querySelector(".cat-use").click();
+    await flush();
+    const readOut = d.getElementById("mcp-read-out");
+    assert(
+      `M8: a resource row reads that URI and shows the text (${readMsg()})`,
+      called("mcp_read_resource").length === 1 &&
+        lastArgs("mcp_read_resource").server === "filesystem" &&
+        lastArgs("mcp_read_resource").uri === "file:///repo/schema.json" &&
+        typeof lastArgs("mcp_read_resource").nowMs === "number" &&
+        readOut.textContent === '{"type":"object"}' &&
+        !readOut.hidden &&
+        /filesystem\/file:\/\/\/repo\/schema.json · 17 chars · application\/json/.test(readMsg()),
+    );
+    d.getElementById("mcp-uri").value = "   ";
+    d.getElementById("mcp-read-btn").click();
+    await flush();
+    assert(
+      "M8: a blank URI is refused here, with no round trip",
+      called("mcp_read_resource").length === 1 && /needs a URI/.test(readMsg()),
+    );
+    d.getElementById("mcp-uri").value = " file:///repo/runbook.md ";
+    d.getElementById("mcp-read-btn").click();
+    await flush();
+    assert(
+      `M8: a typed URI is trimmed and sent as typed (${lastArgs("mcp_read_resource").uri})`,
+      called("mcp_read_resource").length === 2 &&
+        lastArgs("mcp_read_resource").uri === "file:///repo/runbook.md" &&
+        lastArgs("mcp_read_resource").server === "filesystem",
+    );
+    // A row belongs to its own server: the picker currently names filesystem,
+    // and this row is second's, so a row that read from the picker instead of
+    // from its server would be caught here.
+    d.getElementById("mcp-read-server").value = "filesystem";
+    catRows()[3].querySelector(".cat-use").click();
+    await flush();
+    assert(
+      `M8: a resource row reads from its own server (${lastArgs("mcp_read_resource").server}/${lastArgs("mcp_read_resource").uri})`,
+      called("mcp_read_resource").length === 3 &&
+        lastArgs("mcp_read_resource").server === "second" &&
+        lastArgs("mcp_read_resource").uri === "file:///notes/todo.md",
+    );
+
+    // M8 — a chat's own skills: the scope it carries, the switch that changes
+    // it, and the workspace denial that is a floor under both.
+    const restoreScopeSession = state.activeId;
+    state.activeId = "e2e";
+    await loadSkills();
+    const scopeRows = () => [...d.querySelectorAll("#skill-list .skill-row")];
+    const scopeToggles = () => scopeRows().map((row) => row.querySelector(".skill-toggle"));
+    const inheritBtn = d.getElementById("skill-inherit");
+    assert(
+      `M8: the skills pane reads the open chat's own list (${called("skill_activation").length} read(s) for ${
+        lastArgs("skill_activation") && lastArgs("skill_activation").session
+      })`,
+      called("skill_activation").length > 0 &&
+        lastArgs("skill_activation").session === "e2e" &&
+        typeof lastArgs("skill_activation").nowMs === "number",
+    );
+    assert(
+      `M8: every skill row carries this chat's switch, pressed where the chat carries it (${
+        scopeToggles().map((t) => t.getAttribute("aria-pressed")).join("/")
+      })`,
+      scopeToggles().length === 2 &&
+        scopeToggles()[0].getAttribute("aria-pressed") === "true" &&
+        scopeToggles()[1].getAttribute("aria-pressed") === "false" &&
+        scopeToggles()[0].disabled === false &&
+        inheritBtn.hidden === true &&
+        d.getElementById("skill-scope").textContent.length > 0,
+    );
+    assert(
+      "M8: a skill the workspace switched off is present and disabled, so the reason is readable",
+      scopeToggles()[1].disabled === true && scopeToggles()[1].title.length > 0,
+    );
+    const listsBefore = called("skill_list").length;
+    scopeToggles()[0].click();
+    await flush();
+    assert(
+      `M8: switching a skill off sends the chat, the skill and the direction (${
+        lastArgs("skill_set_active") && lastArgs("skill_set_active").name
+      }/${lastArgs("skill_set_active") && lastArgs("skill_set_active").active})`,
+      called("skill_set_active").length === 1 &&
+        lastArgs("skill_set_active").session === "e2e" &&
+        lastArgs("skill_set_active").name === "code-review" &&
+        lastArgs("skill_set_active").active === false &&
+        typeof lastArgs("skill_set_active").nowMs === "number",
+    );
+    assert(
+      `M8: the switch redraws from its own answer without re-reading the directory (${
+        called("skill_list").length - listsBefore
+      } re-read(s), inherit=${inheritBtn.hidden})`,
+      called("skill_list").length === listsBefore &&
+        scopeToggles()[0].getAttribute("aria-pressed") === "false" &&
+        inheritBtn.hidden === false,
+    );
+    inheritBtn.click();
+    await flush();
+    assert(
+      `M8: following the workspace again is one call, and the pane stops offering it (${
+        lastArgs("skill_inherit") && lastArgs("skill_inherit").session
+      })`,
+      called("skill_inherit").length === 1 &&
+        lastArgs("skill_inherit").session === "e2e" &&
+        scopeToggles()[0].getAttribute("aria-pressed") === "true" &&
+        inheritBtn.hidden === true,
+    );
+    // A report that belongs to another chat is not this chat's answer: the
+    // rows must not claim On/Off from it, and nothing may be clicked.
+    const readsBefore = called("skill_activation").length;
+    state.skillActivation = { session: "some-other-chat", explicit: false, active: ["code-review"] };
+    renderSkills();
+    assert(
+      "M8: another chat's activation is not drawn as this chat's, and no switch is armed",
+      scopeToggles().every((t) => t.disabled === true) &&
+        scopeToggles().every((t) => t.getAttribute("aria-pressed") === "false") &&
+        called("skill_activation").length === readsBefore,
+    );
+    // The inventory follows the chat too, and asks about no chat when none is
+    // open — a session-scoped panel refuses rather than calling with an empty id.
+    await loadCapabilities();
+    const capArgs = lastArgs("list_capabilities");
+    const scopeSession = state.activeId;
+    state.activeId = "";
+    await loadSkills();
+    const offlineReads = called("skill_activation").length;
+    assert(
+      `M8: every chat-scoped read names the open chat or none (${capArgs && capArgs.session}, ${
+        scopeToggles().filter((t) => t.disabled).length
+      } disabled)`,
+      capArgs.session === scopeSession &&
+        scopeToggles().every((t) => t.disabled === true) &&
+        called("skill_activation").length === offlineReads,
+    );
+    state.activeId = restoreScopeSession;
+    state.skillActivation = null;
+
+    // Sidebar — the reference row menu, on the real markup. The three chats are
+    // seeded rather than fetched because this guard's fixtures are settled: the
+    // promises asserted here are *which command a gesture sends and with what*,
+    // and whether the menu costs a round trip. What the backend does with that
+    // command is the live guard's business.
+    const restoreConfirm = window.confirm;
+    const restoreSidebar = {
+      sessions: state.sessions,
+      workspaces: state.workspaces,
+      activeWorkspace: state.activeWorkspace,
+      activeId: state.activeId,
+    };
+    // The MCP switches live on the workspace the sidebar already holds, and one
+    // server starts *off* on purpose: a dialog that ticked everything, or a
+    // payload that ignored the boxes, would be indistinguishable if all of them
+    // were on.
+    const w1 = {
+      id: "w1", name: "bos", root: "/tmp/bos", model: "",
+      mcp_servers: [
+        { name: "filesystem", transport: "stdio", command: "mcp-filesystem", url: "", enabled: true },
+        { name: "notes", transport: "stdio", command: "mcp-notes", url: "", enabled: false },
+      ],
+    };
+    // Two workspaces, because the "+" has two different jobs: in the workspace
+    // that is already active it only creates, and in another one it switches
+    // first. One workspace cannot tell those apart.
+    state.workspaces = [w1, { id: "w2", name: "trino", root: "/tmp/trino", model: "" }];
+    state.activeWorkspace = "w1";
+    state.sessions = [
+      // The pinned chat is the *older* one on purpose: with it newer, a list
+      // that ignored the pin would happen to put it first anyway, and the check
+      // could not fail for the reason it exists.
+      { id: "s1", title: "pinned chat", updated_at: 100, workspace: "w1", pinned: true, archived: false },
+      { id: "s2", title: "plain chat", updated_at: 300, workspace: "w1", pinned: false, archived: false },
+      { id: "s3", title: "archived chat", updated_at: 100, workspace: "w1", pinned: false, archived: true },
+      { id: "s4", title: "elsewhere", updated_at: 150, workspace: "w2", pinned: false, archived: false },
+    ];
+    state.showArchived = false;
+    renderSidebar();
+    const rows = () => [...d.querySelectorAll("#session-list .session-row")];
+    const rowOf = (id) => d.querySelector(`#session-list .session-row[data-id="${id}"]`);
+    const openMenu = (host) => d.querySelector(`.row-menu[aria-label="${host}"]`);
+    assert(
+      `the pinned chat floats and the archived one is not in the list (${rows()
+        .map((r) => r.dataset.id)
+        .join(",")})`,
+      rows().length === 3 &&
+        rows()
+          .map((r) => r.dataset.id)
+          .join(",") === "s1,s2,s4" &&
+        rows()[0].dataset.id === "s1" &&
+        rowOf("s1").querySelector(".sess-pin").getAttribute("aria-pressed") === "true" &&
+        rowOf("s2").querySelector(".sess-pin").getAttribute("aria-pressed") === "false" &&
+        !rowOf("s3") &&
+        /Archived \(1\)/.test(d.getElementById("session-list").textContent),
+    );
+
+    const beforeMenu = calls.length;
+    rowOf("s2").querySelector(".sess-menu").click();
+    const menu = openMenu("Actions for plain chat");
+    const items = menu ? [...menu.querySelectorAll('[role="menuitem"]')] : [];
+    assert(
+      `the row menu is a menu whose entries name the reference actions (${
+        items.map((i) => i.dataset.run).join("/")})`,
+      !!menu &&
+        menu.getAttribute("role") === "menu" &&
+        items.length === 5 &&
+        items.map((i) => i.dataset.run).join(",") === "pin,rename,fork,archive,delete" &&
+        /Delete session/.test(items[4].textContent) &&
+        items[4].classList.contains("danger") &&
+        items.every((i) => i.textContent.trim().length > 0) &&
+        d.activeElement === items[0] &&
+        calls.length === beforeMenu,
+    );
+    assert(
+      "the row menu spells out the keys it answers",
+      /Cmd\/Ctrl\+G/.test(items[1].textContent) && /Cmd\/Ctrl\+F/.test(items[2].textContent),
+    );
+    // Dispatched at the focused entry, the way a real keypress arrives: an
+    // event fired at `document` never reaches a listener on the menu.
+    items[0].dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    assert(
+      `Escape closes the menu and hands the keyboard back (open=${!!openMenu("Actions for plain chat")}, active=${
+        d.activeElement && d.activeElement.className
+      })`,
+      !openMenu("Actions for plain chat") &&
+        d.activeElement === rowOf("s2").querySelector(".sess-menu") &&
+        rowOf("s2").querySelector(".sess-menu").getAttribute("aria-expanded") === "false",
+    );
+    const menuNow = () => d.querySelector(".row-menu");
+    // Every entry is reached through a helper that reopens the menu and reports
+    // what it found, so a missing menu fails *this* check instead of throwing
+    // and taking every check after it with it.
+    const pick = (id, run) => {
+      rowOf(id).querySelector(".sess-menu").click();
+      const m = menuNow();
+      const item = m ? m.querySelector(`[data-run="${run}"]`) : null;
+      if (item) item.click();
+      return { opened: !!m, clicked: !!item, items: m ? m.children.length : 0 };
+    };
+    const picked = pick("s2", "pin");
+    await flush();
+    assert(
+      `the pin entry pins the chat whose row opened the menu (${
+        picked.clicked ? JSON.stringify(lastArgs("set_session_pinned")) : JSON.stringify(picked)
+      })`,
+      picked.clicked &&
+        called("set_session_pinned").length === 1 &&
+        lastArgs("set_session_pinned").id === "s2" &&
+        lastArgs("set_session_pinned").pinned === true,
+    );
+    // The confirm is stubbed *before* the click: letting the real one run puts a
+    // native dialog in front of a headless browser that has nobody to answer it,
+    // and the whole guard hangs instead of failing.
+    window.confirm = () => false;
+    pick("s2", "delete");
+    await flush();
+    assert(
+      "the destructive entry asks before it deletes, and does nothing when refused",
+      called("delete_session").length === 0,
+    );
+    window.confirm = () => true;
+    pick("s2", "delete");
+    await flush();
+    assert(
+      `Delete in the menu reaches the trash (${JSON.stringify(lastArgs("delete_session"))})`,
+      called("delete_session").length === 1 && lastArgs("delete_session").id === "s2",
+    );
+    pick("s2", "rename");
+    const field = rowOf("s2").querySelector(".sess-rename");
+    assert(
+      `Rename turns the row's own title into a focused field (${field && field.value})`,
+      !!field && d.activeElement === field && field.value === "plain chat",
+    );
+    field.value = "  renamed here  ";
+    field.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await flush();
+    assert(
+      `Enter sends the name as typed and the row comes back (${JSON.stringify(lastArgs("rename_session"))})`,
+      called("rename_session").length === 1 &&
+        lastArgs("rename_session").id === "s2" &&
+        lastArgs("rename_session").title === "  renamed here  " &&
+        !rowOf("s2").querySelector(".sess-rename"),
+    );
+    pick("s2", "rename");
+    const field2 = rowOf("s2").querySelector(".sess-rename");
+    if (field2) field2.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flush();
+    assert(
+      `Escape leaves the name alone (fields=${rowOf("s2").querySelectorAll(".sess-rename").length})`,
+      called("rename_session").length === 1 && !rowOf("s2").querySelector(".sess-rename"),
+    );
+    // A row menu opened from the archive list carries the same entries, and the
+    // archived chat's own entry offers to put it back rather than to archive it.
+    const archivedToggle = d.querySelector("#session-list .archived-toggle");
+    if (archivedToggle) archivedToggle.click();
+    const archivedRow = rowOf("s3");
+    if (archivedRow && archivedRow.querySelector(".sess-menu")) {
+      archivedRow.querySelector(".sess-menu").click();
+    }
+    const archivedItems = menuNow() ? [...menuNow().querySelectorAll(".row-menu-item")] : [];
+    assert(
+      `an archived chat's menu offers Restore instead of Archive (rows=${rows()
+        .map((r) => r.dataset.id)
+        .join(",")}, items=${archivedItems.map((i) => i.textContent.trim()).join(" / ")})`,
+      !!archivedToggle &&
+        !!archivedRow &&
+        archivedItems.length === 5 &&
+        /Restore session/.test(archivedItems[3].textContent) &&
+        archivedRow.querySelector(".sess-restore") !== null,
+    );
+    closeRowMenu(false);
+    pick("s2", "archive");
+    await flush();
+    assert(
+      `Archive asks the backend to hide the chat (${JSON.stringify(lastArgs("set_session_archived"))})`,
+      called("set_session_archived").length === 1 &&
+        lastArgs("set_session_archived").id === "s2" &&
+        lastArgs("set_session_archived").archived === true,
+    );
+    // The workspace header: "+" starts a chat in *that* workspace, which means
+    // switching to it first — creating in a workspace that is not active would
+    // need a second way to say which workspace a new chat belongs to.
+    const wsCalls = calls.length;
+    const trinoAdd = d.querySelectorAll("#session-list .ws-new")[1];
+    const trinoLabel = trinoAdd.getAttribute("aria-label");
+    trinoAdd.click();
+    await flush();
+    const wsSeq = calls
+      .slice(wsCalls)
+      .map((c) => c.cmd)
+      .filter((cmd) => cmd === "set_active_workspace" || cmd === "create_session");
+    assert(
+      `the + on another workspace switches to it and only then starts a chat (${wsSeq.join(" then ")})`,
+      wsSeq.join(",") === "set_active_workspace,create_session" &&
+        trinoLabel.includes("trino"),
+    );
+    const homeCalls = calls.length;
+    d.querySelectorAll("#session-list .ws-new")[0].click();
+    await flush();
+    assert(
+      "the + on the active workspace does not switch away and back",
+      calls
+        .slice(homeCalls)
+        .filter((c) => c.cmd === "set_active_workspace").length === 0 &&
+        calls.slice(homeCalls).some((c) => c.cmd === "create_session"),
+    );
+    const wsMenuBtn = d.querySelector("#session-list .ws-menu");
+    wsMenuBtn.click();
+    const wsItems = [...d.querySelectorAll(".row-menu .row-menu-item")];
+    assert(
+      `the workspace menu offers the reference actions and opens the remove form (${
+        wsItems.map((i) => i.dataset.run).join("/")})`,
+      wsItems.map((i) => i.dataset.run).join(",") === "new,rename,delete" &&
+        /Delete workspace/.test(wsItems[2].textContent),
+    );
+    const beforeForm = calls.length;
+    wsItems[1].click();
+    await flush();
+    assert(
+      "Rename workspace opens the form instead of calling the backend blind",
+      calls.length === beforeForm &&
+        !!d.querySelector("#session-list .ws-form") &&
+        !d.querySelector(".row-menu"),
+    );
+    // One invariant over everything the sidebar drew: an icon-only control has
+    // an accessible name. The static guard can only see the wiring; this sees
+    // the buttons, including the ones a row builds.
+    const glyph = /^[^\p{L}\p{N}]+$/u;
+    const unnamed = [...d.querySelectorAll("#session-list button, .row-menu button")].filter(
+      (b) => glyph.test(b.textContent.trim()) && !b.getAttribute("aria-label"),
+    );
+    assert(
+      `every glyph-only control in the sidebar has a name (${unnamed
+        .map((b) => b.className)
+        .join(",") || "none"})`,
+      unnamed.length === 0,
+    );
+    window.confirm = restoreConfirm;
+    state.sessions = restoreSidebar.sessions;
+    state.workspaces = restoreSidebar.workspaces;
+    state.activeWorkspace = restoreSidebar.activeWorkspace;
+    state.activeId = restoreSidebar.activeId;
+    state.showArchived = false;
+    renderSidebar();
+
+    // Adding a workspace — its own flow, on the real markup. It is checked here
+    // rather than in Settings because the promise is precisely that it is *not*
+    // in Settings: the button opens a dialog of its own, and the folder, the
+    // MCP switches and the rest travel in one creation payload.
+    const addModal = d.getElementById("ws-add");
+    const addLabel = d.getElementById(addModal.getAttribute("aria-labelledby") || "");
+    assert(
+      `add-workspace is a labelled modal dialog of its own (${addLabel && addLabel.textContent.trim()})`,
+      addModal.getAttribute("role") === "dialog" &&
+        addModal.getAttribute("aria-modal") === "true" &&
+        !!addLabel &&
+        addLabel.textContent.trim() === "Add a workspace" &&
+        !d.querySelector("#settings-modal #ws-add"),
+    );
+    state.workspaces = [
+      { ...w1 },
+      { id: "w2", name: "trino", root: "/tmp/trino", model: "" },
+    ];
+    state.activeWorkspace = "w1";
+    const addOpener = d.getElementById("workspace-add");
+    const settingsReads = called("get_settings").length;
+    const capsReads = called("list_capabilities").length;
+    state.error = "";
+    addOpener.focus();
+    addOpener.click();
+    await flush();
+    assert(
+      `the Workspaces folder-plus opens Add-workspace and leaves Settings shut (${d.getElementById("settings-modal").className.trim()}, ${called("get_settings").length - settingsReads} settings reads)`,
+      !addModal.classList.contains("hidden") &&
+        d.getElementById("settings-modal").classList.contains("hidden") &&
+        called("get_settings").length === settingsReads,
+    );
+    assert(
+      `the dialog offers every MCP server the workspace carries, with its own switch (${[...d.querySelectorAll(".ws-add-mcp-on")].map((b) => b.value + "=" + b.checked).join(",")})`,
+      [...d.querySelectorAll(".ws-add-mcp-on")].map((b) => b.value).join(",") === "filesystem,notes" &&
+        d.querySelector('.ws-add-mcp-on[value="filesystem"]').checked === true &&
+        d.querySelector('.ws-add-mcp-on[value="notes"]').checked === false,
+    );
+    // The two inventory lists are re-read on open, so the dialog shows plugins
+    // and skills the backend registered rather than a remembered copy.
+    assert(
+      `opening the dialog re-reads the capability inventory (${called("list_capabilities").length - capsReads} read, ${[...d.querySelectorAll(".ws-add-skill-on")].map((b) => b.value).join(",") || "no"} skill, ${d.getElementById("ws-add-plugins").textContent})`,
+      called("list_capabilities").length === capsReads + 1 &&
+        [...d.querySelectorAll(".ws-add-skill-on")].map((b) => b.value).join(",") === "pr-review" &&
+        d.querySelectorAll(".ws-add-plugin-on").length === 0 &&
+        d.getElementById("ws-add-plugins").textContent.includes("No plugins"),
+    );
+    // The chooser: it starts at home when no path is named, each row descends,
+    // and "Use this folder" is what writes the resolved path into the field.
+    d.getElementById("ws-add-browse").click();
+    await flush();
+    assert(
+      `Choose folder… asks for the home folder with no path (${JSON.stringify(lastArgs("list_folder"))})`,
+      called("list_folder").length === 1 &&
+        lastArgs("list_folder").path === null &&
+        d.getElementById("ws-browse-path").textContent === "/home/e2e" &&
+        [...d.querySelectorAll("#ws-browse-list .ws-browse-row")].map((r) => r.textContent).join(",") ===
+          "bos,Documents",
+    );
+    d.querySelector('#ws-browse-list .ws-browse-row[data-path="/home/e2e/Documents"]').click();
+    await flush();
+    assert(
+      `a sub-folder row descends into that folder (${JSON.stringify(lastArgs("list_folder").path)})`,
+      lastArgs("list_folder").path === "/home/e2e/Documents",
+    );
+    d.getElementById("ws-browse-use").click();
+    await flush();
+    assert(
+      `Use this folder fills the root field and suggests the folder's name (${d.getElementById("ws-add-root").value} / ${d.getElementById("ws-add-name").value})`,
+      d.getElementById("ws-add-root").value === "/home/e2e/Documents" &&
+        d.getElementById("ws-add-name").value === "Documents" &&
+        d.getElementById("ws-add-browser").classList.contains("hidden"),
+    );
+    // A creation with no folder is refused before the backend is asked: the
+    // message belongs next to the field, not in the status line behind a dialog.
+    const createCalls = called("create_workspace").length;
+    d.getElementById("ws-add-root").value = "   ";
+    d.getElementById("ws-add-create").click();
+    await flush();
+    assert(
+      `a creation with no folder is refused here, not by the backend (${d.getElementById("ws-add-err").textContent})`,
+      called("create_workspace").length === createCalls &&
+        d.getElementById("ws-add-err").textContent.includes("root folder"),
+    );
+    // Everything the form collects crosses in one payload: the unticked boxes
+    // are the deny-lists, and the MCP list is exactly the servers left ticked.
+    d.getElementById("ws-add-root").value = "/home/e2e/Documents";
+    d.getElementById("ws-add-name").value = "docs";
+    d.getElementById("ws-add-model").value = " glm-4.7 ";
+    d.getElementById("ws-add-files").checked = false;
+    d.querySelector('.ws-add-tool-on[value="plan"]').checked = false;
+    d.querySelector('.ws-add-mcp-on[value="filesystem"]').checked = false;
+    d.querySelector('.ws-add-mcp-on[value="notes"]').checked = true;
+    d.querySelector('.ws-add-skill-on[value="pr-review"]').checked = false;
+    state.error = "";
+    d.getElementById("ws-add-create").click();
+    await flush();
+    const draft = lastArgs("create_workspace").config || {};
+    assert(
+      `Add workspace sends the folder, the name and the whole draft in one call (${JSON.stringify({ root: lastArgs("create_workspace").root, name: lastArgs("create_workspace").name, model: draft.model, tools: draft.disabled_tools, skills: draft.disabled_skills, mcp: draft.mcp_enabled })})`,
+      called("create_workspace").length === createCalls + 1 &&
+        lastArgs("create_workspace").root === "/home/e2e/Documents" &&
+        lastArgs("create_workspace").name === "docs" &&
+        draft.model === "glm-4.7" &&
+        draft.disabled_tools.join(",") === "plan" &&
+        draft.disabled_skills.join(",") === "pr-review" &&
+        draft.mcp_enabled.join(",") === "notes" &&
+        draft.file_tools_enabled === false &&
+        draft.bash_enabled === true &&
+        draft.require_approval === true,
+    );
+    assert(
+      `the dialog closes once the workspace exists and the sidebar shows it (${[...d.querySelectorAll("#session-list .ws-name")].map((n) => n.textContent).join(",")})`,
+      addModal.classList.contains("hidden") && !!d.querySelector("#session-list .ws-name"),
+    );
+    // Escape closes it, and hand focus back to what opened it.
+    addOpener.click();
+    await flush();
+    d.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flush();
+    assert(
+      `Escape closes Add-workspace and returns focus to its opener (${d.activeElement && d.activeElement.id})`,
+      addModal.classList.contains("hidden") && d.activeElement === addOpener,
+    );
+    // The sidebar's own "+ New workspace" opens the same dialog: one flow, not a
+    // second inline form that would drift from it.
+    state.wsEdit = null;
+    renderSidebar();
+    d.querySelector("#session-list .ws-add").click();
+    await flush();
+    assert(
+      `+ New workspace opens the same Add-workspace dialog and no inline form (${!!d.querySelector("#session-list .ws-form")})`,
+      !addModal.classList.contains("hidden") && !d.querySelector("#session-list .ws-form"),
+    );
+    closeAddWorkspace();
+    state.wsEdit = null;
+    renderSidebar();
+
+    const restoreSession = state.activeId;
+    state.activeId = "e2e";
+
+    // M7 — jobs: list, output tail, and stopping one.
+    await refreshJobs();
+    const jobRows = d.querySelectorAll("#jobs-list .job-row");
+    const jobStates = Array.from(jobRows).map((r) => (r.querySelector(".job-state") || {}).textContent);
+    assert(
+      `M7: the job list renders each job with its state (${jobStates.join(",")})`,
+      called("jobs_list").length === 1 &&
+        jobRows.length === 2 &&
+        jobStates.join(",") === "running,failed" &&
+        /2 shown/.test(d.getElementById("jobs-count").textContent),
+    );
+    jobRows[0].click();
+    await flush();
+    const detail = d.getElementById("job-detail");
+    assert(
+      `M7: picking a job reads its tail and offers to stop it (${detail.querySelector(".job-output").textContent.replace(/\n/g, "\\n")})`,
+      called("job_output").length === 1 &&
+        lastArgs("job_output").id === "j1" &&
+        typeof lastArgs("job_output").max_bytes === "number" &&
+        !detail.classList.contains("hidden") &&
+        /compiling/.test(detail.querySelector(".job-output").textContent) &&
+        !!detail.querySelector(".btn"),
+    );
+    detail.querySelector(".job-detail-head .btn").click();
+    await flush();
+    assert(
+      `M7: stopping a job calls job_interrupt with that id (${lastArgs("job_interrupt") && lastArgs("job_interrupt").id})`,
+      called("job_interrupt").length === 1 && lastArgs("job_interrupt").id === "j1",
+    );
+
+    // M6 — context: token meter, compaction, and a spilled output.
+    await refreshContext();
+    const meterText = d.getElementById("token-meter").textContent;
+    const compactText = d.getElementById("compact-status").textContent;
+    assert(
+      `M6: the token meter shows the estimate and the reconciliation (${meterText.replace(/\s+/g, " ").slice(0, 72)})`,
+      called("token_meter").length === 1 &&
+        lastArgs("token_meter").session_id === "e2e" &&
+        lastArgs("token_meter").provider_tokens === null &&
+        /1234 tok/.test(meterText) &&
+        /within tolerance/.test(meterText) &&
+        /yes/.test(meterText),
+    );
+    assert(
+      `M6: compaction status shows the budget and what may happen (${compactText.replace(/\s+/g, " ").slice(0, 60)})`,
+      called("compaction_status").length === 1 && /8192 tok/.test(compactText) && /can compact/.test(compactText),
+    );
+    const spillRows = d.querySelectorAll("#spill-list .spill-row");
+    spillRows[0].click();
+    await flush();
+    assert(
+      `M6: a spilled output lists, then reads back through spill_read (${spillRows.length} row(s), ${lastArgs("spill_read") && lastArgs("spill_read").id})`,
+      called("spill_list").length === 1 &&
+        spillRows.length === 1 &&
+        called("spill_read").length === 1 &&
+        lastArgs("spill_read").id === "sp1" &&
+        /head of the output/.test(d.getElementById("spill-detail").textContent),
+    );
+    d.getElementById("ctx-compact").click();
+    await flush();
+    assert(
+      `M6: Compact now calls compact_now and says what it folded (${d.getElementById("ctx-note").textContent})`,
+      called("compact_now").length === 1 &&
+        lastArgs("compact_now").session_id === "e2e" &&
+        /Folded 4 turn/.test(d.getElementById("ctx-note").textContent),
+    );
+    d.getElementById("ctx-restore").click();
+    await flush();
+    assert(
+      `M6: Restore folded turns calls restore_compacted (${lastArgs("restore_compacted") && lastArgs("restore_compacted").session_id}, note=${d.getElementById("ctx-note").textContent})`,
+      called("restore_compacted").length === 1 &&
+        lastArgs("restore_compacted").session_id === "e2e" &&
+        /Restored 4/.test(d.getElementById("ctx-note").textContent),
+    );
+
+    // M4 — rules: the book, its warnings, the audit ring, add and revoke.
+    await refreshRules();
+    const ruleRows = d.querySelectorAll("#rules-list .rule-row");
+    assert(
+      `M4: the rule book renders effect, tool and predicate (${ruleRows.length} row(s), arg=${ruleRows[0] && ruleRows[0].querySelector(".rule-arg").textContent})`,
+      called("approval_rules_list").length === 1 &&
+        ruleRows.length === 1 &&
+        !!ruleRows[0].querySelector(".rule-effect.e-allow") &&
+        /command prefix "git "/.test(ruleRows[0].querySelector(".rule-arg").textContent),
+    );
+    assert(
+      `M4: a malformed rules file is reported, not swallowed (${d.getElementById("rules-warnings").textContent})`,
+      /= "|problem\(s\)/.test(d.getElementById("rules-warnings").textContent) &&
+        /problem\(s\) in the rules file/.test(d.getElementById("rules-warnings").textContent),
+    );
+    assert(
+      `M4: the audit ring renders each decision (${d.querySelectorAll("#audit-list .audit-row").length} row(s))`,
+      called("approval_audit").length === 1 &&
+        lastArgs("approval_audit").limit === 20 &&
+        d.querySelectorAll("#audit-list .audit-row").length === 1 &&
+        /ask/.test(d.querySelector("#audit-list .audit-row .rule-effect").textContent),
+    );
+    d.getElementById("rule-tool").value = "bash";
+    d.getElementById("rule-scope").value = "session";
+    d.getElementById("rule-effect").value = "deny";
+    d.getElementById("rule-key").value = "command";
+    d.getElementById("rule-match").value = "prefix";
+    d.getElementById("rule-value").value = "rm -rf";
+    d.getElementById("rule-add").click();
+    await flush();
+    const e2eAdded = lastArgs("approval_rule_add");
+    assert(
+      `M4: Add rule sends the whole predicate (${e2eAdded && `${e2eAdded.tool}/${e2eAdded.scope}/${e2eAdded.effect}/${e2eAdded.arg_key}:${e2eAdded.arg_match}=${e2eAdded.arg_value}/session=${e2eAdded.session_id}`})`,
+      called("approval_rule_add").length === 1 &&
+        e2eAdded.tool === "bash" &&
+        e2eAdded.scope === "session" &&
+        e2eAdded.effect === "deny" &&
+        e2eAdded.arg_key === "command" &&
+        e2eAdded.arg_match === "prefix" &&
+        e2eAdded.arg_value === "rm -rf" &&
+        e2eAdded.workspace === null &&
+        e2eAdded.session_id === "e2e" &&
+        d.getElementById("rule-tool").value === "",
+    );
+    const revoker = d.querySelector("#rules-list .rule-row .btn");
+    if (revoker) revoker.click();
+    await flush();
+    assert(
+      `M4: Revoke calls approval_rule_revoke with the rule id (${lastArgs("approval_rule_revoke") && lastArgs("approval_rule_revoke").id})`,
+      called("approval_rule_revoke").length === 1 && lastArgs("approval_rule_revoke").id === "r1",
+    );
+
+    // M11 + M10 + M14 — self-inspection, deterministic replay, bundle export.
+    await refreshInspect();
+    const grid = d.getElementById("insight-grid").textContent;
+    assert(
+      `M11: self-inspection reports the live inventory (${grid.replace(/\s+/g, " ").slice(0, 60)})`,
+      called("self_inspect").length === 1 &&
+        lastArgs("self_inspect").session_id === "e2e" &&
+        /tools/.test(grid) &&
+        /9/.test(grid) &&
+        /active/.test(grid),
+    );
+    d.getElementById("insight-evaluate").click();
+    await flush();
+    const scoreBox = d.getElementById("insight-score");
+    assert(
+      `M11: Evaluate calls the critic and shows grade plus reasons (${scoreBox.textContent.replace(/\s+/g, " ").slice(0, 60)})`,
+      called("evaluate_transcript").length === 1 &&
+        lastArgs("evaluate_transcript").session_id === "e2e" &&
+        !scoreBox.classList.contains("hidden") &&
+        /B\+/.test(scoreBox.textContent) &&
+        /blank assistant turns/.test(scoreBox.textContent),
+    );
+    d.getElementById("replay-run").click();
+    await flush();
+    const replayBox = d.getElementById("replay-report");
+    assert(
+      `M10: replay renders the run's metrics and entries (${replayBox.textContent.replace(/\s+/g, " ").slice(0, 64)})`,
+      called("replay_session").length === 1 &&
+        !replayBox.classList.contains("hidden") &&
+        /1\.2 s/.test(replayBox.textContent) &&
+        /1 tool/.test(replayBox.textContent) &&
+        d.querySelectorAll("#replay-report .replay-row").length === 1,
+    );
+    d.getElementById("bundle-export").click();
+    await flush();
+    assert(
+      `M14: Export bundle reports the archive it wrote (${d.getElementById("bundle-result").textContent})`,
+      called("export_bundle").length === 1 &&
+        lastArgs("export_bundle").session_id === "e2e" &&
+        /bos-bundle\.zip/.test(d.getElementById("bundle-result").textContent) &&
+        /4\.0 KiB/.test(d.getElementById("bundle-result").textContent) &&
+        /5 entries/.test(d.getElementById("bundle-result").textContent) &&
+        !d.getElementById("bundle-result").classList.contains("err"),
+    );
+
+    // The whole sweep must have touched every new command exactly as named.
+    const wiredCommands = [
+      "jobs_list", "job_output", "job_interrupt",
+      "token_meter", "compaction_status", "compact_now", "restore_compacted", "spill_list", "spill_read",
+      "approval_rules_list", "approval_audit", "approval_rule_add", "approval_rule_revoke",
+      "self_inspect", "evaluate_transcript", "replay_session", "export_bundle",
+      "skill_activation", "skill_set_active", "skill_inherit",
+    ];
+    const unreached = wiredCommands.filter((cmd) => called(cmd).length === 0);
+    assert(
+      `every new command was exercised through a real UI handler (${unreached.length} unreached: ${unreached.join(",")})`,
+      unreached.length === 0,
+    );
+
+    // A session-scoped panel must refuse politely rather than fire a bad call.
+    const before = calls.length;
+    state.activeId = "";
+    await refreshContext();
+    assert(
+      `a session-scoped panel asks for a chat instead of calling with an empty id (${d.getElementById("ctx-note").textContent})`,
+      calls.length === before && /Open a chat first/.test(d.getElementById("ctx-note").textContent),
+    );
+    state.activeId = restoreSession;
+
   } catch (err) {
     assert(`the live-page harness ran to completion (${err})`, false);
   }

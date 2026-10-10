@@ -114,26 +114,30 @@ body.resizing #doc-panel { transition: none; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 12px 10px;
+  padding: 16px 14px 12px;
 }
 
 .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 700;
-  font-size: 16px;
-  letter-spacing: 1px;
+  font-size: 20px;
+  letter-spacing: 0.02em;
+  color: var(--text);
 }
 
 .session-list {
   flex: 1;
   overflow-y: auto;
-  padding: 4px 8px;
+  padding: 2px 8px 8px;
 }
 
 .session-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 10px;
+  padding: 8px 10px 8px 26px;
   margin-bottom: 2px;
   border-radius: 8px;
   cursor: pointer;
@@ -181,9 +185,239 @@ body.resizing #doc-panel { transition: none; }
 .session-row:hover .del { display: inline-block; }
 .session-row .del:hover { background: #43202a; color: var(--error); }
 
+/* The row's own controls: a pin (which states something) and the menu (which
+   holds the rest). Both stay visible instead of appearing on hover — a control
+   that only exists while the pointer is over the row is not reachable with a
+   keyboard, and the row menu is how a chat is renamed or archived at all. */
+.session-row .sess-pin,
+.session-row .sess-menu {
+  flex: none;
+  border: none;
+  background: transparent;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.session-row .sess-pin { color: var(--faint); font-size: 12px; opacity: 0.6; }
+.session-row .sess-pin.on { color: var(--warn); opacity: 1; }
+.session-row .sess-pin:hover { background: var(--hover); opacity: 1; }
+.session-row .sess-menu { color: var(--dim); font-size: 14px; padding: 2px 6px; }
+.session-row .sess-menu:hover,
+.session-row .sess-menu[aria-expanded="true"] {
+  background: var(--hover);
+  color: var(--text);
+}
+
+/* Renaming in place: the field takes the title's slot so the row does not jump. */
+.session-row .sess-rename {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--text);
+  background: var(--input);
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  padding: 2px 6px;
+}
+
+/* The archive disclosure, and the rows it reveals. */
+.archived-toggle {
+  display: block;
+  width: calc(100% - 12px);
+  margin: 6px 6px 0;
+  padding: 5px 8px;
+  text-align: left;
+  font-size: 12px;
+  color: var(--dim);
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.archived-toggle:hover { background: var(--hover); color: var(--text); }
+.archived-row { padding-left: 10px; opacity: 0.85; }
+.archived-row .title { color: var(--dim); }
+.archived-row .sess-restore {
+  flex: none;
+  font-size: 11px;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.archived-row .sess-restore:hover { border-color: var(--accent); }
+
+/* One popover serves every row: positioned by script, above the panes it points
+   at, with the accelerator spelled out beside the action it runs. */
+.row-menu {
+  position: fixed;
+  z-index: 90;
+  min-width: 190px;
+  padding: 4px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.row-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.row-menu-item:hover,
+.row-menu-item:focus-visible { background: var(--hover); outline: none; }
+.row-menu-item.danger { color: var(--error); }
+.row-menu-item.danger:hover { background: #43202a; }
+.row-menu-key { flex: none; font-size: 11px; color: var(--faint); }
+
 .sidebar-foot {
-  padding: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
   border-top: 1px solid var(--border);
+}
+
+/* ---------- Add a workspace ---------- */
+
+/* Flat, on purpose, and sized on the shell's own scale. The dialog carries no
+   depth of its own — no shadow, no gradient, no blur, no transition longer than
+   a hover colour — so every state it can be in is one solid surface, a 1px
+   border, and a colour change. That is a look, but it is also the cheap one: a
+   shadowed, blurred, layered dialog makes the compositor blend a full-screen
+   stack every time the folder list moves, and this list moves on every click. */
+.ws-add-card {
+  width: 620px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: none;
+  /* Its own paint and layout container, so a long folder list or a short window
+     scrolls this card and does not relay out the page behind it. */
+  contain: content;
+}
+.ws-add-desc {
+  margin: calc(-1 * var(--space-2)) 0 var(--space-3);
+  color: var(--dim);
+  font-size: var(--font-ui);
+}
+.ws-add-label {
+  display: block;
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: var(--font-ui);
+  color: var(--dim);
+}
+.ws-add-card input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  height: var(--control-h);
+  padding: 0 var(--space-2);
+  font-size: var(--font-ui);
+  color: var(--text);
+  /* Flat fields: a solid fill and one border, and focus is that border's colour
+     rather than a ring, which would be a second layer to blend. */
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  box-shadow: none;
+  transition: border-color 90ms linear;
+}
+.ws-add-card input[type="text"]:focus { border-color: var(--accent); }
+.ws-add-rootrow { display: flex; gap: var(--space-2); }
+.ws-add-rootrow input { flex: 1; min-width: 0; }
+.ws-add-sections {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3) var(--space-4);
+  margin-top: var(--space-3);
+}
+.ws-add-sect { min-width: 0; }
+.ws-add-sect-title { font-size: var(--font-ui); color: var(--dim); margin-bottom: var(--space-1); }
+/* A scrollable capability list: containment keeps a ticked box from
+   invalidating layout anywhere but inside this box. */
+.ws-add-tools {
+  max-height: 132px;
+  overflow-y: auto;
+  contain: content;
+}
+.ws-add-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+  font-size: var(--font-ui);
+}
+.ws-add-err { min-height: 16px; margin-top: var(--space-2); font-size: var(--font-ui); color: var(--error); }
+.ws-add-card .btn,
+.ws-add-card .btn-accent {
+  box-shadow: none;
+  background-image: none;
+  transition: background-color 90ms linear, border-color 90ms linear;
+}
+.ws-add-card .btn:disabled,
+.ws-add-card .btn-accent:disabled { opacity: 0.55; }
+
+/* The folder chooser: the path on top, then one flat row per sub-folder. */
+.ws-browse {
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--sidebar);
+}
+.ws-browse-head { display: flex; align-items: center; gap: var(--space-2); }
+.ws-browse-head code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--dim);
+}
+.ws-browse-list {
+  max-height: 168px;
+  overflow-y: auto;
+  margin-top: var(--space-1);
+  contain: content;
+}
+.ws-browse-row {
+  display: block;
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  text-align: left;
+  font: inherit;
+  font-size: var(--font-ui);
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  /* Hover and focus are the same colour change, so pointer and keyboard see one
+     mechanism instead of two. */
+  transition: background-color 90ms linear, border-color 90ms linear;
+}
+.ws-browse-row:hover { background: var(--hover); }
+.ws-browse-row:focus-visible {
+  background: var(--hover);
+  border-color: var(--border);
+  outline: none;
 }
 
 /* ---------- buttons ---------- */
@@ -949,6 +1183,12 @@ body.resizing #doc-panel { transition: none; }
 .bubble-actions:focus-within {
   opacity: 1;
 }
+/* Actions exist in every row, so while this chat is busy they must be neither
+   visible nor clickable — including on touch, where hover reveals them always. */
+#messages.busy .bubble-actions {
+  opacity: 0;
+  pointer-events: none;
+}
 @media (hover: none) {
   .bubble-actions { opacity: 1; }
 }
@@ -1481,12 +1721,13 @@ body.resizing #doc-panel { transition: none; }
 
 /* Sidebar navigation: a short list of surfaces that open the panel owning the
    data. Automation is disabled until jobs ship, and says so in its title. */
-.sidebar-nav { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; }
+.sidebar-nav { display: flex; flex-direction: column; gap: 4px; padding: 4px 10px 8px; }
 .nav-item {
-  text-align: left; padding: 6px 8px; border: none; border-radius: var(--radius-sm, 6px);
-  background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer;
+  display: flex; align-items: center; gap: 10px;
+  text-align: left; padding: 9px 10px; border: none; border-radius: 8px;
+  background: transparent; color: var(--dim); font: inherit; font-size: 13px; cursor: pointer;
 }
-.nav-item:hover:not([disabled]) { background: var(--hover, rgba(255,255,255,.06)); color: var(--fg); }
+.nav-item:hover:not([disabled]) { background: var(--hover, rgba(255,255,255,.06)); color: var(--text); }
 .nav-item:focus-visible { outline: 2px solid var(--focus-ring, #6c8ebf); outline-offset: -2px; }
 .nav-item[disabled] { opacity: .45; cursor: not-allowed; }
 
@@ -1500,17 +1741,17 @@ body.resizing #doc-panel { transition: none; }
 .file-row {
   display: flex; align-items: center; gap: 6px; width: 100%; padding: 3px 6px;
   border: none; border-radius: var(--radius-sm, 6px); background: transparent;
-  color: var(--fg, #e8e8e8); font: inherit; font-size: 12px; text-align: left;
+  color: var(--text); font: inherit; font-size: 12px; text-align: left;
   cursor: pointer; white-space: nowrap; overflow: hidden;
 }
 .file-row:hover { background: var(--hover, rgba(255, 255, 255, .06)); }
 .file-row:focus-visible { outline: 2px solid var(--focus-ring, #6c8ebf); outline-offset: -2px; }
 .file-row .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-.file-row .file-size { color: var(--muted, #9a9a9a); font-size: 11px; }
+.file-row .file-size { color: var(--dim); font-size: 11px; }
 .file-row.state-loading, .file-row.state-error { cursor: default; }
-.file-row.state-loading { color: var(--muted, #9a9a9a); }
+.file-row.state-loading { color: var(--dim); }
 .file-row.state-error { color: var(--error, #ff6b6b); }
-.file-note { color: var(--muted, #9a9a9a); font-size: 11px; padding: 2px 8px; }
+.file-note { color: var(--dim); font-size: 11px; padding: 2px 8px; }
 
 /* The rail keeps only the brand, the new-chat button and the pane toggles. */
 [data-sidebar="rail"] .sidebar-nav { display: none; }
@@ -1519,20 +1760,20 @@ body.resizing #doc-panel { transition: none; }
 /* Settings is one surface with several sections; the tab strip is its index. */
 .set-nav {
   position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 4px;
-  margin: 8px 0 4px; padding: 6px 0; background: var(--panel, #1b1d21);
-  border-bottom: 1px solid var(--line, rgba(255,255,255,.08));
+  margin: 8px 0 4px; padding: 6px 0; background: var(--card);
+  border-bottom: 1px solid var(--border);
 }
 .set-tab {
   padding: 4px 10px; border: 1px solid transparent; border-radius: 999px;
-  background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer;
+  background: transparent; color: var(--dim); font: inherit; font-size: 12px; cursor: pointer;
 }
-.set-tab:hover { color: var(--fg); background: var(--hover, rgba(255,255,255,.06)); }
+.set-tab:hover { color: var(--text); background: var(--hover, rgba(255,255,255,.06)); }
 .set-tab:focus-visible { outline: 2px solid var(--focus-ring, #6c8ebf); outline-offset: 1px; }
 
 /* Workspace headers in the left panel: the name, its bound model, the chat count. */
 .ws-head {
   display: flex; align-items: center; gap: 6px; padding: 8px 10px 4px;
-  color: var(--muted); font-size: 11px; letter-spacing: .02em; text-transform: none;
+  color: var(--dim); font-size: 11px; letter-spacing: .02em; text-transform: none;
 }
 .ws-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-model {
@@ -1542,32 +1783,35 @@ body.resizing #doc-panel { transition: none; }
 .ws-count { opacity: .6; }
 [data-sidebar="rail"] .ws-head { display: none; }
 .ws-head { cursor: pointer; }
-.ws-head:hover { color: var(--fg); }
-.ws-head.active .ws-name { color: var(--fg); font-weight: 600; }
+.ws-head:hover { color: var(--text); }
+.ws-head.active .ws-name { color: var(--text); font-weight: 600; }
 .ws-head.active .ws-count::before { content: "●"; margin-right: 4px; font-size: 8px; }
 
 /* Workspace actions and the inline workspace form (no native dialogs). */
 .ws-act {
-  display: none; border: 0; background: transparent; color: var(--muted);
+  display: none; border: 0; background: transparent; color: var(--dim);
   cursor: pointer; font-size: 11px; padding: 0 2px; line-height: 1;
 }
 .ws-head:hover .ws-act { display: inline; }
-.ws-act:hover { color: var(--fg); }
+/* The two the header keeps are always visible: they are the reference sidebar's
+   affordances, and the "+" is how a chat is started in a specific workspace. */
+.ws-new, .ws-menu { display: inline; font-size: 13px; padding: 0 3px; }
+.ws-act:hover { color: var(--text); }
 .ws-add {
   display: block; width: calc(100% - 16px); margin: 8px; padding: 6px 8px;
   border: 1px dashed var(--border, rgba(255,255,255,.18)); border-radius: 6px;
-  background: transparent; color: var(--muted); cursor: pointer; font-size: 12px;
+  background: transparent; color: var(--dim); cursor: pointer; font-size: 12px;
 }
-.ws-add:hover { color: var(--fg); border-style: solid; }
+.ws-add:hover { color: var(--text); border-style: solid; }
 .ws-form { display: flex; flex-direction: column; gap: 6px; margin: 8px; padding: 8px;
   border: 1px solid var(--border, rgba(255,255,255,.18)); border-radius: 8px; }
-.ws-form-title { font-size: 12px; color: var(--fg); }
+.ws-form-title { font-size: 12px; color: var(--text); }
 .ws-form input[type="text"], .ws-form input:not([type]) {
   width: 100%; box-sizing: border-box; padding: 5px 6px; font-size: 12px;
   border-radius: 5px; border: 1px solid var(--border, rgba(255,255,255,.18));
-  background: var(--input-bg, rgba(0,0,0,.2)); color: inherit;
+  background: var(--input); color: inherit;
 }
-.ws-form-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.ws-form-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dim); }
 .ws-form-go, .ws-form-cancel {
   padding: 5px 8px; border-radius: 5px; font-size: 12px; cursor: pointer;
   border: 1px solid var(--border, rgba(255,255,255,.18));
@@ -1575,14 +1819,14 @@ body.resizing #doc-panel { transition: none; }
 }
 .ws-form-go.danger { color: #ff8f8f; border-color: rgba(255,120,120,.4); }
 .ws-tools { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; }
-.ws-form-hint { font-size: 11px; color: var(--muted); }
-.ws-tool-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg); }
+.ws-form-hint { font-size: 11px; color: var(--dim); }
+.ws-tool-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
 .ws-tool { margin: 0; }
 .ws-add-preset { margin-top: 0; }
 .load-earlier { margin: 6px 0; padding: 4px 8px; font-size: 12px; cursor: pointer;
   border: 1px dashed var(--border, rgba(255,255,255,.18)); border-radius: 6px;
-  background: transparent; color: var(--muted); }
-.load-earlier:hover { color: var(--fg); }
+  background: transparent; color: var(--dim); }
+.load-earlier:hover { color: var(--text); }
 
 /* Narrow windows: below this width the sidebar is not squeezed into the chat
    area, it slides over it on purpose, and this button is the way back. A
@@ -1633,7 +1877,7 @@ body.resizing #doc-panel { transition: none; }
   border-radius: 999px;
   padding: 1px 8px;
   background: #2b2b33;
-  color: var(--muted, #b9b9c4);
+  color: var(--dim);
 }
 .archived-chip:hover {
   border-color: #7a7a8a;
@@ -1670,14 +1914,14 @@ body.resizing #doc-panel { transition: none; }
   border-radius: 999px;
   padding: 1px 8px;
   background: #2b2b33;
-  color: var(--muted, #b9b9c4);
+  color: var(--dim);
 }
 .trash-restore:hover {
   border-color: #b99a5b;
   color: #ffe9b8;
 }
 .cap-empty {
-  color: var(--muted, #8a8a95);
+  color: var(--dim);
 }
 
 /* Stands in for the rows above the window so the scrollbar describes the whole
@@ -1864,3 +2108,906 @@ body.resizing #doc-panel { transition: none; }
   opacity: 0.45;
   cursor: default;
 }
+
+/* M13 polish: the skip link and the shortcut reference.
+   The skip link is off-screen until focused, which is what makes it useful for
+   keyboard users without imposing on anyone else. */
+/* Visually hidden rather than parked off-canvas at -9999px: an element that
+   sits outside the viewport shows up in layout audits and can create a scroll
+   artifact, while the clipped form is inert geometry that is still focusable. */
+.skip-link {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  text-decoration: none;
+}
+.skip-link:focus {
+  left: 8px;
+  top: 8px;
+  width: auto;
+  height: auto;
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+  overflow: visible;
+  clip-path: none;
+  z-index: 60;
+}
+
+.shortcuts-card {
+  width: min(560px, 92vw);
+  max-height: 80vh;
+  overflow: auto;
+}
+.shortcuts-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.shortcuts-head h2 {
+  margin: 0;
+}
+.shortcuts-group {
+  margin: 16px 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.shortcut-row {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  padding: 5px 0;
+  border-top: 1px solid var(--border);
+}
+.shortcut-keys {
+  flex: none;
+  min-width: 160px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+}
+.shortcut-action {
+  color: var(--dim);
+}
+.shortcuts-note {
+  margin: 14px 0 0;
+  font-size: 12px;
+  color: var(--faint);
+}
+
+/* Respecting a reduced-motion request costs nothing here: the shell animates
+   pane widths and the drawers, and none of that motion is load-bearing. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* A high-contrast request thickens the two palettes' weakest values rather
+   than inventing a third theme: dimension lines and secondary text are what
+   people lose first. */
+@media (prefers-contrast: more) {
+  :root {
+    --dim: #d2d2d2;
+    --faint: #b4b4b4;
+    --border: #6a6a6a;
+  }
+  [data-theme="light"] {
+    --dim: #33373f;
+    --faint: #4a4f5a;
+    --border: #8b909c;
+  }
+}
+
+/* Status-line items registered by any surface (Shell.addStatusItem). */
+.status-items {
+  display: inline-flex;
+  gap: 10px;
+  margin-right: 10px;
+}
+.status-item {
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+}
+.status-item-label {
+  color: var(--faint);
+}
+.status-item-value {
+  color: var(--dim);
+}
+
+/* ---------------------------------------------------------------------------
+   Run surfaces: jobs (M7), context (M6), rules (M4), inspect (M10/M11/M14).
+   The settings form is one long scroll, so each panel is a block that reads as
+   a unit and can be scrolled to from the section nav.
+   --------------------------------------------------------------------------- */
+.cap-title .cap-note {
+  margin-left: 8px;
+  font-weight: 400;
+}
+.cap-note {
+  color: var(--dim);
+  font-size: 12px;
+}
+.cap-note.err {
+  color: var(--error);
+}
+.meter-grid {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) 2fr;
+  gap: 2px 12px;
+  margin: 4px 0 8px;
+  font-size: 12px;
+}
+.meter-key {
+  color: var(--faint);
+}
+.meter-value {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.job-list,
+.rule-list,
+.audit-list,
+.spill-list,
+.replay-entries {
+  list-style: none;
+  margin: 6px 0 10px;
+  padding: 0;
+  max-height: 260px;
+  overflow: auto;
+}
+.job-row,
+.rule-row,
+.audit-row,
+.spill-row,
+.replay-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 5px 6px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.job-row:hover,
+.spill-row:hover,
+.replay-row:hover {
+  background: var(--hover);
+}
+.job-row:focus-visible,
+.spill-row:focus-visible,
+.replay-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.job-label {
+  color: var(--text);
+  min-width: 120px;
+}
+.job-kind,
+.job-time,
+.job-bytes,
+.spill-id,
+.replay-text,
+.audit-args,
+.rule-arg {
+  color: var(--dim);
+}
+.job-error {
+  color: var(--error);
+}
+.job-state,
+.rule-effect {
+  flex: none;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+}
+.job-state.s-running,
+.rule-effect.e-ask {
+  color: var(--warn);
+}
+.job-state.s-failed,
+.rule-effect.e-deny {
+  color: var(--error);
+}
+.job-state.s-finished,
+.rule-effect.e-allow {
+  color: var(--success);
+}
+.job-detail {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.job-detail-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.job-output {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 8px;
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+.spill-row:hover,
+.rule-row {
+  cursor: default;
+}
+
+
+/* The MCP per-tool policy (§M8): one line per tool, with the rule that decided
+   it and the three states side by side. The chosen state is the only one lit,
+   because "deny beats ask" is a rule about rules, not about buttons. */
+.mcp-catalog {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+.cat-server {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+}
+.cat-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.cat-name {
+  font-weight: 600;
+}
+.cat-why,
+.cat-desc {
+  color: var(--dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cat-why { flex: 1 1 auto; }
+.cat-desc { flex: 0 1 40%; }
+.cat-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+}
+.cat-use {
+  background: none;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+  text-decoration: underline;
+}
+.cat-use:hover { color: var(--text); }
+.cat-error { color: var(--error); font-size: 12px; }
+.cat-empty { color: var(--dim); font-size: 12px; }
+
+.skill-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.skill-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.skill-name {
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+.skill-why,
+.skill-desc {
+  color: var(--dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.skill-why { flex: 1 1 auto; }
+.skill-desc { flex: 0 1 30%; }
+.skill-use { flex: 0 0 auto; }
+.skill-scope-row {
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.skill-scope-row .cap-note { min-width: 0; }
+/* The chat's own switch. Pressed means this chat carries the skill; the disabled
+   state is a workspace that switched it off, which is a floor and not a choice. */
+.skill-toggle {
+  flex: 0 0 auto;
+  font-size: 12px;
+  min-width: 118px;
+}
+.skill-toggle[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.skill-toggle:disabled { opacity: 0.55; cursor: not-allowed; }
+.skill-empty { color: var(--dim); font-size: 13px; }
+.skill-replace {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--dim);
+}
+.pol-list {
+  margin: 6px 0 4px;
+}
+.pol-server {
+  margin: 6px 0;
+}
+.pol-row,
+.pol-rule {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.pol-row:last-child,
+.pol-rule:last-child {
+  border-bottom: none;
+}
+.pol-head {
+  display: flex;
+  flex: 1;
+  gap: 8px;
+  align-items: baseline;
+}
+.pol-head .pol-why {
+  margin-left: auto;
+}
+.pol-rule .pol-name {
+  flex: 1;
+}
+.pol-name {
+  color: var(--text);
+  font-weight: 600;
+}
+.pol-why {
+  color: var(--faint);
+  font-size: 11px;
+}
+.pol-eff {
+  display: flex;
+  gap: 4px;
+}
+.pol-btn,
+.pol-clear {
+  font-size: 11px;
+  padding: 2px 7px;
+}
+.pol-btn.on {
+  background: var(--active);
+  color: var(--text);
+}
+.pol-btn.danger.on {
+  background: var(--error);
+  color: var(--bg);
+}
+.pol-lbl {
+  color: var(--dim);
+  font-size: 12px;
+}
+.pol-effect {
+  color: var(--text);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+}
+.pol-empty {
+  color: var(--faint);
+  font-size: 11px;
+  padding: 4px 6px;
+}
+
+/* The knowledge pane (§21): a note per card, with the title, its tags and when
+   it was last edited on one line, the body under it. */
+.kb-row {
+  padding: 7px 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.kb-row:last-child {
+  border-bottom: none;
+}
+.kb-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.kb-title {
+  color: var(--text);
+  font-weight: 600;
+}
+.kb-tagline {
+  color: var(--dim);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 16rem;
+}
+.kb-when {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.kb-body-view {
+  color: var(--dim);
+  margin-top: 3px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.kb-head .btn {
+  font-size: 11px;
+  padding: 2px 7px;
+}
+#kb-tags {
+  width: 13rem;
+}
+.kb-body {
+  width: 100%;
+  min-height: 3.6rem;
+  resize: vertical;
+  font: inherit;
+  color: var(--text);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+}
+.kb-form {
+  margin-top: 8px;
+}
+
+#sched-every {
+  width: 4.5rem;
+}
+#sched-history-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#sched-history-head .btn {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.sched-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.sched-id {
+  flex: none;
+  color: var(--faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+.spill-row,
+.replay-row {
+  cursor: pointer;
+}
+.spill-detail {
+  margin: 6px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+.rule-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin: 4px 0 12px;
+}
+.rule-form input,
+.rule-form select {
+  min-width: 0;
+  flex: 1 1 120px;
+}
+.score-box,
+.replay-box {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+}
+.score-head {
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.score-reasons {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--dim);
+  font-size: 12px;
+}
+.replay-row.folded {
+  opacity: 0.72;
+}
+
+/* ---------------------------------------------------------------------------
+   Left panel (rev 88): the reference shell's shape — a brand row, one
+   full-width primary action, icon+label nav rows, then the workspaces the
+   chats live in, and a local identity in the foot. Structure only where it
+   earns it; every token here is defined in both palettes, so light and dark
+   stay legible (see the guard in tests/markup_selftest.sh).
+   --------------------------------------------------------------------------- */
+.brand-mark {
+  width: 24px;
+  height: 24px;
+  flex: none;
+}
+.brand-mark rect,
+.brand-mark path {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.brand-pill {
+  align-self: center;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--text);
+  color: var(--sidebar);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.new-session {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 2px 12px 10px;
+  padding: 11px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+.new-session:hover { background: var(--hover); }
+.new-session:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+.new-session-mark {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+.new-session-mark circle,
+.new-session-mark path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.side-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.side-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px 4px;
+}
+.side-section-title {
+  color: var(--dim);
+  font-size: 12px;
+  letter-spacing: 0.01em;
+}
+.side-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.side-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.side-act:hover { background: var(--hover); color: var(--text); }
+.side-act:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+.side-act[aria-expanded="true"] { color: var(--accent); }
+#session-search[hidden] { display: none; }
+.side-section.searching #session-search {
+  display: block;
+  margin: 0 8px 6px;
+  width: auto;
+}
+/* A session's own marker: hollow while idle, filled while it is streaming. */
+.sess-mark {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid var(--faint);
+  border-radius: 50%;
+}
+.sess-mark.live {
+  border-color: var(--success);
+  background: var(--success);
+}
+.vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.side-user {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.side-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+}
+.side-user-name {
+  color: var(--dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The rail keeps the marks and loses the words. */
+[data-sidebar="rail"] .side-section,
+[data-sidebar="rail"] .brand-word,
+[data-sidebar="rail"] .brand-pill,
+[data-sidebar="rail"] .side-user-name,
+[data-sidebar="rail"] .new-session span { display: none; }
+[data-sidebar="rail"] .new-session { margin: 2px 8px 10px; padding: 9px 0; }
+[data-sidebar="rail"] .sidebar-foot { flex-direction: column; align-items: center; }
+[data-sidebar="rail"] .sidebar-nav { align-items: center; padding: 4px 6px 8px; }
+[data-sidebar="rail"] .nav-item { justify-content: center; padding: 9px 0; }
+
+/* The Files reload belongs to the same family as the section actions: flat
+   until it is pointed at, not a second kind of button next to a nav row. */
+.files-head #files-refresh {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dim);
+}
+.files-head #files-refresh:hover { background: var(--hover); color: var(--text); }
+
+/* ---------------------------------------------------------------------------
+   Settings (rev 88): the reference dialog's shape — a titled header, a
+   vertical rail of sections, and one pane shown at a time, with each group of
+   controls in a card. `focusSection` picks the pane instead of scrolling a
+   single long form.
+   --------------------------------------------------------------------------- */
+.set-card {
+  width: min(1040px, 94vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+}
+.set-card #settings-form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.set-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 20px 22px 10px;
+}
+.set-head #settings-title { margin: 0; font-size: 22px; }
+.set-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 15px;
+  cursor: pointer;
+}
+.set-close:hover { background: var(--hover); color: var(--text); }
+.set-close:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.set-body {
+  display: flex;
+  gap: 20px;
+  flex: 1;
+  min-height: 0;
+  padding: 0 22px;
+}
+.set-nav {
+  flex: 0 0 208px;
+  display: flex;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  position: static;
+  z-index: auto;
+  gap: 2px;
+  margin: 0;
+  padding: 4px 0 12px;
+  background: transparent;
+  border-bottom: none;
+  border-right: none;
+  overflow-y: auto;
+}
+.set-tab {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.set-tab:hover { background: var(--hover); color: var(--text); }
+.set-tab.active { background: var(--active); color: var(--text); font-weight: 600; }
+.set-tab:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.set-icon { flex: none; width: 18px; text-align: center; font-size: 14px; }
+.set-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.set-panes { flex: 1; min-width: 0; overflow-y: auto; padding: 4px 2px 18px; }
+.set-pane { display: none; }
+.set-pane.active { display: block; }
+/* Each group reads as a card, the way the reference groups a provider — both
+   when the pane *is* the card and when a pane holds several of them (the
+   General pane holds the appearance card plus the model fields). */
+.set-pane .cap-section,
+.set-pane.cap-section {
+  margin: 0 0 12px;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card);
+}
+#settings-form .modal-actions {
+  padding: 12px 22px 18px;
+  border-top: 1px solid var(--border);
+}
+/* The provided lockup heads the empty document column. */
+.doc-logo { width: 232px; max-width: 100%; height: auto; margin-bottom: 2px; }
+.brand-mark { flex: none; width: 26px; height: 26px; border-radius: 7px; }
+
+/* Below the desktop breakpoint the rail would leave the panes too narrow to
+   hold a label and its control side by side, so it turns into a scrollable
+   strip above them and the panes get the full width back. */
+@media (max-width: 720px) {
+  .set-body { flex-direction: column; gap: 8px; padding: 0 16px; }
+  .set-nav {
+    flex: 0 0 auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    overflow: visible;
+    gap: 4px;
+    padding: 4px 0 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .set-tab { width: auto; white-space: nowrap; }
+  .set-label { overflow: visible; }
+  .set-panes { padding: 10px 2px 18px; }
+}
+/* A control may shrink before the row pushes the dialog sideways. */
+.set-pane .ui-row { flex-wrap: wrap; }
+.set-pane .ui-row > * { min-width: 0; }
+
+/* One icon system: stroke shapes that inherit the text colour, so an icon is
+   never a colour emoji and never out of step with its label. */
+.ico {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.set-icon { display: inline-flex; align-items: center; justify-content: center; }
+.cap-title .ico, .files-head .ico, .btn .ico { width: 14px; height: 14px; }
+.btn .ico { vertical-align: -2px; }

@@ -2,6 +2,11 @@
 //!
 //! Provides basic skill loading from filesystem with minimal features.
 
+/// Per-session skill activation and skill authoring validation.
+pub mod session;
+
+pub use session::{SkillActivation, SkillAuthoringRecord, SkillValidationError};
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

@@ -1,0 +1,67 @@
+name: gui-e2e
+
+# End-to-end GUI coverage for the desktop app, driven through tauri-driver and
+# WebdriverIO. tauri-driver only has Linux (WebKitWebDriver) and Windows
+# (msedgedriver) backends, so this job runs on Linux under a virtual display;
+# `crates/gui/tests/page_selftest.sh` covers the same feature points from any
+# machine, including macOS, and stays the fast feedback loop.
+on:
+  push:
+    paths:
+      - "crates/gui/**"
+      - ".github/workflows/gui-e2e.yml"
+  pull_request:
+    paths:
+      - "crates/gui/**"
+      - ".github/workflows/gui-e2e.yml"
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the webview, its driver, and a virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            webkit2gtk-driver \
+            xvfb
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+
+      - name: Build the desktop app
+        run: cargo build -p bsh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the WebdriverIO suite
+        working-directory: crates/gui/e2e
+        run: npm install --no-audit --no-fund
+
+      - name: Run the GUI end-to-end suite
+        working-directory: crates/gui/e2e
+        run: xvfb-run --auto-servernum npx wdio run wdio.conf.js
+
+      - name: Upload the failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-e2e-logs
+          path: crates/gui/e2e/logs/
+          if-no-files-found: ignore

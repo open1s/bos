@@ -1,5 +1,13 @@
 //! Filesystem and command safety checks for agent tools.
 
+/// Scoped "allow-always" approval rules, precedence, and audit ring.
+pub mod rules;
+
+pub use rules::{
+    ArgMatch, ArgPredicate, AuditEntry, Decision, DecisionEffect, RuleEffect, RuleScope, RuleSet,
+    ToolRule, DEFAULT_AUDIT_CAPACITY,
+};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;

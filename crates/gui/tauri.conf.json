@@ -22,7 +22,11 @@
     }
   },
   "bundle": {
-    "active": false,
-    "icon": []
+    "active": true,
+    "icon": [
+      "icons/bos-harness-icon.icns",
+      "icons/bos-harness-icon.ico",
+      "icons/icon.png"
+    ]
   }
 }

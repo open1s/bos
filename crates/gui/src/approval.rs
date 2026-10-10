@@ -6,17 +6,19 @@
 //! waits for [`ApprovalBroker::resolve`] from the UI. Denied or expired
 //! requests never execute the inner tool.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use agent::tools::AsyncTool;
 use agent::{Agent, Tool, ToolError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::AppHandle;
 use uuid::Uuid;
+
+use crate::session::unix_now;
 
 /// How long an approval request waits before it is auto-denied.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -65,6 +67,9 @@ pub(crate) struct ApprovalBroker {
     timeout: Mutex<Duration>,
     /// Workspace root used to resolve write targets for review diffs.
     workspace: Mutex<Option<PathBuf>>,
+    /// Scoped persistent rules (M4). Without a book the broker behaves
+    /// exactly as before: allowances plus a question to the user.
+    rules: Mutex<Option<Arc<RuleBook>>>,
 }
 
 impl Default for ApprovalBroker {
@@ -78,6 +83,7 @@ impl Default for ApprovalBroker {
             // NOTE: `Duration::default()` is zero, which would expire instantly.
             timeout: Mutex::new(APPROVAL_TIMEOUT),
             workspace: Mutex::new(None),
+            rules: Mutex::new(None),
         }
     }
 }
@@ -138,6 +144,30 @@ impl ApprovalBroker {
         *self.workspace.lock().unwrap() = root;
     }
 
+    /// Attach the scoped rule book this broker consults before asking.
+    pub(crate) fn set_rules(&self, rules: Arc<RuleBook>) {
+        *self.rules.lock().unwrap() = Some(rules);
+    }
+
+    /// The rule book attached to this broker, if any.
+    pub(crate) fn rules(&self) -> Option<Arc<RuleBook>> {
+        self.rules.lock().unwrap().clone()
+    }
+
+    /// The workspace/session a rule is evaluated against.
+    fn rule_context(&self) -> RuleContext {
+        RuleContext {
+            session: self.active.lock().unwrap().0.clone(),
+            workspace: self
+                .workspace
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        }
+    }
+
     /// (session, gen) of the current stream.
     fn active_context(&self) -> (String, u64) {
         self.active.lock().unwrap().clone()
@@ -146,6 +176,25 @@ impl ApprovalBroker {
     /// Register a pending request, notify the webview, and return its id and
     /// the receiver the gate awaits on.
     fn request(&self, tool: &str, args: &Value) -> (String, tokio::sync::oneshot::Receiver<bool>) {
+        // Scoped persistent rules decide first: a deny must beat a stale
+        // allowance, and an allow must never reach the user. A rule that
+        // matches nothing leaves the answer to the allowances and the dialog.
+        if let Some(book) = self.rules() {
+            let decision = book.decide(tool, args, &self.rule_context());
+            match decision.decision {
+                Decision::Allow => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(true);
+                    return (String::new(), rx);
+                }
+                Decision::Deny => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(false);
+                    return (String::new(), rx);
+                }
+                Decision::Ask => {}
+            }
+        }
         // An allowance short-circuits the question rather than answering it, so
         // an allowed tool never reaches the user at all. The empty id says the
         // same thing to the caller: there is nothing for the UI to answer.
@@ -526,6 +575,470 @@ pub(crate) fn add_gated_tool(
     }
 }
 
+/// How many decisions the audit ring keeps before it drops the oldest.
+pub(crate) const AUDIT_CAP: usize = 200;
+
+/// What a matching rule says a tool call may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RuleEffect {
+    /// Run the tool without asking.
+    Allow,
+    /// Refuse the tool without asking.
+    Deny,
+}
+
+/// How long a rule is in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RuleScope {
+    /// Every workspace and session.
+    Global,
+    /// The workspace the rule was created in.
+    Workspace,
+    /// One session only.
+    Session,
+}
+
+/// How an argument predicate compares the call's argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MatchKind {
+    /// The argument equals the rule's value exactly.
+    Exact,
+    /// The argument starts with the rule's value.
+    Prefix,
+    /// The argument contains the rule's value anywhere.
+    Contains,
+}
+
+/// Optional argument predicate narrowing a rule to one kind of call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ArgPredicate {
+    /// Argument name (JSON object key) the predicate reads.
+    pub(crate) key: String,
+    /// How `value` is compared.
+    pub(crate) match_kind: MatchKind,
+    /// The text compared against the argument.
+    pub(crate) value: String,
+}
+
+/// One persistent allow/deny rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ApprovalRule {
+    /// Stable identifier used to revoke the rule.
+    pub(crate) id: String,
+    /// Tool name, exactly or as a `*`/`?` glob.
+    pub(crate) tool: String,
+    /// Argument predicate, when the rule is narrow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) arg: Option<ArgPredicate>,
+    /// How long the rule lasts.
+    pub(crate) scope: RuleScope,
+    /// Whether a match allows or denies.
+    pub(crate) effect: RuleEffect,
+    /// Unix seconds the rule was created.
+    pub(crate) created_at: u64,
+    /// Workspace a `workspace`-scoped rule applies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace: Option<String>,
+    /// Session a `session`-scoped rule applies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session: Option<String>,
+}
+
+/// What the rule book decided for one tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Decision {
+    /// A matching rule allows the call.
+    Allow,
+    /// A matching rule denies the call.
+    Deny,
+    /// No rule matched; the user is asked.
+    Ask,
+}
+
+/// A decision plus the rule that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleDecision {
+    /// The decided outcome.
+    pub(crate) decision: Decision,
+    /// The winning rule, when one matched.
+    pub(crate) rule: Option<ApprovalRule>,
+}
+
+/// Workspace/session a rule is matched against.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuleContext {
+    /// Active session id (empty when none is known).
+    pub(crate) session: String,
+    /// Active workspace root (empty when none is set).
+    pub(crate) workspace: String,
+}
+
+/// One decision the gate made, kept in a bounded ring for `/audit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AuditEntry {
+    /// Unix seconds the decision was made.
+    pub(crate) at: u64,
+    /// Tool the decision was about.
+    pub(crate) tool: String,
+    /// Bounded preview of the call's arguments.
+    pub(crate) args: String,
+    /// `"allow"`, `"deny"`, or `"ask"`.
+    pub(crate) decision: String,
+    /// Rule that produced the decision, when one matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rule_id: Option<String>,
+    /// The winning rule's scope, when one matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scope: Option<String>,
+    /// Session the call belonged to (empty when unknown).
+    pub(crate) session: String,
+}
+
+/// The rules a caller wants to add, before the book assigns an id and time.
+#[derive(Debug, Clone)]
+pub(crate) struct NewRule {
+    /// Tool name, exactly or as a glob.
+    pub(crate) tool: String,
+    /// Optional argument predicate.
+    pub(crate) arg: Option<ArgPredicate>,
+    /// How long the rule lasts.
+    pub(crate) scope: RuleScope,
+    /// Allow or deny.
+    pub(crate) effect: RuleEffect,
+    /// Workspace a `workspace`-scoped rule applies to.
+    pub(crate) workspace: Option<String>,
+    /// Session a `session`-scoped rule applies to.
+    pub(crate) session: Option<String>,
+}
+
+/// On-disk shape of the rules file.
+#[derive(Debug, Serialize, Deserialize)]
+struct RulesFile {
+    /// Format version; bumped only if the shape ever changes incompatibly.
+    version: u32,
+    /// The rules themselves.
+    rules: Vec<ApprovalRule>,
+}
+
+/// The rules file version this build writes and understands.
+const RULES_VERSION: u32 = 1;
+
+/// Scoped persistent allow/deny rules plus the audit ring of decisions.
+///
+/// The book owns its file, so a malformed document is a warning rather than a
+/// failure: unparseable entries are skipped and reported, and the rest of the
+/// book still works.
+pub(crate) struct RuleBook {
+    /// Where the rules persist.
+    path: PathBuf,
+    /// Live rules, in insertion order.
+    rules: Mutex<Vec<ApprovalRule>>,
+    /// Bounded ring of the most recent decisions.
+    audit: Mutex<VecDeque<AuditEntry>>,
+    /// Problems found while loading (a malformed file or bad entries).
+    warnings: Mutex<Vec<String>>,
+}
+
+impl RuleBook {
+    /// The conventional rules file: beside the settings file the GUI already
+    /// uses (`~/.bos/gui/approval_rules.json`).
+    pub(crate) fn default_path() -> PathBuf {
+        crate::settings::Settings::default_path()
+            .parent()
+            .map(|dir| dir.join("approval_rules.json"))
+            .unwrap_or_else(|| PathBuf::from("approval_rules.json"))
+    }
+
+    /// Open the book at its conventional path.
+    pub(crate) fn open_default() -> Self {
+        Self::open(Self::default_path())
+    }
+
+    /// Load the book from `path`, tolerating a missing or malformed file.
+    pub(crate) fn open(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let (rules, warnings) = load_rules(&path);
+        Self {
+            path,
+            rules: Mutex::new(rules),
+            audit: Mutex::new(VecDeque::new()),
+            warnings: Mutex::new(warnings),
+        }
+    }
+
+    /// The rules, in insertion order.
+    pub(crate) fn rules(&self) -> Vec<ApprovalRule> {
+        self.rules.lock().unwrap().clone()
+    }
+
+    /// Problems found while loading, oldest first.
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        self.warnings.lock().unwrap().clone()
+    }
+
+    /// The most recent `limit` decisions, newest first.
+    pub(crate) fn audit(&self, limit: usize) -> Vec<AuditEntry> {
+        let ring = self.audit.lock().unwrap();
+        ring.iter().rev().take(limit).cloned().collect()
+    }
+
+    /// Add a rule, persist the book, and return the stored rule.
+    pub(crate) fn add(&self, spec: NewRule) -> Result<ApprovalRule, String> {
+        let tool = spec.tool.trim().to_string();
+        if tool.is_empty() {
+            return Err("a rule needs a tool name".to_string());
+        }
+        if let Some(arg) = &spec.arg {
+            if arg.key.trim().is_empty() {
+                return Err("an argument predicate needs a key".to_string());
+            }
+        }
+        let rule = ApprovalRule {
+            id: Uuid::new_v4().to_string(),
+            tool,
+            arg: spec.arg.map(|mut arg| {
+                arg.key = arg.key.trim().to_string();
+                arg
+            }),
+            scope: spec.scope,
+            effect: spec.effect,
+            created_at: unix_now(),
+            workspace: spec.workspace.filter(|w| !w.trim().is_empty()),
+            session: spec.session.filter(|s| !s.trim().is_empty()),
+        };
+        {
+            let mut rules = self.rules.lock().unwrap();
+            rules.push(rule.clone());
+        }
+        self.save().map_err(|e| e.to_string())?;
+        Ok(rule)
+    }
+
+    /// Remove a rule by id. Returns whether it was there.
+    pub(crate) fn revoke(&self, id: &str) -> Result<bool, String> {
+        let removed = {
+            let mut rules = self.rules.lock().unwrap();
+            let before = rules.len();
+            rules.retain(|rule| rule.id != id);
+            rules.len() != before
+        };
+        if removed {
+            self.save().map_err(|e| e.to_string())?;
+        }
+        Ok(removed)
+    }
+
+    /// Write the rules (and clear the load warnings) to disk.
+    pub(crate) fn save(&self) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let rules = self.rules.lock().unwrap().clone();
+        let doc = RulesFile {
+            version: RULES_VERSION,
+            rules,
+        };
+        let text = serde_json::to_string_pretty(&doc)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&self.path, text)
+    }
+
+    /// Decide one call and record it in the audit ring.
+    ///
+    /// Precedence: a matching deny beats a matching allow, and within one
+    /// effect the most specific rule wins (session over workspace over global,
+    /// an exact tool over a glob, an argument predicate over none). No match
+    /// means the user is asked.
+    pub(crate) fn decide(&self, tool: &str, args: &Value, ctx: &RuleContext) -> RuleDecision {
+        let mut best: Option<ApprovalRule> = None;
+        {
+            let rules = self.rules.lock().unwrap();
+            for rule in rules.iter().filter(|r| rule_matches(r, tool, args, ctx)) {
+                if best
+                    .as_ref()
+                    .is_none_or(|cur| rule_rank(rule) > rule_rank(cur))
+                {
+                    best = Some(rule.clone());
+                }
+            }
+        }
+        let decision = match best.as_ref().map(|r| r.effect) {
+            Some(RuleEffect::Allow) => Decision::Allow,
+            Some(RuleEffect::Deny) => Decision::Deny,
+            None => Decision::Ask,
+        };
+        let entry = AuditEntry {
+            at: unix_now(),
+            tool: tool.to_string(),
+            args: format_args_preview(args),
+            decision: match decision {
+                Decision::Allow => "allow",
+                Decision::Deny => "deny",
+                Decision::Ask => "ask",
+            }
+            .to_string(),
+            rule_id: best.as_ref().map(|r| r.id.clone()),
+            scope: best.as_ref().map(|r| scope_name(r.scope).to_string()),
+            session: ctx.session.clone(),
+        };
+        self.record(entry);
+        RuleDecision {
+            decision,
+            rule: best,
+        }
+    }
+
+    /// Push one decision onto the bounded ring, dropping the oldest.
+    fn record(&self, entry: AuditEntry) {
+        let mut ring = self.audit.lock().unwrap();
+        if ring.len() >= AUDIT_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(entry);
+    }
+}
+
+/// Lower-case name of a scope, for audit entries and the UI.
+fn scope_name(scope: RuleScope) -> &'static str {
+    match scope {
+        RuleScope::Global => "global",
+        RuleScope::Workspace => "workspace",
+        RuleScope::Session => "session",
+    }
+}
+
+/// Match `pattern` (`*` any run, `?` one character) against `text`.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while j < t.len() {
+        if i < p.len() && (p[i] == '?' || p[i] == t[j]) {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == '*' {
+            star = i;
+            i += 1;
+            mark = j;
+        } else if star != usize::MAX {
+            i = star + 1;
+            mark += 1;
+            j = mark;
+        } else {
+            return false;
+        }
+    }
+    while i < p.len() && p[i] == '*' {
+        i += 1;
+    }
+    i == p.len()
+}
+
+/// Whether a rule's argument predicate accepts the call's arguments.
+fn predicate_matches(pred: &ArgPredicate, args: &Value) -> bool {
+    let Some(raw) = args.get(&pred.key) else {
+        return false;
+    };
+    let text = match raw {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    match pred.match_kind {
+        MatchKind::Exact => text == pred.value,
+        MatchKind::Prefix => text.starts_with(&pred.value),
+        MatchKind::Contains => text.contains(&pred.value),
+    }
+}
+
+/// Whether `rule` applies to this call at all.
+fn rule_matches(rule: &ApprovalRule, tool: &str, args: &Value, ctx: &RuleContext) -> bool {
+    if !wildcard_match(&rule.tool, tool) {
+        return false;
+    }
+    match rule.scope {
+        RuleScope::Global => {}
+        RuleScope::Workspace => {
+            if rule.workspace.as_deref() != Some(ctx.workspace.as_str()) {
+                return false;
+            }
+        }
+        RuleScope::Session => {
+            if rule.session.as_deref() != Some(ctx.session.as_str()) {
+                return false;
+            }
+        }
+    }
+    rule.arg
+        .as_ref()
+        .is_none_or(|pred| predicate_matches(pred, args))
+}
+
+/// Sort key for rule precedence: effect first (deny beats allow), then
+/// specificity (session > workspace > global, exact tool > glob, predicate > none).
+fn rule_rank(rule: &ApprovalRule) -> (u8, u8, u8, u8) {
+    let effect = match rule.effect {
+        RuleEffect::Allow => 0,
+        RuleEffect::Deny => 1,
+    };
+    let scope = match rule.scope {
+        RuleScope::Global => 0,
+        RuleScope::Workspace => 1,
+        RuleScope::Session => 2,
+    };
+    let tool = if rule.tool.contains(['*', '?']) { 0 } else { 1 };
+    let arg = u8::from(rule.arg.is_some());
+    (effect, scope, tool, arg)
+}
+
+/// Read the rules file, skipping entries that do not parse.
+///
+/// A missing file is normal (no rules yet). A file that is not valid JSON, or
+/// is not the expected document, yields no rules and one warning; a single
+/// bad entry inside an otherwise valid document is skipped with its own
+/// warning, so one broken rule never discards the rest.
+fn load_rules(path: &Path) -> (Vec<ApprovalRule>, Vec<String>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return (Vec::new(), Vec::new());
+    };
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                Vec::new(),
+                vec![format!("{}: not valid JSON ({err})", path.display())],
+            )
+        }
+    };
+    let entries = match value.get("rules").and_then(|rules| rules.as_array()) {
+        Some(entries) => entries,
+        None => {
+            return (
+                Vec::new(),
+                vec![format!(
+                    "{}: expected an object with a \"rules\" array",
+                    path.display()
+                )],
+            )
+        }
+    };
+    let mut rules = Vec::new();
+    let mut warnings = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        match serde_json::from_value::<ApprovalRule>(entry.clone()) {
+            Ok(rule) if rule.tool.trim().is_empty() => {
+                warnings.push(format!("rule {index}: empty tool name — skipped"));
+            }
+            Ok(rule) => rules.push(rule),
+            Err(err) => warnings.push(format!("rule {index}: {err} — skipped")),
+        }
+    }
+    (rules, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,5 +1350,363 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /* ---- M4: scoped persistent rules ---- */
+
+    /// A scratch rules file for one test.
+    fn book(tag: &str) -> (RuleBook, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("bos-gui-rules-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("approval_rules.json");
+        (RuleBook::open(&path), path)
+    }
+
+    fn spec(tool: &str, effect: RuleEffect, scope: RuleScope) -> NewRule {
+        NewRule {
+            tool: tool.to_string(),
+            arg: None,
+            scope,
+            effect,
+            workspace: None,
+            session: None,
+        }
+    }
+
+    /// A glob tool name matches by pattern, and an exact name does not overreach.
+    #[test]
+    fn glob_tool_names_match_by_pattern() {
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("mcp_*", "mcp_files_read"));
+        assert!(wildcard_match("*_read", "files_read"));
+        assert!(wildcard_match("file?", "files"));
+        assert!(!wildcard_match("mcp_*", "bash"));
+        assert!(!wildcard_match("file?", "filetool"));
+        assert!(wildcard_match("bash", "bash"));
+    }
+
+    /// Each predicate kind accepts exactly its own shape of argument.
+    #[test]
+    fn every_predicate_kind_is_honoured() {
+        let exact = ArgPredicate {
+            key: "command".into(),
+            match_kind: MatchKind::Exact,
+            value: "ls".into(),
+        };
+        assert!(predicate_matches(
+            &exact,
+            &serde_json::json!({"command": "ls"})
+        ));
+        assert!(!predicate_matches(
+            &exact,
+            &serde_json::json!({"command": "ls -la"})
+        ));
+
+        let prefix = ArgPredicate {
+            key: "path".into(),
+            match_kind: MatchKind::Prefix,
+            value: "src/".into(),
+        };
+        assert!(predicate_matches(
+            &prefix,
+            &serde_json::json!({"path": "src/main.rs"})
+        ));
+        assert!(!predicate_matches(
+            &prefix,
+            &serde_json::json!({"path": "docs/x.md"})
+        ));
+
+        let contains = ArgPredicate {
+            key: "command".into(),
+            match_kind: MatchKind::Contains,
+            value: "rm -rf".into(),
+        };
+        assert!(predicate_matches(
+            &contains,
+            &serde_json::json!({"command": "echo hi && rm -rf /tmp/x"})
+        ));
+        assert!(!predicate_matches(
+            &contains,
+            &serde_json::json!({"command": "ls"})
+        ));
+        // A missing key never matches, and a non-string argument is stringified.
+        assert!(!predicate_matches(
+            &exact,
+            &serde_json::json!({"other": "ls"})
+        ));
+        let number = ArgPredicate {
+            key: "n".into(),
+            match_kind: MatchKind::Exact,
+            value: "7".into(),
+        };
+        assert!(predicate_matches(&number, &serde_json::json!({"n": 7})));
+    }
+
+    /// Nothing matched means the user is asked, and the audit records it.
+    #[test]
+    fn no_match_asks_and_is_audited() {
+        let (book, path) = book("ask");
+        let decision = book.decide("bash", &serde_json::json!({}), &RuleContext::default());
+        assert_eq!(decision.decision, Decision::Ask);
+        assert!(decision.rule.is_none());
+        let audit = book.audit(10);
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].decision, "ask");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// An allow rule skips the dialog; a deny rule refuses outright.
+    #[test]
+    fn allow_and_deny_rules_decide_without_asking() {
+        let (book, path) = book("allow-deny");
+        book.add(spec("bash", RuleEffect::Allow, RuleScope::Global))
+            .expect("add allow");
+        let ctx = RuleContext::default();
+        assert_eq!(
+            book.decide("bash", &serde_json::json!({}), &ctx).decision,
+            Decision::Allow
+        );
+        book.add(spec("bash", RuleEffect::Deny, RuleScope::Global))
+            .expect("add deny");
+        // Deny beats allow even when the allow was added first.
+        let denied = book.decide("bash", &serde_json::json!({}), &ctx);
+        assert_eq!(denied.decision, Decision::Deny);
+        assert_eq!(denied.rule.as_ref().unwrap().effect, RuleEffect::Deny);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A deny beats an allow even when the allow is the more specific rule.
+    #[test]
+    fn deny_beats_allow_across_specificity() {
+        let (book, path) = book("deny-wins");
+        let mut allow = spec("bash", RuleEffect::Allow, RuleScope::Session);
+        allow.arg = Some(ArgPredicate {
+            key: "command".into(),
+            match_kind: MatchKind::Exact,
+            value: "ls".into(),
+        });
+        allow.session = Some("s1".into());
+        book.add(allow).expect("add narrow allow");
+        book.add(spec("*", RuleEffect::Deny, RuleScope::Global))
+            .expect("add broad deny");
+        let ctx = RuleContext {
+            session: "s1".into(),
+            workspace: "/w".into(),
+        };
+        let decision = book.decide("bash", &serde_json::json!({"command": "ls"}), &ctx);
+        assert_eq!(decision.decision, Decision::Deny, "deny must win");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Among rules of the same effect the most specific one is chosen.
+    #[test]
+    fn more_specific_rules_win_within_an_effect() {
+        let (book, path) = book("specific");
+        book.add(spec("*", RuleEffect::Allow, RuleScope::Global))
+            .expect("broad global");
+        book.add(spec("bash", RuleEffect::Allow, RuleScope::Global))
+            .expect("exact tool");
+        let ctx = RuleContext {
+            session: "s1".into(),
+            workspace: "/w".into(),
+        };
+        let exact = book.decide("bash", &serde_json::json!({}), &ctx);
+        assert_eq!(exact.rule.as_ref().unwrap().tool, "bash", "exact tool wins");
+
+        let mut session_rule = spec("bash", RuleEffect::Allow, RuleScope::Session);
+        session_rule.session = Some("s1".into());
+        let session_rule = book.add(session_rule).expect("session rule");
+        let chosen = book.decide("bash", &serde_json::json!({}), &ctx);
+        assert_eq!(
+            chosen.rule.as_ref().unwrap().id,
+            session_rule.id,
+            "session beats global"
+        );
+        // Another session is not covered by the session-scoped rule.
+        let other = RuleContext {
+            session: "s2".into(),
+            workspace: "/w".into(),
+        };
+        let chosen = book.decide("bash", &serde_json::json!({}), &other);
+        assert_eq!(chosen.rule.as_ref().unwrap().tool, "bash");
+        assert_eq!(chosen.rule.as_ref().unwrap().scope, RuleScope::Global);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A workspace-scoped rule only applies inside its workspace.
+    #[test]
+    fn workspace_scope_is_confined_to_its_root() {
+        let (book, path) = book("workspace");
+        let mut rule = spec("bash", RuleEffect::Allow, RuleScope::Workspace);
+        rule.workspace = Some("/w/one".into());
+        book.add(rule).expect("add");
+        let inside = RuleContext {
+            session: "s".into(),
+            workspace: "/w/one".into(),
+        };
+        let outside = RuleContext {
+            session: "s".into(),
+            workspace: "/w/two".into(),
+        };
+        assert_eq!(
+            book.decide("bash", &serde_json::json!({}), &inside)
+                .decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            book.decide("bash", &serde_json::json!({}), &outside)
+                .decision,
+            Decision::Ask
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Revoking a rule stops it applying; revoking an unknown id is harmless.
+    #[test]
+    fn revoke_removes_the_rule_and_unknown_ids_are_clean() {
+        let (book, path) = book("revoke");
+        let rule = book
+            .add(spec("bash", RuleEffect::Allow, RuleScope::Global))
+            .expect("add");
+        assert!(book.revoke(&rule.id).expect("revoke"));
+        assert_eq!(book.rules().len(), 0);
+        assert_eq!(
+            book.decide("bash", &serde_json::json!({}), &RuleContext::default())
+                .decision,
+            Decision::Ask,
+            "a revoked rule no longer matches"
+        );
+        assert!(!book.revoke("no-such-id").expect("clean no-op"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Rules survive a write/read round trip through the file.
+    #[test]
+    fn rules_round_trip_through_the_file() {
+        let (book, path) = book("roundtrip");
+        let mut rule = spec("write_file", RuleEffect::Deny, RuleScope::Workspace);
+        rule.arg = Some(ArgPredicate {
+            key: "path".into(),
+            match_kind: MatchKind::Prefix,
+            value: ".env".into(),
+        });
+        rule.workspace = Some("/w".into());
+        let added = book.add(rule).expect("add");
+        assert!(book.save().is_ok());
+
+        let reopened = RuleBook::open(&path);
+        assert!(reopened.warnings().is_empty(), "{:?}", reopened.warnings());
+        assert_eq!(reopened.rules(), vec![added.clone()]);
+        let ctx = RuleContext {
+            session: "s".into(),
+            workspace: "/w".into(),
+        };
+        assert_eq!(
+            reopened
+                .decide(
+                    "write_file",
+                    &serde_json::json!({"path": ".env.local"}),
+                    &ctx
+                )
+                .decision,
+            Decision::Deny
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A malformed file never panics: bad entries are skipped and reported.
+    #[test]
+    fn malformed_files_are_tolerated_and_reported() {
+        let dir = std::env::temp_dir().join(format!("bos-gui-rules-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Not JSON at all → no rules, one warning.
+        let garbage = dir.join("garbage.json");
+        std::fs::write(&garbage, b"{not json").unwrap();
+        let book = RuleBook::open(&garbage);
+        assert!(book.rules().is_empty());
+        assert_eq!(book.warnings().len(), 1, "{:?}", book.warnings());
+        assert_eq!(
+            book.decide("bash", &serde_json::json!({}), &RuleContext::default())
+                .decision,
+            Decision::Ask
+        );
+
+        // Valid document, one good entry and two bad ones.
+        let mixed = dir.join("mixed.json");
+        std::fs::write(
+            &mixed,
+            br#"{
+                "version": 1,
+                "rules": [
+                    {"id": "a", "tool": "bash", "scope": "global", "effect": "allow", "created_at": 1},
+                    {"id": "b", "tool": "bash", "scope": "nonsense", "effect": "allow", "created_at": 1},
+                    {"tool": "   ", "scope": "global", "effect": "allow", "created_at": 1},
+                    17
+                ]
+            }"#,
+        )
+        .unwrap();
+        let book = RuleBook::open(&mixed);
+        assert_eq!(book.rules().len(), 1, "the good entry survives");
+        assert_eq!(book.rules()[0].id, "a");
+        assert_eq!(book.warnings().len(), 3, "{:?}", book.warnings());
+        assert_eq!(
+            book.decide("bash", &serde_json::json!({}), &RuleContext::default())
+                .decision,
+            Decision::Allow
+        );
+
+        // A missing file is simply an empty book, with no warning.
+        let book = RuleBook::open(dir.join("absent.json"));
+        assert!(book.rules().is_empty());
+        assert!(book.warnings().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The audit ring is bounded and reports newest first.
+    #[test]
+    fn the_audit_ring_is_bounded_and_newest_first() {
+        let (book, path) = book("audit");
+        let ctx = RuleContext::default();
+        for _ in 0..(AUDIT_CAP + 5) {
+            book.decide("bash", &serde_json::json!({}), &ctx);
+        }
+        assert_eq!(book.audit(AUDIT_CAP * 2).len(), AUDIT_CAP, "ring is capped");
+        let recent = book.audit(3);
+        assert_eq!(recent.len(), 3);
+        assert!(recent[0].at >= recent[2].at, "newest first");
+        assert_eq!(recent[0].tool, "bash");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The broker consults attached rules before asking the user.
+    #[tokio::test]
+    async fn broker_consults_the_rule_book_before_asking() {
+        let (book, path) = book("broker");
+        let book = Arc::new(book);
+        let broker = ApprovalBroker::default();
+        broker.set_rules(Arc::clone(&book));
+        broker.set_active("s1", 1);
+
+        book.add(spec("bash", RuleEffect::Deny, RuleScope::Global))
+            .expect("add deny");
+        let (id, rx) = broker.request("bash", &serde_json::json!({}));
+        assert!(id.is_empty(), "a rule-matching call mints no request id");
+        assert!(!rx.await.expect("resolved"), "the deny refuses the call");
+        assert!(broker.pending.lock().unwrap().is_empty());
+
+        book.add(spec("write_file", RuleEffect::Allow, RuleScope::Global))
+            .expect("add allow");
+        let (id, rx) = broker.request("write_file", &serde_json::json!({}));
+        assert!(id.is_empty());
+        assert!(rx.await.expect("resolved"), "the allow runs it");
+
+        // A tool no rule mentions still reaches the dialog.
+        let (id, _rx) = broker.request("other", &serde_json::json!({}));
+        assert!(!id.is_empty(), "an unmatched tool is still asked about");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

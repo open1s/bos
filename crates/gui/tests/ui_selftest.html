@@ -317,6 +317,70 @@ window.addEventListener("error", (e) => {
         assert("early update keeps the row count", R.rowsAfterEarlyUpdate === beforeRows,
           `rows=${R.rowsAfterEarlyUpdate}`);
 
+        // ---- 3b. adopting a reloaded transcript ------------------------
+        // A finished turn re-reads the session and gets fresh objects for the
+        // very same messages. Identity must survive for the drawn tail, or the
+        // renderer rebuilds the whole window (~400 DOM mutations per turn,
+        // measured by perf_selftest.sh); a message whose content changed must
+        // not keep the old object, or the rewrite never appears; and pairing is
+        // bounded by the drawn window, not by the session.
+        const reload = msgs.map((m) => ({
+          role: m.role,
+          text: m.text,
+          reasoning: m.reasoning,
+          tools: (m.tools || []).map((t) => ({ ...t })),
+          error: m.error,
+        }));
+        const tAdopt = performance.now();
+        const adopted = reuseIdentical(msgs, reload);
+        R.adoptMs = +(performance.now() - tAdopt).toFixed(2);
+        R.adoptRows = adopted.length;
+        R.adoptKeptTail = adopted[N - 1] === msgs[N - 1] && adopted[N - 2] === msgs[N - 2];
+        R.adoptHeadFresh = adopted[0] !== msgs[0];
+        assert("adopting a reload keeps the drawn tail by object", R.adoptKeptTail,
+          `tailKept=${R.adoptKeptTail} rows=${R.adoptRows}`);
+        // Pairing is bounded by the drawn window, so it does not grow with the
+        // session. The phases above run with the window open, hence the reset.
+        const copyOf = () =>
+          msgs.map((m) => ({
+            role: m.role,
+            text: m.text,
+            reasoning: m.reasoning,
+            tools: (m.tools || []).map((t) => ({ ...t })),
+            error: m.error,
+          }));
+        const savedExtra = state.windowExtra;
+        state.windowExtra = 0;
+        const bounded = reuseIdentical(msgs, copyOf());
+        state.windowExtra = savedExtra;
+        R.boundedTailKept = bounded[N - 1] === msgs[N - 1];
+        R.boundedHeadFresh = bounded[0] !== msgs[0];
+        assert("adopting a reload pairs the drawn window, not the session",
+          R.boundedTailKept && R.boundedHeadFresh,
+          `tailKept=${R.boundedTailKept} headFresh=${R.boundedHeadFresh} of ${N}`);
+
+        // The store finalizing a reply rewrites the tail with the same length and
+        // the same last characters as the draft, which is exactly what the
+        // renderer's deliberately lossy signature cannot tell apart.
+        const rewritten = reload.slice();
+        const draft = msgs[N - 1].text;
+        // Same length, same last 24 characters, different text — a collision the
+        // renderer's deliberately lossy signature cannot resolve, so a row kept
+        // across one would never show the rewrite.
+        const collided = draft.slice(0, 8) + (draft[8] === "x" ? "y" : "x") + draft.slice(9);
+        rewritten[N - 1] = { ...rewritten[N - 1], text: collided };
+        assert("the rewrite probe collides with the draft's lossy signature",
+          collided !== draft && collided.length === draft.length &&
+            collided.slice(-24) === draft.slice(-24),
+          `len=${collided.length}/${draft.length} sameTail=${
+            collided.slice(-24) === draft.slice(-24)}`);
+        const adoptedRewrite = reuseIdentical(msgs, rewritten);
+        assert("adopting a reload does not keep a rewritten message",
+          adoptedRewrite[N - 1] !== msgs[N - 1] && adoptedRewrite[N - 1].text === collided,
+          `kept=${adoptedRewrite[N - 1] === msgs[N - 1]}`);
+        assert(`adopting ${N} messages stays inside its budget`, R.adoptMs < 25,
+          `adopt=${R.adoptMs}ms for ${N} messages`);
+
         // ---- 4. control: the previous wipe-and-rebuild renderer ---------
         const CTRL = 5;
         builds.n = 0;
@@ -424,7 +488,7 @@ window.addEventListener("error", (e) => {
         );
 
         // ---- 8. sessions group by workspace -----------------------------
-        const wsGroups = groupSessions(
+        const preGroups = groupSessions(
           [
             { id: "a", title: "a", workspace: "w1" },
             { id: "b", title: "b", workspace: "w2" },
@@ -438,13 +502,13 @@ window.addEventListener("error", (e) => {
         );
         assert(
           "a session with no workspace joins the active one",
-          wsGroups.length === 2 && wsGroups[0].sessions.length === 2,
-          `groups=${wsGroups.length} first=${(wsGroups[0] || {}).sessions?.length}`,
+          preGroups.length === 2 && preGroups[0].sessions.length === 2,
+          `groups=${preGroups.length} first=${(preGroups[0] || {}).sessions?.length}`,
         );
         assert(
           "a group carries the name, root and bound model",
-          wsGroups[0].name === "bos" && wsGroups[0].root === "/p/bos" && wsGroups[0].model === "m1",
-          JSON.stringify({ n: wsGroups[0].name, r: wsGroups[0].root, m: wsGroups[0].model }),
+          preGroups[0].name === "bos" && preGroups[0].root === "/p/bos" && preGroups[0].model === "m1",
+          JSON.stringify({ n: preGroups[0].name, r: preGroups[0].root, m: preGroups[0].model }),
         );
         assert(
           "an unknown workspace still lists its chats",
@@ -479,7 +543,10 @@ window.addEventListener("error", (e) => {
         openWorkspaceForm("remove", "w1");
         assert(
           "removing a workspace asks what to do with its chats",
-          !!document.querySelector(".ws-del-chats") && !document.querySelector(".ws-name"),
+          // Scoped to the form: `.ws-name` is also the sidebar header's name
+          // span, so an unscoped search would pass or fail on whether any
+          // workspace happened to be drawn behind the form.
+          !!document.querySelector(".ws-del-chats") && !document.querySelector(".ws-form .ws-name"),
         );
         closeWorkspaceForm();
         assert("closing the form brings the add button back", !!sessionList.querySelector(".ws-add"));
@@ -1867,6 +1934,444 @@ window.addEventListener("error", (e) => {
         state.runPanel = savedRunPanel;
         setRunMode(savedRunPanel.mode || "run");
         renderRunPanel();
+
+        // The Memory pane's status line is where an implied isolation would show
+        // up, so its branches are pinned as text here rather than through a bridge.
+        const memLine = (status, kept) => memoryStatusLine(status, kept);
+        assert(
+          "the memory status names the file, the sharing and the cap",
+          memLine({ enabled: true, path: "/home/u/.bos/gui/memory.jsonl", shared_workspaces: 2, cap: 500 }, 2) ===
+            "/home/u/.bos/gui/memory.jsonl · shared by 2 workspaces · 2 of 500 kept",
+          memLine({ enabled: true, path: "p", shared_workspaces: 2, cap: 500 }, 2),
+        );
+        assert(
+          "a store only one workspace uses says so instead of implying sharing",
+          memLine({ enabled: true, path: "p", shared_workspaces: 1, cap: 500 }, 1).includes(
+            "its own file",
+          ) && !memLine({ enabled: true, path: "p", shared_workspaces: 1, cap: 500 }, 1).includes("shared by"),
+          memLine({ enabled: true, path: "p", shared_workspaces: 1, cap: 500 }, 1),
+        );
+        assert(
+          "the status warns only when the store is actually at its cap",
+          memLine({ enabled: true, path: "p", shared_workspaces: 1, cap: 3 }, 3).includes("at the cap") &&
+            !memLine({ enabled: true, path: "p", shared_workspaces: 1, cap: 3 }, 2).includes("at the cap"),
+          memLine({ enabled: true, path: "p", shared_workspaces: 1, cap: 3 }, 3),
+        );
+        assert(
+          "a switched-off store says switched off, not that nothing is remembered",
+          memLine({ enabled: false, path: "", shared_workspaces: 1, cap: 500 }, 0) ===
+            "Memory is switched off for this workspace.",
+          memLine({ enabled: false, path: "", shared_workspaces: 1, cap: 500 }, 0),
+        );
+
+        // ---- 20. a reminder reads as a line -------------------------------
+        // How often, when next, and how often it has run — the three facts the
+        // Schedule pane exists to show, in the fewest words that stay exact.
+        assert(
+          "a cadence reads as the interval it is",
+          cadenceText({ kind: "every", every_minutes: 1 }) === "every minute" &&
+            cadenceText({ kind: "every", every_minutes: 5 }) === "every 5 min" &&
+            cadenceText({ kind: "once", at_ms: 5 }) === "once" &&
+            cadenceText(null) === "",
+          [1, 5].map((m) => cadenceText({ kind: "every", every_minutes: m })).join(" / "),
+        );
+        assert(
+          "a due time is described from the caller's clock, and a past one is due",
+          untilText(60000, 0) === "in 1 min" &&
+            untilText(0, 0) === "due now" &&
+            untilText(-60000, 0) === "due now" &&
+            untilText(3600000, 0) === "in 1 h" &&
+            untilText(3 * 86400000, 0) === "in 3 d",
+          [60000, 0, -60000, 3600000, 3 * 86400000].map((d) => untilText(d, 0)).join(" / "),
+        );
+        assert(
+          "a reminder line names what, how often, when next, and how often it ran",
+          scheduleLine(
+            {
+              id: "s1",
+              text: "water the plants",
+              cadence: { kind: "every", every_minutes: 5, next_ms: 300000 },
+              fired: 2,
+            },
+            0,
+          ) === "water the plants · every 5 min · in 5 min · delivered 2×",
+          scheduleLine(
+            {
+              id: "s1",
+              text: "water the plants",
+              cadence: { kind: "every", every_minutes: 5, next_ms: 300000 },
+              fired: 2,
+            },
+            0,
+          ),
+        );
+        // The due time inside a cadence differs by kind, and reading the wrong
+        // field is exactly how a one-shot would render as "due now" forever.
+        assert(
+          "a cadence's next due is read by kind",
+          scheduleDue({ kind: "once", at_ms: 11 }) === 11 &&
+            scheduleDue({ kind: "every", every_minutes: 5, next_ms: 22 }) === 22 &&
+            scheduleDue(null) === 0,
+          `${scheduleDue({ kind: "once", at_ms: 11 })}/${scheduleDue({
+            kind: "every",
+            every_minutes: 5,
+            next_ms: 22,
+          })}`,
+        );
+        assert(
+          "a delivery says how late it was only when a tick was late for it",
+          !/late/.test(deliveryLine({ text: "x", at_ms: 1000, noticed_ms: 1000 })) &&
+            !/late/.test(deliveryLine({ text: "x", at_ms: 1000, noticed_ms: 30000 })) &&
+            /1 min late/.test(deliveryLine({ text: "x", at_ms: 1000, noticed_ms: 61000 })) &&
+            /^x · /.test(deliveryLine({ text: "x", at_ms: 1000, noticed_ms: 1000 })),
+          `${deliveryLine({ text: "x", at_ms: 1000, noticed_ms: 30000 })} | ${deliveryLine({
+            text: "x",
+            at_ms: 1000,
+            noticed_ms: 61000,
+          })}`,
+        );
+        assert(
+          "the bounds line states every cap in force, and names the one at hand",
+          scheduleCapsLine({
+            schedules: [{ id: "a" }, { id: "b" }],
+            history: [{}, {}],
+            caps: { min_every_minutes: 1, max_schedules: 50, max_history: 200, max_text_chars: 500 },
+          }) ===
+            "2 of 50 reminders · 2 of 200 deliveries kept · a repeat needs at least 1 min" &&
+            /at the cap/.test(
+              scheduleCapsLine({
+                schedules: [{}, {}],
+                history: [],
+                caps: {
+                  min_every_minutes: 1,
+                  max_schedules: 2,
+                  max_history: 200,
+                  max_text_chars: 500,
+                },
+              }),
+            ) &&
+            scheduleCapsLine(null) === "",
+          scheduleCapsLine({
+            schedules: [{}, {}],
+            history: [],
+            caps: { min_every_minutes: 1, max_schedules: 2, max_history: 200, max_text_chars: 500 },
+          }),
+        );
+
+        // ---- 21. a knowledge note reads as a card -------------------------
+        // When it was last edited, the first line of the body, and the bounds
+        // in force. A future timestamp (a clock that moved backwards) must read
+        // as "just now" rather than as a negative age.
+        assert(
+          "an edit time is described from the caller's clock, and a future one is now",
+          sinceText(1000, 1000) === "just now" &&
+            sinceText(1000, 61000) === "1 min ago" &&
+            sinceText(1000, 1000 + 59 * 60000) === "59 min ago" &&
+            sinceText(1000, 1000 + 3600000) === "1 h ago" &&
+            sinceText(1000, 1000 + 47 * 3600000) === "47 h ago" &&
+            sinceText(1000, 1000 + 48 * 3600000) === "2 d ago" &&
+            sinceText(1000, 1) === "just now" &&
+            sinceText(undefined, 1) === "just now",
+          [0, 60000, 3540000, 3600000, 47 * 3600000, 48 * 3600000]
+            .map((d) => sinceText(1000, 1000 + d))
+            .join(" / "),
+        );
+        assert(
+          "a body preview is one line, and says when it was cut",
+          kbBodyPreview("first line\n\n  second   line ") === "first line second line" &&
+            kbBodyPreview("") === "" &&
+            kbBodyPreview(null) === "" &&
+            kbBodyPreview("x".repeat(200)) === "x".repeat(200) &&
+            kbBodyPreview("x".repeat(201)) === `${"x".repeat(199)}…`,
+          kbBodyPreview("x".repeat(201)).length,
+        );
+        assert(
+          "the knowledge bounds line states every cap, including the search cap it lowers",
+          kbCapsLine({
+            total: 3,
+            caps: {
+              max_entries: 500,
+              max_title_chars: 120,
+              max_body_chars: 4000,
+              tool_max_limit: 20,
+            },
+          }) ===
+            "3 of 500 entries · titles 120 chars · bodies 4000 · search returns 20 at most" &&
+            /at the cap, delete one first/.test(
+              kbCapsLine({
+                total: 500,
+                caps: {
+                  max_entries: 500,
+                  max_title_chars: 120,
+                  max_body_chars: 4000,
+                  tool_max_limit: 20,
+                },
+              }),
+            ) &&
+            /search returns 5 at most/.test(
+              kbCapsLine({
+                total: 0,
+                caps: {
+                  max_entries: 500,
+                  max_title_chars: 120,
+                  max_body_chars: 4000,
+                  tool_max_limit: 5,
+                },
+              }),
+            ) &&
+            kbCapsLine(null) === "" &&
+            kbCapsLine({}) === "",
+          kbCapsLine({
+            total: 3,
+            caps: {
+              max_entries: 500,
+              max_title_chars: 120,
+              max_body_chars: 4000,
+              tool_max_limit: 20,
+            },
+          }),
+        );
+
+        // ---- 22. the MCP policy reads as a decision -----------------------
+        // A tool's line names the rule that decided it, a server's line says
+        // how many of its tools survived, and the summary carries the counts and
+        // the default — including the one case where the file is not the
+        // version this build writes.
+        assert(
+          "an effect has one spelling, and an unruled tool says so",
+          effectLabel("allow") === "Allow" &&
+            effectLabel("ask") === "Ask" &&
+            effectLabel("deny") === "Deny" &&
+            policyReason("default") === "follows the default" &&
+            policyReason(undefined) === "follows the default" &&
+            policyReason("filesystem/*") === "by rule filesystem/*",
+          [effectLabel("ask"), policyReason("srv/read")].join(" / "),
+        );
+        assert(
+          "the policy summary counts attached, denied, asked and the default",
+          policyLine({
+            attached: 2,
+            denied: 1,
+            asked: 1,
+            default: "allow",
+            rules: [{}, {}],
+            max_rules: 200,
+            servers: [{ tools: [{}, {}] }, { tools: [{}] }],
+            file_version: 1,
+            expected_version: 1,
+          }) === "2 of 3 tools attached · 1 denied · 1 ask · 2 of 200 rules · default allow" &&
+            policyLine(null) === "" &&
+            /version 9, this build writes 1/.test(
+              policyLine({
+                attached: 0,
+                denied: 0,
+                asked: 0,
+                default: "deny",
+                rules: [],
+                max_rules: 200,
+                servers: [],
+                file_version: 9,
+                expected_version: 1,
+              }),
+            ),
+          policyLine({
+            attached: 2,
+            denied: 1,
+            asked: 1,
+            default: "allow",
+            rules: [{}, {}],
+            max_rules: 200,
+            servers: [{ tools: [{}, {}] }, { tools: [{}] }],
+            file_version: 1,
+            expected_version: 1,
+          }),
+        );
+        assert(
+          "a server with nothing denied counts tools, not survivors",
+          serverToolLine({ attached: 1, denied: 0, tools: [{}] }) === "1 tool" &&
+            serverToolLine({ attached: 3, denied: 0, tools: [{}, {}, {}] }) === "3 tools" &&
+            serverToolLine({ attached: 2, denied: 1, tools: [{}, {}, {}] }) ===
+              "2 of 3 tools · 1 denied",
+          serverToolLine({ attached: 2, denied: 1, tools: [{}, {}, {}] }),
+        );
+
+        // ---- 23. a skill row counts what the agent receives ----------------
+        // The pane's number and the loader's number are the same by
+        // construction, so this line is the one place a formatting drift would
+        // show: chars of instruction, where the file is, and whether this
+        // workspace has switched it off.
+        assert(
+          "a skill row names its instructions, its file and its workspace state",
+          skillLine({
+            name: "code-review",
+            instructions_chars: 34,
+            path: "/skills/code-review/SKILL.md",
+            denied: false,
+          }) === "34 chars of instruction · /skills/code-review/SKILL.md" &&
+            skillLine({
+              name: "release-notes",
+              instructions_chars: 12,
+              path: "/skills/release-notes/SKILL.md",
+              denied: true,
+            }) === "12 chars of instruction · off for this workspace · /skills/release-notes/SKILL.md",
+          skillLine({ name: "x", instructions_chars: 0, path: "p", denied: false }),
+        );
+        assert(
+          "the skills summary counts them, says how many are off, and names the directory",
+          skillCapsLine({
+            dir: "/skills",
+            exists: true,
+            skills: [{ denied: false }, { denied: true }],
+            max_body_chars: 12000,
+          }) === "2 skills · 1 off for this workspace · /skills · bodies up to 12000 chars" &&
+            skillCapsLine({
+              dir: "/skills",
+              exists: true,
+              skills: [{ denied: false }],
+              max_body_chars: 12000,
+            }) === "1 skill · /skills · bodies up to 12000 chars" &&
+            skillCapsLine({ dir: "/gone", exists: false, skills: [], max_body_chars: 12000 }) ===
+              "0 skills · /gone (missing — saving creates it) · bodies up to 12000 chars",
+          skillCapsLine({ dir: "/skills", exists: true, skills: [], max_body_chars: 12000 }),
+        );
+
+        // ---- 24. an MCP catalog reads as what a server publishes -----------
+        // A server's line says how many of each it offers — or that it never
+        // declared the capability, which is a different sentence from "none".
+        assert(
+          "a server line counts what it published, or says the capability is absent",
+          catalogServerLine({ connected: true, resources_supported: true, resources_total: 2, prompts_supported: true, prompts_total: 1 }) ===
+            "2 resources · 1 prompt" &&
+            catalogServerLine({ connected: true, resources_supported: true, resources_total: 1, prompts_supported: false, prompts_total: 0 }) ===
+              "1 resource · no prompts capability" &&
+            catalogServerLine({ connected: true, resources_supported: false, prompts_supported: false }) ===
+              "no resources capability · no prompts capability" &&
+            catalogServerLine({ connected: false }) === "not connected this pass",
+          catalogServerLine({ connected: true, resources_supported: true, resources_total: 2, prompts_supported: false }),
+        );
+        assert(
+          "a resource row names its type, and says when the name was cut",
+          catalogRowLine({ name: "schema", mime_type: "application/json", clipped: false }) ===
+            "application/json" &&
+            catalogRowLine({ name: "x", mime_type: null, clipped: true }) === "clipped" &&
+            catalogRowLine({ name: "x" }) === "",
+          catalogRowLine({ mime_type: "text/markdown", clipped: false }),
+        );
+        assert(
+          "a prompt row counts its arguments and the required ones",
+          promptRowLine({ arguments: 0, required: 0 }) === "no arguments" &&
+            promptRowLine({ arguments: 1, required: 0 }) === "1 argument" &&
+            promptRowLine({ arguments: 3, required: 2 }) === "3 arguments · 2 required" &&
+            promptRowLine({ arguments: undefined, required: undefined }) === "no arguments",
+          promptRowLine({ arguments: 3, required: 2 }),
+        );
+        assert(
+          "a read line reports the size it sent and whether it was cut",
+          readLine({ server: "srv", uri: "file:///a", chars: 12, source_chars: 12, mime_type: "text/plain", parts: 1, truncated: false, empty: false }) ===
+            "srv/file:///a · 12 chars · text/plain" &&
+            readLine({ server: "srv", uri: "file:///big", chars: 20000, source_chars: 41000, mime_type: null, parts: 2, truncated: true, empty: false }) ===
+              "srv/file:///big · 20000 of 41000 chars · 2 parts · truncated" &&
+            readLine({ server: "srv", uri: "file:///blob.png", chars: 0, source_chars: 0, mime_type: "image/png", parts: 1, truncated: false, empty: true }) ===
+              "srv/file:///blob.png · no text (image/png)",
+          readLine({ server: "s", uri: "u", chars: 1, source_chars: 2, truncated: true, empty: false }),
+        );
+
+        // ---- 25. a chat's own skills read as a scope -----------------------
+        // "This chat carries nothing" and "nobody has read this chat yet" are
+        // different states, and a report that belongs to another chat is the
+        // second one: guessing from it would print the wrong chat's answer.
+        assert(
+          "a chat's skills read as a scope, and an unread one is not guessed",
+          skillScopeLine(null, "") === "Open a chat to switch a skill on for it." &&
+            skillScopeLine(null, "chat-1") === "Reading this chat's skills…" &&
+            skillScopeLine({ session: "other", explicit: false }, "chat-1") ===
+              "Reading this chat's skills…" &&
+            skillScopeLine(
+              { session: "chat-1", explicit: false, active: ["a", "b"], available: ["a", "b", "c"] },
+              "chat-1",
+            ) === "This chat follows the workspace · 2 of 3 skills" &&
+            skillScopeLine(
+              { session: "chat-1", explicit: true, active: [], available: ["a", "b"] },
+              "chat-1",
+            ) === "This chat carries its own list · 0 of 2 skills" &&
+            skillScopeLine({ session: "chat-1", explicit: true, active: ["a"] }, "chat-1") ===
+              "This chat carries its own list · 1 of 0 skills",
+          skillScopeLine({ session: "chat-1", explicit: true, active: [] }, "chat-1"),
+        );
+
+        /* 26. the sidebar's row menus, as values. The rendered menu is the page
+           guard's business; what is asserted here is the model behind it — the
+           order the reference uses, the labels that flip with the chat's own
+           state, and the sort that keeps a pin inside its own workspace. */
+        const plain = { id: "a", title: "a", pinned: false, archived: false, updated_at: 10 };
+        const pinned = { id: "b", title: "b", pinned: true, archived: false, updated_at: 20 };
+        const filed = { id: "c", title: "c", pinned: false, archived: true, updated_at: 30 };
+        const runs = sessionMenu(plain).map((i) => i.run);
+        const labels = sessionMenu(plain).map((i) => i.label);
+        const keys = sessionMenu(plain).map((i) => i.accel || "");
+        R.checks["26a the chat menu is the reference's five entries in its order"] =
+          runs.join(",") === "pin,rename,fork,archive,delete" ? "PASS" : `FAIL (${runs})`;
+        R.checks["26b only Delete is destructive, and every entry is named"] =
+          sessionMenu(plain).filter((i) => i.danger).map((i) => i.run).join(",") === "delete" &&
+          labels.every((l) => l.length > 4)
+            ? "PASS"
+            : `FAIL (${labels})`;
+        R.checks["26c a pinned chat offers to unpin, not to pin again"] =
+          sessionMenu(pinned)[0].label.includes("Unpin") ? "PASS" : `FAIL (${labels})`;
+        R.checks["26d an archived chat offers Restore, and the key hint goes away"] =
+          sessionMenu(filed)[3].label.includes("Restore") && sessionMenu(filed)[3].accel === ""
+            ? "PASS"
+            : `FAIL (${sessionMenu(filed)[3].label}/${sessionMenu(filed)[3].accel})`;
+        R.checks["26e the accelerators name both platforms this app answers"] =
+          keys[0] === "" && keys[1] === "Cmd/Ctrl+G" && keys[2] === "Cmd/Ctrl+F" && keys[3] === "Cmd/Ctrl+Shift+A"
+            ? "PASS"
+            : `FAIL (${keys})`;
+        const wsRuns = workspaceMenu({ id: "w", name: "bos" }).map((i) => i.run);
+        R.checks["26f the workspace menu starts a chat and keeps rename/delete"] =
+          wsRuns.join(",") === "new,rename,delete" ? "PASS" : `FAIL (${wsRuns})`;
+        // 26g is the interesting one: the pin must order chats *within* a
+        // workspace, which a flat sort cannot express.
+        const emptyWorkspaceGroups = groupSessions(
+        [{ id: "s1", title: "in w1", workspace: "w1", updated_at: 1, pinned: false, archived: false }],
+        [{ id: "w1", name: "bos" }, { id: "w9", name: "just added" }],
+        "w1",
+      );
+      assert(
+        `a workspace with no chats is still a group ("${emptyWorkspaceGroups.map((g) => g.name + ":" + g.sessions.length).join(",")}")`,
+        emptyWorkspaceGroups.length === 2 &&
+          emptyWorkspaceGroups[1].name === "just added" &&
+          emptyWorkspaceGroups[1].sessions.length === 0,
+      );
+      const pinGroups = groupSessions(
+          [
+            { id: "1", workspace: "w1", pinned: false, updated_at: 50 },
+            { id: "2", workspace: "w1", pinned: true, updated_at: 10 },
+            { id: "3", workspace: "w2", pinned: false, updated_at: 99 },
+            { id: "4", workspace: "w1", pinned: false, updated_at: 1, archived: true },
+          ],
+          [
+            { id: "w1", name: "one" },
+            { id: "w2", name: "two" },
+          ],
+          "w1",
+        );
+        R.checks["26g a pin orders its own workspace, not the whole sidebar"] =
+          pinGroups.length === 2 &&
+          pinGroups[0].sessions.map((s) => s.id).join(",") === "2,1" &&
+          pinGroups[1].sessions.map((s) => s.id).join(",") === "3"
+            ? "PASS"
+            : `FAIL (${pinGroups.map((g) => g.sessions.map((s) => s.id).join("+")).join(" / ")})`;
+        R.checks["26h an archived chat is in no group, and is listed as archived"] =
+          pinGroups.every((g) => !g.sessions.some((s) => s.id === "4")) &&
+          archivedSessions([
+            { id: "4", archived: true, updated_at: 1 },
+            { id: "5", archived: false, updated_at: 9 },
+            { id: "6", archived: true, updated_at: 7 },
+          ])
+            .map((s) => s.id)
+            .join(",") === "6,4"
+            ? "PASS"
+            : "FAIL (archived list)";
 
         R.failures = Object.values(R.checks).filter((v) => v.startsWith("FAIL")).length;
         const pre = document.createElement("pre");

@@ -25,6 +25,12 @@ use crate::settings::McpServerEntry;
 /// Cap on the whole handshake (spawn + initialize + list_tools) per server.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Cap on one listing or read against a connected server.
+///
+/// A catalog pass asks every server; an unresponsive one must cost its own
+/// line and a bounded wait rather than hanging the pane behind it.
+pub(crate) const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Connection outcome for one configured server, surfaced to the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct McpStatus {
@@ -36,8 +42,11 @@ pub(crate) struct McpStatus {
     pub(crate) enabled: bool,
     /// Whether the handshake completed and tools were listed.
     pub(crate) connected: bool,
-    /// Number of tools attached to the agent.
+    /// Number of tools attached to the agent (after the policy).
     pub(crate) tools: usize,
+    /// Tool names the server advertised, in the order it listed them. The pane
+    /// needs the names, not just the count, to show and edit the policy.
+    pub(crate) tool_names: Vec<String>,
     /// Failure detail when an attempt was made but `connected` is false.
     pub(crate) error: Option<String>,
 }

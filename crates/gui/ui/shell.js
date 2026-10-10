@@ -581,6 +581,14 @@ const Shell = (() => {
   const renderStart = () => {
     const box = document.createElement("div");
     box.className = "doc-start";
+    // The shipped lockup, served from the frontend root (icons/ ships next to
+    // index.html), so the empty document column still says whose harness it is.
+    const logo = document.createElement("img");
+    logo.className = "doc-logo";
+    logo.src = "icons/bos-harness-logo.svg";
+    logo.alt = "BOS Harness";
+    logo.width = 232;
+    box.appendChild(logo);
     const add = (label, value) => {
       const row = document.createElement("div");
       row.className = "doc-row";
@@ -778,12 +786,26 @@ const Shell = (() => {
     // navigation permanently (Part II §12.1 / GUI-01).
     const head0 = document.getElementById("chat-head");
     if (head0) {
-      const railToggle = document.createElement("button");
-      railToggle.id = "sidebar-toggle";
-      railToggle.type = "button";
-      railToggle.className = "btn btn-ghost head-toggle";
-      railToggle.title = "Toggle sidebar";
-      railToggle.textContent = "\u2630";
+      /* Adopt the button the markup already ships rather than minting a second
+         one. Two elements claiming id="sidebar-toggle" made the id selector
+         show both under 720 px and left the static one dead, because app.js had
+         bound its drawer behaviour to whichever element it found first — so one
+         visible button did nothing at all. */
+      let railToggle = document.getElementById("sidebar-toggle");
+      if (!railToggle) {
+        railToggle = document.createElement("button");
+        railToggle.id = "sidebar-toggle";
+        railToggle.type = "button";
+        railToggle.title = "Toggle sidebar";
+        railToggle.textContent = "\u2630";
+        head0.insertBefore(railToggle, head0.firstChild);
+      }
+      railToggle.classList.add("head-toggle");
+      if (!railToggle.getAttribute("aria-label")) {
+        railToggle.setAttribute("aria-label", "Toggle sidebar");
+      }
+      /* The Mod+B binding is not clickable, so announce it (M13 polish). */
+      railToggle.setAttribute("aria-keyshortcuts", "Meta+B Control+B");
       railToggle.addEventListener("click", toggleSidebar);
       const docToggle = document.createElement("button");
       docToggle.id = "doc-toggle";
@@ -858,6 +880,9 @@ const Shell = (() => {
   const mountSettings = () => {
     const form = document.getElementById("settings-form");
     if (!form || form.querySelector(".ui-general")) return false;
+    // The appearance/typography card belongs to the General section of the rail,
+    // not above it: the dialog shows one pane at a time.
+    const pane = document.getElementById("set-general");
     const section = document.createElement("div");
     section.className = "cap-section ui-general";
     const title = document.createElement("div");
@@ -865,16 +890,23 @@ const Shell = (() => {
     title.textContent = "General";
     section.appendChild(title);
 
-    const row = (label, hint, node, id) => {
+    const row = (label, hint, node, id, key) => {
       const wrap = document.createElement("label");
       wrap.className = "row ui-row";
       const text = document.createElement("span");
       text.className = "ui-row-label";
-      text.textContent = label;
+      /* The visible label lives in its own span so a translation can replace the
+         text without destroying the hint beside it (M13 polish). */
+      const visible = document.createElement("span");
+      visible.className = "ui-row-text";
+      visible.textContent = label;
+      if (key) visible.setAttribute("data-i18n", key);
+      text.appendChild(visible);
       if (hint) {
         const small = document.createElement("small");
         small.className = "ui-row-hint";
         small.textContent = hint;
+        if (key) small.setAttribute("data-i18n", key + "Hint");
         text.appendChild(small);
       }
       wrap.appendChild(text);
@@ -921,16 +953,112 @@ const Shell = (() => {
     const shortcuts = document.createElement("button");
     shortcuts.type = "button";
     shortcuts.className = "btn btn-ghost";
-    shortcuts.textContent = "Edit shortcuts";
-    shortcuts.disabled = true;
-    shortcuts.title = "Shortcut editing is not implemented yet";
-    row("Keyboard shortcuts", "Not implemented yet", shortcuts, "ui-shortcuts");
+    shortcuts.setAttribute("data-i18n", "shortcuts.open");
+    shortcuts.textContent = "View shortcuts";
+    shortcuts.title = "Every key this interface listens for";
+    shortcuts.addEventListener("click", () => {
+      if (window.Polish && typeof window.Polish.openShortcuts === "function") {
+        window.Polish.openShortcuts();
+      }
+    });
+    row(
+      "Keyboard shortcuts",
+      "Every key this interface listens for",
+      shortcuts,
+      "ui-shortcuts",
+      "shortcuts.row",
+    );
 
-    form.insertBefore(section, form.firstChild);
+    (pane || form).insertBefore(section, (pane || form).firstChild);
     controlsBound = true;
     syncControls();
     return true;
   };
+
+  /* ---------- status-line item registry ---------------------------------- */
+
+  /* The footer is not just the token meter's: any surface can contribute an
+     item without knowing how the footer is laid out. The registry keeps one
+     node per id and insertion order, so a panel that refreshes every second
+     updates its value instead of stacking duplicate spans — and the container
+     is a polite live region, because a status line that only changes visually
+     tells a screen-reader user nothing. */
+  const statusRegistry = new Map();
+
+  const statusHost = () => {
+    const bar = document.getElementById("status-right");
+    if (!bar) return null;
+    let host = document.getElementById("status-items");
+    if (!host) {
+      host = document.createElement("span");
+      host.id = "status-items";
+      host.className = "status-items";
+      host.setAttribute("aria-live", "polite");
+      /* First, so the interface's own furniture keeps the outermost slot. */
+      bar.insertBefore(host, bar.firstChild);
+    }
+    return host;
+  };
+
+  const paintStatusItem = (id) => {
+    const host = statusHost();
+    if (!host) return null;
+    const item = statusRegistry.get(id);
+    const existing = host.querySelector(`[data-status-item="${CSS.escape(id)}"]`);
+    if (!item) {
+      if (existing) existing.remove();
+      return null;
+    }
+    let node = existing;
+    if (!node) {
+      node = document.createElement("span");
+      node.className = "status-item";
+      node.setAttribute("data-status-item", id);
+      const label = document.createElement("span");
+      label.className = "status-item-label";
+      const value = document.createElement("span");
+      value.className = "status-item-value";
+      node.appendChild(label);
+      node.appendChild(value);
+      host.appendChild(node);
+    }
+    node.querySelector(".status-item-label").textContent = item.label || "";
+    node.querySelector(".status-item-value").textContent =
+      item.value === null || item.value === undefined ? "" : String(item.value);
+    if (item.title) node.title = item.title;
+    else node.removeAttribute("title");
+    return node;
+  };
+
+  /* Add or replace an item. Re-adding an id is how a poller refreshes in place. */
+  const addStatusItem = (id, item) => {
+    if (!id || typeof id !== "string") return false;
+    statusRegistry.set(id, {
+      label: (item && item.label) || "",
+      value: item ? item.value : "",
+      title: (item && item.title) || "",
+    });
+    paintStatusItem(id);
+    return true;
+  };
+
+  /* Patch an item without restating it: `Shell.updateStatusItem("jobs", {value: 3})`. */
+  const updateStatusItem = (id, patch) => {
+    const current = statusRegistry.get(id);
+    if (!current) return false;
+    statusRegistry.set(id, Object.assign({}, current, patch || {}));
+    paintStatusItem(id);
+    return true;
+  };
+
+  const removeStatusItem = (id) => {
+    if (!statusRegistry.has(id)) return false;
+    statusRegistry.delete(id);
+    paintStatusItem(id);
+    return true;
+  };
+
+  const statusItemIds = () => Array.from(statusRegistry.keys());
 
   /* ---------- public surface -------------------------------------------- */
 
@@ -970,6 +1098,10 @@ const Shell = (() => {
     setTaskStatus,
     setTaskDetail,
     setContext,
+    addStatusItem,
+    updateStatusItem,
+    removeStatusItem,
+    statusItemIds,
     setAppearance,
     setFontSize,
     setWorkDetails,

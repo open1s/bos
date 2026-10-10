@@ -3,50 +3,82 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="icons/bos-harness-icon.svg" />
   <title>BOS</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <a id="skip-link" class="skip-link" href="#messages">Skip to conversation</a>
   <div id="app">
     <aside id="sidebar">
       <div class="sidebar-head">
-        <span class="brand">BOS Harness</span>
-        <button id="new-chat" class="btn btn-accent" title="New chat">+ New</button>
+        <span class="brand">
+          <img class="brand-mark" src="icons/bos-harness-icon.svg" alt="" width="26" height="26" />
+          <span class="brand-word">BOS</span>
+          <span class="brand-pill" data-i18n="brand.pill">HARNESS</span>
+        </span>
       </div>
-      <input id="session-search" class="session-search" type="search"
-             placeholder="Search chats…" aria-label="Search chats" spellcheck="false" />
-      <div id="session-list" class="session-list"></div>
-      <div class="files-head">
-        <button id="files-toggle" class="nav-item" type="button" aria-expanded="false"
-                aria-controls="file-tree" title="Browse the workspace on disk">&#128193; Files</button>
-        <button id="files-refresh" class="btn btn-ghost" type="button"
-                title="Reload the file list">&#8635;</button>
-      </div>
-      <div id="file-tree" class="file-tree" role="tree" aria-label="Workspace files" hidden></div>
+      <button id="new-chat" class="btn new-session" title="New chat">
+        <svg class="new-session-mark" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+          <circle cx="10" cy="10" r="7.5"></circle>
+          <path d="M10 6.6v6.8M6.6 10h6.8"></path>
+        </svg>
+        <span data-i18n="btn.new">New session</span>
+      </button>
       <nav class="sidebar-nav" aria-label="Workspace">
         <button id="nav-plugins" class="nav-item" type="button"
-                title="Plugins, skills and registered tools">&#9096; Plugins &amp; skills</button>
+                title="Plugins, skills and registered tools"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="15.4" cy="8.6" r="4"/><path d="M12.4 11.6 4.5 19.5M6.2 17.8l1.6 1.6"/></svg><span data-i18n="nav.plugins">Plugins &amp; skills</span></button>
+        <button id="nav-automation" class="nav-item" type="button"
+                title="Background jobs: what is running, its output, and how to stop it"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.4V12l3.2 2.1"/></svg><span data-i18n="nav.automation">Automation tasks</span></button>
         <button id="nav-mcp" class="nav-item" type="button"
-                title="MCP servers and fallback providers">&#9723; MCP servers</button>
-        <button id="nav-automation" class="nav-item" type="button" disabled
-                title="Scheduled and background jobs arrive with the jobs milestone">&#9881; Automation</button>
+                title="MCP servers and fallback providers"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3.5" y="9.5" width="17" height="10" rx="2.4"/><path d="M8 9.5V6.4a4 4 0 0 1 8 0v3.1"/></svg><span data-i18n="nav.mcp">MCP connectors</span></button>
+        <div class="files-head">
+          <button id="files-toggle" class="nav-item" type="button" aria-expanded="false"
+                  aria-controls="file-tree" title="Browse the workspace on disk"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 7.6A1.6 1.6 0 0 1 4.6 6h3.6L10.4 8.2h9A1.6 1.6 0 0 1 21 9.8v7.6A1.6 1.6 0 0 1 19.4 19H4.6A1.6 1.6 0 0 1 3 17.4z"/></svg><span data-i18n="nav.files">Files</span></button>
+          <button id="files-refresh" class="btn btn-ghost" type="button"
+                  title="Reload the file list"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19.4 12a7.4 7.4 0 1 1-2.2-5.4"/><path d="M19.4 3.6v5h-5"/></svg></button>
+        </div>
       </nav>
+      <div id="file-tree" class="file-tree" role="tree" aria-label="Workspace files" hidden></div>
+      <div class="side-section" id="side-workspaces">
+        <div class="side-section-head">
+          <span class="side-section-title" data-i18n="side.workspaces">Workspaces</span>
+          <div class="side-actions">
+            <button id="sessions-search" class="side-act" type="button" aria-expanded="false"
+                    aria-controls="session-search" aria-label="Search chats" title="Search chats"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="11" cy="11" r="6.4"/><path d="M15.7 15.7 20.4 20.4"/></svg></button>
+            <button id="sessions-refresh" class="side-act" type="button"
+                    aria-label="Reload chats" title="Reload chats"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19.4 12a7.4 7.4 0 1 1-2.2-5.4"/><path d="M19.4 3.6v5h-5"/></svg></button>
+            <button id="workspace-add" class="side-act" type="button"
+                    aria-label="Add a workspace" title="Add a workspace"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 7.6A1.6 1.6 0 0 1 4.6 6h3.6L10.4 8.2h9A1.6 1.6 0 0 1 21 9.8v7.6A1.6 1.6 0 0 1 19.4 19H4.6A1.6 1.6 0 0 1 3 17.4z"/><path d="M12 11.6v5M9.5 14.1h5"/></svg></button>
+          </div>
+        </div>
+        <input id="session-search" class="session-search" type="search"
+               data-i18n-placeholder="search.placeholder" data-i18n-aria="search.aria"
+               placeholder="Search chats…" aria-label="Search chats" spellcheck="false" hidden />
+        <div id="session-list" class="session-list"></div>
+      </div>
       <div class="sidebar-foot">
-        <button id="open-settings" class="btn btn-ghost" title="Settings">&#9881; Settings</button>
+        <div class="side-user">
+          <span class="side-avatar" aria-hidden="true">B</span>
+          <span class="side-user-name" id="side-user-name" data-i18n="side.local">Local workspace</span>
+        </div>
+        <button id="open-settings" class="btn btn-ghost" title="Settings" aria-label="Settings"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 15.6a3.6 3.6 0 1 0 0-7.2 3.6 3.6 0 0 0 0 7.2z"/><path d="M12 2.6v2.8M12 18.6v2.8M2.6 12h2.8M18.6 12h2.8M5.4 5.4l2 2M16.6 16.6l2 2M18.6 5.4l-2 2M7.4 16.6l-2 2"/></svg></button>
       </div>
     </aside>
 
     <main id="main">
       <header id="chat-head">
         <button type="button" id="sidebar-toggle" class="mini-btn" aria-label="Chats and workspaces"
-                aria-expanded="false" title="Chats and workspaces">☰</button>
+                aria-keyshortcuts="Meta+B Control+B" aria-expanded="false" title="Chats and workspaces">☰</button>
         <span id="chat-title">BOS</span>
-        <div id="center-tabs" class="center-tabs" role="tablist" aria-label="Conversation views">
-          <button type="button" id="tab-chat" class="center-tab active" role="tab" aria-selected="true" aria-controls="messages" tabindex="0">Chat</button>
-          <button type="button" id="tab-trajectory" class="center-tab" role="tab" aria-selected="false" aria-controls="trajectory" tabindex="-1">Trajectory</button>
+        <div id="center-tabs" class="center-tabs" role="tablist" aria-label="Conversation views" data-i18n-aria="tabs.label">
+          <button type="button" id="tab-chat" class="center-tab active" role="tab" aria-selected="true" aria-controls="messages" tabindex="0" data-i18n="tab.chat">Chat</button>
+          <button type="button" id="tab-trajectory" class="center-tab" role="tab" aria-selected="false" aria-controls="trajectory" tabindex="-1" data-i18n="tab.trajectory">Trajectory</button>
         </div>
-        <span id="stream-chip" class="chip idle">idle</span>
+        <span id="stream-chip" class="chip idle" aria-live="polite">idle</span>
         <button type="button" id="goal-open" class="chip goal-open" title="The goal for this chat (Ongoing Goal card)">◎ goal</button>
+        <button type="button" id="theme-toggle" class="mini-btn" title="Theme">◐</button>
+        <button type="button" id="lang-toggle" class="mini-btn" title="Language">EN</button>
       </header>
 
       <div id="messages" role="tabpanel" aria-labelledby="tab-chat" tabindex="0"></div>
@@ -144,8 +176,8 @@
               aria-label="File mentions"></ul>
         </div>
         <div id="queue-list" class="queue-list hidden" aria-label="Queued messages"></div>
-        <textarea id="input" rows="1" aria-controls="cmd-list" aria-expanded="false" placeholder="Send a message&#10;/ = commands &amp; skills · @ = file mentions · Enter = send (queued while streaming) · Shift+Enter = newline"></textarea>
-        <button id="send" class="btn btn-accent" disabled>Send</button>
+        <textarea id="input" rows="1" aria-controls="cmd-list" aria-expanded="false" aria-keyshortcuts="Enter Shift+Enter" data-i18n-placeholder="composer.placeholder" placeholder="Send a message&#10;/ = commands &amp; skills · @ = file mentions · Enter = send (queued while streaming) · Shift+Enter = newline"></textarea>
+        <button id="send" class="btn btn-accent" disabled data-i18n="btn.send">Send</button>
       </div>
 
       <footer id="statusbar">
@@ -157,17 +189,43 @@
 
   <div id="settings-modal" class="modal hidden" role="dialog"
        aria-modal="true" aria-labelledby="settings-title">
-    <div class="modal-card">
-      <h2 id="settings-title">Settings</h2>
+    <div class="modal-card set-card">
+      <header class="set-head">
+        <h2 id="settings-title">Settings</h2>
+        <button type="button" id="settings-close" class="set-close" aria-label="Close settings"
+                title="Close settings">&#10005;</button>
+      </header>
       <form id="settings-form">
-        <nav class="set-nav" aria-label="Settings sections">
-          <button type="button" class="set-tab" data-section="settings-form">General</button>
-          <button type="button" class="set-tab" data-section="ws-list">Workspaces</button>
-          <button type="button" class="set-tab" data-section="mem-list">Memory</button>
-          <button type="button" class="set-tab" data-section="cap-list">Tools &amp; skills</button>
-          <button type="button" class="set-tab" data-section="mcp-list">MCP servers</button>
-          <button type="button" class="set-tab" data-section="prov-list">Providers</button>
+        <div class="set-body">
+        <nav class="set-nav" role="tablist" aria-orientation="vertical" aria-label="Settings sections">
+          <button type="button" class="set-tab" role="tab" id="set-tab-set-general" aria-controls="set-general" aria-selected="true" tabindex="0" data-section="set-general">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 15.6a3.6 3.6 0 1 0 0-7.2 3.6 3.6 0 0 0 0 7.2z"/><path d="M12 2.6v2.8M12 18.6v2.8M2.6 12h2.8M18.6 12h2.8M5.4 5.4l2 2M16.6 16.6l2 2M18.6 5.4l-2 2M7.4 16.6l-2 2"/></svg></span><span class="set-label">General</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-ws-list" aria-controls="ws-list" aria-selected="false" tabindex="-1" data-section="ws-list">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 7.6A1.6 1.6 0 0 1 4.6 6h3.6L10.4 8.2h9A1.6 1.6 0 0 1 21 9.8v7.6A1.6 1.6 0 0 1 19.4 19H4.6A1.6 1.6 0 0 1 3 17.4z"/></svg></span><span class="set-label">Workspaces</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-mem-list" aria-controls="mem-list" aria-selected="false" tabindex="-1" data-section="mem-list">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="7" y="7" width="10" height="10" rx="2.5"/><path d="M12 3.2V7M12 17v3.8M3.2 12H7M17 12h3.8M6.6 6.6 7.8 7.8M16.2 16.2l1.2 1.2M17.4 6.6l-1.2 1.2M6.6 17.4l1.2-1.2"/></svg></span><span class="set-label">Memory</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-knowledge-section" aria-controls="knowledge-section" aria-selected="false" tabindex="-1" data-section="knowledge-section">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4.6 4.6h9.2a2.4 2.4 0 0 1 2.4 2.4v12.4H7a2.4 2.4 0 0 1-2.4-2.4z"/><path d="M16.2 7h3.2v12.4H16.2"/><path d="M7.4 9.2h5.2M7.4 12.4h3.6"/></svg></span><span class="set-label" data-i18n="sec.knowledge">Knowledge</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-cap-list" aria-controls="cap-list" aria-selected="false" tabindex="-1" data-section="cap-list">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="15.4" cy="8.6" r="4"/><path d="M12.4 11.6 4.5 19.5M6.2 17.8l1.6 1.6"/></svg></span><span class="set-label">Tools &amp; skills</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-set-mcp" aria-controls="set-mcp" aria-selected="false" tabindex="-1" data-section="set-mcp">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3.5" y="9.5" width="17" height="10" rx="2.4"/><path d="M8 9.5V6.4a4 4 0 0 1 8 0v3.1"/></svg></span><span class="set-label">MCP servers</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-set-prov" aria-controls="set-prov" aria-selected="false" tabindex="-1" data-section="set-prov">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 8.5h13.5l-3.2-3.2M20 15.5H6.5l3.2 3.2"/></svg></span><span class="set-label">Providers</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-jobs-section" aria-controls="jobs-section" aria-selected="false" tabindex="-1" data-section="jobs-section">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.4V12l3.2 2.1"/></svg></span><span class="set-label" data-i18n="sec.jobs">Jobs</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-schedule-section" aria-controls="schedule-section" aria-selected="false" tabindex="-1" data-section="schedule-section">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4.2a5.6 5.6 0 0 1 5.6 5.6c0 4 1.6 5.4 1.6 5.4H4.8s1.6-1.4 1.6-5.4A5.6 5.6 0 0 1 12 4.2z"/><path d="M10.2 18.4a1.9 1.9 0 0 0 3.6 0"/></svg></span><span class="set-label" data-i18n="sec.schedule">Schedule</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-context-section" aria-controls="context-section" aria-selected="false" tabindex="-1" data-section="context-section">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 3.2 3.2 7.6 12 12l8.8-4.4z"/><path d="M3.2 12 12 16.4 20.8 12"/><path d="M3.2 16.4 12 20.8l8.8-4.4"/></svg></span><span class="set-label" data-i18n="sec.context">Context</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-rules-section" aria-controls="rules-section" aria-selected="false" tabindex="-1" data-section="rules-section">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 3.8h14v16.4l-7-3.2-7 3.2z"/><path d="M8.8 9h6.4M8.8 12.8h4.2"/></svg></span><span class="set-label" data-i18n="sec.rules">Rules</span></button>
+          <button type="button" class="set-tab" role="tab" id="set-tab-insight-section" aria-controls="insight-section" aria-selected="false" tabindex="-1" data-section="insight-section">
+            <span class="set-icon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="11" cy="11" r="6.4"/><path d="M15.7 15.7 20.4 20.4"/></svg></span><span class="set-label" data-i18n="sec.inspect">Inspect</span></button>
         </nav>
+        <div class="set-panes">
+        <div id="set-general" class="set-pane active" role="tabpanel"
+             aria-labelledby="set-tab-set-general">
         <label>Model
           <input id="set-model" type="text" spellcheck="false"
                  placeholder="model name or [llm.<name>] profile" />
@@ -233,7 +291,9 @@
           <input id="set-context-budget" type="number" min="0" step="1024"
                  placeholder="32768" />
         </label>
-        <div class="cap-section">
+        </div>
+        <div class="cap-section set-pane" id="set-mcp" role="tabpanel"
+             aria-labelledby="set-tab-set-mcp">
           <div class="cap-title">MCP servers (plugins)
             <span id="mcp-conn" class="mcp-conn" role="status" aria-live="polite"></span>
           </div>
@@ -254,8 +314,55 @@
                     title="Reconnect every enabled server">Reconnect</button>
           </div>
           <p id="mcp-msg" class="mcp-msg" role="status" aria-live="polite"></p>
+          <div class="cap-title" data-i18n="mcp.policyTitle">Per-tool policy</div>
+          <p class="set-hint" data-i18n="mcp.policyHint">
+            A denied tool is never attached, so the model cannot see or call it; an
+            asked tool stays but every call waits for your approval, even in a
+            workspace that approves nothing else. Deny beats ask beats allow, and
+            either half of a rule may be *.
+          </p>
+          <div class="row">
+            <label class="pol-lbl" for="pol-default" data-i18n="mcp.policyDefault">Anything else</label>
+            <select id="pol-default" class="pol-effect" aria-label="Default decision">
+              <option value="allow" data-i18n="mcp.effectAllow">Allow</option>
+              <option value="ask" data-i18n="mcp.effectAsk">Ask</option>
+              <option value="deny" data-i18n="mcp.effectDeny">Deny</option>
+            </select>
+          </div>
+          <div id="pol-servers" class="pol-list" aria-label="Connected tools and their policy"></div>
+          <div id="pol-rules" class="pol-list" aria-label="Policy rules"></div>
+          <div class="mcp-add">
+            <input id="pol-server" type="text" spellcheck="false" aria-label="Server or *"
+                   placeholder="server or *" data-i18n-placeholder="mcp.policyServer" />
+            <input id="pol-tool" type="text" spellcheck="false" aria-label="Tool or *"
+                   placeholder="tool or *" data-i18n-placeholder="mcp.policyTool" />
+            <select id="pol-effect" class="pol-effect" aria-label="Effect">
+              <option value="allow" data-i18n="mcp.effectAllow">Allow</option>
+              <option value="ask" data-i18n="mcp.effectAsk">Ask</option>
+              <option value="deny" data-i18n="mcp.effectDeny">Deny</option>
+            </select>
+            <button type="button" id="pol-add" class="btn btn-ghost" data-i18n="mcp.policyAdd">Add rule</button>
+          </div>
+          <p id="pol-msg" class="mcp-msg" role="status" aria-live="polite"></p>
+          <div class="cap-title" data-i18n="mcp.catalogTitle">Resources and prompts</div>
+          <p class="set-hint" data-i18n="mcp.catalogHint">
+            What the connected servers publish besides tools. A resource is read
+            on demand — its text never enters a prompt unless you paste it — and a
+            prompt is listed for reference.
+          </p>
+          <div id="mcp-catalog" class="mcp-catalog" aria-label="MCP resources and prompts"></div>
+          <div class="mcp-add">
+            <select id="mcp-read-server" aria-label="Server to read from"></select>
+            <input id="mcp-uri" type="text" spellcheck="false" aria-label="Resource URI"
+                   placeholder="uri://…" data-i18n-placeholder="mcp.uriPlaceholder" />
+            <button type="button" id="mcp-read-btn" class="btn btn-ghost" data-i18n="mcp.read">Read</button>
+          </div>
+          <pre id="mcp-read-out" class="kb-body-view" hidden></pre>
+          <p id="mcp-cat-msg" class="mcp-msg" role="status" aria-live="polite"></p>
+          <p id="mcp-read-msg" class="mcp-msg" role="status" aria-live="polite"></p>
         </div>
-        <div class="cap-section">
+        <div class="cap-section set-pane" id="set-prov" role="tabpanel"
+             aria-labelledby="set-tab-set-prov">
           <div class="cap-title">Failover providers (tried in order after the primary)</div>
           <ul id="prov-list" class="mcp-list" aria-label="Configured fallback providers"></ul>
           <div class="mcp-add">
@@ -271,13 +378,12 @@
           </div>
           <p id="prov-msg" class="mcp-msg" role="status" aria-live="polite"></p>
         </div>
-        <div class="cap-section">
-          <div class="cap-title">Registered capabilities</div>
-          <section id="mem-list">
+        <section id="mem-list" class="set-pane" role="tabpanel" aria-labelledby="set-tab-mem-list">
             <h3>Memory</h3>
             <p class="set-hint">
-              What the agent remembers across chats. One store serves every workspace
-              and is written by hand here or by the agent as it works.
+              What the agent remembers across chats. A workspace may point at its own
+              file; by default every workspace shares one. Written by hand here, or by
+              the agent as it works.
             </p>
             <div class="row">
               <input id="mem-text" type="text" class="grow" spellcheck="false"
@@ -286,7 +392,41 @@
             </div>
             <div id="mem-items" class="ws-manage-list"></div>
           </section>
-          <section id="ws-list">
+          <section id="knowledge-section" class="set-pane" role="tabpanel"
+                   aria-labelledby="set-tab-knowledge-section">
+            <h3 data-i18n="sec.knowledge">Knowledge</h3>
+            <p class="set-hint" data-i18n="kb.hint">
+              Notes you curate — conventions, decisions, setup. The agent searches
+              them on demand with knowledge_search instead of carrying them in
+              every prompt, so they can be many and precise.
+            </p>
+            <div class="row">
+              <input id="kb-query" type="search" class="grow" spellcheck="false"
+                     data-i18n-placeholder="kb.searchPlaceholder"
+                     placeholder="Search titles, tags and bodies" />
+              <button type="button" id="kb-search" class="ws-form-go" data-i18n="kb.search">Search</button>
+              <button type="button" id="kb-all" class="btn" data-i18n="kb.all">All</button>
+            </div>
+            <div id="kb-items" class="ws-manage-list"></div>
+            <div class="row kb-form">
+              <input id="kb-title" type="text" class="grow" spellcheck="false"
+                     data-i18n-placeholder="kb.titlePlaceholder"
+                     placeholder="Title" />
+              <input id="kb-tags" type="text" class="kb-tags" spellcheck="false"
+                     data-i18n-placeholder="kb.tagsPlaceholder"
+                     placeholder="tags, comma, separated" />
+            </div>
+            <textarea id="kb-body" rows="3" class="kb-body"
+                      data-i18n-placeholder="kb.bodyPlaceholder"
+                      placeholder="What the agent should know"></textarea>
+            <div class="row">
+              <button type="button" id="kb-save" class="ws-form-go" data-i18n="kb.add">Add</button>
+              <button type="button" id="kb-cancel" class="btn" hidden data-i18n="kb.cancel">Cancel edit</button>
+            </div>
+            <p id="kb-note" class="cap-note" role="status"></p>
+          </section>
+          <section id="ws-list" class="set-pane" role="tabpanel"
+                   aria-labelledby="set-tab-ws-list">
             <h3>Workspaces</h3>
             <p class="set-hint">
               A workspace is a root folder, a model and a set of tools; every chat belongs to one.
@@ -296,7 +436,147 @@
               <button type="button" id="ws-manage-add" class="ws-form-go">New workspace</button>
             </div>
           </section>
-          <div id="cap-list" class="cap-list"></div>
+          <div id="cap-list" class="cap-list set-pane" role="tabpanel"
+               aria-labelledby="set-tab-cap-list">
+            <div id="cap-items"></div>
+            <section class="cap-section" id="skill-author" aria-labelledby="skill-author-title">
+              <h3 id="skill-author-title" data-i18n="skill.title">Author a skill</h3>
+              <p class="set-hint" data-i18n="skill.hint">
+                A skill is a folder with a SKILL.md whose body the agent reads —
+                an instruction it can follow, discovered from the skills directory
+                below and rebuilt into every open session when you save.
+              </p>
+              <div class="row">
+                <input id="skill-name" type="text" class="grow" spellcheck="false"
+                       data-i18n-placeholder="skill.namePlaceholder"
+                       placeholder="name-with-no-spaces" />
+                <input id="skill-desc" type="text" class="grow" spellcheck="false"
+                       data-i18n-placeholder="skill.descPlaceholder"
+                       placeholder="One line: what it does" />
+              </div>
+              <textarea id="skill-body" rows="4" class="kb-body"
+                        data-i18n-placeholder="skill.bodyPlaceholder"
+                        placeholder="The instruction the agent follows"></textarea>
+              <div class="row">
+                <button type="button" id="skill-save" class="ws-form-go" data-i18n="skill.save">Save skill</button>
+                <label class="skill-replace">
+                  <input type="checkbox" id="skill-overwrite" />
+                  <span data-i18n="skill.replace">Replace it if it already exists</span>
+                </label>
+              </div>
+              <p id="skill-note" class="cap-note" role="status"></p>
+              <div class="row skill-scope-row">
+                <span id="skill-scope" class="cap-note grow" role="status" aria-live="polite"></span>
+                <button type="button" id="skill-inherit" class="btn btn-ghost" hidden
+                        data-i18n="skill.inherit">Follow the workspace</button>
+              </div>
+              <div id="skill-list" class="skill-list" role="list" aria-label="Skills on disk"></div>
+            </section>
+          </div>
+
+        <div class="cap-section set-pane" id="jobs-section" role="tabpanel"
+             aria-labelledby="set-tab-jobs-section">
+          <div class="cap-title"><span data-i18n="sec.jobs">Jobs</span>
+            <span id="jobs-count" class="cap-note" role="status" aria-live="polite"></span>
+            <button type="button" id="jobs-refresh" class="btn btn-ghost" title="Reload the job list"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19.4 12a7.4 7.4 0 1 1-2.2-5.4"/><path d="M19.4 3.6v5h-5"/></svg></button>
+          </div>
+          <div id="jobs-list" class="job-list" role="list" aria-label="Background jobs"></div>
+          <div id="job-detail" class="job-detail hidden"></div>
+        </div>
+
+        <div class="cap-section set-pane" id="schedule-section" role="tabpanel"
+             aria-labelledby="set-tab-schedule-section">
+          <div class="cap-title"><span data-i18n="sec.schedule">Schedule</span>
+            <span id="sched-count" class="cap-note" role="status" aria-live="polite"></span>
+            <button type="button" id="sched-refresh" class="btn btn-ghost" title="Reload the reminders"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19.4 12a7.4 7.4 0 1 1-2.2-5.4"/><path d="M19.4 3.6v5h-5"/></svg></button>
+          </div>
+          <p class="set-hint" data-i18n="schedule.hint">Durable reminders. They outlive a restart, and every delivery is kept.</p>
+          <div class="row">
+            <input id="sched-text" type="text" class="grow" spellcheck="false"
+                   aria-label="Reminder" data-i18n-placeholder="schedule.placeholder"
+                   placeholder="Water the plants" />
+            <input id="sched-every" type="number" min="1" step="1" value="5"
+                   aria-label="Minutes" />
+            <select id="sched-mode" aria-label="Reminder kind">
+              <option value="once" data-i18n="schedule.once">in min, once</option>
+              <option value="every" data-i18n="schedule.repeat">every min</option>
+            </select>
+            <button type="button" id="sched-add" class="ws-form-go" data-i18n="schedule.add">Remind me</button>
+          </div>
+          <ul id="sched-items" class="rule-list" aria-label="Reminders"></ul>
+          <div class="cap-group" id="sched-history-head">
+            <span data-i18n="schedule.history">Delivered</span>
+            <button type="button" id="sched-clear" class="btn btn-ghost" data-i18n="schedule.clear">Clear</button>
+          </div>
+          <ul id="sched-history" class="rule-list" aria-label="Delivered reminders"></ul>
+          <div id="sched-note" class="cap-note" role="status" aria-live="polite"></div>
+        </div>
+
+        <div class="cap-section set-pane" id="context-section" role="tabpanel"
+             aria-labelledby="set-tab-context-section">
+          <div class="cap-title"><span data-i18n="sec.context">Context</span>
+            <button type="button" id="ctx-refresh" class="btn btn-ghost" title="Reload the meter"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19.4 12a7.4 7.4 0 1 1-2.2-5.4"/><path d="M19.4 3.6v5h-5"/></svg></button>
+          </div>
+          <div id="token-meter" class="meter-grid" role="group" aria-label="Token meter"></div>
+          <div id="compact-status" class="meter-grid" role="group" aria-label="Compaction status"></div>
+          <div class="row">
+            <button type="button" id="ctx-compact" class="btn btn-ghost">Compact now</button>
+            <button type="button" id="ctx-restore" class="btn btn-ghost">Restore folded turns</button>
+          </div>
+          <div id="ctx-note" class="cap-note" role="status" aria-live="polite"></div>
+          <div class="cap-group">Spilled tool output</div>
+          <ul id="spill-list" class="spill-list" aria-label="Spilled tool output"></ul>
+          <pre id="spill-detail" class="spill-detail hidden"></pre>
+        </div>
+
+        <div class="cap-section set-pane" id="rules-section" role="tabpanel"
+             aria-labelledby="set-tab-rules-section">
+          <div class="cap-title"><span data-i18n="sec.rules">Rules</span>
+            <button type="button" id="rules-refresh" class="btn btn-ghost" title="Reload the rules"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19.4 12a7.4 7.4 0 1 1-2.2-5.4"/><path d="M19.4 3.6v5h-5"/></svg></button>
+          </div>
+          <div id="rules-warnings" class="cap-note" role="status" aria-live="polite"></div>
+          <ul id="rules-list" class="rule-list" aria-label="Scoped approval rules"></ul>
+          <div class="rule-form">
+            <input id="rule-tool" type="text" spellcheck="false" placeholder="tool (bash, read_*)" aria-label="Tool" />
+            <select id="rule-scope" aria-label="Scope">
+              <option value="global">global</option>
+              <option value="workspace">workspace</option>
+              <option value="session">session</option>
+            </select>
+            <select id="rule-effect" aria-label="Effect">
+              <option value="allow">allow</option>
+              <option value="deny">deny</option>
+            </select>
+            <input id="rule-key" type="text" spellcheck="false" placeholder="arg key (optional)" aria-label="Argument key" />
+            <select id="rule-match" aria-label="Argument match">
+              <option value="">any</option>
+              <option value="exact">exact</option>
+              <option value="prefix">prefix</option>
+              <option value="contains">contains</option>
+            </select>
+            <input id="rule-value" type="text" spellcheck="false" placeholder="arg value" aria-label="Argument value" />
+            <button type="button" id="rule-add" class="btn btn-accent">Add rule</button>
+          </div>
+          <div class="cap-group">Recent decisions</div>
+          <ul id="audit-list" class="audit-list" aria-label="Recent approval decisions"></ul>
+        </div>
+
+        <div class="cap-section set-pane" id="insight-section" role="tabpanel"
+             aria-labelledby="set-tab-insight-section">
+          <div class="cap-title"><span data-i18n="sec.inspect">Inspect</span>
+            <button type="button" id="insight-refresh" class="btn btn-ghost" title="Reload the inventory"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19.4 12a7.4 7.4 0 1 1-2.2-5.4"/><path d="M19.4 3.6v5h-5"/></svg></button>
+          </div>
+          <div id="insight-grid" class="meter-grid" role="group" aria-label="Capability inventory"></div>
+          <div class="row">
+            <button type="button" id="insight-evaluate" class="btn btn-ghost">Evaluate this chat</button>
+            <button type="button" id="replay-run" class="btn btn-ghost">Deterministic replay</button>
+            <button type="button" id="bundle-export" class="btn btn-accent">Export bundle (.zip)</button>
+          </div>
+          <div id="insight-score" class="score-box hidden"></div>
+          <div id="replay-report" class="replay-box hidden"></div>
+          <div id="bundle-result" class="cap-note" role="status" aria-live="polite"></div>
+        </div>
+        </div>
         </div>
         <div class="modal-actions">
           <button type="button" id="settings-cancel" class="btn btn-ghost">Cancel</button>
@@ -325,8 +605,78 @@
     </div>
   </div>
 
+  <!-- Adding a workspace is its own flow, not a settings pane: it points the
+       app at a folder that no workspace owns yet, and configures that
+       workspace's model, MCP servers, plugins, tools and skills as it is made.
+       Everything above the divider belongs to the settings dialog; this
+       belongs to the sidebar. -->
+  <div id="ws-add" class="modal hidden" role="dialog"
+       aria-modal="true" aria-labelledby="ws-add-title">
+    <div class="modal-card ws-add-card">
+      <h2 id="ws-add-title">Add a workspace</h2>
+      <p class="ws-add-desc">
+        A workspace is a folder plus the things that may run in it. Nothing is
+        changed in the folder itself.
+      </p>
+
+      <label class="ws-add-label" for="ws-add-name">Name</label>
+      <input id="ws-add-name" type="text" placeholder="empty = the folder's name" />
+
+      <label class="ws-add-label" for="ws-add-root">Root folder</label>
+      <div class="ws-add-rootrow">
+        <input id="ws-add-root" type="text" placeholder="/path/to/folder" />
+        <button type="button" id="ws-add-browse" class="btn">Choose folder…</button>
+      </div>
+      <div id="ws-add-browser" class="ws-browse hidden" role="group" aria-label="Folders">
+        <div class="ws-browse-head">
+          <button type="button" id="ws-browse-up" class="btn btn-ghost" aria-label="Go to the parent folder">↑</button>
+          <code id="ws-browse-path"></code>
+          <button type="button" id="ws-browse-use" class="btn btn-accent">Use this folder</button>
+        </div>
+        <div id="ws-browse-list" class="ws-browse-list" role="listbox"
+             aria-label="Sub-folders"></div>
+        <div id="ws-browse-note" class="ws-form-hint"></div>
+      </div>
+
+      <label class="ws-add-label" for="ws-add-model">Model</label>
+      <input id="ws-add-model" type="text" placeholder="model or [llm.profile], empty = inherit" />
+
+      <div class="ws-add-sections">
+        <div class="ws-add-sect">
+          <div class="ws-add-sect-title">MCP servers this workspace may use</div>
+          <div id="ws-add-mcp" class="ws-add-tools" role="group" aria-label="MCP servers"></div>
+        </div>
+        <div class="ws-add-sect">
+          <div class="ws-add-sect-title">Plugins</div>
+          <div id="ws-add-plugins" class="ws-add-tools" role="group" aria-label="Plugins"></div>
+        </div>
+        <div class="ws-add-sect">
+          <div class="ws-add-sect-title">Tools</div>
+          <div id="ws-add-tools" class="ws-add-tools" role="group" aria-label="Tools"></div>
+        </div>
+        <div class="ws-add-sect">
+          <div class="ws-add-sect-title">Skills</div>
+          <div id="ws-add-skills" class="ws-add-tools" role="group" aria-label="Skills"></div>
+        </div>
+      </div>
+
+      <div class="ws-add-toggles">
+        <label class="row-check"><input type="checkbox" id="ws-add-bash" checked /> bash</label>
+        <label class="row-check"><input type="checkbox" id="ws-add-files" checked /> file tools</label>
+        <label class="row-check"><input type="checkbox" id="ws-add-approval" checked /> approval gate</label>
+      </div>
+
+      <div id="ws-add-err" class="ws-add-err" role="alert"></div>
+      <div class="modal-actions">
+        <button type="button" id="ws-add-cancel" class="btn btn-ghost">Cancel</button>
+        <button type="button" id="ws-add-create" class="btn btn-accent">Add workspace</button>
+      </div>
+    </div>
+  </div>
+
   <script src="prompt-nav.js"></script>
   <script src="shell.js"></script>
   <script src="app.js"></script>
+  <script src="polish.js"></script>
 </body>
 </html>

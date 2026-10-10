@@ -214,6 +214,251 @@ where
     });
 }
 
+/// Most output one job retains, in bytes. Older bytes are dropped from the
+/// head as new output arrives, so a chatty job cannot grow without bound.
+pub(crate) const MAX_JOB_BYTES: usize = 256 * 1024;
+
+/// Default cap on how much of a job's output one `job_output` call returns.
+pub(crate) const DEFAULT_JOB_READ_BYTES: usize = 64 * 1024;
+
+/// Hard ceiling on how much of a job's output one read may return.
+pub(crate) const MAX_JOB_READ_BYTES: usize = 1024 * 1024;
+
+/// Most jobs the registry keeps before the oldest settled one is evicted.
+pub(crate) const MAX_JOBS: usize = 64;
+
+/// Where a job stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum JobState {
+    /// Still producing output.
+    Running,
+    /// Stopped on its own with no error.
+    Finished,
+    /// Stopped on its own and reported a failure.
+    Failed,
+    /// Stopped because the user asked it to.
+    Interrupted,
+}
+
+impl JobState {
+    /// Whether the job has stopped.
+    pub(crate) fn is_settled(self) -> bool {
+        !matches!(self, JobState::Running)
+    }
+}
+
+/// A background job as the list reports it (no output body).
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct JobRecord {
+    /// Stable identifier, generated when the job starts.
+    pub(crate) id: String,
+    /// Human label, e.g. the command or tool the job runs.
+    pub(crate) label: String,
+    /// Job family, e.g. `"shell"` or `"subagent"`.
+    pub(crate) kind: String,
+    /// Where the job stands.
+    pub(crate) state: JobState,
+    /// Unix seconds the job started.
+    pub(crate) started_at: u64,
+    /// Unix seconds the job settled, when it has.
+    pub(crate) finished_at: Option<u64>,
+    /// Bytes of output currently retained.
+    pub(crate) bytes: usize,
+    /// Bytes dropped from the head because of [`MAX_JOB_BYTES`].
+    pub(crate) dropped_bytes: usize,
+    /// Failure detail, when the job failed.
+    pub(crate) error: Option<String>,
+}
+
+/// A bounded window onto one job's output.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct JobOutput {
+    /// Job that was read.
+    pub(crate) id: String,
+    /// Where the job stood when it was read.
+    pub(crate) state: JobState,
+    /// The most recent retained output, at most the requested cap.
+    pub(crate) text: String,
+    /// Bytes returned in `text`.
+    pub(crate) bytes: usize,
+    /// Bytes of output retained for the job (may exceed `bytes`).
+    pub(crate) total_bytes: usize,
+    /// Whether the read (or retention) dropped anything.
+    pub(crate) truncated: bool,
+    /// Bytes dropped from the head of the read window.
+    pub(crate) dropped_bytes: usize,
+}
+
+/// The stored job: its record plus the retained output body.
+struct Job {
+    record: JobRecord,
+    output: String,
+}
+
+/// In-memory registry of background jobs with byte-bounded output.
+///
+/// The registry is deliberately small and process-local: it exists so the UI
+/// can list what is running, interrupt it, and page through the tail of what it
+/// produced, without ever holding an unbounded string.
+#[derive(Default)]
+pub(crate) struct Jobs {
+    inner: std::sync::Mutex<JobsInner>,
+}
+
+#[derive(Default)]
+struct JobsInner {
+    jobs: Vec<Job>,
+    seq: u64,
+}
+
+impl Jobs {
+    /// An empty registry.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a new running job and return its record.
+    pub(crate) fn start(&self, label: impl Into<String>, kind: impl Into<String>) -> JobRecord {
+        let mut inner = self.inner.lock().unwrap();
+        inner.seq += 1;
+        let record = JobRecord {
+            id: format!("job-{}-{}", std::process::id(), inner.seq),
+            label: label.into(),
+            kind: kind.into(),
+            state: JobState::Running,
+            started_at: crate::session::unix_now(),
+            finished_at: None,
+            bytes: 0,
+            dropped_bytes: 0,
+            error: None,
+        };
+        inner.jobs.push(Job {
+            record: record.clone(),
+            output: String::new(),
+        });
+        evict(&mut inner.jobs);
+        record
+    }
+
+    /// Append output to a running job, keeping only the most recent bytes.
+    pub(crate) fn push(&self, id: &str, text: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let job = inner
+            .jobs
+            .iter_mut()
+            .find(|job| job.record.id == id)
+            .ok_or_else(|| format!("unknown job '{id}'"))?;
+        job.output.push_str(text);
+        let dropped = trim_head(&mut job.output, MAX_JOB_BYTES);
+        job.record.dropped_bytes += dropped;
+        job.record.bytes = job.output.len();
+        Ok(())
+    }
+
+    /// Settle a job. Unknown ids are ignored so a late finish cannot panic.
+    pub(crate) fn finish(&self, id: &str, state: JobState, error: Option<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(job) = inner.jobs.iter_mut().find(|job| job.record.id == id) {
+            job.record.state = state;
+            job.record.finished_at = Some(crate::session::unix_now());
+            job.record.error = error;
+            job.record.bytes = job.output.len();
+        }
+    }
+
+    /// Interrupt a job by id, returning its updated record.
+    ///
+    /// An already-settled job is returned unchanged (interrupting something
+    /// that has stopped is a no-op, not an error); an unknown id is a clean
+    /// error.
+    pub(crate) fn interrupt(&self, id: &str) -> Result<JobRecord, String> {
+        let mut inner = self.inner.lock().unwrap();
+        let job = inner
+            .jobs
+            .iter_mut()
+            .find(|job| job.record.id == id)
+            .ok_or_else(|| format!("unknown job '{id}'"))?;
+        if !job.record.state.is_settled() {
+            job.record.state = JobState::Interrupted;
+            job.record.finished_at = Some(crate::session::unix_now());
+        }
+        Ok(job.record.clone())
+    }
+
+    /// Every job, newest first. Never includes output bodies.
+    pub(crate) fn list(&self) -> Vec<JobRecord> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<JobRecord> = inner.jobs.iter().map(|job| job.record.clone()).collect();
+        out.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        out
+    }
+
+    /// Read the tail of a job's output, bounded by `max_bytes`.
+    pub(crate) fn output(&self, id: &str, max_bytes: Option<usize>) -> Result<JobOutput, String> {
+        let inner = self.inner.lock().unwrap();
+        let job = inner
+            .jobs
+            .iter()
+            .find(|job| job.record.id == id)
+            .ok_or_else(|| format!("unknown job '{id}'"))?;
+        let cap = max_bytes
+            .unwrap_or(DEFAULT_JOB_READ_BYTES)
+            .min(MAX_JOB_READ_BYTES);
+        let (text, cut) = clip_tail(&job.output, cap);
+        Ok(JobOutput {
+            id: job.record.id.clone(),
+            state: job.record.state,
+            bytes: text.len(),
+            total_bytes: job.output.len(),
+            truncated: cut || job.record.dropped_bytes > 0,
+            dropped_bytes: job.record.dropped_bytes + (job.output.len() - text.len()),
+            text,
+        })
+    }
+}
+
+/// Drop bytes from the head of `text` until it fits `max`, on a char boundary.
+/// Returns how many bytes were dropped.
+fn trim_head(text: &mut String, max: usize) -> usize {
+    if text.len() <= max {
+        return 0;
+    }
+    let mut cut = text.len() - max;
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    text.drain(..cut);
+    cut
+}
+
+/// Take the last `max` bytes of `text`, on a char boundary.
+fn clip_tail(text: &str, max: usize) -> (String, bool) {
+    if text.len() <= max {
+        return (text.to_string(), false);
+    }
+    let mut start = text.len() - max;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    (text[start..].to_string(), true)
+}
+
+/// Keep the registry at [`MAX_JOBS`], preferring to drop settled jobs.
+fn evict(jobs: &mut Vec<Job>) {
+    while jobs.len() > MAX_JOBS {
+        let victim = jobs
+            .iter()
+            .position(|job| job.record.state.is_settled())
+            .unwrap_or(0);
+        jobs.remove(victim);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +553,115 @@ mod tests {
         assert!(summary.truncated, "{summary:?}");
         assert!(started.elapsed() < Duration::from_secs(3), "killed late");
         assert_eq!(summary.exit_code, None);
+    }
+
+    /* ---- M7: the job registry ---- */
+
+    #[test]
+    fn a_job_starts_running_and_settles() {
+        let jobs = Jobs::new();
+        let job = jobs.start("cargo test", "shell");
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.bytes, 0);
+        assert_eq!(job.dropped_bytes, 0);
+        assert!(job.finished_at.is_none());
+
+        jobs.push(&job.id, "hello\n").expect("push");
+        jobs.finish(&job.id, JobState::Finished, None);
+
+        let listed = jobs.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, JobState::Finished);
+        assert_eq!(listed[0].bytes, "hello\n".len());
+        assert!(listed[0].finished_at.is_some());
+
+        let read = jobs.output(&job.id, None).expect("read");
+        assert_eq!(read.text, "hello\n");
+        assert_eq!(read.total_bytes, 6);
+        assert!(!read.truncated);
+    }
+
+    /// A chatty job's output is bounded, and the read says it was cut.
+    #[test]
+    fn job_output_is_bounded_with_a_truncation_flag() {
+        let jobs = Jobs::new();
+        let job = jobs.start("chatty", "shell");
+        let chunk = format!("{}\n", "x".repeat(1023));
+        for _ in 0..(MAX_JOB_BYTES / chunk.len() + 8) {
+            jobs.push(&job.id, &chunk).expect("push");
+        }
+        let listed = jobs.list();
+        assert!(
+            listed[0].bytes <= MAX_JOB_BYTES,
+            "retention must be bounded: {}",
+            listed[0].bytes
+        );
+        assert!(listed[0].dropped_bytes > 0, "the head was dropped");
+
+        let read = jobs.output(&job.id, None).expect("read");
+        assert!(read.text.len() <= DEFAULT_JOB_READ_BYTES, "read is capped");
+        assert!(read.truncated, "the read must report the cut");
+        assert!(read.total_bytes > read.bytes);
+
+        // A larger explicit cap returns more, still bounded by the hard ceiling.
+        let wide = jobs
+            .output(&job.id, Some(MAX_JOB_READ_BYTES * 8))
+            .expect("read");
+        assert!(wide.text.len() <= MAX_JOB_READ_BYTES);
+        assert!(wide.text.len() >= read.text.len());
+    }
+
+    /// Interrupting an unknown job is a clean error, never a panic.
+    #[test]
+    fn interrupting_an_unknown_job_fails_cleanly() {
+        let jobs = Jobs::new();
+        let err = jobs
+            .interrupt("job-does-not-exist")
+            .expect_err("unknown job");
+        assert!(err.contains("unknown job"), "{err}");
+        assert!(jobs.output("job-does-not-exist", None).is_err());
+        assert!(jobs.push("job-does-not-exist", "x").is_err());
+        // A late finish for a job that never existed is silently ignored.
+        jobs.finish("job-does-not-exist", JobState::Failed, None);
+        assert!(jobs.list().is_empty());
+    }
+
+    /// Interrupting a running job settles it; a second interrupt is a no-op.
+    #[test]
+    fn interrupt_settles_a_running_job_once() {
+        let jobs = Jobs::new();
+        let job = jobs.start("long runner", "subagent");
+        let stopped = jobs.interrupt(&job.id).expect("interrupt");
+        assert_eq!(stopped.state, JobState::Interrupted);
+        assert!(stopped.finished_at.is_some());
+        let again = jobs.interrupt(&job.id).expect("second interrupt");
+        assert_eq!(again.state, JobState::Interrupted);
+        assert_eq!(again.finished_at, stopped.finished_at, "not re-stamped");
+    }
+
+    /// The registry evicts settled jobs rather than growing forever.
+    #[test]
+    fn the_registry_is_bounded() {
+        let jobs = Jobs::new();
+        for index in 0..(MAX_JOBS + 10) {
+            let job = jobs.start(format!("job {index}"), "shell");
+            jobs.finish(&job.id, JobState::Finished, None);
+        }
+        assert_eq!(jobs.list().len(), MAX_JOBS);
+    }
+
+    /// Tail clipping never splits a multi-byte character.
+    #[test]
+    fn tail_clipping_respects_char_boundaries() {
+        let text = "记".repeat(100);
+        let (clipped, cut) = clip_tail(&text, 51);
+        assert!(cut);
+        assert!(clipped.len() <= 51);
+        assert!(clipped.chars().all(|c| c == '记'));
+        let mut owned = text.clone();
+        let dropped = trim_head(&mut owned, 51);
+        assert!(dropped > 0);
+        assert!(owned.len() <= 51);
+        assert!(owned.chars().all(|c| c == '记'));
     }
 }

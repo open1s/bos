@@ -7,21 +7,30 @@
 
 #![warn(missing_docs)]
 
+mod agi;
 mod app;
 mod approval;
 mod caps;
 mod compact;
+mod context;
 mod export;
 mod filetree;
+mod folders;
 mod init;
 mod instructions;
+mod knowledge;
 mod mcp;
+mod mcp_policy;
+mod mcp_view;
 mod mentions;
 mod pty;
+mod replay;
 mod runner;
 mod runs;
+mod schedule;
 mod session;
 mod settings;
+mod skills;
 #[cfg(test)]
 mod verify;
 

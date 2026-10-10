@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::context::{AgentReactContext, AgentSession};
 
+/// External command hooks: an event matcher plus an argv command.
+pub mod external;
+
 /// Events that can be hooked into during agent execution
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HookEvent {

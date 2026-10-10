@@ -12,14 +12,16 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::session::{ChatMessage, Role, SessionRecord};
 
 /// One file inside the archive.
-struct Entry {
+pub(crate) struct Entry {
     /// Slash-separated name as stored in the archive.
-    name: String,
+    pub(crate) name: String,
     /// The bytes, written uncompressed.
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// CRC-32 table (reflected polynomial 0xEDB88320), built at compile time so the
@@ -91,7 +93,7 @@ pub(crate) fn dos_stamp(unix: u64) -> (u16, u16) {
 }
 
 /// Assemble a stored archive from `entries`.
-fn build_zip(entries: &[Entry], unix: u64) -> Vec<u8> {
+pub(crate) fn build_zip(entries: &[Entry], unix: u64) -> Vec<u8> {
     let (date, time) = dos_stamp(unix);
     let mut body: Vec<u8> = Vec::new();
     let mut central: Vec<u8> = Vec::new();
@@ -238,6 +240,167 @@ pub(crate) fn export_chat(root: &Path, record: &SessionRecord) -> Result<PathBuf
     Ok(path)
 }
 
+/// Version of the manifest schema this build writes.
+pub(crate) const BUNDLE_SCHEMA_VERSION: u32 = 1;
+
+/// One file listed in the bundle manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct BundleFile {
+    /// Slash-separated name inside the archive.
+    pub(crate) name: String,
+    /// Exact stored size in bytes, when it can be known before the archive is
+    /// sealed (the manifest's own row cannot, and says so with `null`).
+    pub(crate) size: Option<u64>,
+    /// Lower-case hex CRC-32 of the stored bytes, under the same rule.
+    pub(crate) crc32: Option<String>,
+}
+
+/// The manifest entry carried inside a bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct BundleManifest {
+    /// Manifest schema version; bumped only on an incompatible change.
+    pub(crate) schema_version: u32,
+    /// Session the bundle was built from.
+    pub(crate) session_id: String,
+    /// Session title, verbatim.
+    pub(crate) title: String,
+    /// Workspace the session was filed under.
+    pub(crate) workspace: String,
+    /// Number of archive entries, including this manifest.
+    pub(crate) entries: usize,
+    /// One row per archive entry, in archive order.
+    pub(crate) files: Vec<BundleFile>,
+    /// Why the manifest row has no size of its own.
+    pub(crate) note: String,
+}
+
+/// A built bundle: the archive bytes and the manifest inside it.
+pub(crate) struct Bundle {
+    /// The stored ZIP.
+    pub(crate) bytes: Vec<u8>,
+    /// The manifest, as written.
+    pub(crate) manifest: BundleManifest,
+}
+
+/// A bundle written to disk.
+pub(crate) struct ExportedBundle {
+    /// Absolute path written.
+    pub(crate) path: PathBuf,
+    /// Size of the archive in bytes.
+    pub(crate) bytes: usize,
+    /// The manifest the archive carries.
+    pub(crate) manifest: BundleManifest,
+}
+
+/// What `export_bundle` reports back to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BundleFileReport {
+    /// Absolute path of the written archive.
+    pub(crate) path: String,
+    /// Size of the archive in bytes.
+    pub(crate) bytes: usize,
+    /// Manifest schema version.
+    pub(crate) schema_version: u32,
+    /// Number of entries in the archive, including the manifest.
+    pub(crate) entries: usize,
+    /// Every entry the manifest lists, in archive order.
+    pub(crate) files: Vec<BundleFile>,
+}
+
+/// Lower-case hex CRC-32 of `data`, the form the manifest records.
+fn crc_hex(data: &[u8]) -> String {
+    format!("{:08x}", crc32(data))
+}
+
+/// Build the bundle archive for one session.
+///
+/// The archive holds the Markdown transcript, a deterministic metrics document,
+/// and a manifest that names every entry with its size and checksum. The
+/// manifest cannot carry its own checksum (it would have to contain itself to
+/// do so), so its own row is listed by name with `size`/`crc32` as `null`; the
+/// `note` field says exactly that.
+pub(crate) fn bundle(record: &SessionRecord) -> Result<Bundle, String> {
+    let transcript = record.to_markdown().into_bytes();
+    let report = crate::replay::replay(record);
+    let metrics = serde_json::json!({
+        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "session_id": report.session_id,
+        "title": report.title,
+        "workspace": report.workspace,
+        "metrics": report.metrics,
+    });
+    let metrics = serde_json::to_vec_pretty(&metrics)
+        .map_err(|e| format!("cannot serialize metrics: {e}"))?;
+
+    // The payload entries are complete before the manifest is composed, so the
+    // manifest can describe them exactly.
+    let payload = [("transcript.md", transcript), ("metrics.json", metrics)];
+    let mut files: Vec<BundleFile> = payload
+        .iter()
+        .map(|(name, data)| BundleFile {
+            name: (*name).to_string(),
+            size: Some(data.len() as u64),
+            crc32: Some(crc_hex(data)),
+        })
+        .collect();
+    files.push(BundleFile {
+        name: "manifest.json".to_string(),
+        size: None,
+        crc32: None,
+    });
+
+    let manifest = BundleManifest {
+        schema_version: BUNDLE_SCHEMA_VERSION,
+        session_id: record.id.clone(),
+        title: record.title.clone(),
+        workspace: record.workspace.clone(),
+        entries: files.len(),
+        files,
+        note:
+            "size and crc32 are null for manifest.json because it cannot contain its own checksum"
+                .to_string(),
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| format!("cannot serialize manifest: {e}"))?;
+
+    let mut entries: Vec<Entry> = payload
+        .into_iter()
+        .map(|(name, data)| Entry {
+            name: name.to_string(),
+            data,
+        })
+        .collect();
+    entries.push(Entry {
+        name: "manifest.json".to_string(),
+        data: manifest_bytes,
+    });
+
+    // The archive timestamp comes from the record, not the clock, so the same
+    // session always packs to the same bytes.
+    Ok(Bundle {
+        bytes: build_zip(&entries, record.updated_at),
+        manifest,
+    })
+}
+
+/// Write a bundle beside the session store under `bundles/`.
+pub(crate) fn export_bundle(
+    store_dir: &Path,
+    record: &SessionRecord,
+) -> Result<ExportedBundle, String> {
+    let bundle = bundle(record)?;
+    let dir = store_dir.join("bundles");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{}.bundle.zip", record.id));
+    std::fs::write(&path, &bundle.bytes)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(ExportedBundle {
+        path,
+        bytes: bundle.bytes.len(),
+        manifest: bundle.manifest,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +531,104 @@ mod tests {
         } else {
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    /// A fixture session with one tool call, for the bundle tests.
+    fn bundle_fixture() -> SessionRecord {
+        let mut record = SessionRecord::new();
+        record.title = "Bundle me".to_string();
+        record.workspace = "/w".to_string();
+        record.messages.push(ChatMessage::user("first ask"));
+        let mut answer = ChatMessage::assistant();
+        answer.text = "the reply".to_string();
+        answer.tools.push(ToolEvent {
+            name: "read".into(),
+            args: "{\"path\":\"a.txt\"}".into(),
+            output: Some("contents".into()),
+            ms: Some(2),
+        });
+        record.messages.push(answer);
+        record
+    }
+
+    /// The bundle round-trips, and its manifest lists exactly its entries.
+    #[test]
+    fn a_bundle_round_trips_and_its_manifest_lists_every_entry() {
+        let record = bundle_fixture();
+        let bundle = bundle(&record).expect("bundle");
+        let read = read_archive(&bundle.bytes);
+        let names: Vec<&str> = read.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["transcript.md", "metrics.json", "manifest.json"]);
+
+        // Every entry's recorded checksum matches the bytes it stores.
+        for entry in &read {
+            assert_eq!(crc32(&entry.data), entry.crc, "{} checksum", entry.name);
+        }
+
+        // The manifest names exactly the archive entries, in archive order.
+        let manifest: BundleManifest = serde_json::from_slice(&read[2].data).expect("manifest");
+        let listed: Vec<&str> = manifest.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(listed, names, "manifest lists exactly the archive entries");
+        assert_eq!(manifest.entries, read.len());
+        assert_eq!(manifest.schema_version, BUNDLE_SCHEMA_VERSION);
+        assert_eq!(manifest.session_id, record.id);
+        assert_eq!(manifest.title, "Bundle me");
+
+        // Each listed size and checksum matches the entry it names.
+        for file in &manifest.files {
+            let actual = read
+                .iter()
+                .find(|r| r.name == file.name)
+                .expect("listed entry exists");
+            match (&file.size, &file.crc32) {
+                (Some(size), Some(crc)) => {
+                    assert_eq!(*size as usize, actual.data.len(), "{} size", file.name);
+                    assert_eq!(crc, &crc_hex(&actual.data), "{} crc", file.name);
+                }
+                (None, None) => assert_eq!(file.name, "manifest.json"),
+                _ => panic!("size and crc32 must be set together: {file:?}"),
+            }
+        }
+
+        // The transcript is the session's Markdown, byte for byte.
+        assert_eq!(read[0].data, record.to_markdown().into_bytes());
+        // Metrics are counts derived from the record, with no wall-clock value.
+        let metrics: serde_json::Value = serde_json::from_slice(&read[1].data).unwrap();
+        assert_eq!(metrics["session_id"], record.id);
+        assert_eq!(metrics["metrics"]["turns"], 2);
+        assert_eq!(metrics["metrics"]["tool_calls"], 1);
+        assert_eq!(metrics["metrics"]["tool_ms_total"], 2);
+        let metrics_text = String::from_utf8(read[1].data.clone()).unwrap();
+        assert!(!metrics_text.contains("updated_at"), "{metrics_text}");
+        assert!(!metrics_text.contains("generated_at"), "{metrics_text}");
+    }
+
+    /// The same session always packs to the same bytes.
+    #[test]
+    fn bundles_are_byte_identical_for_the_same_session() {
+        let record = bundle_fixture();
+        let first = bundle(&record).expect("first");
+        let second = bundle(&record).expect("second");
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.manifest, second.manifest);
+    }
+
+    /// Writing a bundle puts it under the store it was given.
+    #[test]
+    fn exporting_a_bundle_writes_where_it_says() {
+        let dir = std::env::temp_dir().join(format!("bos-gui-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let record = bundle_fixture();
+        let exported = export_bundle(&dir, &record).expect("export bundle");
+        assert!(
+            exported.path.starts_with(&dir),
+            "kept inside the given root"
+        );
+        assert!(exported.path.to_string_lossy().ends_with(".bundle.zip"));
+        let written = std::fs::read(&exported.path).expect("read back");
+        assert_eq!(written, bundle(&record).expect("bundle").bytes);
+        assert_eq!(exported.bytes, written.len());
+        assert_eq!(exported.manifest.entries, 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

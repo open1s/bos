@@ -56,7 +56,7 @@ pub(crate) struct Capabilities {
 }
 
 /// Expand a leading `~` the same way the settings paths expect.
-fn expand_tilde(raw: &str) -> PathBuf {
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(raw.trim()).into_owned())
 }
 
@@ -244,6 +244,21 @@ pub(crate) fn build_agent(
     settings: &Settings,
     broker: Arc<crate::approval::ApprovalBroker>,
 ) -> Arc<Agent> {
+    build_agent_with(settings, broker, None)
+}
+
+/// Build an agent with an extra, session-scoped skill denial list.
+///
+/// [`build_agent`] is this function with no extra list, so a caller that does
+/// not care about a chat's own activation (compaction, `/init`, verification)
+/// keeps the workspace's reading exactly. The extra names are *added* to the
+/// workspace's denials rather than replacing them, because the workspace's
+/// switch-off is a floor: a chat cannot put back a skill its workspace removed.
+pub(crate) fn build_agent_with(
+    settings: &Settings,
+    broker: Arc<crate::approval::ApprovalBroker>,
+    session_skill_deny: Option<&[String]>,
+) -> Arc<Agent> {
     let mut agent = Agent::from_config(settings.agent_config());
 
     let ws = settings.bash_workspace.trim();
@@ -302,17 +317,21 @@ pub(crate) fn build_agent(
         // A missing directory discovers nothing; that is not an error.
         // A workspace may switch individual skills off (§24.8); the deny-list is
         // what makes that real rather than stored.
-        let _ =
-            agent.register_skills_from_dir_denying(expand_tilde(skills), &settings.disabled_skills);
+        let mut deny = settings.disabled_skills.clone();
+        if let Some(extra) = session_skill_deny {
+            deny.extend(extra.iter().cloned());
+        }
+        let _ = agent.register_skills_from_dir_denying(expand_tilde(skills), &deny);
     }
 
+    // A workspace may switch a plugin off. The registry offers no per-name
+    // switch, so the survivors are re-registered on a cleared one — the same
+    // reason a re-attach has to rebuild rather than clone: a registry that is
+    // only ever added to cannot forget anything.
+    apply_plugin_deny(agent.plugins(), &settings.disabled_plugins);
+
     if settings.memory_enabled {
-        let raw = settings.memory_path.trim();
-        let path = if raw.is_empty() {
-            expand_tilde(crate::settings::DEFAULT_MEMORY_PATH)
-        } else {
-            expand_tilde(raw)
-        };
+        let path = crate::settings::memory_file(settings);
         if let Some(memory) = open_file_memory(&path) {
             agent = agent.with_memory(Arc::new(memory));
             // The low-level agent stores each completed exchange itself
@@ -322,6 +341,32 @@ pub(crate) fn build_agent(
     }
 
     Arc::new(agent)
+}
+
+/// Drop every plugin named in `deny`, leaving the rest registered.
+///
+/// Takes the registry rather than the agent so this is testable with a
+/// registry and two stand-in plugins, and so the *only* thing it can touch is
+/// the plugin list.
+pub(crate) fn apply_plugin_deny(registry: &agent::agent::PluginRegistry, deny: &[String]) {
+    if deny.is_empty() {
+        return;
+    }
+    let all = registry.plugins_blocking();
+    let keep: Vec<_> = all
+        .iter()
+        .filter(|p| !deny.iter().any(|d| d == p.name()))
+        .cloned()
+        .collect();
+    if keep.len() == all.len() {
+        // Nothing named is registered: an untouched registry, so a deny-list
+        // that matches nothing costs nothing either.
+        return;
+    }
+    registry.clear_blocking();
+    for plugin in keep {
+        registry.register(plugin);
+    }
 }
 
 /// Open (and cap) a persistent [`agent::memory::FileMemory`] at `path`.
@@ -344,7 +389,7 @@ fn open_file_memory(path: &Path) -> Option<agent::memory::FileMemory> {
         let memory = runtime
             .block_on(agent::memory::FileMemory::open(&path))
             .ok()?;
-        Some(memory.with_max_items(500))
+        Some(memory.with_max_items(crate::settings::MEMORY_MAX_ITEMS))
     })
     .join()
     .ok()
@@ -610,6 +655,32 @@ mod tests {
         let names = tool_names(&agent);
         assert!(names.contains(&"bash".to_string()));
         assert!(names.contains(&"write_file".to_string()));
+    }
+
+    struct Named(String);
+
+    impl agent::agent::AgentPlugin for Named {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[test]
+    fn a_denied_plugin_is_gone_and_the_others_stay() {
+        let registry = agent::agent::PluginRegistry::new();
+        registry.register_blocking(Arc::new(Named("audit".to_string())));
+        registry.register_blocking(Arc::new(Named("budget".to_string())));
+        apply_plugin_deny(&registry, &["audit".to_string()]);
+        assert_eq!(
+            registry.plugin_names_blocking(),
+            vec!["budget".to_string()],
+            "the denied one is rebuilt away, the other survives"
+        );
+        // A name nobody registered, and the empty list every ordinary workspace
+        // carries, must both leave the registry exactly as it was.
+        apply_plugin_deny(&registry, &["not-a-plugin".to_string()]);
+        apply_plugin_deny(&registry, &[]);
+        assert_eq!(registry.plugin_names_blocking(), vec!["budget".to_string()]);
     }
 
     #[test]

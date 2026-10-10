@@ -35,13 +35,21 @@ const state = {
   presets: [],          // [{id,name}] reusable workspace configurations (§24.9)
   activeWorkspace: "",
   wsEdit: null,         // {mode:'create'|'edit'|'remove', id} | null — inline form
+  wsAddOpener: null,    // what had focus when "Add a workspace" opened
+  wsBrowse: null,       // the folder chooser's current level, or null when closed
   wsBusy: false,        // a workspace command is in flight
   windowExtra: 0,       // extra rows kept above the tail window
   collapsed: {},        // workspace groups whose chats are hidden
+  showArchived: false,  // whether the sidebar's archive list is open
   centerTab: "chat",    // header view switch: "chat" (transcript) | "trajectory" (steps)
   hits: [],             // content matches for the current search
   usage: { prompt: 0, completion: 0 }, // what the provider said the last turn cost
   memories: [],         // what the agent remembers across chats
+  memoryStatus: null,   // where that store lives and what bounds it (§20)
+  knowledge: null,      // the curated notes, as the last command answered (§21)
+  skillsReport: null,   // the skills directory, as skill_list answered
+  skillActivation: null, // which skills the open chat carries, as skill_activation answered
+  kbEditing: null,      // id of the entry the form is editing, or null
   budget: 32768,        // context-budget meter ceiling (tokens; 0 = off)
   approvals: [],         // queued approval-request payloads
   allowedTools: [],      // tools allowed permanently ("always allow")
@@ -60,6 +68,9 @@ const state = {
   mcpServers: [],        // edit buffer from the settings dialog
   providers: [],         // fallback-provider edit buffer from the dialog
   mcpStatus: null,       // {connecting, servers} from the mcp_status command
+  mcpPolicy: null,       // {default, rules, servers} from mcp_policy_status
+  mcpCatalog: null,      // what the connected servers publish: resources + prompts
+  mcpRead: null,         // the last resource read, as the command answered
   mcpPolling: false,     // true while a status follow-up loop is running
   search: "",            // sidebar filter (session-title substring)
   palette: null,         // {query, entries, index} | null — slash palette
@@ -113,7 +124,7 @@ const setSkillsDir = $("set-skills-dir");
 const setMemory = $("set-memory");
 const setMemoryPath = $("set-memory-path");
 const setContextBudget = $("set-context-budget");
-const capList = $("cap-list");
+const capItems = $("cap-items");
 const mcpList = $("mcp-list");
 const mcpName = $("mcp-name");
 const mcpTransport = $("mcp-transport");
@@ -151,6 +162,56 @@ function el(tag, cls, text) {
 }
 
 const clip = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
+
+/* What a chat's row offers, in one place and free of the DOM.
+ *
+ * The labels flip with the chat's own state (a pinned chat offers "Unpin", an
+ * archived one offers "Restore") because a menu that always says "Pin" cannot
+ * tell the reader what the click will do. `run` names the action rather than
+ * carrying a closure, so the model is a plain value the fixture guard can read.
+ * Accelerators are spelled "Cmd/Ctrl+…" and not the bare glyph: this interface
+ * answers the same keys on every platform, and a hint that names only one of
+ * them is wrong on the other.
+ */
+function sessionMenu(s) {
+  const on = !!s.pinned;
+  const archived = !!s.archived;
+  return [
+    {
+      run: "pin",
+      label: on
+        ? tr("session.unpin", "Unpin session")
+        : tr("session.pin", "Pin session"),
+    },
+    { run: "rename", label: tr("session.rename", "Rename"), accel: "Cmd/Ctrl+G" },
+    { run: "fork", label: tr("session.fork", "Fork session"), accel: "Cmd/Ctrl+F" },
+    {
+      run: "archive",
+      label: archived
+        ? tr("session.unarchive", "Restore session")
+        : tr("session.archive", "Archive session"),
+      accel: archived ? "" : "Cmd/Ctrl+Shift+A",
+    },
+    { run: "delete", label: tr("session.delete", "Delete session"), danger: true },
+  ];
+}
+
+function workspaceMenu(w) {
+  return [
+    { run: "new", label: tr("ws.new", "New session"), accel: "Cmd/Ctrl+N" },
+    { run: "rename", label: tr("ws.rename", "Rename workspace") },
+    { run: "delete", label: tr("ws.delete", "Delete workspace"), danger: true },
+  ];
+}
+
+/* The archived chats, newest first. Archived is not gone: the row is drawn
+   behind a disclosure and this is the list that puts it back. */
+function archivedSessions(sessions) {
+  return (sessions || [])
+    .filter((s) => !!s.archived)
+    .slice()
+    .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+}
 
 function fmtTime(unix) {
   const d = new Date(unix * 1000);
@@ -214,18 +275,35 @@ function groupSessions(sessions, workspaces, activeId) {
   const byId = new Map((workspaces || []).map((w) => [w.id, w]));
   const groups = new Map();
   for (const s of sessions) {
+    // An archived chat is not in a group at all. Drawing it here would make
+    // "archived" mean nothing, and the count in the archive is the only place
+    // it should still be visible.
+    if (s.archived) continue;
     const id = s.workspace || activeId || "";
     if (!groups.has(id)) groups.set(id, []);
     groups.get(id).push(s);
   }
+  // A workspace exists whether or not it has a chat yet, so it gets a group
+  // either way: a folder just added would otherwise be invisible until someone
+  // happened to start a chat in it, and there would be nothing to aim "+" at.
+  // The ones the sessions did not mention come after them, in the order the
+  // workspaces are configured.
+  for (const w of workspaces || []) {
+    if (w && w.id && !groups.has(w.id)) groups.set(w.id, []);
+  }
   return [...groups.entries()].map(([id, items]) => {
     const w = byId.get(id);
+    // Pinned first, then most recent: a pin orders chats *inside* one
+    // workspace, so a pinned chat in A never lifts A above B.
+    const ordered = items
+      .slice()
+      .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.updated_at || 0) - (a.updated_at || 0));
     return {
       id,
       name: (w && (w.name || w.root)) || id || "Default",
       root: (w && w.root) || "",
       model: (w && w.model) || "",
-      sessions: items,
+      sessions: ordered,
     };
   });
 }
@@ -325,6 +403,213 @@ function openWorkspaceForm(mode, id) {
 function closeWorkspaceForm() {
   state.wsEdit = null;
   renderSidebar();
+}
+
+/* ---------- Add a workspace ---------------------------------------------- */
+
+/* Adding a workspace is its own flow, deliberately outside Settings: it points
+   the app at a folder that no workspace owns yet, and settles the model, the
+   MCP servers, the plugins, the tools and the skills that may run in it as it
+   is made — so the workspace is never briefly configured wrong. The folder is
+   chosen with the app's own browser rather than a platform file dialog, because
+   a native picker is a dialog the harness cannot drive and a webview may not
+   implement at all. */
+function addWorkspaceModal() {
+  return $("ws-add");
+}
+
+function addWorkspaceOpen() {
+  const modal = addWorkspaceModal();
+  return !!modal && !modal.classList.contains("hidden");
+}
+
+function openAddWorkspace() {
+  const modal = addWorkspaceModal();
+  if (!modal) return;
+  state.wsAddOpener = document.activeElement;
+  state.wsBrowse = null;
+  $("ws-add-browser").classList.add("hidden");
+  $("ws-add-browse").setAttribute("aria-expanded", "false");
+  $("ws-add-err").textContent = "";
+  $("ws-add-name").value = "";
+  $("ws-add-root").value = "";
+  $("ws-add-model").value = "";
+  $("ws-add-bash").checked = true;
+  $("ws-add-files").checked = true;
+  $("ws-add-approval").checked = true;
+  fillAddWorkspaceLists();
+  modal.classList.remove("hidden");
+  $("ws-add-name").focus();
+  // The plugins and the skills are whatever the backend last registered, so the
+  // lists are re-read rather than remembered: a skill installed a minute ago
+  // should be offerable now.
+  void refreshAddWorkspaceLists();
+}
+
+function closeAddWorkspace() {
+  const modal = addWorkspaceModal();
+  if (!modal || modal.classList.contains("hidden")) return;
+  modal.classList.add("hidden");
+  const back = state.wsAddOpener;
+  state.wsAddOpener = null;
+  if (back && back.focus) back.focus();
+}
+
+/* One checkbox row, with the label the workspace will carry the name of. */
+function addWorkspaceRow(host, cls, name, checked) {
+  const row = el("label", "ws-tool-row");
+  const box = el("input", cls);
+  box.type = "checkbox";
+  box.value = name;
+  box.checked = !!checked;
+  row.appendChild(box);
+  row.appendChild(el("span", "", name));
+  host.appendChild(row);
+}
+
+/* The MCP servers this installation knows, from the workspace list the sidebar
+   already holds: a new workspace is seeded from the same servers, so the box
+   starts where adoption would leave it — doing nothing changes nothing. */
+function fillAddWorkspaceLists(caps) {
+  const mcpHost = $("ws-add-mcp");
+  const pluginHost = $("ws-add-plugins");
+  const toolHost = $("ws-add-tools");
+  const skillHost = $("ws-add-skills");
+  if (!mcpHost) return;
+  const active = state.workspaces.find((w) => w.id === state.activeWorkspace) || {};
+  const servers = active.mcp_servers || [];
+  mcpHost.textContent = "";
+  if (!servers.length) {
+    mcpHost.appendChild(el("div", "ws-form-hint", tr("ws.add.noMcp", "No MCP servers are configured yet")));
+  }
+  for (const server of servers) addWorkspaceRow(mcpHost, "ws-add-mcp-on", server.name, server.enabled);
+  toolHost.textContent = "";
+  for (const tool of BUILTIN_TOOLS) addWorkspaceRow(toolHost, "ws-add-tool-on", tool, true);
+  if (pluginHost && caps) {
+    pluginHost.textContent = "";
+    if (!caps.plugins || !caps.plugins.length) {
+      pluginHost.appendChild(el("div", "ws-form-hint", tr("ws.add.noPlugins", "No plugins are registered")));
+    }
+    for (const name of caps.plugins || []) addWorkspaceRow(pluginHost, "ws-add-plugin-on", name, true);
+  }
+  if (skillHost && caps) {
+    skillHost.textContent = "";
+    if (!caps.skills || !caps.skills.length) {
+      skillHost.appendChild(el("div", "ws-form-hint", tr("ws.add.noSkills", "No skills are installed")));
+    }
+    // Skills arrive as records (`{name, description}`), plugins as bare names:
+    // the row is named for the skill, never for its description.
+    for (const skill of caps.skills || []) {
+      addWorkspaceRow(skillHost, "ws-add-skill-on", skill.name, true);
+    }
+  }
+}
+
+async function refreshAddWorkspaceLists() {
+  let caps = null;
+  try {
+    caps = await invoke("list_capabilities", { session: null });
+  } catch (e) {
+    // A capability list that will not load is not a reason to refuse to add a
+    // workspace: the dialog still has the folder, the model and the MCP servers,
+    // and the two sections say they are unknown rather than pretending.
+    $("ws-add-plugins").textContent = "";
+    $("ws-add-plugins").appendChild(el("div", "ws-form-hint", String(e)));
+    $("ws-add-skills").textContent = "";
+    $("ws-add-skills").appendChild(el("div", "ws-form-hint", String(e)));
+    return;
+  }
+  if (!addWorkspaceOpen()) return;
+  fillAddWorkspaceLists(caps);
+}
+
+/* What the dialog would send: the folder, the name, and the deny-lists the
+   backend stores — a box that is ticked is a capability this workspace may use,
+   so an unticked one is the name in the deny-list. */
+function addWorkspaceDraft() {
+  const unticked = (cls) =>
+    [...document.querySelectorAll(`.${cls}`)]
+      .filter((box) => !box.checked)
+      .map((box) => box.value);
+  return {
+    model: $("ws-add-model").value.trim(),
+    system_prompt: "",
+    bash_enabled: $("ws-add-bash").checked,
+    file_tools_enabled: $("ws-add-files").checked,
+    require_approval: $("ws-add-approval").checked,
+    disabled_tools: unticked("ws-add-tool-on"),
+    disabled_skills: unticked("ws-add-skill-on"),
+    disabled_plugins: unticked("ws-add-plugin-on"),
+    mcp_enabled: [...document.querySelectorAll(".ws-add-mcp-on")]
+      .filter((box) => box.checked)
+      .map((box) => box.value),
+  };
+}
+
+async function submitAddWorkspace() {
+  const name = $("ws-add-name").value;
+  const root = $("ws-add-root").value.trim();
+  if (!root) {
+    $("ws-add-err").textContent = tr("ws.add.root", "Choose a root folder for this workspace");
+    $("ws-add-root").focus();
+    return;
+  }
+  $("ws-add-err").textContent = "";
+  $("ws-add-create").disabled = true;
+  // The verdict is this attempt's, so the status is cleared first: a stale error
+  // from something else entirely would otherwise keep the dialog open forever
+  // and blame the folder for it.
+  state.error = "";
+  await workspaceCommand(
+    invoke("create_workspace", { name, root, config: addWorkspaceDraft() }),
+  );
+  $("ws-add-create").disabled = false;
+  // A command that failed leaves the dialog open with the reason *and* the form
+  // still filled in, so the folder does not have to be chosen again; one that
+  // succeeded closes.
+  if (state.error) $("ws-add-err").textContent = state.error;
+  else closeAddWorkspace();
+}
+
+/* The folder chooser. `list_folder` answers with sub-folders only and never
+   reads a file's contents — it exists to point the app at a folder, so it
+   deliberately looks outside the current workspace, where the file sidebar
+   would refuse to go. */
+async function browseFolder(path) {
+  state.wsBrowse = { path: path || "", entries: [], parent: null, loading: true, error: "" };
+  renderFolderBrowser();
+  try {
+    const listing = await invoke("list_folder", { path: path || null });
+    state.wsBrowse = { ...listing, loading: false, error: "" };
+  } catch (e) {
+    state.wsBrowse = { path: path || "", entries: [], parent: null, loading: false, error: String(e) };
+  }
+  renderFolderBrowser();
+}
+
+function renderFolderBrowser() {
+  const host = $("ws-browse-list");
+  const browse = state.wsBrowse;
+  if (!host || !browse) return;
+  $("ws-browse-path").textContent = browse.loading ? "…" : browse.path || "";
+  $("ws-browse-up").disabled = !browse.parent;
+  host.textContent = "";
+  if (browse.error) {
+    $("ws-browse-note").textContent = browse.error;
+    return;
+  }
+  for (const entry of browse.entries || []) {
+    const row = el("button", "ws-browse-row", entry.name);
+    row.type = "button";
+    row.setAttribute("role", "option");
+    row.dataset.path = entry.path;
+    row.addEventListener("click", () => void browseFolder(entry.path));
+    host.appendChild(row);
+  }
+  const notes = [];
+  if (browse.truncated) notes.push(`showing the first ${(browse.entries || []).length}`);
+  if (browse.unreadable) notes.push(`${browse.unreadable} not readable`);
+  $("ws-browse-note").textContent = notes.join(" — ");
 }
 
 /* Save the workspace being edited as a reusable preset: a copy of its
@@ -557,6 +842,79 @@ function workspaceFormEl(workspace) {
   return form;
 }
 
+/* ---------- the row menu ------------------------------------------------
+   One popover serves every row: it is anchored to the button that opened it,
+   closes on Escape or on a click outside, and hands focus back to that button
+   so the keyboard never lands nowhere. Only one can be open at a time, and the
+   anchor is the only element that knows it is expanded. */
+let rowMenu = null;
+
+function closeRowMenu(refocus) {
+  if (!rowMenu) return false;
+  const { menu, anchor } = rowMenu;
+  rowMenu = null;
+  menu.remove();
+  anchor.setAttribute("aria-expanded", "false");
+  if (refocus) anchor.focus();
+  return true;
+}
+
+function openRowMenu(anchor, items, onPick) {
+  closeRowMenu(false);
+  const menu = el("div", "row-menu");
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", anchor.getAttribute("aria-label") || "Actions");
+  for (const item of items) {
+    const b = el("button", "row-menu-item" + (item.danger ? " danger" : ""), item.label);
+    b.type = "button";
+    b.setAttribute("role", "menuitem");
+    b.dataset.run = item.run;
+    if (item.accel) b.appendChild(el("span", "row-menu-key", item.accel));
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (closeRowMenu(true)) onPick(item);
+    });
+    menu.appendChild(b);
+  }
+  menu.addEventListener("keydown", (e) => {
+    const items = [...menu.querySelectorAll(".row-menu-item")];
+    const at = items.indexOf(document.activeElement);
+    if (e.key === "Escape") {
+      e.preventDefault();
+      // One Escape closes one thing: without this the document-level handler
+      // would find no menu (this one just closed it) and close the dialog behind.
+      e.stopPropagation();
+      closeRowMenu(true);
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      const next = at < 0 ? 0 : (at + step + items.length) % items.length;
+      items[next].focus();
+    } else if (e.key === "Home" || e.key === "End") {
+      e.preventDefault();
+      items[e.key === "Home" ? 0 : items.length - 1].focus();
+    }
+  });
+  // Positioned after insertion so the menu's own height is known: a row near
+  // the bottom opens upward rather than off the screen.
+  document.body.appendChild(menu);
+  const box = anchor.getBoundingClientRect();
+  const size = menu.getBoundingClientRect();
+  const left = Math.min(
+    Math.max(6, box.left),
+    Math.max(6, document.documentElement.clientWidth - size.width - 6),
+  );
+  const below = box.bottom + 4;
+  const top = below + size.height > window.innerHeight - 6 ? Math.max(6, box.top - size.height - 4) : below;
+  menu.style.left = `${Math.round(left)}px`;
+  menu.style.top = `${Math.round(top)}px`;
+  anchor.setAttribute("aria-expanded", "true");
+  rowMenu = { menu, anchor };
+  const first = menu.querySelector(".row-menu-item");
+  if (first) first.focus();
+  return menu;
+}
+
 function renderSidebar() {
   sessionList.textContent = "";
   // renderSidebar is the sidebar's single re-render point and every session or
@@ -577,24 +935,40 @@ function renderSidebar() {
       : `${group.name} — click to switch`;
     if (group.id === state.activeWorkspace) head.classList.add("active");
     head.addEventListener("click", () => switchWorkspace(group.id));
-    const edit = el("button", "ws-act", "✎");
-    edit.setAttribute("aria-label", "Rename workspace");
-    edit.title = "Rename or move this workspace";
-    edit.addEventListener("click", (e) => {
+    // The header keeps the two gestures the reference sidebar puts here: "+"
+    // starts a chat in *this* workspace, and "…" holds everything else. The
+    // rename and remove forms are unchanged; they are just reached from a menu
+    // now, so the header is not a row of glyphs whose meaning has to be guessed.
+    const add = el("button", "ws-act ws-new", "+");
+    add.setAttribute("aria-label", `New session in ${group.name}`);
+    add.title = `${tr("ws.new", "New session")} (Cmd/Ctrl+N)`;
+    add.setAttribute("aria-keyshortcuts", "Meta+N Control+N");
+    add.addEventListener("click", (e) => {
       e.stopPropagation();
-      openWorkspaceForm("edit", group.id);
+      void newSessionIn(group.id);
     });
-    head.appendChild(edit);
-    const remove = el("button", "ws-act", "✕");
-    remove.setAttribute("aria-label", "Remove workspace");
-    remove.title = "Remove this workspace";
-    remove.addEventListener("click", (e) => {
+    head.appendChild(add);
+    const more = el("button", "ws-act ws-menu", "…");
+    more.setAttribute("aria-label", `${group.name} actions`);
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", "false");
+    more.title = tr("ws.actions", "Workspace actions");
+    more.addEventListener("click", (e) => {
       e.stopPropagation();
-      openWorkspaceForm("remove", group.id);
+      if (rowMenu && rowMenu.anchor === more) return void closeRowMenu(true);
+      openRowMenu(more, workspaceMenu(group), (item) => {
+        if (item.run === "new") void newSessionIn(group.id);
+        else if (item.run === "rename") openWorkspaceForm("edit", group.id);
+        else if (item.run === "delete") openWorkspaceForm("remove", group.id);
+      });
     });
-    head.appendChild(remove);
+    head.appendChild(more);
     const folded = !!state.collapsed[group.id];
     const fold = el("button", "ws-act ws-fold", folded ? "▸" : "▾");
+    // The glyph is the whole label, so it needs a name of its own — the title
+    // is a tooltip, and a screen reader does not read one as a name.
+    fold.setAttribute("aria-label", folded ? `Show ${group.name}'s chats` : `Hide ${group.name}'s chats`);
+    fold.setAttribute("aria-expanded", folded ? "false" : "true");
     fold.title = folded ? "Show this workspace's chats" : "Hide them";
     fold.addEventListener("click", (e) => {
       // Otherwise the click would also switch the active workspace, which is the
@@ -612,19 +986,46 @@ function renderSidebar() {
     if (folded) continue;
     for (const s of group.sessions) {
     const row = el("div", "session-row" + (s.id === state.activeId ? " active" : ""));
+    // The row names the chat it stands for, so a check can address one chat
+    // instead of matching its clipped title.
+    row.dataset.id = s.id;
+    // One marker per chat: hollow while idle, filled while it is streaming. The
+    // ring is decoration, so the state is also spelled out for a screen reader
+    // instead of being carried by colour alone.
+    const live = !!streamOf(s.id);
+    const mark = el("span", "sess-mark" + (live ? " live" : ""));
+    mark.setAttribute("aria-hidden", "true");
+    row.appendChild(mark);
     row.appendChild(el("span", "title", clip(s.title, 24)));
-    if (streamOf(s.id)) row.appendChild(el("span", "dot", "●"));
+    if (live) row.appendChild(el("span", "vh", "streaming"));
+    // The star is the pin's own control, so the state is one click from the row
+    // instead of two: it reads as pressed to a screen reader and stays visible
+    // when the row is not hovered, which a hover-only affordance never can.
+    const pin = el("button", "sess-pin" + (s.pinned ? " on" : ""), s.pinned ? "★" : "☆");
+    pin.type = "button";
+    pin.setAttribute("aria-pressed", s.pinned ? "true" : "false");
+    pin.setAttribute("aria-label", s.pinned ? "Unpin this chat" : "Pin this chat");
+    pin.title = tr("session.pin", s.pinned ? "Unpin session" : "Pin session");
+    pin.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void setPinned(s.id, !s.pinned);
+    });
+    row.appendChild(pin);
     const age = el("span", "time", fmtAge(s.updated_at));
     age.title = fmtTime(s.updated_at);
     row.appendChild(age);
-    const del = el("button", "del", "✕");
-    del.setAttribute("aria-label", "Move this chat to the trash");
-    del.title = "Delete chat";
-    del.addEventListener("click", (e) => {
+    const more = el("button", "sess-menu", "…");
+    more.type = "button";
+    more.setAttribute("aria-label", `Actions for ${s.title || "New chat"}`);
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", "false");
+    more.title = tr("session.actions", "Chat actions");
+    more.addEventListener("click", (e) => {
       e.stopPropagation();
-      deleteSession(s.id);
+      if (rowMenu && rowMenu.anchor === more) return void closeRowMenu(true);
+      openRowMenu(more, sessionMenu(s), (item) => runSessionAction(s, item.run));
     });
-    row.appendChild(del);
+    row.appendChild(more);
     // A chat's workspace decides the model and capabilities that run it, so it
     // can move house without being re-created. Shown only when there is
     // somewhere to move to.
@@ -649,6 +1050,57 @@ function renderSidebar() {
     sessionList.appendChild(row);
     }
   }
+  // The archive, behind one disclosure. It is drawn even while searching: a
+  // search that hid the way back to a chat would be a trap.
+  const archived = archivedSessions(state.sessions);
+  if (archived.length) {
+    const open = !!state.showArchived;
+    const toggle = el(
+      "button",
+      "archived-toggle" + (open ? " open" : ""),
+      `⧉ ${tr("session.archived", "Archived")} (${archived.length})`,
+    );
+    toggle.type = "button";
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    toggle.title = open ? "Hide the archived chats" : "Show the archived chats";
+    toggle.addEventListener("click", () => {
+      state.showArchived = !state.showArchived;
+      renderSidebar();
+    });
+    sessionList.appendChild(toggle);
+    if (open) {
+      for (const s of archived) {
+        const row = el("div", "session-row archived-row");
+        row.dataset.id = s.id;
+        row.appendChild(el("span", "sess-mark"));
+        row.appendChild(el("span", "title", clip(s.title, 24)));
+        const when = el("span", "time", fmtAge(s.updated_at));
+        when.title = `archived ${fmtTime(s.updated_at)}`;
+        row.appendChild(when);
+        const back = el("button", "sess-restore", tr("session.restore", "Restore"));
+        back.type = "button";
+        back.setAttribute("aria-label", `Restore ${s.title || "New chat"}`);
+        back.addEventListener("click", (e) => {
+          e.stopPropagation();
+          void setArchived(s.id, false);
+        });
+        row.appendChild(back);
+        const more = el("button", "sess-menu", "…");
+        more.type = "button";
+        more.setAttribute("aria-label", `Actions for ${s.title || "New chat"}`);
+        more.setAttribute("aria-haspopup", "menu");
+        more.setAttribute("aria-expanded", "false");
+        more.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (rowMenu && rowMenu.anchor === more) return void closeRowMenu(true);
+          openRowMenu(more, sessionMenu(s), (item) => runSessionAction(s, item.run));
+        });
+        row.appendChild(more);
+        row.addEventListener("click", () => void setArchived(s.id, false));
+        sessionList.appendChild(row);
+      }
+    }
+  }
   if (state.wsEdit) {
     const known = state.workspaces.find((w) => w.id === state.wsEdit.id);
     sessionList.appendChild(
@@ -656,7 +1108,7 @@ function renderSidebar() {
     );
   } else {
     const add = el("button", "ws-add", "+ New workspace");
-    add.addEventListener("click", () => openWorkspaceForm("create", ""));
+    add.addEventListener("click", () => openAddWorkspace());
     sessionList.appendChild(add);
     // Presets sit next to "New workspace" because applying one is a way of
     // creating a workspace — a copy of it, never a link to it (§24.9).
@@ -964,6 +1416,15 @@ function buildToolCard(t) {
   return card;
 }
 
+/* Message actions are built from the message alone, so a stream ending cannot
+   change any row's shape. They used to be gated on this chat being idle, which
+   meant the idle flip at the end of every turn rewrote the whole drawn window
+   (200 rebuilt rows, ~400 DOM mutations, measured). The gate moves to the click
+   and to `#messages.busy` in CSS: rendered, hover-revealed, inert while busy. */
+function actionsReady() {
+  return !streamOf(state.activeId) && !state.compacting[state.activeId];
+}
+
 function buildBubble(m, showCaret, opts) {
   const bubble = el("div", "bubble");
   if (m.reasoning) bubble.appendChild(el("div", "reasoning", m.reasoning));
@@ -1003,7 +1464,9 @@ function buildBubble(m, showCaret, opts) {
   if (opts && opts.regen) {
     const regenBtn = el("button", "mini-btn", "Regenerate");
     regenBtn.type = "button";
-    regenBtn.addEventListener("click", () => regenerate());
+    regenBtn.addEventListener("click", () => {
+      if (actionsReady()) regenerate();
+    });
     acts.appendChild(regenBtn);
     hasActs = true;
   }
@@ -1011,6 +1474,7 @@ function buildBubble(m, showCaret, opts) {
     const editBtn = el("button", "mini-btn", "Edit");
     editBtn.type = "button";
     editBtn.addEventListener("click", () => {
+      if (!actionsReady()) return;
       state.editing = { sessionId: state.activeId, index: opts.index };
       renderMessages();
     });
@@ -1020,7 +1484,9 @@ function buildBubble(m, showCaret, opts) {
   if (opts && opts.del) {
     const delBtn = el("button", "mini-btn", "Delete");
     delBtn.type = "button";
-    delBtn.addEventListener("click", () => deleteFrom(opts.index));
+    delBtn.addEventListener("click", () => {
+      if (actionsReady()) deleteFrom(opts.index);
+    });
     acts.appendChild(delBtn);
     hasActs = true;
   }
@@ -1028,7 +1494,9 @@ function buildBubble(m, showCaret, opts) {
     const branchBtn = el("button", "mini-btn", "Branch");
     branchBtn.type = "button";
     branchBtn.title = "Fork this chat at this message into a new session";
-    branchBtn.addEventListener("click", () => branchFrom(opts.index));
+    branchBtn.addEventListener("click", () => {
+      if (actionsReady()) branchFrom(opts.branchIndex);
+    });
     acts.appendChild(branchBtn);
     hasActs = true;
   }
@@ -1145,6 +1613,53 @@ let msgKeySeq = 0;
 
 /* Stable identity for a message object (non-enumerable so it never leaks into
    payloads). Renamed/loaded objects simply get fresh keys and rebuild once. */
+/* A finished turn re-reads the transcript from the store, which hands back fresh
+   objects for messages we already hold. Pairing the drawn tail by content keeps
+   those objects — and the DOM nodes drawn for them — so a turn stops rewriting
+   the whole window (measured: ~400 DOM mutations per turn before this, ~7 after).
+
+   The pairing must be exact. The renderer's own signature is deliberately lossy
+   (`length` + the last 24 characters), which is enough to notice a streamed token
+   but not a rewrite of the same length and tail — so a row kept for a message
+   whose text actually changed would never update, which is precisely what a
+   backend finalizing the reply does. And only the drawn tail is paired: the rows
+   outside it are not drawn, so their identity buys nothing and scanning the whole
+   session on every turn would not scale. */
+function sameMessage(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.role !== b.role || a.text !== b.text) return false;
+  if ((a.reasoning || "") !== (b.reasoning || "")) return false;
+  if ((a.error || "") !== (b.error || "")) return false;
+  const ta = a.tools || [];
+  const tb = b.tools || [];
+  if (ta.length !== tb.length) return false;
+  for (let i = 0; i < ta.length; i += 1) {
+    const x = ta[i];
+    const y = tb[i];
+    if (
+      x.name !== y.name ||
+      x.args !== y.args ||
+      (x.output == null ? null : x.output) !== (y.output == null ? null : y.output) ||
+      (x.ms == null ? null : x.ms) !== (y.ms == null ? null : y.ms) ||
+      !!x.open !== !!y.open
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function reuseIdentical(oldList, fresh) {
+  if (!Array.isArray(oldList) || !Array.isArray(fresh)) return fresh;
+  const span = Math.min(WINDOW + (state.windowExtra || 0) + 8, oldList.length, fresh.length);
+  for (let k = 1; k <= span; k += 1) {
+    const i = fresh.length - k;
+    const j = oldList.length - k;
+    if (sameMessage(oldList[j], fresh[i])) fresh[i] = oldList[j];
+  }
+  return fresh;
+}
+
 function msgKey(m) {
   let key = m[MSG_KEY];
   if (key === undefined) {
@@ -1175,10 +1690,6 @@ function messageSignature(m, opts, editingHere) {
     sigOf(m.error),
     tools,
     opts.showCaret ? 1 : 0,
-    opts.regen ? 1 : 0,
-    opts.edit ? 1 : 0,
-    opts.del ? 1 : 0,
-    opts.branch ? 1 : 0,
     editingHere ? 1 : 0,
   ].join("~");
 }
@@ -1430,6 +1941,10 @@ function renderMessages() {
   const editing =
     state.editing && state.editing.sessionId === state.activeId ? state.editing : null;
 
+  // Whether the row actions are live is a property of the transcript, not of
+  // each row: one class write here replaces a rebuild of every drawn row.
+  messagesEl.classList.toggle("busy", !idle);
+
   // Regenerate applies to the last assistant reply once this chat is idle
   // (a background chat streaming never blocks it).
   let lastAssistant = -1;
@@ -1495,10 +2010,15 @@ function renderMessages() {
     const editingHere = !!(editing && editing.index === abs);
     const opts = {
       index: abs,
-      regen: idle && abs === lastAssistant && !!m.text,
-      edit: idle && m.role === "User" && !!m.text,
-      del: idle,
-      branch: idle && abs > 0,
+      // The branch keeps the first `index` messages, so "branch at this message"
+      // asks for one more than its 0-based number. The double used to add the
+      // one itself, which hid this: against the real backend the branch came out
+      // one message short — without the message it was taken from.
+      branchIndex: abs + 1,
+      regen: abs === lastAssistant && !!m.text,
+      edit: m.role === "User" && !!m.text,
+      del: true,
+      branch: abs > 0,
     };
     const key = msgKey(m);
     if (seen) seen.add(key);
@@ -1816,7 +2336,7 @@ function nextPlanStatus(s) {
 
 function renderPlan(items) {
   const panel = $("plan-panel");
-  const list = $("#plan-list");
+  const list = $("plan-list");
   const editBtn = $("plan-edit");
   if (!panel || !list) return;
   // A stale footer from a previous edit pass never survives a render.
@@ -1860,7 +2380,7 @@ function renderPlan(items) {
     return li;
   });
   list.replaceChildren(...nodes);
-  const count = $("#plan-count");
+  const count = $("plan-count");
   if (count) {
     count.textContent =
       done + "/" + state.plan.length + (active ? " · " + active + " active" : "");
@@ -1896,7 +2416,9 @@ function renderPlanEditor(panel, list) {
     if (it.status === "completed") done += 1;
     if (it.status === "in_progress") active += 1;
     const li = document.createElement("li");
-    li.className = "plan-item plan-edit-row";
+    // The status class carries the strikethrough and the accent; without it
+    // every row in the editor looks pending, so a done step reads as untouched.
+    li.className = "plan-item plan-edit-row status-" + it.status;
     const input = document.createElement("input");
     input.className = "plan-edit-input";
     input.type = "text";
@@ -1957,7 +2479,7 @@ function renderPlanEditor(panel, list) {
   });
   list.replaceChildren(...nodes);
 
-  const count = $("#plan-count");
+  const count = $("plan-count");
   if (count) {
     count.textContent =
       done + "/" + draft.length + (active ? " · " + active + " active" : "");
@@ -2292,6 +2814,13 @@ bindGoalCard();
 
 /* ---------- session management ---------- */
 
+async function reloadSessionList() {
+  // The sidebar's own reload: re-read the list and repaint it, without
+  // disturbing whichever chat is open.
+  state.sessions = await invoke("list_sessions");
+  renderSidebar();
+}
+
 async function refreshSessions() {
   let list = await invoke("list_sessions");
   if (list.length === 0) list = [await invoke("create_session")];
@@ -2330,16 +2859,28 @@ async function switchSession(id) {
   if (id === state.activeId) return;
   state.activeId = id;
   state.promptNav = null; // the walk belonged to the previous chat
+  forgetSkillScope();
   if (!state.cache[id]) await loadActive();
   await restorePlan(id);
   await refreshGoal(id);
   renderAll();
 }
 
+/* Start a chat in a named workspace. A chat's workspace decides the model and
+   the tools that run it, so this switches first and creates second: creating in
+   a workspace that is not active would need a second way to say which one. */
+async function newSessionIn(workspaceId) {
+  if (workspaceId && workspaceId !== state.activeWorkspace) {
+    await switchWorkspace(workspaceId);
+  }
+  await newChat();
+}
+
 async function newChat() {
   const s = await invoke("create_session");
   state.sessions.unshift(s);
   state.activeId = s.id;
+  forgetSkillScope();
   state.cache[s.id] = [];
   state.usage = null;
   state.toolCount = 0;
@@ -2349,6 +2890,135 @@ async function newChat() {
   renderPlan([]);
   renderAll();
   input.focus();
+}
+
+/* A pin is presentation, so it is the one row action that does not wait for a
+   turn to finish; the backend is the authority on that rule, and this only
+   reports what it says. */
+async function setPinned(id, pinned) {
+  try {
+    await invoke("set_session_pinned", { id, pinned });
+  } catch (e) {
+    state.error = String(e);
+  }
+  await refreshSessions();
+  renderSidebar();
+}
+
+/* Archive hides a chat without destroying it. Hiding the chat you are looking
+   at would leave the transcript on screen for a chat the sidebar no longer
+   lists, so the archive moves to a chat that is still listed. */
+async function setArchived(id, archived) {
+  try {
+    await invoke("set_session_archived", { id, archived });
+  } catch (e) {
+    state.error = String(e);
+    renderSidebar();
+    return;
+  }
+  if (archived && id === state.activeId) {
+    const next = state.sessions.find((s) => s.id !== id && !s.archived);
+    if (next) await switchSession(next.id);
+  }
+  await refreshSessions();
+  renderAll();
+}
+
+/* Fork the whole conversation: branch at the end, which is the same thing as
+   copying it into a chat of its own. Branching from the middle is the
+   transcript's own "branch from here", not the row menu's job. */
+async function forkChat(id) {
+  try {
+    const messages = await invoke("load_session", { id });
+    // The backend refuses a branch before the first turn, and it is right to:
+    // a branch at 0 is a blank chat, which is not what "fork this conversation"
+    // can mean. Saying so here keeps the failure in the interface instead of in
+    // a refused request.
+    if (!messages || messages.length === 0) {
+      state.error = tr("session.forkEmpty", "this chat has no turns to fork yet");
+      renderSidebar();
+      scheduleRepaint();
+      return;
+    }
+    const fork = await invoke("fork_session", {
+      sessionId: id,
+      index: (messages || []).length,
+    });
+    await refreshSessions();
+    state.sessions = [fork, ...state.sessions.filter((s) => s.id !== fork.id)];
+    await switchSession(fork.id);
+    renderAll();
+  } catch (e) {
+    state.error = String(e);
+    renderSidebar();
+    scheduleRepaint();
+  }
+}
+
+/* Rename in place. A modal would be a second surface for one string; the row
+   already shows the name, so the name becomes the field. Enter saves, Escape
+   (or losing focus) puts the row back. */
+function startRename(id) {
+  const row = sessionList.querySelector(`.session-row[data-id="${id}"]`);
+  if (!row) return false;
+  const holder = row.querySelector(".title");
+  if (!holder || row.querySelector(".sess-rename")) return false;
+  const input = el("input", "sess-rename");
+  input.type = "text";
+  input.value = (state.sessions.find((s) => s.id === id) || {}).title || "";
+  input.setAttribute("aria-label", tr("session.name", "Chat name"));
+  input.maxLength = 80;
+  row.classList.add("renaming");
+  holder.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const restore = () => {
+    if (done) return;
+    done = true;
+    renderSidebar();
+  };
+  const commit = async () => {
+    if (done) return;
+    done = true;
+    const title = input.value;
+    try {
+      await invoke("rename_session", { id, title });
+      state.error = null;
+    } catch (e) {
+      state.error = String(e);
+    }
+    await refreshSessions();
+    renderSidebar();
+    renderTitle();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void commit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      restore();
+    }
+  });
+  input.addEventListener("blur", () => void commit());
+  return true;
+}
+
+/* One place that turns a menu entry into the action it names, so the row menu
+   and the keyboard chords cannot drift apart. */
+function runSessionAction(s, run) {
+  if (run === "pin") return void setPinned(s.id, !s.pinned);
+  if (run === "rename") return void startRename(s.id);
+  if (run === "fork") return void forkChat(s.id);
+  if (run === "archive") return void setArchived(s.id, !s.archived);
+  if (run === "delete") return void deleteSession(s.id);
+  return undefined;
+}
+
+/* The chat the sidebar says is open, or nothing. */
+function activeSession() {
+  return state.sessions.find((s) => s.id === state.activeId && !s.archived) || null;
 }
 
 async function deleteSession(id) {
@@ -2957,12 +3627,428 @@ function renderCapabilities(host, caps) {
 /* Load and draw the capabilities for the active workspace. Descriptions come
    from tool and plugin definitions, so this is DOM text, never innerHTML. */
 async function loadCapabilities() {
-  capList.textContent = "loading…";
+  capItems.textContent = "…";
   try {
-    renderCapabilities(capList, await invoke("list_capabilities"));
+    renderCapabilities(capItems, await invoke("list_capabilities", { session: state.activeId || null }));
   } catch (err) {
-    capList.textContent = String(err);
+    capItems.textContent = String(err);
   }
+}
+
+/* What the connected MCP servers publish besides tools, read on demand.
+
+   The bounds here are the backend's: the catalog arrives already row-capped and
+   text-capped, so this code counts and names rather than clamping again — a
+   second clamp would report a bound the backend never applied. A resource's
+   text goes into the pane and nowhere else: reading it is a gesture, never a
+   side effect of a server being connected. */
+function catalogServerLine(view) {
+  const v = view || {};
+  if (!v.connected) return "not connected this pass";
+  const resources = v.resources_supported
+    ? `${v.resources_total} resource${v.resources_total === 1 ? "" : "s"}`
+    : "no resources capability";
+  const prompts = v.prompts_supported
+    ? `${v.prompts_total} prompt${v.prompts_total === 1 ? "" : "s"}`
+    : "no prompts capability";
+  return `${resources} · ${prompts}`;
+}
+
+function catalogRowLine(row) {
+  const bits = [];
+  if (row.mime_type) bits.push(row.mime_type);
+  if (row.clipped) bits.push("clipped");
+  return bits.join(" · ");
+}
+
+function promptRowLine(prompt) {
+  const args = Number(prompt.arguments) || 0;
+  const required = Number(prompt.required) || 0;
+  const shape =
+    args === 0
+      ? "no arguments"
+      : `${args} argument${args === 1 ? "" : "s"}${required ? ` · ${required} required` : ""}`;
+  return shape;
+}
+
+function readLine(read) {
+  const r = read || {};
+  const where = `${r.server}/${r.uri}`;
+  if (r.empty) return `${where} · no text (${r.mime_type || "no type"})`;
+  const size = r.truncated ? `${r.chars} of ${r.source_chars} chars` : `${r.chars} chars`;
+  const mime = r.mime_type ? ` · ${r.mime_type}` : "";
+  const parts = r.parts > 1 ? ` · ${r.parts} parts` : "";
+  return `${where} · ${size}${mime}${parts}${r.truncated ? " · truncated" : ""}`;
+}
+
+function renderCatalog(note) {
+  const host = $("mcp-catalog");
+  if (!host) return;
+  const report = state.mcpCatalog || {};
+  const servers = Array.isArray(report.servers) ? report.servers : [];
+  const picker = $("mcp-read-server");
+  if (picker) {
+    const keep = picker.value;
+    picker.textContent = "";
+    for (const view of servers) {
+      if (!view.connected) continue;
+      const option = el("option", "", view.server);
+      option.value = view.server;
+      picker.appendChild(option);
+    }
+    if (keep && servers.some((v) => v.connected && v.server === keep)) picker.value = keep;
+  }
+  host.textContent = "";
+  if (!servers.length) {
+    host.appendChild(el("div", "cat-empty", "No MCP servers are configured."));
+    return;
+  }
+  for (const view of servers) {
+    const block = el("div", "cat-server");
+    const head = el("div", "cat-head");
+    head.appendChild(el("span", "cat-name", view.server));
+    head.appendChild(el("span", "cat-why", catalogServerLine(view)));
+    block.appendChild(head);
+    if (view.error) block.appendChild(el("div", "cat-error", view.error));
+    for (const row of view.resources || []) {
+      const line = el("div", "cat-row");
+      const use = el("button", "cat-use", row.name || row.uri);
+      use.type = "button";
+      use.title = row.uri;
+      use.setAttribute("aria-label", `Read ${row.uri}`);
+      use.addEventListener("click", () => void readResource(row.uri, view.server));
+      line.appendChild(use);
+      const why = catalogRowLine(row);
+      if (why) line.appendChild(el("span", "cat-why", why));
+      block.appendChild(line);
+    }
+    for (const prompt of view.prompts || []) {
+      const line = el("div", "cat-row cat-prompt");
+      line.appendChild(el("span", "cat-name", prompt.name));
+      line.appendChild(el("span", "cat-why", promptRowLine(prompt)));
+      if (prompt.description) line.appendChild(el("span", "cat-desc", prompt.description));
+      block.appendChild(line);
+    }
+    const rows = (view.resources || []).length + (view.prompts || []).length;
+    if (!view.error && rows === 0) {
+      block.appendChild(
+        el("div", "cat-empty", view.connected ? "Nothing published." : "Not connected."),
+      );
+    }
+    if (view.resources_total > (view.resources || []).length) {
+      block.appendChild(
+        el("div", "cat-empty", `showing the first ${(view.resources || []).length} of ${view.resources_total}`),
+      );
+    }
+    host.appendChild(block);
+  }
+  const bounds = `rows up to ${report.max_rows} · a read is cut at ${report.max_text_chars} chars`;
+  panelNote("mcp-cat-msg", note ? `${note} · ${bounds}` : `${servers.length} server${servers.length === 1 ? "" : "s"} · ${bounds}`, false);
+}
+
+async function loadCatalog() {
+  try {
+    state.mcpCatalog = await invoke("mcp_catalog", { nowMs: Date.now() });
+  } catch (err) {
+    panelNote("mcp-cat-msg", String(err), true);
+    return;
+  }
+  renderCatalog();
+}
+
+async function readResource(uri, server) {
+  const picker = $("mcp-read-server");
+  const target = server || (picker ? picker.value : "");
+  const input = $("mcp-uri");
+  const requested = String(uri == null ? input.value : uri).trim();
+  // Every refusal and every failure clears the pane first: text left from an
+  // earlier read would otherwise sit under an error as if it were this read's
+  // result.
+  const out = $("mcp-read-out");
+  out.textContent = "";
+  out.hidden = true;
+  if (!target) return panelNote("mcp-read-msg", "no connected MCP server to read from", true);
+  if (!requested) return panelNote("mcp-read-msg", "a resource read needs a URI", true);
+  input.value = requested;
+  let read;
+  try {
+    read = await invoke("mcp_read_resource", {
+      server: target,
+      uri: requested,
+      nowMs: Date.now(),
+    });
+  } catch (err) {
+    panelNote("mcp-read-msg", String(err), true);
+    return;
+  }
+  state.mcpRead = read;
+  out.textContent = read.empty ? "" : read.text;
+  out.hidden = !!read.empty;
+  panelNote("mcp-read-msg", readLine(read), false);
+}
+
+/* Skills the directory holds, and the form that writes one.
+
+   The list is the loader's own reading — `instructions_chars` is the string the
+   agent receives, not the file size — so a save the loader cannot parse shows up
+   as a missing row instead of a success message next to a skill that will never
+   load. Saving clears the palette's cache: a skill the palette cannot see is one
+   the model cannot be asked to use. */
+const SKILL_MAX_BODY = 12000;
+
+function skillCapsLine(report) {
+  const r = report || {};
+  const skills = Array.isArray(r.skills) ? r.skills : [];
+  const denied = skills.filter((s) => s.denied).length;
+  const where = r.exists ? r.dir : `${r.dir} (missing — saving creates it)`;
+  const off = denied ? ` · ${denied} off for this workspace` : "";
+  return `${skills.length} skill${skills.length === 1 ? "" : "s"}${off} · ${where} · bodies up to ${r.max_body_chars || SKILL_MAX_BODY} chars`;
+}
+
+function skillLine(skill) {
+  const chars = Number(skill.instructions_chars) || 0;
+  const off = skill.denied ? " · off for this workspace" : "";
+  return `${chars} chars of instruction${off} · ${skill.path}`;
+}
+
+function renderSkillNote(text, err) {
+  panelNote("skill-note", text, err);
+}
+
+/* One translated string, with English as the fallback so a key the table has
+   not grown yet still renders a sentence rather than a key. */
+function tr(key, fallback) {
+  const api = window.Polish;
+  if (api && typeof api.t === "function") return api.t(key) || fallback;
+  return fallback;
+}
+
+/* What this chat carries, in one line.
+
+   The report belongs to one chat, so a report for a different chat is not this
+   chat's answer: switching chats must not leave the previous chat's list on
+   screen. That is why the session the report names is compared here rather than
+   trusted. */
+function skillScope(activation, openChat) {
+  if (!openChat) return null;
+  if (activation && activation.session === openChat) return activation;
+  return undefined; // a chat is open and its list has not been read yet
+}
+
+function skillScopeLine(activation, openChat) {
+  if (!openChat) return tr("skill.scopeNoChat", "Open a chat to switch a skill on for it.");
+  const report = skillScope(activation, openChat);
+  if (report === undefined) {
+    return tr("skill.scopeReading", "Reading this chat's skills…");
+  }
+  if (!report) return tr("skill.scopeNoChat", "Open a chat to switch a skill on for it.");
+  const head = report.explicit
+    ? tr("skill.scopeOwn", "This chat carries its own list")
+    : tr("skill.scopeInherit", "This chat follows the workspace");
+  const active = Array.isArray(report.active) ? report.active.length : 0;
+  const available = Array.isArray(report.available) ? report.available.length : 0;
+  return `${head} · ${active} ${tr("skill.scopeOf", "of")} ${available} ${tr(
+    "skill.scopeCount",
+    "skills",
+  )}`;
+}
+
+/* Draw the scope line and its one gesture. */
+function renderSkillScope() {
+  const line = $("skill-scope");
+  const clear = $("skill-inherit");
+  const openChat = state.activeId || "";
+  const report = skillScope(state.skillActivation, openChat);
+  if (line) line.textContent = skillScopeLine(state.skillActivation, openChat);
+  if (clear) clear.hidden = !(report && report.explicit);
+}
+
+/* Redraw everything the activation decides: the scope line *and* the rows,
+   because a toggle is a claim about the open chat and a stale one claims the
+   wrong chat's state. Before the answer arrives the rows are drawn from no
+   report at all, which disarms them rather than guessing. */
+function renderSkillState() {
+  if (state.skillsReport) renderSkills();
+  else renderSkillScope();
+}
+
+/* A chat switch makes the report stale, and a stale report is not a smaller
+   answer than no report: it is another chat's. Drop it, redraw what is left,
+   and read the new chat. */
+function forgetSkillScope() {
+  state.skillActivation = null;
+  renderSkillState();
+  loadActivation().catch(() => {});
+}
+
+function renderSkills(note) {
+  const host = $("skill-list");
+  if (!host) return;
+  const report = state.skillsReport || {};
+  const skills = Array.isArray(report.skills) ? report.skills : [];
+  const caps = skillCapsLine(report);
+  renderSkillNote(note ? `${note} · ${caps}` : caps, false);
+  renderSkillScope();
+  host.textContent = "";
+  if (!skills.length) {
+    host.appendChild(el("div", "skill-empty", "No skills in this directory yet."));
+    return;
+  }
+  const openChat = state.activeId || "";
+  const activation = skillScope(state.skillActivation, openChat);
+  const known = activation !== undefined && !!activation;
+  const carried = known && Array.isArray(activation.active) ? activation.active : [];
+  for (const skill of skills) {
+    const row = el("div", "skill-row");
+    row.appendChild(el("span", "skill-name", skill.name));
+    row.appendChild(el("span", "skill-why", skillLine(skill)));
+    if (skill.description) row.appendChild(el("span", "skill-desc", skill.description));
+    const use = el("button", "btn skill-use", "Use");
+    use.type = "button";
+    use.setAttribute("aria-label", `Use the ${skill.name} skill`);
+    use.addEventListener("click", () => useSkill(skill.name));
+    row.appendChild(use);
+    // The chat's own switch. A workspace that switched the skill off is a
+    // floor, so the control is present and disabled rather than absent: the
+    // reason is then readable instead of the row silently having no control.
+    const on = carried.includes(skill.name);
+    const toggle = el(
+      "button",
+      "btn btn-ghost skill-toggle",
+      known
+        ? on
+          ? tr("skill.on", "On in this chat")
+          : tr("skill.off", "Off in this chat")
+        : tr("skill.onAria", "In this chat"),
+    );
+    toggle.type = "button";
+    toggle.setAttribute("aria-pressed", on ? "true" : "false");
+    toggle.setAttribute("aria-label", `${tr("skill.onAria", "In this chat")}: ${skill.name}`);
+    toggle.disabled = !openChat || !known || !!skill.denied;
+    toggle.title = !openChat
+      ? tr("skill.scopeNoChat", "Open a chat to switch a skill on for it.")
+      : !known
+        ? tr("skill.scopeReading", "Reading this chat's skills…")
+        : skill.denied
+          ? tr("skill.toggleDenied", "This workspace switched the skill off.")
+          : "";
+    toggle.addEventListener("click", () => void setSkillActive(skill.name, !on));
+    row.appendChild(toggle);
+    host.appendChild(row);
+  }
+}
+
+/* Switch one skill on or off for the open chat.
+
+   The set the agent carries changes, so the palette's cached capability list is
+   dropped: it is the same cache `saveSkill` drops, for the same reason. */
+async function setSkillActive(name, on) {
+  const session = state.activeId || "";
+  if (!session) {
+    renderSkillNote(tr("skill.scopeNoChat", "Open a chat to switch a skill on for it."), true);
+    return;
+  }
+  try {
+    state.skillActivation = await invoke("skill_set_active", {
+      session,
+      name,
+      active: on,
+      nowMs: Date.now(),
+    });
+  } catch (err) {
+    renderSkillNote(String(err), true);
+    return;
+  }
+  state.skills = [];
+  renderSkills();
+}
+
+/* Forget the chat's own list, so it follows the workspace again. */
+async function inheritSkills() {
+  const session = state.activeId || "";
+  if (!session) return;
+  try {
+    state.skillActivation = await invoke("skill_inherit", { session, nowMs: Date.now() });
+  } catch (err) {
+    renderSkillNote(String(err), true);
+    return;
+  }
+  state.skills = [];
+  renderSkills();
+}
+
+/* Ask what the open chat carries. No chat, no round trip: the command refuses
+   an empty session on purpose, and the pane has its own answer for that. */
+async function loadActivation() {
+  const session = state.activeId || "";
+  if (!session) {
+    state.skillActivation = null;
+    renderSkillState();
+    return;
+  }
+  try {
+    state.skillActivation = await invoke("skill_activation", { session, nowMs: Date.now() });
+  } catch (err) {
+    state.skillActivation = null;
+    renderSkillState();
+    renderSkillNote(String(err), true);
+    return;
+  }
+  renderSkillState();
+}
+
+/* Prefill the composer the way the palette does, so invoking a skill is one
+   gesture from the row that names it. */
+function useSkill(name) {
+  input.value = `Use the ${name} skill: `;
+  input.focus();
+  autosize();
+  renderSend();
+}
+
+async function loadSkills() {
+  try {
+    state.skillsReport = await invoke("skill_list", { nowMs: Date.now() });
+  } catch (err) {
+    renderSkillNote(String(err), true);
+    return;
+  }
+  await loadActivation();
+}
+
+async function saveSkill() {
+  const name = $("skill-name").value;
+  const description = $("skill-desc").value;
+  const body = $("skill-body").value;
+  if (!name.trim()) return renderSkillNote("a skill needs a name", true);
+  if (!description.trim()) return renderSkillNote("a skill needs a one-line description", true);
+  if (!body.trim()) return renderSkillNote("a skill needs a body — the instruction the agent follows", true);
+  const overwrite = $("skill-overwrite").checked;
+  try {
+    state.skillsReport = await invoke("skill_author", {
+      name,
+      description,
+      body,
+      overwrite,
+      nowMs: Date.now(),
+    });
+  } catch (err) {
+    renderSkillNote(String(err), true);
+    return;
+  }
+  state.skills = [];
+  $("skill-name").value = "";
+  $("skill-desc").value = "";
+  $("skill-body").value = "";
+  $("skill-overwrite").checked = false;
+  // The save answer is this directory's new listing, but it says nothing about
+  // what the open chat carries: without this read, a skill authored a moment
+  // ago draws as "Off in this chat" (and the scope counts are the old ones),
+  // because the activation on screen was measured against the older directory.
+  await loadActivation();
+  renderSkills(`saved ${name.trim()}`);
+  // The pane's own capability list is a second reading of the same directory.
+  void loadCapabilities();
 }
 
 /* Counts, abbreviated, because the status bar is a glance and not a ledger. */
@@ -3110,7 +4196,11 @@ async function restoreTrashed(id) {
     const title = await invoke("restore_session", { id });
     toast(`Restored “${title}”`);
     await loadTrash();
+    // refreshSessions updates the list but never repaints the sidebar by
+    // design (that is reloadSessionList's job), so the restored row needs an
+    // explicit render — the same treatment deleteSession gives its list.
     await refreshSessions();
+    renderAll();
   } catch (err) {
     toast(`Restore failed: ${err}`);
   }
@@ -3136,6 +4226,8 @@ async function purgeTrash() {
 async function openSettings() {
   state.settingsOpener = document.activeElement;
   loadMemories();
+  void loadSchedule();
+  void loadKnowledge();
   void loadTrash();
   try {
     const s = await invoke("get_settings");
@@ -3181,6 +4273,7 @@ async function openSettings() {
   modal.classList.remove("hidden");
   setModel.focus();
   loadCapabilities();
+  loadSkills();
 }
 
 function closeSettings() {
@@ -3325,7 +4418,9 @@ function renderMcp() {
     head.appendChild(el("span", "mcp-tag", entry.transport));
     const st = mcpStatusFor(entry.name);
     if (st && st.connected) {
-      head.appendChild(el("span", "mcp-badge ok", `${st.tools} tool${st.tools === 1 ? "" : "s"}`));
+      // The count is what the agent actually has, so a policy that removed a
+      // tool has to show here too: "2 tool" would hide the rule that decided it.
+      head.appendChild(el("span", "mcp-badge ok", mcpToolsLine(st)));
     } else if (st && st.error) {
       head.appendChild(el("span", "mcp-badge bad", "failed"));
     } else if (st && state.mcpStatus && state.mcpStatus.connecting) {
@@ -3365,6 +4460,19 @@ function updateMcpButton() {
       : "Reconnect every enabled server";
 }
 
+/* What one connected server contributes: the tools it kept, and — when the
+   policy removed some — how many it advertised, so the badge cannot claim a
+   server is fully attached while the policy pane says otherwise. */
+function mcpToolsLine(status) {
+  const names = status.tool_names || [];
+  if (!names.length) return `${status.tools} tool${status.tools === 1 ? "" : "s"}`;
+  return serverToolLine({
+    attached: status.tools,
+    denied: names.length - status.tools,
+    tools: names,
+  });
+}
+
 function mcpStatusLabel(rep) {
   if (!rep.servers || !rep.servers.length) return "";
   if (rep.connecting) return "connecting…";
@@ -3372,6 +4480,168 @@ function mcpStatusLabel(rep) {
   const failed = enabled.filter((s) => !s.connected);
   if (failed.length) return `${enabled.length - failed.length}/${enabled.length} connected`;
   return `${enabled.length} connected`;
+}
+
+/* The per-tool policy. What it prints is the decision the backend made — the
+   rule that decided a tool, or the default — so the pane never re-derives a
+   meaning that could drift from the one being enforced. */
+function effectLabel(effect) {
+  if (effect === "deny") return "Deny";
+  if (effect === "ask") return "Ask";
+  return "Allow";
+}
+
+function policyReason(by) {
+  return !by || by === "default" ? "follows the default" : `by rule ${by}`;
+}
+
+function policyLine(report) {
+  if (!report) return "";
+  const total = (report.servers || []).reduce((n, s) => n + (s.tools || []).length, 0);
+  const parts = [
+    `${report.attached} of ${total} tools attached`,
+    `${report.denied} denied`,
+    `${report.asked} ask`,
+    `${report.rules.length} of ${report.max_rules} rules`,
+    `default ${String(report.default)}`,
+  ];
+  if (report.file_version !== report.expected_version) {
+    parts.push(
+      `this file is version ${report.file_version}, this build writes ${report.expected_version}`,
+    );
+  }
+  return parts.join(" · ");
+}
+
+function serverToolLine(server) {
+  const total = (server.tools || []).length;
+  return total === server.attached
+    ? `${server.attached} tool${server.attached === 1 ? "" : "s"}`
+    : `${server.attached} of ${total} tools · ${server.denied} denied`;
+}
+
+function policyNote(text, err) {
+  const host = $("pol-msg");
+  host.textContent = text;
+  host.classList.toggle("err", Boolean(err));
+}
+
+async function setPolicy(server, tool, effect) {
+  try {
+    state.mcpPolicy = await invoke("mcp_policy_set", { server, tool, effect, nowMs: Date.now() });
+    renderPolicy();
+    // The server badge counts what is attached, so denying a tool has to be
+    // visible there too — one decision, two surfaces that must agree.
+    await refreshMcpStatus();
+  } catch (err) {
+    policyNote(String(err), true);
+  }
+}
+
+async function clearPolicyRule(server, tool) {
+  try {
+    state.mcpPolicy = await invoke("mcp_policy_clear", { server, tool, nowMs: Date.now() });
+    renderPolicy();
+    await refreshMcpStatus();
+  } catch (err) {
+    policyNote(String(err), true);
+  }
+}
+
+async function setPolicyDefault(effect) {
+  try {
+    state.mcpPolicy = await invoke("mcp_policy_default", { effect, nowMs: Date.now() });
+    renderPolicy();
+    await refreshMcpStatus();
+  } catch (err) {
+    policyNote(String(err), true);
+  }
+}
+
+async function addPolicyRule() {
+  const server = $("pol-server").value.trim();
+  const tool = $("pol-tool").value.trim();
+  if (!server || !tool) {
+    policyNote("a rule needs a server and a tool (use * to match any)", true);
+    return;
+  }
+  await setPolicy(server, tool, $("pol-effect").value);
+  $("pol-server").value = "";
+  $("pol-tool").value = "";
+  policyNote(`Rule saved: ${server}/${tool} → ${effectLabel($("pol-effect").value)}.`, false);
+}
+
+function policyToolRow(server, tool) {
+  const row = el("div", "pol-row");
+  const head = el("div", "pol-head");
+  head.appendChild(el("span", "pol-name", tool.name));
+  head.appendChild(el("span", "pol-why", policyReason(tool.by)));
+  row.appendChild(head);
+  const group = el("div", "pol-eff");
+  for (const effect of ["allow", "ask", "deny"]) {
+    const button = el(
+      "button",
+      `btn pol-btn${tool.effect === effect ? " on" : ""}${effect === "deny" ? " danger" : ""}`,
+      effectLabel(effect),
+    );
+    button.type = "button";
+    button.setAttribute("aria-pressed", String(tool.effect === effect));
+    button.setAttribute("aria-label", `${effectLabel(effect)} ${server}/${tool.name}`);
+    button.addEventListener("click", () => void setPolicy(server, tool.name, effect));
+    group.appendChild(button);
+  }
+  row.appendChild(group);
+  return row;
+}
+
+function renderPolicy() {
+  const servers = $("pol-servers");
+  const rules = $("pol-rules");
+  servers.textContent = "";
+  rules.textContent = "";
+  const report = state.mcpPolicy;
+  if (!report) return;
+  $("pol-default").value = report.default;
+  policyNote(policyLine(report), false);
+
+  for (const server of report.servers || []) {
+    const block = el("div", "pol-server");
+    const head = el("div", "pol-head");
+    head.appendChild(el("span", "pol-name", server.name));
+    head.appendChild(el("span", "pol-why", serverToolLine(server)));
+    block.appendChild(head);
+    for (const tool of server.tools || []) block.appendChild(policyToolRow(server.name, tool));
+    servers.appendChild(block);
+  }
+  if (!(report.servers || []).length) {
+    servers.appendChild(
+      el("div", "pol-empty", "No server is connected, so there are no tools to decide about."),
+    );
+  }
+
+  for (const rule of report.rules || []) {
+    const row = el("div", "pol-rule");
+    row.appendChild(el("span", "pol-name", `${rule.server}/${rule.tool}`));
+    row.appendChild(el("span", "pol-why", effectLabel(rule.effect)));
+    const clear = el("button", "btn pol-clear", "Clear");
+    clear.type = "button";
+    clear.setAttribute("aria-label", `Clear rule ${rule.server}/${rule.tool}`);
+    clear.addEventListener("click", () => void clearPolicyRule(rule.server, rule.tool));
+    row.appendChild(clear);
+    rules.appendChild(row);
+  }
+  if (!(report.rules || []).length) {
+    rules.appendChild(el("div", "pol-empty", "No rule yet: every tool follows the default."));
+  }
+}
+
+async function loadPolicy() {
+  try {
+    state.mcpPolicy = await invoke("mcp_policy_status", { nowMs: Date.now() });
+    renderPolicy();
+  } catch (err) {
+    policyNote(String(err), true);
+  }
 }
 
 async function refreshMcpStatus() {
@@ -3531,6 +4801,16 @@ function addProvider() {
 
 provAddBtn.addEventListener("click", addProvider);
 
+$("pol-add").addEventListener("click", () => void addPolicyRule());
+$("pol-default").addEventListener("change", (ev) => void setPolicyDefault(ev.target.value));
+for (const id of ["pol-server", "pol-tool"]) {
+  $(id).addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      void addPolicyRule();
+    }
+  });
+}
 $("mcp-reconnect-btn").addEventListener("click", async () => {
   const btn = $("mcp-reconnect-btn");
   if (btn.disabled) return;
@@ -3576,7 +4856,61 @@ modal.addEventListener("click", (e) => {
   if (e.target === modal) closeSettings();
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !modal.classList.contains("hidden")) closeSettings();
+  if (e.key !== "Escape") return;
+  // The menu first: it sits above the dialog it may have been opened from, and
+  // one Escape should close one thing.
+  if (closeRowMenu(true)) return;
+  // Add-workspace sits above the sidebar but is a dialog of its own, and it is
+  // checked before Settings so an Escape meant for it is not spent on a modal
+  // that is not even open.
+  if (addWorkspaceOpen()) return void closeAddWorkspace();
+  if (!modal.classList.contains("hidden")) closeSettings();
+});
+
+/* A click anywhere else, or a scroll of the list, drops an open row menu: it is
+   anchored to a row that may move under it, and a menu that outlives its anchor
+   points at the wrong chat. */
+document.addEventListener("click", (e) => {
+  if (rowMenu && !rowMenu.menu.contains(e.target)) closeRowMenu(false);
+});
+sessionList.addEventListener("scroll", () => closeRowMenu(false), { passive: true });
+window.addEventListener("resize", () => closeRowMenu(false));
+
+/* A keystroke belongs to a field when it is text input there. The chords below
+   are the reference sidebar's, and they name the *open* chat: there is nothing
+   to rename, fork, archive or pin when no chat is open. */
+function fieldOwnsKeystroke(target) {
+  if (!target) return false;
+  if (target.isContentEditable === true) return true;
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+  if (fieldOwnsKeystroke(e.target)) return;
+  const key = (e.key || "").toLowerCase();
+  if (e.shiftKey && key === "a") {
+    const s = activeSession();
+    if (!s) return;
+    e.preventDefault();
+    void setArchived(s.id, !s.archived);
+    return;
+  }
+  if (e.shiftKey) return;
+  if (key === "n") {
+    e.preventDefault();
+    void newChat();
+  } else if (key === "g") {
+    const s = activeSession();
+    if (!s) return;
+    e.preventDefault();
+    startRename(s.id);
+  } else if (key === "f") {
+    const s = activeSession();
+    if (!s) return;
+    e.preventDefault();
+    void forkChat(s.id);
+  }
 });
 
 /* A labelled checkbox for the workspace form. */
@@ -3962,7 +5296,7 @@ listen("stream-finished", async (event) => {
   clearApprovals(p.session_id);
   try {
     const fresh = await invoke("load_session", { id: p.session_id });
-    state.cache[p.session_id] = fresh;
+    state.cache[p.session_id] = reuseIdentical(state.cache[p.session_id], fresh);
   } catch (_) {
     delete state.cache[p.session_id];
   }
@@ -4002,7 +5336,8 @@ listen("compact-finished", async (event) => {
   state.toolCount = 0;
   try {
     if (state.cache[p.session_id]) {
-      state.cache[p.session_id] = await invoke("load_session", { id: p.session_id });
+      const fresh = await invoke("load_session", { id: p.session_id });
+      state.cache[p.session_id] = reuseIdentical(state.cache[p.session_id], fresh);
     }
   } catch (_) {
     delete state.cache[p.session_id];
@@ -4090,6 +5425,14 @@ async function openHit(hit) {
 async function loadMemories() {
   try {
     state.memories = await invoke("list_memories", { sessionId: state.activeId });
+    // The status is an explanation, not the content: if it cannot load, the pane
+    // still lists what is remembered, so this failure stays quiet while the list's
+    // own failure stays loud.
+    try {
+      state.memoryStatus = await invoke("memory_status");
+    } catch (err) {
+      state.memoryStatus = null;
+    }
     renderMemories();
   } catch (err) {
     renderMemoryNote(String(err));
@@ -4129,14 +5472,33 @@ function renderMemoryNote(text) {
   host.appendChild(el("div", "ws-form-hint", text));
 }
 
+function memoryStatusLine(status, keptCount) {
+  if (!status) return "";
+  if (!status.enabled) return "Memory is switched off for this workspace.";
+  const shared =
+    status.shared_workspaces > 1
+      ? `shared by ${status.shared_workspaces} workspaces`
+      : "its own file";
+  // The count comes from the rows on screen, not from the status: the list is
+  // what the user can check, and it is refreshed by every add and forget.
+  const kept = `${keptCount} of ${status.cap} kept`;
+  const full = keptCount >= status.cap ? " — at the cap, so the oldest memory goes next" : "";
+  return `${status.path} · ${shared} · ${kept}${full}`;
+}
+
 function renderMemories() {
   const host = $("mem-items");
   if (!host) return;
   host.textContent = "";
-  // Whose memory this is. The store follows the workspace, so a list without an
-  // owner line is a list that cannot be checked against the right file.
+  // Whose memory this is — and on the line below it, which file backs it, since
+  // the default file is shared by every workspace rather than owned by one.
   const owner = state.workspaces.find((w) => w.id === state.activeWorkspace);
   host.appendChild(el("div", "ws-head", `Memory for ${owner ? owner.name : "this workspace"}`));
+  // The head names the workspace; this names the *file* and who else lands on
+  // it, which is the part a workspace label cannot be trusted to imply.
+  host.appendChild(
+    el("div", "ws-form-hint", memoryStatusLine(state.memoryStatus, state.memories.length)),
+  );
   if (!state.memories.length) {
     host.appendChild(el("div", "ws-form-hint", "Nothing remembered yet."));
     return;
@@ -4154,6 +5516,360 @@ function renderMemories() {
     });
     row.appendChild(forget);
     host.appendChild(row);
+  }
+}
+
+/* ---- Schedule: durable reminders (M11) ----------------------------------
+   The store is Rust-side and durable; this side owns the clock and the pane.
+   A reminder is either "in N minutes, once" or "every N minutes", and the
+   interval is the only number either needs. The tick runs whether or not the
+   pane is open — a reminder that only fires while you are looking at its list
+   is not a reminder — and a closed pane costs no DOM work per tick. */
+
+/* Deliveries are checked this often. Far finer than the one-minute minimum a
+   repeat may have, and one command per interval. */
+const SCHEDULE_TICK_MS = 30000;
+
+/* The due time inside a cadence, read the same way the report carries it. */
+function scheduleDue(cadence) {
+  if (!cadence) return 0;
+  return cadence.kind === "once"
+    ? Number(cadence.at_ms) || 0
+    : Number(cadence.next_ms) || 0;
+}
+
+/* How often, in the fewest words that stay exact. */
+function cadenceText(cadence) {
+  if (!cadence) return "";
+  if (cadence.kind === "once") return "once";
+  const minutes = Number(cadence.every_minutes) || 0;
+  return minutes === 1 ? "every minute" : `every ${minutes} min`;
+}
+
+/* How long until a due time. Past due says so: a reminder waiting for the next
+   tick has not become "in 0 min", and a long gap uses the coarse unit. */
+function untilText(dueMs, nowMs) {
+  const delta = (Number(dueMs) || 0) - (Number(nowMs) || 0);
+  if (delta <= 0) return "due now";
+  const minutes = Math.round(delta / 60000);
+  if (minutes < 1) return "due now";
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `in ${hours} h`;
+  return `in ${Math.round(hours / 24)} d`;
+}
+
+/* One reminder: what it says, how often, when next, and how often it has run. */
+function scheduleLine(schedule, nowMs) {
+  if (!schedule) return "";
+  const parts = [schedule.text, cadenceText(schedule.cadence)];
+  parts.push(untilText(scheduleDue(schedule.cadence), nowMs));
+  if (schedule.fired) parts.push(`delivered ${schedule.fired}×`);
+  return parts.filter(Boolean).join(" · ");
+}
+
+/* One delivery. `at_ms` is when it was due and `noticed_ms` when a tick caught
+   it, so a late delivery says how late instead of pretending it was on time. */
+function deliveryLine(delivery) {
+  if (!delivery) return "";
+  const at = new Date(Number(delivery.at_ms) || 0);
+  const when = Number.isNaN(at.getTime()) ? "" : at.toLocaleString();
+  const late = (Number(delivery.noticed_ms) || 0) - (Number(delivery.at_ms) || 0);
+  const lateText = late >= 60000 ? ` · ${Math.round(late / 60000)} min late` : "";
+  return `${delivery.text} · ${when}${lateText}`;
+}
+
+/* The bounds, stated where they apply — the same reasoning as the memory pane's
+   status line: a cap nobody can see is a cap that surprises someone. */
+function scheduleCapsLine(report) {
+  const caps = (report && report.caps) || null;
+  if (!caps) return "";
+  const reminders = ((report && report.schedules) || []).length;
+  const kept = ((report && report.history) || []).length;
+  const atCap = reminders >= caps.max_schedules ? " — at the cap, cancel one first" : "";
+  return `${reminders} of ${caps.max_schedules} reminders${atCap} · ${kept} of ${
+    caps.max_history
+  } deliveries kept · a repeat needs at least ${caps.min_every_minutes} min`;
+}
+
+/* Whether the pane is on screen: open Settings, on the Schedule tab. */
+function schedulePaneOpen() {
+  const pane = $("schedule-section");
+  return !!pane && pane.classList.contains("active") && !pane.closest("[hidden]");
+}
+
+function renderScheduleNote(text) {
+  panelNote("sched-note", text, true);
+}
+
+function renderSchedule() {
+  const list = $("sched-items");
+  const history = $("sched-history");
+  if (!list || !history) return;
+  const report = state.schedule;
+  const nowMs = Number((report && report.now_ms) || 0) || Date.now();
+  const schedules = (report && report.schedules) || [];
+  const deliveries = (report && report.history) || [];
+  list.textContent = "";
+  history.textContent = "";
+  const count = $("sched-count");
+  if (count) count.textContent = schedules.length ? `${schedules.length} scheduled` : "";
+  if (!schedules.length) {
+    list.appendChild(el("li", "cap-note", "Nothing scheduled yet."));
+  }
+  for (const schedule of schedules) {
+    const row = el("li", "rule-row");
+    row.appendChild(el("span", "sched-text", scheduleLine(schedule, nowMs)));
+    row.appendChild(el("span", "sched-id", schedule.id));
+    const cancel = el("button", "btn btn-ghost", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", (e) => {
+      e.preventDefault();
+      cancelSchedule(schedule.id);
+    });
+    row.appendChild(cancel);
+    list.appendChild(row);
+  }
+  if (!deliveries.length) {
+    history.appendChild(el("li", "cap-note", "Nothing delivered yet."));
+  }
+  for (const delivery of deliveries) {
+    const row = el("li", "rule-row");
+    row.appendChild(el("span", "sched-text", deliveryLine(delivery)));
+    history.appendChild(row);
+  }
+  panelNote("sched-note", scheduleCapsLine(report), false);
+}
+
+async function loadSchedule() {
+  try {
+    state.schedule = await invoke("schedule_list", { nowMs: Date.now() });
+    renderSchedule();
+  } catch (err) {
+    renderScheduleNote(String(err));
+  }
+}
+
+/* Deliver what is due. `report.fired` is exactly what this tick delivered, so a
+   reminder that was overdue while the app was closed is announced once — and
+   the 200 deliveries already in the store are history, not a backlog of
+   notifications. */
+async function tickSchedule() {
+  try {
+    const report = await invoke("schedule_tick", { nowMs: Date.now() });
+    for (const delivery of (report && report.fired) || []) {
+      toast(`Reminder: ${delivery.text}`);
+    }
+    state.schedule = report;
+    if (schedulePaneOpen()) renderSchedule();
+  } catch (_) {
+    // A tick that cannot reach the store is not worth a message every interval;
+    // opening the pane reports the same failure where there is room to read it.
+  }
+}
+
+/* The interval, rounded, and refused here so the round trip is not spent on a
+   value the store will reject. The store enforces it too. */
+function reminderMinutes() {
+  const field = $("sched-every");
+  const minutes = Math.round(Number(field && field.value));
+  if (!Number.isFinite(minutes) || minutes < 1) {
+    renderScheduleNote("a repeating reminder needs at least 1 minute between deliveries");
+    return 0;
+  }
+  return minutes;
+}
+
+async function addSchedule() {
+  const field = $("sched-text");
+  const text = field ? field.value : "";
+  if (!text.trim()) {
+    renderScheduleNote("a reminder needs some text");
+    return;
+  }
+  const minutes = reminderMinutes();
+  if (!minutes) return;
+  const once = ($("sched-mode") || {}).value === "once";
+  const nowMs = Date.now();
+  try {
+    state.schedule = await invoke("schedule_add", {
+      text,
+      everyMinutes: once ? null : minutes,
+      atMs: once ? nowMs + minutes * 60000 : null,
+      nowMs,
+    });
+    if (field) field.value = "";
+    renderSchedule();
+  } catch (err) {
+    renderScheduleNote(String(err));
+  }
+}
+
+async function cancelSchedule(id) {
+  try {
+    state.schedule = await invoke("schedule_cancel", { id, nowMs: Date.now() });
+    renderSchedule();
+  } catch (err) {
+    renderScheduleNote(String(err));
+  }
+}
+
+async function clearScheduleHistory() {
+  try {
+    state.schedule = await invoke("schedule_clear_history", { nowMs: Date.now() });
+    renderSchedule();
+  } catch (err) {
+    renderScheduleNote(String(err));
+  }
+}
+
+/* The knowledge pane (§21). The store is durable and the agent reaches it
+   through a tool, so this pane is the curator: search the notes, add one, edit
+   an entry in place, delete one. Every command answers with the entries as they
+   stand, so one render draws them all — and the bounds come from the backend,
+   because a cap nobody can see surprises someone. */
+const KB_SEARCH_LIMIT = 20;
+
+function sinceText(ms, nowMs) {
+  const delta = Number(nowMs) - Number(ms);
+  if (!Number.isFinite(delta) || delta < 60000) return "just now";
+  const minutes = Math.round(delta / 60000);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} h ago`;
+  return `${Math.round(hours / 24)} d ago`;
+}
+
+function kbBodyPreview(body) {
+  const text = String(body || "").replace(/\s+/g, " ").trim();
+  return text.length > 200 ? `${text.slice(0, 199)}…` : text;
+}
+
+function kbCapsLine(report) {
+  const caps = (report && report.caps) || null;
+  if (!caps) return "";
+  const total = Number(report.total) || 0;
+  const full = total >= caps.max_entries ? " — at the cap, delete one first" : "";
+  return `${total} of ${caps.max_entries} entries${full} · titles ${caps.max_title_chars} chars · bodies ${caps.max_body_chars} · search returns ${Math.min(
+    KB_SEARCH_LIMIT,
+    caps.tool_max_limit,
+  )} at most`;
+}
+
+function renderKnowledgeNote(text, err) {
+  panelNote("kb-note", text, err);
+}
+
+function renderKnowledge() {
+  const host = $("kb-items");
+  if (!host) return;
+  host.textContent = "";
+  const report = state.knowledge || {};
+  const matches = Array.isArray(report.matches) ? report.matches : [];
+  const nowMs = Date.now();
+  renderKnowledgeNote(kbCapsLine(report), false);
+  if (!matches.length) {
+    const query = String(report.query || "").trim();
+    host.appendChild(
+      el(
+        "div",
+        "ws-form-hint",
+        query ? `Nothing matches “${query}”.` : "No knowledge yet — add the first note below.",
+      ),
+    );
+    return;
+  }
+  for (const entry of matches) {
+    const row = el("div", "kb-row");
+    row.dataset.id = entry.id;
+    const head = el("div", "kb-head");
+    head.appendChild(el("span", "kb-title", entry.title));
+    const tags = (entry.tags || []).join(" · ");
+    if (tags) head.appendChild(el("span", "kb-tagline", tags));
+    head.appendChild(el("span", "kb-when", `edited ${sinceText(entry.updated_ms, nowMs)}`));
+    const edit = el("button", "btn kb-edit", "Edit");
+    edit.type = "button";
+    edit.addEventListener("click", () => startKnowledgeEdit(entry));
+    const del = el("button", "btn kb-del", "Delete");
+    del.type = "button";
+    del.addEventListener("click", () => void deleteKnowledge(entry.id));
+    head.appendChild(edit);
+    head.appendChild(del);
+    row.appendChild(head);
+    const body = el("div", "kb-body-view", kbBodyPreview(entry.body));
+    if (entry.body) body.title = entry.body;
+    row.appendChild(body);
+    host.appendChild(row);
+  }
+}
+
+async function loadKnowledge() {
+  const field = $("kb-query");
+  const query = field ? field.value.trim() : "";
+  try {
+    state.knowledge = query
+      ? await invoke("knowledge_search", { query, limit: KB_SEARCH_LIMIT, nowMs: Date.now() })
+      : await invoke("knowledge_list", { nowMs: Date.now() });
+    renderKnowledge();
+  } catch (err) {
+    renderKnowledgeNote(String(err), true);
+  }
+}
+
+function startKnowledgeEdit(entry) {
+  state.kbEditing = entry.id;
+  $("kb-title").value = entry.title;
+  $("kb-tags").value = (entry.tags || []).join(", ");
+  $("kb-body").value = entry.body || "";
+  const save = $("kb-save");
+  save.textContent = "Save";
+  save.dataset.i18n = "kb.save";
+  $("kb-cancel").hidden = false;
+  renderKnowledgeNote(`Editing “${entry.title}”.`, false);
+}
+
+function cancelKnowledgeEdit() {
+  state.kbEditing = null;
+  $("kb-title").value = "";
+  $("kb-tags").value = "";
+  $("kb-body").value = "";
+  const save = $("kb-save");
+  save.textContent = "Add";
+  save.dataset.i18n = "kb.add";
+  $("kb-cancel").hidden = true;
+  renderKnowledgeNote("", false);
+}
+
+async function saveKnowledge() {
+  const title = $("kb-title").value;
+  const tags = $("kb-tags").value;
+  const body = $("kb-body").value;
+  if (!title.trim()) {
+    renderKnowledgeNote("a knowledge entry needs a title", true);
+    return;
+  }
+  const editing = state.kbEditing;
+  try {
+    const args = { title, tags, body, nowMs: Date.now() };
+    const report = editing
+      ? await invoke("knowledge_update", { id: editing, ...args })
+      : await invoke("knowledge_add", args);
+    state.knowledge = report;
+    cancelKnowledgeEdit();
+    if (editing) await loadKnowledge();
+    else renderKnowledge();
+  } catch (err) {
+    renderKnowledgeNote(String(err), true);
+  }
+}
+
+async function deleteKnowledge(id) {
+  try {
+    state.knowledge = await invoke("knowledge_delete", { id, nowMs: Date.now() });
+    if (state.kbEditing === id) cancelKnowledgeEdit();
+    renderKnowledge();
+  } catch (err) {
+    renderKnowledgeNote(String(err), true);
   }
 }
 
@@ -4236,8 +5952,27 @@ function renderWorkspaceManager() {
 }
 
 function focusSection(sectionId) {
-  const target = document.getElementById(sectionId);
-  if (target) target.scrollIntoView({ block: "start" });
+  // Settings shows one pane at a time, so "focusing" a section means selecting
+  // it: the rail's tab and the pane are two views of the same choice.
+  let target = null;
+  document.querySelectorAll(".set-pane").forEach((pane) => {
+    const on = pane.id === sectionId;
+    pane.classList.toggle("active", on);
+    if (on) target = pane;
+  });
+  document.querySelectorAll(".set-tab").forEach((tab) => {
+    const on = tab.dataset.section === sectionId;
+    tab.classList.toggle("active", on);
+    tab.setAttribute("aria-selected", String(on));
+    tab.tabIndex = on ? 0 : -1;
+  });
+  if (target) {
+    target.scrollIntoView({ block: "start" });
+    return;
+  }
+  // A fixture (or older markup) may still hand over a plain element.
+  const plain = document.getElementById(sectionId);
+  if (plain) plain.scrollIntoView({ block: "start" });
 }
 
 function navTo(sectionId) {
@@ -4250,8 +5985,105 @@ document.querySelectorAll(".set-tab").forEach((tab) => {
   tab.addEventListener("click", () => focusSection(tab.dataset.section));
 });
 
+// Fixtures render a bare subset of the markup, so both bindings are optional:
+// a missing element must not take the whole module down with it.
+const settingsClose = $("settings-close");
+if (settingsClose) settingsClose.addEventListener("click", closeSettings);
+
+// The rail is a vertical tablist: arrows walk it, Home/End jump to the ends.
+const settingsNav = document.querySelector(".set-nav");
+if (settingsNav) settingsNav.addEventListener("keydown", (ev) => {
+  const steps = { ArrowDown: 1, ArrowUp: -1 };
+  const tabs = [...document.querySelectorAll(".set-tab")];
+  const at = tabs.findIndex((tab) => tab.classList.contains("active"));
+  if (tabs.length === 0) return;
+  if (ev.key === "Home") {
+    ev.preventDefault();
+    focusSection(tabs[0].dataset.section);
+    tabs[0].focus();
+    return;
+  }
+  if (ev.key === "End") {
+    ev.preventDefault();
+    const last = tabs[tabs.length - 1];
+    focusSection(last.dataset.section);
+    last.focus();
+    return;
+  }
+  if (!(ev.key in steps)) return;
+  const next = at < 0 ? 0 : (at + steps[ev.key] + tabs.length) % tabs.length;
+  ev.preventDefault();
+  focusSection(tabs[next].dataset.section);
+  tabs[next].focus();
+});
+
+/* The Add-a-workspace dialog's own controls. The folder browser starts at home
+   when it has no path, which is what an empty `list_folder` argument means. */
+const wsAddModal = $("ws-add");
+if (wsAddModal) {
+  $("ws-add-create").addEventListener("click", () => void submitAddWorkspace());
+  $("ws-add-cancel").addEventListener("click", () => closeAddWorkspace());
+  $("ws-add-name").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      $("ws-add-root").focus();
+    }
+  });
+  $("ws-add-root").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void submitAddWorkspace();
+    }
+  });
+  $("ws-add-browse").addEventListener("click", () => {
+    const host = $("ws-add-browser");
+    const reveal = host.classList.contains("hidden");
+    host.classList.toggle("hidden", !reveal);
+    $("ws-add-browse").setAttribute("aria-expanded", String(reveal));
+    if (reveal) void browseFolder($("ws-add-root").value.trim());
+  });
+  $("ws-browse-up").addEventListener("click", () => {
+    if (state.wsBrowse && state.wsBrowse.parent) void browseFolder(state.wsBrowse.parent);
+  });
+  $("ws-browse-use").addEventListener("click", () => {
+    if (!state.wsBrowse || !state.wsBrowse.path) return;
+    $("ws-add-root").value = state.wsBrowse.path;
+    $("ws-add-browser").classList.add("hidden");
+    $("ws-add-browse").setAttribute("aria-expanded", "false");
+    // The name starts empty and is optional, so the folder's own name is only
+    // *suggested* — never forced — and only while the field is still untouched.
+    if (!$("ws-add-name").value.trim()) {
+      const parts = state.wsBrowse.path.split("/").filter(Boolean);
+      $("ws-add-name").value = parts.length ? parts[parts.length - 1] : "";
+    }
+    $("ws-add-err").textContent = "";
+    $("ws-add-name").focus();
+  });
+  // A click on the backdrop dismisses, the same gesture the other dialogs take.
+  wsAddModal.addEventListener("click", (e) => {
+    if (e.target === wsAddModal) closeAddWorkspace();
+  });
+}
+
 $("nav-plugins").addEventListener("click", () => navTo("cap-list"));
-$("nav-mcp").addEventListener("click", () => navTo("mcp-list"));
+$("nav-mcp").addEventListener("click", () => navTo("set-mcp"));
+
+// The Workspaces header: reveal the search field, re-read the chat list, or go
+// add a workspace. The search field stays out of the way until it is asked for.
+$("sessions-search").addEventListener("click", () => {
+  const field = $("session-search");
+  const reveal = field.hidden;
+  field.hidden = !reveal;
+  $("side-workspaces").classList.toggle("searching", reveal);
+  $("sessions-search").setAttribute("aria-expanded", String(reveal));
+  if (reveal) field.focus();
+});
+$("sessions-refresh").addEventListener("click", () => reloadSessionList().catch(() => {}));
+// The folder-plus in the Workspaces header opens the flow that *creates* a
+// workspace. It deliberately does not jump into Settings: choosing a folder and
+// the things that may run in it is the sidebar's business, and Settings only
+// inspects and edits what exists.
+$("workspace-add").addEventListener("click", () => openAddWorkspace());
 
 // Narrow windows turn the sidebar into a drawer (see the 720px rules): the
 // button opens it, and picking a chat closes it, because the point of that tap is
@@ -4277,9 +6109,11 @@ if (addMemoryButton) addMemoryButton.addEventListener("click", () => addMemory()
 // loads this file without it.
 const addWorkspace = $("ws-manage-add");
 if (addWorkspace) {
+  // Settings lists and edits, it does not add: the one Add-workspace flow lives
+  // on the sidebar, so this is a doorway to it rather than a second form.
   addWorkspace.addEventListener("click", () => {
     closeSettings();
-    openWorkspaceForm("create", "");
+    openAddWorkspace();
   });
 }
 $("plan-edit").addEventListener("click", () => startPlanEdit());
@@ -5014,5 +6848,540 @@ async function init() {
   renderAll();
   setInterval(tick, 1000);
 }
+
+/* ===================== run surfaces: M4 · M6 · M7 · M10 · M11 · M14 =========
+   One small panel per capability, all inside Settings, each driven by the
+   command that owns the state. Every render function takes (host, data) so a
+   guard can drive it with a fixture rather than a live backend, and every
+   refresh funnels its failure into the panel's own note instead of throwing
+   into a handler nobody sees. */
+
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return `${v} B`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KiB`;
+  return `${(v / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function fmtMs(ms) {
+  if (ms === null || ms === undefined) return "—";
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
+}
+
+function meterRow(host, label, value) {
+  host.appendChild(el("span", "meter-key", label));
+  host.appendChild(el("span", "meter-value", String(value)));
+}
+
+function panelNote(id, text, err) {
+  const host = $(id);
+  if (!host) return;
+  host.textContent = text || "";
+  host.classList.toggle("err", !!err);
+}
+
+/* ---------- M7: background jobs ---------- */
+
+function jobStateChip(job) {
+  const state = typeof job.state === "string" ? job.state : String(job.state);
+  return el("span", "job-state s-" + state, state);
+}
+
+function renderJobs(host, jobs) {
+  host.textContent = "";
+  if (!jobs || !jobs.length) {
+    host.appendChild(el("div", "cap-note", "No background jobs yet — a shell command or a streaming run appears here while it is alive."));
+    return 0;
+  }
+  for (const job of jobs) {
+    const row = el("div", "job-row");
+    row.setAttribute("role", "listitem");
+    row.tabIndex = 0;
+    row.appendChild(el("span", "job-label", clip(job.label || job.id, 34)));
+    row.appendChild(el("span", "job-kind", job.kind || ""));
+    row.appendChild(jobStateChip(job));
+    row.appendChild(el("span", "job-bytes", fmtBytes(job.bytes)));
+    if (job.finished_at) {
+      row.appendChild(el("span", "job-time", fmtMs((job.finished_at - job.started_at) * 1000)));
+    }
+    if (job.error) row.appendChild(el("span", "job-error", clip(job.error, 48)));
+    row.addEventListener("click", () => openJob(job.id));
+    row.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") openJob(job.id);
+    });
+    host.appendChild(row);
+  }
+  return jobs.length;
+}
+
+function renderJobOutput(host, out) {
+  host.textContent = "";
+  host.classList.remove("hidden");
+  const head = el("div", "job-detail-head");
+  head.appendChild(el("span", "job-label", out.id));
+  head.appendChild(jobStateChip({ state: out.state }));
+  head.appendChild(
+    el(
+      "span",
+      "job-bytes",
+      `${fmtBytes(out.bytes)} of ${fmtBytes(out.total_bytes)}${out.truncated ? " (tail)" : ""}`,
+    ),
+  );
+  if (out.dropped_bytes) {
+    head.appendChild(el("span", "job-error", `${fmtBytes(out.dropped_bytes)} dropped`));
+  }
+  const stop = el("button", "btn btn-ghost", "Stop");
+  stop.type = "button";
+  stop.addEventListener("click", () => interruptJob(out.id));
+  head.appendChild(stop);
+  host.appendChild(head);
+  host.appendChild(el("pre", "job-output", out.text || "(no output yet)"));
+}
+
+async function openJob(id) {
+  try {
+    renderJobOutput($("job-detail"), await invoke("job_output", { id, max_bytes: 16384 }));
+  } catch (err) {
+    panelNote("jobs-count", `Could not read job ${id}: ${err}`, true);
+  }
+}
+
+async function interruptJob(id) {
+  try {
+    await invoke("job_interrupt", { id });
+    await refreshJobs();
+  } catch (err) {
+    panelNote("jobs-count", `Could not stop ${id}: ${err}`, true);
+  }
+}
+
+async function refreshJobs() {
+  const host = $("jobs-list");
+  try {
+    const jobs = await invoke("jobs_list");
+    const n = renderJobs(host, jobs);
+    panelNote("jobs-count", n ? `${n} shown` : "");
+    return n;
+  } catch (err) {
+    panelNote("jobs-count", `Could not read jobs: ${err}`, true);
+    return 0;
+  }
+}
+
+/* ---------- M6: context, compaction and spill ---------- */
+
+function renderTokenMeter(host, r) {
+  host.textContent = "";
+  meterRow(host, "messages", r.messages);
+  meterRow(host, "estimated", `${r.estimated} tok`);
+  meterRow(host, "folded", `${r.archived_estimated} tok`);
+  meterRow(host, "provider", r.provider === null || r.provider === undefined ? "—" : `${r.provider} tok`);
+  meterRow(
+    host,
+    "delta",
+    r.delta === null || r.delta === undefined ? "—" : `${r.delta > 0 ? "+" : ""}${r.delta} tok`,
+  );
+  meterRow(
+    host,
+    "within tolerance",
+    r.within_tolerance === null || r.within_tolerance === undefined
+      ? "—"
+      : r.within_tolerance
+        ? "yes"
+        : "no",
+  );
+}
+
+function renderCompaction(host, s) {
+  host.textContent = "";
+  meterRow(host, "live", s.live_messages);
+  meterRow(host, "folded", s.archived_messages);
+  meterRow(host, "estimated", `${s.estimated_tokens} tok`);
+  meterRow(host, "budget", s.budget_tokens ? `${s.budget_tokens} tok` : "off");
+  meterRow(host, "over budget", s.over_budget ? "yes" : "no");
+  meterRow(host, "can compact", s.can_compact ? "yes" : "no");
+  if (s.compacting) meterRow(host, "compacting", "yes");
+  if (s.refusal) meterRow(host, "refusal", s.refusal);
+}
+
+function renderSpills(host, list) {
+  host.textContent = "";
+  if (!list || !list.length) {
+    host.appendChild(
+      el(
+        "div",
+        "cap-note",
+        "Nothing has spilled — an over-large tool output is written here instead of being kept inline.",
+      ),
+    );
+    return 0;
+  }
+  for (const entry of list) {
+    const li = el("li", "spill-row");
+    li.tabIndex = 0;
+    li.appendChild(el("span", "spill-id", entry.id));
+    li.appendChild(el("span", "job-bytes", fmtBytes(entry.bytes)));
+    li.appendChild(el("span", "spill-preview", clip(entry.preview || entry.file, 64)));
+    li.addEventListener("click", () => openSpill(entry.id));
+    host.appendChild(li);
+  }
+  return list.length;
+}
+
+async function openSpill(id) {
+  try {
+    const read = await invoke("spill_read", { id, max_bytes: 8192 });
+    const pre = $("spill-detail");
+    pre.classList.remove("hidden");
+    pre.textContent = `${read.file}${read.truncated ? " (truncated)" : ""}\n\n${read.text}`;
+  } catch (err) {
+    panelNote("ctx-note", `Could not read ${id}: ${err}`, true);
+  }
+}
+
+async function refreshContext() {
+  const id = state.activeId;
+  if (!id) {
+    panelNote("ctx-note", "Open a chat first — the meter describes one conversation.", true);
+    return;
+  }
+  try {
+    renderTokenMeter(
+      $("token-meter"),
+      await invoke("token_meter", { session_id: id, provider_tokens: null }),
+    );
+    renderCompaction($("compact-status"), await invoke("compaction_status", { session_id: id }));
+    renderSpills($("spill-list"), await invoke("spill_list"));
+    panelNote("ctx-note", "");
+  } catch (err) {
+    panelNote("ctx-note", String(err), true);
+  }
+}
+
+async function compactNow() {
+  if (!state.activeId) return panelNote("ctx-note", "Open a chat first.", true);
+  try {
+    const status = await invoke("compact_now", { session_id: state.activeId });
+    // The refresh clears the note as it redraws, so the outcome goes in after.
+    await refreshContext();
+    panelNote(
+      "ctx-note",
+      status.refusal
+        ? `Not compacted: ${status.refusal}`
+        : `Folded ${status.archived_messages} turn(s); ${status.live_messages} live, ${status.estimated_tokens} tok estimated.`,
+    );
+  } catch (err) {
+    panelNote("ctx-note", String(err), true);
+  }
+}
+
+async function restoreFolded() {
+  if (!state.activeId) return panelNote("ctx-note", "Open a chat first.", true);
+  try {
+    const restored = await invoke("restore_compacted", { session_id: state.activeId });
+    await refreshContext();
+    panelNote("ctx-note", `Restored ${restored} folded turn(s).`);
+  } catch (err) {
+    panelNote("ctx-note", String(err), true);
+  }
+}
+
+/* ---------- M4: scoped approval rules and the audit ring ---------- */
+
+function ruleArgText(rule) {
+  if (!rule.arg) return "any args";
+  const kind = rule.arg.match_kind || rule.arg.kind || "match";
+  return `${rule.arg.key} ${kind} "${rule.arg.value}"`;
+}
+
+function renderRules(host, report) {
+  host.textContent = "";
+  const rules = (report && report.rules) || [];
+  const warnings = (report && report.warnings) || [];
+  panelNote(
+    "rules-warnings",
+    warnings.length ? `${warnings.length} problem(s) in the rules file: ${warnings.join("; ")}` : "",
+    warnings.length > 0,
+  );
+  if (!rules.length) {
+    host.appendChild(
+      el("li", "cap-note", "No scoped rules yet — a rule is how “always allow” stops being a per-call question."),
+    );
+    return 0;
+  }
+  for (const rule of rules) {
+    const li = el("li", "rule-row");
+    li.appendChild(el("span", "rule-effect e-" + rule.effect, rule.effect));
+    li.appendChild(el("span", "rule-tool", rule.tool));
+    li.appendChild(
+      el("span", "rule-scope", typeof rule.scope === "string" ? rule.scope : String(rule.scope)),
+    );
+    li.appendChild(el("span", "rule-arg", ruleArgText(rule)));
+    const revoke = el("button", "btn btn-ghost", "Revoke");
+    revoke.type = "button";
+    revoke.addEventListener("click", () => revokeRule(rule.id));
+    li.appendChild(revoke);
+    host.appendChild(li);
+  }
+  return rules.length;
+}
+
+function renderAudit(host, entries) {
+  host.textContent = "";
+  if (!entries || !entries.length) {
+    host.appendChild(el("li", "cap-note", "No decisions recorded yet."));
+    return 0;
+  }
+  for (const entry of entries) {
+    const li = el("li", "audit-row");
+    li.appendChild(el("span", "audit-when", fmtTime(entry.at)));
+    li.appendChild(el("span", "rule-effect e-" + entry.decision, entry.decision));
+    li.appendChild(el("span", "rule-tool", entry.tool));
+    li.appendChild(el("span", "audit-args", clip(entry.args || "", 56)));
+    if (entry.rule_id) li.appendChild(el("span", "rule-scope", entry.rule_id));
+    host.appendChild(li);
+  }
+  return entries.length;
+}
+
+async function refreshRules() {
+  try {
+    renderRules($("rules-list"), await invoke("approval_rules_list"));
+    renderAudit($("audit-list"), await invoke("approval_audit", { limit: 20 }));
+  } catch (err) {
+    panelNote("rules-warnings", String(err), true);
+  }
+}
+
+async function addRule() {
+  const tool = ($("rule-tool").value || "").trim();
+  const key = ($("rule-key").value || "").trim();
+  const match = $("rule-match").value;
+  const value = ($("rule-value").value || "").trim();
+  if (!tool) return panelNote("rules-warnings", "A rule needs a tool name.", true);
+  if (!!key !== !!match) {
+    return panelNote("rules-warnings", "An argument predicate needs a key and a match kind together.", true);
+  }
+  if (key && !value) return panelNote("rules-warnings", "An argument predicate needs a value.", true);
+  const scope = $("rule-scope").value;
+  try {
+    await invoke("approval_rule_add", {
+      tool,
+      scope,
+      effect: $("rule-effect").value,
+      arg_key: key || null,
+      arg_match: match || null,
+      arg_value: value || null,
+      workspace: null,
+      session_id: scope === "session" ? state.activeId || null : null,
+    });
+    $("rule-tool").value = "";
+    $("rule-key").value = "";
+    $("rule-value").value = "";
+    $("rule-match").value = "";
+    // The refresh clears the note as it redraws the book, so the confirmation
+    // goes in after it — the same ordering compactNow needs.
+    await refreshRules();
+    panelNote("rules-warnings", `Added: ${tool} (${scope}).`);
+  } catch (err) {
+    panelNote("rules-warnings", String(err), true);
+  }
+}
+
+async function revokeRule(id) {
+  try {
+    renderRules($("rules-list"), await invoke("approval_rule_revoke", { id }));
+    renderAudit($("audit-list"), await invoke("approval_audit", { limit: 20 }));
+  } catch (err) {
+    panelNote("rules-warnings", String(err), true);
+  }
+}
+
+/* ---------- M10 · M11 · M14: replay, self-inspection, bundle ---------- */
+
+function renderInspection(host, i) {
+  host.textContent = "";
+  const rows = [
+    ["tools", i.tools],
+    ["async tools", i.async_tools],
+    ["skills", i.skills],
+    ["plugins", i.plugins],
+    ["hook events", i.hook_events],
+    ["MCP servers", i.mcp_servers],
+    ["MCP tools", i.mcp_tools],
+    ["memories", i.memories],
+    ["approval rules", i.approval_rules],
+  ];
+  for (const [label, value] of rows) meterRow(host, label, value);
+  meterRow(host, "model", i.model || "—");
+  meterRow(host, "workspace", i.workspace || "—");
+  meterRow(host, "bash", i.bash_enabled ? "on" : "off");
+  meterRow(host, "file tools", i.file_tools_enabled ? "on" : "off");
+  if (i.active_goal) {
+    const cap = Number(i.goal_rounds || 0) + Number(i.goal_remaining || 0);
+    meterRow(host, "goal", `${i.goal_state || "?"} · ${i.goal_rounds || 0}/${cap || "?"}`);
+  }
+  meterRow(host, "skills dir", i.skills_dir || "—");
+}
+
+function renderScore(host, s) {
+  host.textContent = "";
+  host.classList.remove("hidden");
+  host.appendChild(el("div", "score-head", `${s.grade} · ${s.score}`));
+  const ul = el("ul", "score-reasons");
+  const reasons = s.reasons || [];
+  if (!reasons.length) ul.appendChild(el("li", "", "No problems were found in this transcript."));
+  for (const reason of reasons) ul.appendChild(el("li", "", reason));
+  host.appendChild(ul);
+}
+
+function renderReplay(host, r) {
+  host.textContent = "";
+  host.classList.remove("hidden");
+  host.appendChild(el("div", "score-head", `Replay of ${r.title || r.session_id}`));
+  const m = r.metrics || {};
+  const grid = el("div", "meter-grid");
+  const rows = [
+    ["turns", m.turns],
+    ["user", m.user_turns],
+    ["assistant", m.assistant_turns],
+    ["folded", m.archived_turns],
+    ["tool calls", m.tool_calls],
+    ["tool failures", m.tool_failures],
+    ["tool time", fmtMs(m.tool_ms_total)],
+    ["errors", m.errors],
+    ["blank turns", m.blank_turns],
+    ["estimated", `${m.estimated_tokens} tok`],
+  ];
+  for (const [label, value] of rows) meterRow(grid, label, value);
+  host.appendChild(grid);
+  const ul = el("ul", "replay-entries");
+  for (const entry of (r.entries || []).slice(0, 20)) {
+    const li = el("li", entry.archived ? "replay-row folded" : "replay-row");
+    li.appendChild(
+      el("span", "rule-scope", `${entry.order}. ${entry.role}${entry.archived ? " (folded)" : ""}`),
+    );
+    li.appendChild(el("span", "replay-text", clip(entry.text || entry.reasoning || "", 76)));
+    const tools = entry.tools || [];
+    if (tools.length) li.appendChild(el("span", "job-bytes", `${tools.length} tool`));
+    if (entry.error) li.appendChild(el("span", "job-error", clip(entry.error, 36)));
+    ul.appendChild(li);
+  }
+  host.appendChild(ul);
+}
+
+async function refreshInspect() {
+  try {
+    renderInspection(
+      $("insight-grid"),
+      await invoke("self_inspect", { session_id: state.activeId || null }),
+    );
+  } catch (err) {
+    panelNote("bundle-result", String(err), true);
+  }
+}
+
+async function evaluateChat() {
+  if (!state.activeId) return panelNote("bundle-result", "Open a chat first.", true);
+  try {
+    renderScore($("insight-score"), await invoke("evaluate_transcript", { session_id: state.activeId }));
+    panelNote("bundle-result", "");
+  } catch (err) {
+    panelNote("bundle-result", String(err), true);
+  }
+}
+
+async function runReplay() {
+  if (!state.activeId) return panelNote("bundle-result", "Open a chat first.", true);
+  try {
+    renderReplay($("replay-report"), await invoke("replay_session", { session_id: state.activeId }));
+    panelNote("bundle-result", "");
+  } catch (err) {
+    panelNote("bundle-result", String(err), true);
+  }
+}
+
+async function exportBundle() {
+  if (!state.activeId) return panelNote("bundle-result", "Open a chat first.", true);
+  try {
+    const report = await invoke("export_bundle", { session_id: state.activeId });
+    panelNote(
+      "bundle-result",
+      `Wrote ${report.path} — ${fmtBytes(report.bytes)}, ${report.entries} entr${
+        report.entries === 1 ? "y" : "ies"
+      }, schema v${report.schema_version}.`,
+    );
+  } catch (err) {
+    panelNote("bundle-result", String(err), true);
+  }
+}
+
+/* ---------- wiring ---------- */
+
+const SECTION_REFRESH = {
+  "jobs-section": refreshJobs,
+  "context-section": refreshContext,
+  "rules-section": refreshRules,
+  "insight-section": refreshInspect,
+  "set-mcp": () => Promise.all([refreshMcpStatus(), loadPolicy(), loadCatalog()]),
+  "schedule-section": loadSchedule,
+  "knowledge-section": loadKnowledge,
+  "cap-list": () => Promise.all([loadCapabilities(), loadSkills()]),
+  "set-prov": loadSkills,
+};
+
+function refreshSection(sectionId) {
+  const refresh = SECTION_REFRESH[sectionId];
+  if (refresh) Promise.resolve(refresh()).catch(() => {});
+}
+
+$("nav-automation").addEventListener("click", () => {
+  navTo("jobs-section");
+  refreshJobs().catch(() => {});
+});
+$("jobs-refresh").addEventListener("click", () => refreshJobs().catch(() => {}));
+$("ctx-refresh").addEventListener("click", () => refreshContext().catch(() => {}));
+$("ctx-compact").addEventListener("click", () => compactNow().catch(() => {}));
+$("ctx-restore").addEventListener("click", () => restoreFolded().catch(() => {}));
+$("rules-refresh").addEventListener("click", () => refreshRules().catch(() => {}));
+$("rule-add").addEventListener("click", () => addRule().catch(() => {}));
+$("insight-refresh").addEventListener("click", () => refreshInspect().catch(() => {}));
+$("sched-refresh").addEventListener("click", () => loadSchedule().catch(() => {}));
+$("sched-add").addEventListener("click", () => addSchedule().catch(() => {}));
+$("sched-clear").addEventListener("click", () => clearScheduleHistory().catch(() => {}));
+$("insight-evaluate").addEventListener("click", () => evaluateChat().catch(() => {}));
+$("replay-run").addEventListener("click", () => runReplay().catch(() => {}));
+$("bundle-export").addEventListener("click", () => exportBundle().catch(() => {}));
+$("kb-search").addEventListener("click", () => void loadKnowledge());
+$("kb-all").addEventListener("click", () => {
+  $("kb-query").value = "";
+  void loadKnowledge();
+});
+$("kb-query").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    void loadKnowledge();
+  }
+});
+$("kb-save").addEventListener("click", () => void saveKnowledge());
+$("skill-save").addEventListener("click", () => void saveSkill());
+$("skill-inherit").addEventListener("click", () => void inheritSkills());
+$("mcp-read-btn").addEventListener("click", () => void readResource());
+$("mcp-uri").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    void readResource();
+  }
+});
+$("kb-cancel").addEventListener("click", () => cancelKnowledgeEdit());
+document.querySelectorAll(".set-tab").forEach((tab) => {
+  tab.addEventListener("click", () => refreshSection(tab.dataset.section));
+});
+
+/* Deliver anything that came due while the app was closed, then keep checking.
+   This runs before the first paint, so an overdue reminder is announced with
+   the window. */
+void tickSchedule();
+setInterval(() => void tickSchedule(), SCHEDULE_TICK_MS);
 
 init();

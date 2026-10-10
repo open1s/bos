@@ -27,6 +27,8 @@ struct Streaming {
     gen: u64,
     /// Unix time the stream started (seconds).
     started_at: u64,
+    /// Background job (M7) that mirrors this stream's output for `jobs_list`.
+    job: String,
 }
 
 /// One cached per-session agent: built for a settings generation, carrying
@@ -67,6 +69,25 @@ struct Inner {
     compacting: HashSet<String>,
     /// True while a project-level `/init` generation is running.
     init_in_flight: bool,
+    /// Scoped persistent approval rules (M4), shared by every broker so a
+    /// rule added in one session applies wherever it is scoped to.
+    rules: Arc<crate::approval::RuleBook>,
+    /// Background jobs (M7) whose bounded output the UI can page through.
+    jobs: crate::runs::Jobs,
+    /// Durable reminders (M11). The store is the only state; the clock comes
+    /// from the caller, so a tick is reproducible.
+    schedule: crate::schedule::Store,
+    /// The curated knowledge base (M11). Shared with the `knowledge_search`
+    /// tool registered on every agent, so the pane and the model read the same
+    /// entries.
+    knowledge: Arc<Mutex<crate::knowledge::Store>>,
+    mcp_policy: Arc<Mutex<crate::mcp_policy::Store>>,
+    /// Which skills each chat switched on. Held here rather than read from disk
+    /// on every build: the file is the durable copy, this is the one the agents
+    /// are built from, and a test can seed it without touching the user's home.
+    skill_activation: Mutex<crate::skills::Activation>,
+    /// Where that record is written.
+    skill_activation_path: std::path::PathBuf,
 }
 
 impl Inner {
@@ -86,6 +107,13 @@ impl Inner {
             mcp_connecting: false,
             compacting: HashSet::new(),
             init_in_flight: false,
+            rules: Arc::new(crate::approval::RuleBook::open_default()),
+            jobs: crate::runs::Jobs::new(),
+            schedule: crate::schedule::Store::open(),
+            knowledge: Arc::new(Mutex::new(crate::knowledge::Store::open())),
+            mcp_policy: Arc::new(Mutex::new(crate::mcp_policy::Store::open())),
+            skill_activation: Mutex::new(crate::skills::Activation::open()),
+            skill_activation_path: crate::skills::Activation::default_path(),
         }
     }
 
@@ -106,17 +134,17 @@ impl Inner {
         // Allowances the user made permanent outlive the app, so every broker
         // adopts them and an allowed tool is never asked about again.
         broker.seed_allowed(self.settings.allowed_tools.iter().cloned());
+        // Scoped rules are consulted before any dialog, and the workspace the
+        // broker reports is the one its own tools run against.
+        broker.set_rules(Arc::clone(&self.rules));
+        let effective = self.settings.effective();
+        broker.set_workspace(workspace_root(&effective.bash_workspace));
         if let Some(handle) = &self.app_handle {
             broker.set_handle(handle.clone());
         }
         // The agent is built from the active workspace's choices, not from the
         // globals: model, tools, approval and budget all come from one place.
-        let effective = self.settings.effective();
-        let base = caps::build_agent(&effective, Arc::clone(&broker));
-        let mut agent = base.as_ref().clone();
-        // Connected MCP tools ride along with fresh builds (and the connect
-        // pass re-attaches them to entries that already exist).
-        self.attach_mcp_tools(&mut agent, &broker, &effective);
+        let (agent, _mcp_errors) = self.build_agent_for(session_id, &broker);
         let agent = Arc::new(agent);
         let settings_gen = self.settings_gen;
         self.agent_cache
@@ -133,6 +161,56 @@ impl Inner {
         agent
     }
 
+    /// Build an agent for the active workspace, with the connected MCP tools
+    /// (under the policy) and the knowledge base attached.
+    ///
+    /// **The one construction path.** Re-attaching used to clone a live agent
+    /// and add the missing tools to it, which can only ever add: a tool the
+    /// policy now denies stayed in the registry, because the clone still held
+    /// the old wrapper. Building from the base agent is what makes removal
+    /// possible, and sharing this function is what keeps a re-attach from
+    /// disagreeing with a first build.
+    fn build_agent_for(
+        &self,
+        session: &str,
+        broker: &Arc<crate::approval::ApprovalBroker>,
+    ) -> (Agent, Vec<(String, String)>) {
+        let effective = self.settings.effective();
+        let skill_deny = self.session_skill_deny(session);
+        let base = caps::build_agent_with(&effective, Arc::clone(broker), skill_deny.as_deref());
+        let mut agent = base.as_ref().clone();
+        let errors = self.attach_mcp_tools(&mut agent, broker, &effective);
+        // The curated knowledge base is a tool, not prompt text: memory is
+        // recalled whether it helps or not, while a knowledge entry is pulled
+        // only when the model asks, so the corpus can be large and precise.
+        attach_knowledge(&mut agent, Arc::clone(&self.knowledge));
+        (agent, errors)
+    }
+
+    /// The skills this chat's agent must skip, or `None` when it inherits the
+    /// workspace.
+    ///
+    /// The GUI's registration API takes what to *skip*, so a chat's allow-list
+    /// is inverted here — in one place, because an inverted allow-list that says
+    /// nothing is a chat that receives everything, and that is the failure this
+    /// shape can hide.
+    fn session_skill_deny(&self, session: &str) -> Option<Vec<String>> {
+        let effective = self.settings.effective();
+        let dir = effective.skills_dir.trim();
+        if dir.is_empty() {
+            return None;
+        }
+        let (_, listed) =
+            crate::skills::list(&crate::caps::expand_tilde(dir), &effective.disabled_skills);
+        let discovered: Vec<String> = listed.iter().map(|skill| skill.name.clone()).collect();
+        // A poisoned lock reads as "inherit", which is the workspace's own
+        // answer: a chat losing its own list is a smaller failure than a chat
+        // that cannot be opened at all.
+        let record = self.skill_activation.lock().ok();
+        let active = record.as_deref().and_then(|record| record.active(session));
+        crate::skills::session_deny(&discovered, &effective.disabled_skills, active)
+    }
+
     /// The approval broker serving `session_id`, if its agent was built.
     fn broker(&self, session_id: &str) -> Option<Arc<crate::approval::ApprovalBroker>> {
         self.agent_cache
@@ -147,8 +225,14 @@ impl Inner {
         }
     }
 
-    /// Register the connected MCP tools on `agent`, gated by approvals when
-    /// required. Returns `(namespace, error)` for each registration failure.
+    /// Register the connected MCP tools on `agent`, applying the workspace's
+    /// gate **and** the per-tool policy. Returns `(namespace, error)` for each
+    /// registration failure.
+    ///
+    /// The policy is consulted here, where the tools are attached, so a denied
+    /// tool never reaches the registry and an `ask` rule adds a gate the
+    /// workspace does not have. An unreadable policy attaches **nothing**:
+    /// failing open would turn a damaged file into silently granted access.
     fn attach_mcp_tools(
         &self,
         agent: &mut Agent,
@@ -158,19 +242,43 @@ impl Inner {
         // Approval policy and the allowed servers are the workspace's, not the
         // globals': the handshake may exist because the server is configured,
         // while this workspace is one that switched it off.
-        let gate = settings.require_approval.then(|| Arc::clone(broker));
+        let workspace_gate = settings.require_approval;
         let allowed = enabled_mcp_servers(settings);
+        let policy = match self.mcp_policy.lock() {
+            Ok(policy) => policy,
+            Err(_) => {
+                return vec![(
+                    "*".to_string(),
+                    "the MCP policy could not be read (lock poisoned); no MCP tool was attached"
+                        .to_string(),
+                )];
+            }
+        };
         let mut errors = Vec::new();
         for (namespace, handshake) in &self.mcp_ready {
             if !allowed.iter().any(|name| name == namespace) {
                 continue;
             }
-            for def in &handshake.tools {
-                let tool = crate::mcp::tool_for(handshake, namespace, def, gate.clone());
-                if let Err(err) = agent.add_mcp_tool(namespace, &def.name, tool) {
-                    errors.push((namespace.clone(), err.to_string()));
-                    break;
-                }
+            let names: Vec<String> = handshake.tools.iter().map(|d| d.name.clone()).collect();
+            // The decision is made by the module the pane reads, so the two
+            // cannot disagree about what a rule means.
+            let attachment = crate::mcp_policy::attach_tools_with_policy(
+                agent,
+                namespace,
+                &names,
+                &policy,
+                workspace_gate,
+                |index, gated| {
+                    crate::mcp::tool_for(
+                        handshake,
+                        namespace,
+                        &handshake.tools[index],
+                        gated.then(|| Arc::clone(broker)),
+                    )
+                },
+            );
+            if let Err(err) = attachment {
+                errors.push((namespace.clone(), err));
             }
         }
         errors
@@ -265,6 +373,11 @@ fn spawn_mcp_connect(state: Arc<GuiState>, gen: u64) {
                                 enabled: true,
                                 connected: true,
                                 tools: handshake.tools.len(),
+                                tool_names: handshake
+                                    .tools
+                                    .iter()
+                                    .map(|d| d.name.clone())
+                                    .collect(),
                                 error: None,
                             },
                         );
@@ -279,6 +392,7 @@ fn spawn_mcp_connect(state: Arc<GuiState>, gen: u64) {
                                 enabled: true,
                                 connected: false,
                                 tools: 0,
+                                tool_names: Vec::new(),
                                 error: Some(err),
                             },
                         );
@@ -302,7 +416,7 @@ fn spawn_mcp_connect(state: Arc<GuiState>, gen: u64) {
         // Settings-ordered report; disabled servers still appear so the UI
         // can show them. Handshakes are emitted in settings order too, so
         // tool registration order is deterministic across passes.
-        let mut statuses = build_statuses(&entries, &results);
+        let statuses = build_statuses(&entries, &results);
         let ready: Vec<(String, crate::mcp::Handshake)> = {
             let mut map = handshakes;
             entries
@@ -316,36 +430,20 @@ fn spawn_mcp_connect(state: Arc<GuiState>, gen: u64) {
         };
         // Remember the handshakes so later agent builds attach them too.
         inner.mcp_ready = ready;
-        // Re-attach on a clone of every cached session agent; a stream that
-        // is mid-turn keeps its previous `Arc` untouched.
-        let jobs: Vec<(String, Arc<Agent>, Arc<crate::approval::ApprovalBroker>)> = inner
-            .agent_cache
-            .iter()
-            .map(|(id, e)| (id.clone(), Arc::clone(&e.agent), Arc::clone(&e.broker)))
-            .collect();
-        let effective = inner.settings.effective();
-        for (id, agent, broker) in jobs {
-            let mut fresh = agent.as_ref().clone();
-            let errors = inner.attach_mcp_tools(&mut fresh, &broker, &effective);
-            for (namespace, err) in &errors {
-                if let Some(status) = statuses.iter_mut().find(|s| s.name == *namespace) {
-                    status.connected = false;
-                    status.error = Some(err.clone());
-                }
-            }
-            // Recount from the registry so the report matches what is attached.
-            if let Some(reg) = fresh.registry() {
-                let names = reg.async_tool_names();
-                for status in statuses.iter_mut().filter(|s| s.connected) {
-                    let prefix = format!("{}_", status.name);
-                    status.tools = names.iter().filter(|n| n.starts_with(&prefix)).count();
-                }
-            }
-            if let Some(entry) = inner.agent_cache.get_mut(&id) {
-                entry.agent = Arc::new(fresh);
+        // Install this pass's rows first, then rebuild every cached session
+        // agent: the rebuild has to be able to *remove* a tool (a policy that
+        // started denying one, or a server that dropped it), and re-attaching
+        // onto a clone of the running agent can only ever add. A stream that is
+        // mid-turn keeps its previous `Arc` untouched, because the cache entry
+        // is swapped rather than mutated.
+        inner.mcp_status = statuses;
+        let attach_errors = reattach_cached_agents(&mut inner);
+        for (namespace, err) in &attach_errors {
+            if let Some(status) = inner.mcp_status.iter_mut().find(|s| s.name == *namespace) {
+                status.connected = false;
+                status.error = Some(err.clone());
             }
         }
-        inner.mcp_status = statuses;
         inner.mcp_connecting = false;
     });
 }
@@ -371,6 +469,7 @@ fn build_statuses(
                     enabled: false,
                     connected: false,
                     tools: 0,
+                    tool_names: Vec::new(),
                     error: None,
                 };
             }
@@ -383,6 +482,7 @@ fn build_statuses(
                     enabled: true,
                     connected: false,
                     tools: 0,
+                    tool_names: Vec::new(),
                     error: Some("connect pass never reached this server".to_string()),
                 })
         })
@@ -391,6 +491,7 @@ fn build_statuses(
 
 /// Sidebar row payload sent to the frontend.
 #[derive(Clone, Serialize)]
+#[derive(Debug)]
 struct SessionSummary {
     /// Stable identifier.
     id: String,
@@ -401,6 +502,10 @@ struct SessionSummary {
     /// Workspace this session belongs to; never empty in the UI, because a
     /// session written before workspaces existed is reported as the active one.
     workspace: String,
+    /// Whether the sidebar floats this chat above the others.
+    pinned: bool,
+    /// Whether the chat is hidden in the archive rather than in the list.
+    archived: bool,
 }
 
 fn summary(record: &SessionRecord, active: &str) -> SessionSummary {
@@ -413,6 +518,8 @@ fn summary(record: &SessionRecord, active: &str) -> SessionSummary {
         } else {
             record.workspace.clone()
         },
+        pinned: record.pinned,
+        archived: record.archived_at.is_some(),
     }
 }
 
@@ -523,6 +630,93 @@ fn create_session(state: State<'_, Arc<GuiState>>) -> Result<SessionSummary, Str
     Ok(summary(&record, &inner.settings.active_workspace))
 }
 
+/// Rename a chat.
+///
+/// Refused while a turn or a compaction is running, for the same reason a plan
+/// edit is: the sidebar must not change the thing the reader is looking at
+/// mid-flight. The new name is validated by the record, so the rule lives in one
+/// place and a hand-written name cannot be longer than a typed one.
+#[tauri::command]
+fn rename_session(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    title: String,
+) -> Result<SessionSummary, String> {
+    let mut inner = state.lock()?;
+    rename_session_in(&mut inner, &id, &title)
+}
+
+fn rename_session_in(inner: &mut Inner, id: &str, title: &str) -> Result<SessionSummary, String> {
+    editable(inner, id)?;
+    let mut record = session_record(inner, id)?;
+    record.rename(title)?;
+    inner.store.save(&record).map_err(|e| e.to_string())?;
+    Ok(summary(&record, &inner.settings.active_workspace))
+}
+
+/// Pin or unpin a chat. A pin is presentation only, so it is allowed even while
+/// a turn streams — the one session edit that does not wait for the chat.
+#[tauri::command]
+fn set_session_pinned(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    pinned: bool,
+) -> Result<SessionSummary, String> {
+    let mut inner = state.lock()?;
+    set_session_pinned_in(&mut inner, &id, pinned)
+}
+
+fn set_session_pinned_in(
+    inner: &mut Inner,
+    id: &str,
+    pinned: bool,
+) -> Result<SessionSummary, String> {
+    let mut record = session_record(inner, id)?;
+    // Asking for the state a chat is already in is a no-op *on disk*: a pin
+    // must not rewrite the record (and bump `updated_at`) just because a menu
+    // was opened and closed.
+    if record.pinned != pinned {
+        record.pinned = pinned;
+        inner.store.save(&record).map_err(|e| e.to_string())?;
+    }
+    Ok(summary(&record, &inner.settings.active_workspace))
+}
+
+/// Archive or restore a chat.
+///
+/// Archiving is not deleting: the file stays, the transcript stays, and
+/// [`set_session_archived`] with `false` puts the chat back exactly as it was.
+/// A *streaming* chat is refused, because hiding the surface a running turn is
+/// writing into hides the one thing the reader is waiting for.
+#[tauri::command]
+fn set_session_archived(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    archived: bool,
+) -> Result<SessionSummary, String> {
+    let mut inner = state.lock()?;
+    set_session_archived_in(&mut inner, &id, archived)
+}
+
+fn set_session_archived_in(
+    inner: &mut Inner,
+    id: &str,
+    archived: bool,
+) -> Result<SessionSummary, String> {
+    // Hiding a chat mid-turn hides the output the turn is producing, so the
+    // archive waits. Restoring one is always allowed: the chat is not on screen
+    // while it is archived, so there is no turn to interrupt.
+    if archived {
+        editable(inner, id)?;
+    }
+    let mut record = session_record(inner, id)?;
+    if record.archived_at.is_some() != archived {
+        record.set_archived(archived);
+        inner.store.save(&record).map_err(|e| e.to_string())?;
+    }
+    Ok(summary(&record, &inner.settings.active_workspace))
+}
+
 /// Delete a session's stored file, stopping its stream if it is running.
 #[tauri::command]
 fn delete_session(state: State<'_, Arc<GuiState>>, id: String) -> Result<(), String> {
@@ -621,6 +815,53 @@ async fn memories_of(
     items
 }
 
+/// Where this workspace's memory really lives, and what bounds it (§20).
+///
+/// The pane labels the list by workspace, but an empty `memory_path` — the
+/// default — puts every workspace on one shared file, so the label alone can
+/// imply an isolation that is not there. This answers with the resolved file,
+/// how many workspaces resolve to it, and the two caps a person cannot otherwise
+/// see: the item bound (past which the oldest memory is evicted) and the
+/// per-note character bound. It never fails: a status that refuses to load when
+/// memory is off would hide the very fact it exists to report.
+#[derive(serde::Serialize)]
+pub(crate) struct MemoryStatus {
+    /// Whether the active workspace builds an agent with memory at all.
+    pub(crate) enabled: bool,
+    /// Resolved path of the store, empty when memory is off.
+    pub(crate) path: String,
+    /// How many workspaces resolve to that same file.
+    pub(crate) shared_workspaces: usize,
+    /// Item bound of the store ([`crate::settings::MEMORY_MAX_ITEMS`]).
+    pub(crate) cap: usize,
+    /// Longest note the store accepts.
+    pub(crate) max_chars: usize,
+}
+
+#[tauri::command]
+fn memory_status(state: State<'_, Arc<GuiState>>) -> Result<MemoryStatus, String> {
+    let inner = state.lock()?;
+    let effective = inner.settings.effective();
+    let path = crate::settings::memory_file(&effective);
+    let shared = inner
+        .settings
+        .workspace_memory_files()
+        .iter()
+        .filter(|(_, f)| f == &path)
+        .count();
+    Ok(MemoryStatus {
+        enabled: effective.memory_enabled,
+        path: if effective.memory_enabled {
+            path.to_string_lossy().into_owned()
+        } else {
+            String::new()
+        },
+        shared_workspaces: shared,
+        cap: crate::settings::MEMORY_MAX_ITEMS,
+        max_chars: MAX_MEMORY_CHARS,
+    })
+}
+
 /// List what the GUI remembers (§20). Memory is one file shared by every chat in
 /// this app (`caps::open_file_memory`), so any session's agent answers for all.
 #[tauri::command]
@@ -664,6 +905,238 @@ async fn forget_memory(
 /// Search every stored chat — titles and message text (§17). Hits come back
 /// newest chat first and are capped, because this box is for finding a chat, not
 /// for reading the archive.
+#[tauri::command]
+/// The reminders, their deliveries and the bounds in force, as of `now_ms`.
+fn schedule_list(
+    state: State<'_, Arc<GuiState>>,
+    now_ms: u64,
+) -> Result<crate::schedule::Report, String> {
+    let inner = state.lock()?;
+    Ok(inner.schedule.report(now_ms))
+}
+
+#[tauri::command]
+/// Deliver everything due at `now_ms` and return the state that follows.
+fn schedule_tick(
+    state: State<'_, Arc<GuiState>>,
+    now_ms: u64,
+) -> Result<crate::schedule::Report, String> {
+    let mut inner = state.lock()?;
+    let fired = inner.schedule.tick(now_ms);
+    inner.schedule.save()?;
+    Ok(inner.schedule.report_with(now_ms, fired))
+}
+
+#[tauri::command]
+/// Add a reminder. `every_minutes` makes it repeat; otherwise `at_ms` is the
+/// one delivery. Either way the store validates before it accepts.
+fn schedule_add(
+    state: State<'_, Arc<GuiState>>,
+    text: String,
+    every_minutes: Option<u64>,
+    at_ms: Option<u64>,
+    now_ms: u64,
+) -> Result<crate::schedule::Report, String> {
+    let mut inner = state.lock()?;
+    let cadence = match (every_minutes, at_ms) {
+        (Some(every), _) => crate::schedule::Cadence::Every {
+            every_minutes: every,
+            next_ms: now_ms + every * 60_000,
+        },
+        (None, Some(at)) => crate::schedule::Cadence::Once { at_ms: at },
+        (None, None) => {
+            return Err("a reminder needs either an interval or a time".to_string());
+        }
+    };
+    inner.schedule.add(&text, cadence, now_ms)?;
+    inner.schedule.save()?;
+    Ok(inner.schedule.report(now_ms))
+}
+
+#[tauri::command]
+/// Remove one reminder.
+fn schedule_cancel(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    now_ms: u64,
+) -> Result<crate::schedule::Report, String> {
+    let mut inner = state.lock()?;
+    inner.schedule.cancel(&id)?;
+    inner.schedule.save()?;
+    Ok(inner.schedule.report(now_ms))
+}
+
+#[tauri::command]
+/// Forget every delivery, keeping the reminders.
+fn schedule_clear_history(
+    state: State<'_, Arc<GuiState>>,
+    now_ms: u64,
+) -> Result<crate::schedule::Report, String> {
+    let mut inner = state.lock()?;
+    inner.schedule.clear_history();
+    inner.schedule.save()?;
+    Ok(inner.schedule.report(now_ms))
+}
+
+/// Register the curated knowledge base on `agent`.
+///
+/// A free function so the registration a session actually gets can be tested
+/// against a real agent (see `the_agent_the_gui_builds_can_search_its_knowledge_base`).
+fn attach_knowledge(agent: &mut Agent, store: Arc<Mutex<crate::knowledge::Store>>) {
+    agent.add_tool(crate::knowledge::tool(store));
+}
+
+/// The knowledge store, or an error naming the lock rather than a panic.
+fn knowledge_store(
+    inner: &Inner,
+) -> Result<std::sync::MutexGuard<'_, crate::knowledge::Store>, String> {
+    inner
+        .knowledge
+        .lock()
+        .map_err(|_| "the knowledge store lock is poisoned".to_string())
+}
+
+/// The knowledge entries a query selects (empty for all of them), best first.
+#[tauri::command]
+fn knowledge_list(
+    state: State<'_, Arc<GuiState>>,
+    now_ms: u64,
+) -> Result<crate::knowledge::Report, String> {
+    let inner = state.lock()?;
+    let store = knowledge_store(&inner)?;
+    Ok(store.report("", None, now_ms))
+}
+
+/// Search the knowledge base.
+#[tauri::command]
+fn knowledge_search(
+    state: State<'_, Arc<GuiState>>,
+    query: String,
+    limit: Option<usize>,
+    now_ms: u64,
+) -> Result<crate::knowledge::Report, String> {
+    let inner = state.lock()?;
+    let store = knowledge_store(&inner)?;
+    Ok(store.report(&query, limit, now_ms))
+}
+
+/// Add a knowledge entry. `tags` arrives as typed — comma-separated.
+#[tauri::command]
+fn knowledge_add(
+    state: State<'_, Arc<GuiState>>,
+    title: String,
+    tags: String,
+    body: String,
+    now_ms: u64,
+) -> Result<crate::knowledge::Report, String> {
+    let inner = state.lock()?;
+    let mut store = knowledge_store(&inner)?;
+    store.add(&title, &tags, &body, now_ms)?;
+    store.save()?;
+    Ok(store.report("", None, now_ms))
+}
+
+/// Replace an entry's title, tags and body.
+#[tauri::command]
+fn knowledge_update(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    title: String,
+    tags: String,
+    body: String,
+    now_ms: u64,
+) -> Result<crate::knowledge::Report, String> {
+    let inner = state.lock()?;
+    let mut store = knowledge_store(&inner)?;
+    store.update(&id, &title, &tags, &body, now_ms)?;
+    store.save()?;
+    Ok(store.report("", None, now_ms))
+}
+
+/// Remove one entry.
+#[tauri::command]
+fn knowledge_delete(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    now_ms: u64,
+) -> Result<crate::knowledge::Report, String> {
+    let inner = state.lock()?;
+    let mut store = knowledge_store(&inner)?;
+    store.remove(&id)?;
+    store.save()?;
+    Ok(store.report("", None, now_ms))
+}
+
+/// The skills the active workspace's agent would receive.
+///
+/// Read through the same loader that builds the agent, so this count and the
+/// prompt are the same number by construction.
+#[tauri::command]
+fn skill_list(
+    state: State<'_, Arc<GuiState>>,
+    now_ms: u64,
+) -> Result<crate::skills::Report, String> {
+    let inner = state.lock()?;
+    Ok(skill_report(&inner, now_ms))
+}
+
+/// Author a skill: validate it, write `SKILL.md`, then rebuild the agents that
+/// already exist so the skill is available to a session that is already open.
+#[tauri::command]
+fn skill_author(
+    state: State<'_, Arc<GuiState>>,
+    name: String,
+    description: String,
+    body: String,
+    overwrite: bool,
+    now_ms: u64,
+) -> Result<crate::skills::Report, String> {
+    let mut inner = state.lock()?;
+    let report = author_skill(&mut inner, &name, &description, &body, overwrite, now_ms)?;
+    Ok(report)
+}
+
+/// The directory the active workspace reads skills from.
+fn skill_dir(inner: &Inner) -> std::path::PathBuf {
+    let dir = inner.settings.effective().skills_dir.trim().to_string();
+    if dir.is_empty() {
+        return std::path::PathBuf::new();
+    }
+    caps::expand_tilde(&dir)
+}
+
+/// The pane's report for the active workspace.
+fn skill_report(inner: &Inner, now_ms: u64) -> crate::skills::Report {
+    let effective = inner.settings.effective();
+    let dir = skill_dir(inner);
+    crate::skills::report(&dir, &effective.disabled_skills, now_ms)
+}
+
+/// Write a skill and make it reach the running sessions. Split out from the
+/// command so a test can drive it without a Tauri `State`.
+fn author_skill(
+    inner: &mut Inner,
+    name: &str,
+    description: &str,
+    body: &str,
+    overwrite: bool,
+    now_ms: u64,
+) -> Result<crate::skills::Report, String> {
+    let dir = skill_dir(inner);
+    if dir.as_os_str().is_empty() {
+        return Err(
+            "no skills directory is configured for this workspace — set one in Settings, Tools & skills"
+                .to_string(),
+        );
+    }
+    crate::skills::save(&dir, name, description, body, overwrite)?;
+    // A session's agent read the directory when it was built, so a saved skill
+    // only reaches that session if the agents are rebuilt — the same rule the
+    // MCP policy follows.
+    let _ = reattach_cached_agents(inner);
+    Ok(skill_report(inner, now_ms))
+}
+
 #[tauri::command]
 fn search_sessions(
     state: State<'_, Arc<GuiState>>,
@@ -899,10 +1372,15 @@ fn begin_stream(
     transcript: Vec<ChatMessage>,
 ) -> (Receiver<AgentEvent>, Streaming) {
     inner.stream_gen += 1;
+    let job = inner
+        .jobs
+        .start(format!("session {session_id}"), "stream")
+        .id;
     let streaming = Streaming {
         session_id: session_id.to_string(),
         gen: inner.stream_gen,
         started_at: unix_now(),
+        job,
     };
     let budget = inner.settings.context_budget;
     // Expand `@path` mentions on the outgoing copy only: the transcript in
@@ -965,7 +1443,14 @@ fn send_message(
         begin_stream(&mut inner, &session_id, text, transcript)
     };
 
-    spawn_forwarder(state.inner().clone(), app, rx, session_id, streaming.gen);
+    spawn_forwarder(
+        state.inner().clone(),
+        app,
+        rx,
+        session_id,
+        streaming.gen,
+        streaming.job.clone(),
+    );
     Ok(streaming)
 }
 
@@ -1226,7 +1711,14 @@ fn retry_last(
         begin_stream(&mut inner, &session_id, text, transcript)
     };
 
-    spawn_forwarder(state.inner().clone(), app, rx, session_id, streaming.gen);
+    spawn_forwarder(
+        state.inner().clone(),
+        app,
+        rx,
+        session_id,
+        streaming.gen,
+        streaming.job.clone(),
+    );
     Ok(streaming)
 }
 
@@ -1668,12 +2160,26 @@ fn stop_streaming(
                 broker.reject_all();
             }
             inner.runner.stop(&id);
+            // The stream's job settles as interrupted, matching what the user
+            // asked for, rather than lingering as "running" forever.
+            let job = inner.streaming.get(&id).map(|stream| stream.job.clone());
+            if let Some(job) = job {
+                let _ = inner.jobs.interrupt(&job);
+            }
         }
         None => {
             for broker in &inner.brokers {
                 broker.reject_all();
             }
             inner.runner.stop_all();
+            let jobs: Vec<String> = inner
+                .streaming
+                .values()
+                .map(|stream| stream.job.clone())
+                .collect();
+            for job in jobs {
+                let _ = inner.jobs.interrupt(&job);
+            }
         }
     }
     Ok(())
@@ -1710,12 +2216,21 @@ fn compact_session(
     state: State<'_, Arc<GuiState>>,
     session_id: String,
 ) -> Result<(), String> {
+    begin_compaction(app, state.inner(), &session_id)
+}
+
+/// Validate and start one compaction, reporting through `compact-finished`.
+///
+/// Shared by `/compact` ([`compact_session`]) and the M6 `compact_now`
+/// command, so the two can never disagree about what a startable compaction
+/// looks like.
+fn begin_compaction(app: AppHandle, state: &Arc<GuiState>, session_id: &str) -> Result<(), String> {
     let (settings, messages, before) = {
         let mut inner = state.lock()?;
-        if inner.streaming.contains_key(&session_id) {
+        if inner.streaming.contains_key(session_id) {
             return Err("a turn is in progress — wait for it to finish".to_string());
         }
-        if !inner.compacting.insert(session_id.clone()) {
+        if !inner.compacting.insert(session_id.to_string()) {
             return Err("a compaction is already running for this chat".to_string());
         }
         let found = inner
@@ -1724,18 +2239,19 @@ fn compact_session(
             .into_iter()
             .find(|s| s.id == session_id);
         let Some(record) = found else {
-            inner.compacting.remove(&session_id);
+            inner.compacting.remove(session_id);
             return Err("session not found".to_string());
         };
         if let Some(reason) = crate::compact::refusal(&record.messages) {
-            inner.compacting.remove(&session_id);
+            inner.compacting.remove(session_id);
             return Err(reason);
         }
         let before = record.messages.len();
         (inner.settings.clone(), record.messages, before)
     };
 
-    let state = Arc::clone(state.inner());
+    let state = Arc::clone(state);
+    let session_id = session_id.to_string();
     std::thread::spawn(move || {
         let outcome = run_compaction(&state, &session_id, &settings, &messages);
         // Release the in-flight marker before announcing, so an immediate
@@ -1948,19 +2464,57 @@ fn normalize_workspace_root(root: &str) -> Result<String, String> {
     Ok(canon.to_string_lossy().into_owned())
 }
 
-/// Create a workspace. It starts from the current defaults, so a new workspace
-/// behaves like today's installation until it is configured otherwise.
+/// Create a workspace, with everything the "Add a workspace" dialog collected.
+///
+/// A workspace starts from the current defaults, so a new one behaves like
+/// today's installation until it is configured otherwise — and `config` is how
+/// it is configured *at* creation, in one step, rather than being created wrong
+/// and edited right. A draft naming something that does not exist is refused
+/// before the workspace is added, so a failed creation leaves nothing behind.
 #[tauri::command]
 fn create_workspace(
     state: State<'_, Arc<GuiState>>,
     name: String,
     root: String,
+    config: Option<crate::settings::WorkspaceDraft>,
 ) -> Result<Settings, String> {
     let mut inner = state.lock()?;
-    let root = normalize_workspace_root(&root)?;
+    create_workspace_in(&mut inner, &name, &root, config.as_ref())
+}
+
+/// [`create_workspace`]'s body, separated so a test can drive it without a
+/// Tauri `State` — and so a refused draft can be shown to add nothing.
+fn create_workspace_in(
+    inner: &mut Inner,
+    name: &str,
+    root: &str,
+    config: Option<&crate::settings::WorkspaceDraft>,
+) -> Result<Settings, String> {
+    let w = drafted_workspace(&inner.settings, name, root, config)?;
+    inner.settings.active_workspace = w.id.clone();
+    inner.settings.workspaces.push(w);
+    inner.settings.save().map_err(|e| e.to_string())?;
+    inner.settings_gen = inner.settings_gen.wrapping_add(1);
+    inner.agent_cache.clear();
+    Ok(inner.settings.effective())
+}
+
+/// Build the workspace a creation asks for, without adding it anywhere.
+///
+/// Separated from [`create_workspace_in`] so the two promises can be checked
+/// without a settings file: a valid draft lands whole, and a draft naming an
+/// MCP server this installation does not have is refused *before* anything is
+/// added — the caller pushes only what this returns.
+fn drafted_workspace(
+    settings: &crate::settings::Settings,
+    name: &str,
+    root: &str,
+    config: Option<&crate::settings::WorkspaceDraft>,
+) -> Result<crate::settings::Workspace, String> {
+    let root = normalize_workspace_root(root)?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = crate::session::unix_now();
-    let mut w = crate::settings::Workspace::adopted_from(&inner.settings, &id, now);
+    let mut w = crate::settings::Workspace::adopted_from(settings, &id, now);
     w.name = if name.trim().is_empty() {
         if root.is_empty() {
             "Default".to_string()
@@ -1971,12 +2525,22 @@ fn create_workspace(
         name.trim().to_string()
     };
     w.root = root;
-    inner.settings.workspaces.push(w);
-    inner.settings.active_workspace = id;
-    inner.settings.save().map_err(|e| e.to_string())?;
-    inner.settings_gen = inner.settings_gen.wrapping_add(1);
-    inner.agent_cache.clear();
-    Ok(inner.settings.effective())
+    if let Some(draft) = config {
+        w.apply_draft(draft)?;
+    }
+    Ok(w)
+}
+
+/// List the sub-folders of `path`, for the folder chooser behind
+/// "Add a workspace".
+///
+/// Deliberately reads outside the current workspace: choosing a root is what
+/// happens *before* a workspace exists, so there is nothing to be contained in
+/// yet. It returns directory names and resolved paths only, never a file's
+/// contents, and refuses anything that is not an existing directory.
+#[tauri::command]
+fn list_folder(path: Option<String>) -> Result<crate::folders::FolderListing, String> {
+    crate::folders::list(path.as_deref())
 }
 
 /// Rename a workspace or move its root. Sessions stay put: a chat recorded in the
@@ -2267,6 +2831,7 @@ fn save_settings(
             enabled: s.enabled,
             connected: false,
             tools: 0,
+            tool_names: Vec::new(),
             error: None,
         })
         .collect();
@@ -2295,16 +2860,480 @@ fn enabled_mcp_servers(settings: &Settings) -> Vec<String> {
 /// The panel is settings-scoped, so this reports from a fresh throwaway
 /// build (MCP handshakes attached) rather than any session's cached agent.
 #[tauri::command]
-fn list_capabilities(state: State<'_, Arc<GuiState>>) -> Result<Capabilities, String> {
+fn list_capabilities(
+    state: State<'_, Arc<GuiState>>,
+    session: Option<String>,
+) -> Result<Capabilities, String> {
     let inner = state.lock()?;
     let broker = Arc::new(crate::approval::ApprovalBroker::default());
     let effective = inner.settings.effective();
-    let base = caps::build_agent(&effective, Arc::clone(&broker));
+    // With a chat open this describes *that chat's* agent, so a skill the chat
+    // switched off is absent from the panel and from the palette that reads it.
+    // A chat's own list is a scope, and a scope the inventory does not follow is
+    // one the inventory lies about.
+    let skill_deny = session
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .and_then(|id| inner.session_skill_deny(id));
+    let base = caps::build_agent_with(&effective, Arc::clone(&broker), skill_deny.as_deref());
     let mut agent = base.as_ref().clone();
     inner.attach_mcp_tools(&mut agent, &broker, &effective);
     // Describe the effective set, so the panel reports what this workspace will
     // actually run with.
     Ok(caps::capabilities_of(&Arc::new(agent), &effective))
+}
+
+/// What the policy says about every tool the connected servers advertise.
+///
+/// The pane reads this instead of deriving decisions from the rules, so what it
+/// prints is what the last attach act did.
+fn policy_report(inner: &Inner, now_ms: u64) -> Result<crate::mcp_policy::Report, String> {
+    let store = inner
+        .mcp_policy
+        .lock()
+        .map_err(|_| "the MCP policy lock is poisoned".to_string())?;
+    let mut servers: Vec<(String, Vec<String>)> = inner
+        .mcp_ready
+        .iter()
+        .map(|(name, handshake)| {
+            (
+                name.clone(),
+                handshake.tools.iter().map(|d| d.name.clone()).collect(),
+            )
+        })
+        .collect();
+    servers.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(store.report(&servers, now_ms))
+}
+
+/// Rebuild every cached session agent from the current settings and policy,
+/// keeping the derived MCP counts true.
+///
+/// Two calls need this, for the same reason: a change that is only honored on
+/// the *next* build would leave the running session disagreeing with what the
+/// user just did. An MCP policy change must remove a denied tool immediately
+/// rather than at the next open; a newly authored skill must be available to a
+/// session that is already open rather than after a restart. Both go through
+/// [`Inner::build_agent_for`], so a re-attach cannot drift from a first build —
+/// and a clone of the running agent could only ever add, never remove.
+fn reattach_cached_agents(inner: &mut Inner) -> Vec<(String, String)> {
+    let jobs: Vec<(String, Arc<crate::approval::ApprovalBroker>)> = inner
+        .agent_cache
+        .iter()
+        .map(|(id, e)| (id.clone(), Arc::clone(&e.broker)))
+        .collect();
+    let mut errors = Vec::new();
+    for (id, broker) in jobs {
+        // A fresh build, not a clone of the running agent: removing a tool is
+        // the whole point of re-attaching.
+        let (fresh, mut mcp_errors) = inner.build_agent_for(&id, &broker);
+        let fresh = Arc::new(fresh);
+        errors.append(&mut mcp_errors);
+        if let Some(reg) = fresh.registry() {
+            let names = reg.async_tool_names();
+            for status in inner.mcp_status.iter_mut() {
+                let prefix = format!("{}_", status.name);
+                status.tools = names.iter().filter(|n| n.starts_with(&prefix)).count();
+            }
+        }
+        if let Some(entry) = inner.agent_cache.get_mut(&id) {
+            entry.agent = fresh;
+        }
+    }
+    errors
+}
+
+/// Rebuild **one** cached session agent, for a change that belongs to that
+/// chat alone.
+///
+/// A skill activation is the first such change: switching a skill off in one
+/// chat must not rebuild the other chats, because a rebuild swaps the `Arc` a
+/// running stream is holding and there is no reason to disturb a chat whose
+/// owner asked for nothing. Returns whether an agent was there to rebuild — a
+/// chat nobody has opened yet needs no work, since its first build reads the
+/// record.
+fn rebuild_session_agent(inner: &mut Inner, session: &str) -> bool {
+    let Some(broker) = inner
+        .agent_cache
+        .get(session)
+        .map(|e| Arc::clone(&e.broker))
+    else {
+        return false;
+    };
+    // The same construction path as a first build and as a whole-cache
+    // re-attach: a clone of the running agent could only ever add a skill back.
+    let (fresh, _mcp_errors) = inner.build_agent_for(session, &broker);
+    if let Some(entry) = inner.agent_cache.get_mut(session) {
+        entry.agent = Arc::new(fresh);
+    }
+    true
+}
+
+/// The skills directory in force, expanded, and the workspace's denials.
+fn skills_dir_and_denials(inner: &Inner) -> (std::path::PathBuf, Vec<String>) {
+    let effective = inner.settings.effective();
+    let dir = effective.skills_dir.trim();
+    (
+        crate::caps::expand_tilde(if dir.is_empty() { "." } else { dir }),
+        effective.disabled_skills,
+    )
+}
+
+/// The pane's answer for one chat, from the directory and the record.
+fn activation_state(
+    inner: &Inner,
+    session: &str,
+    now_ms: u64,
+) -> Result<crate::skills::ActivationReport, String> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Err("no chat is open to switch a skill on for".to_string());
+    }
+    let (dir, denied) = skills_dir_and_denials(inner);
+    let record = inner
+        .skill_activation
+        .lock()
+        .map_err(|_| "the skill activation lock is poisoned".to_string())?;
+    Ok(crate::skills::activation_report(
+        &dir,
+        &denied,
+        session,
+        &record,
+        &inner.skill_activation_path,
+        now_ms,
+    ))
+}
+
+/// Switch one skill on or off for one chat, then make it take effect.
+///
+/// The record is written before the agent is rebuilt, and the rebuild happens
+/// only when something actually changed: enabling a skill the chat already
+/// carries is a no-op that must not freeze the chat's set, and rebuilding on it
+/// would swap an `Arc` for nothing.
+fn set_skill_active(
+    inner: &mut Inner,
+    session: &str,
+    name: &str,
+    on: bool,
+    now_ms: u64,
+) -> Result<crate::skills::ActivationReport, String> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Err("no chat is open to switch a skill on for".to_string());
+    }
+    let (dir, denied) = skills_dir_and_denials(inner);
+    let (_, listed) = crate::skills::list(&dir, &denied);
+    let discovered: Vec<String> = listed.iter().map(|skill| skill.name.clone()).collect();
+    let available = crate::skills::effective(&discovered, &denied, None);
+    if !available.iter().any(|held| held == name) {
+        // Name which of the two reasons it is: a skill the workspace switched
+        // off is not the same answer as a name nothing on this machine holds,
+        // and the pane's own listing may show a row for one of them.
+        return Err(if discovered.iter().any(|held| held == name) {
+            format!("this workspace has switched {name:?} off")
+        } else {
+            format!("this workspace has no skill named {name:?}")
+        });
+    }
+    let changed = {
+        let mut record = inner
+            .skill_activation
+            .lock()
+            .map_err(|_| "the skill activation lock is poisoned".to_string())?;
+        let changed = record.set(session, name, on, &available)?;
+        if changed {
+            record.save(&inner.skill_activation_path)?;
+        }
+        changed
+    };
+    if changed {
+        rebuild_session_agent(inner, session);
+    }
+    activation_state(inner, session, now_ms)
+}
+
+/// Put a chat back on the workspace's skills.
+fn inherit_skills(
+    inner: &mut Inner,
+    session: &str,
+    now_ms: u64,
+) -> Result<crate::skills::ActivationReport, String> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Err("no chat is open to switch a skill on for".to_string());
+    }
+    let changed = {
+        let mut record = inner
+            .skill_activation
+            .lock()
+            .map_err(|_| "the skill activation lock is poisoned".to_string())?;
+        let changed = record.clear(session);
+        if changed {
+            record.save(&inner.skill_activation_path)?;
+        }
+        changed
+    };
+    if changed {
+        rebuild_session_agent(inner, session);
+    }
+    activation_state(inner, session, now_ms)
+}
+
+/// Change the policy and make it take effect, then report the result.
+fn edit_policy<T>(
+    inner: &mut Inner,
+    now_ms: u64,
+    edit: T,
+) -> Result<crate::mcp_policy::Report, String>
+where
+    T: FnOnce(&mut crate::mcp_policy::Store) -> Result<(), String>,
+{
+    {
+        let mut store = inner
+            .mcp_policy
+            .lock()
+            .map_err(|_| "the MCP policy lock is poisoned".to_string())?;
+        edit(&mut store)?;
+        store.save()?;
+    }
+    reattach_cached_agents(inner);
+    policy_report(inner, now_ms)
+}
+
+/// The per-tool MCP policy, and what it does to the connected servers.
+#[tauri::command]
+fn mcp_policy_status(
+    state: State<'_, Arc<GuiState>>,
+    now_ms: u64,
+) -> Result<crate::mcp_policy::Report, String> {
+    let inner = state.lock()?;
+    policy_report(&inner, now_ms)
+}
+
+/// Set one `(server, tool)` pair to allow, ask or deny.
+#[tauri::command]
+fn mcp_policy_set(
+    state: State<'_, Arc<GuiState>>,
+    server: String,
+    tool: String,
+    effect: String,
+    now_ms: u64,
+) -> Result<crate::mcp_policy::Report, String> {
+    let effect = crate::mcp_policy::Effect::parse(&effect)
+        .ok_or_else(|| format!("unknown effect {effect:?}; expected allow, ask or deny"))?;
+    let mut inner = state.lock()?;
+    edit_policy(&mut inner, now_ms, |store| {
+        store.set(&server, &tool, effect)
+    })
+}
+
+/// Drop the rule stored for a pair, so it follows the default again.
+#[tauri::command]
+fn mcp_policy_clear(
+    state: State<'_, Arc<GuiState>>,
+    server: String,
+    tool: String,
+    now_ms: u64,
+) -> Result<crate::mcp_policy::Report, String> {
+    let mut inner = state.lock()?;
+    edit_policy(&mut inner, now_ms, |store| {
+        store.clear(&server, &tool);
+        Ok(())
+    })
+}
+
+/// Set what a pair with no rule gets.
+#[tauri::command]
+fn mcp_policy_default(
+    state: State<'_, Arc<GuiState>>,
+    effect: String,
+    now_ms: u64,
+) -> Result<crate::mcp_policy::Report, String> {
+    let effect = crate::mcp_policy::Effect::parse(&effect)
+        .ok_or_else(|| format!("unknown effect {effect:?}; expected allow, ask or deny"))?;
+    let mut inner = state.lock()?;
+    edit_policy(&mut inner, now_ms, |store| {
+        store.set_default(effect);
+        Ok(())
+    })
+}
+
+/// The servers a catalog pass visits, in settings order, each with the live
+/// client when this pass has one.
+///
+/// Configured-but-unreachable servers are included so the pane can say so
+/// rather than showing an empty list, and only a server with a client is asked
+/// anything.
+fn catalog_plan(inner: &Inner) -> Vec<(String, Option<Arc<agent::mcp::McpClient>>)> {
+    inner
+        .mcp_status
+        .iter()
+        .map(|status| {
+            let client = inner
+                .mcp_ready
+                .iter()
+                .find(|(name, _)| name == &status.name)
+                .map(|(_, handshake)| handshake.client.clone());
+            (status.name.clone(), client)
+        })
+        .collect()
+}
+
+/// The live client for one server, or the refusal the pane shows.
+fn read_target(inner: &Inner, server: &str) -> Result<Arc<agent::mcp::McpClient>, String> {
+    inner
+        .mcp_ready
+        .iter()
+        .find(|(name, _)| name == server)
+        .map(|(_, handshake)| handshake.client.clone())
+        .ok_or_else(|| format!("no connected MCP server is named {server:?}"))
+}
+
+/// Validate a URI a read was asked for, before any server sees it.
+fn read_uri(uri: &str) -> Result<String, String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return Err("a resource read needs a URI".to_string());
+    }
+    let chars = trimmed.chars().count();
+    if chars > crate::mcp_view::MAX_URI_CHARS {
+        return Err(format!(
+            "that URI is {chars} characters; the limit is {}",
+            crate::mcp_view::MAX_URI_CHARS
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// One server's resources and prompts.
+///
+/// A capability the server never declared is not asked about, and a listing
+/// that fails or does not answer lands in this server's own `error` field: the
+/// catalog is a summary of several servers and one of them must not be able to
+/// blank the rest.
+async fn fetch_catalog(
+    server: &str,
+    client: Option<&agent::mcp::McpClient>,
+) -> crate::mcp_view::ServerView {
+    let Some(client) = client else {
+        return crate::mcp_view::server_view(server, false, None, Ok(Vec::new()), Vec::new());
+    };
+    let capabilities = client.get_capabilities().await;
+    let caps = capabilities.as_ref();
+    let offered = |cap: &serde_json::Value| crate::mcp_view::supported(cap);
+    let resources_offered = caps.map(|c| offered(&c.resources)).unwrap_or(false);
+    let prompts_offered = caps.map(|c| offered(&c.prompts)).unwrap_or(false);
+    let resources = if resources_offered {
+        match tokio::time::timeout(crate::mcp::LIST_TIMEOUT, client.list_resources()).await {
+            Ok(Ok(listed)) => Ok(listed),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err(format!(
+                "resources/list did not answer within {:?}",
+                crate::mcp::LIST_TIMEOUT
+            )),
+        }
+    } else {
+        Ok(Vec::new())
+    };
+    // `list_prompts` swallows its own errors inside the client, so a timeout is
+    // the only failure this side can observe: it reads as "no prompts", which
+    // is why the wait is bounded rather than left to the server.
+    let prompts = if prompts_offered {
+        tokio::time::timeout(crate::mcp::LIST_TIMEOUT, client.list_prompts())
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    crate::mcp_view::server_view(server, true, caps, resources, prompts)
+}
+
+/// What the connected MCP servers publish besides tools: their resources and
+/// prompts, read on demand rather than carried in every prompt.
+#[tauri::command]
+async fn mcp_catalog(
+    state: State<'_, Arc<GuiState>>,
+    now_ms: u64,
+) -> Result<crate::mcp_view::Catalog, String> {
+    let plan = {
+        let inner = state.lock()?;
+        catalog_plan(&inner)
+    };
+    let mut views = Vec::with_capacity(plan.len());
+    for (server, client) in plan {
+        views.push(fetch_catalog(&server, client.as_deref()).await);
+    }
+    Ok(crate::mcp_view::catalog(now_ms, views))
+}
+
+/// Read one resource from one connected server. The text is bounded on the way
+/// out and is never injected anywhere: reading is a gesture, not a side effect
+/// of a server being connected.
+#[tauri::command]
+async fn mcp_read_resource(
+    state: State<'_, Arc<GuiState>>,
+    server: String,
+    uri: String,
+    now_ms: u64,
+) -> Result<crate::mcp_view::ReadView, String> {
+    let uri = read_uri(&uri)?;
+    let server = server.trim().to_string();
+    let client = {
+        let inner = state.lock()?;
+        read_target(&inner, &server)?
+    };
+    let result =
+        match tokio::time::timeout(crate::mcp::LIST_TIMEOUT, client.read_resource(&uri)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(_) => {
+                return Err(format!(
+                    "resources/read did not answer within {:?}",
+                    crate::mcp::LIST_TIMEOUT
+                ))
+            }
+        };
+    Ok(crate::mcp_view::read_view(&server, &uri, &result, now_ms))
+}
+
+/// Which skills the open chat carries, what it could carry, and what the
+/// workspace keeps from it.
+#[tauri::command]
+fn skill_activation(
+    state: State<'_, Arc<GuiState>>,
+    session: String,
+    now_ms: u64,
+) -> Result<crate::skills::ActivationReport, String> {
+    let inner = state.lock()?;
+    activation_state(&inner, &session, now_ms)
+}
+
+/// Switch one skill on or off for one chat.
+///
+/// The chat's agent is rebuilt when the record actually changed, so the skill
+/// the chat just dropped is gone from what the model is told — not at the next
+/// restart, and not in the other chats.
+#[tauri::command]
+fn skill_set_active(
+    state: State<'_, Arc<GuiState>>,
+    session: String,
+    name: String,
+    active: bool,
+    now_ms: u64,
+) -> Result<crate::skills::ActivationReport, String> {
+    let mut inner = state.lock()?;
+    set_skill_active(&mut inner, &session, name.trim(), active, now_ms)
+}
+
+/// Forget a chat's own list: it follows the workspace again.
+#[tauri::command]
+fn skill_inherit(
+    state: State<'_, Arc<GuiState>>,
+    session: String,
+    now_ms: u64,
+) -> Result<crate::skills::ActivationReport, String> {
+    let mut inner = state.lock()?;
+    inherit_skills(&mut inner, &session, now_ms)
 }
 
 /// Report MCP connection progress for the settings dialog and status bar.
@@ -2344,6 +3373,7 @@ fn reconnect_mcp(state: State<'_, Arc<GuiState>>) -> Result<(), String> {
                 enabled: s.enabled,
                 connected: false,
                 tools: 0,
+                tool_names: Vec::new(),
                 error: None,
             })
             .collect();
@@ -2362,6 +3392,7 @@ fn spawn_forwarder(
     rx: Receiver<AgentEvent>,
     session_id: String,
     gen: u64,
+    job: String,
 ) {
     tauri::async_runtime::spawn(async move {
         // Buffered this turn's output; the record's blank assistant
@@ -2429,9 +3460,48 @@ fn spawn_forwarder(
                 },
             };
             let _ = app.emit("agent-event", &payload);
+            // Mirror the low-volume milestones into the session's job, so the
+            // jobs panel shows what a running turn is doing. Text deltas are
+            // pushed once at the end instead, to avoid locking per token.
+            let milestone = match &payload.event {
+                StreamKind::Tool { name, .. } => Some(format!("[tool] {name}\n")),
+                StreamKind::ToolResult { name, output, ms } => {
+                    Some(format!("[result] {name} ({ms} ms): {output}\n"))
+                }
+                StreamKind::Usage { prompt, completion } => Some(format!(
+                    "[usage] prompt {prompt} tokens, completion {completion} tokens\n"
+                )),
+                StreamKind::Compacted {
+                    before,
+                    after,
+                    dropped,
+                } => Some(format!(
+                    "[compacted] {before} -> {after} messages ({dropped} folded)\n"
+                )),
+                StreamKind::Error { message } => Some(format!("[error] {message}\n")),
+                _ => None,
+            };
+            if let Some(line) = milestone {
+                if let Ok(inner) = state.lock() {
+                    let _ = inner.jobs.push(&job, &line);
+                }
+            }
             if terminal {
                 break;
             }
+        }
+
+        // Mirror the turn's text into its job and settle the job, before the
+        // record is finalized and `error_buf` is consumed.
+        if let Ok(inner) = state.lock() {
+            if !text_buf.is_empty() {
+                let _ = inner.jobs.push(&job, &text_buf);
+            }
+            let (kind, error) = match &error_buf {
+                Some(message) => (crate::runs::JobState::Failed, Some(message.clone())),
+                None => (crate::runs::JobState::Finished, None),
+            };
+            inner.jobs.finish(&job, kind, error);
         }
 
         // Finalize: fill the placeholder, drop it if still blank, derive a
@@ -2454,6 +3524,10 @@ fn spawn_forwarder(
                     .into_iter()
                     .find(|s| s.id == session_id)
                 {
+                    // Oversized tool outputs leave the transcript before it is
+                    // persisted: the full text moves to `<store>/spill/`, and
+                    // the turn keeps a short marker naming the file.
+                    crate::context::spill_oversized_tools(inner.store.dir(), &mut tools_buf);
                     // Write what streamed into the assistant placeholder, so
                     // reloading the session (or restarting) keeps the reply.
                     if let Some(last) = record.messages.last_mut() {
@@ -2506,6 +3580,371 @@ fn spawn_forwarder(
     });
 }
 
+/// Expand a configured workspace root; `None` when none is set.
+fn workspace_root(raw: &str) -> Option<std::path::PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(
+        shellexpand::tilde(raw).into_owned(),
+    ))
+}
+
+/// Load one session by id, or a clean error.
+fn load_record(inner: &Inner, session_id: &str) -> Result<SessionRecord, String> {
+    inner
+        .store
+        .load_all()
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| format!("session {session_id} not found"))
+}
+
+/* ---------------- M4: scoped approval rules ---------------- */
+
+/// The rules in force, plus anything the rules file got wrong.
+#[derive(Clone, Serialize)]
+pub(crate) struct ApprovalRulesReport {
+    /// Every stored rule, in insertion order.
+    rules: Vec<crate::approval::ApprovalRule>,
+    /// Problems found while loading the file (bad entries, bad JSON).
+    warnings: Vec<String>,
+    /// How many decisions the audit ring can hold.
+    audit_cap: usize,
+}
+
+/// Build the report the rules commands return.
+fn rules_report(book: &crate::approval::RuleBook) -> ApprovalRulesReport {
+    ApprovalRulesReport {
+        rules: book.rules(),
+        warnings: book.warnings(),
+        audit_cap: crate::approval::AUDIT_CAP,
+    }
+}
+
+/// Parse a rule scope from its wire name.
+fn parse_rule_scope(raw: &str) -> Result<crate::approval::RuleScope, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "global" => Ok(crate::approval::RuleScope::Global),
+        "workspace" => Ok(crate::approval::RuleScope::Workspace),
+        "session" => Ok(crate::approval::RuleScope::Session),
+        other => Err(format!(
+            "unknown scope '{other}' (expected global, workspace, or session)"
+        )),
+    }
+}
+
+/// Parse a rule effect from its wire name.
+fn parse_rule_effect(raw: &str) -> Result<crate::approval::RuleEffect, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "allow" => Ok(crate::approval::RuleEffect::Allow),
+        "deny" => Ok(crate::approval::RuleEffect::Deny),
+        other => Err(format!("unknown effect '{other}' (expected allow or deny)")),
+    }
+}
+
+/// Parse an argument predicate kind from its wire name.
+fn parse_match_kind(raw: &str) -> Result<crate::approval::MatchKind, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "exact" => Ok(crate::approval::MatchKind::Exact),
+        "prefix" => Ok(crate::approval::MatchKind::Prefix),
+        "contains" => Ok(crate::approval::MatchKind::Contains),
+        other => Err(format!(
+            "unknown argument match '{other}' (expected exact, prefix, or contains)"
+        )),
+    }
+}
+
+/// List the scoped approval rules and any load warnings.
+#[tauri::command]
+fn approval_rules_list(state: State<'_, Arc<GuiState>>) -> Result<ApprovalRulesReport, String> {
+    let inner = state.lock()?;
+    Ok(rules_report(&inner.rules))
+}
+
+/// Add a scoped allow/deny rule and return the book as it now stands.
+///
+/// A `workspace`-scoped rule defaults its workspace to the active one, and a
+/// `session`-scoped rule requires an explicit `session_id`; the argument
+/// predicate must be given whole (key, match kind, and value) or not at all.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn approval_rule_add(
+    state: State<'_, Arc<GuiState>>,
+    tool: String,
+    scope: String,
+    effect: String,
+    arg_key: Option<String>,
+    arg_match: Option<String>,
+    arg_value: Option<String>,
+    workspace: Option<String>,
+    session_id: Option<String>,
+) -> Result<ApprovalRulesReport, String> {
+    let inner = state.lock()?;
+    let scope = parse_rule_scope(&scope)?;
+    let effect = parse_rule_effect(&effect)?;
+    let arg = match (arg_key, arg_match, arg_value) {
+        (None, None, None) => None,
+        (Some(key), Some(kind), Some(value)) => Some(crate::approval::ArgPredicate {
+            key,
+            match_kind: parse_match_kind(&kind)?,
+            value,
+        }),
+        _ => {
+            return Err(
+                "an argument predicate needs arg_key, arg_match, and arg_value together"
+                    .to_string(),
+            )
+        }
+    };
+    let workspace = match scope {
+        crate::approval::RuleScope::Workspace => workspace
+            .filter(|root| !root.trim().is_empty())
+            .or_else(|| {
+                workspace_root(&inner.settings.effective().bash_workspace)
+                    .map(|root| root.to_string_lossy().into_owned())
+            }),
+        _ => None,
+    };
+    let session = match scope {
+        crate::approval::RuleScope::Session => session_id.filter(|id| !id.trim().is_empty()),
+        _ => None,
+    };
+    if scope == crate::approval::RuleScope::Workspace && workspace.is_none() {
+        return Err("a workspace-scoped rule needs an active workspace".to_string());
+    }
+    if scope == crate::approval::RuleScope::Session && session.is_none() {
+        return Err("a session-scoped rule needs a session id".to_string());
+    }
+    inner.rules.add(crate::approval::NewRule {
+        tool,
+        arg,
+        scope,
+        effect,
+        workspace,
+        session,
+    })?;
+    Ok(rules_report(&inner.rules))
+}
+
+/// Revoke a rule by id and return the book as it now stands.
+#[tauri::command]
+fn approval_rule_revoke(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+) -> Result<ApprovalRulesReport, String> {
+    let inner = state.lock()?;
+    if !inner.rules.revoke(&id)? {
+        return Err(format!("no rule with id '{id}'"));
+    }
+    Ok(rules_report(&inner.rules))
+}
+
+/// The most recent approval decisions, newest first (bounded ring).
+#[tauri::command]
+fn approval_audit(
+    state: State<'_, Arc<GuiState>>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::approval::AuditEntry>, String> {
+    let inner = state.lock()?;
+    Ok(inner
+        .rules
+        .audit(limit.unwrap_or(50).min(crate::approval::AUDIT_CAP)))
+}
+
+/* ---------------- M6: context, spill, compaction ---------------- */
+
+/// Estimate a session's token cost and reconcile it with provider usage.
+#[tauri::command]
+fn token_meter(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+    provider_tokens: Option<usize>,
+) -> Result<crate::context::TokenMeterReport, String> {
+    let inner = state.lock()?;
+    let record = load_record(&inner, &session_id)?;
+    Ok(crate::context::meter(&record, provider_tokens))
+}
+
+/// List the tool outputs that were spilled to disk for this store.
+#[tauri::command]
+fn spill_list(state: State<'_, Arc<GuiState>>) -> Result<Vec<crate::context::SpillEntry>, String> {
+    let inner = state.lock()?;
+    Ok(crate::context::spill_list(inner.store.dir()))
+}
+
+/// Read one spilled tool output, bounded by `max_bytes`.
+#[tauri::command]
+fn spill_read(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    max_bytes: Option<usize>,
+) -> Result<crate::context::SpillRead, String> {
+    let inner = state.lock()?;
+    crate::context::spill_read(inner.store.dir(), &id, max_bytes)
+}
+
+/// Report what `/compact` would do for a session right now.
+#[tauri::command]
+fn compaction_status(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+) -> Result<crate::context::CompactionStatus, String> {
+    let inner = state.lock()?;
+    let record = load_record(&inner, &session_id)?;
+    let budget = inner.settings.effective().context_budget;
+    let compacting = inner.compacting.contains(&session_id);
+    Ok(crate::context::compaction_status(
+        &record, budget, compacting,
+    ))
+}
+
+/// Start a compaction now and report the status as it begins.
+///
+/// The summarization turn runs on a background thread and reports through the
+/// same `compact-finished` event as `/compact`; the returned status is the
+/// snapshot taken once the run has been accepted.
+#[tauri::command]
+fn compact_now(
+    app: AppHandle,
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+) -> Result<crate::context::CompactionStatus, String> {
+    begin_compaction(app, state.inner(), &session_id)?;
+    let inner = state.lock()?;
+    let record = load_record(&inner, &session_id)?;
+    let budget = inner.settings.effective().context_budget;
+    Ok(crate::context::compaction_status(&record, budget, true))
+}
+
+/* ---------------- M7: background jobs ---------------- */
+
+/// Every background job, newest first (bounded output bodies).
+#[tauri::command]
+fn jobs_list(state: State<'_, Arc<GuiState>>) -> Result<Vec<crate::runs::JobRecord>, String> {
+    let inner = state.lock()?;
+    Ok(inner.jobs.list())
+}
+
+/// Read the tail of a job's output, bounded by `max_bytes`.
+#[tauri::command]
+fn job_output(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    max_bytes: Option<usize>,
+) -> Result<crate::runs::JobOutput, String> {
+    let inner = state.lock()?;
+    inner.jobs.output(&id, max_bytes)
+}
+
+/// Interrupt a job by id, returning its updated record.
+#[tauri::command]
+fn job_interrupt(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+) -> Result<crate::runs::JobRecord, String> {
+    let inner = state.lock()?;
+    inner.jobs.interrupt(&id)
+}
+
+/* ---------------- M10: deterministic replay ---------------- */
+
+/// Replay a stored session into an ordered transcript and deterministic metrics.
+#[tauri::command]
+fn replay_session(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+) -> Result<crate::replay::ReplayReport, String> {
+    let inner = state.lock()?;
+    let record = load_record(&inner, &session_id)?;
+    Ok(crate::replay::replay(&record))
+}
+
+/* ---------------- M11: AGI surfaces ---------------- */
+
+/// Read the agent's own composition: tools, skills, plugins, MCP, memories, goal.
+#[tauri::command]
+async fn self_inspect(
+    state: State<'_, Arc<GuiState>>,
+    session_id: Option<String>,
+) -> Result<crate::agi::SelfInspection, String> {
+    // Snapshot everything that needs the lock, then await memory outside it:
+    // the state guard is not `Send` and must never cross an await point.
+    let (capabilities, settings, goal, mcp_servers, rules) = {
+        let inner = state.lock()?;
+        let effective = inner.settings.effective();
+        let broker = Arc::new(crate::approval::ApprovalBroker::default());
+        let base = caps::build_agent(&effective, Arc::clone(&broker));
+        let mut agent = base.as_ref().clone();
+        inner.attach_mcp_tools(&mut agent, &broker, &effective);
+        let capabilities = caps::capabilities_of(&Arc::new(agent), &effective);
+        let goal = match &session_id {
+            Some(id) => inner.store.load(id).and_then(|record| record.goal),
+            None => None,
+        };
+        (
+            capabilities,
+            effective,
+            goal,
+            inner.mcp_ready.len(),
+            inner.rules.rules().len(),
+        )
+    };
+    let memories = match &session_id {
+        Some(id) => {
+            let store = {
+                let mut inner = state.lock()?;
+                inner.agent(id).memory().cloned()
+            };
+            match store {
+                Some(store) => store.all().await.len(),
+                None => 0,
+            }
+        }
+        None => 0,
+    };
+    Ok(crate::agi::inspect(
+        &capabilities,
+        memories,
+        goal.as_ref(),
+        &settings,
+        mcp_servers,
+        rules,
+    ))
+}
+
+/// Score a session transcript with explicit reasons (deterministic critic).
+#[tauri::command]
+fn evaluate_transcript(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+) -> Result<crate::agi::TranscriptScore, String> {
+    let inner = state.lock()?;
+    let record = load_record(&inner, &session_id)?;
+    Ok(crate::agi::evaluate(&record))
+}
+
+/* ---------------- M14: packaging ---------------- */
+
+/// Bundle a chat as a ZIP (transcript + metrics + manifest) and return its path.
+#[tauri::command]
+fn export_bundle(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+) -> Result<crate::export::BundleFileReport, String> {
+    let inner = state.lock()?;
+    let record = load_record(&inner, &session_id)?;
+    let exported = crate::export::export_bundle(inner.store.dir(), &record)?;
+    Ok(crate::export::BundleFileReport {
+        path: exported.path.to_string_lossy().into_owned(),
+        bytes: exported.bytes,
+        schema_version: exported.manifest.schema_version,
+        entries: exported.manifest.entries,
+        files: exported.manifest.files,
+    })
+}
+
 /// Build the Tauri app and run the event loop (blocks until quit).
 pub(crate) fn run() -> anyhow::Result<()> {
     tauri::Builder::default()
@@ -2531,6 +3970,9 @@ pub(crate) fn run() -> anyhow::Result<()> {
             list_sessions,
             create_session,
             delete_session,
+            rename_session,
+            set_session_pinned,
+            set_session_archived,
             load_session,
             restore_plan,
             get_plan,
@@ -2569,6 +4011,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             save_settings,
             set_active_workspace,
             create_workspace,
+            list_folder,
             apply_preset,
             save_preset,
             update_workspace,
@@ -2576,14 +4019,52 @@ pub(crate) fn run() -> anyhow::Result<()> {
             list_capabilities,
             mcp_status,
             reconnect_mcp,
+            mcp_policy_status,
+            mcp_policy_set,
+            mcp_policy_clear,
+            mcp_policy_default,
             move_session,
             search_sessions,
+            memory_status,
             list_memories,
+            schedule_list,
+            schedule_tick,
+            schedule_add,
+            schedule_cancel,
+            schedule_clear_history,
+            knowledge_list,
+            knowledge_search,
+            knowledge_add,
+            knowledge_update,
+            knowledge_delete,
+            skill_activation,
+            skill_set_active,
+            skill_inherit,
+            mcp_catalog,
+            mcp_read_resource,
+            skill_list,
+            skill_author,
             remember_memory,
             forget_memory,
             allow_tool,
             forget_allowed_tool,
             list_profiles,
+            approval_rules_list,
+            approval_rule_add,
+            approval_rule_revoke,
+            approval_audit,
+            token_meter,
+            spill_list,
+            spill_read,
+            compaction_status,
+            compact_now,
+            jobs_list,
+            job_output,
+            job_interrupt,
+            replay_session,
+            self_inspect,
+            evaluate_transcript,
+            export_bundle,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2592,6 +4073,270 @@ pub(crate) fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The knowledge tool has to be reachable the way the model reaches it: in
+    /// the registry of a real agent, counted by the same composition the Insight
+    /// pane reads, and callable by name through the registry's own dispatch. A
+    /// registration assertion alone would not prove a call works.
+    #[test]
+    fn the_agent_the_gui_builds_can_search_its_knowledge_base() {
+        let dir = std::env::temp_dir().join(format!("bos-kb-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = crate::knowledge::Store::load(&dir.join("knowledge.json"));
+        store
+            .add("Release ritual", "ops", "tag, then push main", 7)
+            .unwrap();
+        let settings = crate::settings::Settings::default();
+
+        let mut plain = (*crate::caps::build_agent(
+            &settings,
+            Arc::new(crate::approval::ApprovalBroker::default()),
+        ))
+        .clone();
+        let without = crate::caps::capabilities_of(&Arc::new(plain.clone()), &settings);
+        attach_knowledge(&mut plain, Arc::new(Mutex::new(store)));
+        let with = crate::caps::capabilities_of(&Arc::new(plain.clone()), &settings);
+        assert_eq!(
+            with.tools.len(),
+            without.tools.len() + 1,
+            "the composition the Insight pane reads must count the knowledge tool"
+        );
+
+        let registry = plain.registry().expect("a registry");
+        let names = registry.list();
+        assert!(
+            names.iter().any(|name| name == crate::knowledge::TOOL_NAME),
+            "{names:?}"
+        );
+        // `execute` is the model's dispatch path, and it validates the arguments
+        // against the tool's own schema first — so this also pins the schema.
+        let out = registry
+            .execute(
+                crate::knowledge::TOOL_NAME,
+                &serde_json::json!({ "query": "ritual" }),
+            )
+            .expect("the knowledge tool answers");
+        assert_eq!(out["matches"][0]["title"], "Release ritual");
+        assert_eq!(out["matches"][0]["body"], "tag, then push main");
+        assert_eq!(out["total"], 1);
+        assert!(out["note"].as_str().unwrap().contains("1 of 1"));
+
+        // And the path a session actually takes: `Inner::agent` must attach it,
+        // not just `attach_knowledge` when called by hand.
+        let mut inner = Inner::new();
+        let session_agent = inner.agent("knowledge-check");
+        let names = session_agent.registry().expect("a registry").list();
+        assert!(
+            names.iter().any(|name| name == crate::knowledge::TOOL_NAME),
+            "a session's agent must carry the knowledge tool: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The policy is consulted **where tools are attached**, so a denied tool is
+    /// absent from the agent a session actually runs on — not merely from the
+    /// report. The handshake is injected because the decision, not the network,
+    /// is what is under test.
+    #[test]
+    fn a_policy_denied_mcp_tool_never_reaches_a_session_agent() {
+        let mut inner = Inner::new();
+        let handshake = crate::mcp::Handshake {
+            // `connect_http` builds a transport and nothing more; registration
+            // never calls the client, so no server is needed.
+            client: Arc::new(agent::mcp::McpClient::connect_http(
+                "http://127.0.0.1:1/mcp",
+            )),
+            tools: vec![
+                agent::mcp::ToolDefinition {
+                    name: "read".to_string(),
+                    description: "read a file".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                agent::mcp::ToolDefinition {
+                    name: "write".to_string(),
+                    description: "write a file".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+        };
+        inner.mcp_ready.push(("srv".to_string(), handshake));
+        // Which servers a session may use is the **workspace's** list, so the
+        // test has to enable it there; the globals are set as well so the test
+        // holds on an installation with no workspaces at all.
+        let entry = crate::settings::McpServerEntry {
+            name: "srv".to_string(),
+            transport: "http".to_string(),
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            enabled: true,
+            ..crate::settings::McpServerEntry::default()
+        };
+        inner.settings.mcp_servers = vec![entry.clone()];
+        let active = inner.settings.active_workspace.clone();
+        for workspace in inner.settings.workspaces.iter_mut() {
+            if workspace.id == active {
+                workspace.mcp_servers = vec![entry.clone()];
+            }
+        }
+
+        let names = |agent: &Arc<Agent>| agent.registry().expect("registry").async_tool_names();
+        let agent = inner.agent("s");
+        assert!(names(&agent).contains(&"srv_read".to_string()));
+        assert!(names(&agent).contains(&"srv_write".to_string()));
+
+        inner
+            .mcp_policy
+            .lock()
+            .expect("policy")
+            .set("srv", "write", crate::mcp_policy::Effect::Deny)
+            .expect("rule");
+        // A rebuild is what a settings change does; the point is that the next
+        // agent of this session carries one tool instead of two.
+        inner.settings_gen += 1;
+        let agent = inner.agent("s");
+        let after = names(&agent);
+        assert!(after.contains(&"srv_read".to_string()), "{after:?}");
+        assert!(
+            !after.contains(&"srv_write".to_string()),
+            "a denied tool must not exist on the session's agent: {after:?}"
+        );
+
+        // And the report the pane reads agrees with what was attached.
+        let report = policy_report(&inner, 7).expect("report");
+        assert_eq!(report.servers.len(), 1);
+        assert_eq!(report.servers[0].name, "srv");
+        assert_eq!(report.servers[0].attached, 1);
+        assert_eq!(report.servers[0].denied, 1);
+        assert_eq!(report.servers[0].tools[1].by, "srv/write");
+        assert_eq!(report.default, crate::mcp_policy::Effect::Allow);
+        // The tool left behind is not an `ask` rule's business: nothing in the
+        // report claims a gate the policy did not ask for.
+        assert_eq!(
+            report.servers[0].tools[0].effect,
+            crate::mcp_policy::Effect::Allow
+        );
+        assert_eq!(report.servers[0].tools[0].by, "default");
+        assert_eq!(report.asked, 0);
+    }
+
+    /// A policy change reaches the agent a session is **already running**, not
+    /// just the next build: otherwise a denied tool stays callable for the rest
+    /// of the session, which is the promise the pane is making.
+    #[test]
+    fn a_policy_change_re_attaches_the_agents_that_already_exist() {
+        let mut inner = Inner::new();
+        let handshake = crate::mcp::Handshake {
+            client: Arc::new(agent::mcp::McpClient::connect_http(
+                "http://127.0.0.1:1/mcp",
+            )),
+            tools: vec![
+                agent::mcp::ToolDefinition {
+                    name: "read".to_string(),
+                    description: "read a file".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                agent::mcp::ToolDefinition {
+                    name: "write".to_string(),
+                    description: "write a file".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+        };
+        inner.mcp_ready.push(("srv".to_string(), handshake));
+        let entry = crate::settings::McpServerEntry {
+            name: "srv".to_string(),
+            transport: "http".to_string(),
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            enabled: true,
+            ..crate::settings::McpServerEntry::default()
+        };
+        inner.settings.mcp_servers = vec![entry.clone()];
+        let active = inner.settings.active_workspace.clone();
+        for workspace in inner.settings.workspaces.iter_mut() {
+            if workspace.id == active {
+                workspace.mcp_servers = vec![entry.clone()];
+            }
+        }
+        let cached_names = |inner: &Inner| {
+            inner
+                .agent_cache
+                .get("s")
+                .expect("cached")
+                .agent
+                .registry()
+                .expect("registry")
+                .async_tool_names()
+        };
+        inner.agent("s");
+        assert!(cached_names(&inner).contains(&"srv_write".to_string()));
+        // The connect pass's row, so the re-attach has a count to correct.
+        inner.mcp_status = vec![crate::mcp::McpStatus {
+            name: "srv".to_string(),
+            transport: "http".to_string(),
+            enabled: true,
+            connected: true,
+            tools: 2,
+            tool_names: vec!["read".to_string(), "write".to_string()],
+            error: None,
+        }];
+
+        inner
+            .mcp_policy
+            .lock()
+            .expect("policy")
+            .set("srv", "write", crate::mcp_policy::Effect::Deny)
+            .expect("rule");
+        // No settings change, no rebuild: the same session's cached agent has
+        // to lose the tool.
+        reattach_cached_agents(&mut inner);
+        let after = cached_names(&inner);
+        assert!(after.contains(&"srv_read".to_string()), "{after:?}");
+        assert!(
+            !after.contains(&"srv_write".to_string()),
+            "a denied tool must leave the running session: {after:?}"
+        );
+        // And the reported count follows the re-attach, not the handshake.
+        let filesystem = inner
+            .mcp_status
+            .iter()
+            .find(|s| s.name == "srv")
+            .expect("status row");
+        assert_eq!(filesystem.tools, 1, "the status counts what is attached");
+        assert_eq!(
+            filesystem.tool_names.len(),
+            2,
+            "and still knows what was offered"
+        );
+    }
+
+    /// A rule that asks gates its tool even where the workspace asks for
+    /// nothing — that is the whole difference between `ask` and the global gate.
+    #[test]
+    fn an_ask_rule_gates_one_tool_without_a_workspace_gate() {
+        let path = std::env::temp_dir().join("bos-mcp-policy-gate-test.json");
+        let _ = std::fs::remove_file(&path);
+        let mut store = crate::mcp_policy::Store::load(&path);
+        store
+            .set("srv", "write", crate::mcp_policy::Effect::Ask)
+            .expect("rule");
+        // With no workspace gate, only the asked tool takes one.
+        assert!(crate::mcp_policy::gate_for(
+            false,
+            &store.decide("srv", "write")
+        ));
+        assert!(!crate::mcp_policy::gate_for(
+            false,
+            &store.decide("srv", "read")
+        ));
+        // With the workspace gate on, everything takes one — including a tool
+        // the policy explicitly allows, which must not weaken the gate.
+        store
+            .set("srv", "read", crate::mcp_policy::Effect::Allow)
+            .expect("rule");
+        assert!(crate::mcp_policy::gate_for(
+            true,
+            &store.decide("srv", "read")
+        ));
+    }
 
     #[test]
     fn a_memory_has_to_say_something_and_fit() {
@@ -3034,6 +4779,7 @@ mod tests {
                 enabled: true,
                 connected: true,
                 tools: 3,
+                tool_names: vec!["read".to_string(), "write".to_string(), "list".to_string()],
                 error: None,
             },
         );
@@ -3042,9 +4788,610 @@ mod tests {
         assert_eq!(names, ["a", "b", "c"]);
         assert!(statuses[0].connected);
         assert_eq!(statuses[0].tools, 3);
+        assert_eq!(statuses[0].tool_names.len(), 3, "names ride with the count");
         assert!(!statuses[1].enabled);
         assert!(statuses[1].error.is_none());
         assert!(!statuses[2].connected);
         assert!(statuses[2].error.is_some());
+    }
+
+    fn mcp_status_row(name: &str, connected: bool) -> crate::mcp::McpStatus {
+        crate::mcp::McpStatus {
+            name: name.to_string(),
+            transport: "stdio".to_string(),
+            enabled: true,
+            connected,
+            tools: 0,
+            tool_names: Vec::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_catalog_pass_lists_every_configured_server_and_asks_only_the_live_ones() {
+        let mut inner = Inner::new();
+        inner.mcp_status = vec![
+            mcp_status_row("reachable", true),
+            mcp_status_row("gone", false),
+        ];
+        let client = Arc::new(agent::mcp::McpClient::connect_http("http://127.0.0.1:9"));
+        inner.mcp_ready = vec![(
+            "reachable".to_string(),
+            crate::mcp::Handshake {
+                client: client.clone(),
+                tools: Vec::new(),
+            },
+        )];
+
+        let plan = catalog_plan(&inner);
+        let names: Vec<&str> = plan.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["reachable", "gone"],
+            "settings order, nothing dropped"
+        );
+        assert!(
+            plan[0].1.as_ref().is_some_and(|c| Arc::ptr_eq(c, &client)),
+            "the live client is the one this pass holds"
+        );
+        assert!(
+            plan[1].1.is_none(),
+            "an unreachable server has nothing to ask"
+        );
+    }
+
+    #[test]
+    fn reading_from_a_server_that_is_not_connected_is_refused_by_name() {
+        let mut inner = Inner::new();
+        inner.mcp_status = vec![mcp_status_row("files", true), mcp_status_row("gone", false)];
+        // Two live clients, so "the one named" and "the first one there" are
+        // different answers: with a single client the check cannot tell them
+        // apart, which is how the first version of this test stayed green while
+        // `read_target` ignored the name it was handed.
+        let named = Arc::new(agent::mcp::McpClient::connect_http("http://127.0.0.1:9"));
+        let other = Arc::new(agent::mcp::McpClient::connect_http("http://127.0.0.1:9"));
+        inner.mcp_ready = vec![
+            (
+                "files".to_string(),
+                crate::mcp::Handshake {
+                    client: named.clone(),
+                    tools: Vec::new(),
+                },
+            ),
+            (
+                "other".to_string(),
+                crate::mcp::Handshake {
+                    client: other.clone(),
+                    tools: Vec::new(),
+                },
+            ),
+        ];
+        // Not `expect`/`expect_err`: `McpClient` is not `Debug`, so both sides
+        // are matched out by hand.
+        let client = match read_target(&inner, "files") {
+            Ok(client) => client,
+            Err(err) => panic!("files has a live client: {err}"),
+        };
+        assert!(Arc::ptr_eq(&client, &named), "the server that was named");
+        let client = match read_target(&inner, "other") {
+            Ok(client) => client,
+            Err(err) => panic!("other has a live client: {err}"),
+        };
+        assert!(
+            Arc::ptr_eq(&client, &other),
+            "the second server, not the first one on the list"
+        );
+        let err = match read_target(&inner, "gone") {
+            Ok(_) => panic!("a server with no live client must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.contains("gone"), "{err}");
+        assert!(err.contains("no connected MCP server"), "{err}");
+
+        // The URI is checked before any server is consulted, so a blank or
+        // oversized one never becomes a round trip.
+        let blank = read_uri("   ").expect_err("refused");
+        assert!(blank.contains("needs a URI"), "{blank}");
+        assert_eq!(read_uri("  file:///a  ").expect("ok"), "file:///a");
+        let long = "u".repeat(crate::mcp_view::MAX_URI_CHARS + 1);
+        let err = read_uri(&long).expect_err("refused");
+        assert!(
+            err.contains(&format!("{}", crate::mcp_view::MAX_URI_CHARS)),
+            "{err}"
+        );
+    }
+
+    /// A skills directory of this test's own: removed first, so a previous run
+    /// cannot answer for this one.
+    fn skill_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bos-gui-skill-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Point the whole configuration at `dir`, workspace and global alike, so
+    /// the test cannot read the machine's real skills.
+    fn use_skills_dir(inner: &mut Inner, dir: &str) {
+        inner.settings.skills_dir = dir.to_string();
+        let active = inner.settings.active_workspace.clone();
+        for workspace in inner.settings.workspaces.iter_mut() {
+            if workspace.id == active {
+                workspace.skills_dir = dir.to_string();
+            }
+        }
+    }
+
+    /// A record file of this test's own, with an empty record in memory: an
+    /// assertion about activations must not read — or write — the file the
+    /// user's own chats are in.
+    fn use_activation(inner: &mut Inner, tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bos-gui-activation-{tag}-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        *inner.skill_activation.lock().expect("lock") = crate::skills::Activation::default();
+        inner.skill_activation_path = path.clone();
+        path
+    }
+
+    /// The skills one chat's agent actually carries, sorted.
+    ///
+    /// Sorted because the agent's order is the loader's directory read order,
+    /// which is not a promise: every assertion here is about which skills a
+    /// chat has, not the order they would be listed in.
+    fn skill_names(inner: &Inner, session: &str) -> Vec<String> {
+        let mut names: Vec<String> = inner
+            .agent_cache
+            .get(session)
+            .expect("cached")
+            .agent
+            .get_skills_content()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A store the test owns: the commands under test write records, and
+    /// `Inner::new()` points at the user's real `~/.bos/gui/sessions`.
+    fn private_store(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bos-gui-sessions-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// One stored chat with a message and a plan, so an edit that damages the
+    /// record can be told apart from one that only renames it.
+    fn stored_chat(inner: &mut Inner, title: &str, text: &str) -> String {
+        let mut record = SessionRecord::new();
+        record.title = title.to_string();
+        record.workspace = inner.settings.active_workspace.clone();
+        record.messages.push(crate::session::ChatMessage::user(text));
+        inner.store.save(&record).expect("stored");
+        record.id
+    }
+
+    /// The mtime of the one file holding `id`, which is what tells "the record
+    /// was rewritten" apart from "the answer was the same". Comparing
+    /// `updated_at` cannot: a save that does not `touch()` leaves that field
+    /// identical, so the check would pass whether or not the write happened.
+    fn record_mtime(dir: &std::path::Path, id: &str) -> std::time::SystemTime {
+        let entry = std::fs::read_dir(dir)
+            .expect("store dir")
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().contains(id))
+            .expect("the record file");
+        entry.metadata().expect("metadata").modified().expect("mtime")
+    }
+
+    fn reload(inner: &Inner, id: &str) -> SessionRecord {
+        inner
+            .store
+            .load_all()
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("the record is still on disk")
+    }
+
+    #[test]
+    fn a_new_workspace_can_be_born_configured_and_a_bad_draft_adds_nothing() {
+        let mut settings = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        settings.mcp_servers = vec![crate::settings::McpServerEntry {
+            name: "files".to_string(),
+            enabled: true,
+            ..Default::default()
+        }];
+        // The valid draft lands whole: model, plugins, and exactly the MCP
+        // servers that were ticked.
+        let draft = crate::settings::WorkspaceDraft {
+            model: "glm-4.7".to_string(),
+            disabled_plugins: vec!["audit".to_string()],
+            mcp_enabled: Some(Vec::new()),
+            ..Default::default()
+        };
+        let dir = private_store("draft-ws");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let root = dir.to_string_lossy().to_string();
+        let w = drafted_workspace(&settings, "trino", &root, Some(&draft)).expect("built");
+        assert_eq!(w.name, "trino");
+        assert_eq!(w.model, "glm-4.7");
+        assert_eq!(w.disabled_plugins, vec!["audit".to_string()]);
+        assert!(!w.mcp_servers[0].enabled, "nothing ticked means nothing on");
+        // The bad one is refused, and the caller has nothing to add.
+        let bad = crate::settings::WorkspaceDraft {
+            mcp_enabled: Some(vec!["ghost".to_string()]),
+            ..Default::default()
+        };
+        let err = drafted_workspace(&settings, "trino", &root, Some(&bad))
+            .expect_err("unknown server");
+        assert!(err.contains("ghost"), "{err}");
+        // A root that is not a folder is refused the same way — the chooser
+        // hands over a real one, and the backend does not take a path on trust.
+        let missing = dir.join("nowhere");
+        let err = drafted_workspace(&settings, "trino", &missing.to_string_lossy(), None)
+            .expect_err("a missing root is refused");
+        assert!(err.contains("nowhere"), "{err}");
+        // And the payload an older caller sends (none) still creates a workspace
+        // that behaves exactly as before.
+        let plain = drafted_workspace(&settings, "", &root, None).expect("built");
+        assert_eq!(
+            plain.name,
+            w.root,
+            "an unnamed workspace takes the folder's resolved path as its name"
+        );
+        assert_eq!(plain.model, settings.model);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renaming_a_chat_rewrites_the_name_and_leaves_the_conversation_alone() {
+        let mut inner = Inner::new();
+        inner.store = crate::session::SessionStore::new(&private_store("rename"));
+        let id = stored_chat(&mut inner, "old name", "the only prompt");
+
+        let after = rename_session_in(&mut inner, &id, "  Deploy notes  ").expect("renamed");
+        assert_eq!(after.title, "Deploy notes", "the name is trimmed");
+        assert!(!after.pinned && !after.archived);
+
+        // Durable, not just returned: the sidebar re-reads the list on the next
+        // turn, so a rename that only reached the response would vanish.
+        let on_disk = reload(&inner, &id);
+        assert_eq!(on_disk.title, "Deploy notes");
+        assert_eq!(on_disk.messages.len(), 1);
+        assert_eq!(on_disk.messages[0].text, "the only prompt");
+    }
+
+    #[test]
+    fn a_name_that_is_blank_or_too_long_is_refused_without_touching_the_file() {
+        let mut inner = Inner::new();
+        inner.store = crate::session::SessionStore::new(&private_store("rename-refuse"));
+        let id = stored_chat(&mut inner, "keep me", "prompt");
+
+        let blank = rename_session_in(&mut inner, &id, "   ").expect_err("blank refused");
+        assert!(blank.contains("needs a name"), "{blank}");
+        let too_long = rename_session_in(&mut inner, &id, &"x".repeat(81)).expect_err("long");
+        assert!(too_long.contains("at most 80"), "{too_long}");
+        // 80 is the boundary and must be accepted, or the rule documented in
+        // the message would be one character stricter than the one enforced.
+        assert_eq!(
+            rename_session_in(&mut inner, &id, &"y".repeat(80))
+                .expect("80 characters is a name")
+                .title
+                .chars()
+                .count(),
+            80
+        );
+
+        assert_eq!(reload(&inner, &id).title, "y".repeat(80));
+    }
+
+    #[test]
+    fn pinning_is_allowed_mid_turn_and_rewriting_the_same_pin_is_not_a_write() {
+        let mut inner = Inner::new();
+        let dir = private_store("pin");
+        inner.store = crate::session::SessionStore::new(&dir);
+        let id = stored_chat(&mut inner, "busy", "prompt");
+        let before = reload(&inner, &id).updated_at;
+        inner.streaming.insert(
+            id.clone(),
+            Streaming {
+                session_id: id.clone(),
+                gen: 1,
+                started_at: 1,
+                job: String::new(),
+            },
+        );
+
+        assert!(set_session_pinned_in(&mut inner, &id, true).expect("pinned mid-turn").pinned);
+        assert!(inner.streaming.contains_key(&id), "the turn was not disturbed");
+        assert!(reload(&inner, &id).updated_at >= before);
+
+        // The same pin again is answered, not written: a menu opened and closed
+        // must not keep rewriting the record.
+        let pinned_at = record_mtime(&dir, &id);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(set_session_pinned_in(&mut inner, &id, true).expect("idempotent").pinned);
+        assert_eq!(
+            record_mtime(&dir, &id),
+            pinned_at,
+            "pinning an already-pinned chat rewrote the file"
+        );
+
+        // Renaming and archiving are refused while the turn runs, so hiding a
+        // chat cannot hide the output it is producing.
+        assert!(rename_session_in(&mut inner, &id, "later").is_err());
+        assert!(set_session_archived_in(&mut inner, &id, true).is_err());
+        assert!(!reload(&inner, &id).archived_at.is_some());
+    }
+
+    #[test]
+    fn archiving_hides_a_chat_and_restoring_brings_it_back_whole() {
+        let mut inner = Inner::new();
+        inner.store = crate::session::SessionStore::new(&private_store("archive"));
+        let id = stored_chat(&mut inner, "on the record", "the only prompt");
+        let pinned = set_session_pinned_in(&mut inner, &id, true).expect("pinned");
+        assert!(pinned.pinned);
+
+        let archived = set_session_archived_in(&mut inner, &id, true).expect("archived");
+        assert!(archived.archived && archived.pinned, "a pin survives archiving");
+        let on_disk = reload(&inner, &id);
+        assert!(on_disk.archived_at.is_some());
+        assert_eq!(on_disk.messages.len(), 1, "archiving destroys nothing");
+
+        let back = set_session_archived_in(&mut inner, &id, false).expect("restored");
+        assert!(!back.archived);
+        assert_eq!(reload(&inner, &id).messages[0].text, "the only prompt");
+    }
+
+    /// A workspace denial, set the way the settings pane sets it.
+    ///
+    /// `effective()` reads the *workspace's* list, not the global one, so a test
+    /// that only writes `settings.disabled_skills` writes to a field the agent
+    /// build never reads — and passes while proving nothing.
+    fn use_disabled_skills(inner: &mut Inner, denied: &[&str]) {
+        let denied: Vec<String> = denied.iter().map(|name| name.to_string()).collect();
+        inner.settings.disabled_skills = denied.clone();
+        let active = inner.settings.active_workspace.clone();
+        for workspace in inner.settings.workspaces.iter_mut() {
+            if workspace.id == active {
+                workspace.disabled_skills = denied.clone();
+            }
+        }
+    }
+
+    fn cached_skills(inner: &Inner) -> Vec<(String, String)> {
+        inner
+            .agent_cache
+            .get("s")
+            .expect("cached")
+            .agent
+            .get_skills_content()
+            .into_iter()
+            .map(|(name, instructions)| (name.to_string(), instructions.to_string()))
+            .collect()
+    }
+
+    /// Two chats, two skills, one activation.
+    ///
+    /// The whole promise of this feature is a *scope*: the chat that switched a
+    /// skill off loses it now, and the chat that asked for nothing keeps both
+    /// its skill and the agent it was already running.
+    fn two_chats(tag: &str) -> (Inner, std::path::PathBuf) {
+        let mut inner = Inner::new();
+        let dir = skill_temp_dir(tag);
+        use_skills_dir(&mut inner, &dir.display().to_string());
+        let record = use_activation(&mut inner, tag);
+        author_skill(
+            &mut inner,
+            "pr-review",
+            "Review a pull request",
+            "Read the diff.",
+            false,
+            1,
+        )
+        .expect("authored");
+        author_skill(
+            &mut inner,
+            "docs",
+            "Write the docs",
+            "Explain it.",
+            false,
+            1,
+        )
+        .expect("authored");
+        inner.agent("a");
+        inner.agent("b");
+        (inner, record)
+    }
+
+    #[test]
+    fn switching_a_skill_off_in_one_chat_rebuilds_that_chat_and_no_other() {
+        let (mut inner, record_path) = two_chats("activation");
+        assert_eq!(skill_names(&inner, "a"), vec!["docs", "pr-review"]);
+        assert_eq!(skill_names(&inner, "b"), vec!["docs", "pr-review"]);
+        let untouched = Arc::clone(&inner.agent_cache.get("b").expect("cached").agent);
+
+        let report =
+            set_skill_active(&mut inner, "a", "pr-review", false, 7).expect("switched off");
+        assert_eq!(report.session, "a");
+        assert_eq!(report.now_ms, 7);
+        assert!(report.explicit, "the chat now holds a list of its own");
+        assert_eq!(report.active, vec!["docs"]);
+        assert_eq!(report.available, vec!["docs", "pr-review"]);
+        assert!(report.denied.is_empty());
+        assert_eq!(report.path, record_path.display().to_string());
+        assert_eq!(report.sessions_known, 1);
+        assert_eq!(report.max_sessions, crate::skills::MAX_SESSIONS);
+
+        // Now, not at the next open: the running chat's agent is what changed.
+        assert_eq!(skill_names(&inner, "a"), vec!["docs"]);
+        assert_eq!(
+            skill_names(&inner, "b"),
+            vec!["docs", "pr-review"],
+            "the other chat asked for nothing"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &untouched,
+                &inner.agent_cache.get("b").expect("cached").agent
+            ),
+            "an activation in one chat does not rebuild another"
+        );
+
+        // The list is durable, so a chat opened later reads the same one.
+        let stored = crate::skills::Activation::load(&record_path);
+        assert_eq!(stored.active("a"), Some(&["docs".to_string()][..]));
+        assert_eq!(stored.active("b"), None, "b inherits");
+
+        // Inheriting is one gesture, and it puts the workspace back.
+        let back = inherit_skills(&mut inner, "a", 8).expect("inherited");
+        assert!(!back.explicit);
+        assert_eq!(back.active, vec!["docs", "pr-review"]);
+        assert_eq!(report_path(&back), record_path.display().to_string());
+        assert_eq!(skill_names(&inner, "a"), vec!["docs", "pr-review"]);
+        assert_eq!(
+            crate::skills::Activation::load(&record_path).record_count(),
+            0
+        );
+
+        let _ = std::fs::remove_file(&record_path);
+    }
+
+    fn report_path(report: &crate::skills::ActivationReport) -> String {
+        report.path.clone()
+    }
+
+    #[test]
+    fn a_chat_that_is_not_open_and_a_skill_the_workspace_switched_off_are_refused() {
+        let (mut inner, record_path) = two_chats("activation-refuse");
+
+        let err = set_skill_active(&mut inner, "  ", "docs", false, 1).expect_err("no chat");
+        assert!(err.contains("no chat is open"), "{err}");
+        let err = set_skill_active(&mut inner, "a", "nope", true, 1).expect_err("not offered");
+        assert!(
+            err.contains("no skill named") && err.contains("nope"),
+            "{err}"
+        );
+        assert!(activation_state(&inner, "", 1).is_err());
+        assert!(inherit_skills(&mut inner, "", 1).is_err());
+        // A refusal leaves no record and no rebuild behind.
+        assert!(!inner
+            .skill_activation
+            .lock()
+            .expect("lock")
+            .is_explicit("a"));
+
+        // The workspace's switch-off is a floor, even for a chat whose own
+        // record names the skill — the file is not trusted over the workspace.
+        use_disabled_skills(&mut inner, &["pr-review"]);
+        std::fs::write(
+            &record_path,
+            r#"{"version": 1, "sessions": {"a": ["pr-review", "docs"]}}"#,
+        )
+        .expect("wrote");
+        *inner.skill_activation.lock().expect("lock") =
+            crate::skills::Activation::load(&record_path);
+        assert!(rebuild_session_agent(&mut inner, "a"));
+        assert_eq!(
+            skill_names(&inner, "a"),
+            vec!["docs"],
+            "the workspace keeps it off"
+        );
+        let report = activation_state(&inner, "a", 2).expect("report");
+        assert_eq!(report.available, vec!["docs"]);
+        assert_eq!(report.denied, vec!["pr-review"]);
+        assert_eq!(report.active, vec!["docs"]);
+        let err = set_skill_active(&mut inner, "a", "pr-review", true, 3).expect_err("denied");
+        assert!(
+            err.contains("switched \"pr-review\" off"),
+            "a workspace denial says so: {err}"
+        );
+
+        // A chat nobody opened needs no rebuild: its first build reads the
+        // record, so there is nothing to swap.
+        assert!(!rebuild_session_agent(&mut inner, "never-opened"));
+
+        let _ = std::fs::remove_file(&record_path);
+    }
+
+    #[test]
+    fn an_authored_skill_reaches_the_session_that_already_exists() {
+        let mut inner = Inner::new();
+        let dir = skill_temp_dir("author");
+        use_skills_dir(&mut inner, &dir.display().to_string());
+        inner.agent("s");
+        assert!(
+            !cached_skills(&inner)
+                .iter()
+                .any(|(name, _)| name == "pr-review"),
+            "the machine already has a skill by this name"
+        );
+
+        let body = "Read the diff, then list findings with file and line.";
+        let report = author_skill(
+            &mut inner,
+            "pr-review",
+            "Review a pull request",
+            body,
+            false,
+            11,
+        )
+        .expect("authored");
+
+        assert_eq!(report.now_ms, 11);
+        assert!(report.exists);
+        assert_eq!(report.skills.len(), 1, "{:?}", report.skills);
+        assert_eq!(report.skills[0].name, "pr-review");
+        assert_eq!(report.skills[0].instructions_chars, body.chars().count());
+        assert!(!report.skills[0].denied);
+        assert!(dir.join("pr-review").join("SKILL.md").is_file());
+
+        // The session that was already open carries it, without reopening.
+        let skills = cached_skills(&inner);
+        assert_eq!(
+            skills
+                .iter()
+                .find(|(name, _)| name == "pr-review")
+                .map(|(_, instructions)| instructions.as_str()),
+            Some(body),
+            "the authored skill did not reach the running session: {skills:?}"
+        );
+
+        // A second save neither replaces the file nor the running agent.
+        let err = author_skill(&mut inner, "pr-review", "Other", "Other body.", false, 12)
+            .expect_err("refused");
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(
+            cached_skills(&inner)
+                .iter()
+                .find(|(name, _)| name == "pr-review")
+                .map(|(_, instructions)| instructions.as_str()),
+            Some(body),
+            "a refused save changed the running session"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authoring_without_a_skills_directory_is_refused() {
+        let mut inner = Inner::new();
+        use_skills_dir(&mut inner, "");
+        // The name carries the process id: this asserts about a path in the
+        // working directory, so it has to own that path rather than inherit a
+        // directory a previous run (or a deliberate removal of the guard) left.
+        let stray = format!("nowhere-{}", std::process::id());
+        let path = std::path::Path::new(&stray);
+        let _ = std::fs::remove_dir_all(path);
+        let err = author_skill(&mut inner, &stray, "d", "b", false, 0).expect_err("refused");
+        assert!(err.contains("no skills directory is configured"), "{err}");
+        // Nothing was written into the working directory.
+        assert!(!path.exists(), "wrote {}", path.display());
+        let _ = std::fs::remove_dir_all(path);
     }
 }
