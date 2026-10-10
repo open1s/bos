@@ -1082,6 +1082,7 @@ async function branchFrom(index) {
     state.sessions.unshift(fork);
     state.activeId = fork.id;
     await restorePlan(fork.id);
+    await refreshGoal(fork.id);
     renderAll();
     toast(`Branched into "${fork.title}"`);
   } catch (err) {
@@ -1921,6 +1922,241 @@ async function restorePlan(id) {
   }
 }
 
+/* ---------- goal surface (M3) ------------------------------------------ */
+
+/* The plan answers "what steps are left"; the goal answers "what is all this
+   for", and it outlives any single turn. The reference layout keeps it as a
+   card right above the composer — visible while chatting, not behind a panel
+   switch — so the round counter and the state read at a glance. */
+
+const GOAL_STATES = {
+  active: { label: "active", icon: "◎" },
+  paused: { label: "paused", icon: "‖" },
+  completed: { label: "completed", icon: "✓" },
+  blocked: { label: "blocked", icon: "⛔" },
+};
+
+/* Read the card's nodes on demand: the markup is static in index.html, so
+   there is nothing to build and nothing to leak. */
+function goalRefs() {
+  return {
+    card: $("goal-card"),
+    icon: $("goal-icon"),
+    state: $("goal-state"),
+    rounds: $("goal-rounds"),
+    objective: $("goal-objective"),
+    blocked: $("goal-blocked"),
+    error: $("goal-error"),
+    form: $("goal-form"),
+    input: $("goal-input"),
+    max: $("goal-max"),
+    blockForm: $("goal-block-form"),
+    reason: $("goal-reason"),
+    advance: $("goal-advance"),
+    pause: $("goal-pause"),
+    edit: $("goal-edit"),
+    block: $("goal-block"),
+    complete: $("goal-complete"),
+    remove: $("goal-delete"),
+    save: $("goal-save"),
+    clear: $("goal-clear"),
+    cancel: $("goal-cancel"),
+  };
+}
+
+function goalFail(msg) {
+  const r = goalRefs();
+  if (!r.error) return;
+  r.error.textContent = msg || "";
+  r.error.classList.toggle("hidden", !msg);
+}
+
+/* Paint the whole card from one goal value (or from `goalOpen` when there is
+   no goal yet and the reader asked to set one). */
+function renderGoal(goal) {
+  const r = goalRefs();
+  if (!r.card) return;
+  const g = goal || null;
+  const meta = g ? GOAL_STATES[g.state] || GOAL_STATES.active : null;
+  r.card.classList.toggle("hidden", !g && !state.goalOpen);
+  goalFail("");
+  if (!g) {
+    r.icon.textContent = "◎";
+    r.state.textContent = "no goal";
+    r.state.dataset.state = "none";
+    r.rounds.textContent = "";
+    r.objective.textContent = "No goal yet — say what this work is for.";
+    r.objective.title = "";
+    r.objective.classList.add("dim");
+    r.blocked.classList.add("hidden");
+    for (const b of [r.pause, r.block, r.complete, r.remove]) {
+      if (b) b.disabled = true;
+    }
+    if (r.advance) r.advance.disabled = true;
+    if (r.edit) r.edit.textContent = "✎";
+    return;
+  }
+  r.icon.textContent = meta.icon;
+  r.state.textContent = meta.label;
+  r.state.dataset.state = g.state;
+  r.rounds.textContent = g.max_rounds != null
+    ? `${g.rounds} of ${g.max_rounds} rounds${g.rounds >= g.max_rounds ? " · cap" : ""}`
+    : `${g.rounds} round${g.rounds === 1 ? "" : "s"}`;
+  r.objective.textContent = g.objective;
+  r.objective.title = g.objective;
+  r.objective.classList.remove("dim");
+  if (g.state === "blocked" && g.blocked_reason) {
+    r.blocked.textContent = `Blocked: ${g.blocked_reason}`;
+    r.blocked.classList.remove("hidden");
+  } else {
+    r.blocked.classList.add("hidden");
+  }
+  if (r.advance) {
+    r.advance.disabled = !(g.state === "active" && (g.max_rounds == null || g.rounds < g.max_rounds));
+  }
+  if (r.pause) r.pause.disabled = g.state !== "active" && g.state !== "paused";
+  if (r.pause) r.pause.textContent = g.state === "paused" ? "▶" : "⏸";
+  if (r.pause) r.pause.title = g.state === "paused" ? "Resume the goal" : "Pause the goal";
+  if (r.block) r.block.disabled = g.state === "completed" || g.state === "blocked";
+  if (r.complete) r.complete.disabled = g.state === "completed" || g.state === "blocked";
+  if (r.remove) r.remove.disabled = false;
+}
+
+function goalShowForm(on) {
+  const r = goalRefs();
+  r.form.classList.toggle("hidden", !on);
+  if (on) {
+    r.input.value = state.goal ? state.goal.objective : "";
+    r.max.value = state.goal && state.goal.max_rounds != null ? String(state.goal.max_rounds) : "";
+    r.blockForm.classList.add("hidden");
+    r.input.focus();
+  }
+}
+
+/* Open the card in the chat column; with no goal yet the editor opens too, so
+   the next thing to do is obvious. */
+function openGoal() {
+  state.goalOpen = true;
+  renderGoal(state.goal);
+  if (!state.goal) goalShowForm(true);
+}
+
+/* The goal of the active session, or `id`'s when switching to it. */
+async function refreshGoal(id) {
+  const target = id || state.activeId;
+  if (!target) {
+    state.goal = null;
+    renderGoal(null);
+    return;
+  }
+  try {
+    state.goal = await invoke("get_goal", { sessionId: target });
+  } catch (_) {
+    /* a transient failure keeps whatever is on screen */
+    return;
+  }
+  if (target === state.activeId) renderGoal(state.goal);
+}
+
+/* Drive the state machine. The transitions live in the backend, so an action
+   that does not apply comes back as a sentence rather than a silent no-op. */
+async function goalAction(action, reason) {
+  if (!state.activeId) return false;
+  try {
+    state.goal = await invoke("goal_action", {
+      sessionId: state.activeId,
+      action,
+      reason: reason === undefined ? null : reason,
+    });
+    renderGoal(state.goal);
+    return true;
+  } catch (err) {
+    goalFail(String(err));
+    return false;
+  }
+}
+
+/* Create, replace or clear the goal. A blank objective clears it, which is the
+   backend's rule and is surfaced here instead of being second-guessed. */
+async function saveGoal(objective, maxRounds) {
+  if (!state.activeId) return false;
+  try {
+    state.goal = await invoke("set_goal", {
+      sessionId: state.activeId,
+      objective,
+      maxRounds: maxRounds === undefined ? null : maxRounds,
+    });
+    renderGoal(state.goal);
+    return true;
+  } catch (err) {
+    goalFail(String(err));
+    return false;
+  }
+}
+
+/* Bind the card once; the markup is static, so every listener is attached
+   here instead of being rebuilt per render. */
+function bindGoalCard() {
+  // The head chip is the always-reachable entry point while the card is folded.
+  const chip = $("goal-open");
+  if (chip) chip.addEventListener("click", () => openGoal());
+  const r = goalRefs();
+  if (!r.card) return;
+  if (r.advance) r.advance.addEventListener("click", () => void goalAction("advance"));
+  if (r.edit) r.edit.addEventListener("click", () => goalShowForm(true));
+  r.cancel.addEventListener("click", () => {
+    // Cancelling the first-ever edit leaves no goal, so the card folds away
+    // instead of idling as an empty box above the composer.
+    if (!state.goal) state.goalOpen = false;
+    goalShowForm(false);
+    renderGoal(state.goal);
+  });
+  if (r.pause) {
+    r.pause.addEventListener("click", () => void goalAction(state.goal && state.goal.state === "paused" ? "resume" : "pause"));
+  }
+  if (r.complete) r.complete.addEventListener("click", () => void goalAction("complete"));
+  if (r.remove) {
+    r.remove.addEventListener("click", () => void saveGoal("", null));
+  }
+  if (r.block) {
+    r.block.addEventListener("click", () => {
+      r.blockForm.classList.toggle("hidden");
+      if (!r.blockForm.classList.contains("hidden")) r.reason.focus();
+    });
+  }
+  r.blockForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const why = r.reason.value.trim();
+    // The backend refuses a blank reason too; saying so here means the reader
+    // learns it without a round trip.
+    if (!why) {
+      goalFail("A blocked goal has to say what blocks it.");
+      return;
+    }
+    void goalAction("block", why).then((ok) => {
+      if (ok) {
+        r.blockForm.classList.add("hidden");
+        r.reason.value = "";
+      }
+    });
+  });
+  r.form.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const cap = r.max.value.trim();
+    const parsed = cap === "" ? null : Number(cap);
+    if (parsed !== null && (!Number.isFinite(parsed) || parsed < 0)) {
+      goalFail("Max rounds must be a whole number, or empty for no cap.");
+      return;
+    }
+    void saveGoal(r.input.value, parsed).then((ok) => {
+      if (ok) goalShowForm(false);
+    });
+  });
+  r.clear.addEventListener("click", () =>
+    void saveGoal("", null).then((ok) => ok && goalShowForm(false)));
+}
+bindGoalCard();
+
 /* ---------- session management ---------- */
 
 async function refreshSessions() {
@@ -1932,6 +2168,7 @@ async function refreshSessions() {
   // The active session may have changed (delete, restart, stream end);
   // re-point the shared plan store at it so the panel matches.
   await restorePlan(state.activeId);
+  await refreshGoal(state.activeId);
 }
 
 async function loadActive() {
@@ -1962,6 +2199,7 @@ async function switchSession(id) {
   state.promptNav = null; // the walk belonged to the previous chat
   if (!state.cache[id]) await loadActive();
   await restorePlan(id);
+  await refreshGoal(id);
   renderAll();
 }
 
@@ -2169,6 +2407,7 @@ const BUILTIN_COMMANDS = [
   { name: "/term", hint: "Attach an interactive shell for this workspace (survives a reload)", run: () => void attachTermSession() },
   { name: "/export", hint: "Keep this chat as a ZIP file", run: () => void openExportView() },
   { name: "/settings", hint: "Open settings & capabilities", run: () => openSettings() },
+  { name: "/goal", hint: "Set or review the goal for this chat", run: () => openGoal() },
   {
     name: "/compact",
     hint: "Summarize this chat's history with the model",
@@ -2812,6 +3051,26 @@ function closeSettings() {
   const back = state.settingsOpener;
   state.settingsOpener = null;
   if (back && typeof back.focus === "function" && document.contains(back)) back.focus();
+  // The captured opener may never have taken focus — `focus()` on a
+  // display:none affordance (the sidebar toggle is hidden above 720px) is a
+  // silent no-op, and a programmatic open records `body`, which focus() does
+  // not accept either. Probe: closing then stranded the keyboard on set-model,
+  // a field that is itself gone. Fall back to an anchor that is really on
+  // screen instead of leaving focus inside the hidden dialog.
+  const active = document.activeElement;
+  const stranded =
+    !active ||
+    active === document.body ||
+    (typeof active.getClientRects === "function" && active.getClientRects().length === 0);
+  if (stranded) {
+    for (const id of ["open-settings", "sidebar-toggle"]) {
+      const anchor = document.getElementById(id);
+      if (anchor && anchor.getClientRects().length > 0) {
+        anchor.focus();
+        break;
+      }
+    }
+  }
 }
 
 settingsForm.addEventListener("submit", async (ev) => {

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent::goal::Goal;
 use agent::tools::PlanItem;
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +105,11 @@ pub(crate) struct SessionRecord {
     /// panel survives restarts (older session files simply have none).
     #[serde(default)]
     pub(crate) plan: Vec<PlanItem>,
+    /// The goal this session is pursuing, so it survives restarts and is the
+    /// same statement the model and the reader see (older session files simply
+    /// have none).
+    #[serde(default)]
+    pub(crate) goal: Option<Goal>,
     /// The turns the last compaction folded away, oldest first.
     ///
     /// Compaction rewrites the history into an anchor plus a summary, and a
@@ -127,6 +133,7 @@ impl SessionRecord {
             workspace: String::new(),
             messages: Vec::new(),
             plan: Vec::new(),
+            goal: None,
             archived: Vec::new(),
         }
     }
@@ -162,6 +169,10 @@ impl SessionRecord {
             workspace: self.workspace.clone(),
             messages: self.messages[..index].to_vec(),
             plan: self.plan.clone(),
+            // A branch inherits the goal it was branched from: the work is still
+            // the same work, and starting the branch at round zero would lie
+            // about how far it has come.
+            goal: self.goal.clone(),
             // A branch starts with nothing folded of its own.
             archived: Vec::new(),
         })

@@ -1573,3 +1573,181 @@ body.resizing #doc-panel { transition: none; }
   flex: 0 0 auto;
   width: 100%;
 }
+
+/* One rule hides every closed surface. Component rules decide how a surface
+   looks while open; the `hidden` class always wins, so a closed one really
+   leaves layout. Before this, only components that happened to carry their own
+   `.x.hidden` rule were ever hidden (rev 83 fixed that class of bug one
+   component at a time) — a bare `hidden` class did nothing at all. */
+.hidden { display: none !important; }
+
+/* ---------- goal card (M3) -----------------------------------------------
+   The ongoing goal sits above the composer (the reference layout): a compact
+   card that keeps the objective, the round counter and the state machine one
+   glance away while the chat is in use. */
+
+.goal-open {
+  cursor: pointer;
+}
+
+.goal-open:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.goal-card {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  margin: 0 20px 6px;
+  padding: var(--space-2) var(--space-3);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.goal-icon {
+  flex: none;
+  font-size: 15px;
+  line-height: 20px;
+  color: var(--dim);
+}
+
+.goal-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.goal-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: 12px;
+}
+
+.goal-label {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.goal-rounds {
+  color: var(--dim);
+}
+
+.goal-chip[data-state="none"] {
+  color: var(--dim);
+}
+
+.goal-chip[data-state="active"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.goal-chip[data-state="paused"] {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.goal-chip[data-state="completed"] {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.goal-chip[data-state="blocked"] {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.goal-objective {
+  margin: var(--space-1) 0 0;
+  font-size: 13px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.goal-objective.dim {
+  color: var(--dim);
+}
+
+.goal-blocked,
+.goal-error {
+  margin: var(--space-1) 0 0;
+  font-size: 12px;
+  color: var(--error);
+}
+
+.goal-form {
+  margin-top: var(--space-2);
+}
+
+.goal-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 44px;
+  max-height: 140px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--input);
+  color: var(--text);
+  font: inherit;
+}
+
+.goal-form-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-2);
+}
+
+.goal-cap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-right: auto;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.goal-cap input {
+  width: 76px;
+  height: var(--control-h);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--input);
+  color: var(--text);
+  font: inherit;
+}
+
+.goal-block-form {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.goal-block-form input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--input);
+  color: var(--text);
+  font: inherit;
+}
+
+.goal-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.goal-actions .mini-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}

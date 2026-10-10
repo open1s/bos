@@ -40,11 +40,15 @@ stub = (
     "transformCallback:()=>0},event:{listen:()=>new Promise(()=>{})}};</script>"
 )
 base = f'<base href="file://{root}/ui/">'
-# The <base> must be inside <head>: the HTML spec says a base element outside
-# it is ignored, and the first version of this runner put it after the body
-# opened, so app.js resolved against /tmp and never loaded at all.
-assert html.count("</head>") == 1, "the shipped page has one head to extend"
-html = html.replace("</head>", base + stub + "</head>", 1)
+# The <base> must be the FIRST child of <head>: URL resolution happens as each
+# element is parsed, so a base appended at the end of the head (where this
+# runner first put it) never re-resolves the stylesheet link that precedes it —
+# style.css 404'd against the temp dir, the page rendered unstyled, and every
+# style-dependent check reported phantom failures. The structural checks never
+# needed CSS, so the broken base passed unnoticed for rounds.
+assert html.count("<head>") == 1, "the shipped page has one head to extend"
+html = html.replace("<head>", "<head>" + base, 1)
+html = html.replace("</head>", stub + "</head>", 1)
 html = html.replace("</body>", f"<script>{checks}</script></body>", 1)
 open(out, "w", encoding="utf-8").write(html)
 print(f"page_selftest: assembled {len(html)} bytes from the shipped page")

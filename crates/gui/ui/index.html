@@ -42,6 +42,7 @@
                 aria-expanded="false" title="Chats and workspaces">☰</button>
         <span id="chat-title">BOS</span>
         <span id="stream-chip" class="chip idle">idle</span>
+        <button type="button" id="goal-open" class="chip goal-open" title="The goal for this chat (Ongoing Goal card)">◎ goal</button>
       </header>
 
       <div id="messages"></div>
@@ -78,6 +79,53 @@
                  placeholder="Run a shell command in the workspace&#8203; — Enter to run, output streams in above">
           <button id="run-send" class="btn" type="submit">Run</button>
         </form>
+      </section>
+
+      <section id="goal-card" class="goal-card hidden" aria-live="polite" aria-label="Ongoing goal">
+        <span id="goal-icon" class="goal-icon" aria-hidden="true">◎</span>
+        <div class="goal-body">
+          <div class="goal-line">
+            <span class="goal-label">Ongoing Goal</span>
+            <span id="goal-state" class="chip goal-chip" data-state="none">no goal</span>
+            <span id="goal-rounds" class="goal-rounds"></span>
+          </div>
+          <p id="goal-objective" class="goal-objective dim"></p>
+          <p id="goal-blocked" class="goal-blocked hidden"></p>
+          <p id="goal-error" class="goal-error" role="alert"></p>
+          <form id="goal-form" class="goal-form hidden">
+            <textarea id="goal-input" rows="2" aria-label="Goal objective"
+                      spellcheck="false" placeholder="What is this work for?"></textarea>
+            <div class="goal-form-foot">
+              <label class="goal-cap">Max rounds
+                <input id="goal-max" type="number" min="0" step="1"
+                       aria-label="Max rounds" placeholder="none" />
+              </label>
+              <button type="submit" id="goal-save" class="btn btn-accent">Save</button>
+              <button type="button" id="goal-clear" class="btn btn-ghost">Clear goal</button>
+              <button type="button" id="goal-cancel" class="btn btn-ghost">Cancel</button>
+            </div>
+          </form>
+          <form id="goal-block-form" class="goal-block-form hidden">
+            <input id="goal-reason" type="text" spellcheck="false"
+                   aria-label="Why is the goal blocked?"
+                   placeholder="What must change before progress is possible?" />
+            <button type="submit" class="btn btn-ghost">Confirm block</button>
+          </form>
+        </div>
+        <div class="goal-actions">
+          <button type="button" id="goal-advance" class="mini-btn"
+                  title="Count one round toward the goal">+1</button>
+          <button type="button" id="goal-pause" class="mini-btn"
+                  title="Pause the goal">⏸</button>
+          <button type="button" id="goal-edit" class="mini-btn"
+                  title="Edit the goal" aria-label="Edit the goal">✎</button>
+          <button type="button" id="goal-block" class="mini-btn"
+                  title="Block the goal" aria-label="Block the goal">⛔</button>
+          <button type="button" id="goal-complete" class="mini-btn"
+                  title="Mark the goal completed" aria-label="Mark the goal completed">✓</button>
+          <button type="button" id="goal-delete" class="mini-btn"
+                  title="Clear the goal" aria-label="Clear the goal">&#128465;</button>
+        </div>
       </section>
 
       <div id="composer">

@@ -756,6 +756,103 @@ fn set_plan(
     Ok(record.plan)
 }
 
+/// Locate one session record by id.
+fn session_record(inner: &Inner, session_id: &str) -> Result<SessionRecord, String> {
+    inner
+        .store
+        .load_all()
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .ok_or_else(|| "session not found".to_string())
+}
+
+/// Refuse an edit that would change the record under a running turn.
+fn editable(inner: &Inner, session_id: &str) -> Result<(), String> {
+    if inner.streaming.contains_key(session_id) {
+        return Err("a turn is in progress — wait for it to finish".to_string());
+    }
+    if inner.compacting.contains(session_id) {
+        return Err("a compaction is running for this chat".to_string());
+    }
+    Ok(())
+}
+
+/// The goal `session_id` is pursuing, if it has one.
+#[tauri::command]
+fn get_goal(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+) -> Result<Option<agent::goal::Goal>, String> {
+    let inner = state.lock()?;
+    Ok(session_record(&inner, &session_id)?.goal)
+}
+
+/// Create or replace the goal of `session_id`.
+///
+/// A blank objective **clears** the goal: the absence of a goal is expressed by
+/// having none, not by storing an empty one. An edit mid-turn is refused for the
+/// same reason a plan edit is — the statement the model is working from must not
+/// change under it.
+#[tauri::command]
+fn set_goal(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+    objective: String,
+    max_rounds: Option<u32>,
+) -> Result<Option<agent::goal::Goal>, String> {
+    let inner = state.lock()?;
+    editable(&inner, &session_id)?;
+    let mut record = session_record(&inner, &session_id)?;
+    record.goal = agent::goal::Goal::new(objective, max_rounds);
+    inner
+        .store
+        .save(&record)
+        .map_err(|err| format!("failed to persist: {err}"))?;
+    Ok(record.goal)
+}
+
+/// Drive the goal's state machine: `advance`, `pause`, `resume`, `complete`, or
+/// `block` (which requires a `reason`).
+///
+/// The transitions live in [`agent::goal::Goal`], so the host cannot invent one:
+/// an action that does not apply is an error that says why, and nothing is
+/// written.
+#[tauri::command]
+fn goal_action(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+    action: String,
+    reason: Option<String>,
+) -> Result<agent::goal::Goal, String> {
+    let inner = state.lock()?;
+    editable(&inner, &session_id)?;
+    let mut record = session_record(&inner, &session_id)?;
+    let goal = record
+        .goal
+        .as_mut()
+        .ok_or_else(|| "this chat has no goal".to_string())?;
+    let changed = match action.as_str() {
+        "advance" => goal.advance(),
+        "pause" => goal.pause(),
+        "resume" => goal.resume(),
+        "complete" => goal.complete(),
+        "block" => goal.block(reason.unwrap_or_default()),
+        other => return Err(format!("unknown goal action '{other}'")),
+    };
+    if !changed {
+        return Err(format!(
+            "'{action}' does not apply while the goal is {:?}",
+            goal.state
+        ));
+    }
+    let updated = goal.clone();
+    inner
+        .store
+        .save(&record)
+        .map_err(|err| format!("failed to persist: {err}"))?;
+    Ok(updated)
+}
+
 /// The `[llm.<name>]` profiles discovered in the config file.
 ///
 /// A profile is selected by typing its name into the model field, which is not
@@ -2438,6 +2535,9 @@ pub(crate) fn run() -> anyhow::Result<()> {
             restore_plan,
             get_plan,
             set_plan,
+            get_goal,
+            set_goal,
+            goal_action,
             export_session,
             current_stream,
             send_message,

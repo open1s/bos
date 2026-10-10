@@ -78,8 +78,19 @@
 
     // C. Focus hand-back, on the real dialog, with the host answering.
     window.__TAURI__.core.invoke = () => Promise.resolve({});
-    const opener = d.getElementById("sidebar-toggle");
+    // The opener must be an element that can really take focus at this
+    // viewport. The first version of this check used #sidebar-toggle, which
+    // is display:none above 720px — focus() on it is a silent no-op, so the
+    // recorded "opener" was BODY; the check only ever passed while a broken
+    // <base> left the page unstyled and every element was focusable.
+    const opener = d.getElementById("open-settings");
     opener.focus();
+    assert(
+      `the focus anchor really takes focus here (active=${
+        d.activeElement && d.activeElement.id
+      })`,
+      d.activeElement === opener,
+    );
     await window.openSettings();
     const shown = !modal.classList.contains("hidden");
     window.closeSettings();
@@ -99,6 +110,120 @@
         "hidden",
       )}, active=${d.activeElement && d.activeElement.id})`,
       modal.classList.contains("hidden") && d.activeElement === opener,
+    );
+
+    // D2. A dialog opened with nothing focusable on the way in must not
+    //     strand the keyboard once it closes: with BODY as the recorded
+    //     opener, the pre-fix probe left activeElement on set-model — a field
+    //     that is display:none at that point. blur() so the opener really is
+    //     body, then assert close lands on something still on screen.
+    if (d.activeElement && typeof d.activeElement.blur === "function") {
+      d.activeElement.blur();
+    }
+    await window.openSettings();
+    window.closeSettings();
+    const strandedOn = d.activeElement;
+    assert(
+      `closing with no focusable opener lands focus on screen (active=${
+        strandedOn && (strandedOn.id || strandedOn.tagName)
+      }, visible=${
+        strandedOn && strandedOn.getClientRects
+          ? strandedOn.getClientRects().length > 0
+          : false
+      })`,
+      !!strandedOn &&
+        strandedOn !== d.getElementById("set-model") &&
+        typeof strandedOn.getClientRects === "function" &&
+        strandedOn.getClientRects().length > 0,
+    );
+    // E. The ongoing goal follows the reference layout: a card above the
+    //    composer, folded without a goal, state machine visible in the chips.
+    const goalCard = d.getElementById("goal-card");
+    const goalForm = d.getElementById("goal-form");
+    const composer = d.getElementById("composer");
+    assert(
+      `the goal card sits above the composer (${
+        goalCard && composer
+          ? !!(goalCard.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING)
+          : "markup missing"
+      })`,
+      !!goalCard &&
+        !!composer &&
+        !!(goalCard.compareDocumentPosition(composer) &
+          Node.DOCUMENT_POSITION_FOLLOWING),
+    );
+    // A bare `hidden` class used to hide nothing (only components with their
+    // own `.x.hidden` rule ever closed); the global rule is what makes this
+    // folded state real, so assert the computed display, not just the class.
+    assert(
+      `no goal means no card in layout (class-hidden=${goalCard.classList.contains(
+        "hidden",
+      )}, display=${getComputedStyle(goalCard).display})`,
+      goalCard.classList.contains("hidden") &&
+        getComputedStyle(goalCard).display === "none",
+    );
+    window.renderGoal({
+      objective: "ship the goal card",
+      state: "active",
+      rounds: 3,
+      max_rounds: 12,
+      blocked_reason: null,
+    });
+    assert(
+      `an active goal shows objective, state and rounds (chip=${d
+        .getElementById("goal-state")
+        .textContent.trim()}, rounds=${d
+        .getElementById("goal-rounds")
+        .textContent.trim()}, +1=${d.getElementById("goal-advance").disabled ? "off" : "on"})`,
+      !goalCard.classList.contains("hidden") &&
+        d.getElementById("goal-objective").textContent === "ship the goal card" &&
+        d.getElementById("goal-state").textContent === "active" &&
+        d.getElementById("goal-rounds").textContent.includes("3 of 12") &&
+        !d.getElementById("goal-advance").disabled &&
+        !d.getElementById("goal-pause").disabled,
+    );
+    window.renderGoal({
+      objective: "x",
+      state: "active",
+      rounds: 12,
+      max_rounds: 12,
+      blocked_reason: null,
+    });
+    assert(
+      `reaching the round cap disables +1 (${d
+        .getElementById("goal-rounds")
+        .textContent.trim()})`,
+      d.getElementById("goal-advance").disabled &&
+        /cap/.test(d.getElementById("goal-rounds").textContent),
+    );
+    window.renderGoal({
+      objective: "x",
+      state: "blocked",
+      rounds: 4,
+      max_rounds: null,
+      blocked_reason: "waiting on deps",
+    });
+    assert(
+      `a blocked goal states its reason and locks the state actions (blocked=${d
+        .getElementById("goal-blocked")
+        .textContent.trim()})`,
+      !d.getElementById("goal-blocked").classList.contains("hidden") &&
+        /waiting on deps/.test(d.getElementById("goal-blocked").textContent) &&
+        d.getElementById("goal-block").disabled &&
+        d.getElementById("goal-complete").disabled &&
+        d.getElementById("goal-pause").disabled,
+    );
+    // The head chip is the entry point while the card is folded.
+    window.renderGoal(null);
+    d.getElementById("goal-open").click();
+    const chipOpened =
+      !goalCard.classList.contains("hidden") && !goalForm.classList.contains("hidden");
+    d.getElementById("goal-cancel").click();
+    assert(
+      `the head chip opens the card with its editor and Cancel folds it away (opened=${chipOpened}, after=${goalCard.classList.contains(
+        "hidden",
+      )})`,
+      chipOpened && goalCard.classList.contains("hidden"),
     );
   } catch (err) {
     assert(`the live-page harness ran to completion (${err})`, false);
