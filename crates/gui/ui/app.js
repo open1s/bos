@@ -38,6 +38,7 @@ const state = {
   wsBusy: false,        // a workspace command is in flight
   windowExtra: 0,       // extra rows kept above the tail window
   collapsed: {},        // workspace groups whose chats are hidden
+  centerTab: "chat",    // header view switch: "chat" (transcript) | "trajectory" (steps)
   hits: [],             // content matches for the current search
   usage: { prompt: 0, completion: 0 }, // what the provider said the last turn cost
   memories: [],         // what the agent remembers across chats
@@ -1265,7 +1266,139 @@ function stickToBottom() {
   }
 }
 
+/* ---------- center tabs: Chat | Trajectory (M10 step 1) ----------
+   The reference gives the center column a tab strip. Chat is the transcript
+   that already exists; Trajectory reads the same message cache as steps — one
+   row per turn with its tool calls, durations and errors — so the seat needs
+   no backend and no second store. The tab choice is device-local UI state: it
+   follows the window, not the session. */
+const TRAJ_MAX = 300;
+let trajKey = null;
+
+function buildTrajTool(t) {
+  const row = el("div", "traj-tool");
+  row.appendChild(el("span", "traj-tool-name", t.name));
+  row.appendChild(el("span", "traj-tool-args", toolArgsSummary(t.args)));
+  const done = t.output != null;
+  // The badge carries the state in text first — color is decoration, never
+  // the signal (the chat's own badges say the same two words).
+  row.appendChild(
+    el("span", "traj-badge" + (done ? " done" : " running"),
+      done ? (t.ms != null ? `${t.ms} ms` : "done") : "running…")
+  );
+  return row;
+}
+
+function buildTrajStep(m, index) {
+  const user = m.role === "User";
+  const step = el("div", "traj-step" + (user ? " traj-user" : ""));
+  const head = el("div", "traj-head");
+  head.appendChild(el("span", "traj-idx", String(index + 1)));
+  head.appendChild(el("span", "traj-role", user ? "User" : "Assistant"));
+  const tools = m.tools || [];
+  if (tools.length) {
+    head.appendChild(el("span", "traj-count", `${tools.length} tool${tools.length === 1 ? "" : "s"}`));
+  }
+  step.appendChild(head);
+  const text = (m.text || "").replace(/\s+/g, " ").trim();
+  if (text) {
+    step.appendChild(el("div", "traj-text", text.length > 240 ? `${text.slice(0, 240)}…` : text));
+  } else if (!tools.length && !m.error && !m.reasoning) {
+    step.appendChild(el("div", "traj-text traj-muted", user ? "" : "…"));
+  }
+  if (m.reasoning) step.appendChild(el("div", "traj-meta", "reasoning shown in Chat"));
+  if (m.error) step.appendChild(el("div", "traj-err", `⚠ ${m.error}`));
+  for (const t of tools) step.appendChild(buildTrajTool(t));
+  return step;
+}
+
+function renderTrajectory() {
+  const host = $("trajectory");
+  if (!host) return;
+  const msgs = activeMsgs();
+  let tools = 0;
+  let errs = 0;
+  for (const m of msgs) {
+    tools += (m.tools || []).length;
+    if (m.error) errs += 1;
+  }
+  const last = msgs[msgs.length - 1];
+  // Rebuild only on a structural change: the tail preview refreshes every
+  // 256 characters of streamed text instead of on every chunk, so watching a
+  // long stream costs one rebuild per turn, not one per frame.
+  const key = [state.activeId, msgs.length, tools, errs,
+    Math.floor(((last && last.text) || "").length / 256)].join("|");
+  if (key === trajKey) return;
+  const atTail = host.scrollHeight - host.scrollTop - host.clientHeight < 8;
+  trajKey = key;
+  host.textContent = "";
+  if (msgs.length === 0) {
+    const empty = el("div", "traj-empty");
+    empty.appendChild(el("div", "", "No turns yet"));
+    empty.appendChild(el("div", "traj-muted", "Steps appear here as the conversation runs."));
+    host.appendChild(empty);
+    return;
+  }
+  const start = Math.max(0, msgs.length - TRAJ_MAX);
+  if (start > 0) {
+    host.appendChild(
+      el("div", "traj-note", `Showing the last ${TRAJ_MAX} of ${msgs.length} steps.`)
+    );
+  }
+  for (let i = start; i < msgs.length; i++) host.appendChild(buildTrajStep(msgs[i], i));
+  if (atTail) host.scrollTop = host.scrollHeight;
+}
+
+function setCenterTab(name) {
+  if (name !== "chat" && name !== "trajectory") return;
+  state.centerTab = name;
+  for (const [key, id] of [["chat", "tab-chat"], ["trajectory", "tab-trajectory"]]) {
+    const t = $(id);
+    if (!t) continue;
+    const on = key === name;
+    t.setAttribute("aria-selected", on ? "true" : "false");
+    t.tabIndex = on ? 0 : -1;
+    t.classList.toggle("active", on);
+  }
+  for (const [id, on] of [["messages", name === "chat"], ["trajectory", name === "trajectory"]]) {
+    const pane = $(id);
+    if (!pane) continue;
+    pane.hidden = !on;
+    pane.classList.toggle("hidden", !on);
+  }
+  if (name === "trajectory") renderTrajectory();
+}
+
+function bindCenterTabs() {
+  const list = $("center-tabs");
+  if (!list) return;
+  const tabs = [$("tab-chat"), $("tab-trajectory")].filter(Boolean);
+  for (const t of tabs) {
+    t.addEventListener("click", () =>
+      setCenterTab(t.id === "tab-chat" ? "chat" : "trajectory"));
+  }
+  // Roving tabindex: one tab stop for the strip, arrows move and activate
+  // (automatic activation — with two views, selection and focus stay together).
+  list.addEventListener("keydown", (e) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    const i = Math.max(0, tabs.findIndex((t) => t.getAttribute("aria-selected") === "true"));
+    let next = i;
+    if (e.key === "ArrowLeft") next = (i - 1 + tabs.length) % tabs.length;
+    if (e.key === "ArrowRight") next = (i + 1) % tabs.length;
+    if (e.key === "Home") next = 0;
+    if (e.key === "End") next = tabs.length - 1;
+    tabs[next].focus();
+    setCenterTab(tabs[next].id === "tab-chat" ? "chat" : "trajectory");
+  });
+}
+bindCenterTabs();
+
 function renderMessages() {
+  // The trajectory reads the same cache, so every transcript repaint — stream
+  // chunk, splice, switch, restore — refreshes it while that tab is the one
+  // on screen.
+  if (state.centerTab === "trajectory") renderTrajectory();
   const msgs = activeMsgs();
   // A session swap opens at the newest message, like a chat client should.
   if (followSession !== state.activeId) {
@@ -2408,6 +2541,12 @@ const BUILTIN_COMMANDS = [
   { name: "/export", hint: "Keep this chat as a ZIP file", run: () => void openExportView() },
   { name: "/settings", hint: "Open settings & capabilities", run: () => openSettings() },
   { name: "/goal", hint: "Set or review the goal for this chat", run: () => openGoal() },
+  {
+    name: "/trajectory",
+    hint: "Read this chat as steps: turns, tool calls, timings",
+    run: () => setCenterTab("trajectory"),
+  },
+  { name: "/chat", hint: "Back to the conversation", run: () => setCenterTab("chat") },
   {
     name: "/compact",
     hint: "Summarize this chat's history with the model",

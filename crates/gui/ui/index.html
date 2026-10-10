@@ -41,11 +41,17 @@
         <button type="button" id="sidebar-toggle" class="mini-btn" aria-label="Chats and workspaces"
                 aria-expanded="false" title="Chats and workspaces">☰</button>
         <span id="chat-title">BOS</span>
+        <div id="center-tabs" class="center-tabs" role="tablist" aria-label="Conversation views">
+          <button type="button" id="tab-chat" class="center-tab active" role="tab" aria-selected="true" aria-controls="messages" tabindex="0">Chat</button>
+          <button type="button" id="tab-trajectory" class="center-tab" role="tab" aria-selected="false" aria-controls="trajectory" tabindex="-1">Trajectory</button>
+        </div>
         <span id="stream-chip" class="chip idle">idle</span>
         <button type="button" id="goal-open" class="chip goal-open" title="The goal for this chat (Ongoing Goal card)">◎ goal</button>
       </header>
 
-      <div id="messages"></div>
+      <div id="messages" role="tabpanel" aria-labelledby="tab-chat" tabindex="0"></div>
+
+      <section id="trajectory" class="hidden" role="tabpanel" aria-labelledby="tab-trajectory" tabindex="0"></section>
 
       <section id="plan-panel" class="plan-panel hidden" aria-live="polite">
         <div class="plan-head">

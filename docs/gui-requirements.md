@@ -567,10 +567,10 @@ Per milestone: `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,
 `cargo test --workspace --exclude nbos --exclude jsbos`, `node --check` on the
 UI bundle, GUI build, and a live verification against the local broker. Baselines
-must never regress: tests **600/0 (63 suites)** — re-measure with the command above
+must never regress: tests **633/0 (63 suites)** — re-measure with the command above
 rather than trusting this number, which has been stale twice — live verify 5/5, and
 the GUI guards, whose counts are also measured rather than remembered:
-`ui_selftest.sh` **87** checks over the transcript and shell surfaces,
+`ui_selftest.sh` **125** ui + **87** shell checks over the transcript and shell surfaces,
 `layout_selftest.sh` **0** failures across five widths (1440/900/560/500 measured;
 420 unreachable — Chrome clamps to ~500 px); `markup_selftest.sh` **25** structural
 checks (the only guard that reads the shipped `index.html`); `wiring_selftest.sh`

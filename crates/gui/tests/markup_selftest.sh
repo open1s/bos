@@ -73,5 +73,28 @@ for label in "Rename workspace" "Remove workspace" "Move this chat to the trash"
     && ok || bad "icon-only button needs aria-label: $label"
 done
 
+# The header's view switch must be a real tab strip: a tablist owns its two
+# tabs, each tab names a pane that exists, the panes label their tabs back,
+# and only one tab claims selection at load.
+[ "$(grep -cE '<div id="center-tabs"[^>]*role="tablist"' $HTML)" = 1 ] \
+  && ok || bad "the center strip must own role=tablist"
+[ "$(grep -cE 'role="tab"' $HTML)" = 2 ] \
+  && ok || bad "exactly two tabs must exist in the strip"
+for tab in tab-chat:messages tab-trajectory:trajectory; do
+  t="${tab%%:*}"; p="${tab##*:}"
+  grep -qE "<button[^>]*id=\"$t\"[^>]*role=\"tab\"" $HTML \
+    && ok || bad "#$t must be role=tab"
+  grep -qE "<button[^>]*id=\"$t\"[^>]*aria-controls=\"$p\"" $HTML \
+    && ok || bad "#$t must control its pane #$p"
+  grep -qE "<(div|section) id=\"$p\"[^>]*role=\"tabpanel\"" $HTML \
+    && ok || bad "#$p must be role=tabpanel"
+  grep -qE "<(div|section) id=\"$p\"[^>]*aria-labelledby=\"$t\"" $HTML \
+    && ok || bad "#$p must label its tab #$t back"
+done
+grep -qE '<button[^>]*id="tab-chat"[^>]*aria-selected="true"[^>]*tabindex="0"' $HTML \
+  && ok || bad "Chat must load selected and own the strip's tab stop"
+grep -qE '<button[^>]*id="tab-trajectory"[^>]*aria-selected="false"[^>]*tabindex="-1"' $HTML \
+  && ok || bad "Trajectory must load unselected, out of the tab order"
+
 echo "[markup] checks=$checks failures=$fail"
 [ "$fail" = 0 ]

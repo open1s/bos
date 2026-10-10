@@ -258,6 +258,119 @@ body.resizing #doc-panel { transition: none; }
   scroll-behavior: auto;
 }
 
+/* Center tab strip (Chat | Trajectory): a segmented switch in the header.
+   Inactive tabs are plain dim text; the active one reads as a surface, and
+   the focus ring lands on whichever tab owns the strip (roving tabindex). */
+.center-tabs {
+  flex: none;
+  display: flex;
+  gap: var(--space-1);
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+}
+
+.center-tab {
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.center-tab:hover { color: var(--text); }
+.center-tab.active { color: var(--text); background: var(--active); }
+.center-tab:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+/* Trajectory: the same history read as steps. It shares the transcript's
+   seat (flex: 1 + own scroll), so the two panes swap in place. */
+#trajectory {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 24px 12px;
+  font-size: var(--content-font-size);
+}
+
+.traj-step {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-bottom: var(--space-2);
+}
+
+.traj-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.traj-idx {
+  min-width: 2ch;
+  text-align: right;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.traj-role { font-weight: 600; }
+.traj-step.traj-user .traj-role { color: var(--accent); }
+.traj-count { margin-left: auto; color: var(--faint); }
+
+.traj-text {
+  margin-top: var(--space-1);
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.traj-muted { color: var(--faint); }
+
+.traj-meta {
+  margin-top: 2px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--faint);
+}
+
+.traj-err { margin-top: var(--space-1); font-size: 12px; color: var(--error); }
+
+.traj-tool {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--input);
+  font-size: 12px;
+}
+
+.traj-tool-name { color: var(--text); font-weight: 600; }
+
+.traj-tool-args {
+  flex: 1;
+  min-width: 0;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.traj-badge { flex: none; color: var(--faint); font-variant-numeric: tabular-nums; }
+.traj-badge.done { color: var(--success); }
+.traj-badge.running { color: var(--accent); }
+
+.traj-note { font-size: 12px; color: var(--faint); margin-bottom: var(--space-2); }
+
+.traj-empty { text-align: center; padding: var(--space-5) 0; color: var(--dim); }
+.traj-empty .traj-muted { margin-top: var(--space-1); font-size: 12px; }
+
 .msg {
   display: flex;
   margin-bottom: 14px;

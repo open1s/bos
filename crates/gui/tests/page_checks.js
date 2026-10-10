@@ -225,6 +225,136 @@
       )})`,
       chipOpened && goalCard.classList.contains("hidden"),
     );
+    // F. The header's Chat | Trajectory strip (M10): a tablist that owns its
+    //    tabs, a switch that really swaps the panes, and a trajectory built
+    //    from the real message cache — roles, tool timings, running tools,
+    //    errors, the rebuild guard and the empty state.
+    const strip = d.getElementById("center-tabs");
+    const tabChat = d.getElementById("tab-chat");
+    const tabTraj = d.getElementById("tab-trajectory");
+    const msgsPane = d.getElementById("messages");
+    const trajPane = d.getElementById("trajectory");
+    const vis = (el) => getComputedStyle(el).display !== "none";
+    assert(
+      `the header carries a tablist owning its two tabs (role=${strip && strip.getAttribute(
+        "role",
+      )}, children=${strip ? strip.querySelectorAll('[role="tab"]').length : 0})`,
+      !!strip &&
+        strip.getAttribute("role") === "tablist" &&
+        strip.querySelectorAll('[role="tab"]').length === 2 &&
+        !!tabChat &&
+        !!tabTraj &&
+        tabChat.parentElement === strip &&
+        tabTraj.parentElement === strip,
+    );
+    assert(
+      `each tab names its pane and the pane names it back (controls=${tabChat.getAttribute(
+        "aria-controls",
+      )},${tabTraj.getAttribute("aria-controls")})`,
+      !!msgsPane &&
+        !!trajPane &&
+        d.getElementById(tabChat.getAttribute("aria-controls") || "") === msgsPane &&
+        d.getElementById(tabTraj.getAttribute("aria-controls") || "") === trajPane &&
+        msgsPane.getAttribute("aria-labelledby") === "tab-chat" &&
+        trajPane.getAttribute("aria-labelledby") === "tab-trajectory",
+    );
+    assert(
+      `Chat loads as the visible pane (messages=${vis(msgsPane)}, trajectory=${vis(
+        trajPane,
+      )}, selected=${tabChat.getAttribute("aria-selected")})`,
+      !msgsPane.classList.contains("hidden") &&
+        vis(msgsPane) &&
+        !vis(trajPane) &&
+        tabChat.getAttribute("aria-selected") === "true" &&
+        tabTraj.getAttribute("aria-selected") === "false" &&
+        tabChat.tabIndex === 0 &&
+        tabTraj.tabIndex === -1,
+    );
+    // Seed the cache the transcript really reads, then drive the real tab.
+    state.activeId = "page-checks-g";
+    state.cache["page-checks-g"] = [
+      { role: "User", text: "first turn", reasoning: null, tools: [], error: null },
+      {
+        role: "Assistant",
+        text: "on it",
+        reasoning: "think",
+        tools: [
+          // args is a JSON *string* in the shipped cache (the stream's own
+          // shape — signature and summary both parse it), so seed that.
+          { name: "read", args: JSON.stringify({ path: "a.txt" }), output: "ok", ms: 42 },
+          { name: "shell", args: JSON.stringify({ cmd: "ls" }), output: null, ms: null },
+        ],
+        error: null,
+      },
+      { role: "Assistant", text: "", reasoning: null, tools: [], error: "boom" },
+    ];
+    window.renderMessages();
+    tabTraj.click();
+    const steps = trajPane.querySelectorAll(".traj-step");
+    assert(
+      `Trajectory lists every turn as a step (${steps.length} steps, ${trajPane.querySelectorAll(
+        ".traj-tool",
+      ).length} tool rows, panes swapped=${vis(trajPane) && !vis(msgsPane)})`,
+      tabTraj.getAttribute("aria-selected") === "true" &&
+        tabChat.getAttribute("aria-selected") === "false" &&
+        tabTraj.tabIndex === 0 &&
+        tabChat.tabIndex === -1 &&
+        vis(trajPane) &&
+        !vis(msgsPane) &&
+        steps.length === 3,
+    );
+    const trajText = trajPane.textContent;
+    assert(
+      "a step states its tools with timings, and a running tool says so in words",
+      /42 ms/.test(trajText) &&
+        /running…/.test(trajText) &&
+        /read/.test(trajText) &&
+        /shell/.test(trajText),
+    );
+    assert(
+      "roles and errors are carried in text, not color alone",
+      /Assistant/.test(trajText) && /User/.test(trajText) && /⚠ boom/.test(trajText),
+    );
+    const firstStep = steps[0];
+    window.renderMessages();
+    assert(
+      "an unchanged conversation does not rebuild the trajectory (same node)",
+      trajPane.querySelectorAll(".traj-step")[0] === firstStep,
+    );
+    // Arrows move and activate; one tab stop serves the strip. Start from
+    // Chat explicitly — the flow above left Trajectory selected, and a
+    // direction key wraps from wherever selection actually is.
+    tabChat.click();
+    tabChat.focus();
+    strip.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    assert(
+      `ArrowRight moves the strip to Trajectory and activates it (active=${
+        d.activeElement && d.activeElement.id
+      })`,
+      d.activeElement === tabTraj &&
+        tabTraj.getAttribute("aria-selected") === "true" &&
+        vis(trajPane),
+    );
+    strip.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
+    assert(
+      `ArrowLeft moves it back to Chat (active=${d.activeElement && d.activeElement.id}, visible=${vis(
+        msgsPane,
+      )})`,
+      d.activeElement === tabChat &&
+        tabChat.getAttribute("aria-selected") === "true" &&
+        vis(msgsPane),
+    );
+    // Empty state: an empty chat explains itself instead of going blank.
+    state.cache["page-checks-g"] = [];
+    tabTraj.click();
+    const empty = trajPane.querySelector(".traj-empty");
+    assert(
+      `an empty chat says so in the trajectory (${empty ? empty.textContent.trim().split("\n")[0] : "no state"})`,
+      !!empty && /No turns yet/.test(trajPane.textContent) && !vis(msgsPane),
+    );
+    tabChat.click();
+    state.activeId = "";
+    delete state.cache["page-checks-g"];
   } catch (err) {
     assert(`the live-page harness ran to completion (${err})`, false);
   }
