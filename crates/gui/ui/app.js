@@ -2846,6 +2846,8 @@ settingsForm.addEventListener("submit", async (ev) => {
     // The run output is stored per root, so the new root's history takes over.
     restoreRunLines();
     renderRunPanel();
+    // So is the column geometry: each workspace keeps its own widths.
+    Shell.setLayoutScope(state.workspaceRoot || "default");
     state.mcpServers = Array.isArray(s.mcp_servers) ? s.mcp_servers : [];
     state.providers = Array.isArray(s.providers) ? s.providers : [];
     state.error = null;
@@ -4302,31 +4304,44 @@ function scheduleRunPaint() {
 function persistRunLines() {
   state.runPanel.lines = trimRunLines(state.runPanel.lines, MAX_RUN_LINES);
   try {
-    localStorage.setItem(runPanelKey(), JSON.stringify(state.runPanel.lines));
+    localStorage.setItem(
+      runPanelKey(),
+      JSON.stringify({ open: state.runPanel.open, lines: state.runPanel.lines }),
+    );
   } catch (_) {
     /* private mode or a full quota: the panel still works, it just forgets */
   }
 }
 
-/** Load the lines the last session showed for this workspace root. */
-function restoreRunLines() {
-  let lines = [];
-  try {
-    const saved = JSON.parse(localStorage.getItem(runPanelKey()) || "[]");
-    if (Array.isArray(saved)) {
-      lines = saved.filter(
-        (l) => l && typeof l.text === "string" && typeof l.stream === "string"
-      );
-    }
-  } catch (_) {
-    lines = [];
+/* What the blob may look like on disk, as a pure function the harness can
+   pin: the open flag arrived after the bare array, and the array shape still
+   loads — nobody's panel should be lost to a tidier format. */
+function parseRunBlob(raw) {
+  if (Array.isArray(raw)) return { open: false, lines: raw };
+  if (raw && typeof raw === "object" && Array.isArray(raw.lines)) {
+    return { open: raw.open === true, lines: raw.lines };
   }
-  state.runPanel.lines = lines;
+  return { open: false, lines: [] };
+}
+
+/** Load the lines (and open state) the last session showed for this root. */
+function restoreRunLines() {
+  let parsed = { open: false, lines: [] };
+  try {
+    parsed = parseRunBlob(JSON.parse(localStorage.getItem(runPanelKey()) || "null"));
+  } catch (_) {
+    parsed = { open: false, lines: [] };
+  }
+  state.runPanel.open = parsed.open;
+  state.runPanel.lines = parsed.lines.filter(
+    (l) => l && typeof l.text === "string" && typeof l.stream === "string"
+  );
 }
 
 async function toggleRunPanel() {
   state.runPanel.open = !state.runPanel.open;
   renderRunPanel();
+  persistRunLines();
   if (state.runPanel.open) {
     const field = $("run-input");
     if (field) field.focus();
@@ -4366,6 +4381,7 @@ $("run-clear").addEventListener("click", () => {
 $("run-close").addEventListener("click", () => {
   state.runPanel.open = false;
   renderRunPanel();
+  persistRunLines(); // a closed panel stays closed across a reload
 });
 
 listen("run-line", (event) => {
@@ -4410,6 +4426,8 @@ async function init() {
     // The run panel keeps what it showed: reload that history for this root.
     restoreRunLines();
     renderRunPanel();
+    // Column geometry is per workspace too; this swaps in the root's widths.
+    Shell.setLayoutScope(state.workspaceRoot || "default");
     // Start page context: what this app instance is pointed at.
     Shell.setContext({
       workspace: settings.bash_workspace || "",

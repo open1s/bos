@@ -145,6 +145,39 @@
     );
     Shell.closeDocument("d1");
     check("closing doc restores start", document.querySelectorAll(".doc-tab").length === 1 && body.textContent.includes("No document open"));
+
+    // --- layout scope (per workspace) ---------------------------------------
+    // Two workspaces must not inherit each other's geometry: the app names a
+    // scope and the shell swaps the stored layout under the live panes.
+    const geo0 = {
+      sidebar: Shell.state.sidebar,
+      doc: Shell.state.doc,
+      collapsed: Shell.state.sidebarCollapsed,
+      open: Shell.state.docOpen,
+    };
+    Shell.setSidebar(320);
+    Shell.setLayoutScope("/ws/a");
+    check("scope swap adopts defaults", Shell.state.sidebar === 280 && Shell.state.docOpen === true, Shell.state.sidebar);
+    Shell.setSidebar(360);
+    Shell.toggleDoc();
+    check(
+      "scope A stores its own geometry",
+      JSON.parse(Shell.storage.get("bos.layout.v1:/ws/a") || "null").sidebar === 360,
+    );
+    Shell.setLayoutScope("/ws/b");
+    check("second workspace starts at defaults", Shell.state.sidebar === 280 && Shell.state.docOpen === true);
+    Shell.setLayoutScope("/ws/a");
+    check("returning restores that workspace", Shell.state.sidebar === 360 && Shell.state.docOpen === false);
+    Shell.setLayoutScope("/ws/a");
+    check("same scope is a no-op", Shell.state.sidebar === 360);
+    Shell.setLayoutScope("");
+    check("default scope kept its own layout", Shell.state.sidebar === 320, Shell.state.sidebar);
+    // leave the page the way we found it
+    Shell.setSidebar(geo0.sidebar);
+    Shell.setDoc(geo0.doc);
+    if (Shell.state.docOpen !== geo0.open) Shell.toggleDoc();
+    if (Shell.state.sidebarCollapsed !== geo0.collapsed) Shell.toggleSidebar();
+
     Shell.setAppearance("system");
     Shell.setFontSize(14);
   } catch (err) {

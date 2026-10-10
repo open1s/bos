@@ -1770,8 +1770,36 @@ window.addEventListener("error", (e) => {
         );
         setRunChip(false);
         assert(
+          `the chip falls back to idle (${$("run-chip").textContent} / ${$("run-chip").className})`,
+          $("run-chip").textContent === "idle" && $("run-chip").className === "chip idle",
+        );
+        assert(
           "the palette carries /run",
           BUILTIN_COMMANDS.some((c) => c.name === "/run"),
+        );
+
+        // A reload should bring the panel back as it was: open stays open,
+        // lines come with it. The blob gained an open flag, and the bare
+        // array it used to be must still load — pure parser, pinned here.
+        const blobArray = parseRunBlob([{ stream: "stdout", text: "hi" }]);
+        assert(
+          "the old bare-array blob still loads, closed",
+          blobArray.open === false &&
+            blobArray.lines.length === 1 &&
+            blobArray.lines[0].text === "hi",
+        );
+        const blobOpen = parseRunBlob({
+          open: true,
+          lines: [{ stream: "stderr", text: "e" }],
+        });
+        assert(
+          "an open panel comes back open after a reload",
+          blobOpen.open === true && blobOpen.lines.length === 1,
+        );
+        const blobJunk = parseRunBlob({ nope: 1 });
+        assert(
+          "a malformed blob degrades to an empty, closed panel",
+          blobJunk.open === false && blobJunk.lines.length === 0,
         );
 
         state.runPanel = savedRunPanel;

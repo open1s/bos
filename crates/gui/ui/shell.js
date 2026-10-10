@@ -97,10 +97,10 @@ const Shell = (() => {
   const savedUi = readJson(UI_KEY);
 
   const state = {
-    sidebar: clamp(Number(savedLayout.sidebar) || SIDEBAR_DEFAULT, SIDEBAR_MIN, SIDEBAR_MAX),
-    doc: Number(savedLayout.doc) || 0, // 0 = derive from the ratio
-    sidebarCollapsed: savedLayout.sidebarCollapsed === true,
-    docOpen: savedLayout.docOpen !== false,
+    sidebar: SIDEBAR_DEFAULT,
+    doc: 0, // 0 = derive from the ratio
+    sidebarCollapsed: false,
+    docOpen: true,
     appearance: isOneOf(savedUi.appearance, APPEARANCES, "system"),
     fontSize: clamp(Number(savedUi.fontSize) || 14, 10, 22),
     workDetails: isOneOf(savedUi.workDetails, WORK_DETAILS, "detailed"),
@@ -110,6 +110,16 @@ const Shell = (() => {
     task: { taskId: null, status: "Idle", seq: -1, startedAt: 0, endedAt: 0, phase: "" },
     context: { workspace: "", model: "", session: "", detail: "" },
   };
+
+  /* One clamping policy for geometry, whether it arrives at boot or when the
+     workspace scope swaps under it. */
+  const adoptLayout = (saved) => {
+    state.sidebar = clamp(Number(saved.sidebar) || SIDEBAR_DEFAULT, SIDEBAR_MIN, SIDEBAR_MAX);
+    state.doc = Number(saved.doc) || 0;
+    state.sidebarCollapsed = saved.sidebarCollapsed === true;
+    state.docOpen = saved.docOpen !== false;
+  };
+  adoptLayout(savedLayout);
 
   const listeners = new Map();
   const emit = (name, payload) => {
@@ -229,6 +239,15 @@ const Shell = (() => {
 
   /* ---------- layout ---------------------------------------------------- */
 
+  /* The geometry is per workspace: two projects on two monitors should not
+     inherit each other's column widths. The shell stays Tauri-free, so the
+     app tells it the scope (the workspace root) and the shell keeps the
+     storage seam to itself; the unscoped key stays the "default" scope, so
+     whatever was saved before scoping existed is still the layout you get
+     when no workspace is configured. */
+  let layoutScope = "";
+  const layoutKey = () => (layoutScope ? `${LAYOUT_KEY}:${layoutScope}` : LAYOUT_KEY);
+
   const appWidth = () => (app ? app.clientWidth : 0);
   const sidebarWidth = () =>
     state.sidebarCollapsed ? Math.min(SIDEBAR_RAIL, state.sidebar) : state.sidebar;
@@ -241,7 +260,7 @@ const Shell = (() => {
   };
 
   const persistLayout = () =>
-    writeJson(LAYOUT_KEY, {
+    writeJson(layoutKey(), {
       sidebar: state.sidebar,
       doc: state.doc,
       sidebarCollapsed: state.sidebarCollapsed,
@@ -295,6 +314,18 @@ const Shell = (() => {
   const toggleDoc = () => {
     state.docOpen = !state.docOpen;
     persistLayout();
+    applyLayout();
+  };
+
+  /* Swap to another workspace's geometry: the geometry on screen still
+     belongs to the scope being left, so it is written back there first, then
+     the new scope's saved layout is adopted (defaults when it has none). */
+  const setLayoutScope = (scope) => {
+    const next = String(scope || "");
+    if (next === layoutScope) return;
+    persistLayout();
+    layoutScope = next;
+    adoptLayout(readJson(layoutKey()));
     applyLayout();
   };
 
@@ -741,6 +772,7 @@ const Shell = (() => {
     setDoc,
     toggleSidebar,
     toggleDoc,
+    setLayoutScope,
     openDocument,
     closeDocument,
     documents,
