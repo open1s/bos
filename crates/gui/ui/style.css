@@ -1225,6 +1225,21 @@ body.resizing #doc-panel { transition: none; }
   border-left: 1px solid var(--border);
 }
 
+/* A registered panel gets the column's geometry and one scroll container of its
+   own; the shell owns the frame, the panel owns everything inside it. */
+.panel-host { padding: 0; }
+.panel-surface {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-3);
+}
+
+/* `display: flex` above outranks the user agent's `[hidden] { display: none }`,
+   so the attribute has to win explicitly — otherwise a "hidden" panel still
+   occupies the column and only the width variable makes it look gone. */
+.doc-panel[hidden] { display: none; }
+
 .doc-head {
   display: flex;
   align-items: center;
@@ -1344,7 +1359,7 @@ body.resizing #doc-panel { transition: none; }
 /* A narrow window closes the document pane first, then rails the sidebar;
    both stay reachable from the centre toolbar toggles. */
 @media (max-width: 1023px) {
-  #doc-panel, #divider-right { display: none; }
+  #doc-panel, #panel-host, #divider-right { display: none; }
 }
 
 @media (max-width: 859px) {

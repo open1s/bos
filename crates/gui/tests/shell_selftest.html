@@ -228,6 +228,43 @@
       Shell.registerPanel({ id: "probe", title: "Probe" }) === true &&
         Shell.registerPanel({ id: "probe" }) === false,
     );
+    // A panel is a mount point, not just an identity: its surface is created on
+    // first activation and its own render function fills it exactly once.
+    let probeRenders = 0;
+    check(
+      "a panel accepts a render function",
+      Shell.registerPanel({
+        id: "probe2",
+        title: "Probe two",
+        render(host) {
+          probeRenders += 1;
+          const p = document.createElement("p");
+          p.className = "probe-line";
+          p.textContent = "probe surface";
+          host.appendChild(p);
+        },
+      }) === true,
+    );
+    check("a panel rejects a non-function render", Shell.registerPanel({ id: "probe3", render: 7 }) === false);
+    check(
+      "selecting the panel fills its surface",
+      Shell.selectPanel("probe2") === true &&
+        probeRenders === 1 &&
+        document.querySelector('#panel-host [data-panel-id="probe2"] .probe-line') !== null,
+    );
+    check(
+      "the active surface takes the column from the documents",
+      document.getElementById("panel-host").hidden === false &&
+        document.getElementById("doc-panel").hidden === true,
+    );
+    Shell.selectPanel("probe2");
+    check("re-selecting reuses the surface instead of re-rendering", probeRenders === 1, probeRenders);
+    Shell.selectPanel(null);
+    check(
+      "returning to the conversation shows the documents panel again",
+      document.getElementById("panel-host").hidden === true && document.getElementById("doc-panel").hidden === false,
+    );
+    check("unregistering removes the surface", Shell.unregisterPanel("probe2") === true && document.querySelector('#panel-host [data-panel-id="probe2"]') === null);
     check(
       "selecting a registered panel makes it active",
       Shell.selectPanel("probe") === true && Shell.activePanel === "probe" && app.dataset.panel === "probe",

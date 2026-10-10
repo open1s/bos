@@ -345,7 +345,12 @@ const Shell = (() => {
       right.setAttribute("aria-valuenow", String(showDoc ? geo.width : 0));
       right.hidden = !showDoc;
     }
-    if (docPanel) docPanel.hidden = !showDoc;
+    if (docPanel) docPanel.hidden = !(showDoc && (!activePanel || activePanel === DOCUMENT));
+    /* The column docks one occupant at a time: the documents panel when nothing
+       else is selected, otherwise the active panel's own surface. */
+    const hostShown = showDoc && !!activePanel && activePanel !== DOCUMENT;
+    if (panelHost) panelHost.hidden = !hostShown;
+    for (const [key, host] of surfaces) host.hidden = !(hostShown && key === activePanel);
     const docToggle = document.getElementById("doc-toggle");
     if (docToggle) docToggle.setAttribute("aria-pressed", String(showDoc));
     const railToggle = document.getElementById("sidebar-toggle");
@@ -437,23 +442,60 @@ const Shell = (() => {
      API a future surface would, an unknown id changes nothing, and the reserved
      key cannot be registered or displaced. */
   const CONVERSATION = "conversation";
+  const DOCUMENT = "document";
   const panels = new Map();
+  const surfaces = new Map();
   let activePanel = null;
+  let panelHost = null;
 
   const panelIds = () => [CONVERSATION, ...panels.keys()];
   const activePanelId = () => activePanel || CONVERSATION;
 
-  const registerPanel = ({ id, title = "", kind = "right" } = {}) => {
+  const registerPanel = ({ id, title = "", kind = "right", render = null } = {}) => {
     const key = String(id || "");
     if (!key || key === CONVERSATION || panels.has(key)) return false;
-    panels.set(key, { id: key, title, kind });
+    if (render !== null && typeof render !== "function") return false;
+    panels.set(key, { id: key, title, kind, render });
     emit("panel", { action: "register", id: key, panels: panelIds() });
     return true;
+  };
+
+  /* A registered surface is a mount point, not just an identity: its host element
+     is created the first time the panel becomes active and handed to the panel's
+     own render function exactly once, so a re-selected panel reuses its DOM
+     instead of rebuilding under the reader. Until then nothing is rendered, which
+     is what keeps an unopened panel free. */
+  const surfaceFor = (key) => {
+    if (key === DOCUMENT) return docPanel;
+    const entry = panels.get(key);
+    if (!entry) return null;
+    let host = surfaces.get(key);
+    if (!host) {
+      host = document.createElement("section");
+      host.className = "panel-surface";
+      host.dataset.panelId = key;
+      if (entry.title) host.setAttribute("aria-label", entry.title);
+      surfaces.set(key, host);
+      if (panelHost) panelHost.appendChild(host);
+    }
+    return host;
+  };
+
+  const renderSurface = (key) => {
+    const entry = panels.get(key);
+    if (!entry || !entry.render) return;
+    const host = surfaceFor(key);
+    if (!host || host.dataset.rendered === "1") return;
+    host.dataset.rendered = "1";
+    entry.render(host);
   };
 
   const unregisterPanel = (id) => {
     const key = String(id || "");
     if (!panels.delete(key)) return false;
+    const host = surfaces.get(key);
+    if (host) host.remove();
+    surfaces.delete(key);
     if (activePanel === key) selectPanel(null);
     emit("panel", { action: "unregister", id: key, panels: panelIds() });
     return true;
@@ -463,15 +505,15 @@ const Shell = (() => {
     const key = id == null || id === CONVERSATION ? null : String(id);
     if (key && !panels.has(key)) return false;
     activePanel = key;
-    /* The built-in document panel opens the right column through the same
-       concession path a plugin's panel would use. */
-    if (key === "document") {
+    /* Selecting a right-docked surface surfaces it: the column opens through the
+       same concession path a plugin's panel and the built-in documents panel
+       both use. */
+    const entry = key ? panels.get(key) : null;
+    if (key === DOCUMENT || (entry && entry.kind === "right")) {
       state.docOpen = true;
       openRightColumn();
     }
-    if (!key) {
-      activePanel = null;
-    }
+    if (key) renderSurface(key);
     if (app) app.dataset.panel = activePanelId();
     persistLayout();
     applyLayout();
@@ -680,6 +722,14 @@ const Shell = (() => {
     docPanel.appendChild(docPath);
     docPanel.appendChild(docBody);
     right.insertAdjacentElement("afterend", docPanel);
+    /* The docking host for registered surfaces sits beside the built-in document
+       panel and takes the column's geometry when a panel is selected. */
+    panelHost = document.createElement("aside");
+    panelHost.id = "panel-host";
+    panelHost.className = "doc-panel panel-host";
+    panelHost.setAttribute("aria-label", "Panel");
+    panelHost.hidden = true;
+    docPanel.insertAdjacentElement("afterend", panelHost);
     /* The built-in surface registers itself through the public seam, so the
        registry is exercised by the product rather than only by tests. */
     registerPanel({ id: "document", title: "Documents", kind: "right" });
