@@ -68,13 +68,14 @@ window.addEventListener("error", (e) => {
         "plan-edit", "plan-panel", "prov-add-btn", "prov-key", "prov-list",
         "prov-model", "prov-msg", "prov-name", "prov-url", "queue-list",
         "run-chip", "run-clear", "run-close", "run-form", "run-input",
-        "run-output", "run-panel", "run-send", "send",
+        "run-note", "run-output", "run-panel", "run-send", "send",
         "session-list", "session-search", "set-api-key", "set-approval",
         "set-base-url", "set-bash", "set-context-budget", "set-effort",
         "set-files", "set-instructions", "set-memory", "set-memory-path",
         "set-model", "set-skills-dir", "set-system", "set-temperature",
         "set-workspace", "settings-cancel", "settings-form", "settings-modal",
         "status-left", "status-right", "stream-chip",
+        "term-kill", "term-open",
       ];
       const root = document.getElementById("root");
       for (const id of IDS) {
@@ -1802,7 +1803,69 @@ window.addEventListener("error", (e) => {
           blobJunk.open === false && blobJunk.lines.length === 0,
         );
 
+        // The blob gained a mode after the open flag; the two older shapes
+        // still load, and a mode that is not exactly "term" is run mode.
+        const blobTerm = parseRunBlob({ open: true, mode: "term", lines: [] });
+        assert(
+          "a term-mode panel comes back in term mode",
+          blobTerm.open === true && blobTerm.mode === "term",
+        );
+        const blobBadMode = parseRunBlob({ open: true, mode: "TUI?", lines: [] });
+        assert(
+          "a garbage mode degrades to run mode, never a crash",
+          blobBadMode.mode === "run",
+        );
+        assert(
+          "the old bare-array blob still loads as run mode",
+          parseRunBlob([{ stream: "stdout", text: "hi" }]).mode === "run",
+        );
+        assert(
+          "the palette carries /term next to /run",
+          BUILTIN_COMMANDS.some((c) => c.name === "/term"),
+        );
+
+        // Term chunks may split a line mid-way; the panel holds the tail
+        // until the newline lands, then emits whole lines only.
+        state.runPanel.partial = "";
+        state.runPanel.lines = [];
+        pushTermChunk("abc");
+        const heldWhole = state.runPanel.lines.length === 0 && state.runPanel.partial === "abc";
+        pushTermChunk("def\nnext");
+        assert(
+          "a split line is held, then flushed whole",
+          heldWhole &&
+            state.runPanel.lines.length === 1 &&
+            state.runPanel.lines[0].text === "abcdef" &&
+            state.runPanel.partial === "next",
+        );
+
+        // The note and the chip speak the mode: a terminal must say so.
+        setRunMode("term");
+        const termNoteOk =
+          $("run-note").textContent.includes("interactive shell") &&
+          $("run-panel").classList.contains("term");
+        setRunMode("run");
+        assert(
+          "the honesty note swaps with the mode (term ↔ run)",
+          termNoteOk &&
+            $("run-note").textContent.includes("plain text") &&
+            !$("run-panel").classList.contains("term"),
+        );
+        setRunChip(true, "attached");
+        assert(
+          `the chip can announce an attached session (${$("run-chip").textContent})`,
+          $("run-chip").textContent === "attached" &&
+            $("run-chip").className === "chip streaming",
+        );
+        setRunChip(false, "exit 7");
+        assert(
+          "the chip can announce a dead session with its code",
+          $("run-chip").textContent === "exit 7" &&
+            $("run-chip").className === "chip idle",
+        );
+
         state.runPanel = savedRunPanel;
+        setRunMode(savedRunPanel.mode || "run");
         renderRunPanel();
 
         R.failures = Object.values(R.checks).filter((v) => v.startsWith("FAIL")).length;

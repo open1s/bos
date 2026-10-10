@@ -10,7 +10,7 @@
   <div id="app">
     <aside id="sidebar">
       <div class="sidebar-head">
-        <span class="brand">BOS</span>
+        <span class="brand">BOS Harness</span>
         <button id="new-chat" class="btn btn-accent" title="New chat">+ New</button>
       </div>
       <input id="session-search" class="session-search" type="search"
@@ -59,7 +59,12 @@
         <div class="run-head">
           <span id="run-title">Run</span>
           <span id="run-chip" class="chip idle">idle</span>
-          <span class="run-note">plain text, not a terminal</span>
+          <span id="run-note" class="run-note">plain text, not a terminal</span>
+          <button id="term-open" class="mini-btn" type="button"
+                  title="Attach an interactive shell for this workspace"
+                  aria-label="Attach an interactive shell">Shell</button>
+          <button id="term-kill" class="mini-btn" type="button"
+                  title="End the interactive session" aria-label="End the interactive session">Kill</button>
           <button id="run-clear" class="mini-btn" type="button"
                   title="Clear the output shown here">Clear</button>
           <button id="run-close" class="mini-btn" type="button"

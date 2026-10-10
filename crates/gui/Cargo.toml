@@ -1,6 +1,6 @@
 [package]
-name = "gui"
-description = "Native desktop chat GUI for BOS, built on Tauri"
+name = "bsh"
+description = "BOS Harness, Native desktop built on Tauri"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,14 +21,15 @@ async-channel = { workspace = true }
 uuid = { workspace = true }
 shellexpand = { workspace = true }
 toml = { workspace = true }
+portable-pty = "0.9"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [lib]
-name = "gui"
+name = "bshlib"
 path = "src/lib.rs"
 
 [[bin]]
-name = "bos-gui"
+name = "bsh"
 path = "src/main.rs"

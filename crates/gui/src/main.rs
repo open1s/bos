@@ -1,8 +1,8 @@
-//! `bos-gui` binary: launch the BOS chat GUI.
+//! `bsh` binary: launch the BOS chat GUI.
 
 fn main() {
-    if let Err(err) = gui::run() {
-        eprintln!("bos-gui failed to start: {err:?}");
+    if let Err(err) = bshlib::run() {
+        eprintln!("bsh failed to start: {err:?}");
         std::process::exit(1);
     }
 }

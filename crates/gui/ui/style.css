@@ -972,6 +972,10 @@ body.resizing #doc-panel { transition: none; }
 .run-line.err { color: var(--error); }
 .run-line.note { color: var(--dim); }
 
+/* The Kill control belongs to an attached session; run mode has nothing to
+   end, so the button is shed rather than shown dead. */
+.run-panel:not(.term) #term-kill { display: none; }
+
 .run-form {
   display: flex;
   gap: 8px;

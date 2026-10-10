@@ -1327,10 +1327,11 @@ struct RunFinishedEvent {
 /// Run a shell command in the workspace and stream its output to the panel.
 ///
 /// Deliberately **not** a terminal: the command runs against pipes, so there
-/// is no interactivity and no ANSI colour (a PTY backend is not available in
-/// this build, and the panel says as much). Output is bounded by
+/// is no interactivity and no ANSI colour. That is the point — this is the
+/// bounded path for a one-shot command, with output held by
 /// [`crate::runs`]'s line budget, per-line clamp and deadline, and the panel
-/// keeps what it showed across a reload.
+/// keeps what it showed across a reload. Interactive shells live in the
+/// panel's terminal mode behind [`pty_start`].
 #[tauri::command]
 fn run_command(
     app: AppHandle,
@@ -1378,6 +1379,119 @@ fn run_command(
         let _ = app.emit("run-finished", payload);
     });
     Ok(())
+}
+
+/// Result payload of the `pty-output` event: one read from a session,
+/// escape sequences already stripped by the backend.
+#[derive(Clone, Serialize)]
+struct PtyOutputEvent {
+    /// The session the text came from, so two sessions never mix.
+    session_id: String,
+    /// The text of this read; printable bytes only.
+    text: String,
+}
+
+/// Result payload of the `pty-exit` event: a session's process ended.
+#[derive(Clone, Serialize)]
+struct PtyExitEvent {
+    /// The session that ended.
+    session_id: String,
+    /// Its exit code; `None` when it died on a signal or could not be reaped.
+    exit_code: Option<i32>,
+}
+
+/// What `pty_start` reports; the panel uses it to replay a re-attach.
+#[derive(Clone, Serialize)]
+struct PtyStatus {
+    /// True when this call spawned a new shell (false = re-attached).
+    fresh: bool,
+    /// The shell program the session runs.
+    shell: String,
+    /// Recent output, oldest first — everything since the last reload.
+    tail: Vec<String>,
+}
+
+/// Start a PTY session for the workspace, or re-attach to the running one.
+///
+/// The session id is chosen by the panel (one per workspace root) and the
+/// process lives on the Rust side, so a webview reload re-attaches with the
+/// tail replayed instead of losing the shell. Output arrives as `pty-output`
+/// events with escape sequences already stripped by [`crate::pty`]; the end
+/// arrives as `pty-exit`.
+#[tauri::command]
+fn pty_start(
+    app: AppHandle,
+    state: State<'_, Arc<GuiState>>,
+    hub: State<'_, crate::pty::PtyRegistry>,
+    session_id: String,
+    shell: Option<String>,
+) -> Result<PtyStatus, String> {
+    let root = {
+        let inner = state.lock()?;
+        std::path::PathBuf::from(inner.settings.bash_workspace.trim())
+    };
+    if root.as_os_str().is_empty() {
+        return Err("no workspace configured".to_string());
+    }
+    let session_id = session_id.trim().to_string();
+    if session_id.is_empty() || session_id.len() > 128 {
+        return Err("bad session id".to_string());
+    }
+    let sink_app = app.clone();
+    let sink = move |event: crate::pty::PtyEvent| match event {
+        crate::pty::PtyEvent::Output { session_id, text } => {
+            let _ = sink_app.emit("pty-output", PtyOutputEvent { session_id, text });
+        }
+        crate::pty::PtyEvent::Exit { session_id, code } => {
+            let _ = sink_app.emit(
+                "pty-exit",
+                PtyExitEvent {
+                    session_id,
+                    exit_code: code,
+                },
+            );
+        }
+    };
+    let report = hub.start(
+        &session_id,
+        shell.as_deref(),
+        &root,
+        crate::pty::DEFAULT_COLS,
+        crate::pty::DEFAULT_ROWS,
+        Arc::new(sink),
+    )?;
+    Ok(PtyStatus {
+        fresh: report.fresh,
+        shell: report.shell,
+        tail: report.tail,
+    })
+}
+
+/// Send raw input to a PTY session (the line the panel typed, Enter included).
+#[tauri::command]
+fn pty_write(
+    hub: State<'_, crate::pty::PtyRegistry>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    hub.write(session_id.trim(), &data)
+}
+
+/// Resize a session's window; the backend clamps to a sane range.
+#[tauri::command]
+fn pty_resize(
+    hub: State<'_, crate::pty::PtyRegistry>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    hub.resize(session_id.trim(), cols, rows)
+}
+
+/// Kill a PTY session's process; its printed tail stays until restart.
+#[tauri::command]
+fn pty_kill(hub: State<'_, crate::pty::PtyRegistry>, session_id: String) -> Result<(), String> {
+    hub.kill(session_id.trim())
 }
 
 #[cfg(test)]
@@ -2299,6 +2413,7 @@ fn spawn_forwarder(
 pub(crate) fn run() -> anyhow::Result<()> {
     tauri::Builder::default()
         .manage(Arc::new(GuiState::new()))
+        .manage(crate::pty::PtyRegistry::default())
         .setup(|app| {
             // Brokers emit `approval-request` from inside the agent: install
             // the handle once here; brokers built later pick it up too.
@@ -2342,6 +2457,10 @@ pub(crate) fn run() -> anyhow::Result<()> {
             read_file,
             list_files,
             run_command,
+            pty_start,
+            pty_write,
+            pty_resize,
+            pty_kill,
             stop_streaming,
             respond_approval,
             compact_session,
@@ -2453,7 +2572,7 @@ mod tests {
     ///
     /// Ignored rather than asserted: a timing is evidence for a person, not a
     /// gate, because a busy machine would make it flaky. Run it with
-    /// `cargo test -p gui search_benchmark -- --ignored --nocapture`.
+    /// `cargo test -p bsh search_benchmark -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn search_benchmark_prints_cold_and_warm_costs() {

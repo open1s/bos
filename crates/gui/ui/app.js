@@ -66,7 +66,7 @@ const state = {
   mention: null,         // {query, atStart, entries, index, fresh} | null — @file picker
   mentionDismissed: "",  // token query dismissed with Esc (reopens on change)
   promptNav: null,       // {pos, draft} | null — ↑/↓ prompt-history walk
-  runPanel: { open: false, activeId: null, lines: [] }, // run panel: streamed command output
+  runPanel: { open: false, activeId: null, lines: [], mode: "run", partial: "" }, // streamed command output, or an interactive PTY session
 };
 
 /* ---------- multi-session streaming helpers ---------- */
@@ -2165,7 +2165,8 @@ const BUILTIN_COMMANDS = [
   { name: "/restore", hint: "Put turns folded by /compact back", run: () => void restoreArchived() },
   { name: "/stats", hint: "Counts and outline for this chat", run: () => void openStatsView() },
   { name: "/files", hint: "Show the workspace files in the sidebar", run: () => void toggleFilePanel() },
-  { name: "/run", hint: "Run a shell command, output streams into the run panel", run: () => void toggleRunPanel() },
+  { name: "/run", hint: "Run a shell command, output streams into the run panel", run: () => void setRunPanelMode("run") },
+  { name: "/term", hint: "Attach an interactive shell for this workspace (survives a reload)", run: () => void attachTermSession() },
   { name: "/export", hint: "Keep this chat as a ZIP file", run: () => void openExportView() },
   { name: "/settings", hint: "Open settings & capabilities", run: () => openSettings() },
   {
@@ -4242,6 +4243,11 @@ function runPanelKey() {
   return "bos.runs." + (state.workspaceRoot || "default");
 }
 
+/** One live shell per workspace root; the Rust side keeps it across reloads. */
+function runPanelSessionId() {
+  return "bos-pty-" + (state.workspaceRoot || "default");
+}
+
 /** Keep the newest `max` lines — what fell off the front stays gone. */
 function trimRunLines(lines, max) {
   return lines.length > max ? lines.slice(lines.length - max) : lines;
@@ -4262,11 +4268,42 @@ function pushRunLine(stream, text) {
   state.runPanel.lines = trimRunLines(state.runPanel.lines, MAX_RUN_LINES);
 }
 
-function setRunChip(running) {
+/** Backend chunks may split a line mid-way: hold the tail until its newline. */
+function pushTermChunk(text) {
+  const pieces = (state.runPanel.partial + text).split("\n");
+  state.runPanel.partial = pieces.pop();
+  for (const piece of pieces) pushRunLine("out", piece);
+}
+
+function setRunChip(running, label) {
   const el = $("run-chip");
   if (!el) return;
-  el.textContent = running ? "running" : "idle";
+  el.textContent = label || (running ? "running" : "idle");
   el.className = "chip " + (running ? "streaming" : "idle");
+}
+
+/** The honesty note swaps with the mode: a terminal must say it is one. */
+function setRunMode(mode) {
+  state.runPanel.mode = mode === "term" ? "term" : "run";
+  state.runPanel.partial = "";
+  // The class carries the mode to CSS (the Kill control only exists in term
+  // mode); the note carries it to the eye.
+  const panel = $("run-panel");
+  if (panel) panel.classList.toggle("term", state.runPanel.mode === "term");
+  const note = $("run-note");
+  if (note) {
+    note.textContent =
+      state.runPanel.mode === "term"
+        ? "interactive shell · ANSI stripped"
+        : "plain text, not a terminal";
+  }
+  const field = $("run-input");
+  if (field) {
+    field.placeholder =
+      state.runPanel.mode === "term"
+        ? "Type a command — Enter sends it to the shell"
+        : "Run a shell command in the workspace\u200B — Enter to run, output streams in above";
+  }
 }
 
 function renderRunPanel() {
@@ -4306,7 +4343,11 @@ function persistRunLines() {
   try {
     localStorage.setItem(
       runPanelKey(),
-      JSON.stringify({ open: state.runPanel.open, lines: state.runPanel.lines }),
+      JSON.stringify({
+        open: state.runPanel.open,
+        mode: state.runPanel.mode,
+        lines: state.runPanel.lines,
+      }),
     );
   } catch (_) {
     /* private mode or a full quota: the panel still works, it just forgets */
@@ -4314,28 +4355,38 @@ function persistRunLines() {
 }
 
 /* What the blob may look like on disk, as a pure function the harness can
-   pin: the open flag arrived after the bare array, and the array shape still
-   loads — nobody's panel should be lost to a tidier format. */
+   pin: the open flag arrived after the bare array, the mode after that, and
+   both older shapes still load — nobody's panel should be lost to a tidier
+   format. Garbage for a field means the safe default, never a crash. */
 function parseRunBlob(raw) {
-  if (Array.isArray(raw)) return { open: false, lines: raw };
+  if (Array.isArray(raw)) return { open: false, mode: "run", lines: raw };
   if (raw && typeof raw === "object" && Array.isArray(raw.lines)) {
-    return { open: raw.open === true, lines: raw.lines };
+    return {
+      open: raw.open === true,
+      mode: raw.mode === "term" ? "term" : "run",
+      lines: raw.lines,
+    };
   }
-  return { open: false, lines: [] };
+  return { open: false, mode: "run", lines: [] };
 }
 
 /** Load the lines (and open state) the last session showed for this root. */
 function restoreRunLines() {
-  let parsed = { open: false, lines: [] };
+  let parsed = { open: false, mode: "run", lines: [] };
   try {
     parsed = parseRunBlob(JSON.parse(localStorage.getItem(runPanelKey()) || "null"));
   } catch (_) {
-    parsed = { open: false, lines: [] };
+    parsed = { open: false, mode: "run", lines: [] };
   }
+  setRunMode(parsed.mode);
   state.runPanel.open = parsed.open;
   state.runPanel.lines = parsed.lines.filter(
     (l) => l && typeof l.text === "string" && typeof l.stream === "string"
   );
+  // Term mode follows the shell, not the snapshot: the backend replays the
+  // live tail (it holds far more than the blob kept), and a workspace switch
+  // re-attaches to that root's session instead of this one's history.
+  if (state.runPanel.mode === "term") void attachTermSession();
 }
 
 async function toggleRunPanel() {
@@ -4348,10 +4399,77 @@ async function toggleRunPanel() {
   }
 }
 
+/** `/run`: show the panel in one-shot mode. A term session stays alive in the
+    background — switching back to it with the Shell button re-attaches. */
+function setRunPanelMode(mode) {
+  if (mode === "term") return attachTermSession();
+  state.runPanel.open = true;
+  setRunMode("run");
+  renderRunPanel();
+  persistRunLines();
+  const field = $("run-input");
+  if (field) field.focus();
+}
+
+/**
+ * Attach the panel to this workspace's shell: `/term` opens it, and a reload
+ * or a workspace switch re-attaches to the same live process with its tail
+ * replayed. The old run lines are shed here on purpose — they belong to the
+ * run-mode history, and the backend's tail is the fuller truth anyway.
+ */
+async function attachTermSession() {
+  state.runPanel.open = true;
+  setRunMode("term");
+  state.runPanel.lines = [];
+  renderRunPanel();
+  persistRunLines();
+  const field = $("run-input");
+  if (field) field.focus();
+  try {
+    const status = await invoke("pty_start", {
+      sessionId: runPanelSessionId(),
+      shell: null,
+    });
+    for (const chunk of status.tail) pushTermChunk(chunk);
+    if (state.runPanel.partial) pushRunLine("out", state.runPanel.partial);
+    setRunChip(true, status.fresh ? "shell" : "attached");
+    pushRunLine(
+      "note",
+      `[${status.shell} · ${status.fresh ? "started" : "re-attached"}]`,
+    );
+    scheduleRunPaint();
+    persistRunLines();
+    syncTermSize();
+  } catch (err) {
+    setRunChip(false, "no shell");
+    pushRunLine("note", `[shell unavailable: ${err}]`);
+    scheduleRunPaint();
+    persistRunLines();
+  }
+}
+
+$("term-open").addEventListener("click", () => void attachTermSession());
+
 $("run-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const field = $("run-input");
-  const command = (field.value || "").trim();
+  const raw = field.value || "";
+  if (state.runPanel.mode === "term") {
+    // The PTY echoes what is typed; echoing here too would print it twice.
+    // An empty line is a bare Enter — legal at a shell prompt.
+    field.value = "";
+    try {
+      await invoke("pty_write", {
+        sessionId: runPanelSessionId(),
+        data: raw + "\n",
+      });
+    } catch (err) {
+      pushRunLine("note", `[refused: ${err}]`);
+      scheduleRunPaint();
+    }
+    return;
+  }
+  const command = raw.trim();
   // One run at a time: a second command would interleave its lines with the
   // first, and the panel has no way to tell them apart on screen.
   if (!command || state.runPanel.activeId) return;
@@ -4399,6 +4517,65 @@ listen("run-finished", (event) => {
   pushRunLine("note", formatRunFooter(p));
   scheduleRunPaint();
   persistRunLines();
+});
+
+/* The shell outlives the webview: events for this root's session keep
+   flowing as long as the panel is in term mode, and only that one. */
+listen("pty-output", (event) => {
+  const p = event.payload;
+  if (state.runPanel.mode !== "term" || p.session_id !== runPanelSessionId()) return;
+  pushTermChunk(p.text);
+  scheduleRunPaint();
+});
+
+listen("pty-exit", (event) => {
+  const p = event.payload;
+  if (state.runPanel.mode !== "term" || p.session_id !== runPanelSessionId()) return;
+  const how = p.exit_code === null || p.exit_code === undefined ? "killed" : `exit ${p.exit_code}`;
+  setRunChip(false, how);
+  pushRunLine("note", `[session ended · ${how} · the Shell button starts a new one]`);
+  scheduleRunPaint();
+  persistRunLines();
+});
+
+$("term-kill").addEventListener("click", async () => {
+  if (state.runPanel.mode !== "term") return;
+  try {
+    await invoke("pty_kill", { sessionId: runPanelSessionId() });
+    // The exit event narrates the end; nothing else to say here.
+  } catch (err) {
+    pushRunLine("note", `[kill refused: ${err}]`);
+    scheduleRunPaint();
+  }
+});
+
+/* A program that lays out columns (`ls`, `htop`) needs the real window, so
+   the shell hears the panel's size — measured in characters off the panel's
+   own monospace font, then kept in step while the window changes. */
+let termCharW = 0;
+let termCharH = 0;
+function syncTermSize() {
+  if (state.runPanel.mode !== "term") return;
+  const out = $("run-output");
+  if (!out || !out.clientWidth || !out.clientHeight) return;
+  if (!termCharW) {
+    const probe = document.createElement("span");
+    probe.textContent = "0".repeat(100);
+    probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;";
+    const cs = getComputedStyle(out);
+    probe.style.font = cs.font || `${cs.fontSize} ${cs.fontFamily}`;
+    out.appendChild(probe);
+    termCharW = probe.offsetWidth / 100;
+    termCharH = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.45 || 16;
+    probe.remove();
+    if (!termCharW) return;
+  }
+  const cols = Math.max(20, Math.min(500, Math.floor(out.clientWidth / termCharW) - 1));
+  const rows = Math.max(5, Math.min(200, Math.floor(out.clientHeight / termCharH)));
+  invoke("pty_resize", { sessionId: runPanelSessionId(), cols, rows }).catch(() => {});
+}
+window.addEventListener("resize", () => {
+  if (state.runPanel.mode === "term") syncTermSize();
 });
 
 /* ---------- init ---------- */

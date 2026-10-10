@@ -11,7 +11,7 @@ WS="$(cd "$ROOT/../.." && pwd)"
 KEEP="$(mktemp -d -t bos-export-guard)"
 trap 'rm -rf "$KEEP"' EXIT
 
-OUT="$(cd "$WS" && BOS_EXPORT_KEEP="$KEEP" cargo test -p gui exporting_writes_where_it_says_it_wrote -- --nocapture 2>&1)"
+OUT="$(cd "$WS" && BOS_EXPORT_KEEP="$KEEP" cargo test -p bsh exporting_writes_where_it_says_it_wrote -- --nocapture 2>&1)"
 PATH_TO_ZIP="$(printf '%s\n' "$OUT" | grep -oE 'BOS_EXPORT_PATH=.*' | head -1 | cut -d= -f2-)"
 if [ -z "$PATH_TO_ZIP" ] || [ ! -f "$PATH_TO_ZIP" ]; then
   echo "[zip] failures: 1"

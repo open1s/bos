@@ -17,6 +17,7 @@ mod init;
 mod instructions;
 mod mcp;
 mod mentions;
+mod pty;
 mod runner;
 mod runs;
 mod session;
