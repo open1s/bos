@@ -216,6 +216,51 @@
     app.style.width = appWidthStyle;
     window.dispatchEvent(new Event("resize"));
     Shell.setSidebar(geo0.sidebar);
+    // --- panel registry (DSH's keyed `main` slot) --------------------------
+    check("conversation is always the leading panel key", Shell.panels[0] === "conversation");
+    check("the built-in document panel registers through the seam", Shell.panels.includes("document"));
+    check(
+      "the reserved conversation key cannot be registered",
+      Shell.registerPanel({ id: "conversation", title: "nope" }) === false,
+    );
+    check(
+      "a panel registers once",
+      Shell.registerPanel({ id: "probe", title: "Probe" }) === true &&
+        Shell.registerPanel({ id: "probe" }) === false,
+    );
+    check(
+      "selecting a registered panel makes it active",
+      Shell.selectPanel("probe") === true && Shell.activePanel === "probe" && app.dataset.panel === "probe",
+      Shell.activePanel,
+    );
+    check("an unknown panel changes nothing", Shell.selectPanel("ghost") === false && Shell.activePanel === "probe");
+    check(
+      "null returns to the conversation",
+      Shell.selectPanel(null) === true && Shell.activePanel === "conversation" && app.dataset.panel === "conversation",
+      Shell.activePanel,
+    );
+    check(
+      "selecting the document panel opens the right column",
+      Shell.selectPanel("document") === true && document.getElementById("doc-panel").hidden === false,
+    );
+    Shell.toggleDoc();
+    check("closing the column releases the surface", Shell.activePanel === "conversation", Shell.activePanel);
+    check("a panel can be unregistered", Shell.unregisterPanel("probe") === true && !Shell.panels.includes("probe"));
+    check("an unregistered panel cannot be selected", Shell.selectPanel("probe") === false);
+
+    // One breakpoint, one chord: Mod+B toggles the sidebar and yields to a
+    // control that has its own meaning for it.
+    if (Shell.state.sidebarCollapsed) Shell.toggleSidebar();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "b", metaKey: true, bubbles: true }));
+    check("Mod+B collapses the sidebar", px(app.style.getPropertyValue("--sidebar-w")) === 56, app.style.getPropertyValue("--sidebar-w"));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "b", metaKey: true, bubbles: true }));
+    check("Mod+B restores the sidebar", px(app.style.getPropertyValue("--sidebar-w")) > 56, app.style.getPropertyValue("--sidebar-w"));
+    const field = document.createElement("input");
+    document.body.appendChild(field);
+    field.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true }));
+    check("Mod+B yields to an editable control", !Shell.state.sidebarCollapsed);
+    field.remove();
+
     // Theme presenter parity: the platform chrome reads `color-scheme`, DSH's
     // styles read `body[data-ds-dark-theme]`, and the owned theme-color meta
     // must agree with what actually rendered.

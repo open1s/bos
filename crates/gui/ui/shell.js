@@ -330,6 +330,9 @@ const Shell = (() => {
     const collapse = state.sidebarCollapsed || width < COMPACT_AT;
     app.dataset.doc = showDoc ? "open" : "closed";
     app.dataset.sidebar = collapse ? "rail" : "expanded";
+    /* A column that is gone cannot still own the active surface. */
+    if (activePanel === "document" && !showDoc) activePanel = null;
+    app.dataset.panel = activePanelId();
     app.style.setProperty("--sidebar-w", `${collapse ? SIDEBAR_RAIL : state.sidebar}px`);
     app.style.setProperty("--doc-w", `${showDoc ? geo.width : 0}px`);
     const left = document.getElementById("divider-left");
@@ -423,6 +426,57 @@ const Shell = (() => {
         onEnd?.("reset");
       }
     });
+  };
+
+  /* ---------- panel registry --------------------------------------------- */
+
+  /* DSH ui-layout: the root column is a keyed `main` slot whose `conversation`
+     key is reserved for the product, every other surface is a panel selected by
+     id, and `null` means Conversation. The registry keeps that seam real here
+     instead of decorative: the built-in document panel goes through the same
+     API a future surface would, an unknown id changes nothing, and the reserved
+     key cannot be registered or displaced. */
+  const CONVERSATION = "conversation";
+  const panels = new Map();
+  let activePanel = null;
+
+  const panelIds = () => [CONVERSATION, ...panels.keys()];
+  const activePanelId = () => activePanel || CONVERSATION;
+
+  const registerPanel = ({ id, title = "", kind = "right" } = {}) => {
+    const key = String(id || "");
+    if (!key || key === CONVERSATION || panels.has(key)) return false;
+    panels.set(key, { id: key, title, kind });
+    emit("panel", { action: "register", id: key, panels: panelIds() });
+    return true;
+  };
+
+  const unregisterPanel = (id) => {
+    const key = String(id || "");
+    if (!panels.delete(key)) return false;
+    if (activePanel === key) selectPanel(null);
+    emit("panel", { action: "unregister", id: key, panels: panelIds() });
+    return true;
+  };
+
+  const selectPanel = (id) => {
+    const key = id == null || id === CONVERSATION ? null : String(id);
+    if (key && !panels.has(key)) return false;
+    activePanel = key;
+    /* The built-in document panel opens the right column through the same
+       concession path a plugin's panel would use. */
+    if (key === "document") {
+      state.docOpen = true;
+      openRightColumn();
+    }
+    if (!key) {
+      activePanel = null;
+    }
+    if (app) app.dataset.panel = activePanelId();
+    persistLayout();
+    applyLayout();
+    emit("panel", { action: "select", active: activePanelId(), panels: panelIds() });
+    return true;
   };
 
   /* ---------- document panel -------------------------------------------- */
@@ -626,6 +680,25 @@ const Shell = (() => {
     docPanel.appendChild(docPath);
     docPanel.appendChild(docBody);
     right.insertAdjacentElement("afterend", docPanel);
+    /* The built-in surface registers itself through the public seam, so the
+       registry is exercised by the product rather than only by tests. */
+    registerPanel({ id: "document", title: "Documents", kind: "right" });
+
+    /* DSH ui-layout: Mod+B toggles the sidebar. It yields to a control that has
+       its own meaning for the chord — an editable field, or the terminal, where
+       Ctrl+B belongs to the program on the other end of the PTY. */
+    const ownsKeystroke = (el) =>
+      !!el &&
+      (el.isContentEditable === true ||
+        ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) ||
+        (typeof el.closest === "function" && !!el.closest(".run-panel")));
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key !== "b" && ev.key !== "B") return;
+      if (!(ev.metaKey || ev.ctrlKey) || ev.altKey) return;
+      if (ownsKeystroke(ev.target)) return;
+      ev.preventDefault();
+      toggleSidebar();
+    });
 
     // Pane toggles live in the centre toolbar so a narrow window never hides
     // navigation permanently (Part II §12.1 / GUI-01).
@@ -837,6 +910,15 @@ const Shell = (() => {
     openDocument,
     closeDocument,
     documents,
+    registerPanel,
+    unregisterPanel,
+    selectPanel,
+    get panels() {
+      return panelIds();
+    },
+    get activePanel() {
+      return activePanelId();
+    },
     get layout() {
       return {
         sidebar: sidebarWidth(),
