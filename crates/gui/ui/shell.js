@@ -16,12 +16,21 @@ const Shell = (() => {
   const SIDEBAR_MAX = 420;
   const SIDEBAR_DEFAULT = 280;
   const SIDEBAR_RAIL = 56;
+  /* Right-column and frame geometry, cloned from DSH's ui-layout contract (see
+     docs/dsh-ui-reference/dsh-client-ui-layout/README.md): the sidebar spans
+     264-420px at a 280px default with a 56px rail, the right column opens at 45%
+     of the viewport and never exceeds 70%, the centre keeps 400px, and below
+     1024px the sidebar auto-collapses. */
   const DOC_DEFAULT_RATIO = 0.45;
   const DOC_MAX_RATIO = 0.7;
   const DOC_MIN = 280;
+  /* DSH reduces the right column to 300px before it reports that there is no
+     room at all; a narrower column is where the occupant closes instead. */
+  const DOC_STEP = 300;
   const CENTER_MIN = 400;
+  /* One breakpoint, both rules: below it the right column is not offered and the
+     sidebar auto-collapses (DSH couples the two). */
   const COMPACT_AT = 1024;
-  const RAIL_AT = 860;
 
   const STATUSES = [
     "Idle",
@@ -192,12 +201,21 @@ const Shell = (() => {
 
   const applyUi = () => {
     const root = document.documentElement;
-    root.dataset.theme = resolvedAppearance();
+    const scheme = resolvedAppearance();
+    root.dataset.theme = scheme;
     root.dataset.appearance = state.appearance;
     root.dataset.workDetails = state.workDetails;
     root.dataset.codingView = state.codingView ? "on" : "off";
     root.lang = state.language === "zh" ? "zh-CN" : "en";
     root.style.setProperty("--content-font-size", `${state.fontSize}px`);
+    /* Colour-scheme and the dark marker are what the platform chrome (scrollbars,
+       form controls, `color-scheme` UA styles) reads; DSH's theme presenter
+       writes both, and the marker is the name DSH's own styles select on. */
+    root.style.colorScheme = scheme;
+    if (document.body) {
+      if (scheme === "dark") document.body.dataset.dsDarkTheme = "";
+      else delete document.body.dataset.dsDarkTheme;
+    }
     writeJson(UI_KEY, {
       appearance: state.appearance,
       fontSize: state.fontSize,
@@ -207,7 +225,24 @@ const Shell = (() => {
       permission: state.permission,
     });
     syncControls();
+    syncThemeColor();
     emit("ui", { ...state });
+  };
+
+  /* One owned `<meta name="theme-color">` whose content follows the landed body
+     background — the resolved theme is the single colour authority, so the
+     meta is read from the rendered result rather than recomputed (DSH ui-layout
+     theme presenter). */
+  const syncThemeColor = () => {
+    if (!document.body) return;
+    let meta = document.querySelector('meta[name="theme-color"]');
+    if (!meta) {
+      meta = document.createElement("meta");
+      meta.setAttribute("name", "theme-color");
+      document.head.appendChild(meta);
+    }
+    const bg = getComputedStyle(document.body).backgroundColor;
+    if (bg) meta.setAttribute("content", bg);
   };
 
   const setAppearance = (v) => {
@@ -252,12 +287,26 @@ const Shell = (() => {
   const sidebarWidth = () =>
     state.sidebarCollapsed ? Math.min(SIDEBAR_RAIL, state.sidebar) : state.sidebar;
 
-  const docWidthFor = () => {
+  /* The right column's width, and whether it fits at all. The stored width is a
+     preference, not a right: when it would squeeze the centre below its floor
+     the column steps down to 300px, and when even that does not fit the caller
+     is told there is no room (DSH's deterministic close, never an automatic
+     reopen on a wider window). */
+  const docCap = () =>
+    Math.max(
+      DOC_MIN,
+      Math.min(appWidth() * DOC_MAX_RATIO, appWidth() - sidebarWidth() - CENTER_MIN - 16),
+    );
+
+  const docGeometry = () => {
     const width = appWidth();
-    const max = Math.max(DOC_MIN, Math.min(width * DOC_MAX_RATIO, width - sidebarWidth() - CENTER_MIN - 16));
     const want = state.doc || Math.round(width * DOC_DEFAULT_RATIO);
-    return Math.round(clamp(want, DOC_MIN, max));
+    const cap = docCap();
+    if (want <= cap) return { width: Math.round(clamp(want, DOC_MIN, cap)), canShow: true };
+    if (cap >= DOC_STEP) return { width: Math.round(cap), canShow: true };
+    return { width: 0, canShow: false };
   };
+  const docWidthFor = () => docGeometry().width;
 
   const persistLayout = () =>
     writeJson(layoutKey(), {
@@ -270,12 +319,19 @@ const Shell = (() => {
   const applyLayout = () => {
     if (!app) return;
     const width = appWidth();
-    const showDoc = state.docOpen && width >= COMPACT_AT;
-    const collapse = state.sidebarCollapsed || width < RAIL_AT;
+    const geo = docGeometry();
+    /* Not enough room for the column at any width: it closes deterministically,
+       and widening the window later does not reopen it (DSH ui-layout). */
+    if (state.docOpen && width >= COMPACT_AT && !geo.canShow) {
+      state.docOpen = false;
+      persistLayout();
+    }
+    const showDoc = state.docOpen && width >= COMPACT_AT && geo.canShow;
+    const collapse = state.sidebarCollapsed || width < COMPACT_AT;
     app.dataset.doc = showDoc ? "open" : "closed";
     app.dataset.sidebar = collapse ? "rail" : "expanded";
     app.style.setProperty("--sidebar-w", `${collapse ? SIDEBAR_RAIL : state.sidebar}px`);
-    app.style.setProperty("--doc-w", `${showDoc ? docWidthFor() : 0}px`);
+    app.style.setProperty("--doc-w", `${showDoc ? geo.width : 0}px`);
     const left = document.getElementById("divider-left");
     const right = document.getElementById("divider-right");
     if (left) {
@@ -283,7 +339,7 @@ const Shell = (() => {
       left.hidden = collapse;
     }
     if (right) {
-      right.setAttribute("aria-valuenow", String(showDoc ? docWidthFor() : 0));
+      right.setAttribute("aria-valuenow", String(showDoc ? geo.width : 0));
       right.hidden = !showDoc;
     }
     if (docPanel) docPanel.hidden = !showDoc;
@@ -291,7 +347,7 @@ const Shell = (() => {
     if (docToggle) docToggle.setAttribute("aria-pressed", String(showDoc));
     const railToggle = document.getElementById("sidebar-toggle");
     if (railToggle) railToggle.setAttribute("aria-pressed", String(!collapse));
-    emit("layout", { sidebar: state.sidebar, doc: docWidthFor(), open: showDoc, collapse });
+    emit("layout", { sidebar: state.sidebar, doc: showDoc ? geo.width : 0, open: showDoc, collapse, tight: !geo.canShow });
   };
 
   const setSidebar = (px) => {
@@ -300,9 +356,7 @@ const Shell = (() => {
     applyLayout();
   };
   const setDoc = (px) => {
-    const width = appWidth();
-    const max = Math.max(DOC_MIN, Math.min(width * DOC_MAX_RATIO, width - sidebarWidth() - CENTER_MIN - 16));
-    state.doc = Math.round(clamp(px, DOC_MIN, max));
+    state.doc = Math.round(clamp(px, DOC_MIN, docCap()));
     persistLayout();
     applyLayout();
   };
@@ -313,8 +367,14 @@ const Shell = (() => {
   };
   const toggleDoc = () => {
     state.docOpen = !state.docOpen;
+    openRightColumn();
     persistLayout();
     applyLayout();
+  };
+  /* DSH: opening the right column concedes the space from the sidebar first, so
+     a manually expanded sidebar collapses rather than squeezing the centre. */
+  const openRightColumn = () => {
+    if (state.docOpen && !state.sidebarCollapsed) state.sidebarCollapsed = true;
   };
 
   /* Swap to another workspace's geometry: the geometry on screen still
@@ -465,6 +525,7 @@ const Shell = (() => {
     else documents.push(entry);
     activeDoc = entry.id;
     state.docOpen = true;
+    openRightColumn();
     applyLayout();
     renderDoc();
     emit("document", { action: "open", id: entry.id });
@@ -781,7 +842,7 @@ const Shell = (() => {
         sidebar: sidebarWidth(),
         doc: docWidthFor(),
         docOpen: state.docOpen,
-        collapsed: state.sidebarCollapsed || appWidth() < RAIL_AT,
+        collapsed: state.sidebarCollapsed || appWidth() < COMPACT_AT,
       };
     },
     resolvedAppearance,

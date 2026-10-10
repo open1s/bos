@@ -33,6 +33,14 @@
   --shadow-panel: 0 8px 26px rgba(0, 0, 0, 0.4);
   --sidebar-w: 280px;
   --doc-w: 0px;
+  /* Frame clearances, cloned from DSH's ui-layout contract: the reserved strip
+     below the window's top edge, the extra inset an overlay adds for dialogs and
+     menus, and the band the window chrome owns at the top-left (macOS traffic
+     lights, or a seat mounted beside them). A plain browser document publishes
+     none of these; the desktop shell does. */
+  --frame-top-clearance: 48px;
+  --frame-overlay-top: 68px;
+  --frame-leading-clearance: 0px;
 }
 
 [data-theme="light"] {

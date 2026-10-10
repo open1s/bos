@@ -76,11 +76,15 @@
     check("toggle hides doc", Shell.state.docOpen === false && app.dataset.doc === "closed" && document.getElementById("doc-panel").hidden);
     check("doc toggle aria", document.getElementById("doc-toggle").getAttribute("aria-pressed") === "false");
     Shell.toggleDoc();
+    // DSH ui-layout: opening the right column concedes the space from the
+    // sidebar first, so a manually expanded sidebar collapses rather than
+    // squeezing the centre.
+    check("open concedes the sidebar", Shell.state.sidebarCollapsed === true);
+    Shell.toggleSidebar();
+    check("sidebar restores width", px(app.style.getPropertyValue("--sidebar-w")) === 300);
     Shell.toggleSidebar();
     check("rail collapses sidebar", px(app.style.getPropertyValue("--sidebar-w")) === 56);
     check("rail hides session list", css(document.getElementById("session-list"), "display") === "none");
-    Shell.toggleSidebar();
-    check("sidebar restores width", px(app.style.getPropertyValue("--sidebar-w")) === 300);
 
     // --- theming, typography, presentation ---------------------------------
     Shell.setAppearance("light");
@@ -177,6 +181,57 @@
     Shell.setDoc(geo0.doc);
     if (Shell.state.docOpen !== geo0.open) Shell.toggleDoc();
     if (Shell.state.sidebarCollapsed !== geo0.collapsed) Shell.toggleSidebar();
+
+    // --- DSH ui-layout parity ---------------------------------------------
+    // The frame geometry is cloned from DSH's ui-layout contract (vendored at
+    // docs/dsh-ui-reference/dsh-client-ui-layout); these checks hold the engine
+    // to those numbers instead of to prose.
+    check("frame top clearance is DSH's 48px", css(document.documentElement, "--frame-top-clearance") === "48px");
+    check("frame overlay inset is DSH's 68px", css(document.documentElement, "--frame-overlay-top") === "68px");
+    const appWidthStyle = app.style.width;
+    Shell.setSidebar(420);
+    if (Shell.state.sidebarCollapsed) Shell.toggleSidebar();
+    // Store the preference where there is room for it, then shrink: the stored
+    // pixel width survives while the rendered column steps down.
+    app.style.width = "1440px";
+    window.dispatchEvent(new Event("resize"));
+    Shell.setDoc(600);
+    app.style.width = "1200px";
+    window.dispatchEvent(new Event("resize"));
+    const stepped = Shell.layout.doc;
+    check(
+      "a stored right column steps down instead of squeezing the centre",
+      stepped > 0 && stepped < 600 && Shell.state.doc === 600,
+      `doc=${stepped} stored=${Shell.state.doc}`,
+    );
+    // 420px sidebar + 400px centre + a 300px column does not fit in 1100px: DSH
+    // closes the column rather than violating the centre's floor.
+    app.style.width = "1100px";
+    window.dispatchEvent(new Event("resize"));
+    check("no room at all closes the right column", Shell.state.docOpen === false && app.dataset.doc === "closed");
+    // ...and widening the window again does not reopen it.
+    app.style.width = "1440px";
+    window.dispatchEvent(new Event("resize"));
+    check("a closed column stays closed when the window widens", Shell.state.docOpen === false);
+    app.style.width = appWidthStyle;
+    window.dispatchEvent(new Event("resize"));
+    Shell.setSidebar(geo0.sidebar);
+    // Theme presenter parity: the platform chrome reads `color-scheme`, DSH's
+    // styles read `body[data-ds-dark-theme]`, and the owned theme-color meta
+    // must agree with what actually rendered.
+    Shell.setAppearance("dark");
+    check("dark writes color-scheme", document.documentElement.style.colorScheme === "dark");
+    check("dark sets the DSH dark marker", document.body.hasAttribute("data-ds-dark-theme"));
+    Shell.setAppearance("light");
+    check("light writes color-scheme", document.documentElement.style.colorScheme === "light");
+    check("light clears the DSH dark marker", !document.body.hasAttribute("data-ds-dark-theme"));
+    const metas = document.querySelectorAll('meta[name="theme-color"]');
+    check("theme-color is owned exactly once", metas.length === 1, metas.length);
+    check(
+      "theme-color follows the rendered body",
+      metas[0] && metas[0].getAttribute("content") === css(document.body, "background-color"),
+      metas[0] ? metas[0].getAttribute("content") : "missing",
+    );
 
     Shell.setAppearance("system");
     Shell.setFontSize(14);

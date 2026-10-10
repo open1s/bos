@@ -38,11 +38,16 @@
       const open = sb.classList.contains("open");
       out.sidebarOpen = open;
       const rows = sb.querySelectorAll(".session-row, .nav-item, .ws-head, .sidebar-head").length;
+      // A collapsed rail keeps its head and hides the rows; the head is not a
+      // list, so only visible *content* rows can make a narrow box unreadable.
+      const visibleRows = [...sb.querySelectorAll(".session-row, .nav-item, .ws-head")]
+        .filter((el) => el.getClientRects().length > 0).length;
       out.sidebarRows = rows;
+      out.sidebarVisibleRows = visibleRows;
       // `scrollWidth` is flush even when the text is squeezed, because the flex
       // children shrink with the box. The honest test for "unreadable" is a box
       // too small that still has rows in it.
-      out.sidebarSqueezed = sb.clientWidth < 200 && rows > 0;
+      out.sidebarSqueezed = sb.clientWidth < 200 && visibleRows > 0;
       if (!open) out.offscreen = out.offscreen.filter((k) => !k.startsWith("sidebar"));
     }
     out.drawer = measureDrawer();
