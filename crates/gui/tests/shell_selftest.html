@@ -76,12 +76,16 @@
     check("toggle hides doc", Shell.state.docOpen === false && app.dataset.doc === "closed" && document.getElementById("doc-panel").hidden);
     check("doc toggle aria", document.getElementById("doc-toggle").getAttribute("aria-pressed") === "false");
     Shell.toggleDoc();
-    // DSH ui-layout: opening the right column concedes the space from the
-    // sidebar first, so a manually expanded sidebar collapses rather than
-    // squeezing the centre.
-    check("open concedes the sidebar", Shell.state.sidebarCollapsed === true);
-    Shell.toggleSidebar();
-    check("sidebar restores width", px(app.style.getPropertyValue("--sidebar-w")) === 300);
+    // Rev 85: opening the right column never rails the sidebar — the DSH
+    // reference concedes only a *manually expanded* sidebar, and a railed
+    // session list was unreadable in practice. The list keeps its width;
+    // only the ☰ toggle rails the column, deliberately.
+    check(
+      "open keeps the sidebar column",
+      Shell.state.sidebarCollapsed === false && px(app.style.getPropertyValue("--sidebar-w")) === 300,
+      px(app.style.getPropertyValue("--sidebar-w")),
+    );
+    check("open keeps the session list", css(document.getElementById("session-list"), "display") !== "none");
     Shell.toggleSidebar();
     check("rail collapses sidebar", px(app.style.getPropertyValue("--sidebar-w")) === 56);
     check("rail hides session list", css(document.getElementById("session-list"), "display") === "none");
@@ -176,6 +180,29 @@
     check("same scope is a no-op", Shell.state.sidebar === 360);
     Shell.setLayoutScope("");
     check("default scope kept its own layout", Shell.state.sidebar === 320, Shell.state.sidebar);
+    // rev 85 layout schema: a rail written by the old concession heals once on
+    // adopt, while a rail the user chose under schema v2 is theirs to keep.
+    Shell.storage.set(
+      "bos.layout.v1:/ws/legacy",
+      JSON.stringify({ sidebar: 300, sidebarCollapsed: true, docOpen: true }),
+    );
+    Shell.setLayoutScope("/ws/legacy");
+    check(
+      "pre-v2 concession rail heals once",
+      Shell.state.sidebarCollapsed === false && Shell.state.sidebar === 300,
+      `${Shell.state.sidebarCollapsed} ${Shell.state.sidebar}`,
+    );
+    Shell.storage.set(
+      "bos.layout.v1:/ws/manual",
+      JSON.stringify({ v: 2, sidebar: 340, sidebarCollapsed: true, docOpen: true }),
+    );
+    Shell.setLayoutScope("/ws/manual");
+    check(
+      "v2 manual rail survives adopt",
+      Shell.state.sidebarCollapsed === true && Shell.state.sidebar === 340,
+      `${Shell.state.sidebarCollapsed} ${Shell.state.sidebar}`,
+    );
+    Shell.setLayoutScope("");
     // leave the page the way we found it
     Shell.setSidebar(geo0.sidebar);
     Shell.setDoc(geo0.doc);

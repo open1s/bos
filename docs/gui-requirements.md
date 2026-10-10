@@ -570,12 +570,17 @@ UI bundle, GUI build, and a live verification against the local broker. Baseline
 must never regress: tests **633/0 (63 suites)** — re-measure with the command above
 rather than trusting this number, which has been stale twice — live verify 5/5, and
 the GUI guards, whose counts are also measured rather than remembered:
-`ui_selftest.sh` **125** ui + **87** shell checks over the transcript and shell surfaces,
-`layout_selftest.sh` **0** failures across five widths (1440/900/560/500 measured;
-420 unreachable — Chrome clamps to ~500 px); `markup_selftest.sh` **25** structural
+`ui_selftest.sh` **125** ui + **89** shell checks over the transcript and shell surfaces
+(shell holds the rev 85 sidebar contract: the right column opens without railing
+the session list, the ☰ toggle rails it, and layout schema v2 heals a pre-v2
+concession rail once while keeping a rail the user chose), `layout_selftest.sh`
+**0** failures across five widths (1440/900/560/500 measured;
+420 unreachable — Chrome clamps to ~500 px); `markup_selftest.sh` **37** structural
 checks (the only guard that reads the shipped `index.html`); `wiring_selftest.sh`
-**56/56** commands reachable, no phantoms; `page_selftest.sh` **16** checks that
-execute the shipped page itself — executed **styled**: the harness injects `<base>`
+**56/56** commands reachable, no phantoms; `page_selftest.sh` **26** checks that
+execute the shipped page itself (including the Chat | Trajectory tab strip: click,
+roving-key navigation, cross-tab visibility and the honest empty state) — executed
+**styled**: the harness injects `<base>`
 as the *first* child of `<head>` (rev 84; appending it after the stylesheet link
 left every earlier run reading an unstyled document); `zip_selftest.sh` **10**
 checks in which an **independent** reader (Python's zipfile) accepts an archive the
@@ -652,7 +657,7 @@ recorded in the round log.
 | M7 | Subagents + jobs: catalog, live output panels, control actions | delegate/interrupt/list from UI; job panels stream bounded output | |
 | M8 | Skills + MCP v2: authoring/install, resources on demand, per-session activation, governance | skill author→invoke round trip; MCP allow/deny enforced | |
 | M9 | Extensibility: Rust plugin seam + declarative presets + hooks (Codex/Claude) | sample plugin registers tool+panel+command; preset validation errors actionable | |
-| M10 | Trajectory + replay: timeline with timing, deterministic session replay | replay reproduces transcript + metrics | |
+| M10 | Trajectory + replay: timeline with timing, deterministic session replay | replay reproduces transcript + metrics | ✅ **step 1 (rev 85): the Chat \| Trajectory tab strip** — a `role=tablist` strip under the title (roving tabindex, click + ArrowLeft/ArrowRight) switches the centre between the conversation and a read-only **Trajectory** view of the run: steps with timings, tools summarised with durations and running states in words, roles/errors carried in text, the honest "No turns yet / Steps appear here as the conversation runs." empty state, and a **300-row cap** with a truncation note; `/trajectory` and `/chat` command the strip. Evidence: page **26/26** (5 tab checks), markup **37**, wiring **56/56**. Limits: tab choice is device-local (not persisted) and the trajectory is a view, not a replay. ⬜ timeline with timing, deterministic session replay (M10 proper). |
 | M11 | AGI surfaces: memory/knowledge UI, self-inspection tool, evaluator/critic, workspace scoping | memory CRUD + recall surfacing; agent can read its own composition | |
 | M12 | Multi-frontend: headless + stdio JSON-RPC SDK, scriptable from tests | external client drives a session over stdio | |
 | M13 | Polish: i18n zh/en, theming tokens, shortcuts UI, a11y audit | no hard-coded UI strings; a11y checklist | |
@@ -915,8 +920,9 @@ state and document-panel state (`bos.layout.v1:<root>`; the unscoped
 existed are still honoured). Widths are changed by dragging a divider or
 with the keyboard (arrows, shift-arrows for a bigger step, Home resets) and
 are clamped — sidebar 264–420 px, document panel at most 70 % of the window
-while the centre keeps 400 px — with the compact-window rules (rail below
-860 px, no document panel below 1 024 px) overriding the stored width rather
+while the centre keeps 400 px — with the compact-window rules (the sidebar rails
+and no document panel below 1 024 px; the panel's own toggle hides below 860 px)
+overriding the stored width rather
 than fighting it. The shell stays Tauri-free: the app names the scope
 (`Shell.setLayoutScope`) when the root is known or changes; the geometry on
 screen is written back to the scope being **left**, then the new scope's
@@ -1058,7 +1064,7 @@ The PTY half of the M2 terminal slot, behind the same panel. `/term` from the pa
 
 **Honest limits (rev 80)**: no alternate screen buffer, no true colour or cursor addressing — ANSI is stripped, not interpreted, so `vim`/`htop` render as plain scrolled text (a vt100 emulator is the documented upgrade path behind the same events); no tab completion UI beyond what the shell itself echoes; no key binding for Ctrl-C (the shell's own controls apply only to what the PTY receives — type `exit` or press **Kill** to end the session). The spawning PTY tests stand down, loudly, in sandboxes that refuse `/dev/ptmx`, and run in full on a normal dev machine.
 
-### 12.6 DSH frontend reference (rev 81–84)
+### 12.6 DSH frontend reference (rev 81–85)
 
 The UI is a **reference-driven clone of DSH's web frontend**: we study DSH's
 published UI contracts and reimplement them in our own thin, dependency-free
@@ -1077,8 +1083,17 @@ Adopted so far (frame geometry + theme presenter), each held by a harness check:
    centre, the column steps down to 300px, and is reported as not fitting only
    when even that cannot be honoured; a column that does not fit **closes
    deterministically** and is not reopened automatically by a wider window.
-3. **Space comes from the sidebar first** — opening the right column collapses a
-   manually expanded sidebar.
+3. **Space comes from the sidebar first — in width, not in the column (rev 85)**
+   — the reference concedes a *manually expanded* sidebar when the right panel
+   opens; railed session lists read as broken in use, and the geometry never
+   needs the concession (264 + 400 + 280 + 16 = 976 fits under the 1 024px doc
+   threshold, and the step-down/deterministic-close rules already protect both
+   floors). Opening now narrows an over-wide sidebar just far enough for the
+   column's 300px floor — never below 264px — rails only via the explicit ☰
+   toggle or the <1 024px rule, and layout schema **v2** heals a rail written by
+   the pre-v2 concession once on adopt while keeping a rail the user chose.
+   Documented divergence: reference line 30's "collapses a manually expanded
+   sidebar" is intentionally not cloned.
 4. **Theme presenter** — `color-scheme` on the root, `body[data-ds-dark-theme]`,
    `--content-font-size`, and one owned `<meta name="theme-color">` whose content
    is read back from the rendered body background.

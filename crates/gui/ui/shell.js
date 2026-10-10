@@ -10,6 +10,10 @@
 
 const Shell = (() => {
   const LAYOUT_KEY = "bos.layout.v1";
+  /* Layout schema: v2 stops the right column from railing an expanded sidebar
+     (rev 85), so a record without `v` is a pre-v2 one whose rail — written by
+     the old concession — is healed once on adopt. */
+  const LAYOUT_V = 2;
   const UI_KEY = "bos.ui.v1";
 
   const SIDEBAR_MIN = 264;
@@ -125,7 +129,12 @@ const Shell = (() => {
   const adoptLayout = (saved) => {
     state.sidebar = clamp(Number(saved.sidebar) || SIDEBAR_DEFAULT, SIDEBAR_MIN, SIDEBAR_MAX);
     state.doc = Number(saved.doc) || 0;
-    state.sidebarCollapsed = saved.sidebarCollapsed === true;
+    /* A rail only survives from a v2 record — i.e. one the user chose with the
+       toggle — never from the pre-v2 concession that railed the sidebar the
+       moment the right column opened. Idempotent: v2 records persist with `v`,
+       so a manual rail after the upgrade is kept. */
+    const legacy = saved.v !== LAYOUT_V;
+    state.sidebarCollapsed = saved.sidebarCollapsed === true && !legacy;
     state.docOpen = saved.docOpen !== false;
   };
   adoptLayout(savedLayout);
@@ -310,6 +319,7 @@ const Shell = (() => {
 
   const persistLayout = () =>
     writeJson(layoutKey(), {
+      v: LAYOUT_V,
       sidebar: state.sidebar,
       doc: state.doc,
       sidebarCollapsed: state.sidebarCollapsed,
@@ -379,10 +389,24 @@ const Shell = (() => {
     persistLayout();
     applyLayout();
   };
-  /* DSH: opening the right column concedes the space from the sidebar first, so
-     a manually expanded sidebar collapses rather than squeezing the centre. */
+  /* DSH's frame takes the right column's room from the sidebar first, but the
+     reference concedes only a *manually expanded* sidebar (see
+     docs/dsh-ui-reference/dsh-client-ui-layout/README.md), and a railed session
+     list was unreadable in practice (rev 85). We concede width instead of the
+     column: opening narrows an over-wide sidebar just far enough for the
+     column's 300px floor, never below 264px. The column's own step-down rule
+     then decides whether it opens at all — below the 1024px threshold
+     it is not offered, and an explicit rail (the ☰ toggle) is respected as the
+     user's own choice. */
   const openRightColumn = () => {
-    if (state.docOpen && !state.sidebarCollapsed) state.sidebarCollapsed = true;
+    if (!state.docOpen || state.sidebarCollapsed) return;
+    if (appWidth() < COMPACT_AT) return;
+    if (appWidth() - sidebarWidth() - CENTER_MIN - 16 >= DOC_STEP) return;
+    const next = clamp(appWidth() - CENTER_MIN - 16 - DOC_STEP, SIDEBAR_MIN, SIDEBAR_MAX);
+    if (next !== state.sidebar) {
+      state.sidebar = next;
+      persistLayout();
+    }
   };
 
   /* Swap to another workspace's geometry: the geometry on screen still
