@@ -919,6 +919,7 @@ affordance and a rerun of every structural assertion, not a silent shrink.
 | 111 | 2026-10-11 | **The sidebar's most prominent control was "New session", and the user said it should be "Add Workspace"; asked where the old control goes, they said "move to here as an icon".** Two instructions, one redesign, and the redesign is a rename of *intent* rather than of a label. A chat is started from the workspace it belongs to — the row's `+` — or from the keyboard (Cmd/Ctrl+N) or from the palette (`/new`), so the top of the sidebar is free for the gesture that creates the thing the sidebar is a list *of*. The old `.side-primary` "New session" button, its `#new-chat` id and its `.new-session` class are gone; the new control is a folder-plus whose name and tooltip travel as `data-i18n-aria`/`data-i18n-title="btn.addWorkspace"`, because a glyph has no text for the translator to find. **One chat-start, three doors**: the row `+` (`newSessionIn(group.id)`, with `aria-keyshortcuts`), Cmd/Ctrl+N and the palette's `/new` all reach the same creation path, which is what makes removing the big button a *move* rather than a loss of a capability. Evidence: **markup 81/0** (the guard's `STALE_NAMES` scan asserts no `#new-chat`, `.new-session` or `side-primary` survives in the shipped bytes; three scoped greps assert the three doors, one of them scoped to the row's own `+` block because its `…` menu also creates), **page 132/0** (the Add-workspace opener is the sidebar's own control and leaves Settings shut), **live 135** with both M9 Add-workspace checks green — the single red is the concurrent session's image-bubble check, which aborts the harness after they have passed — **ui 164/0 + shell 94/0**, **layout 0** at 1440/900/560/500, **wiring 0**, **package 16/0**, **zip 10/0**, **perf 19/0**. Falsified **7 ways**, each against a copy of `ui/`, `tests/` and `icons/` under `/tmp` rather than the shared tree (another session is editing `ui/app.js` in this working copy), each injection reddening the check that owns it with byte-identical residue. Limits: for exactly one round the icon sat in the brand row of `.sidebar-head`, which **rev 112 reverses** — the design puts it in the header of the section it adds to; the row's `+` and the icon are distinct gestures (a chat in *that* workspace versus a new workspace), so neither replaces the other; and the icon is not itself a keyboard shortcut (the palette and Cmd+N are). |
 | 112 | 2026-10-11 | **The design redraws the Workspaces header into three controls and hides three settings behind the middle one.** The mockup's grey band holds a magnifier, a sliders glyph and a folder-plus; its arrows say magnifier → the search field, sliders → a menu, folder-plus → a workspace root out of the system panel. The menu is the new thing, and it is the whole of the requirement's "search, filter/settings, and create actions" §12.1 item 4 already asked for: **Group by** WorkSpace / Workspace Tree (ticked) / In one list, **Order by** Manual / Last updated (ticked), **Filter sessions** Hide archived (ticked, counted) / All conversations (show archived) / Archived only (counted), with the header's lost reload folded in as the menu's one acting item. The design is silent about the brand row above the band (a redraw with nothing there), so the reading is written down: the folder-plus **returns to the section header** and the brand row is the brand alone again — **rev 111's placement is reversed**, and this row is where to disagree with it. **One menu, one writer.** `state.showArchived` is deleted, `state.view = {group, order, filter}` is the only state, and the `⧉ Archived (n)` disclosure is deleted with it: which archived rows are drawn is the filter's decision, made in `groupSessions`, and the counts live in the labels that make the decision. `openRowMenu` — the repo's single menu — gained the two shapes this needs: `item.group` draws a `.row-menu-head` only when the group changes, and `item.checked` makes an entry a `role="menuitemradio"` with `aria-checked` and a tick. A pick redraws the list and **reopens the menu** (the three choices are usually set together), which is why the button stops propagation — the document closes any menu a click lands outside of, so without it the menu opened and shut inside one gesture. **That defect is this revision's most useful finding**: it was written, the page guard's click went red on it (`menu=false, items=0`), and the guard's diagnostic step — not a reading — named it. **The three modes are three shapes of one list, not three lists.** `tree` is the default shape (a header per workspace, all expanded); `workspace` is every workspace as a header with only the **active** one expanded, and the fold is drawn only on the active group, because a fold that folds nothing is a dead control; `list` has no headers at all — one ordered list, every row carrying a `.sess-ws-chip`, since a mode that drops the workspace name would drop a fact the grouping was carrying. `order` is `updated` (default) or `manual` (the store's order; the sort is stable, so ties stay where the backend put them). `filter` is `hide` (default), `all` (archived rows drawn beside their own workspace's chats) or `archived` (only archived, and no empty group for a workspace with nothing archived). **Every label in it is translated like the row menus' are** — thirteen new `tr()` keys — and widening the completeness check from the markup's `data-i18n` marks to **every** key `tr()` is asked for found seven *pre-existing* keys that had an English fallback and no dictionary entry (the Add-workspace dialog's hints and the active-workspace label), so those rendered English in a Chinese UI while the check stayed green: a check that reads only one of the two places a label can live is the same shape as rev 110's check that could never fail. The choice is persisted under **one key** (`bos.sessionView`) through the same `parse…Blob` guard the run panel uses, so a hand-edited or truncated blob is the default rather than an exception at boot. Evidence: **markup 90/0** (9 new: the header holds search, the menu and add in that order with the menu announcing `aria-haspopup="menu"`; the brand row holds the brand alone; no `#new-chat`, `#workspace-add`, `.new-session`, `side-primary`, `sessions-refresh`, `archived-toggle` or `showArchived` may survive in the shipped bytes; the six mode/order/filter strings and the one key exist; the reload's item **and** its handler exist, because either half alone is a control that does nothing), **page 140/0** (8 new, driven through the button's own click: the menu is nine radio entries under four headings with `group:tree,order:updated,filter:hide` ticked and both counts in their labels; "In one list" has no `.ws-head` and chips reading `bos,bos,trino`; "WorkSpace" draws two headers, one fold and only the active group's rows; "Manual" keeps a fixture's array order where "Last updated" reorders it (`o2,o1` versus `o1,o2` — a fixture whose array order *is* its recency order could not tell them apart); "All conversations" puts the archived row back between `s2` and `s4` in its own group; "Archived only" draws one row and one header; the blob is read back and `parseViewBlob` refuses nonsense), **live 135** (the archive flow now drives the design end-to-end — the count in the label, its `aria-checked`, "All conversations" revealing the row, Restore putting the chat back; the single red is the concurrent session's image-bubble check, which aborts the harness after mine have passed), **ui 164/0 + shell 94/0** (four fixture call sites now pass the view explicitly — `groupSessions` reads it, and a fixture that silently inherited a default would be testing a mode the app never had), **layout 0** at 1440/900/560/500, **wiring 0**, **package 16/0**, **zip 10/0**, **perf 19/0**. Falsified **12 ways**, each in a `/tmp` copy and each reddening its own layer, with byte-identical residue: the header losing the menu (markup 2), the folder-plus returning to the brand row (markup 3), the storage key renamed (markup 1), the reload's handler dropped while its item stayed (markup 1), "Manual" ignored (page 1), the click let through to the document (page 2 — the defect above, reproduced on demand), "Archived only" no longer excluding the live chats (page 4), the flat chip emptied (page 1), a choice no longer redrawing the list (live 1), a view-menu key removed from the dictionary (markup 1, naming `view.filterArchived`), a *pre-existing* key app.js asks for removed (markup 1, naming `ws.active`), and the reload item losing its `tr()` wrapper (markup 1). The Chinese screenshot of the same menu is the visual half of that: every group heading, choice and count renders translated, and taking it is what found **two `New workspace` labels with no i18n mark at all** — the sidebar's own add row and the manager's button — which no text check could see, because a label that opts into nothing is invisible to a scan of the marks. Both are marked (`ws.add`) now, and the sidebar's is drawn through `tr()`. Limits: the e2e specs were retargeted to the doors that exist (`newChat()` clicks the active workspace row's `+`; `shell.spec.js` asserts `#workspace-add-primary`) but tauri-driver has no macOS backend, so that path is read rather than run; the menu is opened by click and is not reachable from the list beside it by keyboard (Escape, arrows, Home/End and focus hand-back work once it is open); "Manual" order is the backend's and cannot be edited (no drag); the counts in the labels count the whole store, not the filtered view; and `workspace` mode's fold exists only on the active group, so a non-active workspace cannot be folded by hand. |
 
+| 113 | 2026-10-11 | **A workspace's configuration moved next to the code: adding one creates `<root>/.bos/workspace.toml`, the way a project carries `.vscode`.** The registry (`~/.bos/gui/settings.toml`) still answers "which workspaces exist"; the folder now answers "how this one runs", so the settings can be read, edited, diffed, committed and carried to another machine with the code. `crates/gui/src/workspace_dir.rs` owns the format and the three rules that make writing into someone's project directory safe: **identity never travels** (`id`/`name`/`root`/timestamps stay in the registry, so the same file in a clone is a configuration and not a second workspace), **secrets never travel** (the API key, the providers that carry keys of their own, and the MCP *entries* — whose `args`/`url` can hold a token — are not written; MCP travels as a list of **names**, so a file can switch an existing server and can never introduce a command this installation does not have), and **a file is input, never an instruction** (unparsable files, absent keys and unknown names are ignored, not fatal). Creation writes it before the record is pushed, so a root that will not take a `.bos` is refused with nothing added; editing rewrites it and puts the whole record back if the write fails — the runtime is applied before the write and the backup taken before that, so a restore that ran late would leave a model the folder never took; `apply_preset` writes it only when the preset's root is a folder, because that door has never validated a root, and the Settings dialog's save writes it too — that door copies the globals onto the workspace in use (`push_globals_to_active_workspace`), and leaving the folder behind there would mean the next load folded the older file back over the user's own save. Loading folds each file over the registry copy, and field keys are `Option`s precisely so "absent" (inherit) and "set to empty" stay different answers. Evidence: seven module tests (round trip; no secret and no identity key, checked as TOML keys rather than substrings; missing/unparsable file; unknown MCP name; a plain file where `.bos` goes; second write replaces with no `.tmp` left; an empty root skipped in both directions, with the check owning the path it probes), three `app::tests` through the new `create_workspace_record`/`rewrite_workspace`/`push_globals_to_active_workspace` seams (which exist so a test can drive them without rewriting the user's registry), one `settings::tests` load from a real file on disk, and the dialog's own copy before the folder is picked — the claim it used to make, "Nothing is changed in the folder itself", is deleted because it stopped being true, and the replacement is guarded in `markup_selftest.sh` as a sentence rather than as a key, since a claim nobody checks is how the false one survived. Limits: a pre-existing workspace gets its folder on its next edit rather than on launch (startup must not write into folders nobody asked it to touch); a read-only folder cannot be added as a workspace; an **empty** root is skipped in both directions rather than resolved to the process working directory, because a bundled app launches from `/` and a create there is a permission refusal that would take the whole creation down; the pane does not print the resolved path; sessions and the app's other stores stay in `~/.bos/gui/`. |
 
 ## 9. Evidence status
 
@@ -2162,3 +2163,98 @@ this crate chose on purpose — one lock, one owner, no partial state — and th
 redesign (per-store locks, I/O off the command thread), not a patch. It is recorded as the
 reason P1/P6/P7 are worth doing first: they are the *work* that redesign would move, so
 making them cheap is useful whichever way the lock goes.
+
+### 24.15 The workspace's own `.bos` folder (like `.vscode`)
+
+A workspace's configuration had exactly one home: `~/.bos/gui/settings.toml`, the
+app's user-level registry. That is the right place for "which workspaces exist", and
+the wrong *only* place for "how this folder runs": a project's settings belong next
+to the project, where they can be read, edited, diffed, committed, and carried to
+another machine with the code.
+
+**What happens now.** Adding a workspace **creates** `<root>/.bos/` and writes
+`workspace.toml` in it *before the record exists anywhere*, so a folder that cannot
+take one is refused with the system's reason and nothing is added — the creation
+dialog keeps the refusal path it already had (§24.11), with one more thing to refuse.
+Editing a workspace rewrites the same file, and a write that fails puts the record
+back, so the app and the folder cannot disagree about what was saved. The Settings
+dialog is a third door — it copies the globals onto the workspace in use — and that
+save reaches the folder as well, because a registry that moved on while the file kept
+the older answer would be silently reverted at the next load. Applying a
+preset writes it too, except when the preset's root is not a folder: `apply_preset`
+has never validated a root, and a preset saved from a folder that has since moved
+must still apply. Loading folds each workspace's file over the registry copy, so a
+folder cloned with its `.bos` arrives configured. Removing a workspace leaves the
+folder alone, the way removing a project from an editor leaves `.vscode`. The one
+root that gets no folder is the **empty** one — the dialog's "empty = current
+folder" — because the directory the app was launched in is not one the user picked:
+nothing is written into it, and (the same rule read the other way) nothing is read
+from it either, so a stray `.bos` there cannot configure the workspace that stands
+for "here".
+
+**Field by field: the file wins, and absent means inherit.** Every key is optional,
+and the two states are different — a key the file does not have leaves the registry's
+value in place, one it has replaces it. The file carries the model, the base URL, the
+system prompt, temperature and reasoning effort, the bash and file-tool switches, the
+approval gate, the context budget, the instruction-folding switch, the memory switch
+and its file, the skills directory, the three deny-lists, and which MCP servers are
+on.
+
+**Three rules make that safe inside someone's project directory.**
+
+- *Identity never travels.* `id`, `name`, `root` and the timestamps stay in the
+  registry: the file says how a folder runs, not which records point at it, so the
+  same file in a clone is a configuration rather than a second workspace.
+- *Secrets never travel.* The API key, the fallback providers (which carry keys of
+  their own) and the MCP **entries** — whose `args` and `url` can hold a token —
+  are not written. What travels about MCP is the list of **names** that are on, so a
+  file can switch an existing server on or off and can never introduce a command this
+  installation did not already have. The file is therefore safe to commit.
+- *A file is input, never an instruction.* One that will not parse, a field it does
+  not carry, and an MCP name this installation does not know are each ignored rather
+  than fatal: the app must not fail to load because a hand-edited file next to
+  someone's code has a typo.
+
+Writing is atomic — a sibling temporary file, then a rename — so a crash mid-write
+cannot leave a half-parsed file where the next load reads it.
+
+**Evidence.** `crates/gui/src/workspace_dir.rs` owns the format, and its seven tests
+cover the round trip, the absence of every secret *and* of the identity keys (checked
+as TOML keys, not as substrings that a field name might contain by accident), a
+missing or unparsable file leaving the record alone, an MCP name that matches nothing,
+the refusal when a plain file sits where `.bos` has to go, a second write replacing
+the first with no `.tmp` left behind, and the empty root being skipped in both
+directions — that last check owning the path it asserts about, and failing loudly if
+the skip ever regresses, because the write would land in the folder the tests were
+started from. `app::tests` drives the three
+composed promises — a creation that prepares the folder before it records anything, an
+edit that rewrites the file or puts the whole record back (the model included, because
+the runtime is applied before the write and the backup is taken before that), and the
+globals push a settings save performs, checked by reading the file the folder actually
+got — through `create_workspace_record`, `rewrite_workspace` and
+`push_globals_to_active_workspace`, which exist precisely so a test can reach them
+without rewriting the user's registry. `settings::tests` loads
+a real file from disk and asserts that the folder's value wins while a key the file
+does not carry stays. The dialog says what will happen before the folder is picked
+(`.ws-add-desc` and `ws.add.bos`, both languages), and the sentence it used to
+carry — "Nothing is changed in the folder itself" — is gone because it is no longer
+true. `markup_selftest.sh` owns the replacement as the sentence a reader gets rather
+than as a key: the claim it deleted was false for as long as nobody checked it.
+
+**Limits.** A workspace that existed before this feature gets its folder on the next
+edit, not on the next launch: startup must not write into folders nobody asked it to
+touch. A folder that cannot take a `.bos` cannot be *added* as a workspace (nor have
+a root moved into it), which is the same strictness §24.7 applies to a root that is
+missing or is not a directory; a *preset* whose root is gone still applies and simply
+skips the write; and an empty root is skipped rather than resolved to the process
+working directory, so "add a workspace and leave the folder blank" neither writes to
+nor reads from wherever the app happened to start — the older empty-root meaning
+survives for the tools, not for the configuration. The launch directory is not a
+stable identity for a workspace, and that is the stronger half of the reason: a file
+written there would be picked up by the next launch, or not, depending on the
+directory the app was started in, so the workspace's configuration would follow the
+*invocation* rather than the workspace. The workspace pane does not print the resolved path — the dialog
+names the folder, and the pane would have to guess a platform separator. Sessions,
+spills, exports and the MCP policy store stay in `~/.bos/gui/`: this section moves
+the workspace's *configuration*, not the app's database.
+

@@ -2487,7 +2487,10 @@ fn normalize_workspace_root(root: &str) -> Result<String, String> {
 /// today's installation until it is configured otherwise — and `config` is how
 /// it is configured *at* creation, in one step, rather than being created wrong
 /// and edited right. A draft naming something that does not exist is refused
-/// before the workspace is added, so a failed creation leaves nothing behind.
+/// before the workspace is added, so a failed creation leaves nothing behind —
+/// and the folder is given its own `.bos` configuration directory before the
+/// record exists anywhere (§24.15), so a folder that cannot take one is refused
+/// with the system's reason rather than becoming a workspace without a home.
 #[tauri::command]
 fn create_workspace(
     state: State<'_, Arc<GuiState>>,
@@ -2507,13 +2510,32 @@ fn create_workspace_in(
     root: &str,
     config: Option<&crate::settings::WorkspaceDraft>,
 ) -> Result<Settings, String> {
-    let w = drafted_workspace(&inner.settings, name, root, config)?;
-    inner.settings.active_workspace = w.id.clone();
-    inner.settings.workspaces.push(w);
+    create_workspace_record(inner, name, root, config)?;
     inner.settings.save().map_err(|e| e.to_string())?;
     inner.settings_gen = inner.settings_gen.wrapping_add(1);
     inner.agent_cache.clear();
     Ok(inner.settings.effective())
+}
+
+/// Everything a creation does except write the settings file: build the record,
+/// prepare the folder it is going to live in, and put it in place.
+///
+/// Separated for the same reason as `drafted_workspace` — the settings write is
+/// the one step a test must not reach, because it would rewrite the user's
+/// registry — and because the order is the promise: the folder's `.bos` is
+/// written **before** the record is pushed, so a root that will not take one is
+/// refused with nothing added, not after the fact.
+fn create_workspace_record(
+    inner: &mut Inner,
+    name: &str,
+    root: &str,
+    config: Option<&crate::settings::WorkspaceDraft>,
+) -> Result<(), String> {
+    let w = drafted_workspace(&inner.settings, name, root, config)?;
+    crate::workspace_dir::write_for(&w)?;
+    inner.settings.active_workspace = w.id.clone();
+    inner.settings.workspaces.push(w);
+    Ok(())
 }
 
 /// Build the workspace a creation asks for, without adding it anywhere.
@@ -2594,6 +2616,9 @@ async fn choose_folder(
 
 /// Rename a workspace or move its root. Sessions stay put: a chat recorded in the
 /// old folder keeps saying so, because its approvals and tool calls happened there.
+/// The workspace's own `.bos/workspace.toml` is rewritten from the result — the
+/// folder's copy is the one a clone would carry — and a write that fails puts the
+/// record back, so the app and the file cannot disagree about what was saved.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn update_workspace(
@@ -2625,45 +2650,81 @@ fn update_workspace(
     crate::settings::validate_mcp_servers(&mcp_servers)?;
     let mut inner = state.lock()?;
     let root = normalize_workspace_root(&root)?;
-    inner.settings.set_workspace_runtime(
-        &id,
-        &crate::settings::WorkspaceRuntime {
-            bash_enabled,
-            file_tools_enabled,
-            require_approval,
-            context_budget,
-            project_instructions,
-            memory_enabled,
-            model: model.to_string(),
-            base_url: base_url.to_string(),
-            api_key: api_key.to_string(),
-            system_prompt: system_prompt.to_string(),
-            temperature,
-            reasoning_effort: reasoning_effort.to_string(),
-            memory_path: memory_path.to_string(),
-            skills_dir: skills_dir.to_string(),
-        },
-    )?;
-    let now = crate::session::unix_now();
-    let Some(w) = inner.settings.workspaces.iter_mut().find(|w| w.id == id) else {
-        return Err(format!("unknown workspace '{id}'"));
+    let runtime = crate::settings::WorkspaceRuntime {
+        bash_enabled,
+        file_tools_enabled,
+        require_approval,
+        context_budget,
+        project_instructions,
+        memory_enabled,
+        model: model.to_string(),
+        base_url: base_url.to_string(),
+        api_key: api_key.to_string(),
+        system_prompt: system_prompt.to_string(),
+        temperature,
+        reasoning_effort: reasoning_effort.to_string(),
+        memory_path: memory_path.to_string(),
+        skills_dir: skills_dir.to_string(),
     };
-    if !name.trim().is_empty() {
-        w.name = name.trim().to_string();
-    }
-    w.root = root;
-    // The deny-lists are the workspace's own selection (§24.8), and the names are
-    // the ones the model sees, so the panel hands back exactly what it showed.
-    w.disabled_tools = disabled_tools;
-    w.disabled_skills = disabled_skills;
-    // Which MCP servers this workspace may use. A handshake that exists does not
-    // attach unless its server is enabled here (§24.8, enforced at attach time).
-    w.mcp_servers = mcp_servers;
-    w.updated_at = now;
+    rewrite_workspace(&mut inner, &id, &runtime, |w| {
+        if !name.trim().is_empty() {
+            w.name = name.trim().to_string();
+        }
+        w.root = root;
+        // The deny-lists are the workspace's own selection (§24.8), and the names
+        // are the ones the model sees, so the panel hands back exactly what it
+        // showed.
+        w.disabled_tools = disabled_tools;
+        w.disabled_skills = disabled_skills;
+        // Which MCP servers this workspace may use. A handshake that exists does
+        // not attach unless its server is enabled here (§24.8, enforced at attach
+        // time).
+        w.mcp_servers = mcp_servers;
+    })?;
     inner.settings.save().map_err(|e| e.to_string())?;
     inner.settings_gen = inner.settings_gen.wrapping_add(1);
     inner.agent_cache.clear();
     Ok(inner.settings.effective())
+}
+
+/// Change one stored workspace and the configuration in its own folder, or
+/// change neither.
+///
+/// The record is cloned before the first edit and put back when the folder
+/// cannot take the write, because the file is where this workspace's
+/// configuration lives: an app holding settings the folder never took is the
+/// state §24.15 exists to prevent. The settings file is deliberately **not**
+/// written here, so a test can drive the whole rule without rewriting the user's
+/// registry — the command saves after this returns.
+fn rewrite_workspace(
+    inner: &mut Inner,
+    id: &str,
+    runtime: &crate::settings::WorkspaceRuntime,
+    edit: impl FnOnce(&mut crate::settings::Workspace),
+) -> Result<(), String> {
+    let Some(backup) = inner
+        .settings
+        .workspaces
+        .iter()
+        .find(|w| w.id == id)
+        .cloned()
+    else {
+        return Err(format!("unknown workspace '{id}'"));
+    };
+    inner.settings.set_workspace_runtime(id, runtime)?;
+    let Some(w) = inner.settings.workspaces.iter_mut().find(|w| w.id == id) else {
+        return Err(format!("unknown workspace '{id}'"));
+    };
+    edit(w);
+    w.updated_at = crate::session::unix_now();
+    let written = crate::workspace_dir::write_for(w);
+    if let Err(e) = written {
+        if let Some(slot) = inner.settings.workspaces.iter_mut().find(|x| x.id == id) {
+            *slot = backup;
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Remove a workspace. The last one cannot go — the GUI always needs one to work
@@ -2760,8 +2821,65 @@ fn set_active_workspace(state: State<'_, Arc<GuiState>>, id: String) -> Result<S
     Ok(inner.settings.clone())
 }
 
+/// Copy the globals the settings dialog owns onto the workspace in use, and put
+/// the same answer in that workspace's own `.bos` (§24.15).
+///
+/// The globals are refreshed as well, because they are what a *new* workspace
+/// starts from; these values are what this workspace actually runs with. The folder
+/// write is not decoration: the file is the source of truth for the fields it
+/// carries, so a registry that moved on while the folder kept the old answer would
+/// be silently reverted at the next load — and a folder that refuses the write is a
+/// save that did not happen, reported with the folder's own reason.
+///
+/// The tool and skill deny-lists are deliberately absent: they are the workspace's
+/// own selection, and overwriting them here would silently re-enable what the user
+/// switched off.
+fn push_globals_to_active_workspace(inner: &mut Inner) -> Result<(), String> {
+    let Some(idx) = inner
+        .settings
+        .workspaces
+        .iter()
+        .position(|w| w.id == inner.settings.active_workspace)
+    else {
+        return Ok(());
+    };
+    let g = inner.settings.clone();
+    let now = crate::session::unix_now();
+    let w = &mut inner.settings.workspaces[idx];
+    // A workspace named after its folder follows the folder when it moves.
+    let follows_root = w.name == w.root;
+    w.model = g.model.clone();
+    w.base_url = g.base_url.clone();
+    w.api_key = g.api_key.clone();
+    w.system_prompt = g.system_prompt.clone();
+    w.temperature = Some(g.temperature);
+    w.reasoning_effort = g.reasoning_effort.clone();
+    w.project_instructions = g.project_instructions;
+    w.bash_enabled = g.bash_enabled;
+    w.file_tools_enabled = g.file_tools_enabled;
+    w.root = g.bash_workspace.clone();
+    w.skills_dir = g.skills_dir.clone();
+    w.memory_enabled = g.memory_enabled;
+    w.memory_path = g.memory_path.clone();
+    w.require_approval = g.require_approval;
+    w.context_budget = g.context_budget;
+    w.mcp_servers = g.mcp_servers.clone();
+    w.providers = g.providers.clone();
+    if follows_root {
+        w.name = w.root.clone();
+    }
+    w.updated_at = now;
+    crate::workspace_dir::write_for(&inner.settings.workspaces[idx])?;
+    Ok(())
+}
+
 /// Apply and persist settings; the agent cache is invalidated and any MCP
-/// servers reconnect in the background.
+/// servers reconnect in the background. The workspace in use is written along with
+/// the globals it was filled from — see
+/// [`push_globals_to_active_workspace`] — so this dialog cannot move the registry
+/// on while the workspace's own folder keeps the older answer.
+///
+/// [`push_globals_to_active_workspace`]: push_globals_to_active_workspace
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn save_settings(
@@ -2821,45 +2939,7 @@ fn save_settings(
     inner.settings.search_api_key = search_api_key.trim().to_string();
     inner.settings.mcp_servers = mcp_servers;
     inner.settings.providers = providers;
-    // The dialog edits the workspace in use. The globals above are refreshed too,
-    // because they are what a *new* workspace starts from; these values are what
-    // this workspace actually runs with.
-    if let Some(idx) = inner
-        .settings
-        .workspaces
-        .iter()
-        .position(|w| w.id == inner.settings.active_workspace)
-    {
-        let g = inner.settings.clone();
-        let now = crate::session::unix_now();
-        let w = &mut inner.settings.workspaces[idx];
-        // A workspace named after its folder follows the folder when it moves.
-        let follows_root = w.name == w.root;
-        w.model = g.model.clone();
-        w.base_url = g.base_url.clone();
-        w.api_key = g.api_key.clone();
-        w.system_prompt = g.system_prompt.clone();
-        w.temperature = Some(g.temperature);
-        w.reasoning_effort = g.reasoning_effort.clone();
-        w.project_instructions = g.project_instructions;
-        w.bash_enabled = g.bash_enabled;
-        w.file_tools_enabled = g.file_tools_enabled;
-        w.root = g.bash_workspace.clone();
-        w.skills_dir = g.skills_dir.clone();
-        w.memory_enabled = g.memory_enabled;
-        w.memory_path = g.memory_path.clone();
-        w.require_approval = g.require_approval;
-        w.context_budget = g.context_budget;
-        w.mcp_servers = g.mcp_servers.clone();
-        w.providers = g.providers.clone();
-        // The tool and skill deny-lists are not in this dialog: they are the
-        // workspace's own selection, and overwriting them here would silently
-        // re-enable what the user switched off.
-        if follows_root {
-            w.name = w.root.clone();
-        }
-        w.updated_at = now;
-    }
+    push_globals_to_active_workspace(&mut inner)?;
     inner.settings.save().map_err(|e| e.to_string())?;
     // Pending approvals belong to the old agents: deny them before rebuild.
     for broker in &inner.brokers {
@@ -5183,6 +5263,156 @@ mod tests {
             "an unnamed workspace takes the folder's resolved path as its name"
         );
         assert_eq!(plain.model, settings.model);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root this test owns and has created. `private_store` is named for the
+    /// session store it isolates, so a workspace root gets its own name — and is
+    /// left behind for the next run to clear, like every other fixture here.
+    fn workspace_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bos-gui-wsroot-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn a_creation_prepares_the_folders_own_configuration_before_it_records_it() {
+        let mut inner = Inner::new();
+        let dir = workspace_root("create");
+        let before = inner.settings.workspaces.len();
+        create_workspace_record(&mut inner, "trino", &dir.to_string_lossy(), None)
+            .expect("created");
+
+        let path = dir.join(".bos").join("workspace.toml");
+        assert!(
+            path.is_file(),
+            "the folder the user picked carries its own configuration"
+        );
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(
+            text.contains("bash_enabled"),
+            "and it is the configuration: {text}"
+        );
+        assert_eq!(inner.settings.workspaces.len(), before + 1);
+        let added = inner.settings.workspaces.last().expect("added");
+        assert_eq!(
+            inner.settings.active_workspace, added.id,
+            "the new one is the shown one"
+        );
+        assert_eq!(
+            added.root,
+            dir.canonicalize().expect("canonical").to_string_lossy(),
+            "and the stored root is the resolved one the file was written from"
+        );
+
+        // A root that cannot take a `.bos` is refused **with nothing added**: the
+        // write happens before the record is pushed, which is the whole reason it
+        // is a separate function.
+        let blocked = workspace_root("create-blocked");
+        std::fs::write(blocked.join(".bos"), b"not a directory").expect("the blocking file");
+        let list = inner.settings.workspaces.clone();
+        let active = inner.settings.active_workspace.clone();
+        let err = create_workspace_record(&mut inner, "blocked", &blocked.to_string_lossy(), None)
+            .expect_err("refused");
+        assert!(err.contains(".bos"), "{err}");
+        assert_eq!(
+            inner.settings.workspaces, list,
+            "a refused creation adds nothing"
+        );
+        assert_eq!(
+            inner.settings.active_workspace, active,
+            "and switches nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&blocked);
+    }
+
+    #[test]
+    fn a_settings_save_puts_the_same_answer_in_the_workspaces_own_folder() {
+        let mut inner = Inner::new();
+        let dir = workspace_root("globals");
+        create_workspace_record(&mut inner, "trino", &dir.to_string_lossy(), None)
+            .expect("created");
+        let id = inner.settings.active_workspace.clone();
+        // The settings dialog owns the globals; the workspace in use is written from
+        // them, and the global root is what this workspace's root follows.
+        inner.settings.model = "gemini-3".to_string();
+        inner.settings.bash_enabled = false;
+        inner.settings.bash_workspace = dir.to_string_lossy().into_owned();
+        push_globals_to_active_workspace(&mut inner).expect("pushed");
+
+        let stored = inner
+            .settings
+            .workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .expect("the workspace in use");
+        assert_eq!(
+            stored.model, "gemini-3",
+            "the workspace follows the globals"
+        );
+        assert!(!stored.bash_enabled);
+        // And the folder follows the workspace — without this write the next load
+        // would fold the older file back over the save, which is the one way the two
+        // can silently disagree.
+        let text = std::fs::read_to_string(dir.join(".bos").join("workspace.toml"))
+            .expect("the workspace folder is readable");
+        assert!(
+            text.contains("gemini-3"),
+            "the folder carries the new model: {text}"
+        );
+        assert!(
+            text.contains("bash_enabled = false"),
+            "and the switch: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_rewrites_the_folders_file_and_a_refused_write_puts_the_record_back() {
+        let mut inner = Inner::new();
+        let dir = workspace_root("edit");
+        create_workspace_record(&mut inner, "trino", &dir.to_string_lossy(), None)
+            .expect("created");
+        let id = inner.settings.active_workspace.clone();
+        let path = dir.join(".bos").join("workspace.toml");
+
+        let runtime = crate::settings::WorkspaceRuntime {
+            model: "glm-4.8".to_string(),
+            ..Default::default()
+        };
+        rewrite_workspace(&mut inner, &id, &runtime, |w| {
+            w.disabled_tools = vec!["bash".to_string()];
+        })
+        .expect("rewritten");
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(
+            text.contains("glm-4.8"),
+            "the folder's copy carries the edit: {text}"
+        );
+        assert!(text.contains("\"bash\""), "including the deny-list: {text}");
+
+        // Now make the folder refuse. The whole edit must be undone — the model
+        // included, because it is set before the write and the backup is taken
+        // before that: a restore that ran after the runtime was applied would
+        // leave the app holding a model the folder never took.
+        std::fs::remove_dir_all(dir.join(".bos")).expect("remove the folder");
+        std::fs::write(dir.join(".bos"), b"not a directory").expect("block it");
+        let before = inner.settings.workspaces.clone();
+        let runtime = crate::settings::WorkspaceRuntime {
+            model: "glm-4.9".to_string(),
+            ..Default::default()
+        };
+        let err = rewrite_workspace(&mut inner, &id, &runtime, |w| {
+            w.name = "renamed".to_string();
+        })
+        .expect_err("refused");
+        assert!(err.contains(".bos"), "{err}");
+        assert_eq!(
+            inner.settings.workspaces, before,
+            "a refused write leaves the record exactly as it was"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

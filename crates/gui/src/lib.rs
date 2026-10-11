@@ -35,6 +35,7 @@ mod skills;
 #[cfg(test)]
 mod verify;
 mod webtools;
+mod workspace_dir;
 
 /// Launch the GUI (opens the Tauri window and blocks until quit).
 pub fn run() -> anyhow::Result<()> {

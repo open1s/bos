@@ -154,6 +154,16 @@
     "ws.active": { en: "Active workspace", zh: "当前工作区" },
     "ws.add": { en: "New workspace", zh: "新建工作区" },
     "ws.add.root": { en: "Choose a root folder for this workspace", zh: "为该工作区选择根目录" },
+    // The folder is no longer a passive choice: adding a workspace creates a
+    // `.bos` folder in it, and the dialog says so before the folder is picked.
+    "ws.add.desc": {
+      en: "A workspace is a folder plus the things that may run in it.",
+      zh: "工作区就是一个文件夹，加上允许在其中运行的东西。",
+    },
+    "ws.add.bos": {
+      en: "The folder gets a .bos folder for this workspace's settings — like .vscode for a project.",
+      zh: "该文件夹会得到一个 .bos 文件夹，用于存放此工作区的设置——就像项目里的 .vscode。",
+    },
     "ws.add.browseHint": { en: "Listing folders from this app instead.", zh: "改为在本应用内浏览文件夹。" },
     "ws.add.noPicker": { en: "The system folder panel is unavailable", zh: "系统文件夹面板不可用" },
     "ws.add.noMcp": { en: "No MCP servers are configured yet", zh: "尚未配置 MCP 服务器" },

@@ -702,6 +702,13 @@ impl Settings {
         } else {
             w.root.clone()
         };
+        // A workspace built from a preset lives in a folder like any other, so it
+        // gets its own `.bos` before it is recorded anywhere. The root is the one
+        // thing this door has never validated — a preset keeps a copy of the
+        // workspace it was saved from, and a folder that has since moved still
+        // applies — which is why a root that is not there is skipped rather than
+        // refused; a folder that *is* there but will not take the file is a refusal.
+        crate::workspace_dir::write_for(&w)?;
         self.workspaces.push(w);
         self.active_workspace = new_id.clone();
         Ok(new_id)
@@ -803,6 +810,24 @@ impl Settings {
 }
 
 impl Settings {
+    /// Fold each workspace's own configuration over the registry's copy.
+    ///
+    /// The folder is the source of truth for the workspace rooted in it: a
+    /// `.bos/workspace.toml` that carries a field replaces what
+    /// `~/.bos/gui/settings.toml` had for it, and every field the file leaves
+    /// out — the identity, the api key, the MCP entries — keeps what the registry
+    /// had (§24.15). Answers how many files were applied, which is what a test
+    /// asserts on rather than "the load did not panic".
+    pub(crate) fn adopt_workspace_dirs(&mut self) -> usize {
+        let mut applied = 0;
+        for w in &mut self.workspaces {
+            if crate::workspace_dir::load_for(w) {
+                applied += 1;
+            }
+        }
+        applied
+    }
+
     /// Every workspace paired with the memory file it resolves to, in workspace
     /// order. Two entries sharing a path means they share a store — which is
     /// what the default is, and what the pane has to be able to say.
@@ -997,6 +1022,11 @@ impl Settings {
     }
 
     /// Load from an explicit path (used by tests); fall back to discovered config.
+    ///
+    /// Migration runs first and the workspaces' own `.bos/workspace.toml` files
+    /// run second ([Self::adopt_workspace_dirs]), so a root that carries its own
+    /// configuration is already a workspace by the time it is folded in, and the
+    /// environment overrides still land on top of both (§24.15).
     pub(crate) fn load_from(path: &Path) -> Self {
         if let Ok(text) = fs::read_to_string(path) {
             if let Ok(mut settings) = toml::from_str::<Settings>(&text) {
@@ -1004,11 +1034,13 @@ impl Settings {
                     settings.merge_discovered_config();
                 }
                 settings.migrate();
+                settings.adopt_workspace_dirs();
                 return settings.with_env_overrides();
             }
         }
         let mut settings = Self::from_config_value(&discover_config());
         settings.migrate();
+        settings.adopt_workspace_dirs();
         settings.with_env_overrides()
     }
 
@@ -1515,6 +1547,60 @@ mod tests {
         assert!((loaded.temperature - 0.2).abs() < f32::EPSILON);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn loading_folds_a_workspaces_own_bos_file_over_the_registry() {
+        let path = tmp_path("ws-bos");
+        let _ = fs::remove_file(&path);
+        let root = std::env::temp_dir().join(format!("bos-gui-ws-bos-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".bos")).expect("the folder");
+        fs::write(
+            root.join(".bos/workspace.toml"),
+            "model = \"folder/model\"\nbash_enabled = false\n",
+        )
+        .expect("the file");
+
+        // The workspace with the folder is deliberately **not** the active one:
+        // the `BOS_*` environment overrides reach the active workspace, and a test
+        // that cannot tell the file from an override is a test of neither.
+        let mut settings = Settings::from_config_value(&serde_json::Value::Null);
+        settings.migrate();
+        let mut other = settings.workspaces[0].clone();
+        other.id = "second".to_string();
+        other.root = root.to_string_lossy().into_owned();
+        other.model = "registry/model".to_string();
+        other.api_key = "sk-registry".to_string();
+        other.bash_enabled = true;
+        settings.workspaces.push(other);
+        settings.save_to(&path).expect("save");
+
+        let loaded = Settings::load_from(&path);
+        let w = loaded
+            .workspaces
+            .iter()
+            .find(|w| w.id == "second")
+            .expect("the stored workspace");
+        assert_eq!(w.model, "folder/model", "the folder is the source of truth");
+        assert!(!w.bash_enabled, "for the switches too");
+        assert_eq!(
+            w.api_key, "sk-registry",
+            "and a key the file has no room for stays put"
+        );
+        assert_eq!(
+            w.root,
+            root.to_string_lossy(),
+            "identity travels neither way"
+        );
+        assert_eq!(
+            loaded.workspaces.len(),
+            2,
+            "reading a folder's file never adds a workspace"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

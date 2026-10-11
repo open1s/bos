@@ -288,6 +288,21 @@ for key in $(grep -oE 'data-i18n(-placeholder|-aria|-title)?="[^"]+"' $HTML \
 done
 [ "$missing" = 0 ] && ok || bad "$missing translation mark(s) have no string in polish.js"
 
+# The Add-workspace dialog tells the user what creating a workspace does to the
+# folder they are about to pick, and that sentence is a claim about code no guard
+# on this page can see — the Rust side writes `.bos` into it. The claim it
+# replaced ("Nothing is changed in the folder itself") was false from the day
+# creation started writing there, and nothing caught it; so the claim that replaced
+# it is checked as the sentence a reader actually gets, not as a key.
+bos_claim=$(python3 - "$PWD/$HTML" <<'PYEOF'
+import re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r'<p[^>]*data-i18n="ws.add.bos"[^>]*>(.*?)</p>', html, re.S)
+print("" if (m and ".bos" in m.group(1)) else "missing")
+PYEOF
+)
+[ -z "$bos_claim" ] && ok || bad "the creation dialog must say the folder gets its own .bos configuration"
+
 # No id may appear twice: a duplicate was actually shipped (the static drawer
 # button and the shell's injected rail button both claimed sidebar-toggle).
 dupes=$(grep -oE ' id="[^"]+"' $HTML | sed 's/.*="//; s/"//' | sort | uniq -d | tr '\n' ' ')

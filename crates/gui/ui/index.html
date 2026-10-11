@@ -625,9 +625,8 @@
        aria-modal="true" aria-labelledby="ws-add-title">
     <div class="modal-card ws-add-card">
       <h2 id="ws-add-title">Add a workspace</h2>
-      <p class="ws-add-desc">
-        A workspace is a folder plus the things that may run in it. Nothing is
-        changed in the folder itself.
+      <p class="ws-add-desc" data-i18n="ws.add.desc">
+        A workspace is a folder plus the things that may run in it.
       </p>
 
       <label class="ws-add-label" for="ws-add-name">Name</label>
@@ -643,6 +642,9 @@
         <button type="button" id="ws-add-browse-manual" class="btn btn-ghost"
                 aria-expanded="false" aria-controls="ws-add-browser">Browse in-app</button>
       </div>
+      <p class="ws-add-desc" data-i18n="ws.add.bos">
+        The folder gets a .bos folder for this workspace's settings — like .vscode for a project.
+      </p>
       <div id="ws-add-browser" class="ws-browse hidden" role="group" aria-label="Folders">
         <div class="ws-browse-head">
           <button type="button" id="ws-browse-up" class="btn btn-ghost" aria-label="Go to the parent folder">↑</button>
