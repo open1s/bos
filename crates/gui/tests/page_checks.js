@@ -370,14 +370,17 @@
 
     const tabLabel = () => d.getElementById("tab-chat").textContent.trim();
     const shippedTab = tabLabel();
-    const navSpan = d.querySelector("#nav-plugins [data-i18n]");
+    // A mark in the sidebar's own Workspaces header: the shipped chrome, not a
+    // fixture copy, and one that survives the sidebar being the conversation
+    // list plus workspaces and nothing else.
+    const navSpan = d.querySelector("#side-workspaces [data-i18n]");
     if (polish) polish.setLang("zh");
     const zhTab = tabLabel();
     const zhNav = navSpan ? navSpan.textContent.trim() : "";
     assert(
       `choosing 中文 translates the chrome (${shippedTab}→${zhTab}, nav=${zhNav})`,
       zhTab === "对话" &&
-        zhNav === "插件与技能" &&
+        zhNav === "工作区" &&
         /发送消息/.test(d.getElementById("input").placeholder) &&
         /^zh/i.test(d.documentElement.lang),
     );
@@ -756,6 +759,10 @@
         max_name_chars: 128,
         max_description_chars: 1024,
       },
+      choose_folder: () => {
+        if (pickerFails.value) throw new Error("no folder dialog here: osascript is not installed");
+        return pickerChoice.value;
+      },
       list_folder: (args) => ({
         path: args.path || "/home/e2e",
         parent: "/home",
@@ -927,6 +934,11 @@
       compact_now: { session_id: "e2e", title: "t", messages: 4, live_messages: 0, archived_messages: 4, estimated_tokens: 10, budget_tokens: 8192, over_budget: false, can_compact: false, compacting: false, refusal: null },
       restore_compacted: 4,
     };
+    // The system panel is a modal and no guard can drive one, so what is checked
+    // here is what this app decides around it: the picked path lands, a dismissal
+    // changes nothing, and an absent panel reveals the fallback with the reason.
+    const pickerChoice = { value: "/home/e2e/Documents" };
+    const pickerFails = { value: false };
     d.defaultView.__TAURI__.core.invoke = (cmd, args) => {
       calls.push({ cmd, args: args || {} });
       const answer = fixtures[cmd];
@@ -1484,7 +1496,7 @@
       { id: "s3", title: "archived chat", updated_at: 100, workspace: "w1", pinned: false, archived: true },
       { id: "s4", title: "elsewhere", updated_at: 150, workspace: "w2", pinned: false, archived: false },
     ];
-    state.showArchived = false;
+    state.view.filter = "hide";
     renderSidebar();
     const rows = () => [...d.querySelectorAll("#session-list .session-row")];
     const rowOf = (id) => d.querySelector(`#session-list .session-row[data-id="${id}"]`);
@@ -1501,7 +1513,7 @@
         rowOf("s1").querySelector(".sess-pin").getAttribute("aria-pressed") === "true" &&
         rowOf("s2").querySelector(".sess-pin").getAttribute("aria-pressed") === "false" &&
         !rowOf("s3") &&
-        /Archived \(1\)/.test(d.getElementById("session-list").textContent),
+        state.view.filter === "hide",
     );
 
     const beforeMenu = calls.length;
@@ -1537,6 +1549,139 @@
         rowOf("s2").querySelector(".sess-menu").getAttribute("aria-expanded") === "false",
     );
     const menuNow = () => d.querySelector(".row-menu");
+    // The head's sliders: one menu for how the list is drawn, and the only
+    // writer of that state — so every mode is entered through its own item, the
+    // way a person does, rather than by setting the state the menu sets.
+    const viewBtn = d.getElementById("session-view");
+    const viewItems = () => [...d.querySelectorAll(".row-menu .row-menu-item")];
+    // Every mode is entered through a named step: a mode that cannot be reached
+    // must say *which* one it was, not just "undefined is not a function".
+    const step = (name, fn) => {
+      try {
+        return fn();
+      } catch (e) {
+        throw new Error(`${name}: ${e && e.message}`);
+      }
+    };
+    const pickView = (name) =>
+      step(name, () => {
+        const item = viewItems().find((b) => new RegExp(`^${name}`).test(b.textContent));
+        if (!item) throw new Error(`no ${name} item among [${viewItems().map((b) => b.dataset.run).join(",")}]`);
+        item.click();
+      });
+    const viewItem = (re) => viewItems().find((b) => re.test(b.textContent));
+    viewBtn.click();
+    assert(
+      `the head's sliders opens a radio menu of the three choices (${viewItems()
+        .map((b) => b.dataset.run)
+        .join(" / ")})`,
+      !!menuNow() &&
+        viewItems().length === 9 &&
+        viewItems()
+          .slice(0, 8)
+          .every((b) => b.getAttribute("role") === "menuitemradio") &&
+        viewItems()[8].getAttribute("role") === "menuitem" &&
+        viewItems()
+          .filter((b) => b.getAttribute("aria-checked") === "true")
+          .map((b) => b.dataset.run)
+          .join(",") === "group:tree,order:updated,filter:hide" &&
+        [...d.querySelectorAll(".row-menu .row-menu-head")].map((h) => h.textContent).join(",") ===
+          "Group by,Order by,Filter sessions,Chats" &&
+        viewBtn.getAttribute("aria-expanded") === "true",
+    );
+    assert(
+      `the menu counts the archived chats and ticks the choice that hides them (${viewItem(/^Hide archived/).textContent.trim()})`,
+      /Hide archived \(1\)/.test(viewItem(/^Hide archived/).textContent) &&
+        /Archived only \(1\)/.test(viewItem(/^Archived only/).textContent) &&
+        /^Reload chats/.test(viewItems()[8].textContent),
+    );
+    // "In one list" is the mode with no workspace rows, so the row has to carry
+    // the workspace itself — otherwise the choice would drop a fact.
+    pickView("In one list");
+    assert(
+      `"In one list" drops the workspace rows and names each row's workspace (${rows()
+        .map((r) => r.dataset.id)
+        .join(",")} / ${[...d.querySelectorAll("#session-list .sess-ws-chip")]
+        .map((c) => c.textContent)
+        .join(",")})`,
+      !d.querySelector("#session-list .ws-head") &&
+        rows()
+          .map((r) => r.dataset.id)
+          .join(",") === "s1,s2,s4" &&
+        [...d.querySelectorAll("#session-list .sess-ws-chip")].map((c) => c.textContent).join(",") ===
+          "bos,bos,trino" &&
+        viewItem(/^In one list/).getAttribute("aria-checked") === "true" &&
+        !!menuNow(),
+    );
+    // "WorkSpace" keeps every workspace as a row and opens only the active one.
+    pickView("WorkSpace");
+    assert(
+      `"WorkSpace" keeps a row per workspace and opens only the active one (heads=${d.querySelectorAll(
+        "#session-list .ws-head",
+      ).length}, folds=${d.querySelectorAll("#session-list .ws-fold").length}, rows=${rows()
+        .map((r) => r.dataset.id)
+        .join(",")})`,
+      d.querySelectorAll("#session-list .ws-head").length === 2 &&
+        d.querySelectorAll("#session-list .ws-fold").length === 1 &&
+        rows()
+          .map((r) => r.dataset.id)
+          .join(",") === "s1,s2",
+    );
+    // A fixture whose array order is *not* its recency order, because "Manual"
+    // and "Last updated" would otherwise be indistinguishable — and one that can
+    // tell them apart is the only one that tests either.
+    const restoreView = state.sessions;
+    state.sessions = [
+      { id: "o1", title: "older", updated_at: 50, workspace: "w1", pinned: false, archived: false },
+      { id: "o2", title: "newer", updated_at: 900, workspace: "w1", pinned: false, archived: false },
+    ];
+    state.view = { group: "tree", order: "updated", filter: "hide" };
+    renderSidebar();
+    const drawn = () => rows().map((r) => r.dataset.id).join(",");
+    const freshest = drawn();
+    // The menu is still open from the pick above — and that is a promise of its
+    // own: the three choices are usually set together, so a pick leaves it up.
+    pickView("Manual");
+    assert(
+      `"Manual" keeps the store's order where "Last updated" reorders (updated=${freshest}, manual=${drawn()})`,
+      freshest === "o2,o1" && drawn() === "o1,o2",
+    );
+    // The filter is the archive's only door now, in all three of its states.
+    state.sessions = restoreView;
+    state.view = { group: "tree", order: "updated", filter: "hide" };
+    renderSidebar();
+    pickView("All conversations");
+    assert(
+      `"All conversations" puts an archived chat back among its own workspace's (${drawn()} / heads=${
+        d.querySelectorAll("#session-list .ws-head").length
+      })`,
+      drawn() === "s1,s2,s3,s4" &&
+        !!rowOf("s3").classList.contains("archived-row") &&
+        !!rowOf("s3").querySelector(".sess-restore") &&
+        d.querySelectorAll("#session-list .ws-head").length === 2,
+    );
+    pickView("Archived only");
+    assert(
+      `"Archived only" lists the archive alone, with no group for a workspace that has nothing archived (${drawn()} / heads=${
+        d.querySelectorAll("#session-list .ws-head").length
+      })`,
+      drawn() === "s3" && d.querySelectorAll("#session-list .ws-head").length === 1,
+    );
+    assert(
+      `the choice is written down as one blob the next run reads back (${localStorage.getItem(
+        "bos.sessionView",
+      )})`,
+      JSON.parse(localStorage.getItem("bos.sessionView")).filter === "archived" &&
+        parseViewBlob({ group: "nope", order: "manual" }).group === "tree" &&
+        parseViewBlob({ group: "nope", order: "manual" }).order === "manual" &&
+        parseViewBlob(null).filter === "hide" &&
+        parseViewBlob("garbage").group === "tree",
+    );
+    closeRowMenu(false);
+    localStorage.removeItem("bos.sessionView");
+    state.sessions = restoreView;
+    state.view = { group: "tree", order: "updated", filter: "hide" };
+    renderSidebar();
     // Every entry is reached through a helper that reopens the menu and reports
     // what it found, so a missing menu fails *this* check instead of throwing
     // and taking every check after it with it.
@@ -1599,10 +1744,12 @@
       `Escape leaves the name alone (fields=${rowOf("s2").querySelectorAll(".sess-rename").length})`,
       called("rename_session").length === 1 && !rowOf("s2").querySelector(".sess-rename"),
     );
-    // A row menu opened from the archive list carries the same entries, and the
+    // A row menu opened from an archived row carries the same entries, and the
     // archived chat's own entry offers to put it back rather than to archive it.
-    const archivedToggle = d.querySelector("#session-list .archived-toggle");
-    if (archivedToggle) archivedToggle.click();
+    // The filter the view menu sets is what puts that row in the list: there is
+    // no second disclosure writing the same choice.
+    state.view.filter = "all";
+    renderSidebar();
     const archivedRow = rowOf("s3");
     if (archivedRow && archivedRow.querySelector(".sess-menu")) {
       archivedRow.querySelector(".sess-menu").click();
@@ -1612,8 +1759,7 @@
       `an archived chat's menu offers Restore instead of Archive (rows=${rows()
         .map((r) => r.dataset.id)
         .join(",")}, items=${archivedItems.map((i) => i.textContent.trim()).join(" / ")})`,
-      !!archivedToggle &&
-        !!archivedRow &&
+      !!archivedRow &&
         archivedItems.length === 5 &&
         /Restore session/.test(archivedItems[3].textContent) &&
         archivedRow.querySelector(".sess-restore") !== null,
@@ -1690,7 +1836,7 @@
     state.workspaces = restoreSidebar.workspaces;
     state.activeWorkspace = restoreSidebar.activeWorkspace;
     state.activeId = restoreSidebar.activeId;
-    state.showArchived = false;
+    state.view.filter = "hide";
     renderSidebar();
 
     // Adding a workspace — its own flow, on the real markup. It is checked here
@@ -1712,7 +1858,7 @@
       { id: "w2", name: "trino", root: "/tmp/trino", model: "" },
     ];
     state.activeWorkspace = "w1";
-    const addOpener = d.getElementById("workspace-add");
+    const addOpener = d.getElementById("workspace-add-primary");
     const settingsReads = called("get_settings").length;
     const capsReads = called("list_capabilities").length;
     state.error = "";
@@ -1720,7 +1866,7 @@
     addOpener.click();
     await flush();
     assert(
-      `the Workspaces folder-plus opens Add-workspace and leaves Settings shut (${d.getElementById("settings-modal").className.trim()}, ${called("get_settings").length - settingsReads} settings reads)`,
+      `the sidebar's folder-plus opens Add-workspace and leaves Settings shut (${d.getElementById("settings-modal").className.trim()}, ${called("get_settings").length - settingsReads} settings reads)`,
       !addModal.classList.contains("hidden") &&
         d.getElementById("settings-modal").classList.contains("hidden") &&
         called("get_settings").length === settingsReads,
@@ -1740,14 +1886,70 @@
         d.querySelectorAll(".ws-add-plugin-on").length === 0 &&
         d.getElementById("ws-add-plugins").textContent.includes("No plugins"),
     );
-    // The chooser: it starts at home when no path is named, each row descends,
-    // and "Use this folder" is what writes the resolved path into the field.
+    // The panel is the door the user expects: "Choose folder…" asks the backend
+    // for the system dialog and adopts the path it returns. The in-app browser is
+    // not opened at all — it is the fallback, not a second way of doing this.
+    d.getElementById("ws-add-root").value = "/home/e2e";
     d.getElementById("ws-add-browse").click();
     await flush();
     assert(
-      `Choose folder… asks for the home folder with no path (${JSON.stringify(lastArgs("list_folder"))})`,
-      called("list_folder").length === 1 &&
-        lastArgs("list_folder").path === null &&
+      `Choose folder… asks the system panel for a folder, starting where the field points (${JSON.stringify(lastArgs("choose_folder"))})`,
+      called("choose_folder").length === 1 &&
+        lastArgs("choose_folder").start === "/home/e2e" &&
+        d.getElementById("ws-add-root").value === "/home/e2e/Documents" &&
+        d.getElementById("ws-add-browser").classList.contains("hidden") &&
+        d.getElementById("ws-add-name").value === "Documents",
+    );
+    // Dismissing the panel is a decision: the field keeps what it had, and no
+    // error is written for it.
+    pickerChoice.value = null;
+    d.getElementById("ws-add-root").value = "/home/e2e";
+    d.getElementById("ws-add-browse").click();
+    await flush();
+    assert(
+      `dismissing the panel changes nothing and is not reported as a failure (${d.getElementById("ws-add-root").value} / ${d.getElementById("ws-add-err").textContent})`,
+      called("choose_folder").length === 2 &&
+        d.getElementById("ws-add-root").value === "/home/e2e" &&
+        d.getElementById("ws-add-err").textContent === "",
+    );
+    // A machine with no panel: the fallback opens with the reason, and the field
+    // is not left dead — this is the path that reveals the browser from a click.
+    pickerChoice.value = "/home/e2e/Documents";
+    pickerFails.value = true;
+    d.getElementById("ws-add-browse").click();
+    await flush();
+    assert(
+      `a system panel that is not there opens the in-app browser and says why (${d.getElementById("ws-add-browse-hint").textContent})`,
+      !d.getElementById("ws-add-browser").classList.contains("hidden") &&
+        d.getElementById("ws-add-browse-manual").getAttribute("aria-expanded") === "true" &&
+        d.getElementById("ws-add-browse-hint").textContent.includes("osascript is not installed") &&
+        called("list_folder").length === 1 &&
+        lastArgs("list_folder").path === "/home/e2e",
+    );
+    // The panel is available again, and its path closes the fallback that was
+    // open a moment ago: the two doors end in one function, so landing a path
+    // cannot leave the other door's list sitting open behind it. This check needs
+    // the browser *open* to mean anything — with it shut, "still hidden" would be
+    // true however the code behaved.
+    pickerFails.value = false;
+    d.getElementById("ws-add-root").value = "/home/e2e";
+    d.getElementById("ws-add-browse").click();
+    await flush();
+    assert(
+      `a path from the panel closes the fallback that was open (browser ${d.getElementById("ws-add-browser").className.trim()}, root ${d.getElementById("ws-add-root").value})`,
+      d.getElementById("ws-add-root").value === "/home/e2e/Documents" &&
+        d.getElementById("ws-add-browser").classList.contains("hidden") &&
+        d.getElementById("ws-add-browse-manual").getAttribute("aria-expanded") === "false",
+    );
+    // The browser itself: "Browse in-app" opens it at the field's folder, each row
+    // descends, and "Use this folder" writes the resolved path.
+    d.getElementById("ws-add-root").value = "/home/e2e";
+    d.getElementById("ws-add-browse-manual").click();
+    await flush();
+    assert(
+      `Browse in-app opens the listing at the field's folder (${JSON.stringify(lastArgs("list_folder"))})`,
+      called("list_folder").length === 2 &&
+        lastArgs("list_folder").path === "/home/e2e" &&
         d.getElementById("ws-browse-path").textContent === "/home/e2e" &&
         [...d.querySelectorAll("#ws-browse-list .ws-browse-row")].map((r) => r.textContent).join(",") ===
           "bos,Documents",
@@ -1817,19 +2019,34 @@
       `Escape closes Add-workspace and returns focus to its opener (${d.activeElement && d.activeElement.id})`,
       addModal.classList.contains("hidden") && d.activeElement === addOpener,
     );
-    // The sidebar's own "+ New workspace" opens the same dialog: one flow, not a
-    // second inline form that would drift from it.
+    // The row that used to sit under the list ("+ New workspace") is gone, and
+    // the header's folder-plus above is the whole of the door: the check is that
+    // nothing was left behind, driven by rendering rather than by reading. It is
+    // not vacuous — the same assertion is what reddens when the row comes back.
     state.wsEdit = null;
     renderSidebar();
-    d.querySelector("#session-list .ws-add").click();
-    await flush();
     assert(
-      `+ New workspace opens the same Add-workspace dialog and no inline form (${!!d.querySelector("#session-list .ws-form")})`,
-      !addModal.classList.contains("hidden") && !d.querySelector("#session-list .ws-form"),
+      `the sidebar draws no add row of its own (rows=${d.querySelectorAll("#session-list .ws-add").length}, presets=${d.querySelectorAll("#session-list .ws-preset-row").length}, text=${/New workspace/.test(d.getElementById("session-list").textContent)})`,
+      !d.querySelector("#session-list .ws-add") &&
+        !d.querySelector("#session-list .ws-form") &&
+        !/New workspace/.test(d.getElementById("session-list").textContent),
     );
-    closeAddWorkspace();
     state.wsEdit = null;
     renderSidebar();
+    // The active-workspace dot is an element, not a `::before`: a status drawn
+    // only by CSS cannot be asserted on, and it cannot be announced either.
+    const heads = Array.from(d.querySelectorAll("#session-list .ws-head"));
+    const activeHeads = heads.filter((h) => h.classList.contains("active"));
+    const dotted = heads.filter((h) => h.querySelector(".ws-dot"));
+    assert(
+      `exactly the active workspace's header carries the dot and aria-current (${heads.length} headers, ${activeHeads.length} active, ${dotted.length} dotted)`,
+      heads.length >= 2 &&
+        activeHeads.length === 1 &&
+        dotted.length === 1 &&
+        dotted[0] === activeHeads[0] &&
+        activeHeads[0].getAttribute("aria-current") === "true" &&
+        heads.filter((h) => h.getAttribute("aria-current")).length === 1,
+    );
 
     const restoreSession = state.activeId;
     state.activeId = "e2e";

@@ -715,7 +715,10 @@
         LIVE.lastArgs("list_capabilities").session === chatA,
     );
 
-    d.getElementById("new-chat").click();
+    // A chat starts from the keyboard now that the sidebar's prominent action
+    // adds a workspace (rev 111); this is the shortcut the workspace row's "+"
+    // advertises, so it is the gesture a user without the button would use.
+    d.dispatchEvent(new KeyboardEvent("keydown", { key: "n", metaKey: true }));
     await waitFor(
       () => state.activeId !== chatA && !!skillToggle("pr-review"),
       "a new chat to open",
@@ -762,7 +765,7 @@
     );
 
     /* ---- M8: what the MCP servers publish ---- */
-    d.getElementById("nav-mcp").click();
+    openPane("set-mcp");
     await settle();
     const catHeads = () =>
       [...d.querySelectorAll("#mcp-catalog .cat-head")].map((head) => head.textContent);
@@ -1281,8 +1284,62 @@
       `settings: the model round-trips through the store (model=${setModel.value})`,
       setModel.value === "glm-4.7",
     );
-    d.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    await waitFor(() => modal.classList.contains("hidden"), "settings to close");
+    // The web tools fields ride the same save: endpoint and key round-trip,
+    // and the switch goes off and back on.
+    const setWebTools = d.getElementById("set-web-tools");
+    const setSearchUrl = d.getElementById("set-search-url");
+    const setSearchKey = d.getElementById("set-search-key");
+    assert(
+      `settings: the web tools fields read live values (url=${setSearchUrl.value}, on=${setWebTools.checked})`,
+      setWebTools.checked === true && setSearchUrl.value === "" && setSearchKey.value === "",
+    );
+    setSearchUrl.value = "https://api.tavily.com/search";
+    setSearchKey.value = "tvly-live";
+    d.getElementById("settings-form").dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await waitFor(() => modal.classList.contains("hidden"), "the web settings to save");
+    assert(
+      `settings: the search endpoint and key cross the bridge (args=${
+        JSON.stringify(LIVE.lastArgs("save_settings")).slice(0, 44)})`,
+      LIVE.lastArgs("save_settings").searchApiUrl === "https://api.tavily.com/search" &&
+        LIVE.lastArgs("save_settings").searchApiKey === "tvly-live",
+    );
+    d.getElementById("open-settings").click();
+    await waitFor(() => !modal.classList.contains("hidden") && setModel.value !== "",
+      "settings to reload for web tools");
+    assert(
+      `settings: the search endpoint and key round-trip (url=${setSearchUrl.value})`,
+      setSearchUrl.value === "https://api.tavily.com/search" &&
+        setSearchKey.value === "tvly-live",
+    );
+    setWebTools.checked = false;
+    d.getElementById("settings-form").dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await waitFor(() => modal.classList.contains("hidden"), "the switch-off to save");
+    d.getElementById("open-settings").click();
+    await waitFor(() => !modal.classList.contains("hidden") && setModel.value !== "",
+      "settings to reload again");
+    assert(
+      "settings: switching the web tools off survives the round-trip",
+      setWebTools.checked === false,
+    );
+    setWebTools.checked = true;
+    d.getElementById("settings-form").dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await waitFor(() => modal.classList.contains("hidden"), "the switch-on to save");
+    // Restore the seeded shape: empty endpoint, tools on.
+    d.getElementById("open-settings").click();
+    await waitFor(() => !modal.classList.contains("hidden") && setModel.value !== "",
+      "settings to reload a third time");
+    setSearchUrl.value = "";
+    setSearchKey.value = "";
+    d.getElementById("settings-form").dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await waitFor(() => modal.classList.contains("hidden"), "settings to close clean");
 
     /* ---- trash: delete, see it named in settings, restore -------------- */
     window.confirm = () => true;
@@ -1335,6 +1392,55 @@
     );
     searchBox.value = "";
     searchBox.dispatchEvent(new Event("input", { bubbles: true }));
+
+    /* ---- the Files section walks the workspace, and opens what it finds - */
+    // The tree moved from the sidebar into the Settings rail (rev 110), and this
+    // is the only guard that sees the whole loop: select the section, expand a
+    // folder (a listing keyed by path, so the root's rows cannot pass for the
+    // folder's), then open a file into the document panel.
+    openPane("files-section");
+    await waitFor(
+      () => d.querySelectorAll("#file-tree .file-row").length === 2,
+      "the workspace root to list",
+    );
+    const treeRows = () => [...d.querySelectorAll("#file-tree .file-row")];
+    const rowNames = () =>
+      treeRows().map((row) => row.querySelector(".file-name").textContent);
+    assert(
+      `Files: selecting the section lists the workspace root (${rowNames().join(
+        " | ",
+      )} asked=${JSON.stringify(LIVE.lastArgs("list_files"))})`,
+      rowNames().join(" | ") === "src | README.md" &&
+        LIVE.lastArgs("list_files").path === "" &&
+        /21 B/.test(treeRows()[1].textContent),
+    );
+    treeRows()[0].click();
+    await waitFor(
+      () => d.querySelectorAll("#file-tree .file-row").length === 3,
+      "the folder to expand",
+    );
+    assert(
+      `Files: expanding a folder asks for that folder (${rowNames().join(
+        " | ",
+      )} asked=${JSON.stringify(LIVE.lastArgs("list_files"))})`,
+      rowNames().join(" | ") === "src | main.rs | README.md" &&
+        LIVE.lastArgs("list_files").path === "src" &&
+        // Depth is what says `main.rs` is inside `src` rather than beside it.
+        parseFloat(treeRows()[1].style.paddingLeft) >
+          parseFloat(treeRows()[0].style.paddingLeft),
+    );
+    treeRows()[1].click();
+    await waitFor(
+      () => /fn main/.test(d.getElementById("doc-body").textContent),
+      "the file to open in the document panel",
+    );
+    assert(
+      `Files: opening a file fills the document panel (${
+        d.getElementById("doc-path").textContent
+      })`,
+      LIVE.lastArgs("read_file").path === "src/main.rs" &&
+        d.getElementById("doc-path").textContent === "src/main.rs",
+    );
 
     /* ---- a finished turn renders the store's text, not the draft ------- */
     // The stream wrote one reply; the store holds another. After the turn ends
@@ -1614,29 +1720,38 @@
           !!rowByTitle(renamed),
       );
 
-      // Archive the open chat: it leaves the list, the disclosure counts it, and
-      // restoring puts it back with the name it had.
+      // Archive the open chat: it leaves the list, the head's menu counts it, and
+      // restoring — through the filter that menu sets — puts it back with the
+      // name it had.
       d.dispatchEvent(new KeyboardEvent("keydown", { key: "a", metaKey: true, shiftKey: true, bubbles: true }));
       await waitFor(
         () => LIVE.called("set_session_archived").length === 1,
         "the archive to reach the backend",
       );
-      await waitFor(
-        () => !!d.querySelector("#session-list .archived-toggle"),
-        "the archive disclosure to appear",
-      );
-      const disclosure = d.querySelector("#session-list .archived-toggle");
+      await waitFor(() => !rowByTitle(renamed), "the chat to leave the list");
+      d.getElementById("session-view").click();
+      await waitFor(() => !!d.querySelector(".row-menu"), "the view menu to open");
+      const viewItems = () => [...d.querySelectorAll(".row-menu .row-menu-item")];
+      const hideItem = viewItems().find((b) => /^Hide archived/.test(b.textContent));
       assert(
-        `M9: archiving hides the chat from the list and counts it (${disclosure.textContent.trim()})`,
-        !rowByTitle(renamed) &&
-          /Archived \(1\)/.test(disclosure.textContent) &&
+        `M9: archiving hides the chat and the view menu counts it (${hideItem && hideItem.textContent.trim()})`,
+        !!hideItem &&
+          /Hide archived \(1\)/.test(hideItem.textContent) &&
+          hideItem.getAttribute("aria-checked") === "true" &&
           LIVE.lastArgs("set_session_archived").id === openId &&
           LIVE.lastArgs("set_session_archived").archived === true &&
           state.activeId !== openId,
       );
-      disclosure.click();
+      // "All conversations" is the way back to an archived chat now: the row it
+      // reveals is the same choice read back, not a second disclosure's state.
+      const allItem = viewItems().find((b) => /^All conversations/.test(b.textContent));
+      allItem.click();
+      await waitFor(
+        () => !!d.querySelector(`#session-list .session-row.archived-row[data-id="${openId}"]`),
+        "the archived row to appear",
+      );
       const back = d.querySelector(`#session-list .session-row.archived-row[data-id="${openId}"]`);
-      if (back) back.querySelector(".sess-restore").click();
+      back.querySelector(".sess-restore").click();
       await waitFor(
         () => LIVE.called("set_session_archived").length === 2,
         "the restore to reach the backend",
@@ -1754,6 +1869,34 @@
       );
     }
 
+    /* ---- the sidebar's prominent action adds a workspace --------------- */
+    // It opened a chat before rev 111. This drives the button the sidebar leads
+    // with and asserts the dialog the other door opens is the one that appears —
+    // the folder-plus below drives it again for the creation flow itself.
+    {
+      const before = LIVE.settings().workspaces.length;
+      closeSettings();
+      closeAddWorkspace();
+      await sleep(20);
+      d.getElementById("workspace-add-primary").click();
+      await sleep(60);
+      assert(
+        `M9: the sidebar leads with Add-workspace (${d
+          .getElementById("workspace-add-primary")
+          .getAttribute("aria-label")} → ${d.getElementById("ws-add").className.trim()})`,
+        !d.getElementById("ws-add").classList.contains("hidden") &&
+          d.getElementById("settings-modal").classList.contains("hidden") &&
+          d.getElementById("ws-add-name").value === "",
+      );
+      closeAddWorkspace();
+      await sleep(20);
+      assert(
+        `M9: dismissing it adds no workspace (${before} → ${LIVE.settings().workspaces.length})`,
+        d.getElementById("ws-add").classList.contains("hidden") &&
+          LIVE.settings().workspaces.length === before,
+      );
+    }
+
     /* ---- adding a workspace, end to end --------------------------------- */
     // The one flow that creates a workspace: a folder chosen with the app's own
     // browser, the MCP switches for that workspace, and one call that carries
@@ -1766,11 +1909,11 @@
       closeSettings();
       closeAddWorkspace();
       await sleep(20);
-      d.getElementById("workspace-add").click();
+      d.getElementById("workspace-add-primary").click();
       await sleep(60);
       const modal = d.getElementById("ws-add");
       assert(
-        `M9: the Workspaces folder-plus opens Add-workspace, not Settings (${modal.className.trim()}, settings ${d.getElementById("settings-modal").className.trim()})`,
+        `M9: the sidebar's folder-plus opens Add-workspace, not Settings (${modal.className.trim()}, settings ${d.getElementById("settings-modal").className.trim()})`,
         !modal.classList.contains("hidden") &&
           d.getElementById("settings-modal").classList.contains("hidden"),
       );
@@ -1779,9 +1922,47 @@
         [...d.querySelectorAll(".ws-add-mcp-on")].map((b) => b.value).join(",") === "filesystem,notes" &&
           d.querySelector('.ws-add-mcp-on[value="notes"]').checked === false,
       );
-      // The chooser walks the filesystem one level at a time and hands the
-      // resolved path back to the field.
+      // The system panel: modal, un-drivable, and therefore asked for through the
+      // backend, whose answer this page only has to act on. A path lands.
+      d.getElementById("ws-add-root").value = "/home/e2e";
       d.getElementById("ws-add-browse").click();
+      await waitFor(
+        () => d.getElementById("ws-add-root").value === "/home/e2e/bos",
+        "the panel's folder to land in the field",
+      );
+      assert(
+        `M9: the system panel's answer lands in the root field (${JSON.stringify(LIVE.lastArgs("choose_folder"))} → ${d.getElementById("ws-add-root").value})`,
+        d.getElementById("ws-add-root").value === "/home/e2e/bos" &&
+          d.getElementById("ws-add-browser").classList.contains("hidden") &&
+          d.getElementById("ws-add-name").value === "bos",
+      );
+      // Dismissing it is not an error and not a change.
+      d.getElementById("ws-add-root").value = "";
+      LIVE.answerNext("choose_folder", null);
+      d.getElementById("ws-add-browse").click();
+      await sleep(60);
+      assert(
+        `M9: dismissing the panel leaves the field alone and writes no error (${JSON.stringify(d.getElementById("ws-add-root").value)} / ${JSON.stringify(d.getElementById("ws-add-err").textContent)})`,
+        d.getElementById("ws-add-root").value === "" &&
+          d.getElementById("ws-add-err").textContent === "" &&
+          d.getElementById("ws-add-browser").classList.contains("hidden"),
+      );
+      // No panel on this machine: the app opens its own browser and says why,
+      // and the field keeps whatever it had.
+      d.getElementById("ws-add-root").value = "/home/e2e";
+      LIVE.answerNext("choose_folder", new Error("no folder dialog here: osascript is not installed"));
+      d.getElementById("ws-add-browse").click();
+      await waitFor(
+        () => !d.getElementById("ws-add-browser").classList.contains("hidden"),
+        "the fallback browser to open",
+      );
+      assert(
+        `M9: an absent panel opens the in-app browser and says why (${d.getElementById("ws-add-browse-hint").textContent})`,
+        d.getElementById("ws-add-browse-hint").textContent.includes("osascript") &&
+          d.getElementById("ws-add-root").value === "/home/e2e",
+      );
+      // The browser walks the filesystem one level at a time and hands the
+      // resolved path back to the same field.
       await waitFor(() => d.querySelectorAll("#ws-browse-list .ws-browse-row").length === 2, "the folder level to render");
       d.querySelector('#ws-browse-list .ws-browse-row[data-path="/home/e2e/bos"]').click();
       await waitFor(
@@ -1795,10 +1976,10 @@
         d.getElementById("ws-add-root").value === "/home/e2e/bos" &&
           d.getElementById("ws-add-browser").classList.contains("hidden"),
       );
-      // A folder the app cannot list says so beside the chooser instead of
+      // A folder the app cannot list says so beside the browser instead of
       // leaving an empty list that looks like an empty folder.
       LIVE.failNext("list_folder", "/home/e2e/gone: no such file or directory");
-      d.getElementById("ws-add-browse").click();
+      d.getElementById("ws-add-browse-manual").click();
       await waitFor(
         () => d.getElementById("ws-browse-note").textContent.includes("no such file"),
         "the folder failure to be reported",
@@ -1807,6 +1988,7 @@
         `M9: a folder that will not list says why beside it (${d.getElementById("ws-browse-note").textContent})`,
         d.getElementById("ws-add-root").value === "/home/e2e/bos",
       );
+      d.getElementById("ws-add-browse-manual").click();
       // The switch the dialog carries is the workspace's own: the server that
       // starts on is ticked off here and the one that starts off is ticked on,
       // so the payload cannot be "whatever was inherited" and pass.
@@ -1838,7 +2020,7 @@
       );
       // A backend refusal keeps the dialog open with the form still filled in,
       // so the folder does not have to be chosen again.
-      d.getElementById("workspace-add").click();
+      d.getElementById("workspace-add-primary").click();
       await sleep(40);
       d.getElementById("ws-add-root").value = "/home/e2e/bos";
       d.getElementById("ws-add-name").value = "twice";
@@ -1862,6 +2044,114 @@
         modal.classList.contains("hidden"),
       );
     }
+
+    /* ---- attachments: paste, stage, send, store, render, queue --------
+       A turn may carry images. The paste path is the one a user's hand makes:
+       a clipboard image becomes a chip, the chip rides the send as a data
+       URL, the stored turn re-renders it, and a click zooms it in place. */
+    await waitFor(
+      () => sendBtn.textContent.trim() === "Send",
+      "idle before the attachment scenario",
+    );
+    const sendsBeforeAttach = LIVE.called("send_message").length;
+    const PNG_1PX =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const pasteImage = () => {
+      const file = new File(
+        [Uint8Array.from(atob(PNG_1PX), (c) => c.charCodeAt(0))],
+        "dot.png",
+        { type: "image/png" },
+      );
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      const ev = new Event("paste", { bubbles: true });
+      Object.defineProperty(ev, "clipboardData", { value: dt });
+      input.dispatchEvent(ev);
+    };
+    const strip = d.getElementById("attach-strip");
+    pasteImage();
+    await waitFor(() => !strip.classList.contains("hidden"), "the attach chip to render");
+    assert(
+      `attach: a pasted image becomes a named, removable chip (chips=${
+        strip.querySelectorAll(".attach-chip").length})`,
+      strip.querySelectorAll(".attach-chip").length === 1 &&
+        strip.querySelector(".attach-x").getAttribute("aria-label") ===
+          "Remove attached image 1",
+    );
+    assert(
+      `attach: staged images alone enable Send (text=${JSON.stringify(input.value)}, disabled=${
+        sendBtn.disabled})`,
+      sendBtn.disabled === false && input.value === "",
+    );
+    strip.querySelector(".attach-x").click();
+    assert(
+      "attach: the chip's ✕ removes it and hides the strip",
+      strip.classList.contains("hidden") && sendBtn.disabled === true,
+    );
+    // The image-only turn: no text at all, and the backend still gets it.
+    pasteImage();
+    await waitFor(() => !strip.classList.contains("hidden"), "the chip to come back");
+    sendBtn.click();
+    await waitFor(
+      () => LIVE.called("send_message").length === sendsBeforeAttach + 1,
+      "the image turn to send",
+    );
+    const attachArgs = LIVE.lastArgs("send_message");
+    assert(
+      `attach: the data URL crosses to the backend (text=${JSON.stringify(attachArgs.text)}, images=${
+        (attachArgs.images || []).length})`,
+      attachArgs.text === "" &&
+        (attachArgs.images || []).length === 1 &&
+        /^data:image\/png;base64,/.test(attachArgs.images[0]),
+    );
+    await waitFor(() => sendBtn.textContent.trim() === "Send", "the image turn to finish");
+    // A finished turn re-reads the store: the picture must still be there.
+    await waitFor(
+      () => d.querySelector("#messages .msg.user .msg-img"),
+      "the image bubble to render from the store",
+    );
+    assert(
+      "attach: the stored turn re-renders its image in the user bubble",
+      !!d.querySelector("#messages .msg.user .msg-img"),
+    );
+    const msgImg = d.querySelector("#messages .msg.user .msg-img");
+    msgImg.click();
+    assert(
+      "attach: clicking the image zooms it in place (no navigation)",
+      msgImg.classList.contains("zoomed"),
+    );
+    msgImg.click();
+    assert(
+      "attach: a second click returns the image to its thumbnail",
+      !msgImg.classList.contains("zoomed"),
+    );
+    // And a queued follow-up keeps its attachment through the wait.
+    type("slow with image");
+    sendBtn.click();
+    await waitFor(() => sendBtn.classList.contains("stop"), "the slow turn to start");
+    pasteImage();
+    await waitFor(() => !strip.classList.contains("hidden"), "the queued image's chip");
+    type("queued with image");
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await waitFor(
+      () => /1 image/.test(d.getElementById("queue-list").textContent),
+      "the queue row to name the image",
+    );
+    const queuedSends = LIVE.called("send_message").length;
+    await waitFor(
+      () => LIVE.called("send_message").length === queuedSends + 1,
+      "the queued image turn to flush",
+    );
+    assert(
+      `attach: a queued follow-up carries its images (text=${
+        LIVE.lastArgs("send_message").text})`,
+      LIVE.lastArgs("send_message").text === "queued with image" &&
+        (LIVE.lastArgs("send_message").images || []).length === 1,
+    );
+    await waitFor(
+      () => sendBtn.textContent.trim() === "Send",
+      "the queued image turn to finish",
+    );
 
     /* ---- hygiene: nothing crashed on the way through ------------------- */
     assert(

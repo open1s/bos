@@ -401,6 +401,38 @@ impl McpClient {
         }
     }
 
+    /// Fetch one prompt by name, with optional arguments.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<crate::mcp::GetPromptResult, McpError> {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "name".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        if let Some(args) = arguments {
+            params.insert("arguments".to_string(), args);
+        }
+        let resp = self
+            .call("prompts/get", Some(serde_json::Value::Object(params)))
+            .await?;
+
+        if let Some(error) = resp.error {
+            return Err(McpError::Server {
+                code: error.code,
+                message: error.message,
+            });
+        }
+
+        let result = resp
+            .result
+            .ok_or_else(|| McpError::Protocol("No result in response".to_string()))?;
+
+        Self::parse_prompt_result(result)
+    }
+
     /// The capabilities captured during initialization, if any.
     pub async fn get_capabilities(&self) -> Option<ServerCapabilities> {
         self.capabilities.lock().unwrap().clone()
@@ -515,6 +547,14 @@ impl McpClient {
 
         Ok(result)
     }
+
+    /// Parse a `prompts/get` result payload into [`GetPromptResult`].
+    fn parse_prompt_result(
+        result: serde_json::Value,
+    ) -> Result<crate::mcp::GetPromptResult, McpError> {
+        serde_json::from_value(result)
+            .map_err(|e| McpError::Protocol(format!("malformed prompts/get result: {e}")))
+    }
 }
 
 #[cfg(test)]
@@ -567,5 +607,33 @@ mod tests {
         });
         let err = McpClient::parse_tool_call_result(payload).unwrap_err();
         assert!(err.to_string().contains("isError=true"));
+    }
+
+    #[test]
+    fn parse_prompt_result_accepts_messages_and_description() {
+        let payload = serde_json::json!({
+            "description": "Review a diff",
+            "messages": [
+                {"role": "user", "content": {"type": "text", "text": "Review this"}}
+            ]
+        });
+        let parsed = McpClient::parse_prompt_result(payload).expect("parses");
+        assert_eq!(parsed.description.as_deref(), Some("Review a diff"));
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].role, "user");
+    }
+
+    #[test]
+    fn parse_prompt_result_defaults_missing_fields() {
+        let parsed = McpClient::parse_prompt_result(serde_json::json!({})).expect("parses");
+        assert!(parsed.description.is_none());
+        assert!(parsed.messages.is_empty());
+    }
+
+    #[test]
+    fn parse_prompt_result_rejects_wrong_shape() {
+        let err = McpClient::parse_prompt_result(serde_json::json!({"messages": "nope"}))
+            .expect_err("wrong shape refused");
+        assert!(err.to_string().contains("malformed prompts/get result"));
     }
 }

@@ -501,6 +501,8 @@ dependencies = [
  "config",
  "futures",
  "portable-pty",
+ "react",
+ "reqwest",
  "serde",
  "serde_json",
  "shellexpand",

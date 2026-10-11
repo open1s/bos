@@ -82,6 +82,18 @@ impl AgentSession {
         self.update_metadata();
     }
 
+    /// Append a user message holding arbitrary [`Content`].
+    ///
+    /// Multimodal turns (text plus images) arrive as
+    /// [`Content::Parts`]; vendors render each part the way their
+    /// API expects, and [`ContextBudget::estimate_session`] keeps
+    /// counting only the text, so a pasted screenshot does not
+    /// masquerade as a prompt of base64.
+    pub fn add_user_content(&mut self, content: Content) {
+        self.messages.push(Message::User { content });
+        self.update_metadata();
+    }
+
     /// Append a system message.
     pub fn add_system(&mut self, profile: String) {
         self.messages.push(Message::System { content: profile });
@@ -932,6 +944,36 @@ impl MessageContext {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn a_multimodal_user_turn_holds_its_parts() {
+        let mut session = AgentSession::new();
+        session.add_user_content(Content::parts(vec![
+            ContentPart::Text {
+                text: "what is in this picture?".into(),
+            },
+            ContentPart::Binary {
+                binary: react::llm::Binary::from_base64("image/png", "aGVsbG8=", None),
+            },
+        ]));
+        let [Message::User { content }] = session.messages() else {
+            panic!("one user message expected");
+        };
+        match content {
+            Content::Parts(parts) => {
+                assert_eq!(parts.len(), 2, "text and image travel together");
+                assert!(matches!(parts[1], ContentPart::Binary { .. }));
+            }
+            other => panic!("parts expected, got {other:?}"),
+        }
+        // The budget counts only the text, never the base64 payload.
+        let budget = ContextBudget::default();
+        let est = budget.estimate_session(&session);
+        assert!(
+            est < 40,
+            "base64 must not inflate the estimate: {est} tokens"
+        );
+    }
 
     /// A session of `messages` alternating user/assistant turns of `body`
     /// ASCII characters each.

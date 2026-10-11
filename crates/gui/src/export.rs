@@ -189,6 +189,14 @@ fn render_message(message: &ChatMessage) -> String {
         out.push_str(message.text.trim_end());
         out.push_str("\n\n");
     }
+    // The data URL stays out of the export on purpose: a base64 blob would
+    // dwarf every transcript it lands in. The count is the record.
+    for (n, _) in message.images.iter().enumerate() {
+        out.push_str(&format!("![attached image {}]\n", n + 1));
+    }
+    if !message.images.is_empty() {
+        out.push('\n');
+    }
     for tool in &message.tools {
         out.push_str(&format!("- tool `{}`\n", tool.name));
     }

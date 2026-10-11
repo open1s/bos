@@ -40,7 +40,11 @@ const state = {
   wsBusy: false,        // a workspace command is in flight
   windowExtra: 0,       // extra rows kept above the tail window
   collapsed: {},        // workspace groups whose chats are hidden
-  showArchived: false,  // whether the sidebar's archive list is open
+  // How the sidebar draws the chats, as the head's sliders menu sets it: which
+  // rows are grouped (and under what), in what order, and which archived chats
+  // are listed at all. One object, one writer (that menu), one reader
+  // (renderSidebar) — the archive used to be a second flag of its own.
+  view: { group: "tree", order: "updated", filter: "hide" },
   centerTab: "chat",    // header view switch: "chat" (transcript) | "trajectory" (steps)
   hits: [],             // content matches for the current search
   usage: { prompt: 0, completion: 0 }, // what the provider said the last turn cost
@@ -78,6 +82,7 @@ const state = {
   mention: null,         // {query, atStart, entries, index, fresh} | null — @file picker
   mentionDismissed: "",  // token query dismissed with Esc (reopens on change)
   promptNav: null,       // {pos, draft} | null — ↑/↓ prompt-history walk
+  pendingImages: [],     // data URLs attached to the next message (this composer)
   runPanel: { open: false, activeId: null, lines: [], mode: "run", partial: "" }, // streamed command output, or an interactive PTY session
 };
 
@@ -123,6 +128,9 @@ const setWorkspace = $("set-workspace");
 const setSkillsDir = $("set-skills-dir");
 const setMemory = $("set-memory");
 const setMemoryPath = $("set-memory-path");
+const setWebTools = $("set-web-tools");
+const setSearchUrl = $("set-search-url");
+const setSearchKey = $("set-search-key");
 const setContextBudget = $("set-context-budget");
 const capItems = $("cap-items");
 const mcpList = $("mcp-list");
@@ -271,14 +279,71 @@ function fmtTokens(v) {
 /* Sessions belong to a workspace, so the panel shows them that way: one header per
    workspace (name, root, the model bound to it) with its chats underneath. Pure, so
    the grouping can be tested without a DOM. */
-function groupSessions(sessions, workspaces, activeId) {
+/* How the sidebar is drawn survives a restart: it is how this person reads their
+   own chats, not a property of any workspace, so it is one blob of three choices
+   in local storage. A value that is gone or nonsense means the default, never a
+   crash — an older blob may not have the field at all. */
+const SESSION_VIEW_KEY = "bos.sessionView";
+const SESSION_VIEW_CHOICES = {
+  group: ["tree", "workspace", "list"],
+  order: ["updated", "manual"],
+  filter: ["hide", "all", "archived"],
+};
+function parseViewBlob(raw) {
+  const out = { group: "tree", order: "updated", filter: "hide" };
+  if (raw && typeof raw === "object") {
+    for (const key of Object.keys(out)) {
+      if (SESSION_VIEW_CHOICES[key].includes(raw[key])) out[key] = raw[key];
+    }
+  }
+  return out;
+}
+function persistSessionView() {
+  try {
+    localStorage.setItem(SESSION_VIEW_KEY, JSON.stringify(state.view));
+  } catch (_) {
+    /* private mode or a full quota: the sidebar still follows the choice, it
+       just forgets it next time */
+  }
+}
+function restoreSessionView() {
+  let raw = null;
+  try {
+    raw = JSON.parse(localStorage.getItem(SESSION_VIEW_KEY) || "null");
+  } catch (_) {
+    raw = null;
+  }
+  state.view = parseViewBlob(raw);
+}
+/** Set one of the three choices, remember it, and redraw the list it decides. */
+function setSessionView(patch) {
+  state.view = { ...state.view, ...patch };
+  persistSessionView();
+  renderSidebar();
+}
+
+/* Pinned first, then the order the person chose in the head's menu. A pin is a
+   statement about the chat, not about which workspace holds it, so it floats to
+   the top of whatever list the chat is drawn in. "Manual" keeps the backend's
+   order — the sort is stable, so ties stay where the store put them — and "Last
+   updated" puts the freshest first. */
+function orderSessions(items, view) {
+  return items.slice().sort(
+    (a, b) =>
+      (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) ||
+      (view.order === "manual" ? 0 : (b.updated_at || 0) - (a.updated_at || 0)),
+  );
+}
+
+function groupSessions(sessions, workspaces, activeId, view) {
+  const onlyArchived = view.filter === "archived";
   const byId = new Map((workspaces || []).map((w) => [w.id, w]));
   const groups = new Map();
   for (const s of sessions) {
-    // An archived chat is not in a group at all. Drawing it here would make
-    // "archived" mean nothing, and the count in the archive is the only place
-    // it should still be visible.
-    if (s.archived) continue;
+    // Which archived chats are listed is the filter's decision, made in one
+    // place: "hide" leaves them to the count in the menu, "all" puts them back
+    // among their own workspace's chats, "archived" shows nothing else.
+    if (onlyArchived ? !s.archived : s.archived && view.filter === "hide") continue;
     const id = s.workspace || activeId || "";
     if (!groups.has(id)) groups.set(id, []);
     groups.get(id).push(s);
@@ -287,23 +352,21 @@ function groupSessions(sessions, workspaces, activeId) {
   // either way: a folder just added would otherwise be invisible until someone
   // happened to start a chat in it, and there would be nothing to aim "+" at.
   // The ones the sessions did not mention come after them, in the order the
-  // workspaces are configured.
-  for (const w of workspaces || []) {
-    if (w && w.id && !groups.has(w.id)) groups.set(w.id, []);
+  // workspaces are configured. "Archived only" is the exception: a workspace
+  // with nothing archived is not a group in a list of archived chats.
+  if (!onlyArchived) {
+    for (const w of workspaces || []) {
+      if (w && w.id && !groups.has(w.id)) groups.set(w.id, []);
+    }
   }
   return [...groups.entries()].map(([id, items]) => {
     const w = byId.get(id);
-    // Pinned first, then most recent: a pin orders chats *inside* one
-    // workspace, so a pinned chat in A never lifts A above B.
-    const ordered = items
-      .slice()
-      .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.updated_at || 0) - (a.updated_at || 0));
     return {
       id,
       name: (w && (w.name || w.root)) || id || "Default",
       root: (w && w.root) || "",
       model: (w && w.model) || "",
-      sessions: ordered,
+      sessions: orderSessions(items, view),
     };
   });
 }
@@ -311,7 +374,9 @@ function groupSessions(sessions, workspaces, activeId) {
 /* Every workspace command returns the newly effective settings, because the
    server bumps its settings generation when the choice changes (each cached agent
    is then rebuilt from the new model and tool set). One applier keeps that
-   invariant in a single place. */
+   invariant in a single place — and re-points the transcript at the workspace
+   the snapshot names, so the chat on screen is always one the active
+   workspace's own configuration would run. */
 async function applyWorkspaceSnapshot(s) {
   state.workspaces = s.workspaces || [];
   state.presets = s.presets || [];
@@ -320,6 +385,7 @@ async function applyWorkspaceSnapshot(s) {
   state.budget = s.context_budget ?? state.budget;
   const list = await invoke("list_sessions");
   state.sessions = Array.isArray(list) ? list : [];
+  await syncTranscriptToWorkspace();
   renderSidebar();
   renderTitle();
 }
@@ -428,8 +494,7 @@ function openAddWorkspace() {
   if (!modal) return;
   state.wsAddOpener = document.activeElement;
   state.wsBrowse = null;
-  $("ws-add-browser").classList.add("hidden");
-  $("ws-add-browse").setAttribute("aria-expanded", "false");
+  hideInAppBrowser();
   $("ws-add-err").textContent = "";
   $("ws-add-name").value = "";
   $("ws-add-root").value = "";
@@ -575,6 +640,63 @@ async function submitAddWorkspace() {
    reads a file's contents — it exists to point the app at a folder, so it
    deliberately looks outside the current workspace, where the file sidebar
    would refuse to go. */
+/* The system's own folder panel, asked for through the backend. It is the door
+   the user expects, and it is a modal: nothing here can be automated end to end,
+   so the *decisions* are what this function owns — a dismissal changes nothing,
+   and a panel this machine does not have falls back to the in-app browser with
+   the reason shown rather than leaving the user with a dead button. */
+async function chooseFolderNative() {
+  const start = $("ws-add-root").value.trim();
+  $("ws-add-browse").disabled = true;
+  let picked;
+  try {
+    picked = await invoke("choose_folder", {
+      title: "Choose a folder for this workspace",
+      start: start || null,
+    });
+  } catch (err) {
+    // No panel here. The reason travels *into* the fallback, which is where the
+    // user is about to look — writing it first and then revealing the browser
+    // would overwrite it, which is a bug this guard caught.
+    showInAppBrowser(String(err));
+    await browseFolder(start || null);
+    return;
+  } finally {
+    $("ws-add-browse").disabled = false;
+  }
+  if (!picked) return; // dismissed: the field keeps what it had
+  adoptRoot(picked);
+}
+
+/* One field, two doors: the panel and the browser both end here, so the path is
+   resolved once, the name is suggested once, and neither door can drift from the
+   other. */
+function adoptRoot(path) {
+  $("ws-add-root").value = path;
+  hideInAppBrowser();
+  // The name starts empty and is optional, so the folder's own name is only
+  // *suggested* — never forced — and only while the field is still untouched.
+  if (!$("ws-add-name").value.trim()) {
+    const parts = path.split("/").filter(Boolean);
+    $("ws-add-name").value = parts.length ? parts[parts.length - 1] : "";
+  }
+  $("ws-add-err").textContent = "";
+  $("ws-add-name").focus();
+}
+
+function showInAppBrowser(reason) {
+  $("ws-add-browser").classList.remove("hidden");
+  $("ws-add-browse-manual").setAttribute("aria-expanded", "true");
+  $("ws-add-browse-hint").textContent = reason
+    ? `${tr("ws.add.noPicker", "The system folder panel is unavailable")} — ${reason}`
+    : tr("ws.add.browseHint", "Listing folders from this app instead.");
+}
+
+function hideInAppBrowser() {
+  $("ws-add-browser").classList.add("hidden");
+  $("ws-add-browse-manual").setAttribute("aria-expanded", "false");
+}
+
 async function browseFolder(path) {
   state.wsBrowse = { path: path || "", entries: [], parent: null, loading: true, error: "" };
   renderFolderBrowser();
@@ -685,10 +807,16 @@ function submitWorkspaceForm(form) {
 }
 
 /* Re-home a chat into another workspace. The command returns the session list,
-   so the sidebar re-groups from the server's answer rather than guessing. */
+   so the sidebar re-groups from the server's answer rather than guessing.
+   Moving the chat the reader is looking at carries them along: the transcript
+   must never keep showing a chat that another workspace's agent would now run. */
 async function moveSession(id, workspaceId) {
   const list = await invoke("move_session", { id, workspaceId });
   state.sessions = list;
+  if (id === state.activeId && workspaceId !== state.activeWorkspace) {
+    state.activeId = id;
+    await switchWorkspace(workspaceId);
+  }
   renderSidebar();
 }
 
@@ -864,12 +992,26 @@ function openRowMenu(anchor, items, onPick) {
   const menu = el("div", "row-menu");
   menu.setAttribute("role", "menu");
   menu.setAttribute("aria-label", anchor.getAttribute("aria-label") || "Actions");
+  let heading = null;
   for (const item of items) {
+    // A heading is a caption for the choices under it, not a choice: it is
+    // skipped by the keyboard walk, which only ever visits `.row-menu-item`.
+    if (item.group && item.group !== heading) {
+      heading = item.group;
+      const head = el("div", "row-menu-head", heading);
+      head.setAttribute("role", "presentation");
+      menu.appendChild(head);
+    }
     const b = el("button", "row-menu-item" + (item.danger ? " danger" : ""), item.label);
     b.type = "button";
-    b.setAttribute("role", "menuitem");
+    // A checked item is one of a set: role=menuitemradio plus aria-checked is
+    // what tells a screen reader that picking it un-picks its siblings. The tick
+    // is decoration on top of that, not the state itself.
+    b.setAttribute("role", item.checked === undefined ? "menuitem" : "menuitemradio");
+    if (item.checked !== undefined) b.setAttribute("aria-checked", item.checked ? "true" : "false");
     b.dataset.run = item.run;
     if (item.accel) b.appendChild(el("span", "row-menu-key", item.accel));
+    if (item.checked) b.appendChild(el("span", "row-menu-tick", "✓"));
     b.addEventListener("click", (e) => {
       e.stopPropagation();
       if (closeRowMenu(true)) onPick(item);
@@ -915,6 +1057,115 @@ function openRowMenu(anchor, items, onPick) {
   return menu;
 }
 
+/* The head's sliders menu: how the sidebar draws the chats. Each item is a radio
+   rather than a command — the current choice is ticked and announced as checked,
+   because there is no other place the state is written — and picking one redraws
+   the list underneath with the menu still open, since the three choices are
+   usually set together. "Reload chats" is the one item that acts instead of
+   choosing: it is the reload button the head used to carry. */
+function sessionViewMenu(anchor) {
+  const view = state.view;
+  const archived = archivedSessions(state.sessions).length;
+  const count = archived ? ` (${archived})` : "";
+  openRowMenu(
+    anchor,
+    [
+      // Every label goes through `tr` like the row menus' do; the two counts are
+      // appended *after* the translation, so a translator never sees the number.
+      {
+        group: tr("view.groupBy", "Group by"),
+        label: tr("view.groupWorkspace", "WorkSpace"),
+        run: "group:workspace",
+        checked: view.group === "workspace",
+      },
+      {
+        group: tr("view.groupBy", "Group by"),
+        label: tr("view.groupTree", "Workspace Tree"),
+        run: "group:tree",
+        checked: view.group === "tree",
+      },
+      {
+        group: tr("view.groupBy", "Group by"),
+        label: tr("view.groupList", "In one list"),
+        run: "group:list",
+        checked: view.group === "list",
+      },
+      {
+        group: tr("view.orderBy", "Order by"),
+        label: tr("view.orderManual", "Manual"),
+        run: "order:manual",
+        checked: view.order === "manual",
+      },
+      {
+        group: tr("view.orderBy", "Order by"),
+        label: tr("view.orderUpdated", "Last updated"),
+        run: "order:updated",
+        checked: view.order === "updated",
+      },
+      {
+        group: tr("view.filterSessions", "Filter sessions"),
+        label: tr("view.filterHide", "Hide archived") + count,
+        run: "filter:hide",
+        checked: view.filter === "hide",
+      },
+      {
+        group: tr("view.filterSessions", "Filter sessions"),
+        label: tr("view.filterAll", "All conversations (show archived)"),
+        run: "filter:all",
+        checked: view.filter === "all",
+      },
+      {
+        group: tr("view.filterSessions", "Filter sessions"),
+        label: tr("view.filterArchived", "Archived only") + count,
+        run: "filter:archived",
+        checked: view.filter === "archived",
+      },
+      { group: tr("view.chats", "Chats"), label: tr("view.reload", "Reload chats"), run: "reload" },
+    ],
+    (item) => {
+      const [key, value] = String(item.run).split(":");
+      if (key === "reload") return void reloadSessionList().catch(() => {});
+      setSessionView({ [key]: value });
+      sessionViewMenu(anchor);
+    },
+  );
+}
+
+/* An archived chat's row, drawn wherever the filter says it belongs: beside its
+   own workspace's chats, or alone in the archived-only list. It carries no pin
+   and no workspace picker — an archived chat is a target for neither — and both
+   the row and its "…" menu lead back to the live list. */
+function archivedRow(s) {
+  const row = el("div", "session-row archived-row");
+  row.dataset.id = s.id;
+  row.appendChild(el("span", "sess-mark"));
+  row.appendChild(el("span", "title", clip(s.title, 24)));
+  const when = el("span", "time", fmtAge(s.updated_at));
+  when.title = `archived ${fmtTime(s.updated_at)}`;
+  row.appendChild(when);
+  const back = el("button", "sess-restore", tr("session.restore", "Restore"));
+  back.type = "button";
+  back.setAttribute("aria-label", `Restore ${s.title || "New chat"}`);
+  back.addEventListener("click", (e) => {
+    e.stopPropagation();
+    void setArchived(s.id, false);
+  });
+  row.appendChild(back);
+  const more = el("button", "sess-menu", "…");
+  more.type = "button";
+  more.setAttribute("aria-label", `Actions for ${s.title || "New chat"}`);
+  more.setAttribute("aria-haspopup", "menu");
+  more.setAttribute("aria-expanded", "false");
+  more.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (rowMenu && rowMenu.anchor === more) return void closeRowMenu(true);
+    openRowMenu(more, sessionMenu(s), (item) => runSessionAction(s, item.run));
+  });
+  row.appendChild(more);
+  row.addEventListener("click", () => void setArchived(s.id, false));
+  return row;
+}
+
 function renderSidebar() {
   sessionList.textContent = "";
   // renderSidebar is the sidebar's single re-render point and every session or
@@ -926,65 +1177,112 @@ function renderSidebar() {
   const visible = state.sessions.filter(
     (s) => !q || (s.title || "New chat").toLowerCase().includes(q),
   );
-  for (const group of groupSessions(visible, state.workspaces, state.activeWorkspace)) {
-    // The header is the workspace switcher's anchor: root on hover, bound model
-    // beside the name so the panel answers "which model am I about to use?".
-    const head = el("div", "ws-head");
-    head.title = group.root
-      ? `${group.root} — click to switch`
-      : `${group.name} — click to switch`;
-    if (group.id === state.activeWorkspace) head.classList.add("active");
-    head.addEventListener("click", () => switchWorkspace(group.id));
-    // The header keeps the two gestures the reference sidebar puts here: "+"
-    // starts a chat in *this* workspace, and "…" holds everything else. The
-    // rename and remove forms are unchanged; they are just reached from a menu
-    // now, so the header is not a row of glyphs whose meaning has to be guessed.
-    const add = el("button", "ws-act ws-new", "+");
-    add.setAttribute("aria-label", `New session in ${group.name}`);
-    add.title = `${tr("ws.new", "New session")} (Cmd/Ctrl+N)`;
-    add.setAttribute("aria-keyshortcuts", "Meta+N Control+N");
-    add.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void newSessionIn(group.id);
-    });
-    head.appendChild(add);
-    const more = el("button", "ws-act ws-menu", "…");
-    more.setAttribute("aria-label", `${group.name} actions`);
-    more.setAttribute("aria-haspopup", "menu");
-    more.setAttribute("aria-expanded", "false");
-    more.title = tr("ws.actions", "Workspace actions");
-    more.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (rowMenu && rowMenu.anchor === more) return void closeRowMenu(true);
-      openRowMenu(more, workspaceMenu(group), (item) => {
-        if (item.run === "new") void newSessionIn(group.id);
-        else if (item.run === "rename") openWorkspaceForm("edit", group.id);
-        else if (item.run === "delete") openWorkspaceForm("remove", group.id);
+  const view = state.view;
+  const groups = groupSessions(visible, state.workspaces, state.activeWorkspace, view);
+  // "In one list" is the one mode with no workspace rows at all, so the whole
+  // list is ordered in one pass and every row names the workspace it runs in —
+  // without that name the mode would drop the fact the grouping was carrying.
+  const flat = view.group === "list";
+  const drawn = flat
+    ? [
+        {
+          id: "",
+          name: "",
+          root: "",
+          model: "",
+          sessions: orderSessions(groups.flatMap((g) => g.sessions), view),
+        },
+      ]
+    : groups;
+  const wsNames = new Map(state.workspaces.map((w) => [w.id, w.name || w.root || w.id]));
+  for (const group of drawn) {
+    // Declared before the header's own block because the `continue` below reads
+    // it from outside that block (the flat list has no headers at all).
+    let folded = false;
+    if (!flat) {
+      // The header is the workspace switcher's anchor: root on hover, bound model
+      // beside the name so the panel answers "which model am I about to use?".
+      const head = el("div", "ws-head");
+      head.title = group.root
+        ? `${group.root} — click to switch`
+        : `${group.name} — click to switch`;
+      if (group.id === state.activeWorkspace) {
+        head.classList.add("active");
+        // The dot is decorative — the status is in the class, and this is how a
+        // screen reader hears it. It is an element and not a `::before` so a guard
+        // can see it: a surface drawn only by CSS is a surface nothing is true of.
+        head.setAttribute("aria-current", "true");
+      }
+      head.addEventListener("click", () => switchWorkspace(group.id));
+      // The header keeps the two gestures the reference sidebar puts here: "+"
+      // starts a chat in *this* workspace, and "…" holds everything else. The
+      // rename and remove forms are unchanged; they are just reached from a menu
+      // now, so the header is not a row of glyphs whose meaning has to be guessed.
+      const add = el("button", "ws-act ws-new", "+");
+      add.setAttribute("aria-label", `New session in ${group.name}`);
+      add.title = `${tr("ws.new", "New session")} (Cmd/Ctrl+N)`;
+      add.setAttribute("aria-keyshortcuts", "Meta+N Control+N");
+      add.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void newSessionIn(group.id);
       });
-    });
-    head.appendChild(more);
-    const folded = !!state.collapsed[group.id];
-    const fold = el("button", "ws-act ws-fold", folded ? "▸" : "▾");
-    // The glyph is the whole label, so it needs a name of its own — the title
-    // is a tooltip, and a screen reader does not read one as a name.
-    fold.setAttribute("aria-label", folded ? `Show ${group.name}'s chats` : `Hide ${group.name}'s chats`);
-    fold.setAttribute("aria-expanded", folded ? "false" : "true");
-    fold.title = folded ? "Show this workspace's chats" : "Hide them";
-    fold.addEventListener("click", (e) => {
-      // Otherwise the click would also switch the active workspace, which is the
-      // header's job, not the fold's.
-      e.stopPropagation();
-      state.collapsed[group.id] = !folded;
-      renderSidebar();
-    });
-    head.appendChild(fold);
-    head.appendChild(el("span", "ws-name", clip(group.name, 18)));
-    if (group.model) head.appendChild(el("span", "ws-model", clip(group.model, 16)));
-    head.appendChild(el("span", "ws-count", String(group.sessions.length)));
-    sessionList.appendChild(head);
+      head.appendChild(add);
+      const more = el("button", "ws-act ws-menu", "…");
+      more.setAttribute("aria-label", `${group.name} actions`);
+      more.setAttribute("aria-haspopup", "menu");
+      more.setAttribute("aria-expanded", "false");
+      more.title = tr("ws.actions", "Workspace actions");
+      more.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (rowMenu && rowMenu.anchor === more) return void closeRowMenu(true);
+        openRowMenu(more, workspaceMenu(group), (item) => {
+          if (item.run === "new") void newSessionIn(group.id);
+          else if (item.run === "rename") openWorkspaceForm("edit", group.id);
+          else if (item.run === "delete") openWorkspaceForm("remove", group.id);
+        });
+      });
+      head.appendChild(more);
+      // "WorkSpace" keeps every workspace as a row and opens only the active one,
+      // so switching workspace is what opens a group; a fold the person set by
+      // hand still wins inside the group it was set on.
+      const canFold = view.group !== "workspace" || group.id === state.activeWorkspace;
+      folded =
+        !!state.collapsed[group.id] ||
+        (view.group === "workspace" && group.id !== state.activeWorkspace);
+      if (canFold) {
+        const fold = el("button", "ws-act ws-fold", folded ? "▸" : "▾");
+        // The glyph is the whole label, so it needs a name of its own — the title
+        // is a tooltip, and a screen reader does not read one as a name.
+        fold.setAttribute("aria-label", folded ? `Show ${group.name}'s chats` : `Hide ${group.name}'s chats`);
+        fold.setAttribute("aria-expanded", folded ? "false" : "true");
+        fold.title = folded ? "Show this workspace's chats" : "Hide them";
+        fold.addEventListener("click", (e) => {
+          // Otherwise the click would also switch the active workspace, which is the
+          // header's job, not the fold's.
+          e.stopPropagation();
+          state.collapsed[group.id] = !folded;
+          renderSidebar();
+        });
+        head.appendChild(fold);
+      }
+      head.appendChild(el("span", "ws-name", clip(group.name, 18)));
+      if (group.model) head.appendChild(el("span", "ws-model", clip(group.model, 16)));
+      if (group.id === state.activeWorkspace) {
+        const dot = el("span", "ws-dot", "●");
+        dot.setAttribute("aria-hidden", "true");
+        dot.title = tr("ws.active", "Active workspace");
+        head.appendChild(dot);
+      }
+      head.appendChild(el("span", "ws-count", String(group.sessions.length)));
+      sessionList.appendChild(head);
+    }
     // A collapsed group still counts its chats in the header; it just hides them.
-    if (folded) continue;
+    if (!flat && folded) continue;
     for (const s of group.sessions) {
+    if (s.archived) {
+      sessionList.appendChild(archivedRow(s));
+      continue;
+    }
     const row = el("div", "session-row" + (s.id === state.activeId ? " active" : ""));
     // The row names the chat it stands for, so a check can address one chat
     // instead of matching its clipped title.
@@ -997,6 +1295,13 @@ function renderSidebar() {
     mark.setAttribute("aria-hidden", "true");
     row.appendChild(mark);
     row.appendChild(el("span", "title", clip(s.title, 24)));
+    // In one list the row has no workspace header above it, so it carries the
+    // workspace itself: a chip, not a second name in the title.
+    if (flat) {
+      row.appendChild(
+        el("span", "sess-ws-chip", clip(wsNames.get(s.workspace) || s.workspace || "Default", 14)),
+      );
+    }
     if (live) row.appendChild(el("span", "vh", "streaming"));
     // The star is the pin's own control, so the state is one click from the row
     // instead of two: it reads as pressed to a screen reader and stays visible
@@ -1050,70 +1355,20 @@ function renderSidebar() {
     sessionList.appendChild(row);
     }
   }
-  // The archive, behind one disclosure. It is drawn even while searching: a
-  // search that hid the way back to a chat would be a trap.
-  const archived = archivedSessions(state.sessions);
-  if (archived.length) {
-    const open = !!state.showArchived;
-    const toggle = el(
-      "button",
-      "archived-toggle" + (open ? " open" : ""),
-      `⧉ ${tr("session.archived", "Archived")} (${archived.length})`,
-    );
-    toggle.type = "button";
-    toggle.setAttribute("aria-expanded", open ? "true" : "false");
-    toggle.title = open ? "Hide the archived chats" : "Show the archived chats";
-    toggle.addEventListener("click", () => {
-      state.showArchived = !state.showArchived;
-      renderSidebar();
-    });
-    sessionList.appendChild(toggle);
-    if (open) {
-      for (const s of archived) {
-        const row = el("div", "session-row archived-row");
-        row.dataset.id = s.id;
-        row.appendChild(el("span", "sess-mark"));
-        row.appendChild(el("span", "title", clip(s.title, 24)));
-        const when = el("span", "time", fmtAge(s.updated_at));
-        when.title = `archived ${fmtTime(s.updated_at)}`;
-        row.appendChild(when);
-        const back = el("button", "sess-restore", tr("session.restore", "Restore"));
-        back.type = "button";
-        back.setAttribute("aria-label", `Restore ${s.title || "New chat"}`);
-        back.addEventListener("click", (e) => {
-          e.stopPropagation();
-          void setArchived(s.id, false);
-        });
-        row.appendChild(back);
-        const more = el("button", "sess-menu", "…");
-        more.type = "button";
-        more.setAttribute("aria-label", `Actions for ${s.title || "New chat"}`);
-        more.setAttribute("aria-haspopup", "menu");
-        more.setAttribute("aria-expanded", "false");
-        more.addEventListener("click", (e) => {
-          e.stopPropagation();
-          if (rowMenu && rowMenu.anchor === more) return void closeRowMenu(true);
-          openRowMenu(more, sessionMenu(s), (item) => runSessionAction(s, item.run));
-        });
-        row.appendChild(more);
-        row.addEventListener("click", () => void setArchived(s.id, false));
-        sessionList.appendChild(row);
-      }
-    }
-  }
   if (state.wsEdit) {
     const known = state.workspaces.find((w) => w.id === state.wsEdit.id);
     sessionList.appendChild(
       workspaceFormEl(known || { id: state.wsEdit.id, name: state.wsEdit.id, root: "" }),
     );
   } else {
-    const add = el("button", "ws-add", "+ New workspace");
-    add.addEventListener("click", () => openAddWorkspace());
-    sessionList.appendChild(add);
-    // Presets sit next to "New workspace" because applying one is a way of
-    // creating a workspace — a copy of it, never a link to it (§24.9).
+    // The row that used to sit here ("+ New workspace") is gone: the folder-plus
+    // in this section's header is the one door to the Add-workspace dialog, and a
+    // second one under the list was a duplicate 40 px from the first — the same
+    // shape as the two folder-plus glyphs rev 111 removed from the brand row.
+    // Presets stay: applying one is a way of creating a workspace — a copy of it,
+    // never a link to it (§24.9) — and it is not a second way to that dialog.
     for (const preset of state.presets) {
-      const from = el("button", "ws-add ws-add-preset", `▸ ${preset.name || preset.id}`);
+      const from = el("button", "ws-preset-row", `▸ ${preset.name || preset.id}`);
       from.title = "Create a workspace from this preset (a copy, not a link)";
       from.addEventListener("click", () =>
         workspaceCommand(invoke("apply_preset", { id: preset.id, name: "" })),
@@ -1431,6 +1686,17 @@ function buildBubble(m, showCaret, opts) {
   for (const t of m.tools || []) {
     bubble.appendChild(buildToolCard(t));
   }
+  // Attachments render above the text, thumbnail-sized; a click enlarges the
+  // image in place (the class toggles, so no navigation and no new window).
+  for (const url of m.images || []) {
+    const img = document.createElement("img");
+    img.className = "msg-img";
+    img.src = url;
+    img.alt = "attached image";
+    img.loading = "lazy";
+    img.addEventListener("click", () => img.classList.toggle("zoomed"));
+    bubble.appendChild(img);
+  }
   if (m.text || showCaret) {
     const text = el("div", "text");
     if (m.text) {
@@ -1443,7 +1709,12 @@ function buildBubble(m, showCaret, opts) {
     }
     if (showCaret) text.appendChild(el("span", "caret"));
     bubble.appendChild(text);
-  } else if (!m.reasoning && !(m.tools || []).length && !m.error) {
+  } else if (
+    !m.reasoning &&
+    !(m.tools || []).length &&
+    !(m.images || []).length &&
+    !m.error
+  ) {
     bubble.appendChild(el("div", "text", "…"));
   }
   if (m.error) bubble.appendChild(el("div", "err", "⚠ " + m.error));
@@ -1508,8 +1779,11 @@ function buildBubble(m, showCaret, opts) {
    appends the edited prompt as a fresh turn, and the agent re-seeds from
    the surviving prefix. sendText rolls the tail back if the invoke fails. */
 function resendEdited(index, text) {
+  const msgs = state.cache[state.activeId] || [];
+  const original = msgs[index];
+  const images = original && original.role === "User" ? original.images || [] : [];
   state.editing = null;
-  sendText(text, state.activeId, index).catch(() => {});
+  sendText(text, state.activeId, index, images).catch(() => {});
 }
 
 /* "Delete from here": drop message `index` and everything after it from
@@ -1567,12 +1841,21 @@ function buildEditor(m, i) {
   ta.value = m.text;
   ta.setAttribute("aria-label", "Edit message");
   box.appendChild(ta);
+  // The attachments are shown, not edited: a resend keeps them (the edited
+  // turn re-asks about the same pictures with new words).
+  for (const url of m.images || []) {
+    const img = document.createElement("img");
+    img.className = "msg-img";
+    img.src = url;
+    img.alt = "attached image";
+    box.appendChild(img);
+  }
   const row = el("div", "bubble-actions");
   const save = el("button", "mini-btn", "Send");
   save.type = "button";
   save.addEventListener("click", () => {
     const v = ta.value.trim();
-    if (!v) return;
+    if (!v && !(m.images || []).length) return;
     resendEdited(i, v);
   });
   const cancel = el("button", "mini-btn", "Cancel");
@@ -1630,6 +1913,12 @@ function sameMessage(a, b) {
   if (!a || !b || a.role !== b.role || a.text !== b.text) return false;
   if ((a.reasoning || "") !== (b.reasoning || "")) return false;
   if ((a.error || "") !== (b.error || "")) return false;
+  const ia = a.images || [];
+  const ib = b.images || [];
+  if (ia.length !== ib.length) return false;
+  for (let k = 0; k < ia.length; k += 1) {
+    if (ia[k] !== ib[k]) return false;
+  }
   const ta = a.tools || [];
   const tb = b.tools || [];
   if (ta.length !== tb.length) return false;
@@ -1683,11 +1972,14 @@ function messageSignature(m, opts, editingHere) {
       t.output == null ? "-" : sigOf(t.output)
     }|${t.ms == null ? "-" : t.ms}|${t.open ? "o" : "c"};`;
   }
+  let images = "";
+  for (const url of m.images || []) images += `${sigOf(url)};`;
   return [
     m.role,
     sigOf(m.text),
     sigOf(m.reasoning),
     sigOf(m.error),
+    images,
     tools,
     opts.showCaret ? 1 : 0,
     editingHere ? 1 : 0,
@@ -1906,6 +2198,7 @@ function bindCenterTabs() {
 bindCenterTabs();
 
 function renderMessages() {
+  growDrawn = true; // the previous growth, if any, has now been drawn
   // The trajectory reads the same cache, so every transcript repaint — stream
   // chunk, splice, switch, restore — refreshes it while that tab is the one
   // on screen.
@@ -2015,8 +2308,8 @@ function renderMessages() {
       // one itself, which hid this: against the real backend the branch came out
       // one message short — without the message it was taken from.
       branchIndex: abs + 1,
-      regen: abs === lastAssistant && !!m.text,
-      edit: m.role === "User" && !!m.text,
+      regen: abs === lastAssistant && (!!m.text || (m.images || []).length),
+      edit: m.role === "User" && (!!m.text || (m.images || []).length),
       del: true,
       branch: abs > 0,
     };
@@ -2145,15 +2438,35 @@ function sampleRowHeight() {
 }
 
 /* Scrolling near the top grows the window, one window at a time, so reading
-   backwards off the start of a long chat needs no button. */
+   backwards off the start of a long chat needs no button.
+
+   A gesture fires dozens of scroll events per frame, and the first version grew
+   the window per *event*: one flick added the whole burst (measured in the ui
+   fixture: 50 events took the drawn transcript from 200 rows to all 1 000), so
+   the window cap held only until the first scroll-up. The gate below grants one
+   growth per drawn frame — `renderMessages` re-opens it — which is also what
+   makes the gesture self-limiting: the growth prepends rows above the reader, the
+   render restores their offset, and `scrollTop` is then ~200 rows below the top
+   again, so the next growth needs another deliberate scroll. */
+let growDrawn = true;
+function growWindow() {
+  if (!growDrawn) return;
+  growDrawn = false;
+  const total = (state.cache[state.activeId] || []).length;
+  state.windowExtra = Math.min((state.windowExtra || 0) + WINDOW, total);
+  markDirtyAll();
+  scheduleRepaint();
+}
+function resetWindow() {
+  state.windowExtra = 0;
+  growDrawn = true;
+}
 function ensureScrollGrow() {
   if (scrollGrowBound || !messagesEl) return;
   scrollGrowBound = true;
   messagesEl.addEventListener("scroll", () => {
     if (messagesEl.scrollTop > 320 || lastWindowStart <= 0) return;
-    state.windowExtra = (state.windowExtra || 0) + WINDOW;
-    markDirtyAll();
-    scheduleRepaint();
+    growWindow();
   });
 }
 
@@ -2170,9 +2483,7 @@ function renderLoadEarlier(windowStart) {
   if (!loadEarlierEl) {
     loadEarlierEl = el("button", "load-earlier", "");
     loadEarlierEl.addEventListener("click", () => {
-      state.windowExtra = (state.windowExtra || 0) + WINDOW;
-      markDirtyAll();
-      scheduleRepaint();
+      growWindow();
     });
     const host = messagesEl && messagesEl.parentNode;
     if (!host) return;
@@ -2186,7 +2497,6 @@ function renderLoadEarlier(windowStart) {
 ensureScrollGrow();
 
 function renderStatus() {
-  renderUsage();
   statusLeft.textContent = "";
   statusLeft.appendChild(el("span", "", state.model || "no model"));
   statusLeft.appendChild(
@@ -2196,6 +2506,13 @@ function renderStatus() {
 
   statusRight.textContent = "";
   renderArchived(statusRight, state.archived, () => void openArchivedView(), restoreArchived);
+  // After *both* clears, not just this one: `renderUsage` appends its meter to
+  // this very element, and `renderArchived` clears the host it is handed too, so
+  // a meter written between the two clears is built and thrown away on every
+  // frame — which is what happened during a stream. Two writers and one element
+  // is a lost update; the fixture's direct `renderUsage()` call could not see it,
+  // so its check now goes through this pass.
+  renderUsage();
   if (state.toolCount > 0) {
     statusRight.appendChild(
       el("span", "tools", `⚙ ${state.toolCount} tool call${state.toolCount === 1 ? "" : "s"}`)
@@ -2248,7 +2565,7 @@ function renderSend() {
   } else {
     sendBtn.textContent = "Send";
     sendBtn.classList.remove("stop");
-    sendBtn.disabled = !input.value.trim();
+    sendBtn.disabled = !input.value.trim() && !state.pendingImages.length;
   }
 }
 
@@ -2262,12 +2579,14 @@ function renderQueue() {
     queueList.classList.add("hidden");
     return;
   }
-  q.forEach((text, i) => {
+  q.forEach((entry, i) => {
+    const text = typeof entry === "string" ? entry : entry.text || "";
+    const imageCount = typeof entry === "string" ? 0 : (entry.images || []).length;
     const row = document.createElement("div");
     row.className = "queue-item";
     const label = document.createElement("span");
     label.className = "queue-text";
-    label.textContent = `queued · ${text}`;
+    label.textContent = `queued · ${imageCount ? `[${imageCount} image${imageCount === 1 ? "" : "s"}] ` : ""}${text}`;
     const drop = document.createElement("button");
     drop.type = "button";
     drop.className = "queue-x";
@@ -2821,16 +3140,52 @@ async function reloadSessionList() {
   renderSidebar();
 }
 
-async function refreshSessions() {
-  let list = await invoke("list_sessions");
-  if (list.length === 0) list = [await invoke("create_session")];
-  state.sessions = list;
-  if (!list.some((s) => s.id === state.activeId)) state.activeId = list[0].id;
+/* One rule decides which chat is open, because a chat's workspace decides the
+   model, tools and skills that run it (§24.6): the transcript must always show
+   a chat of the workspace in use. Keep the open chat while it belongs here;
+   else the newest live chat of this workspace (pins first, the sidebar's own
+   order); else create one — which is the "create session for workspace" step,
+   done for the reader rather than left to be discovered.
+
+   Every workspace command funnels through here (applyWorkspaceSnapshot), so
+   creating a workspace ends inside its own fresh chat, switching workspaces
+   lands in that workspace's chat, and no snapshot can leave a transcript of
+   workspace A on screen while workspace B's agent would answer the next
+   message. */
+async function syncTranscriptToWorkspace() {
+  const here = state.activeWorkspace;
+  const mine = state.sessions.filter(
+    (s) => !s.archived && (s.workspace || here) === here,
+  );
+  if (state.activeId && mine.some((s) => s.id === state.activeId)) {
+    // The open chat still belongs here; the plan store and the goal card are
+    // re-pointed anyway, because a stream may have moved either since.
+    await restorePlan(state.activeId);
+    await refreshGoal(state.activeId);
+    return;
+  }
+  const pick = mine.find((s) => s.pinned) || mine[0];
+  if (pick) {
+    state.activeId = pick.id;
+  } else {
+    // A chat cannot exist without a workspace, but a workspace with no chat
+    // gets one: the composer is the workspace's front door.
+    state.sessions.unshift(await invoke("create_session"));
+    state.activeId = state.sessions[0].id;
+  }
+  resetWindow(); // a widened window belonged to the chat that was open
+  state.promptNav = null; // so did the history walk
+  clearAttachments(); // so did the composer's staged images
+  forgetSkillScope();
   if (!state.cache[state.activeId]) await loadActive();
-  // The active session may have changed (delete, restart, stream end);
-  // re-point the shared plan store at it so the panel matches.
   await restorePlan(state.activeId);
   await refreshGoal(state.activeId);
+}
+
+async function refreshSessions() {
+  const list = await invoke("list_sessions");
+  state.sessions = Array.isArray(list) ? list : [];
+  await syncTranscriptToWorkspace();
 }
 
 async function loadActive() {
@@ -2858,7 +3213,9 @@ function ensureSessionCache(id) {
 async function switchSession(id) {
   if (id === state.activeId) return;
   state.activeId = id;
+  resetWindow(); // a widened window belonged to the chat that was open
   state.promptNav = null; // the walk belonged to the previous chat
+  clearAttachments(); // so were the composer's staged images
   forgetSkillScope();
   if (!state.cache[id]) await loadActive();
   await restorePlan(id);
@@ -2880,6 +3237,8 @@ async function newChat() {
   const s = await invoke("create_session");
   state.sessions.unshift(s);
   state.activeId = s.id;
+  resetWindow();
+  clearAttachments(); // staged images belonged to the previous chat's composer
   forgetSkillScope();
   state.cache[s.id] = [];
   state.usage = null;
@@ -2917,7 +3276,12 @@ async function setArchived(id, archived) {
     return;
   }
   if (archived && id === state.activeId) {
-    const next = state.sessions.find((s) => s.id !== id && !s.archived);
+    const next = state.sessions.find(
+      (s) =>
+        s.id !== id &&
+        !s.archived &&
+        (s.workspace || state.activeWorkspace) === state.activeWorkspace,
+    );
     if (next) await switchSession(next.id);
   }
   await refreshSessions();
@@ -3032,6 +3396,138 @@ async function deleteSession(id) {
   renderAll();
 }
 
+/* ---------- image attachments ----------
+
+   A turn may carry screenshots/photos alongside its text (codex parity, and
+   the deepseek upload affordance). Files arrive three ways — paste in the
+   composer, drag onto it, or the picker — and become data URLs on the spot,
+   downscaled when the bytes would bloat the transcript. The same URLs travel
+   to the backend, which validates and forwards them as binary parts. */
+
+const MAX_ATTACHMENTS = 6;
+const attachStrip = $("attach-strip");
+const attachBtn = $("attach-btn");
+const attachFile = $("attach-file");
+
+/* Read a dropped/pasted image into a data URL, downscaling big frames first:
+   a 4K screenshot at full size is megabytes of base64 for no extra meaning. */
+function imageFileToDataUrl(file) {
+  const keepSmall = () =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error || new Error("unreadable image"));
+      reader.readAsDataURL(file);
+    });
+  if (file.size <= 256 * 1024) return keepSmall();
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  return new Promise((resolve, reject) => {
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const max = 1280;
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL("image/jpeg", 0.85));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      keepSmall().then(resolve, reject);
+    };
+    img.src = url;
+  });
+}
+
+function addAttachments(files) {
+  const images = Array.from(files || []).filter((f) => f.type.startsWith("image/"));
+  if (!images.length) return;
+  const room = MAX_ATTACHMENTS - state.pendingImages.length;
+  if (room <= 0) {
+    toast(`At most ${MAX_ATTACHMENTS} images per message.`);
+    return;
+  }
+  if (images.length > room) {
+    toast(`Only ${room} more image${room === 1 ? "" : "s"} fit on this message.`);
+  }
+  images.slice(0, room).forEach((file) => {
+    imageFileToDataUrl(file)
+      .then((url) => {
+        if (state.pendingImages.length >= MAX_ATTACHMENTS) return;
+        state.pendingImages.push(url);
+        renderAttachments();
+      })
+      .catch(() => toast(`Could not read ${file.name || "the pasted image"}.`));
+  });
+}
+
+function renderAttachments() {
+  if (!attachStrip) return;
+  attachStrip.replaceChildren();
+  state.pendingImages.forEach((url, i) => {
+    const chip = document.createElement("div");
+    chip.className = "attach-chip";
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = `attached image ${i + 1}`;
+    const drop = document.createElement("button");
+    drop.type = "button";
+    drop.className = "attach-x";
+    drop.textContent = "✕";
+    drop.setAttribute("aria-label", `Remove attached image ${i + 1}`);
+    drop.addEventListener("click", () => {
+      state.pendingImages.splice(i, 1);
+      renderAttachments();
+    });
+    chip.append(img, drop);
+    attachStrip.appendChild(chip);
+  });
+  attachStrip.classList.toggle("hidden", !state.pendingImages.length);
+  // The Send gate is derived from the staged images exactly where they are
+  // rendered, so every mutation path (add, remove, send, switch) keeps the
+  // button honest without each caller remembering to ask.
+  renderSend();
+}
+
+function clearAttachments() {
+  if (!state.pendingImages.length) return;
+  state.pendingImages = [];
+  renderAttachments();
+}
+
+function bindAttachments() {
+  if (!attachBtn || !attachFile) return;
+  attachBtn.addEventListener("click", () => attachFile.click());
+  attachFile.addEventListener("change", () => {
+    addAttachments(attachFile.files);
+    attachFile.value = "";
+  });
+  input.addEventListener("paste", (ev) => {
+    const files = Array.from(ev.clipboardData?.files || []).filter((f) =>
+      f.type.startsWith("image/"),
+    );
+    if (!files.length) return;
+    ev.preventDefault();
+    addAttachments(files);
+  });
+  const composer = $("composer");
+  if (!composer) return;
+  composer.addEventListener("dragover", (ev) => {
+    if (Array.from(ev.dataTransfer?.types || []).includes("Files")) ev.preventDefault();
+  });
+  composer.addEventListener("drop", (ev) => {
+    const files = ev.dataTransfer?.files;
+    if (!files || !files.length) return;
+    const images = Array.from(files).filter((f) => f.type.startsWith("image/"));
+    if (!images.length) return;
+    ev.preventDefault();
+    addAttachments(files);
+  });
+}
+bindAttachments();
+
 /* ---------- sending ---------- */
 
 /* Stop just this chat's turn; background streams keep going. The Stop button
@@ -3047,14 +3543,17 @@ async function stopStream() {
 
 async function send() {
   const text = input.value;
-  if (!text.trim()) return;
+  const images = state.pendingImages.slice();
+  if (!text.trim() && !images.length) return;
   closePalette();
   closeMention();
   input.value = "";
+  clearAttachments();
   state.promptNav = null; // a send ends the history walk (list moves on)
   autosize();
   renderSend();
-  if (runCommand(text)) return;
+  // An image-only turn has no slash command to run; a text turn may.
+  if (text.trim() && runCommand(text)) return;
   if (state.compacting[state.activeId]) {
     // /compact rewrites history when the summary lands; hold new turns out
     // of it so the backend never has to discard a just-finished summary.
@@ -3067,20 +3566,27 @@ async function send() {
   if (streamOf(state.activeId)) {
     // A turn is in flight: keep it running and wait in line — queued text
     // is sent FIFO the moment this chat's stream ends — instead of stopping.
-    const q = state.queue[state.activeId] || (state.queue[state.activeId] = []);
-    if (q.length >= MAX_QUEUE) {
-      // Give the text back: typed content is never dropped silently.
-      input.value = text;
-      autosize();
-      state.error = `Queue full (${MAX_QUEUE} messages waiting) — wait for the turn to finish or press Stop.`;
-      renderAll();
-      return;
-    }
-    q.push(text);
-    renderQueue();
+    queueFollowUp(text, images);
     return;
   }
-  await sendText(text);
+  await sendText(text, state.activeId, null, images);
+}
+
+/* Park one follow-up (text plus any attachments) in the active chat's queue,
+   or hand the content back when the line is full — nothing is dropped. */
+function queueFollowUp(text, images) {
+  const q = state.queue[state.activeId] || (state.queue[state.activeId] = []);
+  if (q.length >= MAX_QUEUE) {
+    input.value = text;
+    autosize();
+    state.pendingImages.push(...images.slice(0, MAX_ATTACHMENTS - state.pendingImages.length));
+    renderAttachments();
+    state.error = `Queue full (${MAX_QUEUE} messages waiting) — wait for the turn to finish or press Stop.`;
+    renderAll();
+    return;
+  }
+  q.push({ text, images });
+  renderQueue();
 }
 
 /* Push the local (user, assistant) pair, then ask the backend to stream.
@@ -3092,10 +3598,10 @@ async function send() {
    `truncateFrom` (edit-and-resend) drops every local message from that
    index on before pushing the pair; the backend drops the same tail from
    the stored record, so a failed invoke must splice the saved rows back. */
-async function sendText(text, sessionId = state.activeId, truncateFrom = null) {
+async function sendText(text, sessionId = state.activeId, truncateFrom = null, images = []) {
   const msgs = state.cache[sessionId] || (state.cache[sessionId] = []);
   const removed = truncateFrom != null ? msgs.splice(truncateFrom) : null;
-  msgs.push({ role: "User", text, reasoning: "", tools: [], error: null });
+  msgs.push({ role: "User", text, reasoning: "", tools: [], images, error: null });
   msgs.push({ role: "Assistant", text: "", reasoning: "", tools: [], error: null });
   state.usage = null;
   state.toolCount = 0;
@@ -3106,6 +3612,7 @@ async function sendText(text, sessionId = state.activeId, truncateFrom = null) {
     const streaming = await invoke("send_message", {
       sessionId,
       text,
+      images,
       truncateFrom,
     });
     state.streams[sessionId] = streaming;
@@ -3121,6 +3628,12 @@ async function sendText(text, sessionId = state.activeId, truncateFrom = null) {
     if (sessionId === state.activeId && !input.value.trim()) {
       input.value = text;
       autosize();
+      // The attachments come back with the text: typed and pasted content is
+      // never dropped silently, on a failure any more than on a full queue.
+      state.pendingImages.push(
+        ...images.slice(0, MAX_ATTACHMENTS - state.pendingImages.length),
+      );
+      renderAttachments();
     }
     state.error = String(err);
     renderAll();
@@ -3133,10 +3646,10 @@ async function flushQueue(sessionId) {
   const q = state.queue[sessionId];
   if (!q || !q.length) return;
   if (state.streams[sessionId]) return; // a newer turn already took over
-  const text = q.shift();
+  const { text, images } = q.shift();
   if (!q.length) delete state.queue[sessionId];
   renderQueue();
-  const ok = await sendText(text, sessionId);
+  const ok = await sendText(text, sessionId, null, images || []);
   if (!ok) {
     // Rows are kept (typed content is never dropped): the next manual send
     // starts a turn whose end re-flushes them, and each row stays
@@ -3162,7 +3675,14 @@ async function regenerate() {
     if (dropped) msgs.push(dropped);
     return;
   }
-  msgs.push({ role: "User", text: user.text, reasoning: "", tools: [], error: null });
+  msgs.push({
+    role: "User",
+    text: user.text,
+    reasoning: "",
+    tools: [],
+    images: user.images || [],
+    error: null,
+  });
   msgs.push({ role: "Assistant", text: "", reasoning: "", tools: [], error: null });
   state.usage = null;
   state.toolCount = 0;
@@ -3190,8 +3710,13 @@ async function regenerate() {
 }
 
 function autosize() {
+  // Chrome counts the wrapped placeholder in scrollHeight, so pinning an empty
+  // composer to it would leave it tall forever after one clear; an empty value
+  // is one row by definition, which is the CSS min-height.
   input.style.height = "auto";
-  input.style.height = Math.min(input.scrollHeight, 180) + "px";
+  input.style.height = input.value
+    ? Math.min(input.scrollHeight, 180) + "px"
+    : "";
 }
 
 /* ---------- slash-command palette ----------
@@ -3205,8 +3730,13 @@ const BUILTIN_COMMANDS = [
   { name: "/export", hint: "Export this chat as Markdown", run: exportActive },
   { name: "/restore", hint: "Put turns folded by /compact back", run: () => void restoreArchived() },
   { name: "/stats", hint: "Counts and outline for this chat", run: () => void openStatsView() },
-  { name: "/files", hint: "Show the workspace files in the sidebar", run: () => void toggleFilePanel() },
+  { name: "/files", hint: "Browse the workspace files (Settings → Files)", run: () => navTo("files-section") },
   { name: "/run", hint: "Run a shell command, output streams into the run panel", run: () => void setRunPanelMode("run") },
+  {
+    name: "/diff",
+    hint: "Review the workspace's uncommitted changes (git diff)",
+    run: reviewDiff,
+  },
   { name: "/term", hint: "Attach an interactive shell for this workspace (survives a reload)", run: () => void attachTermSession() },
   { name: "/export", hint: "Keep this chat as a ZIP file", run: () => void openExportView() },
   { name: "/settings", hint: "Open settings & capabilities", run: () => openSettings() },
@@ -3238,6 +3768,17 @@ async function exportActive() {
   if (!state.activeId) return;
   const path = await invoke("export_session", { id: state.activeId });
   toast(`Exported: ${path}`);
+}
+
+/* /diff (codex parity): review what changed in the workspace. The stat goes
+   first so the shape of the change is readable before the details; both run
+   through the run panel, the same surface any git command shares. */
+function reviewDiff() {
+  state.runPanel.open = true;
+  setRunMode("run");
+  renderRunPanel();
+  persistRunLines();
+  runShellCommand("git --no-pager diff --stat && git --no-pager diff");
 }
 
 /* /compact (codex parity): ask the backend to summarize the stored history
@@ -3681,6 +4222,36 @@ function readLine(read) {
   return `${where} · ${size}${mime}${parts}${r.truncated ? " · truncated" : ""}`;
 }
 
+/* One fetched prompt's receipt: server/name, message count, size, cut. */
+function promptLine(view) {
+  const v = view || {};
+  const where = `${v.server}/${v.name}`;
+  if (v.empty) return `${where} · no messages`;
+  const size = v.truncated ? `${v.chars} of ${v.source_chars} chars` : `${v.chars} chars`;
+  return `${where} · ${v.messages} message${v.messages === 1 ? "" : "s"} · ${size}${v.truncated ? " · truncated" : ""}`;
+}
+
+async function fetchPrompt(name, server) {
+  const picker = $("mcp-read-server");
+  const target = server || (picker ? picker.value : "");
+  const out = $("mcp-read-out");
+  out.textContent = "";
+  out.hidden = true;
+  if (!target) return panelNote("mcp-read-msg", "no connected MCP server to fetch from", true);
+  if (!name) return panelNote("mcp-read-msg", "a prompt fetch needs a name", true);
+  let view;
+  try {
+    view = await invoke("mcp_get_prompt", { server: target, name, nowMs: Date.now() });
+  } catch (err) {
+    panelNote("mcp-read-msg", String(err), true);
+    return;
+  }
+  state.mcpRead = view;
+  out.textContent = view.empty ? "" : view.text;
+  out.hidden = !!view.empty;
+  panelNote("mcp-read-msg", promptLine(view), false);
+}
+
 function renderCatalog(note) {
   const host = $("mcp-catalog");
   if (!host) return;
@@ -3724,7 +4295,12 @@ function renderCatalog(note) {
     }
     for (const prompt of view.prompts || []) {
       const line = el("div", "cat-row cat-prompt");
-      line.appendChild(el("span", "cat-name", prompt.name));
+      const use = el("button", "cat-use", prompt.name);
+      use.type = "button";
+      use.title = prompt.description || prompt.name;
+      use.setAttribute("aria-label", `Fetch prompt ${prompt.name}`);
+      use.addEventListener("click", () => void fetchPrompt(prompt.name, view.server));
+      line.appendChild(use);
       line.appendChild(el("span", "cat-why", promptRowLine(prompt)));
       if (prompt.description) line.appendChild(el("span", "cat-desc", prompt.description));
       block.appendChild(line);
@@ -4257,6 +4833,9 @@ async function openSettings() {
     setSkillsDir.value = s.skills_dir || "";
     setMemory.checked = s.memory_enabled !== false;
     setMemoryPath.value = s.memory_path || "";
+    setWebTools.checked = s.web_tools_enabled !== false;
+    setSearchUrl.value = s.search_api_url || "";
+    setSearchKey.value = s.search_api_key || "";
     state.budget = s.context_budget ?? 32768;
     setContextBudget.value = String(state.budget);
     state.mcpServers = Array.isArray(s.mcp_servers) ? s.mcp_servers : [];
@@ -4325,6 +4904,9 @@ settingsForm.addEventListener("submit", async (ev) => {
       memoryPath: setMemoryPath.value,
       requireApproval: setApproval.checked,
       contextBudget: Math.max(0, Math.floor(Number(setContextBudget.value) || 0)),
+      webToolsEnabled: setWebTools.checked,
+      searchApiUrl: setSearchUrl.value,
+      searchApiKey: setSearchKey.value,
       mcpServers: state.mcpServers,
       providers: state.providers,
     });
@@ -4334,7 +4916,10 @@ settingsForm.addEventListener("submit", async (ev) => {
     // directory, so the tree is dropped and refetched from the new root.
     state.workspaceRoot = setWorkspace.value || "";
     fileTree.cache = {};
-    if (fileTree.open) void restoreFileTree();
+    // Only the Files pane reads these listings. Refetch on a root change while
+    // it is the pane on screen; otherwise the next visit's `ensureFilesLoaded`
+    // sees an empty cache and fetches the new root then.
+    if ($("files-section").classList.contains("active")) void restoreFileTree();
     // The run output is stored per root, so the new root's history takes over.
     restoreRunLines();
     renderRunPanel();
@@ -5381,7 +5966,10 @@ messagesEl.addEventListener("click", async (ev) => {
   }
 });
 
-$("new-chat").addEventListener("click", () => newChat().catch(() => {}));
+/* The sidebar's prominent action adds a workspace, not a chat (rev 111): with no
+   workspace configured there is nothing for a chat to belong to, and a chat is
+   started from a workspace row's "+", Cmd/Ctrl+N, or the palette's /new. */
+$("workspace-add-primary").addEventListener("click", () => openAddWorkspace());
 $("open-settings").addEventListener("click", () => openSettings());
 
 /* Sidebar navigation opens the panel that owns the thing instead of inventing a
@@ -5960,6 +6548,11 @@ function focusSection(sectionId) {
     pane.classList.toggle("active", on);
     if (on) target = pane;
   });
+  // The Files pane is the one section whose content is a fetch rather than a
+  // render of state already in hand, so arriving at it is what starts the
+  // fetch. It happens on the way in, before the pane is scrolled into view, so
+  // the first paint lands in a pane the user is already looking at.
+  if (sectionId === "files-section") void ensureFilesLoaded();
   document.querySelectorAll(".set-tab").forEach((tab) => {
     const on = tab.dataset.section === sectionId;
     tab.classList.toggle("active", on);
@@ -6035,38 +6628,29 @@ if (wsAddModal) {
       void submitAddWorkspace();
     }
   });
-  $("ws-add-browse").addEventListener("click", () => {
+  $("ws-add-browse").addEventListener("click", () => void chooseFolderNative());
+  $("ws-add-browse-manual").addEventListener("click", () => {
     const host = $("ws-add-browser");
     const reveal = host.classList.contains("hidden");
-    host.classList.toggle("hidden", !reveal);
-    $("ws-add-browse").setAttribute("aria-expanded", String(reveal));
-    if (reveal) void browseFolder($("ws-add-root").value.trim());
+    if (reveal) {
+      showInAppBrowser();
+      void browseFolder($("ws-add-root").value.trim());
+    } else {
+      hideInAppBrowser();
+    }
   });
   $("ws-browse-up").addEventListener("click", () => {
     if (state.wsBrowse && state.wsBrowse.parent) void browseFolder(state.wsBrowse.parent);
   });
   $("ws-browse-use").addEventListener("click", () => {
     if (!state.wsBrowse || !state.wsBrowse.path) return;
-    $("ws-add-root").value = state.wsBrowse.path;
-    $("ws-add-browser").classList.add("hidden");
-    $("ws-add-browse").setAttribute("aria-expanded", "false");
-    // The name starts empty and is optional, so the folder's own name is only
-    // *suggested* — never forced — and only while the field is still untouched.
-    if (!$("ws-add-name").value.trim()) {
-      const parts = state.wsBrowse.path.split("/").filter(Boolean);
-      $("ws-add-name").value = parts.length ? parts[parts.length - 1] : "";
-    }
-    $("ws-add-err").textContent = "";
-    $("ws-add-name").focus();
+    adoptRoot(state.wsBrowse.path);
   });
   // A click on the backdrop dismisses, the same gesture the other dialogs take.
   wsAddModal.addEventListener("click", (e) => {
     if (e.target === wsAddModal) closeAddWorkspace();
   });
 }
-
-$("nav-plugins").addEventListener("click", () => navTo("cap-list"));
-$("nav-mcp").addEventListener("click", () => navTo("set-mcp"));
 
 // The Workspaces header: reveal the search field, re-read the chat list, or go
 // add a workspace. The search field stays out of the way until it is asked for.
@@ -6078,12 +6662,21 @@ $("sessions-search").addEventListener("click", () => {
   $("sessions-search").setAttribute("aria-expanded", String(reveal));
   if (reveal) field.focus();
 });
-$("sessions-refresh").addEventListener("click", () => reloadSessionList().catch(() => {}));
-// The folder-plus in the Workspaces header opens the flow that *creates* a
-// workspace. It deliberately does not jump into Settings: choosing a folder and
-// the things that may run in it is the sidebar's business, and Settings only
-// inspects and edits what exists.
-$("workspace-add").addEventListener("click", () => openAddWorkspace());
+// The head's sliders: one menu for how the chats are grouped, ordered and
+// filtered, instead of three glyph controls whose meaning has to be guessed. The
+// click is stopped at the button — the document closes any menu a click lands
+// outside of, so without this the menu opened and shut in the same gesture
+// (which is exactly what the page guard caught it doing).
+$("session-view").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const btn = $("session-view");
+  if (rowMenu && rowMenu.anchor === btn) return void closeRowMenu(true);
+  sessionViewMenu(btn);
+});
+// The folder-plus in the sidebar's head row is the one door to the flow that
+// *creates* a workspace. It deliberately does not jump into Settings: choosing a
+// folder and the things that may run in it is the sidebar's business, and
+// Settings only inspects and edits what exists.
 
 // Narrow windows turn the sidebar into a drawer (see the 720px rules): the
 // button opens it, and picking a chat closes it, because the point of that tap is
@@ -6236,7 +6829,7 @@ input.addEventListener("keydown", (e) => {
 
 /* cache[path] is missing (closed) or { status, entries, error }; "" is the
    workspace root. `status` is "loading" | "ok" | "error". */
-const fileTree = { open: false, cache: {} };
+const fileTree = { cache: {} };
 
 /* Flatten the lazy cache into the rows the tree paints, in paint order.
    Pure — the harness feeds a fixture cache and checks order, depth,
@@ -6342,11 +6935,6 @@ function renderFileTree() {
   const host = $("file-tree");
   if (!host) return;
   host.textContent = "";
-  if (!fileTree.open) {
-    host.hidden = true;
-    return;
-  }
-  host.hidden = false;
   for (const row of fileRowsFrom(fileTree.cache)) {
     const el = document.createElement("button");
     el.type = "button";
@@ -6435,13 +7023,12 @@ async function restoreFileTree() {
   await Promise.all(open.map((path) => loadFileDir(path)));
 }
 
-/* Show or hide the panel; the first open loads the workspace root. */
-async function toggleFilePanel() {
-  fileTree.open = !fileTree.open;
-  const toggle = $("files-toggle");
-  if (toggle) toggle.setAttribute("aria-expanded", String(fileTree.open));
-  if (fileTree.open && !Object.keys(fileTree.cache).length) await restoreFileTree();
-  renderFileTree();
+/* Load the listing the Files section shows, once: selecting the section is the
+   gesture that needs it, and an already-filled cache needs nothing. Visibility
+   belongs to the pane (`focusSection`), so there is no open/closed flag and no
+   second place that could disagree about whether the tree is showing. */
+async function ensureFilesLoaded() {
+  if (!Object.keys(fileTree.cache).length) await restoreFileTree();
 }
 
 function refreshFileTree() {
@@ -6449,7 +7036,6 @@ function refreshFileTree() {
   void restoreFileTree();
 }
 
-$("files-toggle").addEventListener("click", () => void toggleFilePanel());
 $("files-refresh").addEventListener("click", () => refreshFileTree());
 $("file-tree").addEventListener("click", (ev) => {
   const row = ev.target && ev.target.closest ? ev.target.closest(".file-row") : null;
@@ -6705,22 +7291,27 @@ $("run-form").addEventListener("submit", async (ev) => {
   // One run at a time: a second command would interleave its lines with the
   // first, and the panel has no way to tell them apart on screen.
   if (!command || state.runPanel.activeId) return;
-  field.value = "";
+  runShellCommand(command);
+});
+
+/** Run one command through the run panel and stream its output in. `/diff`
+    takes this path with a git command, so the review is the same surface. */
+function runShellCommand(command) {
+  const field = $("run-input");
+  if (field) field.value = "";
   const runId = `run-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
   state.runPanel.activeId = runId;
   setRunChip(true);
   pushRunLine("note", "$ " + command);
   scheduleRunPaint();
-  try {
-    await invoke("run_command", { runId, command });
-  } catch (err) {
+  invoke("run_command", { runId, command }).catch((err) => {
     state.runPanel.activeId = null;
     setRunChip(false);
     pushRunLine("note", `[refused: ${err}]`);
     scheduleRunPaint();
     persistRunLines();
-  }
-});
+  });
+}
 
 $("run-clear").addEventListener("click", () => {
   state.runPanel.lines = [];
@@ -6814,13 +7405,9 @@ window.addEventListener("resize", () => {
 
 async function init() {
   try {
-    await refreshSessions();
-    const streams = await invoke("current_stream");
-    for (const s of streams) {
-      state.streams[s.session_id] = s;
-      // Warm each streaming chat's cache so switching to it renders live.
-      ensureSessionCache(s.session_id);
-    }
+    // Settings come first on purpose: which workspace is active decides which
+    // chat the session sync opens, and a selection made before the active
+    // workspace is known could land on a chat another workspace owns.
     const settings = await invoke("get_settings");
     state.model = settings.model;
     state.budget = settings.context_budget ?? 32768;
@@ -6832,6 +7419,16 @@ async function init() {
     // it, so it needs it before the first open.
     state.workspaceRoot = settings.bash_workspace || "";
     state.presets = settings.presets || [];
+    // How this person reads the list is remembered before the first paint, so a
+    // restart opens on the view they left, not on the default and a jump.
+    restoreSessionView();
+    await refreshSessions();
+    const streams = await invoke("current_stream");
+    for (const s of streams) {
+      state.streams[s.session_id] = s;
+      // Warm each streaming chat's cache so switching to it renders live.
+      ensureSessionCache(s.session_id);
+    }
     // The run panel keeps what it showed: reload that history for this root.
     restoreRunLines();
     renderRunPanel();
@@ -7335,10 +7932,6 @@ function refreshSection(sectionId) {
   if (refresh) Promise.resolve(refresh()).catch(() => {});
 }
 
-$("nav-automation").addEventListener("click", () => {
-  navTo("jobs-section");
-  refreshJobs().catch(() => {});
-});
 $("jobs-refresh").addEventListener("click", () => refreshJobs().catch(() => {}));
 $("ctx-refresh").addEventListener("click", () => refreshContext().catch(() => {}));
 $("ctx-compact").addEventListener("click", () => compactNow().catch(() => {}));

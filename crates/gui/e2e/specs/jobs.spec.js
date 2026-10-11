@@ -3,9 +3,12 @@ const { $, expect } = require("@wdio/globals");
 const { textOf, rowCount } = require("./helpers");
 
 describe("M7 background jobs", () => {
-  it("opens the jobs panel from the Automation nav item", async () => {
-    await $("#nav-automation").click();
-    await $("#jobs-list").waitForDisplayed({ timeoutMsg: "the Automation item did not reach the jobs panel" });
+  it("opens the jobs panel from the Settings rail", async () => {
+    // The sidebar's Automation row is gone (rev 110); Jobs is a Settings
+    // section, and this is the click path a user has.
+    await $("#open-settings").click();
+    await $("#set-tab-jobs-section").click();
+    await $("#jobs-list").waitForDisplayed({ timeoutMsg: "the Jobs section did not open" });
     await expect($("#jobs-refresh")).toBeDisplayed();
   });
 

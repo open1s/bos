@@ -196,6 +196,23 @@ impl Store {
         &self.file.history
     }
 
+    /// Deliver everything due at `now_ms` and persist **only if something was
+    /// delivered**.
+    ///
+    /// The pane ticks this every 30 s whether or not a reminder exists, so an
+    /// unconditional save meant serialize + temp file + rename 2 880 times a day
+    /// for a file that had not changed. `tick` already no-ops when nothing is
+    /// due; this is the persistence half of the same rule. A tick that *did*
+    /// deliver must still persist, or a restart would deliver the same repeat
+    /// again — both halves are asserted.
+    pub(crate) fn tick_due(&mut self, now_ms: u64) -> Result<Vec<Delivery>, String> {
+        let fired = self.tick(now_ms);
+        if !fired.is_empty() {
+            self.save()?;
+        }
+        Ok(fired)
+    }
+
     /// Add a reminder, or report why it cannot be added.
     pub(crate) fn add(
         &mut self,
@@ -618,5 +635,45 @@ mod tests {
         s.cancel(&a.id).unwrap();
         assert_eq!(s.schedules().len(), 1);
         assert_eq!(s.schedules()[0].id, b.id);
+    }
+
+    #[test]
+    fn a_tick_with_nothing_due_leaves_the_file_alone() {
+        // This assertion is about the bytes on disk, so it owns its path: a fixed
+        // temp name would make it an assertion about whatever the last run left.
+        let path = std::env::temp_dir().join(format!("bos-sched-tick-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut store = Store::load(&path);
+        store
+            .add("stand up", Cadence::Once { at_ms: 5 * MIN }, 0)
+            .unwrap();
+        store.save().unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // Nothing due: no delivery and no write. The pane ticks every 30 s even
+        // with an empty list, so this is the common case rather than the rare one.
+        let fired = store.tick_due(MIN).unwrap();
+        assert!(fired.is_empty(), "nothing is due yet: {fired:?}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "a tick that delivered nothing rewrote the file anyway"
+        );
+
+        // Due: it delivers *and* persists, or a restart delivers the same
+        // reminder again.
+        let fired = store.tick_due(5 * MIN).unwrap();
+        assert_eq!(fired.len(), 1);
+        assert_ne!(
+            fs::read(&path).unwrap(),
+            before,
+            "a delivery was not written back"
+        );
+        let mut reopened = Store::load(&path);
+        assert!(
+            reopened.tick_due(5 * MIN).unwrap().is_empty(),
+            "the delivery was not persisted, so a restart would deliver it twice"
+        );
+        let _ = fs::remove_file(&path);
     }
 }

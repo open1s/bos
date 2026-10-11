@@ -26,6 +26,14 @@
   LIVE.failNext = (cmd, message, count) => {
     LIVE.failures.push({ cmd, message, left: count || 1 });
   };
+  /* The system folder panel is a modal: a headless page cannot open one, and the
+     double cannot pretend to have shown one either. What it can do is answer the
+     way the platform's program answers — a path, a dismissal, or the absence of
+     any panel — which is exactly what the app's decisions are about. */
+  LIVE.answers = {};
+  LIVE.answerNext = (cmd, value) => {
+    LIVE.answers[cmd] = value;
+  };
   LIVE.called = (cmd) => LIVE.calls.filter((c) => c.cmd === cmd);
   LIVE.sessions = () => copy(store.sessions);
   LIVE.settings = () => copy(store.settings);
@@ -341,6 +349,9 @@
     memory_enabled: true,
     memory_path: "",
     context_budget: 32768,
+    web_tools_enabled: true,
+    search_api_url: "",
+    search_api_key: "",
     mcp_servers: [
       { name: "filesystem", transport: "stdio", command: "mcp-filesystem", url: "", enabled: true },
     ],
@@ -927,6 +938,27 @@
     },
   });
 
+  /* The workspace the Files section walks: one folder holding one file, keyed by
+     path, so expanding the folder answers with *that* folder's children rather
+     than the root's again — a fixture with one level cannot tell the two apart. */
+  const workspaceFiles = {
+    "": {
+      entries: [
+        { name: "src", path: "src", is_dir: true, bytes: 0 },
+        { name: "README.md", path: "README.md", is_dir: false, bytes: 21 },
+      ],
+      truncated: false,
+    },
+    src: {
+      entries: [{ name: "main.rs", path: "src/main.rs", is_dir: false, bytes: 10 }],
+      truncated: false,
+    },
+  };
+  const workspaceText = {
+    "README.md": "# bos notes\n",
+    "src/main.rs": "fn main()\n",
+  };
+
   const handlers = {
     list_sessions: () =>
       copy(store.sessions)
@@ -991,17 +1023,32 @@
       store.trash = [];
       return n;
     },
-    send_message: ({ sessionId, text, truncateFrom }) => {
+    send_message: ({ sessionId, text, images, truncateFrom }) => {
       if (store.streams[sessionId]) throw new Error("already streaming");
       const msgs = store.cache[sessionId] || (store.cache[sessionId] = []);
       if (typeof truncateFrom === "number") msgs.splice(truncateFrom);
-      msgs.push({ role: "User", text, reasoning: "", tools: [], error: null });
+      msgs.push({
+        role: "User",
+        text,
+        reasoning: "",
+        tools: [],
+        images: images || [],
+        error: null,
+      });
       return scriptTurn(sessionId, text);
     },
     retry_last: ({ sessionId }) => {
       const msgs = store.cache[sessionId] || [];
+      const lastUser = [...msgs].reverse().find((m) => m.role === "User");
       msgs.splice(Math.max(0, msgs.length - 2));
-      const lastUser = [...(msgs)].reverse().find((m) => m.role === "User");
+      msgs.push({
+        role: "User",
+        text: lastUser ? lastUser.text : "again",
+        reasoning: "",
+        tools: [],
+        images: lastUser ? lastUser.images || [] : [],
+        error: null,
+      });
       return scriptTurn(sessionId, lastUser ? lastUser.text : "again");
     },
     stop_streaming: ({ sessionId }) => {
@@ -1097,6 +1144,9 @@
         memoryPath: "memory_path",
         requireApproval: "require_approval",
         contextBudget: "context_budget",
+        webToolsEnabled: "web_tools_enabled",
+        searchApiUrl: "search_api_url",
+        searchApiKey: "search_api_key",
         mcpServers: "mcp_servers",
         providers: "providers",
       };
@@ -1355,8 +1405,14 @@
       return copy(store.settings);
     },
     search_files: () => [],
-    list_files: () => [],
-    read_file: () => ({ text: "", lines: [] }),
+    list_files: ({ path }) => copy(workspaceFiles[path] || { entries: [], truncated: false }),
+    read_file: ({ path }) => ({
+      path,
+      text: workspaceText[path] || "",
+      bytes: (workspaceText[path] || "").length,
+      truncated: false,
+      lines: [],
+    }),
     // M4/M6/M7/M10/M11/M14 panels: not driven here (page_selftest owns them
     // with settled fixtures), but answer honestly if a refresh fires.
     jobs_list: () => store.jobs.map(jobRecord),
@@ -1583,6 +1639,15 @@
       return copy({ ...store.settings, active_workspace: id });
     },
     // The folder chooser's own tree, one level at a time.
+    choose_folder: ({ start }) => {
+      const next = LIVE.answers.choose_folder;
+      if (next !== undefined) {
+        LIVE.answers.choose_folder = undefined;
+        if (next instanceof Error) throw next;
+        return next;
+      }
+      return start ? `${start}/bos` : "/home/e2e";
+    },
     list_folder: ({ path }) => {
       const tree = {
         "/home/e2e": { parent: "/home", dirs: ["bos", "Documents"] },

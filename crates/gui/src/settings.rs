@@ -41,6 +41,11 @@ fn unversioned_settings() -> u32 {
     UNVERSIONED_SETTINGS
 }
 
+/// Serde fallback for opt-in booleans that default to *on*.
+fn default_true() -> bool {
+    true
+}
+
 /// Editable connection and prompt settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -87,6 +92,15 @@ pub(crate) struct Settings {
     /// Send-side context budget in tokens: transcripts estimated over this
     /// are compacted into a summary before each turn; 0 disables it.
     pub(crate) context_budget: usize,
+    /// Register the read-only web tools (`web_fetch`, `web_search`) on the
+    /// chat agent. Global, not per-workspace: the network is the same
+    /// network from every folder.
+    #[serde(default = "default_true")]
+    pub(crate) web_tools_enabled: bool,
+    /// Optional JSON search endpoint (Tavily-style); empty uses DuckDuckGo.
+    pub(crate) search_api_url: String,
+    /// Optional key sent with `search_api_url`; empty means none.
+    pub(crate) search_api_key: String,
     /// Attach a persistent memory store so the agent learns across sessions.
     pub(crate) memory_enabled: bool,
     /// Memory JSON-lines file; empty means `~/.bos/gui/memory.jsonl`.
@@ -873,6 +887,9 @@ impl Settings {
             skills_dir: DEFAULT_SKILLS_DIR.to_string(),
             require_approval: true,
             context_budget: 32_768,
+            web_tools_enabled: true,
+            search_api_url: String::new(),
+            search_api_key: String::new(),
             memory_enabled: true,
             memory_path: String::new(),
             mcp_servers: Vec::new(),
@@ -1759,7 +1776,10 @@ mod tests {
             ..Default::default()
         };
         w.apply_draft(&draft).expect("draft applies");
-        assert_eq!(w.model, "glm-4.7", "the model is trimmed, not stored as typed");
+        assert_eq!(
+            w.model, "glm-4.7",
+            "the model is trimmed, not stored as typed"
+        );
         assert_eq!(w.system_prompt, "be terse");
         assert!(!w.bash_enabled && w.require_approval);
         assert_eq!(w.disabled_plugins, vec!["audit".to_string()]);
@@ -1809,7 +1829,8 @@ mod tests {
             },
         ];
         let mut w = Workspace::adopted_from(&global, "w1", 1);
-        w.apply_draft(&WorkspaceDraft::default()).expect("empty draft");
+        w.apply_draft(&WorkspaceDraft::default())
+            .expect("empty draft");
         let on: Vec<bool> = w.mcp_servers.iter().map(|s| s.enabled).collect();
         assert_eq!(on, vec![true, false], "no choice means the seeded answer");
         assert!(WorkspaceDraft::default().is_empty());
@@ -1826,5 +1847,4 @@ pub(crate) struct Preset {
     pub(crate) name: String,
     /// The configuration copied into a new workspace.
     pub(crate) workspace: Workspace,
-
 }

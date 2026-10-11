@@ -5,7 +5,7 @@ const { openSettings, closeSettings } = require("./helpers");
 describe("shell chrome", () => {
   it("shows the workspace, the composer and a way to start a chat", async () => {
     await expect($("#sidebar")).toBeDisplayed();
-    await expect($("#new-chat")).toBeDisplayed();
+    await expect($("#workspace-add-primary")).toBeDisplayed();
     await expect($("#input")).toBeDisplayed();
   });
 

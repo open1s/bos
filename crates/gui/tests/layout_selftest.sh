@@ -27,7 +27,7 @@ open(dst, "w", encoding="utf-8").write(html.replace("</body>", tag + "\n</body>"
 PY
 fail=0
 for W in $WIDTHS; do
-  "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-crashpad --disable-breakpad \
+  "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-crashpad \
     --no-first-run --no-default-browser-check --disable-dev-shm-usage --hide-scrollbars \
     --user-data-dir="$P/u$W" --allow-file-access-from-files --window-size=$W,900 \
     --dump-dom "file://$PWD/ui/.layout_probe.html" > "$P/dom$W.html" 2>/dev/null
@@ -48,10 +48,23 @@ print(f'width={d["viewport"]} doc={d["docClientW"]}/{d["docScrollW"]} '
       f'statusbar={box("statusbar")} offscreen=[{",".join(d["offscreen"])}] '
       f'sidebarSqueezed={d.get("sidebarSqueezed")} rows={d.get("sidebarRows")} '
       f'modalCard={d["modal"]["card"]} modalOutside=[{",".join(d["modal"]["outside"])}] '
+      f'painted=[{",".join(d.get("painted", []))}] '
       f'drawer={d.get("drawer")} modalClipped=[{",".join(d["modal"]["clipped"])}] scrolledX={d.get("scrolledX")} widest=[{",".join(d.get("widest", []))}] leftmost=[{",".join(d.get("leftmost", []))}]')
 PY
 )"
+  attach="$(python3 - "$P/dom$W.html" <<'PY'
+import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r'<[a-zA-Z]+[^>]*\bid="result-attach"[^>]*>(.*?)</[a-zA-Z]+>', raw, re.S)
+if not m:
+    print("attach=missing")
+    raise SystemExit
+d = json.loads(m.group(1))
+print("attach=" + json.dumps(d))
+PY
+)"
   echo "[layout] $line"
+  echo "[layout] $attach"
   echo "$line" | grep -q "doc=[0-9]*/[0-9]*" || fail=1
   echo "$line" | grep -q "scrolledX=0" || { echo "[layout]  WIDE: the window can be panned sideways"; fail=1; }
   echo "$line" | grep -q "offscreen=\[\]" || { echo "[layout]  WIDE: elements leave the viewport"; fail=1; }
@@ -64,6 +77,18 @@ PY
     echo "$line" | grep -q "'present': False" || { echo "[layout]  WIDE: the drawer shows on a wide window"; fail=1; }
   fi
   echo "$line" | grep -q "sidebarSqueezed=False" || { echo "[layout]  WIDE: the chat list is squeezed into an unreadable box"; fail=1; }
+  echo "$line" | grep -q "painted=\[\]" || { echo "[layout]  WIDE: something in the UI paints a shadow, a blur or a gradient"; fail=1; }
+  # The attach strip is only visible with images staged, which the empty-window
+  # measures above never produce — these are its own assertions.
+  echo "$attach" | grep -q '"present": true' || { echo "[layout]  WIDE: the attach probe did not run"; fail=1; }
+  echo "$attach" | grep -q '"chips": 2' || { echo "[layout]  WIDE: staging two images must draw two chips"; fail=1; }
+  echo "$attach" | grep -q '"sendEnabledImagesOnly": true' || { echo "[layout]  WIDE: staged images alone must enable Send"; fail=1; }
+  echo "$attach" | grep -q '"overlapsInput": false' || { echo "[layout]  WIDE: the attach strip covers the composer input"; fail=1; }
+  echo "$attach" | grep -q '"insideViewport": true' || { echo "[layout]  WIDE: the attach strip leaves the viewport"; fail=1; }
+  echo "$attach" | grep -q '"paletteCoversStrip": true' || { echo "[layout]  WIDE: the palette does not cover the strip it shares an anchor with"; fail=1; }
+  echo "$attach" | grep -q '"stripBackAfterPalette": true' || { echo "[layout]  WIDE: the attach strip does not come back after the palette closes"; fail=1; }
+  echo "$attach" | grep -q '"chipsAfterRemove": 1' || { echo "[layout]  WIDE: the chip's remove control does not remove its own chip"; fail=1; }
+  echo "$attach" | grep -q '"hiddenWhenEmpty": true' || { echo "[layout]  WIDE: the empty strip must hide and disable Send again"; fail=1; }
 done
 echo "[layout] failures: $fail"
 exit $fail

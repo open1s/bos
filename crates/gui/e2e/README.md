@@ -45,6 +45,7 @@ commands behind the elements answer for real.
 * The rules spec adds a **global** rule (`read_file` → allow) and revokes it
   again, which touches the real rules file for the duration of the test. A
   failed run could leave that one rule behind; revoke it from the Rules panel.
-* The suite starts a fresh chat (`#new-chat`) for session-scoped panels, so it
+* The suite starts a fresh chat through the active workspace row's `+`
+  (`#session-list .ws-head.active .ws-new`) for session-scoped panels, so it
   never depends on the state of an existing conversation.
 * Run it under a virtual display on a headless Linux box: `xvfb-run`.

@@ -22,6 +22,9 @@ class McpHttpHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
+
+
     def do_POST(self):
         try:
             content_length = int(self.headers.get("Content-Length", 0))
@@ -38,7 +41,18 @@ class McpHttpHandler(BaseHTTPRequestHandler):
             params = req.get("params", {})
             req_id = req.get("id")
 
-            result = self._dispatch(method, params)
+            try:
+                result = self._dispatch(method, params)
+            except McpRpcError as e:
+                # A JSON-RPC error envelope, not an error-shaped result: the
+                # client must see code+message in the `error` field.
+                if req_id is not None:
+                    self._send_json(200, {"jsonrpc": "2.0", "id": req_id,
+                                          "error": {"code": e.code, "message": e.message}})
+                else:
+                    self.send_response(202)
+                    self.end_headers()
+                return
 
             if req_id is not None:
                 resp = {"jsonrpc": "2.0", "id": req_id, "result": result}
@@ -131,9 +145,64 @@ class McpHttpHandler(BaseHTTPRequestHandler):
                 elif name == "time":
                     return {"content": [{"type": "text", "text": str(int(time.time()))}]}
                 return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
+            elif method == "prompts/list":
+                return {
+                    "prompts": [
+                        {
+                            "name": "review",
+                            "description": "Review a piece of code",
+                            "arguments": [
+                                {
+                                    "name": "focus",
+                                    "description": "What to focus the review on",
+                                    "required": False,
+                                }
+                            ],
+                        },
+                        {
+                            "name": "standup",
+                            "description": "Write a standup update",
+                            "arguments": [],
+                        },
+                    ]
+                }
+            elif method == "prompts/get":
+                name = params.get("name", "")
+                args = params.get("arguments", {}) or {}
+                if name == "review":
+                    focus = args.get("focus", "general correctness")
+                    return {
+                        "description": "Review a piece of code",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": {
+                                    "type": "text",
+                                    "text": f"Please review the following code with a focus on {focus}. Report findings with file and line.",
+                                },
+                            }
+                        ],
+                    }
+                elif name == "standup":
+                    return {
+                        "description": "Write a standup update",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": {
+                                    "type": "text",
+                                    "text": "Write a three-line standup update: yesterday, today, blockers.",
+                                },
+                            }
+                        ],
+                    }
+                raise McpRpcError(-32602, f"Unknown prompt: {name}")
             elif method == "notifications/initialized":
                 return {}
             return {"error": f"Method not found: {method}"}
+        except McpRpcError:
+            # Deliberate RPC errors propagate to do_POST's envelope handler.
+            raise
         except Exception as e:
             print(f"[MCP Server] Error in _dispatch for method {method}: {e}", file=sys.stderr, flush=True)
             traceback.print_exc(file=sys.stderr)
@@ -152,6 +221,14 @@ class McpHttpHandler(BaseHTTPRequestHandler):
     def _send_error(self, code, message):
         self._send_json(200, {"jsonrpc": "2.0", "error": {"code": code, "message": message}})
 
+
+class McpRpcError(Exception):
+    """A JSON-RPC error to send as an error envelope, not as a result."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 def run_server(port=8000):
     try:

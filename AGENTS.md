@@ -170,7 +170,7 @@ render bug belongs in a fixture guard, not e2e. All guards are shell scripts und
 | `package_selftest.sh` | `tauri.conf.json` + `icons/` as files | identifier/product agreement, `frontendDist` and `index.html` present, no build step, every listed icon exists and carries its format's magic bytes, one icon per platform | the install artifact — a renamed or truncated icon fails the bundle silently otherwise |
 | `wiring_selftest.sh` | source text, both directions | `#[tauri::command]` ↔ `invoke()` names, and the plan status vocabulary (`PLAN_ICONS` vs the tool's JSON schema) | every command reachable, no phantom calls, no cross-crate vocabulary drift |
 | `page_selftest.sh` | shipped page + **settled-fixture** bridge | handler → invoke → render, one microtask pass | static wiring of a panel/dialog on the real markup |
-| `live_selftest.sh` | shipped page + **stateful async** bridge (`tests/live/bridge.js`) | streams that end, queues that flush, approvals, rollbacks, PTY attach/write/kill, compaction splits, job tails, self-inspection, replay, scoped approval rules, durable reminders (add → tick → deliver-late → cancel → clear), knowledge curation (add → refuse a blank title → search → edit in place → delete), a per-tool MCP policy (deny → the row, the server badge and the self-inspection inventory all follow; ask → the default select; clear a rule), authoring a skill (the pane's listing against the double's directory → Use prefills the composer → a save lands in the pane, the capability list and the double's disk → a second save refuses by path → Replace overwrites in place), reading a server's published resources (the catalog listing → a row read into the pane → a body cut at its cap with both numbers → a URI the server does not hold → a resource with no text) | behaviors that only exist against a live backend |
+| `live_selftest.sh` | shipped page + **stateful async** bridge (`tests/live/bridge.js`) | streams that end, queues that flush, approvals, rollbacks, PTY attach/write/kill, compaction splits, job tails, self-inspection, replay, scoped approval rules, durable reminders (add → tick → deliver-late → cancel → clear), knowledge curation (add → refuse a blank title → search → edit in place → delete), a per-tool MCP policy (deny → the row, the server badge and the self-inspection inventory all follow; ask → the default select; clear a rule), adding a workspace (the sidebar opens its own dialog, the system panel's path lands while a dismissal changes nothing and an absent panel opens the in-app fallback with the reason, the fallback walks a real tree and reports a folder it cannot list, the MCP switches travel as one payload, the workspace lands in the store and the sidebar, a refusal keeps the dialog open with the fresh reason), authoring a skill (the pane's listing against the double's directory → Use prefills the composer → a save lands in the pane, the capability list and the double's disk → a second save refuses by path → Replace overwrites in place), reading a server's published resources (the catalog listing → a row read into the pane → a body cut at its cap with both numbers → a URI the server does not hold → a resource with no text) | behaviors that only exist against a live backend |
 | `perf_selftest.sh` | shipped page + the same bridge, asked for a heavy workspace via `window.__PERF_SCALE__` | frames requested, repaints run, DOM mutations, rows drawn, round trips, line caps held, per-turn cost across a soak | what a behavior costs — work-per-burst budgets for the streaming hot path and the shell's output flood, plus a 10-turn soak proving the drawn window and the per-turn cost do not grow with the session |
 | `e2e/` (WDIO + `tauri-driver`) | **the real app binary** | everything, including the Rust side | Linux/Windows only — tauri-driver has **no macOS backend**; the preflight blocks it |
 
@@ -248,12 +248,123 @@ invisible while the fixture had a single connected server (the picker's default
 *was* the row's server); the fixture grew a fourth server and the check clicks
 *its* row while the picker names another. Write the precondition down next to the
 assertion: a fixture that cannot distinguish the defect is a fixture, not a test.
+The Add-workspace batch produced a third instance from the other direction:
+**redundant guards make a check indistinguishable from itself.** A missing root is
+refused twice — once by the `metadata` lookup, once by `canonicalize` — so weakening
+the lookup left "a missing root is refused" green. The test now also hands the
+function a path that *exists and is a file*, which only the directory rule refuses.
+When two code paths produce one outcome, no test on that outcome covers either one.
 
 **A mutation count must be drained in both places.** `takeRecords()` returns only
 what is *still queued*; records delivered to the observer's callback are gone by
 then, and an empty callback throws them away. Count in the callback **and** with
 `takeRecords()` — one path alone silently drops everything that spans an `await`,
 which is every turn, flood and post-frame repaint.
+
+**A settled fixture cannot answer per argument.** `page_selftest.sh`'s fixtures
+are static, so a command whose answer *depends on what it was asked* — the folder
+chooser, which returns a different level for each path — cannot be checked with one
+frozen value. The dispatcher now calls a fixture that is a function, and the folder
+fixture is one; before that, the "descend, then Use this folder" check asserted the
+path of the level the fixture always returned, which is a check that would have
+passed for the wrong reason. When a fixture has to lie to make a gesture checkable,
+prefer teaching the fixture the argument.
+
+**A stale global status makes a fresh verdict unknowable.** The Add-workspace
+dialog decided whether it had succeeded by reading `state.error` *after* the command
+— and any earlier failure in the run left that non-empty, so a **successful**
+creation kept the dialog open and blamed the folder for it. The live guard caught it
+(a `waitFor` for the dialog to close timed out). Clear the status before the attempt
+and let the verdict be this attempt's; a global that outlives its operation is not a
+result, it is a rumour.
+
+**A group derived from its members cannot show an empty one.** `groupSessions`
+built its groups by walking sessions, so a workspace with no chats was not a group at
+all — which meant a folder just added was invisible until someone happened to start a
+chat in it, and `+` had nothing to aim at. Groups are now seeded from the workspace
+list as well (the ones sessions did not mention come after them, in configured
+order), and the ui fixture asserts the empty group directly. The general shape: a
+list that exists to show a *set* must not be derived from the subset that happens to
+have members yet.
+
+**Scope a fixture query to the thing being asserted.** A check that "the remove form
+has no name field" searched the whole document for `.ws-name` and passed only
+accidentally, because no workspace header happened to be drawn behind the form; once
+empty workspaces gained a group, the header's own `.ws-name` span made it fail. The
+selector is now `.ws-form .ws-name`. An unscoped query in a fixture is an assertion
+about everything else on the page.
+
+**A modal cannot be driven — swap the modal call, do not skip it.** The platform's
+folder panel (`osascript`/`zenity`/PowerShell, `crates/gui/src/picker.rs`) is a dialog
+on the user's screen: no guard can click it, and no unit test can either. Leaving it
+untested is how a typo in the AppleScript wrapper ships, so the test runs **the same
+argv with only the panel statement replaced** by a reference to a folder that exists.
+That puts the `-e` list, the escaping, `POSIX path of` and the error-handler syntax
+under the real interpreter. The one statement the swap removes is still checked, by
+handing the **real** argv to `osacompile`, which validates the AppleScript — the
+`choose folder` verb, its parameter names, the handler — and writes a compiled script
+**without opening a panel**; a typo in the verb fails that check and nothing else.
+Exactly one thing is left unverified: the human click and what AppKit does with it,
+which is reported as such rather than claimed as automated. Two
+consequences worth copying: the swap is only honest if you assert it happened (a
+statement that silently fails to match would leave the panel call in place and hang
+the suite), and the shape test must also assert the parts a *successful* swap cannot
+exercise (the `-128` cancellation handler is why the panel can be dismissed without a
+red error — nothing else in that test would notice if its number were wrong).
+
+**Cancelling is not failing, and a modal's answer deserves a type.** `ChooseOutcome`
+is `Picked` / `Cancelled` / `Unavailable` rather than `Option<String>` plus an error,
+because the three answers lead to three different UIs: a path lands, a dismissal
+changes nothing and writes no error, and an absent panel opens the fallback **with the
+reason**. Collapsing them is how "changed my mind" becomes a red message. Building it
+found a small defect of the same family the guards exist for: the fallback's reason was
+written to the hint and then `showInAppBrowser()` — which sets the same hint — was
+called, so the user was told the fallback had opened and never why. One element written
+by two functions in sequence is a lost update; pass the reason into the reveal.
+
+**Flat is a rule, not a taste, and it is also the cheap option.** The Add-workspace
+dialog carries no shadow, gradient, blur or transition longer than a 90 ms hover
+colour; every state is one solid fill plus a 1px border; pointer hover and keyboard
+focus are the *same* colour change; sizes come from the shell's scale (`--space-*`,
+`--radius-*`, `--control-h`, `--font-ui`). The mechanism behind it: `contain: content`
+on the dialog card and on each of its scroll regions, one capability read **per open**
+(never per repaint), the MCP list read from state at **zero** round trips, no geometry
+reads in the folder browser, and no `innerHTML` anywhere in it.
+
+**Flat covers the whole chrome, and it is checked in two places because each is blind
+to the other.** Rev 108 removed the last seven shadows, the one `filter: brightness()`
+and 53 literal corner radii from `ui/style.css`, and both layers now own the rule.
+`markup_selftest.sh` scans the stylesheet as text — no `box-shadow`/`text-shadow`/
+`backdrop-filter`/`filter` other than `none`, no `gradient(`, no literal px radius, no
+non-`transform` transition over 120 ms — with two exemptions named in the guard (the
+streaming caret's `steps(1)` blink; the mobile drawer's `transform` slide), because a
+rule whose exceptions are implicit is a rule that quietly grows one. `layout_selftest.sh`
+asks every laid-out element in the shipped page what it *paints* (`painted=[]`), since
+the scan cannot see a shadow set from JS and the probe cannot see a rule that never
+applies; injecting one `.modal-card` shadow reddens both. Radii come from
+`--radius-xs|sm|md|lg` (4/6/8/12), and overlays take `--border-strong` instead of a
+shadow — on a dark background a shadow was buying almost nothing and the edge was
+already the depth cue.
+
+**A check that calls the inner function cannot see the pass that owns the element.**
+The token meter passed its ui check for months while it never painted in the app: the
+check called `renderUsage()` directly (the meter's text and near-limit class were right),
+and the defect lived one level out — `renderStatus()` cleared `#status-right` before
+filling it, so the meter was built and thrown away on every streaming frame. Fixing it
+took three attempts, each caught by a check written to enter through `renderStatus()`:
+the first still lost the meter to `renderArchived`, which clears the same host, so a value
+written between two clears is a lost update even when each writer looks correct on its
+own. Enter the door the user's gesture uses, and when several functions write one element,
+find out which of them clears it.
+
+**A bound proven on one path is not proven on another.** The perf soak showed the drawn
+transcript stays at `WINDOW` rows across a ten-turn stream, and the ui fixture showed one
+scroll-up adds one window — both green, while the scroll *handler* grew the window per
+scroll **event**. A gesture fires dozens per frame, so one flick measured 50 events →
+`windowExtra` 10 000 → the whole 1 000-row chat drawn: the documented cap held only until
+the first scroll-up. The check that sees it drives the burst the user's hand produces (50
+dispatched events, one render) instead of the single event the code was written for. When
+a limit is stated over a gesture, count the events one gesture can deliver.
 
 **Why `perf_selftest.sh` counts work instead of timing it:** it needs
 `--virtual-time-budget` for the bridge's pushed events to land, and under virtual

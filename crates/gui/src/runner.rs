@@ -6,10 +6,41 @@ use std::sync::Arc;
 
 use agent::{Agent, ContextBudget, StreamToken};
 use futures::StreamExt;
+use react::llm::{Content, ContentPart};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use crate::session::{ChatMessage, Role, ToolEvent};
+
+/// The outgoing user turn as the engine's `Content`.
+///
+/// Attachments arrive as `data:image/…;base64,…` URLs (already sanitized by
+/// [`crate::session::sanitize_images`]); they become binary parts so each
+/// vendor renders them the way its API expects. A turn with no images stays
+/// plain text, constructed directly rather than through `From<String>` so a
+/// prompt that happens to be valid JSON can never be re-read as parts.
+pub(crate) fn turn_content(text: String, images: &[String]) -> Content {
+    if images.is_empty() {
+        return Content::Text(text);
+    }
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        parts.push(ContentPart::Text { text });
+    }
+    for url in images {
+        let Some((meta, data)) = url
+            .strip_prefix("data:")
+            .and_then(|rest| rest.split_once(','))
+        else {
+            continue;
+        };
+        let mime = meta.strip_suffix(";base64").unwrap_or(meta);
+        parts.push(ContentPart::Binary {
+            binary: react::llm::Binary::from_base64(mime.to_string(), data.to_string(), None),
+        });
+    }
+    Content::parts(parts)
+}
 
 /// One update forwarded from the agent stream to the UI.
 #[derive(Debug, Clone)]
@@ -100,7 +131,9 @@ impl Runner {
         session.restore_messages(Vec::new());
         for message in transcript {
             match message.role {
-                Role::User if !message.text.is_empty() => session.add_user(message.text.clone()),
+                Role::User if !message.text.is_empty() || !message.images.is_empty() => {
+                    session.add_user_content(turn_content(message.text.clone(), &message.images));
+                }
                 Role::Assistant if !message.text.is_empty() => {
                     session.add_assistant(message.text.clone());
                 }
@@ -125,7 +158,7 @@ impl Runner {
         &mut self,
         session_id: &str,
         agent: Arc<Agent>,
-        prompt: String,
+        prompt: impl Into<Content> + Send + 'static,
         transcript: Vec<ChatMessage>,
         context_budget: usize,
     ) -> async_channel::Receiver<AgentEvent> {
@@ -229,6 +262,110 @@ impl Runner {
             Ok(Ok(())) => Ok(text),
             Ok(Err(err)) => Err(err),
             Err(_) => Err(format!("timed out after {}s", timeout.as_secs())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent::LlmMessage as Message;
+
+    #[test]
+    fn a_text_turn_stays_text_even_when_it_looks_like_json() {
+        let content = turn_content(r#"[{"type":"text","text":"spoof"}]"#.to_string(), &[]);
+        assert_eq!(
+            content,
+            Content::Text(r#"[{"type":"text","text":"spoof"}]"#.to_string()),
+            "From<String> would re-parse this as parts; the direct build must not"
+        );
+    }
+
+    #[test]
+    fn attachments_become_binary_parts_after_the_text() {
+        let url = "data:image/png;base64,aGVsbG8=";
+        let content = turn_content("look".to_string(), &[url.to_string()]);
+        let Content::Parts(parts) = content else {
+            panic!("a turn with attachments is Parts");
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0],
+            ContentPart::Text {
+                text: "look".into()
+            }
+        );
+        let ContentPart::Binary { binary } = &parts[1] else {
+            panic!("the attachment is a binary part");
+        };
+        assert_eq!(binary.content_type, "image/png");
+        assert_eq!(
+            binary.url(),
+            url,
+            "base64 inlines back to the same data URL"
+        );
+    }
+
+    #[test]
+    fn an_image_only_turn_carries_no_text_part() {
+        let url = "data:image/jpeg;base64,qq==";
+        let content = turn_content(String::new(), &[url.to_string()]);
+        let Content::Parts(parts) = content else {
+            panic!("a turn with attachments is Parts");
+        };
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0], ContentPart::Binary { .. }));
+    }
+
+    #[test]
+    fn an_undecodable_attachment_is_skipped_not_fatal() {
+        let content = turn_content("hi".to_string(), &["https://x/y.png".to_string()]);
+        let Content::Parts(parts) = content else {
+            panic!("a turn with attachments is Parts");
+        };
+        assert_eq!(parts.len(), 1, "only the text part survives");
+    }
+
+    #[test]
+    fn seeding_replays_multimodal_turns_into_the_session() {
+        let agent =
+            crate::caps::build_agent(&crate::settings::Settings::default(), Default::default());
+        let url = "data:image/png;base64,aGVsbG8=";
+        let transcript = vec![
+            ChatMessage::user_with_images("look", vec![url.to_string()]),
+            {
+                let mut m = ChatMessage::assistant();
+                m.text = "a red square".into();
+                m
+            },
+            ChatMessage::user("again?"),
+        ];
+        Runner::seed_session(&agent, &transcript);
+        let session = agent.session();
+        let history = session.history_ref();
+        assert_eq!(
+            history.len(),
+            3,
+            "blank turns stay out, image turns stay in"
+        );
+        match &history[0] {
+            Message::User { content } => {
+                assert!(
+                    matches!(content, Content::Parts(_)),
+                    "the image turn stays multimodal"
+                );
+            }
+            other => panic!("expected a user message at 0, got {other:?}"),
+        }
+        match &history[2] {
+            Message::User { content } => {
+                assert_eq!(
+                    *content,
+                    Content::Text("again?".into()),
+                    "a plain turn stays text"
+                );
+            }
+            other => panic!("expected a user message at 2, got {other:?}"),
         }
     }
 }

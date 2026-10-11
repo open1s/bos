@@ -21,7 +21,8 @@ pub use client::McpError;
 pub use http_transport::HttpTransport;
 pub use policy::{McpDecision, McpEffect, McpPolicy, McpRule};
 pub use protocol::{
-    JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpPrompt, McpPromptArgument, McpResource,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ToolDefinition,
+    GetPromptResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpPrompt, McpPromptArgument,
+    McpPromptMessage, McpResource, ReadResourceResult, ResourceContents, ServerCapabilities,
+    ToolDefinition,
 };
 pub use transport::StdioTransport;

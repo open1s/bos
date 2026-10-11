@@ -36,9 +36,12 @@ async function openSection(sectionId) {
   return panel;
 }
 
-/** Start a fresh chat so session-scoped panels have something to describe. */
+/** Start a fresh chat so session-scoped panels have something to describe.
+ *  There are three doors — the workspace row's "+", Cmd/Ctrl+N and the palette's
+ *  "/new" — and the row's "+" is the one that is a *place* rather than a key, so
+ *  it is the one a driver can click without depending on focus. */
 async function newChat() {
-  await $("#new-chat").click();
+  await $("#session-list .ws-head.active .ws-new").click();
   await browser.waitUntil(
     async () => (await $("#input").isDisplayed()),
     { timeoutMsg: "the composer never appeared" },

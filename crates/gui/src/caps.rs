@@ -312,6 +312,24 @@ pub(crate) fn build_agent_with(
         agent.add_tool(plan);
     }
 
+    // The web tools are read-only (the same standing as `read_file`), so no
+    // approval gate; a workspace may switch either of them off by name, the
+    // same §24.8 deny-list the built-ins use. Registration can only fail on a
+    // duplicate name, which a fresh build cannot produce — the agents here are
+    // constructed from config, never shared — so the Result carries nothing
+    // the caller could act on.
+    if settings.web_tools_enabled {
+        if !off("web_fetch") {
+            let _ = agent.try_add_async_tool(crate::webtools::web_fetch_tool());
+        }
+        if !off("web_search") {
+            let _ = agent.try_add_async_tool(crate::webtools::web_search_tool(
+                &settings.search_api_url,
+                &settings.search_api_key,
+            ));
+        }
+    }
+
     let skills = settings.skills_dir.trim();
     if !skills.is_empty() {
         // A missing directory discovers nothing; that is not an error.
@@ -506,6 +524,7 @@ mod tests {
         let mut settings = Settings::from_config_value(&serde_json::Value::Null);
         settings.bash_enabled = false;
         settings.file_tools_enabled = false;
+        settings.web_tools_enabled = false;
         let agent = build_agent(
             &settings,
             Arc::new(crate::approval::ApprovalBroker::default()),
@@ -517,6 +536,43 @@ mod tests {
             vec!["update_plan".to_string()],
             "only the plan tool should remain"
         );
+    }
+
+    #[test]
+    fn web_tools_register_and_deny_by_name() {
+        let settings = Settings::from_config_value(&serde_json::Value::Null);
+        let agent = build_agent(
+            &settings,
+            Arc::new(crate::approval::ApprovalBroker::default()),
+        );
+        let names = tool_names(&agent);
+        assert!(names.contains(&"web_fetch".to_string()), "{names:?}");
+        assert!(names.contains(&"web_search".to_string()), "{names:?}");
+
+        // The workspace's deny-list switches either one off by the name the
+        // model sees, the same rule the built-ins follow.
+        let mut settings = Settings::from_config_value(&serde_json::Value::Null);
+        settings.disabled_tools = vec!["web_search".to_string()];
+        let agent = build_agent(
+            &settings,
+            Arc::new(crate::approval::ApprovalBroker::default()),
+        );
+        let names = tool_names(&agent);
+        assert!(names.contains(&"web_fetch".to_string()), "{names:?}");
+        assert!(!names.contains(&"web_search".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn disabled_web_tools_register_nothing() {
+        let mut settings = Settings::from_config_value(&serde_json::Value::Null);
+        settings.web_tools_enabled = false;
+        let agent = build_agent(
+            &settings,
+            Arc::new(crate::approval::ApprovalBroker::default()),
+        );
+        let names = tool_names(&agent);
+        assert!(!names.contains(&"web_fetch".to_string()), "{names:?}");
+        assert!(!names.contains(&"web_search".to_string()), "{names:?}");
     }
 
     /// Planning is registered on every build and shares the agent's store:
@@ -646,6 +702,7 @@ mod tests {
     fn disabling_approval_keeps_tools_synchronous() {
         let mut settings = Settings::from_config_value(&serde_json::Value::Null);
         settings.require_approval = false;
+        settings.web_tools_enabled = false; // the web tools are async by design
         let agent = build_agent(
             &settings,
             Arc::new(crate::approval::ApprovalBroker::default()),

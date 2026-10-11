@@ -57,7 +57,7 @@ pub(crate) fn home() -> String {
 }
 
 /// Resolve `path` (or [`home`]) to an existing directory.
-fn resolve(path: Option<&str>) -> Result<PathBuf, String> {
+pub(crate) fn resolve(path: Option<&str>) -> Result<PathBuf, String> {
     let raw = path
         .map(str::trim)
         .filter(|p| !p.is_empty())
@@ -95,7 +95,10 @@ pub(crate) fn list_capped(path: Option<&str>, cap: usize) -> Result<FolderListin
         let child = entry.path();
         // Follow the link rather than trusting `file_type`: a symlinked folder
         // is a folder the user can enter, and it is the target that decides.
-        if !std::fs::metadata(&child).map(|m| m.is_dir()).unwrap_or(false) {
+        if !std::fs::metadata(&child)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
         entries.push(FolderEntry {
@@ -120,12 +123,26 @@ pub(crate) fn list_capped(path: Option<&str>, cap: usize) -> Result<FolderListin
     })
 }
 
+/// What the platform's panel answered, turned into a root this app will trust.
+///
+/// Split from the panel itself so the rule is testable without a modal: `None`
+/// is a dismissal and stays one — resolving must never turn "changed my mind"
+/// into an error — and a path is resolved exactly as a typed one is, so the
+/// panel cannot smuggle in a root that names a different folder than it says.
+pub(crate) fn resolve_picked(picked: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = picked else {
+        return Ok(None);
+    };
+    Ok(Some(resolve(Some(&raw))?.to_string_lossy().into_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tree(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bos-gui-folders-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("bos-gui-folders-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("archive")).expect("mkdir archive");
         std::fs::create_dir_all(dir.join("Bos")).expect("mkdir Bos");
@@ -156,6 +173,26 @@ mod tests {
     }
 
     #[test]
+    fn a_picked_folder_is_resolved_and_a_dismissal_is_left_alone() {
+        let dir = tree("picked");
+        let sub = dir.join("Bos");
+        // A path with `..` in it is the shape the panel's own output can take on
+        // some platforms; it must come back canonicalized, not as given.
+        let winding = sub.join("..").join("Bos");
+        let out = resolve_picked(Some(winding.to_string_lossy().into_owned()))
+            .expect("an existing folder resolves")
+            .expect("the panel picked one");
+        assert_eq!(out, sub.canonicalize().unwrap().to_string_lossy());
+        assert!(!out.contains(".."), "{out}");
+        assert_eq!(
+            resolve_picked(None).expect("a dismissal is not an error"),
+            None
+        );
+        assert!(resolve_picked(Some("/no/such/folder".to_string())).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_file_is_not_a_folder_and_a_missing_path_says_which_one() {
         let dir = tree("refuse");
         let file = dir.join("notes.txt");
@@ -167,7 +204,10 @@ mod tests {
         // A blank path is not an error: it means "open at home".
         std::env::set_var("HOME", &dir);
         let home_listing = list(Some("  ")).expect("blank opens home");
-        assert_eq!(home_listing.path, dir.canonicalize().unwrap().to_string_lossy());
+        assert_eq!(
+            home_listing.path,
+            dir.canonicalize().unwrap().to_string_lossy()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

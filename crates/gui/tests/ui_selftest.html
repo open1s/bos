@@ -61,21 +61,21 @@ window.addEventListener("error", (e) => {
       const IDS = [
         "approval-allow", "approval-args", "approval-deny", "approval-diff",
         "approval-modal", "approval-tool", "cap-list", "chat-title", "cmd-list",
-        "cmd-palette", "file-tree", "files-refresh", "files-toggle", "input",
+        "cmd-palette", "file-tree", "files-refresh", "files-section", "input",
         "mcp-add-btn", "mcp-cmd", "mcp-conn", "mcp-list",
         "mcp-msg", "mcp-name", "mcp-reconnect-btn", "mcp-transport", "mcp-url",
-        "mention-list", "mention-pop", "messages", "new-chat", "open-settings",
+        "mention-list", "mention-pop", "messages", "open-settings",
         "plan-edit", "plan-panel", "prov-add-btn", "prov-key", "prov-list",
         "prov-model", "prov-msg", "prov-name", "prov-url", "queue-list",
         "run-chip", "run-clear", "run-close", "run-form", "run-input",
         "run-note", "run-output", "run-panel", "run-send", "send",
-        "session-list", "session-search", "set-api-key", "set-approval",
+        "session-list", "session-search", "session-view", "set-api-key", "set-approval",
         "set-base-url", "set-bash", "set-context-budget", "set-effort",
         "set-files", "set-instructions", "set-memory", "set-memory-path",
         "set-model", "set-skills-dir", "set-system", "set-temperature",
         "set-workspace", "settings-cancel", "settings-form", "settings-modal",
         "status-left", "status-right", "stream-chip",
-        "term-kill", "term-open",
+        "term-kill", "term-open", "workspace-add-primary",
       ];
       const root = document.getElementById("root");
       for (const id of IDS) {
@@ -83,6 +83,18 @@ window.addEventListener("error", (e) => {
         n.id = id;
         root.appendChild(n);
       }
+      /* The Settings rail, as far as this fixture needs it. The Files section is
+         the one section whose content is a *fetch* rather than a render of state
+         already in hand, so the gesture that selects it is the gesture that loads
+         it — and the tab has to exist before app.js binds every `.set-tab`. */
+      const filesPane = document.getElementById("files-section");
+      filesPane.className = "set-pane";
+      const filesTab = document.createElement("button");
+      filesTab.type = "button";
+      filesTab.className = "set-tab";
+      filesTab.id = "set-tab-files-section";
+      filesTab.dataset.section = "files-section";
+      root.appendChild(filesTab);
       const realGet = document.getElementById("root").constructor
         ? document.getElementById.bind(document)
         : null;
@@ -482,9 +494,13 @@ window.addEventListener("error", (e) => {
           fmtAge(NOW - 30 * 86400, NOW),
         );
         assert("navigation routes to a panel", typeof navTo === "function");
+        // The sidebar no longer lists these surfaces (rev 110), so the palette is
+        // the path that must not rot: `/files` has to name the Settings section
+        // that owns the tree. The section gesture itself is check 40 below.
+        const filesCmd = BUILTIN_COMMANDS.find((c) => c.name === "/files");
         assert(
-          "sidebar navigation is wired",
-          !!document.getElementById("nav-plugins") && !!document.getElementById("nav-mcp"),
+          `the palette still reaches the files browser (${filesCmd ? filesCmd.hint : "missing"})`,
+          !!filesCmd && /files-section/.test(String(filesCmd.run)),
         );
 
         // ---- 8. sessions group by workspace -----------------------------
@@ -499,6 +515,7 @@ window.addEventListener("error", (e) => {
             { id: "w2", name: "notes", root: "/notes", model: "" },
           ],
           "w1",
+          { group: "tree", order: "updated", filter: "hide" },
         );
         assert(
           "a session with no workspace joins the active one",
@@ -512,19 +529,23 @@ window.addEventListener("error", (e) => {
         );
         assert(
           "an unknown workspace still lists its chats",
-          groupSessions([{ id: "d", title: "d", workspace: "gone" }], [], "w1")[0].name === "gone",
+          groupSessions([{ id: "d", title: "d", workspace: "gone" }], [], "w1", { group: "tree", order: "updated", filter: "hide" })[0].name === "gone",
         );
 
         // ---- 9. workspace management in the panel -----------------------
         renderSidebar();
+        // The Add-workspace dialog is the section header's folder-plus and
+        // nothing else: a second row under the list was removed on request, and
+        // this is the check that keeps it removed (the control itself is the
+        // header's, so a fixture that only looked for a row could not see it).
         assert(
-          "the panel offers a way to add a workspace",
-          !!sessionList.querySelector(".ws-add"),
-          "no .ws-add in the rendered panel",
+          "the sidebar draws no add row of its own — the header's folder-plus is the door",
+          !sessionList.querySelector(".ws-add") && !!document.getElementById("workspace-add-primary"),
+          `rows=${sessionList.querySelectorAll(".ws-add").length} header=${!!document.getElementById("workspace-add-primary")}`,
         );
         openWorkspaceForm("create", "");
         assert(
-          "the add form replaces the add button",
+          "the inline form is still the row that appears for a rename/edit",
           !!document.querySelector(".ws-form") && !document.querySelector(".ws-add"),
         );
         assert(
@@ -549,7 +570,10 @@ window.addEventListener("error", (e) => {
           !!document.querySelector(".ws-del-chats") && !document.querySelector(".ws-form .ws-name"),
         );
         closeWorkspaceForm();
-        assert("closing the form brings the add button back", !!sessionList.querySelector(".ws-add"));
+        assert(
+          "closing the form leaves the list as it was — no add row returns",
+          !sessionList.querySelector(".ws-add") && !document.querySelector(".ws-form"),
+        );
 
         // ---- 10. per-workspace tool selection ---------------------------
         state.workspaces = [
@@ -679,18 +703,21 @@ window.addEventListener("error", (e) => {
         state.wsEdit = null;
         state.presets = [{ id: "p1", name: "Strict" }];
         renderSidebar();
-        const presetBtns = [...sessionList.querySelectorAll(".ws-add-preset")];
+        const presetBtns = [...sessionList.querySelectorAll(".ws-preset-row")];
         assert(
           "a preset is offered by name",
           presetBtns.length === 1 && presetBtns[0].textContent.includes("Strict"),
           JSON.stringify(presetBtns.map((b) => b.textContent)),
         );
-        assert("and the create button is still there", !!sessionList.querySelector(".ws-add"));
+        assert(
+          "and the preset row is not a second way to the Add-workspace dialog",
+          !sessionList.querySelector(".ws-add") && presetBtns[0].className === "ws-preset-row",
+        );
         state.presets = [];
         renderSidebar();
         assert(
-          "no presets means no preset buttons",
-          sessionList.querySelectorAll(".ws-add-preset").length === 0,
+          "no presets means no preset rows",
+          sessionList.querySelectorAll(".ws-preset-row").length === 0,
         );
 
         // ---- 14. a workspace can be promoted to a preset ------------------
@@ -1083,6 +1110,24 @@ window.addEventListener("error", (e) => {
             withBudget.near === true &&
             calm.near === false,
         );
+
+        // The direct calls above cannot see the defect this one exists for: the
+        // meter is appended by a helper, and `renderStatus` clears `#status-right`
+        // before it fills it — so a helper called *before* that clear built and
+        // threw away its own span on every frame, and the meter never painted
+        // during a real stream. This check goes through the pass that owns the
+        // element.
+        state.usage = { prompt: 12345, completion: 678 };
+        state.budget = 14000;
+        renderStatus();
+        const meterAfter = statusRight.querySelector(".usage-meter");
+        assert(
+          `the token meter survives the status line's own clear (text="${
+            meterAfter ? meterAfter.textContent : "none"
+          }")`,
+          !!meterAfter && meterAfter.textContent.includes("88% of 14k"),
+        );
+        renderStatus();
         assert(
           `token counts are read the way a status line reads (999=${fmtTokens(999)} 12500=${fmtTokens(12500)})`,
           fmtTokens(999) === "999" && fmtTokens(12500) === "13k",
@@ -1646,6 +1691,22 @@ window.addEventListener("error", (e) => {
             Math.abs(moved - (h0 - h1)) <= 1,
           );
 
+          // A gesture fires dozens of scroll events in one frame; each used to
+          // add its own window, so one flick grew the drawn transcript by the
+          // whole burst and the window cap held only until the first scroll-up.
+          state.windowExtra = 0;
+          followTail = false;
+          msgsEl.scrollTop = 0;
+          markDirtyAll();
+          renderMessages();
+          for (let i = 0; i < 50; i++) msgsEl.dispatchEvent(new Event("scroll"));
+          const burstExtra = state.windowExtra;
+          renderMessages();
+          assert(
+            `a burst of scroll events grows the window once (events=50 extra=${burstExtra} rows=${rowCache.size})`,
+            burstExtra === 200,
+          );
+
           // ---- 38. the spacer goes away when the whole chat is drawn -----
           state.windowExtra = growN;
           markDirtyAll();
@@ -1735,27 +1796,34 @@ window.addEventListener("error", (e) => {
             formatFileBytes(3 * 1024 * 1024) === "3.0 MB",
         );
 
-        // ---- 40. the panel itself opens, asks once, and closes ----------
-        // The harness's invoke never settles, so the first paint is the
-        // loading row: enough to prove the toggle drives the DOM and the
-        // backend is asked for the root exactly when the tree opens.
+        // ---- 40. the Files section loads on the way in, once -------------
+        // The harness's invoke never settles, so the first paint is the loading
+        // row: enough to prove selecting the section drives the fetch. The
+        // second selection must not ask again — a cache that is refetched on
+        // every visit is the same work as no cache, and the section is selected
+        // by clicking a rail tab, so that click is what this drives.
         const treeHost = $("file-tree");
-        const treeToggle = $("files-toggle");
-        treeToggle.click();
+        const filesCalls = [];
+        window.__TAURI__.core.invoke = (cmd) => {
+          filesCalls.push(cmd);
+          return new Promise(() => {});
+        };
+        const filesTab = document.querySelector('.set-tab[data-section="files-section"]');
+        const filesPane = $("files-section");
+        const listCalls = () => filesCalls.filter((c) => c === "list_files").length;
+        filesTab.click();
         assert(
-          `opening the tree shows its one loading row (hidden=${treeHost.hidden} rows=${treeHost.querySelectorAll(
-            ".file-row",
-          ).length} aria=${treeToggle.getAttribute("aria-expanded")})`,
-          !treeHost.hidden &&
+          `selecting Files asks for the root once and paints its loading row (pane=${
+            filesPane.classList.contains("active")
+          } rows=${treeHost.querySelectorAll(".file-row").length} calls=${listCalls()})`,
+          filesPane.classList.contains("active") &&
             treeHost.querySelectorAll(".file-row").length === 1 &&
-            treeToggle.getAttribute("aria-expanded") === "true",
+            listCalls() === 1,
         );
-        treeToggle.click();
+        filesTab.click();
         assert(
-          `closing it hides the tree (hidden=${treeHost.hidden} aria=${treeToggle.getAttribute(
-            "aria-expanded",
-          )})`,
-          treeHost.hidden && treeToggle.getAttribute("aria-expanded") === "false",
+          `selecting it again re-uses the cache (calls=${listCalls()})`,
+          listCalls() === 1 && filesPane.classList.contains("active"),
         );
 
         // ---- 41. the run panel keeps bounded, honest, plain-text output --
@@ -2335,6 +2403,7 @@ window.addEventListener("error", (e) => {
         [{ id: "s1", title: "in w1", workspace: "w1", updated_at: 1, pinned: false, archived: false }],
         [{ id: "w1", name: "bos" }, { id: "w9", name: "just added" }],
         "w1",
+        { group: "tree", order: "updated", filter: "hide" },
       );
       assert(
         `a workspace with no chats is still a group ("${emptyWorkspaceGroups.map((g) => g.name + ":" + g.sessions.length).join(",")}")`,
@@ -2354,6 +2423,7 @@ window.addEventListener("error", (e) => {
             { id: "w2", name: "two" },
           ],
           "w1",
+          { group: "tree", order: "updated", filter: "hide" },
         );
         R.checks["26g a pin orders its own workspace, not the whole sidebar"] =
           pinGroups.length === 2 &&

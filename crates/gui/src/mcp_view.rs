@@ -25,7 +25,7 @@
 
 use serde::Serialize;
 
-use agent::mcp::{McpPrompt, McpResource, ReadResourceResult, ServerCapabilities};
+use agent::mcp::{GetPromptResult, McpPrompt, McpResource, ReadResourceResult, ServerCapabilities};
 
 /// Most rows (resources plus prompts) drawn per server.
 pub(crate) const MAX_ROWS: usize = 200;
@@ -130,6 +130,31 @@ pub(crate) struct ReadView {
     /// How many content parts the server returned.
     pub(crate) parts: usize,
     /// Whether the server returned no text at all (a binary resource).
+    pub(crate) empty: bool,
+}
+
+/// One prompt's fetched messages, as the pane draws it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PromptView {
+    /// Caller's clock.
+    pub(crate) now_ms: u64,
+    /// Server the prompt came from.
+    pub(crate) server: String,
+    /// Prompt name that was fetched.
+    pub(crate) name: String,
+    /// Optional description the server returned.
+    pub(crate) description: Option<String>,
+    /// The messages, bounded by [`MAX_TEXT_CHARS`] characters in total.
+    pub(crate) text: String,
+    /// Characters actually handed over.
+    pub(crate) chars: usize,
+    /// Characters the server sent, before bounding.
+    pub(crate) source_chars: usize,
+    /// Whether the body was cut to fit.
+    pub(crate) truncated: bool,
+    /// How many messages the server returned.
+    pub(crate) messages: usize,
+    /// Whether the server returned no messages.
     pub(crate) empty: bool,
 }
 
@@ -273,6 +298,46 @@ pub(crate) fn read_view(
         source_chars,
         truncated,
         parts: result.contents.len(),
+        empty: source_chars == 0,
+    }
+}
+
+/// One fetched prompt, bounded the way `read_view` bounds a resource.
+///
+/// Each message renders as `role: text` (or its JSON when the content is not a
+/// text part), joined with blank lines, then clipped to [`MAX_TEXT_CHARS`]
+/// characters — the same bound, and the same honesty about the cut.
+pub(crate) fn prompt_view(
+    server: &str,
+    name: &str,
+    result: &GetPromptResult,
+    now_ms: u64,
+) -> PromptView {
+    let text = result
+        .messages
+        .iter()
+        .map(|m| {
+            let body = m
+                .content
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| m.content.to_string());
+            format!("{}: {}", m.role, body)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let (text, source_chars, truncated) = clip(&text, MAX_TEXT_CHARS);
+    PromptView {
+        now_ms,
+        server: server.to_string(),
+        name: name.to_string(),
+        description: result.description.clone(),
+        chars: text.chars().count(),
+        text,
+        source_chars,
+        truncated,
+        messages: result.messages.len(),
         empty: source_chars == 0,
     }
 }
@@ -514,5 +579,75 @@ mod tests {
         assert_eq!(report.servers.len(), 1);
         assert!(!report.servers[0].connected);
         assert!(!report.servers[0].resources_supported);
+    }
+
+    fn prompt_message(role: &str, text: &str) -> agent::mcp::McpPromptMessage {
+        agent::mcp::McpPromptMessage {
+            role: role.to_string(),
+            content: serde_json::json!({"type": "text", "text": text}),
+        }
+    }
+
+    #[test]
+    fn prompt_view_renders_roles_and_text() {
+        let result = GetPromptResult {
+            description: Some("Review a diff".to_string()),
+            messages: vec![
+                prompt_message("user", "Review this"),
+                prompt_message("assistant", "Here is my review"),
+            ],
+        };
+        let view = prompt_view("srv", "review", &result, 7);
+        assert_eq!(view.server, "srv");
+        assert_eq!(view.name, "review");
+        assert_eq!(view.description.as_deref(), Some("Review a diff"));
+        assert_eq!(view.messages, 2);
+        assert!(!view.empty);
+        assert_eq!(
+            view.text,
+            "user: Review this\n\nassistant: Here is my review"
+        );
+        assert!(!view.truncated);
+    }
+
+    #[test]
+    fn prompt_view_bounds_oversized_bodies_by_characters() {
+        let body = "x".repeat(MAX_TEXT_CHARS + 100);
+        let result = GetPromptResult {
+            description: None,
+            messages: vec![prompt_message("user", &body)],
+        };
+        let view = prompt_view("srv", "big", &result, 0);
+        assert_eq!(view.chars, MAX_TEXT_CHARS);
+        // The source count includes the "user: " prefix the view adds.
+        assert_eq!(view.source_chars, body.chars().count() + "user: ".len());
+        assert!(view.truncated);
+    }
+
+    #[test]
+    fn prompt_view_of_no_messages_is_empty_and_non_text_content_is_json() {
+        let result = GetPromptResult {
+            description: None,
+            messages: vec![agent::mcp::McpPromptMessage {
+                role: "user".to_string(),
+                content: serde_json::json!({"type": "image", "data": "abc"}),
+            }],
+        };
+        let view = prompt_view("srv", "p", &result, 0);
+        assert!(view.text.contains("user:"));
+        assert!(
+            view.text.contains("image"),
+            "non-text content stringified: {}",
+            view.text
+        );
+        assert!(!view.empty);
+
+        let empty = GetPromptResult {
+            description: None,
+            messages: vec![],
+        };
+        let view = prompt_view("srv", "p", &empty, 0);
+        assert!(view.empty);
+        assert_eq!(view.text, "");
     }
 }

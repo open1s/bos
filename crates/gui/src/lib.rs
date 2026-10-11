@@ -23,6 +23,7 @@ mod mcp;
 mod mcp_policy;
 mod mcp_view;
 mod mentions;
+mod picker;
 mod pty;
 mod replay;
 mod runner;
@@ -33,6 +34,7 @@ mod settings;
 mod skills;
 #[cfg(test)]
 mod verify;
+mod webtools;
 
 /// Launch the GUI (opens the Tauri window and blocks until quit).
 pub fn run() -> anyhow::Result<()> {

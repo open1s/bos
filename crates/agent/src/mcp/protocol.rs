@@ -245,3 +245,24 @@ pub struct ResourceContents {
     /// Optional text body.
     pub text: Option<String>,
 }
+
+/// One message inside a fetched prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptMessage {
+    /// `"user"` or `"assistant"`.
+    pub role: String,
+    /// The message body.
+    #[serde(default)]
+    pub content: serde_json::Value,
+}
+
+/// Result of a `prompts/get` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPromptResult {
+    /// Optional description the server returns with the messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The prompt's messages, in order.
+    #[serde(default)]
+    pub messages: Vec<McpPromptMessage>,
+}

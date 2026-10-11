@@ -47,6 +47,13 @@ pub(crate) struct ChatMessage {
     /// Tool calls made while producing the response.
     #[serde(default)]
     pub(crate) tools: Vec<ToolEvent>,
+    /// Images attached to the message, each a `data:image/…;base64,…` URL.
+    ///
+    /// Only user turns carry images today; the data URL keeps the transcript
+    /// self-contained (a re-opened chat re-renders the same pictures and the
+    /// agent re-sees them) without adding a file store beside the sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) images: Vec<String>,
     /// Error description when the turn failed.
     #[serde(default)]
     pub(crate) error: Option<String>,
@@ -60,8 +67,16 @@ impl ChatMessage {
             text: text.into(),
             reasoning: String::new(),
             tools: Vec::new(),
+            images: Vec::new(),
             error: None,
         }
+    }
+
+    /// Create a user message carrying attached images.
+    pub(crate) fn user_with_images(text: impl Into<String>, images: Vec<String>) -> Self {
+        let mut message = Self::user(text);
+        message.images = images;
+        message
     }
 
     /// Create an empty assistant message that streaming fills in.
@@ -71,6 +86,7 @@ impl ChatMessage {
             text: String::new(),
             reasoning: String::new(),
             tools: Vec::new(),
+            images: Vec::new(),
             error: None,
         }
     }
@@ -78,10 +94,70 @@ impl ChatMessage {
     /// Whether the message carries nothing renderable.
     pub(crate) fn is_blank(&self) -> bool {
         self.text.is_empty()
+            && self.images.is_empty()
             && self.reasoning.is_empty()
             && self.tools.is_empty()
             && self.error.is_none()
     }
+}
+
+/// Keep the image attachments a turn may carry: `data:image/…;base64,…` URLs
+/// only, de-duplicated, with a per-image and per-turn size ceiling.
+///
+/// The base64 payload is what ships to the provider, so the ceilings bound a
+/// single paste (one huge screenshot) and a bulk drop (a folder of photos)
+/// rather than trusting the webview. Invalid entries fail the whole call: the
+/// composer offered them, so silently dropping one would send a turn the
+/// reader sees but the model does not.
+pub(crate) fn sanitize_images(images: &[String]) -> Result<Vec<String>, String> {
+    const MAX_IMAGES: usize = 6;
+    /// Base64 characters allowed, including the 4%1 padding and data-URL-safe `+ / =`.
+    const B64: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+    const MAX_IMAGE_CHARS: usize = 12 * 1024 * 1024; // ~9 MB decoded per image
+    const MAX_TURN_CHARS: usize = 24 * 1024 * 1024;
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for raw in images {
+        let url = raw.trim();
+        let payload = url
+            .strip_prefix("data:")
+            .and_then(|rest| rest.split_once(','))
+            .ok_or_else(|| "an attached image is not a data URL".to_string())?;
+        let (meta, data) = payload;
+        let mime = meta.strip_suffix(";base64").unwrap_or(meta);
+        if !mime.starts_with("image/") || !meta.ends_with(";base64") {
+            return Err("attachments must be base64 images (data:image/…)".to_string());
+        }
+        if data.is_empty() {
+            return Err("an attached image is empty".to_string());
+        }
+        if !data
+            .chars()
+            .all(|c| B64.contains(c) || c == '\n' || c == '\r')
+        {
+            return Err("an attached image has a malformed base64 payload".to_string());
+        }
+        if data.len() > MAX_IMAGE_CHARS {
+            return Err(format!(
+                "an attached image is too large ({} MB; the ceiling is {} MB)",
+                data.len() / 1024 / 1024,
+                MAX_IMAGE_CHARS / 1024 / 1024
+            ));
+        }
+        if kept.iter().any(|k| k == url) {
+            continue;
+        }
+        total += data.len();
+        if total > MAX_TURN_CHARS {
+            return Err("too many attached images for one turn".to_string());
+        }
+        kept.push(url.to_string());
+        if kept.len() >= MAX_IMAGES {
+            break;
+        }
+    }
+    Ok(kept)
 }
 
 /// A conversation session, persisted as one JSON file.
@@ -884,6 +960,60 @@ mod tests {
         assert!(SessionRecord::new().workspace.is_empty());
     }
 
+    #[test]
+    fn an_older_session_file_loads_without_images_and_a_new_one_keeps_them() {
+        let json = r#"{"id":"s1","title":"t","created_at":1,"updated_at":2,
+            "messages":[{"role":"User","text":"look at this"}]}"#;
+        let record: SessionRecord = serde_json::from_str(json).expect("legacy message loads");
+        assert!(record.messages[0].images.is_empty());
+
+        let url = "data:image/png;base64,aGVsbG8=";
+        let mut record = SessionRecord::new();
+        record
+            .messages
+            .push(ChatMessage::user_with_images("look", vec![url.into()]));
+        let saved = serde_json::to_string(&record).unwrap();
+        assert!(saved.contains(url), "the image must survive the roundtrip");
+        let reopened: SessionRecord = serde_json::from_str(&saved).unwrap();
+        assert_eq!(reopened.messages[0].images, vec![url]);
+    }
+
+    #[test]
+    fn images_are_sanitized_or_the_turn_is_refused() {
+        let good = "data:image/png;base64,aGVsbG8=";
+        let ok = sanitize_images(&[good.into()]).expect("a well-formed image passes");
+        assert_eq!(ok, vec![good]);
+
+        assert!(
+            sanitize_images(&["https://x/y.png".into()]).is_err(),
+            "a URL is not a data URL"
+        );
+        assert!(
+            sanitize_images(&["data:image/png,".into()]).is_err(),
+            "no base64 segment"
+        );
+        assert!(
+            sanitize_images(&["data:image/png;base64,".into()]).is_err(),
+            "empty payload"
+        );
+        assert!(
+            sanitize_images(&["data:text/html;base64,aGVsbG8=".into()]).is_err(),
+            "only images may attach"
+        );
+        assert!(
+            sanitize_images(&["data:image/png;base64,not@@base64".into()]).is_err(),
+            "the payload must be base64"
+        );
+
+        let dup = "data:image/jpeg;base64,qq==";
+        let kept = sanitize_images(&[dup.into(), dup.into()]).expect("duplicates pass");
+        assert_eq!(
+            kept.len(),
+            1,
+            "a duplicate attachment is dropped, not an error"
+        );
+    }
+
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bos-gui-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1154,8 +1284,13 @@ mod tests {
         // what actually carries over.
         record.pinned = true;
         record.set_archived(true);
-        let branch = record.fork_from(2).expect("fork of a pinned, archived chat");
-        assert!(!branch.pinned, "a branch is not pinned because its parent was");
+        let branch = record
+            .fork_from(2)
+            .expect("fork of a pinned, archived chat");
+        assert!(
+            !branch.pinned,
+            "a branch is not pinned because its parent was"
+        );
         assert!(!branch.archived_at.is_some(), "a branch is live");
         assert_eq!(branch.messages.len(), 2);
 
@@ -1190,7 +1325,10 @@ mod tests {
         let mut reloaded = store.load(&record.id).expect("load");
         assert!(reloaded.pinned);
         assert!(reloaded.archived_at.is_some());
-        assert!(!reloaded.set_archived(false), "restoring clears the timestamp");
+        assert!(
+            !reloaded.set_archived(false),
+            "restoring clears the timestamp"
+        );
         assert!(reloaded.archived_at.is_none());
 
         // A session file written before either field existed is live and
@@ -1217,7 +1355,10 @@ mod tests {
         assert_eq!(record.title, "before", "a refused rename changes nothing");
         assert!(record.rename(&"z".repeat(81)).is_err());
         assert_eq!(record.title, "before");
-        assert_eq!(record.rename("  two words  ").expect("renamed"), "two words");
+        assert_eq!(
+            record.rename("  two words  ").expect("renamed"),
+            "two words"
+        );
         assert_eq!(record.title, "two words");
     }
 

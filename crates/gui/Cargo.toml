@@ -10,6 +10,8 @@ license.workspace = true
 [dependencies]
 tauri = { version = "2", features = [] }
 agent = { path = "../agent" }
+react = { path = "../react" }
+reqwest = { workspace = true, features = ["json"] }
 async-trait = { workspace = true }
 config = { path = "../config" }
 tokio = { workspace = true }

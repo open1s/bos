@@ -83,8 +83,8 @@ grep -q 'pin.setAttribute("aria-pressed"' $JS && ok || bad "the pin must report 
 # The menu itself is labelled by the button that opened it, and says so.
 grep -q 'menu.setAttribute("aria-label"' $JS && ok || bad "the row menu needs a name"
 grep -q 'menu.setAttribute("role", "menu")' $JS && ok || bad "the row menu must be a menu"
-[ "$(grep -c 'setAttribute("role", "menuitem")' $JS)" -ge 1 ] \
-  && ok || bad "the row menu's entries must be menu items"
+[ "$(grep -c 'setAttribute("role", item.checked === undefined ? "menuitem" : "menuitemradio")' $JS)" -ge 1 ] \
+  && ok || bad "the row menu's entries must be menu items, and a choice must be a radio"
 # The workspace rename/remove forms still exist and are still reachable — from
 # the menu now. A guard that only checked the glyphs would have let the forms go.
 for run in '"rename"' '"delete"'; do
@@ -136,6 +136,115 @@ grep -qE '<button[^>]*id="tab-chat"[^>]*aria-selected="true"[^>]*tabindex="0"' $
 grep -qE '<button[^>]*id="tab-trajectory"[^>]*aria-selected="false"[^>]*tabindex="-1"' $HTML \
   && ok || bad "Trajectory must load unselected, out of the tab order"
 
+# --- the sidebar is the conversation list (rev 110) -------------------------
+# Four utility rows used to sit above it (Plugins & skills, Automation tasks,
+# MCP connectors, Files). Three duplicated a Settings section that already
+# existed, and the user asked for them gone; Files moved to the rail beside its
+# siblings. The rows are deleted rather than hidden, so a test *claiming* they
+# are gone has to read the shipped markup — no fixture can see index.html.
+[ "$(grep -cE '<nav class="sidebar-nav"' $HTML)" = 0 ] \
+  && ok || bad "the sidebar's utility nav must be gone from the markup"
+[ "$(grep -cE 'class="nav-item"' $HTML)" = 0 ] \
+  && ok || bad "no nav-item rows may remain in the shipped markup"
+[ "$(grep -cE 'id="files-toggle"|class="files-head"' $HTML)" = 0 ] \
+  && ok || bad "the sidebar Files toggle must be gone"
+[ "$(grep -cE 'sidebar-nav|nav-item|files-head' $CSSFILE)" = 0 ] \
+  && ok || bad "the stylesheet must not keep rules for the removed nav rows"
+# Files is now a Settings section: tab and pane must exist, point at each other,
+# and the tree must live *inside* the pane rather than under the sidebar.
+grep -qE '<button[^>]*role="tab"[^>]*id="set-tab-files-section"[^>]*aria-controls="files-section"' $HTML \
+  && ok || bad "the rail must carry a Files tab that controls #files-section"
+# A pane's opening tag wraps in this file (id and role on one line, the label on
+# the next), so the two halves are matched separately rather than as one tag.
+grep -qE '<(div|section) id="files-section"[^>]*role="tabpanel"' $HTML \
+  && grep -qE 'aria-labelledby="set-tab-files-section"' $HTML \
+  && ok || bad "#files-section must be a tabpanel labelled by its tab"
+FILE_TREE_LINE=$(grep -n 'id="file-tree"' $HTML | cut -d: -f1)
+SIDE_WS_LINE=$(grep -n 'id="side-workspaces"' $HTML | head -1 | cut -d: -f1)
+[ -n "$FILE_TREE_LINE" ] && [ "$FILE_TREE_LINE" -gt "$SIDE_WS_LINE" ] \
+  && ok || bad "the file tree must sit after the sidebar, inside the Files pane"
+# And inside the pane itself: scoping the search to the section is what makes
+# this an assertion about the pane rather than about the document.
+FILES_PANE=$(sed -n '/<section id="files-section"/,/<\/section>/p' $HTML)
+case "$FILES_PANE" in
+  *'id="file-tree"'*) ok ;;
+  *) bad "the tree host must be inside #files-section" ;;
+esac
+# The palette is the keyboard path to what the sidebar no longer lists.
+grep -qE '"\/files", hint: "[^"]*", run: \(\) => navTo\("files-section"\)' $JS \
+  && ok || bad "/files must open the Files section, not a removed sidebar toggle"
+
+# --- the Workspaces header carries search, a view menu, and add (rev 111/112) -
+# It was "New session", then a labelled button with a row of its own, then an
+# icon in the brand row for one round; it is the folder-plus in the header of the
+# section it adds to now, as the design shows, and the brand row is the brand
+# alone again. Two identical folder-plus glyphs 40 px apart are a duplicate, not
+# a shortcut, so the count of them is asserted too.
+SIDEBAR_HEAD=$(sed -n '/<div class="sidebar-head">/,/<\/div>/p' $HTML)
+case "$SIDEBAR_HEAD" in
+  '') bad "the sidebar head row must exist" ;;
+  *'workspace-add-primary'*) bad "the brand row holds the brand alone; the folder-plus moved to the Workspaces header" ;;
+  *) ok ;;
+esac
+# Scoped to the section header's own action row: this is an assertion about that
+# row rather than about the document. (The opening tags wrap, so the id and the
+# class are matched as positions in the block, not as one tag.)
+SIDE_ACTIONS=$(sed -n '/<div class="side-actions">/,/<\/div>/p' $HTML)
+case "$SIDE_ACTIONS" in
+  *'id="sessions-search"'*'id="session-view"'*'id="workspace-add-primary"'*) ok ;;
+  *) bad "the Workspaces header must hold search, the view menu and add-workspace, in that order" ;;
+esac
+case "$SIDE_ACTIONS" in
+  *'aria-label="Add a workspace"'*) ok ;;
+  *) bad "the header's add-workspace control must carry its name" ;;
+esac
+grep -q 'data-i18n-aria="btn.addWorkspace"' $HTML && grep -q 'data-i18n-title="btn.addWorkspace"' $HTML \
+  && ok || bad "that icon must carry its translated name and tooltip"
+grep -q 'data-i18n="btn.addWorkspace"' $HTML \
+  && bad "an icon-only control must not keep a visible label it no longer draws" || ok
+# The sliders button announces a menu, not a toggle: it opens a list of choices.
+case "$SIDE_ACTIONS" in
+  *'id="session-view"'*'aria-haspopup="menu"'*) ok ;;
+  *) bad "the view control must announce the menu it opens" ;;
+esac
+STALE_NAMES=$(grep -cE 'id="new-chat"|id="workspace-add"|class="new-session"|new-session-mark|side-primary|sessions-refresh|archived-toggle|showArchived' \
+              $HTML $CSSFILE $JS | awk -F: '{n+=$NF} END {print n+0}')
+[ "$STALE_NAMES" = 0 ] \
+  && ok || bad "no stale new-session, duplicate workspace-add, refresh or archive-disclosure name may survive ($STALE_NAMES found)"
+# --- the view menu is the one writer of how the list is drawn (rev 112) ------
+# Three choices, each with its own vocabulary: a mode that exists in the state
+# but not in the menu is a mode nobody can reach, and one in the menu but not in
+# the state is a control that does nothing.
+for choice in 'Workspace Tree' 'In one list' 'Last updated' 'Hide archived' 'All conversations (show archived)' 'Archived only'; do
+  grep -qF "$choice" $JS && ok || bad "the view menu must offer $choice"
+done
+grep -qE 'const SESSION_VIEW_KEY = "bos\.sessionView"' $JS && grep -q 'persistSessionView();' $JS \
+  && grep -q 'restoreSessionView();' $JS \
+  && ok || bad "the view choice must be written, read back, and named by one key"
+# The reload the header used to carry has to survive *whole* in the menu: an item
+# that is offered and a handler that acts on it are two halves of one gesture, and
+# either half alone is a control that does nothing.
+grep -qF 'label: tr("view.reload", "Reload chats"), run: "reload"' $JS \
+  && grep -qF 'if (key === "reload") return void reloadSessionList()' $JS \
+  && ok || bad "the reload gesture the header used to carry must survive in the menu"
+# A gesture removed from the chrome must keep a door: three, and each is
+# asserted so "the button is gone" cannot quietly mean "a chat is unreachable".
+grep -qE 'if \(key === "n"\) \{' $JS && grep -q 'void newChat();' $JS \
+  && ok || bad "Cmd/Ctrl+N must still start a chat"
+grep -qE '"\/new", hint: "Start a new chat", run: \(\) => newChat\(\)' $JS \
+  && ok || bad "/new must still start a chat"
+# The row's own "+" must start a session *in that row's workspace*: scoped to the
+# listener that follows the button's construction, because the row's "…" menu
+# offers the same action and would satisfy a document-wide grep on its own
+# (measured: rewiring the "+" to newChat() left such a check green).
+WS_NEW_BLOCK=$(grep -A 8 'el("button", "ws-act ws-new", "+")' $JS)
+case "$WS_NEW_BLOCK" in
+  *'void newSessionIn(group.id);'*) ok ;;
+  *) bad "a workspace row's + must still start a session in that workspace" ;;
+esac
+grep -qE 'add.setAttribute\("aria-keyshortcuts", "Meta\+N Control\+N"\)' $JS \
+  && ok || bad "that row control must advertise the shortcut it answers to"
+
 
 # --- M13 polish: the chrome the polish layer drives -------------------------
 # The skip link must be the body's first element (it is only useful before
@@ -166,10 +275,15 @@ POLISH_LINE=$(grep -n '<script src="polish.js"' $HTML | cut -d: -f1)
   && ok || bad "polish.js must load after shell.js"
 
 # Every translation mark must have a string, or the element silently keeps
-# whatever it shipped with and a typo'd key is invisible.
+# whatever it shipped with and a typo'd key is invisible. The marks are the
+# markup's `data-i18n*` attributes **and** the keys app.js asks `tr()` for: a
+# label built in JS never appears in the markup scan, which is how seven keys —
+# the Add-workspace dialog's hints among them — rendered English in a Chinese UI
+# while this check stayed green.
 missing=0
 for key in $(grep -oE 'data-i18n(-placeholder|-aria|-title)?="[^"]+"' $HTML \
-               | sed 's/.*="//; s/"//' | sort -u); do
+               | sed 's/.*="//; s/"//' | sort -u) \
+           $(grep -oE 'tr\("[a-zA-Z0-9_.]+"' $JS | sed 's/^tr("//; s/"$//' | sort -u); do
   grep -q "\"$key\":" ui/polish.js || { missing=$((missing + 1)); echo "  missing string: $key"; }
 done
 [ "$missing" = 0 ] && ok || bad "$missing translation mark(s) have no string in polish.js"
@@ -193,6 +307,45 @@ print(" ".join(sorted(used - defined)))
 PYEOF
 )
 [ -z "$undefined_tokens" ] && ok || bad "style.css uses undefined custom properties: $undefined_tokens"
+
+# Flat is a rule, so it is checked like one. The UI carries no shadow, gradient,
+# blur or brightness filter — depth comes from a 1px border and a solid fill —
+# and every corner comes from the radius scale, so the chrome cannot drift back
+# into nine different radii. Two things are deliberately not violations and are
+# named here so a third cannot be added quietly: the streaming caret's `steps(1)`
+# blink (a text caret, one paint per second) and the mobile drawer's `transform`
+# slide (a motion, not a surface). Flat is about surfaces, not about movement.
+# Two radius values are shapes rather than corners and are allowed: `999px` for a
+# pill and `50%` for a circle.
+flat_offenders=$(python3 - "$PWD/$CSSFILE" <<'PYEOF'
+import re, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+bad = []
+for n, line in enumerate(lines, 1):
+    decl = line.split("/*")[0]
+    if not decl.strip():
+        continue
+    for prop in ("box-shadow", "text-shadow", "backdrop-filter", "filter"):
+        m = re.search(r"(?<![-\w])" + prop + r"\s*:\s*([^;]+);", decl)
+        if m and m.group(1).strip() != "none":
+            bad.append("%d:%s=%s" % (n, prop, m.group(1).strip()))
+    if re.search(r"gradient\(", decl):
+        bad.append("%d:gradient" % n)
+    m = re.search(r"border-radius\s*:\s*([^;]+);", decl)
+    if m:
+        for part in m.group(1).split():
+            if re.fullmatch(r"[\d.]+px", part) and part not in ("0px", "999px"):
+                bad.append("%d:radius=%s" % (n, part))
+    m = re.search(r"transition\s*:\s*([^;]+);", decl)
+    if m and "transform" not in m.group(1):
+        for value in re.findall(r"([\d.]+)(m?s)\b", m.group(1)):
+            ms = float(value[0]) * (1 if value[1] == "ms" else 1000)
+            if ms > 120:
+                bad.append("%d:transition=%dms" % (n, int(ms)))
+print(" ".join(bad))
+PYEOF
+)
+[ -z "$flat_offenders" ] && ok || bad "style.css is not flat: $flat_offenders"
 
 # A translation mark must wrap text, never elements: applying a translation
 # replaces the mark's children, so a mark on a wrapper silently deletes the

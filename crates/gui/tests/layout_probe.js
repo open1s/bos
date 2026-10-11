@@ -2,6 +2,29 @@
 // not opinions: the narrow-window question is whether anything leaves the
 // viewport horizontally, and by how much.
 (function () {
+  // Elements that paint a shadow, a blur, a filter or a gradient. Depth in this
+  // UI comes from a 1px border and a solid fill, so any of those is a defect and
+  // the name of the offending element is what makes it fixable.
+  function paintedOffenders() {
+    const bad = [];
+    const skip = new Set(["script", "style", "link", "meta", "head", "html"]);
+    for (const el of document.querySelectorAll("*")) {
+      const tag = el.tagName.toLowerCase();
+      if (skip.has(tag)) continue;
+      const cs = getComputedStyle(el);
+      const why = [];
+      if (cs.boxShadow && cs.boxShadow !== "none") why.push("shadow");
+      if (cs.textShadow && cs.textShadow !== "none") why.push("text-shadow");
+      if (cs.backdropFilter && cs.backdropFilter !== "none") why.push("backdrop-filter");
+      if (cs.filter && cs.filter !== "none") why.push("filter");
+      if (cs.backgroundImage && cs.backgroundImage.indexOf("gradient") >= 0) why.push("gradient");
+      if (!why.length) continue;
+      const name = el.id || (typeof el.className === "string" ? el.className : "") || tag;
+      bad.push(String(name).split(" ")[0] + "(" + why.join(",") + ")");
+    }
+    return [...new Set(bad)].slice(0, 8);
+  }
+
   function measure() {
     const out = { viewport: window.innerWidth, docScrollW: document.documentElement.scrollWidth,
                   docClientW: document.documentElement.clientWidth, boxes: {}, offscreen: [] };
@@ -37,10 +60,10 @@
     if (sb) {
       const open = sb.classList.contains("open");
       out.sidebarOpen = open;
-      const rows = sb.querySelectorAll(".session-row, .nav-item, .ws-head, .sidebar-head").length;
+      const rows = sb.querySelectorAll(".session-row, .ws-head, .sidebar-head").length;
       // A collapsed rail keeps its head and hides the rows; the head is not a
       // list, so only visible *content* rows can make a narrow box unreadable.
-      const visibleRows = [...sb.querySelectorAll(".session-row, .nav-item, .ws-head")]
+      const visibleRows = [...sb.querySelectorAll(".session-row, .ws-head")]
         .filter((el) => el.getClientRects().length > 0).length;
       out.sidebarRows = rows;
       out.sidebarVisibleRows = visibleRows;
@@ -51,6 +74,11 @@
       if (!open) out.offscreen = out.offscreen.filter((k) => !k.startsWith("sidebar"));
     }
     out.drawer = measureDrawer();
+    // Flat is a property of what is *painted*, not of what the stylesheet says:
+    // a shadow arriving from a token, a class added in JS or an inline style is
+    // invisible to a text scan of style.css and perfectly visible on screen. So
+    // every element the page lays out is asked what it actually paints.
+    out.painted = paintedOffenders();
     const beforeX = window.scrollX;
     window.scrollTo(4000, 0);
     out.scrolledX = Math.round(window.scrollX);
@@ -64,16 +92,83 @@
     out.widest = live.slice().sort((x, y) => y[1].right - x[1].right).slice(0, 4).map(name);
     out.leftmost = live.slice().sort((x, y) => x[1].left - y[1].left).slice(0, 3).map(name);
     out.modal = measureModal();
+    out.attach = measureAttachments();
+    return out;
+  }
+  // The attach strip is the one composer surface the empty-window passes above
+  // never see: it exists only while images are staged. Staged here through the
+  // app's own renderer, then measured against the input it must not cover, the
+  // palette it shares an anchor with, and the remove control it must obey.
+  function measureAttachments() {
+    const strip = document.getElementById("attach-strip");
+    const input = document.getElementById("input");
+    const send = document.getElementById("send");
+    const palette = document.getElementById("cmd-palette");
+    const missing = !strip || !input || !send || !palette ||
+      typeof state === "undefined" || typeof renderAttachments !== "function" ||
+      typeof syncPalette !== "function";
+    if (missing) return { present: false };
+    const rect = (el) => {
+      const r = el.getBoundingClientRect();
+      return [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)];
+    };
+    const dot = "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACwAAAAAAQABAAACAUwAOw==";
+    state.pendingImages = [dot, dot + "-2"];
+    renderAttachments();
+    const out = { present: true, chips: strip.querySelectorAll(".attach-chip").length };
+    out.strip = rect(strip);
+    out.input = rect(input);
+    const sR = strip.getBoundingClientRect();
+    const iR = input.getBoundingClientRect();
+    out.overlapsInput = sR.bottom > iR.top + 1 && sR.top < iR.bottom - 1;
+    out.insideViewport =
+      sR.left >= -1 && sR.right <= window.innerWidth + 1 && sR.top >= -1;
+    out.sendEnabledImagesOnly = !send.disabled && input.value === "";
+    // The palette opens at the same anchor as the strip: it must cover the
+    // strip while open (an opaque panel that half-dodges would tear), and the
+    // strip must be back the moment the palette closes.
+    input.value = "/";
+    syncPalette();
+    const pR = palette.getBoundingClientRect();
+    const sR2 = strip.getBoundingClientRect();
+    out.paletteOpen = !palette.classList.contains("hidden");
+    out.paletteCoversStrip = out.paletteOpen &&
+      pR.top <= sR2.top + 1 && pR.bottom >= sR2.bottom - 1 &&
+      pR.left <= sR2.left + 1 && pR.right >= sR2.right - 1;
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    out.stripBackAfterPalette = !strip.classList.contains("hidden");
+    const x = strip.querySelector(".attach-x");
+    if (x) x.click();
+    out.chipsAfterRemove = strip.querySelectorAll(".attach-chip").length;
+    state.pendingImages = [];
+    renderAttachments();
+    out.hiddenWhenEmpty = strip.classList.contains("hidden") && send.disabled;
     return out;
   }
   function report(data) {
+    // The hosts are layout-inert on purpose: their JSON is one unbreakable
+    // token, and a probe that widens the document would then report itself as
+    // the overflow (measured: #result-attach pushed scrollWidth to 1382 at a
+    // 900px window and the guard failed on a defect the page never had).
+    const inert = "position:fixed;left:-99999px;top:0;white-space:pre;";
     let host = document.getElementById("result");
     if (!host) {
       host = document.createElement("div");
       host.id = "result";
+      host.style.cssText = inert;
       document.body.appendChild(host);
     }
-    host.textContent = JSON.stringify(data);
+    const { attach, ...rest } = data;
+    host.textContent = JSON.stringify(rest);
+    let attachHost = document.getElementById("result-attach");
+    if (!attachHost) {
+      attachHost = document.createElement("div");
+      attachHost.id = "result-attach";
+      attachHost.style.cssText = inert;
+      document.body.appendChild(attachHost);
+    }
+    attachHost.textContent = JSON.stringify(attach);
   }
   // The settings modal ships hidden, so the first measurement cannot see it.
   // A narrow window breaks a modal long before it breaks the shell, and a modal

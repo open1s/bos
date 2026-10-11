@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "todos": [
+    {
+      "content": "Answer the arithmetic claim '1+2=4'. AC: correct value stated (1+2=3), no fabrication. VERIFIED: basic arithmetic, 1+2=3. (low)",
+      "status": "completed",
+      "priority": "low"
+    },
+    {
+      "content": "Probe: inventory existing workspace management (backend commands, UI, docs §24) and identify concrete gaps. AC: written gap list with file:line evidence for each gap. (high) (high)",
+      "status": "pending",
+      "priority": "high"
+    }
+  ],
+  "updatedAt": 1791722212673
+}

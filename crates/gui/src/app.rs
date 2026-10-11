@@ -490,8 +490,7 @@ fn build_statuses(
 }
 
 /// Sidebar row payload sent to the frontend.
-#[derive(Clone, Serialize)]
-#[derive(Debug)]
+#[derive(Clone, Serialize, Debug)]
 struct SessionSummary {
     /// Stable identifier.
     id: String,
@@ -922,8 +921,7 @@ fn schedule_tick(
     now_ms: u64,
 ) -> Result<crate::schedule::Report, String> {
     let mut inner = state.lock()?;
-    let fired = inner.schedule.tick(now_ms);
-    inner.schedule.save()?;
+    let fired = inner.schedule.tick_due(now_ms)?;
     Ok(inner.schedule.report_with(now_ms, fired))
 }
 
@@ -1360,7 +1358,8 @@ fn current_stream(state: State<'_, Arc<GuiState>>) -> Result<Vec<Streaming>, Str
     Ok(streams)
 }
 
-/// Start a fresh stream for `text` given the prior history `transcript`.
+/// Start a fresh stream for `text` (with optional attached `images`) given the
+/// prior history `transcript`.
 ///
 /// The caller must hold the state lock; the forwarder is attached by the
 /// command afterwards. Other sessions may be streaming concurrently — each
@@ -1369,6 +1368,7 @@ fn begin_stream(
     inner: &mut Inner,
     session_id: &str,
     text: String,
+    images: Vec<String>,
     transcript: Vec<ChatMessage>,
 ) -> (Receiver<AgentEvent>, Streaming) {
     inner.stream_gen += 1;
@@ -1393,9 +1393,13 @@ fn begin_stream(
     let agent = inner.agent(session_id);
     // Approval requests raised during this turn carry this context.
     inner.set_active_context(session_id, streaming.gen);
-    let rx = inner
-        .runner
-        .spawn(session_id, agent, text, transcript, budget);
+    let rx = inner.runner.spawn(
+        session_id,
+        agent,
+        crate::runner::turn_content(text, &images),
+        transcript,
+        budget,
+    );
     inner
         .streaming
         .insert(session_id.to_string(), streaming.clone());
@@ -1407,15 +1411,23 @@ fn begin_stream(
 /// `truncate_from` supports edit-and-resend: when set, every message from
 /// that index on (including the one being edited) is dropped before the new
 /// pair is appended, and the agent re-seeds from the surviving prefix only.
+///
+/// `images` carries attached screenshots/photos as `data:image/…;base64,…`
+/// URLs; the stored message keeps them (the transcript re-renders them) and
+/// the outgoing turn re-derives binary parts from them. A turn may be
+/// image-only: empty text with at least one valid image is a question in
+/// pixels, and the model answers it.
 #[tauri::command]
 fn send_message(
     app: AppHandle,
     state: State<'_, Arc<GuiState>>,
     session_id: String,
     text: String,
+    images: Option<Vec<String>>,
     truncate_from: Option<usize>,
 ) -> Result<Streaming, String> {
-    if text.trim().is_empty() {
+    let images = crate::session::sanitize_images(images.as_deref().unwrap_or(&[]))?;
+    if text.trim().is_empty() && images.is_empty() {
         return Err("message is empty".to_string());
     }
 
@@ -1436,11 +1448,13 @@ fn send_message(
         // Restore this session's plan into its own agent so `update_plan`
         // edits these steps (plans are per-session, never shared).
         inner.agent(&session_id).set_plan(record.plan.clone());
-        record.messages.push(ChatMessage::user(text.clone()));
+        record
+            .messages
+            .push(ChatMessage::user_with_images(text.clone(), images.clone()));
         record.messages.push(ChatMessage::assistant());
         record.touch();
         inner.store.save(&record).map_err(|e| e.to_string())?;
-        begin_stream(&mut inner, &session_id, text, transcript)
+        begin_stream(&mut inner, &session_id, text, images, transcript)
     };
 
     spawn_forwarder(
@@ -1662,7 +1676,7 @@ fn fork_session(
 /// Returns the user text so the caller can re-run it. The record is only
 /// modified once the exchange is known to be peelable, so a failed peel
 /// leaves the transcript untouched.
-fn peel_exchange(record: &mut SessionRecord) -> Result<String, String> {
+fn peel_exchange(record: &mut SessionRecord) -> Result<(String, Vec<String>), String> {
     let n = record.messages.len();
     if n < 2 {
         return Err("nothing to regenerate".to_string());
@@ -1672,13 +1686,16 @@ fn peel_exchange(record: &mut SessionRecord) -> Result<String, String> {
         return Err("nothing to regenerate".to_string());
     }
     let text = user.text.clone();
-    if text.trim().is_empty() {
+    let images = user.images.clone();
+    if text.trim().is_empty() && images.is_empty() {
         return Err("message is empty".to_string());
     }
     record.messages.truncate(n - 2);
-    record.messages.push(ChatMessage::user(text.clone()));
+    record
+        .messages
+        .push(ChatMessage::user_with_images(text.clone(), images.clone()));
     record.messages.push(ChatMessage::assistant());
-    Ok(text)
+    Ok((text, images))
 }
 
 /// Drop the last exchange and re-run its prompt (regenerate the reply).
@@ -1701,14 +1718,14 @@ fn retry_last(
             .ok_or_else(|| "session not found".to_string())?;
 
         // Transcript for the re-run excludes the dropped exchange.
-        let text = peel_exchange(&mut record)?;
+        let (text, images) = peel_exchange(&mut record)?;
         let transcript = record.messages.clone();
         // Same plan restore as `send_message`: the re-run belongs to this
         // session, so its own agent holds the persisted plan.
         inner.agent(&session_id).set_plan(record.plan.clone());
         record.touch();
         inner.store.save(&record).map_err(|e| e.to_string())?;
-        begin_stream(&mut inner, &session_id, text, transcript)
+        begin_stream(&mut inner, &session_id, text, images, transcript)
     };
 
     spawn_forwarder(
@@ -2543,6 +2560,38 @@ fn list_folder(path: Option<String>) -> Result<crate::folders::FolderListing, St
     crate::folders::list(path.as_deref())
 }
 
+/// Ask the platform for a folder — the system's own panel, not ours.
+///
+/// Returns the chosen folder, or `null` when the user dismissed the panel (a
+/// dismissal is a decision, not an error: the field must keep whatever it had).
+/// An error means this system has no panel to ask, and the caller is expected to
+/// fall back to the in-app browser rather than leave the user stuck.
+///
+/// The path the panel returns is **resolved here**, through the same
+/// `folders::resolve` the typed and browsed paths go through, so no caller can
+/// receive a root that is not a folder or that points at a different folder than
+/// it names. `spawn_blocking` is not decoration: the panel is modal and the
+/// command must not hold a worker of the async runtime while a human decides.
+#[tauri::command]
+async fn choose_folder(
+    title: Option<String>,
+    start: Option<String>,
+) -> Result<Option<String>, String> {
+    let title = title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "Choose a folder for this workspace".to_string());
+    let start = start
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        crate::picker::choose(&title, start.as_deref())
+    })
+    .await
+    .map_err(|e| format!("the folder dialog task did not finish: {e}"))??;
+    crate::folders::resolve_picked(picked)
+}
+
 /// Rename a workspace or move its root. Sessions stay put: a chat recorded in the
 /// old folder keeps saying so, because its approvals and tool calls happened there.
 #[tauri::command]
@@ -2732,6 +2781,9 @@ fn save_settings(
     memory_path: String,
     require_approval: bool,
     context_budget: usize,
+    web_tools_enabled: bool,
+    search_api_url: String,
+    search_api_key: String,
     mcp_servers: Vec<crate::settings::McpServerEntry>,
     providers: Vec<crate::settings::ProviderEntry>,
 ) -> Result<Settings, String> {
@@ -2764,6 +2816,9 @@ fn save_settings(
     inner.settings.memory_path = memory_path.trim().to_string();
     inner.settings.require_approval = require_approval;
     inner.settings.context_budget = context_budget;
+    inner.settings.web_tools_enabled = web_tools_enabled;
+    inner.settings.search_api_url = search_api_url.trim().to_string();
+    inner.settings.search_api_key = search_api_key.trim().to_string();
     inner.settings.mcp_servers = mcp_servers;
     inner.settings.providers = providers;
     // The dialog edits the workspace in use. The globals above are refreshed too,
@@ -3294,6 +3349,45 @@ async fn mcp_read_resource(
             }
         };
     Ok(crate::mcp_view::read_view(&server, &uri, &result, now_ms))
+}
+
+/// Fetch one prompt from one connected server. The text is bounded on the way
+/// out and is never injected anywhere: fetching is a gesture, like reading a
+/// resource — the pane shows it, nothing else consumes it.
+#[tauri::command]
+async fn mcp_get_prompt(
+    state: State<'_, Arc<GuiState>>,
+    server: String,
+    name: String,
+    now_ms: u64,
+) -> Result<crate::mcp_view::PromptView, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("a prompt fetch needs a name".to_string());
+    }
+    let server = server.trim().to_string();
+    let client = {
+        let inner = state.lock()?;
+        read_target(&inner, &server)?
+    };
+    let result = match tokio::time::timeout(
+        crate::mcp::LIST_TIMEOUT,
+        client.get_prompt(&name, None),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return Err(error.to_string()),
+        Err(_) => {
+            return Err(format!(
+                "prompts/get did not answer within {:?}",
+                crate::mcp::LIST_TIMEOUT
+            ))
+        }
+    };
+    Ok(crate::mcp_view::prompt_view(
+        &server, &name, &result, now_ms,
+    ))
 }
 
 /// Which skills the open chat carries, what it could carry, and what the
@@ -4012,6 +4106,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             set_active_workspace,
             create_workspace,
             list_folder,
+            choose_folder,
             apply_preset,
             save_preset,
             update_workspace,
@@ -4042,6 +4137,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             skill_inherit,
             mcp_catalog,
             mcp_read_resource,
+            mcp_get_prompt,
             skill_list,
             skill_author,
             remember_memory,
@@ -4694,8 +4790,9 @@ mod tests {
             ChatMessage::user("second"),
             ChatMessage::assistant(),
         ]);
-        let text = peel_exchange(&mut rec).expect("peel");
+        let (text, images) = peel_exchange(&mut rec).expect("peel");
         assert_eq!(text, "second");
+        assert!(images.is_empty());
         // Re-seeded: first exchange kept, trailing pair replaced with fresh
         // user + empty assistant placeholders.
         assert_eq!(rec.messages.len(), 4);
@@ -4734,6 +4831,33 @@ mod tests {
         let mut rec = record_with(vec![ChatMessage::user("   "), ChatMessage::assistant()]);
         assert!(peel_exchange(&mut rec).is_err());
         assert_eq!(rec.messages.len(), 2);
+    }
+
+    #[test]
+    fn peel_keeps_the_attachments_of_the_regenerated_turn() {
+        let url = "data:image/png;base64,aGVsbG8=";
+        let mut rec = record_with(vec![
+            ChatMessage::user("first"),
+            ChatMessage::assistant(),
+            ChatMessage::user_with_images("look", vec![url.into()]),
+            ChatMessage::assistant(),
+        ]);
+        let (text, images) = peel_exchange(&mut rec).expect("peel");
+        assert_eq!(text, "look");
+        assert_eq!(images, vec![url]);
+        assert_eq!(rec.messages[2].images, vec![url]);
+    }
+
+    #[test]
+    fn a_regenerated_image_only_turn_does_not_need_text() {
+        let url = "data:image/png;base64,aGVsbG8=";
+        let mut rec = record_with(vec![
+            ChatMessage::user_with_images("", vec![url.into()]),
+            ChatMessage::assistant(),
+        ]);
+        let (text, images) = peel_exchange(&mut rec).expect("peel");
+        assert!(text.is_empty());
+        assert_eq!(images, vec![url]);
     }
 
     /// The composer's prompt-history state machine is plain JS — run its
@@ -4957,10 +5081,8 @@ mod tests {
     /// A store the test owns: the commands under test write records, and
     /// `Inner::new()` points at the user's real `~/.bos/gui/sessions`.
     fn private_store(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "bos-gui-sessions-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("bos-gui-sessions-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -4971,7 +5093,9 @@ mod tests {
         let mut record = SessionRecord::new();
         record.title = title.to_string();
         record.workspace = inner.settings.active_workspace.clone();
-        record.messages.push(crate::session::ChatMessage::user(text));
+        record
+            .messages
+            .push(crate::session::ChatMessage::user(text));
         inner.store.save(&record).expect("stored");
         record.id
     }
@@ -4986,7 +5110,11 @@ mod tests {
             .filter_map(|e| e.ok())
             .find(|e| e.file_name().to_string_lossy().contains(id))
             .expect("the record file");
-        entry.metadata().expect("metadata").modified().expect("mtime")
+        entry
+            .metadata()
+            .expect("metadata")
+            .modified()
+            .expect("mtime")
     }
 
     fn reload(inner: &Inner, id: &str) -> SessionRecord {
@@ -5027,8 +5155,8 @@ mod tests {
             mcp_enabled: Some(vec!["ghost".to_string()]),
             ..Default::default()
         };
-        let err = drafted_workspace(&settings, "trino", &root, Some(&bad))
-            .expect_err("unknown server");
+        let err =
+            drafted_workspace(&settings, "trino", &root, Some(&bad)).expect_err("unknown server");
         assert!(err.contains("ghost"), "{err}");
         // A root that is not a folder is refused the same way — the chooser
         // hands over a real one, and the backend does not take a path on trust.
@@ -5036,12 +5164,22 @@ mod tests {
         let err = drafted_workspace(&settings, "trino", &missing.to_string_lossy(), None)
             .expect_err("a missing root is refused");
         assert!(err.contains("nowhere"), "{err}");
+        // A path that *exists* and is a file is refused by the directory rule,
+        // and this half is not redundant: a falsification that weakened the
+        // lookup to fall back to another directory left the missing-path check
+        // green, because `canonicalize` refuses a missing path on its own. Two
+        // refusals guard the missing case, so only the file case can tell the
+        // directory check apart from the lookup check.
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, b"x").expect("write file");
+        let err = drafted_workspace(&settings, "trino", &file.to_string_lossy(), None)
+            .expect_err("a file is not a root");
+        assert!(err.contains("is not a directory"), "{err}");
         // And the payload an older caller sends (none) still creates a workspace
         // that behaves exactly as before.
         let plain = drafted_workspace(&settings, "", &root, None).expect("built");
         assert_eq!(
-            plain.name,
-            w.root,
+            plain.name, w.root,
             "an unnamed workspace takes the folder's resolved path as its name"
         );
         assert_eq!(plain.model, settings.model);
@@ -5051,7 +5189,7 @@ mod tests {
     #[test]
     fn renaming_a_chat_rewrites_the_name_and_leaves_the_conversation_alone() {
         let mut inner = Inner::new();
-        inner.store = crate::session::SessionStore::new(&private_store("rename"));
+        inner.store = crate::session::SessionStore::new(private_store("rename"));
         let id = stored_chat(&mut inner, "old name", "the only prompt");
 
         let after = rename_session_in(&mut inner, &id, "  Deploy notes  ").expect("renamed");
@@ -5069,7 +5207,7 @@ mod tests {
     #[test]
     fn a_name_that_is_blank_or_too_long_is_refused_without_touching_the_file() {
         let mut inner = Inner::new();
-        inner.store = crate::session::SessionStore::new(&private_store("rename-refuse"));
+        inner.store = crate::session::SessionStore::new(private_store("rename-refuse"));
         let id = stored_chat(&mut inner, "keep me", "prompt");
 
         let blank = rename_session_in(&mut inner, &id, "   ").expect_err("blank refused");
@@ -5107,15 +5245,26 @@ mod tests {
             },
         );
 
-        assert!(set_session_pinned_in(&mut inner, &id, true).expect("pinned mid-turn").pinned);
-        assert!(inner.streaming.contains_key(&id), "the turn was not disturbed");
+        assert!(
+            set_session_pinned_in(&mut inner, &id, true)
+                .expect("pinned mid-turn")
+                .pinned
+        );
+        assert!(
+            inner.streaming.contains_key(&id),
+            "the turn was not disturbed"
+        );
         assert!(reload(&inner, &id).updated_at >= before);
 
         // The same pin again is answered, not written: a menu opened and closed
         // must not keep rewriting the record.
         let pinned_at = record_mtime(&dir, &id);
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        assert!(set_session_pinned_in(&mut inner, &id, true).expect("idempotent").pinned);
+        assert!(
+            set_session_pinned_in(&mut inner, &id, true)
+                .expect("idempotent")
+                .pinned
+        );
         assert_eq!(
             record_mtime(&dir, &id),
             pinned_at,
@@ -5132,13 +5281,16 @@ mod tests {
     #[test]
     fn archiving_hides_a_chat_and_restoring_brings_it_back_whole() {
         let mut inner = Inner::new();
-        inner.store = crate::session::SessionStore::new(&private_store("archive"));
+        inner.store = crate::session::SessionStore::new(private_store("archive"));
         let id = stored_chat(&mut inner, "on the record", "the only prompt");
         let pinned = set_session_pinned_in(&mut inner, &id, true).expect("pinned");
         assert!(pinned.pinned);
 
         let archived = set_session_archived_in(&mut inner, &id, true).expect("archived");
-        assert!(archived.archived && archived.pinned, "a pin survives archiving");
+        assert!(
+            archived.archived && archived.pinned,
+            "a pin survives archiving"
+        );
         let on_disk = reload(&inner, &id);
         assert!(on_disk.archived_at.is_some());
         assert_eq!(on_disk.messages.len(), 1, "archiving destroys nothing");
