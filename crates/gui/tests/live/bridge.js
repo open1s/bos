@@ -993,6 +993,10 @@
       return summaryOf(s);
     },
     load_session: ({ id }) => copy(store.cache[id] || []),
+    // The page logs through a command of its own (logf → ui_log → ~/.bos/log).
+    // There is no file to write here, but a command the page calls with no
+    // handler is recorded as a hygiene error, so this one has to answer.
+    ui_log: () => null,
     delete_session: ({ id }) => {
       // The trash names the chat back on restore, so keep its title.
       const s = store.sessions.find((x) => x.id === id);

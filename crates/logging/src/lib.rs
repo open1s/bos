@@ -6,7 +6,11 @@
 
 use flexi_logger::{Cleanup, Criterion, DeferredNow, FileSpec, Logger, Naming};
 use log::Record;
-use std::{io::Write, path::Path, sync::Mutex};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 static LOGGER_HANDLE: Mutex<Option<flexi_logger::LoggerHandle>> = Mutex::new(None);
 
@@ -63,21 +67,36 @@ fn pretty_msg(msg: &str) -> String {
     msg.to_string()
 }
 
+/// The default log directory: `~/.bos/log`. `None` when no home directory
+/// can be determined.
+pub fn default_log_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|d| d.join(".bos").join("log"))
+}
+
 /// Initialize the global logger.
 ///
-/// Writes rotating files under `~/.bos/log` and mirrors them to stdout. The
-/// level comes from `RUST_LOG`, then `BOS_LOG`, then the `logging.level` config
-/// key, defaulting to `error`. Returns early if the log directory cannot be
-/// created; a failure to install the logger is printed to stderr.
+/// Writes rotating files under [`default_log_dir`] with the basename `bos`
+/// and mirrors them to stdout. The level comes from `RUST_LOG`, then
+/// `BOS_LOG`, then the `logging.level` config key, defaulting to `error`.
+/// Returns early if the log directory cannot be created; a failure to
+/// install the logger is printed to stderr.
 pub fn auto_init_tracing() {
-    let logdir = match dirs::home_dir() {
-        Some(d) => d.join(".bos/log"),
-        None => {
-            return;
-        }
-    };
+    if let Some(dir) = default_log_dir() {
+        auto_init_tracing_in(dir, "bos");
+    }
+}
 
-    if std::fs::create_dir_all(&logdir).is_err() {
+/// Initialize the global logger into a caller-chosen directory and file
+/// basename.
+///
+/// `log_dir` is created if missing; rotating files carry `basename` (e.g.
+/// `basename("gui")` writes `gui.log`, keeping rotated files beside it).
+/// Level resolution, rotation policy and stdout mirroring match
+/// [`auto_init_tracing`].
+pub fn auto_init_tracing_in(log_dir: impl AsRef<Path>, basename: &str) {
+    let logdir = log_dir.as_ref();
+
+    if std::fs::create_dir_all(logdir).is_err() {
         return;
     }
 
@@ -103,10 +122,14 @@ pub fn auto_init_tracing() {
         "info".to_string()
     };
 
-    let level =
-        format!("bus={level},agent={level},react={level},nbos={level},resource={level},zenoh=off,h2=off,rustls=off");
+    // `ui` is the GUI's decision trail (webview lines and backend choices
+    // alike); it stays at info so the trail survives an error-level default,
+    // and matches no target in non-GUI processes.
+    let level = format!(
+        "bus={level},agent={level},react={level},nbos={level},resource={level},ui=info,zenoh=off,h2=off,rustls=off"
+    );
 
-    let file_spec = FileSpec::default().directory(logdir).basename("bos");
+    let file_spec = FileSpec::default().directory(logdir).basename(basename);
     let logger = Logger::try_with_str(level)
         .unwrap()
         .log_to_file(file_spec)
@@ -166,31 +189,39 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_init_tracing_creates_log_file() {
-        use crate::{auto_init_tracing, log_test_message};
+    fn test_auto_init_tracing_in_writes_to_given_dir_and_basename() {
+        use crate::auto_init_tracing_in;
 
-        auto_init_tracing();
+        // Own the path this test asserts about: a per-process temp dir,
+        // cleared first so a leftover file from an earlier run cannot make
+        // the assertion pass for the wrong reason.
+        let dir = std::env::temp_dir().join(format!("bos-logging-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
 
-        log::info!("DIRECT LOG TEST");
-        log_test_message("test message from rust test");
+        auto_init_tracing_in(&dir, "test-basename");
+        // Target `ui` on purpose: it is the one target the filter always
+        // keeps at info, and the line only lands if that directive works.
+        log::info!(target: "ui", "DIRECT LOG TEST");
 
-        let logdir = dirs::home_dir().unwrap().join(".bos/log");
-        println!("Log directory: {:?}", logdir);
-
-        if let Ok(entries) = std::fs::read_dir(&logdir) {
-            let files: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            println!("Found {} files in log dir", files.len());
-            for entry in &files {
-                println!("  - {:?}", entry.path());
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    println!(
-                        "    Content: {}",
-                        content.lines().take(3).collect::<Vec<_>>().join("\n    ")
-                    );
+        // The logger may write on its own thread; poll briefly for the line.
+        let file = dir.join("test-basename.log");
+        let mut content = String::new();
+        for _ in 0..50 {
+            if let Ok(c) = std::fs::read_to_string(&file) {
+                if c.contains("DIRECT LOG TEST") {
+                    content = c;
+                    break;
                 }
             }
-        } else {
-            println!("Could not read log directory");
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
+
+        assert!(
+            content.contains("DIRECT LOG TEST"),
+            "expected {} to hold the logged line",
+            file.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

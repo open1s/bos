@@ -1475,7 +1475,6 @@
     // promises asserted here are *which command a gesture sends and with what*,
     // and whether the menu costs a round trip. What the backend does with that
     // command is the live guard's business.
-    const restoreConfirm = window.confirm;
     const restoreSidebar = {
       sessions: state.sessions,
       workspaces: state.workspaces,
@@ -1714,18 +1713,28 @@
         lastArgs("set_session_pinned").id === "s2" &&
         lastArgs("set_session_pinned").pinned === true,
     );
-    // The confirm is stubbed *before* the click: letting the real one run puts a
-    // native dialog in front of a headless browser that has nobody to answer it,
-    // and the whole guard hangs instead of failing.
-    window.confirm = () => false;
+    // The question is the app's own dialog, clicked here rather than stubbed.
+    // The stub that used to stand in for window.confirm answered a question no
+    // user is ever shown; both halves of the answer are now the same gesture a
+    // hand makes, and the harness cannot assume either one.
     pick("s2", "delete");
     await flush();
+    const ask = d.getElementById("confirm-modal");
     assert(
-      "the destructive entry asks before it deletes, and does nothing when refused",
-      called("delete_session").length === 0,
+      "the destructive entry asks before it deletes, in the app's own dialog",
+      !!ask && !ask.classList.contains("hidden") && called("delete_session").length === 0,
     );
-    window.confirm = () => true;
+    d.getElementById("confirm-cancel").click();
+    await flush();
+    await flush();
+    assert(
+      "changing your mind closes the question and sends nothing",
+      ask.classList.contains("hidden") && called("delete_session").length === 0,
+    );
     pick("s2", "delete");
+    await flush();
+    d.getElementById("confirm-ok").click();
+    await flush();
     await flush();
     assert(
       `Delete in the menu reaches the trash (${JSON.stringify(lastArgs("delete_session"))})`,
@@ -1942,7 +1951,6 @@
         .join(",") || "none"})`,
       unnamed.length === 0,
     );
-    window.confirm = restoreConfirm;
     state.sessions = restoreSidebar.sessions;
     state.workspaces = restoreSidebar.workspaces;
     state.activeWorkspace = restoreSidebar.activeWorkspace;

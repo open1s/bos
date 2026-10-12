@@ -11,6 +11,9 @@ license.workspace = true
 tauri = { version = "2", features = [] }
 agent = { path = "../agent" }
 react = { path = "../react" }
+logging = { path = "../logging" }
+log = { version = "0.4" }
+dirs = "7.0.0"
 reqwest = { workspace = true, features = ["json"] }
 async-trait = { workspace = true }
 config = { path = "../config" }

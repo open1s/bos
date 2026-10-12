@@ -19,6 +19,7 @@ mod folders;
 mod init;
 mod instructions;
 mod knowledge;
+mod logx;
 mod mcp;
 mod mcp_policy;
 mod mcp_view;
@@ -39,5 +40,12 @@ mod workspace_dir;
 
 /// Launch the GUI (opens the Tauri window and blocks until quit).
 pub fn run() -> anyhow::Result<()> {
+    // The GUI's rotating log, in its own subtree beside the sessions it
+    // already owns: the webview's decision trail lands here through `logx`.
+    // Before any command can log. No home directory, no file — same
+    // best-effort contract as the logging crate's own default.
+    if let Some(home) = dirs::home_dir() {
+        logging::auto_init_tracing_in(home.join(".bos").join("gui").join("log"), "gui");
+    }
     crate::app::run()
 }

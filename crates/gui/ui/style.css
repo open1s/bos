@@ -1037,6 +1037,38 @@ body.resizing #doc-panel { transition: none; }
   font-size: 17px;
 }
 
+/* One yes/no question, for the few actions that cannot be taken back. The same
+   card as settings, one line of copy and two buttons; the confirm button is the
+   only place the error colour is used as a fill. */
+.confirm-card {
+  width: 400px;
+  padding: 18px 20px;
+}
+
+.confirm-title {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+.confirm-body {
+  margin: 0 0 16px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+#confirm-ok.danger {
+  background: var(--error);
+  border-color: var(--error);
+  color: #fff;
+}
+
 .modal-card label {
   display: block;
   font-size: 12.5px;

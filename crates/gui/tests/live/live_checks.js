@@ -1365,13 +1365,36 @@
     await waitFor(() => modal.classList.contains("hidden"), "settings to close clean");
 
     /* ---- trash: delete, see it named in settings, restore -------------- */
-    window.confirm = () => true;
     const victim = rowByTitle("Empty notebook");
     assert("trash: the seeded empty chat is in the sidebar", !!victim);
-    // Delete lives in the row menu now, where the reference puts it.
+    // Delete lives in the row menu now, where the reference puts it, and the
+    // question it asks is the app's own dialog. It used to be window.confirm,
+    // stubbed to true right here: a platform panel cannot be clicked by a
+    // guard, so the harness answered a question no user was ever shown.
+    const delsBefore = LIVE.called("delete_session").length;
+    const ask = d.getElementById("confirm-modal");
     victim.querySelector(".sess-menu").click();
     d.querySelector('.row-menu [data-run="delete"]').click();
-    await waitFor(() => LIVE.called("delete_session").length === 1, "delete_session to fire");
+    await waitFor(() => ask && !ask.classList.contains("hidden"), "the delete question to appear");
+    assert(
+      "trash: deleting asks first, and the question names the action",
+      /Move to trash/.test(d.getElementById("confirm-ok").textContent),
+    );
+    // Changing your mind is not a delete: the answer decides the command.
+    d.getElementById("confirm-cancel").click();
+    await waitFor(() => ask.classList.contains("hidden"), "the question to close");
+    assert(
+      "trash: a cancelled delete asks nothing of the backend",
+      LIVE.called("delete_session").length === delsBefore,
+    );
+    victim.querySelector(".sess-menu").click();
+    d.querySelector('.row-menu [data-run="delete"]').click();
+    await waitFor(() => !ask.classList.contains("hidden"), "the question to come back");
+    d.getElementById("confirm-ok").click();
+    await waitFor(
+      () => LIVE.called("delete_session").length === delsBefore + 1,
+      "delete_session to fire",
+    );
     await waitFor(() => !rowByTitle("Empty notebook"), "the row to leave the sidebar");
     assert(
       "trash: deleting moves the chat out of the sidebar",
@@ -1742,12 +1765,19 @@
       );
       // A refused delete is not a delete: the chat stays in the sidebar, the reason
       // is shown, and nothing local is thrown away for a chat the backend still has.
-      window.confirm = () => true;
       const delsBefore = LIVE.called("delete_session").length;
       LIVE.failNext("delete_session", "the trash is closed for now");
       d.querySelector(`#session-list .session-row[data-id="${targetId}"] .sess-menu`).click();
       const delItem = d.querySelector('.row-menu [data-run="delete"]');
       if (delItem) delItem.click();
+      // The question has to be answered before the command exists at all — the
+      // answer *is* the command. Leaving it unanswered would keep the backend
+      // silent, and the refusal this check is about would never be reached.
+      await waitFor(
+        () => !d.getElementById("confirm-modal").classList.contains("hidden"),
+        "the delete question to appear",
+      );
+      d.getElementById("confirm-ok").click();
       await waitFor(
         () => LIVE.called("delete_session").length === delsBefore + 1,
         "the refused delete to reach the backend",

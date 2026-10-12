@@ -183,6 +183,18 @@
     </main>
   </div>
 
+  <div id="confirm-modal" class="modal hidden" role="dialog"
+       aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+    <div class="modal-card confirm-card">
+      <h2 id="confirm-title" class="confirm-title"></h2>
+      <p id="confirm-body" class="confirm-body"></p>
+      <div class="confirm-actions">
+        <button type="button" id="confirm-cancel" class="btn btn-ghost"></button>
+        <button type="button" id="confirm-ok" class="btn btn-accent"></button>
+      </div>
+    </div>
+  </div>
+
   <div id="settings-modal" class="modal hidden" role="dialog"
        aria-modal="true" aria-labelledby="settings-title">
     <div class="modal-card set-card">

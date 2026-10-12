@@ -134,5 +134,35 @@ else
   esac
 fi
 
+# --- the window must be allowed to listen, which is the one core surface it uses ---
+# Tauri v2 answered every listen() with "core:event:allow-listen is not allowed"
+# while this entry was missing. The app's own #[tauri::command]s are exempt from
+# capabilities, so everything a fixture could see — rendering, invokes, the whole
+# page guard — worked, and nothing at all arrived from the backend: no streamed
+# token, no approval, no PTY output, no job or reminder update. A denial like that
+# only exists in a running window, which is why it is checked here, in the file
+# the bundle is built from.
+perm=$(python3 - "$PWD" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+perms = []
+conf = json.loads(open(os.path.join(root, "tauri.conf.json"), encoding="utf-8").read())
+for entry in (conf.get("app", {}).get("security", {}).get("capabilities") or []):
+    if isinstance(entry, str):
+        perms.append(entry)
+    else:
+        perms.extend(entry.get("permissions") or [])
+capdir = os.path.join(root, "capabilities")
+if os.path.isdir(capdir):
+    for name in sorted(os.listdir(capdir)):
+        if name.endswith(".json"):
+            cap = json.loads(open(os.path.join(capdir, name), encoding="utf-8").read())
+            perms.extend(cap.get("permissions") or [])
+print("\n".join(perms))
+PY
+)
+printf '%s\n' "$perm" | grep -Eq 'core:(default|event:(default|allow-listen))' \
+  && ok || bad "no capability grants the event channel: every listen() is refused at runtime"
+
 echo "[package] checks=$checks failures=$fail"
 [ "$fail" = 0 ]

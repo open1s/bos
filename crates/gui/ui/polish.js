@@ -85,6 +85,19 @@
     "kb.add": { en: "Add", zh: "新增" },
     "kb.save": { en: "Save", zh: "保存" },
     "kb.cancel": { en: "Cancel edit", zh: "取消编辑" },
+    "ui.cancel": { en: "Cancel", zh: "取消" },
+    "session.deleteTitle": { en: "Delete this chat?", zh: "删除这个会话？" },
+    "session.deleteBody": {
+      en: "It moves to the trash. You can restore it from settings.",
+      zh: "它会移入回收站，可以在设置里恢复。",
+    },
+    "session.deleteOk": { en: "Move to trash", zh: "移入回收站" },
+    "trash.purgeTitle": { en: "Empty the trash?", zh: "清空回收站？" },
+    "trash.purgeOk": { en: "Delete permanently", zh: "永久删除" },
+    "trash.purgeBody": {
+      en: "Permanently delete {n} {many}? This cannot be undone.",
+      zh: "永久删除 {n} 个会话？此操作不可撤销。",
+    },
     "mcp.catalogTitle": { en: "Resources and prompts", zh: "资源与提示词" },
     "mcp.catalogHint": {
       en: "What the connected servers publish besides tools. A resource is read on demand — its text never enters a prompt unless you paste it — and a prompt is fetched on demand the same way.",

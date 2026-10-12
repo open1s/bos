@@ -735,6 +735,7 @@ fn set_session_archived_in(
 /// Delete a session's stored file, stopping its stream if it is running.
 #[tauri::command]
 fn delete_session(state: State<'_, Arc<GuiState>>, id: String) -> Result<(), String> {
+    crate::logx::write_line("INFO", "delete", &format!("chat={id} received"));
     let mut inner = state.lock()?;
     if inner.streaming.remove(&id).is_some() {
         inner.runner.stop(&id);
@@ -748,6 +749,7 @@ fn delete_session(state: State<'_, Arc<GuiState>>, id: String) -> Result<(), Str
         inner.stream_gen += 1;
     }
     inner.store.delete(&id);
+    crate::logx::write_line("INFO", "delete", &format!("chat={id} deleted"));
     Ok(())
 }
 
@@ -1165,14 +1167,24 @@ fn search_sessions(
 /// the frontend also loads background sessions through this).
 #[tauri::command]
 fn load_session(state: State<'_, Arc<GuiState>>, id: String) -> Result<Vec<ChatMessage>, String> {
+    crate::logx::write_line("INFO", "load", &format!("chat={id}"));
     let inner = state.lock()?;
-    inner
+    let found = inner
         .store
         .load_all()
         .into_iter()
         .find(|s| s.id == id)
         .map(|s| s.messages)
-        .ok_or_else(|| "session not found".to_string())
+        .ok_or_else(|| "session not found".to_string());
+    match &found {
+        Ok(msgs) => crate::logx::write_line(
+            "INFO",
+            "load",
+            &format!("chat={id} msgs={}", msgs.len()),
+        ),
+        Err(_) => crate::logx::write_line("WARN", "load", &format!("chat={id} not found")),
+    }
+    found
 }
 
 /// Load session `id`'s persisted plan into its agent and return it.
@@ -1664,12 +1676,52 @@ fn fork_session(
     state: State<'_, Arc<GuiState>>,
     session_id: String,
     index: usize,
-) -> Result<SessionRecord, String> {
+) -> Result<SessionSummary, String> {
+    crate::logx::write_line(
+        "INFO",
+        "fork",
+        &format!("chat={session_id} index={index}"),
+    );
     let inner = state.lock()?;
-    if inner.streaming.contains_key(&session_id) {
+    let out = fork_session_summary(&inner, &session_id, index);
+    match &out {
+        Ok(s) => crate::logx::write_line(
+            "INFO",
+            "fork",
+            &format!("chat={session_id} -> {} ({})", s.id, s.title),
+        ),
+        Err(e) => crate::logx::write_line(
+            "WARN",
+            "fork",
+            &format!("chat={session_id} refused: {e}"),
+        ),
+    }
+    out
+}
+
+/// What the sidebar gets when a branch is made. The answer is a row, not the
+/// record: they carry the same chat in two different shapes, and the record's
+/// archived field is a timestamp where the row's is a flag — one serialises as
+/// a list, which is truthy in the page either way, so handing the page a record
+/// made a fresh fork draw itself as archived and vanish from the list it had
+/// just been added to. The page cannot tell the two shapes apart after the
+/// fact, so the command answers in the vocabulary its caller speaks.
+fn fork_session_summary(
+    inner: &Inner,
+    session_id: &str,
+    index: usize,
+) -> Result<SessionSummary, String> {
+    let fork = fork_session_in(inner, session_id, index)?;
+    Ok(summary(&fork, &inner.settings.active_workspace))
+}
+
+/// The body of fork_session, so a test can drive the same door the command
+/// opens: a turn in flight and a compaction both refuse to be branched.
+fn fork_session_in(inner: &Inner, session_id: &str, index: usize) -> Result<SessionRecord, String> {
+    if inner.streaming.contains_key(session_id) {
         return Err("a turn is in progress — wait for it to finish".to_string());
     }
-    if inner.compacting.contains(&session_id) {
+    if inner.compacting.contains(session_id) {
         return Err("a compaction is running for this chat".to_string());
     }
     let record = inner
@@ -4183,6 +4235,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            crate::logx::ui_log,
             list_sessions,
             create_session,
             delete_session,
@@ -4743,6 +4796,46 @@ mod tests {
         assert_eq!(reloaded.messages.len(), 1);
 
         assert!(store.move_to("missing-session", "workspace-b").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// A fork is reported the way the sidebar lists chats, not the way the
+    /// store keeps them. The two shapes differ in exactly the field the page
+    /// reads to choose between the list and the archive, and the record's is a
+    /// timestamp — which serialises as a list, truthy in the page — so a fresh
+    /// branch drew itself as archived and vanished from the list it had just
+    /// been added to. The row the command returns is the only place this is
+    /// visible: the live bridge hands the page whichever shape its author had
+    /// in mind, so it answered "a row" while the real command answered "a
+    /// record".
+    #[test]
+    fn a_fork_is_reported_the_way_the_sidebar_lists_chats() {
+        let mut inner = Inner::new();
+        let dir = private_store("fork-shape");
+        inner.store = crate::session::SessionStore::new(&dir);
+        inner.settings.active_workspace = "workspace-a".to_string();
+        let source = stored_chat(&mut inner, "hello", "one");
+        let mut record = inner.store.load(&source).expect("loaded");
+        record.messages.push(ChatMessage::user("two"));
+        inner.store.save(&record).expect("saved");
+
+        let fork = fork_session_summary(&inner, &source, 1).expect("branched");
+        assert_ne!(fork.id, source, "a branch is a chat of its own");
+        assert!(
+            !fork.archived,
+            "a fresh branch belongs in the list, not the archive"
+        );
+        assert_eq!(fork.workspace, "workspace-a");
+        // A branch is named so it can be told apart in the list it lands in.
+        assert_eq!(fork.title, "hello (branch)");
+        assert!(
+            inner.store.load(&fork.id).is_some(),
+            "the branch is on disk before it is announced"
+        );
+        // The other half of the same door: a branch nobody can find is refused,
+        // and a refused branch writes nothing.
+        let before = inner.store.load_all().len();
+        assert!(fork_session_summary(&inner, "no-such-chat", 1).is_err());
+        assert_eq!(inner.store.load_all().len(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]

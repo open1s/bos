@@ -4,10 +4,22 @@
 // Late-bound on purpose: the runtime injects `__TAURI__`, and reading it per
 // call means a harness (or a test double) can observe what a form sends.
 const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
-const { listen } = window.__TAURI__.event;
+const { listen: listenRaw } = window.__TAURI__.event;
+/* A refused subscription is logged, not merely rejected. Tauri rejects a listen
+   it is not permitted, and before this wrapper that became an unhandled
+   rejection naming no topic: the entire event bridge was dead while every
+   invoke still worked, which is how a window can look alive and never receive a
+   token, an approval, a PTY line or a job update. */
+const listen = (topic, handler) => {
+  const subscribed = listenRaw(topic, handler);
+  if (subscribed && typeof subscribed.catch === "function") {
+    subscribed.catch((err) => logf("error", "events", `${topic} refused: ${err}`));
+  }
+  return subscribed;
+};
 
 /* One log funnel for the webview: console (visible in devtools) plus the
-   backend's file (`ui_log` → ~/.bos/log/gui.log), so a report that "the menu
+   backend's file (`ui_log` → ~/.bos/gui/log/gui.log), so a report that "the menu
    does nothing" can be answered from one ordered log instead of a guess.
    Fire-and-forget and never throws: a logging mistake must not become the bug
    being observed. */
@@ -3608,7 +3620,9 @@ async function forkChat(id) {
     });
     logf("info", "fork", `chat=${id} -> ${fork && fork.id}`);
     await refreshSessions();
-    state.sessions = [fork, ...state.sessions.filter((s) => s.id !== fork.id)];
+    // The refresh already lists the fork, in the row shape the sidebar speaks;
+    // prepending the command's answer put a second shape of the same chat at
+    // the top of the list and threw the correct row away.
     await switchSession(fork.id);
     renderAll();
   } catch (e) {
@@ -3687,12 +3701,72 @@ function activeSession() {
   return state.sessions.find((s) => s.id === state.activeId && !s.archived) || null;
 }
 
+/* One yes/no question, asked by the app rather than by the platform. The
+   native window.confirm panel cannot be driven by any guard — which is exactly
+   why the guards stubbed it to true and never saw what the user saw — cannot be
+   themed, and belongs to a thread that is not this window. */
+let confirmWired = false;
+let confirmAnswer = null;
+
+function confirmAction({ title, body, ok, danger }) {
+  const modal = $("confirm-modal");
+  if (!modal) {
+    logf("error", "confirm", "no dialog in the markup");
+    return Promise.resolve(false);
+  }
+  if (confirmAnswer) closeConfirm(false);
+  if (!confirmWired) {
+    wireConfirm();
+    confirmWired = true;
+  }
+  $("confirm-title").textContent = title || "";
+  $("confirm-body").textContent = body || "";
+  const go = $("confirm-ok");
+  go.textContent = ok || "OK";
+  go.classList.toggle("danger", !!danger);
+  const cancel = $("confirm-cancel");
+  cancel.textContent = tr("ui.cancel", "Cancel");
+  modal.classList.remove("hidden");
+  cancel.focus();
+  return new Promise((resolve) => {
+    confirmAnswer = resolve;
+  });
+}
+
+function closeConfirm(answer) {
+  const modal = $("confirm-modal");
+  if (modal) modal.classList.add("hidden");
+  const done = confirmAnswer;
+  confirmAnswer = null;
+  if (done) done(answer);
+}
+
+function wireConfirm() {
+  const modal = $("confirm-modal");
+  $("confirm-ok").addEventListener("click", () => closeConfirm(true));
+  $("confirm-cancel").addEventListener("click", () => closeConfirm(false));
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) closeConfirm(false);
+  });
+  modal.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    e.preventDefault();
+    e.stopPropagation();
+    closeConfirm(false);
+  });
+}
+
 async function deleteSession(id) {
   // Two lines around the confirm on purpose: if the log shows "asking" but
   // never "confirm=", the dialog call itself never returned — which is the
   // shape a webview without a confirm-panel delegate has.
   logf("info", "delete", `chat=${id} asking confirm`);
-  const sure = window.confirm("Move this chat to the trash? You can restore it from settings.");
+  const sure = await confirmAction({
+    title: tr("session.deleteTitle", "Delete this chat?"),
+    body: tr("session.deleteBody", "It moves to the trash. You can restore it from settings."),
+    ok: tr("session.deleteOk", "Move to trash"),
+    danger: true,
+  });
   logf("info", "delete", `chat=${id} confirm=${sure}`);
   if (!sure) return;
   state.error = null;
@@ -5126,7 +5200,18 @@ async function purgeTrash() {
     return;
   }
   const many = count === 1 ? "chat" : "chats";
-  if (!window.confirm(`Permanently delete ${count} ${many}? This cannot be undone.`)) return;
+  const sure = await confirmAction({
+    title: tr("trash.purgeTitle", "Empty the trash?"),
+    // The count is substituted into the translated sentence: Chinese has no
+    // plural to agree with, and a sentence glued together from fragments would
+    // read wrong in whichever language orders them differently.
+    body: tr("trash.purgeBody", "Permanently delete {n} {many}? This cannot be undone.")
+      .replace("{n}", String(count))
+      .replace("{many}", many),
+    ok: tr("trash.purgeOk", "Delete permanently"),
+    danger: true,
+  });
+  if (!sure) return;
   try {
     const purged = await invoke("purge_trash");
     toast(`Permanently deleted ${purged} ${purged === 1 ? "chat" : "chats"}`);
