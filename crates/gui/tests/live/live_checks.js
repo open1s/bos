@@ -1869,39 +1869,88 @@
       );
     }
 
-    /* ---- the sidebar's prominent action adds a workspace --------------- */
-    // It opened a chat before rev 111. This drives the button the sidebar leads
-    // with and asserts the dialog the other door opens is the one that appears —
-    // the folder-plus below drives it again for the creation flow itself.
+    /* ---- the sidebar's prominent action asks the system panel ---------- */
+    // It opened a chat before rev 111, and a form before rev 114. The gesture is
+    // the folder, so the panel comes first and its answer *is* the workspace.
     {
       const before = LIVE.settings().workspaces.length;
+      const createsBefore = LIVE.called("create_workspace").length;
       closeSettings();
       closeAddWorkspace();
       await sleep(20);
+      LIVE.answerNext("choose_folder", "/home/e2e/bos");
       d.getElementById("workspace-add-primary").click();
-      await sleep(60);
-      assert(
-        `M9: the sidebar leads with Add-workspace (${d
-          .getElementById("workspace-add-primary")
-          .getAttribute("aria-label")} → ${d.getElementById("ws-add").className.trim()})`,
-        !d.getElementById("ws-add").classList.contains("hidden") &&
-          d.getElementById("settings-modal").classList.contains("hidden") &&
-          d.getElementById("ws-add-name").value === "",
+      await waitFor(
+        () => LIVE.called("create_workspace").length === createsBefore + 1,
+        "the pick to reach the backend as a workspace",
       );
-      closeAddWorkspace();
-      await sleep(20);
+      const sent = LIVE.lastArgs("create_workspace");
       assert(
-        `M9: dismissing it adds no workspace (${before} → ${LIVE.settings().workspaces.length})`,
-        d.getElementById("ws-add").classList.contains("hidden") &&
-          LIVE.settings().workspaces.length === before,
+        `M9: the folder-plus asks the system panel first and the pick becomes the workspace (${JSON.stringify({ asked: LIVE.lastArgs("choose_folder").start, root: sent.root, name: sent.name, config: sent.config })})`,
+        sent.root === "/home/e2e/bos" &&
+          sent.name === "bos" &&
+          sent.config === null &&
+          d.getElementById("ws-add").classList.contains("hidden") &&
+          d.getElementById("settings-modal").classList.contains("hidden"),
+      );
+      const made = LIVE.settings().workspaces.find((w) => w.root === "/home/e2e/bos");
+      assert(
+        `M9: the folder's workspace is the active one and is in the sidebar (${[...d.querySelectorAll("#session-list .ws-name")].map((n) => n.textContent).join(",")})`,
+        !!made &&
+          LIVE.settings().active_workspace === made.id &&
+          [...d.querySelectorAll("#session-list .ws-name")].some((n) => n.textContent === "bos"),
+      );
+      // A folder that is already a workspace — the one that is *not* active here —
+      // is focused rather than recorded twice: with a panel, one click on a folder
+      // you already have is the easy mistake, and two records for one folder is a
+      // state nobody asked for.
+      LIVE.answerNext("choose_folder", "/tmp/second");
+      d.getElementById("workspace-add-primary").click();
+      await waitFor(
+        () => LIVE.settings().active_workspace === "w-second",
+        "the folder that already is a workspace to be focused",
+      );
+      assert(
+        `M9: picking a folder that already is a workspace focuses it instead of adding it again (${LIVE.settings().workspaces.length} workspaces, ${LIVE.called("create_workspace").length} creations)`,
+        LIVE.settings().workspaces.length === before + 1 &&
+          LIVE.called("create_workspace").length === createsBefore + 1,
+      );
+      // Settings lists and edits, it does not add: its "New workspace" is a doorway
+      // to this same flow, so there is one answer to what adding a workspace does.
+      d.getElementById("open-settings").click();
+      await waitFor(() => !d.getElementById("settings-modal").classList.contains("hidden"), "settings to open");
+      d.getElementById("set-tab-ws-list").click();
+      await sleep(20);
+      LIVE.answerNext("choose_folder", "/home/e2e/docs");
+      d.getElementById("ws-manage-add").click();
+      await waitFor(
+        () => LIVE.called("create_workspace").length === createsBefore + 2,
+        "the Settings doorway to reach the panel",
+      );
+      assert(
+        `M9: the Settings doorway runs the same panel-first flow (${LIVE.lastArgs("create_workspace").root})`,
+        LIVE.lastArgs("create_workspace").root === "/home/e2e/docs" &&
+          d.getElementById("settings-modal").classList.contains("hidden") &&
+          d.getElementById("ws-add").classList.contains("hidden"),
+      );
+      // A dismissal is not an error and not a change.
+      const afterDoors = LIVE.settings().workspaces.length;
+      LIVE.answerNext("choose_folder", null);
+      d.getElementById("workspace-add-primary").click();
+      await sleep(80);
+      assert(
+        `M9: dismissing the panel adds no workspace and opens no form (${afterDoors} to ${LIVE.settings().workspaces.length}, ${d.getElementById("ws-add").className.trim()})`,
+        LIVE.settings().workspaces.length === afterDoors &&
+          d.getElementById("ws-add").classList.contains("hidden"),
       );
     }
 
-    /* ---- adding a workspace, end to end --------------------------------- */
-    // The one flow that creates a workspace: a folder chosen with the app's own
-    // browser, the MCP switches for that workspace, and one call that carries
-    // all of it. Read back from the bridge's store, because what the dialog
-    // rendered is not evidence that the backend was told.
+    /* ---- the form the flow falls back to, end to end -------------------- */
+    // A machine with no folder panel is the way to the form, and there the form is
+    // the whole answer: the app's own browser walks the tree, the MCP switches are
+    // that workspace's own, and one call carries all of it. Read back from the
+    // bridge's store, because what the form rendered is not evidence that the
+    // backend was told.
     {
       const workspacesBefore = LIVE.settings().workspaces.length;
       // Whatever dialog an earlier block left open is closed first, so "this
@@ -1909,12 +1958,15 @@
       closeSettings();
       closeAddWorkspace();
       await sleep(20);
+      LIVE.answerNext("choose_folder", new Error("no folder dialog here: osascript is not installed"));
       d.getElementById("workspace-add-primary").click();
-      await sleep(60);
+      await waitFor(() => !d.getElementById("ws-add").classList.contains("hidden"), "the fallback form to open");
       const modal = d.getElementById("ws-add");
       assert(
-        `M9: the sidebar's folder-plus opens Add-workspace, not Settings (${modal.className.trim()}, settings ${d.getElementById("settings-modal").className.trim()})`,
+        `M9: with no panel the folder-plus opens the form, its browser and the reason (${d.getElementById("ws-add-browse-hint").textContent})`,
         !modal.classList.contains("hidden") &&
+          !d.getElementById("ws-add-browser").classList.contains("hidden") &&
+          d.getElementById("ws-add-browse-hint").textContent.includes("osascript") &&
           d.getElementById("settings-modal").classList.contains("hidden"),
       );
       assert(
@@ -2018,10 +2070,11 @@
         LIVE.settings().workspaces.length === workspacesBefore + 1 &&
           [...d.querySelectorAll("#session-list .ws-name")].some((n) => n.textContent === "bos build"),
       );
-      // A backend refusal keeps the dialog open with the form still filled in,
-      // so the folder does not have to be chosen again.
+      // A backend refusal keeps the form open with the folder still filled in, so
+      // the next attempt is one field away rather than one panel away.
+      LIVE.answerNext("choose_folder", new Error("no folder dialog here: osascript is not installed"));
       d.getElementById("workspace-add-primary").click();
-      await sleep(40);
+      await waitFor(() => !modal.classList.contains("hidden"), "the form to open again");
       d.getElementById("ws-add-root").value = "/home/e2e/bos";
       d.getElementById("ws-add-name").value = "twice";
       LIVE.failNext("create_workspace", "no MCP server named \"ghost\"");

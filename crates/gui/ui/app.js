@@ -473,13 +473,19 @@ function closeWorkspaceForm() {
 
 /* ---------- Add a workspace ---------------------------------------------- */
 
-/* Adding a workspace is its own flow, deliberately outside Settings: it points
-   the app at a folder that no workspace owns yet, and settles the model, the
-   MCP servers, the plugins, the tools and the skills that may run in it as it
-   is made — so the workspace is never briefly configured wrong. The folder is
-   chosen with the app's own browser rather than a platform file dialog, because
-   a native picker is a dialog the harness cannot drive and a webview may not
-   implement at all. */
+/* Adding a workspace starts where a workspace is: the folder. The sidebar's
+   folder-plus therefore asks the system's own panel *first*, and the pick is the
+   workspace — named for the folder, inheriting today's defaults, and with its own
+   `.bos` written before the record exists (§24.15), the way a project carries
+   `.vscode`.
+
+   The form below is the fallback, not the door: a machine with no panel gets it
+   with the reason and its own way into the tree, and a folder that will not take
+   its configuration gets it with the folder and the reason still in it. Nothing
+   is lost by creating in one gesture, because the model, the MCP servers, the
+   plugins, the tools and the skills are all on the workspace's own Edit form — a
+   workspace made this way inherits until it is asked differently, rather than
+   being configured wrong and edited right. */
 function addWorkspaceModal() {
   return $("ws-add");
 }
@@ -518,6 +524,67 @@ function closeAddWorkspace() {
   const back = state.wsAddOpener;
   state.wsAddOpener = null;
   if (back && back.focus) back.focus();
+}
+
+/* A folder's own name: what a workspace made from a pick is called, and what the
+   form suggests when the same folder is chosen there. */
+function folderName(path) {
+  const parts = String(path).split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
+/* The sidebar's folder-plus: the system's panel first, then the workspace a
+   folder makes. A machine with no panel is not a dead end — the form opens with
+   the reason and with the app's own browser already listing folders — and a
+   dismissal adds nothing and writes no error, because changing your mind is a
+   decision rather than a failure. */
+async function addWorkspaceFromPanel() {
+  const button = $("workspace-add-primary");
+  if (button) button.disabled = true;
+  let picked;
+  try {
+    picked = await invoke("choose_folder", {
+      title: tr("ws.add.pickTitle", "Choose a folder for this workspace"),
+      start: null,
+    });
+  } catch (err) {
+    openAddWorkspace();
+    showInAppBrowser(String(err));
+    await browseFolder(null);
+    return;
+  } finally {
+    if (button) button.disabled = false;
+  }
+  if (!picked) return;
+  await createWorkspaceAt(picked);
+}
+
+/* One pick, one workspace. A folder that is already a workspace is focused rather
+   than added twice: with a panel, picking a folder you already have is one click
+   away, and two records for one folder is a state nobody asked for. */
+async function createWorkspaceAt(root) {
+  const existing = state.workspaces.find((w) => w.root === root);
+  if (existing) {
+    toast(tr("ws.add.have", "Already a workspace") + ": " + existing.name);
+    if (existing.id !== state.activeWorkspace) await switchWorkspace(existing.id);
+    return;
+  }
+  // "No opinion" is what picking a folder expressed, so the new workspace
+  // inherits today's installation; every field is on its own Edit form after.
+  state.error = "";
+  await workspaceCommand(
+    invoke("create_workspace", { name: folderName(root), root, config: null }),
+  );
+  if (!state.error) {
+    toast(tr("ws.add.done", "Workspace added") + ": " + (folderName(root) || root));
+    return;
+  }
+  // Refused: the form opens with the folder still in it, so the next attempt is
+  // one field away rather than one panel away.
+  const reason = state.error;
+  openAddWorkspace();
+  adoptRoot(root);
+  $("ws-add-err").textContent = reason;
 }
 
 /* One checkbox row, with the label the workspace will carry the name of. */
@@ -651,7 +718,7 @@ async function chooseFolderNative() {
   let picked;
   try {
     picked = await invoke("choose_folder", {
-      title: "Choose a folder for this workspace",
+      title: tr("ws.add.pickTitle", "Choose a folder for this workspace"),
       start: start || null,
     });
   } catch (err) {
@@ -5968,8 +6035,10 @@ messagesEl.addEventListener("click", async (ev) => {
 
 /* The sidebar's prominent action adds a workspace, not a chat (rev 111): with no
    workspace configured there is nothing for a chat to belong to, and a chat is
-   started from a workspace row's "+", Cmd/Ctrl+N, or the palette's /new. */
-$("workspace-add-primary").addEventListener("click", () => openAddWorkspace());
+   started from a workspace row's "+", Cmd/Ctrl+N, or the palette's /new. It asks
+   the system's folder panel directly (rev 114), because a workspace *is* a
+   folder and the folder is therefore the first question — not a form about one. */
+$("workspace-add-primary").addEventListener("click", () => void addWorkspaceFromPanel());
 $("open-settings").addEventListener("click", () => openSettings());
 
 /* Sidebar navigation opens the panel that owns the thing instead of inventing a
@@ -6703,10 +6772,12 @@ if (addMemoryButton) addMemoryButton.addEventListener("click", () => addMemory()
 const addWorkspace = $("ws-manage-add");
 if (addWorkspace) {
   // Settings lists and edits, it does not add: the one Add-workspace flow lives
-  // on the sidebar, so this is a doorway to it rather than a second form.
+  // on the sidebar, so this is a doorway to it rather than a second form — and it
+  // is the same door, panel first, so there is only ever one answer to "what does
+  // adding a workspace do".
   addWorkspace.addEventListener("click", () => {
     closeSettings();
-    openAddWorkspace();
+    void addWorkspaceFromPanel();
   });
 }
 $("plan-edit").addEventListener("click", () => startPlanEdit());

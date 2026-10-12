@@ -1861,13 +1861,19 @@
     const addOpener = d.getElementById("workspace-add-primary");
     const settingsReads = called("get_settings").length;
     const capsReads = called("list_capabilities").length;
+    // The gesture is the folder, so the panel is asked first (the checks below do
+    // that); the form is what a machine without one falls back to, and this is
+    // that machine.
     state.error = "";
+    pickerFails.value = true;
     addOpener.focus();
     addOpener.click();
     await flush();
     assert(
-      `the sidebar's folder-plus opens Add-workspace and leaves Settings shut (${d.getElementById("settings-modal").className.trim()}, ${called("get_settings").length - settingsReads} settings reads)`,
+      `with no panel the folder-plus opens the form, its browser and the reason, and leaves Settings shut (${d.getElementById("ws-add-browse-hint").textContent}; ${called("get_settings").length - settingsReads} settings reads)`,
       !addModal.classList.contains("hidden") &&
+        !d.getElementById("ws-add-browser").classList.contains("hidden") &&
+        d.getElementById("ws-add-browse-hint").textContent.includes("osascript is not installed") &&
         d.getElementById("settings-modal").classList.contains("hidden") &&
         called("get_settings").length === settingsReads,
     );
@@ -1889,12 +1895,14 @@
     // The panel is the door the user expects: "Choose folder…" asks the backend
     // for the system dialog and adopts the path it returns. The in-app browser is
     // not opened at all — it is the fallback, not a second way of doing this.
+    pickerFails.value = false;
+    const asksBeforePick = called("choose_folder").length;
     d.getElementById("ws-add-root").value = "/home/e2e";
     d.getElementById("ws-add-browse").click();
     await flush();
     assert(
       `Choose folder… asks the system panel for a folder, starting where the field points (${JSON.stringify(lastArgs("choose_folder"))})`,
-      called("choose_folder").length === 1 &&
+      called("choose_folder").length === asksBeforePick + 1 &&
         lastArgs("choose_folder").start === "/home/e2e" &&
         d.getElementById("ws-add-root").value === "/home/e2e/Documents" &&
         d.getElementById("ws-add-browser").classList.contains("hidden") &&
@@ -1902,18 +1910,20 @@
     );
     // Dismissing the panel is a decision: the field keeps what it had, and no
     // error is written for it.
+    const asksBeforeMiss = called("choose_folder").length;
     pickerChoice.value = null;
     d.getElementById("ws-add-root").value = "/home/e2e";
     d.getElementById("ws-add-browse").click();
     await flush();
     assert(
       `dismissing the panel changes nothing and is not reported as a failure (${d.getElementById("ws-add-root").value} / ${d.getElementById("ws-add-err").textContent})`,
-      called("choose_folder").length === 2 &&
+      called("choose_folder").length === asksBeforeMiss + 1 &&
         d.getElementById("ws-add-root").value === "/home/e2e" &&
         d.getElementById("ws-add-err").textContent === "",
     );
     // A machine with no panel: the fallback opens with the reason, and the field
     // is not left dead — this is the path that reveals the browser from a click.
+    const listsBeforeGone = called("list_folder").length;
     pickerChoice.value = "/home/e2e/Documents";
     pickerFails.value = true;
     d.getElementById("ws-add-browse").click();
@@ -1923,7 +1933,7 @@
       !d.getElementById("ws-add-browser").classList.contains("hidden") &&
         d.getElementById("ws-add-browse-manual").getAttribute("aria-expanded") === "true" &&
         d.getElementById("ws-add-browse-hint").textContent.includes("osascript is not installed") &&
-        called("list_folder").length === 1 &&
+        called("list_folder").length === listsBeforeGone + 1 &&
         lastArgs("list_folder").path === "/home/e2e",
     );
     // The panel is available again, and its path closes the fallback that was
@@ -1943,12 +1953,13 @@
     );
     // The browser itself: "Browse in-app" opens it at the field's folder, each row
     // descends, and "Use this folder" writes the resolved path.
+    const listsBeforeBrowse = called("list_folder").length;
     d.getElementById("ws-add-root").value = "/home/e2e";
     d.getElementById("ws-add-browse-manual").click();
     await flush();
     assert(
       `Browse in-app opens the listing at the field's folder (${JSON.stringify(lastArgs("list_folder"))})`,
-      called("list_folder").length === 2 &&
+      called("list_folder").length === listsBeforeBrowse + 1 &&
         lastArgs("list_folder").path === "/home/e2e" &&
         d.getElementById("ws-browse-path").textContent === "/home/e2e" &&
         [...d.querySelectorAll("#ws-browse-list .ws-browse-row")].map((r) => r.textContent).join(",") ===
@@ -2010,7 +2021,9 @@
       `the dialog closes once the workspace exists and the sidebar shows it (${[...d.querySelectorAll("#session-list .ws-name")].map((n) => n.textContent).join(",")})`,
       addModal.classList.contains("hidden") && !!d.querySelector("#session-list .ws-name"),
     );
-    // Escape closes it, and hand focus back to what opened it.
+    // Escape closes it, and hand focus back to what opened it. The form has to be
+    // open for that: the panel answers first, so this machine has none again.
+    pickerFails.value = true;
     addOpener.click();
     await flush();
     d.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
@@ -2018,6 +2031,40 @@
     assert(
       `Escape closes Add-workspace and returns focus to its opener (${d.activeElement && d.activeElement.id})`,
       addModal.classList.contains("hidden") && d.activeElement === addOpener,
+    );
+    // The door itself, last because it leaves a workspace behind: the folder-plus
+    // asks the system's panel *first*, and its answer becomes the workspace —
+    // named for the folder, seeded from the installation — with the form never
+    // opened at all. Driving it here rather than in Settings is the point: adding
+    // a workspace is not inspecting one.
+    const pickerReads = called("choose_folder").length;
+    const createdByPick = called("create_workspace").length;
+    state.error = "";
+    pickerFails.value = false;
+    pickerChoice.value = "/home/e2e/bos";
+    addOpener.click();
+    await flush();
+    assert(
+      `the folder-plus asks the system panel directly and the pick is the workspace (${JSON.stringify(lastArgs("create_workspace"))}, form ${addModal.className.trim()})`,
+      called("choose_folder").length === pickerReads + 1 &&
+        called("create_workspace").length === createdByPick + 1 &&
+        lastArgs("create_workspace").root === "/home/e2e/bos" &&
+        lastArgs("create_workspace").name === "bos" &&
+        lastArgs("create_workspace").config === null &&
+        addModal.classList.contains("hidden") &&
+        d.getElementById("settings-modal").classList.contains("hidden"),
+    );
+    // A folder that is already a workspace's root is focused rather than recorded
+    // twice: with a panel, one click on a folder you already have is the easy
+    // mistake, and two records for one folder is a state nobody asked for.
+    pickerChoice.value = "/tmp/trino";
+    addOpener.click();
+    await flush();
+    assert(
+      `a folder that already is a workspace is focused instead of added again (${called("create_workspace").length} creations, asked for ${JSON.stringify(lastArgs("set_active_workspace"))})`,
+      called("create_workspace").length === createdByPick + 1 &&
+        lastArgs("set_active_workspace").id === "w2" &&
+        addModal.classList.contains("hidden"),
     );
     // The row that used to sit under the list ("+ New workspace") is gone, and
     // the header's folder-plus above is the whole of the door: the check is that

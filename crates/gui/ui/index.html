@@ -616,11 +616,13 @@
     </div>
   </div>
 
-  <!-- Adding a workspace is its own flow, not a settings pane: it points the
-       app at a folder that no workspace owns yet, and configures that
-       workspace's model, MCP servers, plugins, tools and skills as it is made.
-       Everything above the divider belongs to the settings dialog; this
-       belongs to the sidebar. -->
+  <!-- The Add-a-workspace form. It is the fallback, not the first door: the
+       sidebar's folder-plus, and Settings' "New workspace", ask the system's folder
+       panel directly, and this opens when there is no panel or when a folder
+       refuses its configuration — so it is where the reason is shown and where a
+       workspace's model, MCP servers, plugins, tools and skills can be settled
+       before the record exists. Everything above the divider belongs to the
+       settings dialog; this belongs to the sidebar. -->
   <div id="ws-add" class="modal hidden" role="dialog"
        aria-modal="true" aria-labelledby="ws-add-title">
     <div class="modal-card ws-add-card">

@@ -154,6 +154,14 @@
     "ws.active": { en: "Active workspace", zh: "当前工作区" },
     "ws.add": { en: "New workspace", zh: "新建工作区" },
     "ws.add.root": { en: "Choose a root folder for this workspace", zh: "为该工作区选择根目录" },
+    // The folder-plus asks the system's panel first, so a folder's own name is
+    // what the workspace made from it is called.
+    "ws.add.pickTitle": {
+      en: "Choose a folder for this workspace",
+      zh: "为该工作区选择文件夹",
+    },
+    "ws.add.done": { en: "Workspace added", zh: "已添加工作区" },
+    "ws.add.have": { en: "Already a workspace", zh: "已是工作区" },
     // The folder is no longer a passive choice: adding a workspace creates a
     // `.bos` folder in it, and the dialog says so before the folder is picked.
     "ws.add.desc": {

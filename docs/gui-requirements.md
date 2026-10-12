@@ -921,6 +921,8 @@ affordance and a rerun of every structural assertion, not a silent shrink.
 
 | 113 | 2026-10-11 | **A workspace's configuration moved next to the code: adding one creates `<root>/.bos/workspace.toml`, the way a project carries `.vscode`.** The registry (`~/.bos/gui/settings.toml`) still answers "which workspaces exist"; the folder now answers "how this one runs", so the settings can be read, edited, diffed, committed and carried to another machine with the code. `crates/gui/src/workspace_dir.rs` owns the format and the three rules that make writing into someone's project directory safe: **identity never travels** (`id`/`name`/`root`/timestamps stay in the registry, so the same file in a clone is a configuration and not a second workspace), **secrets never travel** (the API key, the providers that carry keys of their own, and the MCP *entries* — whose `args`/`url` can hold a token — are not written; MCP travels as a list of **names**, so a file can switch an existing server and can never introduce a command this installation does not have), and **a file is input, never an instruction** (unparsable files, absent keys and unknown names are ignored, not fatal). Creation writes it before the record is pushed, so a root that will not take a `.bos` is refused with nothing added; editing rewrites it and puts the whole record back if the write fails — the runtime is applied before the write and the backup taken before that, so a restore that ran late would leave a model the folder never took; `apply_preset` writes it only when the preset's root is a folder, because that door has never validated a root, and the Settings dialog's save writes it too — that door copies the globals onto the workspace in use (`push_globals_to_active_workspace`), and leaving the folder behind there would mean the next load folded the older file back over the user's own save. Loading folds each file over the registry copy, and field keys are `Option`s precisely so "absent" (inherit) and "set to empty" stay different answers. Evidence: seven module tests (round trip; no secret and no identity key, checked as TOML keys rather than substrings; missing/unparsable file; unknown MCP name; a plain file where `.bos` goes; second write replaces with no `.tmp` left; an empty root skipped in both directions, with the check owning the path it probes), three `app::tests` through the new `create_workspace_record`/`rewrite_workspace`/`push_globals_to_active_workspace` seams (which exist so a test can drive them without rewriting the user's registry), one `settings::tests` load from a real file on disk, and the dialog's own copy before the folder is picked — the claim it used to make, "Nothing is changed in the folder itself", is deleted because it stopped being true, and the replacement is guarded in `markup_selftest.sh` as a sentence rather than as a key, since a claim nobody checks is how the false one survived. Limits: a pre-existing workspace gets its folder on its next edit rather than on launch (startup must not write into folders nobody asked it to touch); a read-only folder cannot be added as a workspace; an **empty** root is skipped in both directions rather than resolved to the process working directory, because a bundled app launches from `/` and a create there is a permission refusal that would take the whole creation down; the pane does not print the resolved path; sessions and the app's other stores stay in `~/.bos/gui/`. |
 
+| 114 | 2026-10-12 | **The folder-plus opened a form *about* a folder instead of asking for the folder, and a workspace is a folder.** The user pointed at the control and at the system's file window and said "use system folder dialog directly", and the order they asked for is the truthful one: the platform's panel is now the first thing that button does, and the pick *is* the workspace — named for the folder it names, seeded from the installation as it stands, with `<root>/.bos` written before the record exists (rev 113). A folder that is already some workspace's root is **focused rather than recorded twice**, because with a panel one click on a folder you already have is the easy mistake; a dismissal adds nothing, writes no error and opens no form. The Add-a-workspace form is now the **fallback** rather than the door: a machine with no panel gets it with the reason and with the app's own browser already listing folders, and a refused creation gets it with the folder and the fresh reason still in it — so the `WorkspaceDraft` payload (model, the deny-lists, `mcp_enabled`) is still sent, from the one path that has a form to send it from. Nothing that form could settle at creation is lost: the model, the MCP servers, the plugins, the tools and the skills are all on the workspace's own inline Edit form. `+ New workspace` in the Settings Workspaces pane doorways into the same flow instead of a second one. Evidence: the live guard's M9 drives the panel-first path (the pick becomes the workspace with `config: null`; the duplicate pick focuses the other workspace and creates nothing; the dismissal leaves the store and the DOM alone), the Settings doorway reaching the same panel, the no-panel fallback opening the form with its browser and the reason, and the whole form path behind it (browser walk, MCP payload, refusal, Escape) — 138 checks, with the one pre-existing image-bubble red unchanged. |
+
 ## 9. Evidence status
 
 **Landed (under `target/`, which is ignored — regenerate from the bundle):**
@@ -1061,7 +1063,9 @@ not the project.
    the design draws them (rev 112): a magnifier that reveals the search field
    (`#sessions-search`), a sliders glyph that opens the group/order/filter menu
    (`#session-view`), and an icon-only folder-plus (`#workspace-add-primary`)
-   that opens the Add-workspace dialog. Icon-only, because a sidebar's height
+   that asks the platform's folder panel for a folder and makes the workspace it names
+   (rev 114); the Add-workspace form is what that button opens when there is no panel.
+   Icon-only, because a sidebar's height
    belongs to the sessions — and none of the three is where a chat is started:
    that is the workspace row's `+`, Cmd/Ctrl+N or the palette's `/new` (rev 111,
    whose brief stay in the brand row rev 112 reverses).
@@ -1900,8 +1904,9 @@ its results are grouped by workspace. The nav entries below the list keep openin
 the unified settings surface (§ 12.1), where a **Workspaces** section owns the
 management table (rename, root, model, remove, "use defaults", presets). **Creation is
 not there**: adding a workspace is its own flow on the sidebar (§24.11), because it
-points the app at a folder no workspace owns yet and settles everything that may run in
-it in the same step — Settings inspects and edits what exists.
+points the app at a folder no workspace owns yet — the pick *is* the workspace, and
+everything that may run in it is inherited until it is asked otherwise — while Settings
+inspects and edits what exists.
 
 ### 24.5 Commands
 
@@ -1910,7 +1915,7 @@ it in the same step — Settings inspects and edits what exists.
 (with a keep/delete policy for its sessions), `set_active_workspace`, `choose_folder` (the platform's folder panel, §24.11) and
 `list_folder` (the in-app fallback chooser, §24.11), plus the existing session commands
 taking a workspace filter. `get_settings`/`save_settings`
-keep their shape for the global half so the dialog and its tests do not churn.
+keep their shape for the global half so the Add-workspace form and its tests do not churn.
 
 ### 24.6 Acceptance
 
@@ -1924,10 +1929,11 @@ keep their shape for the global half so the dialog and its tests do not churn.
 
 ### 24.7 Choosing the root folder
 
-The root is the workspace's identity, so it is chosen, not typed if we can avoid it:
-a **Choose folder** button opens the native picker (`tauri-plugin-dialog`, which the
-crate does not yet depend on — adding it is part of this milestone), with the typed
-path kept beside it for headless use and for people who paste a path. Whichever way
+The root is the workspace's identity, so it is chosen, not typed, wherever a panel can
+be asked: the folder-plus asks the platform's own panel directly (§24.11, not a dialog
+plugin), and the form's **Choose folder** button re-points the field the same way. The
+typed path stays beside it for headless use and for people who paste a path — a machine
+with no panel is a supported machine, not an error. Whichever way
 it arrives, the server validates before saving: the path must exist, be a directory,
 and be canonicalized so `..` and symlinks cannot escape it — the same guardrails
 [`resolve_workspace_file`] already applies to file reads. The dialog shows the
@@ -2008,16 +2014,28 @@ endpoints out of the GUI's copy of them.
 
 ### 24.11 Add a workspace: one flow, one payload
 
-Adding a workspace is a flow of its own, on the sidebar — the folder-plus in the
-Workspaces head and the `+ New workspace` row both open it, and the Settings Workspaces
-pane only doorways into it. It is not in Settings because it is not inspecting anything
-that exists yet: it points the app at a folder no workspace owns, and settles in the
-same step the model, the MCP servers, the plugins, the tools and the skills that may run
-there. Creating first and editing after leaves an installation that is briefly
-configured wrong, which is exactly the state a first chat must not be handed.
+Adding a workspace is a flow of its own, and **the folder is the gesture**: the
+folder-plus in the Workspaces head asks the platform's panel *first*, and the answer is
+the workspace — named for the folder it names, inheriting today's installation, with its
+own `.bos` written before the record exists (§24.15). A folder that is already a
+workspace's root is **focused rather than recorded twice** (with a panel, one click on a
+folder you already have is the easy mistake), and a dismissal changes nothing and is not
+an error. `+ New workspace` in the Settings Workspaces pane doorways into the same flow —
+it closes Settings and asks the panel — so there is still only one answer to what adding
+a workspace does.
 
-**The folder chooser is the platform's, with ours behind it.** "Choose folder…" opens
-the system's own panel — on macOS `osascript`'s `choose folder`, on Linux
+The form is the **fallback**, not the door: a machine with no panel opens it with the
+reason and with the app's own browser already listing folders, and a folder that refuses
+its configuration opens it with the folder and the reason still in it. Nothing is lost by
+creating in one gesture — the model, the MCP servers, the plugins, the tools and the
+skills are all on the workspace's own inline Edit form, so a workspace made by picking a
+folder inherits until it is asked differently. What the form's draft buys is that a
+deliberate configuration can be stated *before* the first chat exists; the one-gesture
+path buys the folder being the first question, which is what a workspace is.
+
+**The folder chooser is the platform's, with ours behind it.** The folder-plus opens the
+system's own panel directly, and the form's "Choose folder…" opens the same one — on macOS
+`osascript`'s `choose folder`, on Linux
 `zenity --file-selection --directory` (falling back to `kdialog`), on Windows
 PowerShell's `FolderBrowserDialog` — because the root of a workspace is chosen once and
 trusted for a long time, and the gesture that picks it should be the one the user already
@@ -2028,8 +2046,8 @@ are easy to get wrong are the reason the outcome is a type rather than a `String
 **a dismissal is not a failure** (macOS reports `-128`, the others exit non-zero with no
 output; the field must keep what it had and no error may be shown) and **a missing panel
 is not a failure either** (a container, a headless session, a Linux box without zenity):
-it says so, and the in-app browser — `list_folder`, kept as the fallback — opens with the
-reason. A modal panel cannot be automated, so what is tested is everything decided around
+the form opens, and the in-app browser — `list_folder`, kept as the fallback — opens
+inside it with the reason. A modal panel cannot be automated, so what is tested is everything decided around
 it, plus one test that runs *the same command line* with only the panel call swapped for a
 reference to a folder that exists, against the real interpreter: the `-e` statements, the
 AppleScript escaping, `POSIX path of` and the `-128` handler are all under test, and only
@@ -2049,7 +2067,9 @@ keyboard, `folders::resolve` is the one place it is canonicalized and checked, s
 three doors land on the same rule.
 
 **One payload.** `create_workspace(state, name, root, config: Option<WorkspaceDraft>)`
-carries everything the dialog collected:
+carries everything the form collected — and `config: null`, which is what the
+one-gesture path sends, is "no opinion": the workspace is seeded from the installation as
+it stands, which is what picking a folder expressed.
 
 ```rust
 struct WorkspaceDraft {
@@ -2079,7 +2099,8 @@ stored, enforced and tested, and waiting for a plugin to govern.
 
 ### 24.12 Flat surfaces, and the cost they avoid
 
-The Add-workspace dialog is **flat** and stays flat: no shadow, no gradient, no blur, no
+The Add-workspace form — the fallback the folder-plus opens when there is no panel — is
+**flat** and stays flat: no shadow, no gradient, no blur, no
 transition longer than a 90 ms hover colour, and no depth that would have to be
 composited. Every state is one solid fill, a 1px border and a colour change — and pointer
 hover and keyboard focus are the *same* colour change, so there is one mechanism to learn
@@ -2104,20 +2125,24 @@ the wiring guard proves every command the dialog can reach is registered.
 
 ### 24.13 Acceptance (add a workspace)
 
-9. The folder-plus and `+ New workspace` open the same dialog, and opening it does not
-   open Settings (no `get_settings` read).
-10. "Choose folder…" opens the platform's panel and adopts the folder it names;
-    dismissing the panel changes nothing and is not reported as an error; a machine with
-    no panel opens the in-app browser and says why. The browser walks the filesystem,
-    "Use this folder" writes the resolved path, a folder that will not list says why
-    beside the list, and a creation with no folder is refused before any round trip.
-    Whichever door was used, the path is resolved before it is trusted.
-11. One `create_workspace` call carries the folder, the name, the model and the draft: the
-    unticked boxes arrive as the deny-lists and the ticked MCP servers as `mcp_enabled`,
-    so a server that started on and was ticked off arrives off.
-12. A backend refusal keeps the dialog open with the fresh reason and the form still
+9. The folder-plus opens the platform's panel directly, and the folder it names becomes
+   a workspace — named for the folder, seeded from the installation — and the active one,
+   without opening Settings. Picking a folder that already has a workspace focuses that
+   workspace and records nothing. Dismissing the panel changes nothing, is not reported
+   as an error, and opens no form.
+10. The panel's other two outcomes: a machine with no panel opens the form with the reason
+    and the in-app browser already listing folders, and a creation the backend refuses
+    opens the form with the folder in it and the fresh reason. The browser walks the
+    filesystem, "Use this folder" writes the resolved path, a folder that will not list
+    says why beside the list, and a creation with no folder is refused before any round
+    trip. Whichever door was used, the path is resolved before it is trusted.
+11. One `create_workspace` call carries the folder, the name and the draft: the unticked
+    boxes arrive as the deny-lists and the ticked MCP servers as `mcp_enabled`, so a server
+    that started on and was ticked off arrives off. The one-gesture path sends
+    `config: null` instead, and the workspace it makes is seeded from the installation.
+12. A backend refusal keeps the form open with the fresh reason and the folder still
     filled in; a stale error from anything else can neither keep it open nor be shown as
-    this attempt's failure.
+    this attempt's failure. `+ New workspace` in Settings runs the same panel-first flow.
 13. A workspace with no chats is drawn as a group, and the workspace created this way is
     the active one.
 
