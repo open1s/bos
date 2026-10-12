@@ -254,7 +254,7 @@
           () => window.__LIVE__.called("send_message").length === sendsBefore + i,
           `soak turn ${i} to reach the bridge`,
         );
-        await waitFor(() => !sendBtn.textContent.includes("Stop"), `soak turn ${i} to end`);
+        await waitFor(() => !sendBtn.classList.contains("stop"), `soak turn ${i} to end`);
         // rAF starves under virtual time, so the frame the app scheduled is run
         // by hand: exactly the work that frame would have done.
         repaint();

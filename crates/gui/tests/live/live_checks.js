@@ -92,9 +92,10 @@
       /read 120 bytes/.test(messagesText()),
     );
     const left = d.getElementById("status-left").textContent;
+    const chipModel = (d.getElementById("model-label") || {}).textContent || "";
     assert(
-      `boot: model and chat count reach the status line (${left.replace(/\s+/g, " ").slice(0, 40)})`,
-      /glm-4\.6/.test(left) && /2 chats/.test(left) && /4 msgs/.test(left) && /1 tools/.test(left),
+      `boot: the model reaches the composer chip and the counts the status line (${chipModel}/${left.replace(/\s+/g, " ").slice(0, 30)})`,
+      /glm-4\.6/.test(chipModel) && /2 chats/.test(left) && /4 msgs/.test(left) && /1 tools/.test(left),
     );
     assert(
       `boot: the live goal reaches its card (objective=${
@@ -122,12 +123,12 @@
     await waitFor(() => /hello harness/.test(messagesText()), "user bubble to appear");
     assert(
       `send: the pair appears at once and the button turns into Stop (btn=${
-        sendBtn.textContent.trim()})`,
+        sendBtn.getAttribute("aria-label")})`,
       /hello harness/.test(messagesText()) && sendBtn.classList.contains("stop"),
     );
     await waitFor(() => /Hello, world — from the live harness\./.test(messagesText()),
       "streamed reply to finish");
-    await waitFor(() => sendBtn.textContent.trim() === "Send", "the turn to end");
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the turn to end");
     assert(
       "stream: chunked text lands complete and Stop returns to Send",
       /Hello, world — from the live harness\. \(you said: hello harness\)/.test(messagesText()) &&
@@ -215,11 +216,11 @@
     );
     assert(
       "stop: the partial text stays on screen and the composer is free again",
-      /chunk 0/.test(messagesText()) && sendBtn.textContent.trim() === "Send",
+      /chunk 0/.test(messagesText()) && !sendBtn.classList.contains("stop"),
     );
     await waitFor(
       () => !LIVE.lastArgs("send_message") ||
-        sendBtn.textContent.trim() === "Send",
+        !sendBtn.classList.contains("stop"),
       "idle before the approval scenario",
     );
 
@@ -245,7 +246,7 @@
       LIVE.lastArgs("respond_approval").approved === true &&
         typeof LIVE.lastArgs("respond_approval").id === "string",
     );
-    await waitFor(() => sendBtn.textContent.trim() === "Send", "the approval turn to finish");
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the approval turn to finish");
     // The tool's output hides behind its collapsed card, like any transcript
     // tool row: open it, then read what the tool did.
     const streamedTool = [...d.querySelectorAll("#messages .tool-head")].pop();
@@ -265,7 +266,7 @@
     await waitFor(() => !approvalModal.classList.contains("hidden"), "the second dialog to open");
     d.getElementById("approval-deny").click();
     await waitFor(() => approvalModal.classList.contains("hidden"), "the second dialog to close");
-    await waitFor(() => sendBtn.textContent.trim() === "Send", "the denied turn to settle");
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the denied turn to settle");
     const deniedTool = [...d.querySelectorAll("#messages .tool-head")].pop();
     if (deniedTool) deniedTool.click();
     repaint();
@@ -277,7 +278,7 @@
         /denied by the user/.test(messagesText()) &&
         /Understood — I left the file alone\./.test(messagesText()),
     );
-    await waitFor(() => sendBtn.textContent.trim() === "Send", "idle after approvals");
+    await waitFor(() => !sendBtn.classList.contains("stop"), "idle after approvals");
 
     /* ---- M4: a scoped rule settles the next call, and the ring says who did */
     openPane("rules-section");
@@ -331,7 +332,7 @@
       () => countOf("Done — notes/a.txt is written.") > doneBefore,
       "the rule-allowed turn",
     );
-    await waitFor(() => sendBtn.textContent.trim() === "Send", "the allowed turn to settle");
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the allowed turn to settle");
     const allowedTool = [...d.querySelectorAll("#messages .tool-head")].pop();
     if (allowedTool) allowedTool.click();
     repaint();
@@ -376,7 +377,7 @@
     );
     const promptedAgain = !d.getElementById("approval-modal").classList.contains("hidden");
     d.getElementById("approval-deny").click();
-    await waitFor(() => sendBtn.textContent.trim() === "Send", "the denied turn to settle");
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the denied turn to settle");
     d.getElementById("rules-refresh").click();
     await waitFor(() => auditRow(0) !== undefined && /ask/.test(auditRow(0).textContent), "the ask in the ring");
     assert(
@@ -415,7 +416,7 @@
     type("hello again");
     sendBtn.click();
     await waitFor(
-      () => /you said: hello again/.test(messagesText()) && sendBtn.textContent.trim() === "Send",
+      () => /you said: hello again/.test(messagesText()) && !sendBtn.classList.contains("stop"),
       "the retry to go through",
     );
     assert("error: the next send after the failure goes through", true);
@@ -1068,7 +1069,7 @@
     );
 
     /* ---- plan editor: draft, reorder, save, cancel, keys, switch ----- */
-    await waitFor(() => sendBtn.textContent.trim() === "Send", "the plan turn to settle");
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the plan turn to settle");
     const draftInputs = () => [...d.querySelectorAll("#plan-list .plan-edit-input")];
     const draftText = () => draftInputs().map((i) => i.value);
     const draftRow = (text) =>
@@ -1295,9 +1296,9 @@
       LIVE.lastArgs("save_settings").model === "glm-4.7",
     );
     assert(
-      `settings: the saved model owns the status line at once (${
-        d.getElementById("status-left").textContent.slice(0, 12)})`,
-      /glm-4\.7/.test(d.getElementById("status-left").textContent),
+      `settings: the saved model owns the composer chip at once (${
+        (d.getElementById("model-label") || {}).textContent})`,
+      /glm-4\.7/.test((d.getElementById("model-label") || {}).textContent || ""),
     );
     d.getElementById("open-settings").click();
     await waitFor(() => !modal.classList.contains("hidden") && setModel.value !== "",
@@ -2183,7 +2184,7 @@
        a clipboard image becomes a chip, the chip rides the send as a data
        URL, the stored turn re-renders it, and a click zooms it in place. */
     await waitFor(
-      () => sendBtn.textContent.trim() === "Send",
+      () => !sendBtn.classList.contains("stop"),
       "idle before the attachment scenario",
     );
     const sendsBeforeAttach = LIVE.called("send_message").length;
@@ -2237,7 +2238,7 @@
         (attachArgs.images || []).length === 1 &&
         /^data:image\/png;base64,/.test(attachArgs.images[0]),
     );
-    await waitFor(() => sendBtn.textContent.trim() === "Send", "the image turn to finish");
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the image turn to finish");
     // A finished turn re-reads the store: the picture must still be there.
     await waitFor(
       () => d.querySelector("#messages .msg.user .msg-img"),
@@ -2282,7 +2283,7 @@
         (LIVE.lastArgs("send_message").images || []).length === 1,
     );
     await waitFor(
-      () => sendBtn.textContent.trim() === "Send",
+      () => !sendBtn.classList.contains("stop"),
       "the queued image turn to finish",
     );
 

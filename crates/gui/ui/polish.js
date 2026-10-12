@@ -120,8 +120,8 @@
     "search.placeholder": { en: "Search sessions…", zh: "搜索会话…" },
     "search.aria": { en: "Search Session Names", zh: "搜索会话名称" },
     "composer.placeholder": {
-      en: "Send a message\n/ = commands & skills · @ = file mentions · paste or drop images · Enter = send (queued while streaming) · Shift+Enter = newline",
-      zh: "发送消息\n/ = 命令与技能 · @ = 文件提及 · 粘贴或拖入图片 · Enter = 发送（流式输出时排队） · Shift+Enter = 换行",
+      en: "Message or run a task\n/ commands & skills · @ file mentions · paste or drop images · Enter = send · Shift+Enter = newline",
+      zh: "输入消息或任务\n/ 命令与技能 · @ 文件提及 · 粘贴或拖入图片 · Enter = 发送 · Shift+Enter = 换行",
     },
     "attach.aria": { en: "Attach images", zh: "附加图片" },
     "attach.title": {

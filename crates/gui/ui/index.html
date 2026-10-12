@@ -49,17 +49,20 @@
 
     <main id="main">
       <header id="chat-head">
-        <button type="button" id="sidebar-toggle" class="mini-btn" aria-label="Chats and workspaces"
-                aria-keyshortcuts="Meta+B Control+B" aria-expanded="false" title="Chats and workspaces">☰</button>
-        <span id="chat-title">BOS</span>
+        <div class="head-row">
+          <button type="button" id="sidebar-toggle" class="mini-btn" aria-label="Chats and workspaces"
+                  aria-keyshortcuts="Meta+B Control+B" aria-expanded="false" title="Chats and workspaces">☰</button>
+          <span id="chat-title">BOS</span>
+          <span class="head-gap"></span>
+          <span id="stream-chip" class="chip idle" aria-live="polite">idle</span>
+          <button type="button" id="goal-open" class="chip goal-open" title="The goal for this chat (Ongoing Goal card)">◎ goal</button>
+          <button type="button" id="theme-toggle" class="mini-btn" title="Theme">◐</button>
+          <button type="button" id="lang-toggle" class="mini-btn" title="Language">EN</button>
+        </div>
         <div id="center-tabs" class="center-tabs" role="tablist" aria-label="Conversation views" data-i18n-aria="tabs.label">
           <button type="button" id="tab-chat" class="center-tab active" role="tab" aria-selected="true" aria-controls="messages" tabindex="0" data-i18n="tab.chat">Chat</button>
           <button type="button" id="tab-trajectory" class="center-tab" role="tab" aria-selected="false" aria-controls="trajectory" tabindex="-1" data-i18n="tab.trajectory">Trajectory</button>
         </div>
-        <span id="stream-chip" class="chip idle" aria-live="polite">idle</span>
-        <button type="button" id="goal-open" class="chip goal-open" title="The goal for this chat (Ongoing Goal card)">◎ goal</button>
-        <button type="button" id="theme-toggle" class="mini-btn" title="Theme">◐</button>
-        <button type="button" id="lang-toggle" class="mini-btn" title="Language">EN</button>
       </header>
 
       <div id="messages" role="tabpanel" aria-labelledby="tab-chat" tabindex="0"></div>
@@ -158,12 +161,19 @@
         </div>
         <div id="queue-list" class="queue-list hidden" aria-label="Queued messages"></div>
         <div id="attach-strip" class="attach-strip hidden" aria-label="Attached images"></div>
-        <textarea id="input" rows="1" aria-controls="cmd-list" aria-expanded="false" aria-keyshortcuts="Enter Shift+Enter" data-i18n-placeholder="composer.placeholder" placeholder="Send a message&#10;/ = commands &amp; skills · @ = file mentions · paste or drop images · Enter = send (queued while streaming) · Shift+Enter = newline"></textarea>
-        <button id="attach-btn" class="mini-btn attach-btn" type="button"
-                data-i18n-aria="attach.aria" data-i18n-title="attach.title"
-                aria-label="Attach images" title="Attach images (or paste / drop them)">📎</button>
-        <input id="attach-file" type="file" accept="image/*" multiple hidden />
-        <button id="send" class="btn btn-accent" disabled data-i18n="btn.send">Send</button>
+        <textarea id="input" rows="1" aria-controls="cmd-list" aria-expanded="false" aria-keyshortcuts="Enter Shift+Enter" data-i18n-placeholder="composer.placeholder" placeholder="Message or run a task&#10;/ commands &amp; skills · @ file mentions · paste or drop images · Enter = send · Shift+Enter = newline"></textarea>
+        <div id="composer-foot">
+          <button id="attach-btn" class="comp-icon" type="button"
+                  data-i18n-aria="attach.aria" data-i18n-title="attach.title"
+                  aria-label="Attach images" title="Attach images (or paste / drop them)"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 5.6v12.8M5.6 12h12.8"/></svg></button>
+          <input id="attach-file" type="file" accept="image/*" multiple hidden />
+          <button id="mode-btn" class="comp-chip" type="button" aria-haspopup="menu" aria-expanded="false"
+                  title="Which tools this chat may use"><span id="mode-label"></span><svg class="ico comp-chev" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8.4 10.4 12 14l3.6-3.6"/></svg></button>
+          <span class="comp-gap"></span>
+          <button id="model-btn" class="comp-chip" type="button" aria-haspopup="menu" aria-expanded="false"
+                  title="The model this workspace runs"><span id="model-label">no model</span><svg class="ico comp-chev" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8.4 10.4 12 14l3.6-3.6"/></svg></button>
+          <button id="send" class="btn btn-accent comp-send" disabled aria-label="Send" title="Send (Enter)"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 19.4V5.4"/><path d="M6.4 11 12 5.4l5.6 5.6"/></svg></button>
+        </div>
       </div>
 
       <footer id="statusbar">

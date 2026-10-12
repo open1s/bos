@@ -163,7 +163,14 @@
       document.querySelectorAll(".doc-tab").length,
     );
     Shell.closeDocument("d1");
-    check("closing doc restores start", document.querySelectorAll(".doc-tab").length === 1 && body.textContent.includes("No document open"));
+    check(
+      "closing doc restores start",
+      document.querySelectorAll(".doc-tab").length === 1 &&
+        [...document.querySelectorAll(".start-card")].map((c) => c.dataset.act).join(",") ===
+          "files,terminal,browser" &&
+        !!body.querySelector(".start-compass"),
+      [...document.querySelectorAll(".start-card")].map((c) => c.dataset.act).join(","),
+    );
 
     // --- layout scope (per workspace) ---------------------------------------
     // Two workspaces must not inherit each other's geometry: the app names a

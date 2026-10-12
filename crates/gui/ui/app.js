@@ -6,6 +6,30 @@
 const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
 const { listen } = window.__TAURI__.event;
 
+/* One log funnel for the webview: console (visible in devtools) plus the
+   backend's file (`ui_log` → ~/.bos/log/gui.log), so a report that "the menu
+   does nothing" can be answered from one ordered log instead of a guess.
+   Fire-and-forget and never throws: a logging mistake must not become the bug
+   being observed. */
+function logf(level, target, message) {
+  try {
+    const line = `${target}: ${message}`;
+    if (level === "error") console.error(`[bos-ui] ${line}`);
+    else console.log(`[bos-ui] ${line}`);
+    const sent = invoke("ui_log", { level, target, message });
+    if (sent && typeof sent.catch === "function") sent.catch(() => {});
+  } catch (_) { /* logging must never break the caller */ }
+}
+
+/* Uncaught page errors and rejected promises are exactly the "nothing happened"
+   class of bug this log exists for, so they land in the same file. */
+window.addEventListener("error", (ev) =>
+  logf("error", "window", `${ev.message || "error"} at ${ev.filename || "?"}:${ev.lineno || "?"}`),
+);
+window.addEventListener("unhandledrejection", (ev) =>
+  logf("error", "window", `unhandled rejection: ${ev.reason || ev}`),
+);
+
 /* ---------- state ---------- */
 
 /* Only the tail of a long transcript is drawn: a 10 000-message chat should cost
@@ -2661,7 +2685,8 @@ ensureScrollGrow();
 
 function renderStatus() {
   statusLeft.textContent = "";
-  statusLeft.appendChild(el("span", "", state.model || "no model"));
+  // The model is named once, on the composer's chip, where it is also changed
+  // (rev 122); the foot says how much work there is instead.
   statusLeft.appendChild(
     el("span", "", `${state.sessions.length} chat${state.sessions.length === 1 ? "" : "s"}`)
   );
@@ -2718,17 +2743,90 @@ function renderStatus() {
   if (state.error) {
     statusRight.appendChild(el("span", "err", clip(state.error, 160)));
   }
+  // The composer's chips read two of the same facts this foot does, and every
+  // path that refreshes the foot has just changed one of them (a saved model
+  // most of all), so they are repainted together rather than drifting apart.
+  renderComposer();
 }
 
+/* The composer's one button: send while the chat is idle, stop while a turn is
+   in flight. The glyph carries the state (the reference's arrow and square) and
+   the name is spoken rather than printed, so the button never changes size. */
 function renderSend() {
-  if (streamOf(state.activeId)) {
-    sendBtn.textContent = "■ Stop";
-    sendBtn.classList.add("stop");
-    sendBtn.disabled = false;
-  } else {
-    sendBtn.textContent = "Send";
-    sendBtn.classList.remove("stop");
-    sendBtn.disabled = !input.value.trim() && !state.pendingImages.length;
+  const stop = !!streamOf(state.activeId);
+  sendBtn.textContent = "";
+  sendBtn.appendChild(
+    stop
+      ? ico(["M8.4 8.4h7.2v7.2H8.4z"], true)
+      : ico(["M12 19.4V5.4", "M6.4 11 12 5.4l5.6 5.6"])
+  );
+  sendBtn.setAttribute("aria-label", stop ? "Stop" : "Send");
+  sendBtn.title = stop ? "Stop this turn" : "Send (Enter)";
+  sendBtn.classList.toggle("stop", stop);
+  sendBtn.disabled = stop ? false : !input.value.trim() && !state.pendingImages.length;
+}
+
+/* The composer's two facts. Each is read from where it is owned — the
+   permission from the shell's UI state, the model from the settings this app
+   loaded — so a chip cannot drift from the answer it names. */
+const PERMISSION_LABELS = {
+  "read-only": "Read only",
+  "workspace-write": "Workspace Write",
+  "danger-full-access": "Full access",
+};
+
+let composerChipsWired = false;
+
+function renderComposer() {
+  const modeLabel = $("mode-label");
+  const modelLabel = $("model-label");
+  const permission = (Shell.state && Shell.state.permission) || "";
+  if (modeLabel) modeLabel.textContent = PERMISSION_LABELS[permission] || permission;
+  if (modelLabel) modelLabel.textContent = state.model || "no model";
+  // Wired on the first paint rather than at parse time: this module may run
+  // before the markup it names (the page harness assembles it into the head),
+  // and a listener attached to nothing fails silently.
+  wireComposerChips();
+}
+
+/* Both chips open the menu the sidebar's rows use, because a chip that names a
+   setting is the setting's own control — the permission is a UI preference the
+   shell own, and the model lives in Settings, so the chip goes there. */
+function wireComposerChips() {
+  if (composerChipsWired) return;
+  composerChipsWired = true;
+  const modeBtn = $("mode-btn");
+  if (modeBtn) {
+    modeBtn.addEventListener("click", (e) => {
+      // The document closes an open menu on any click that reaches it, so the
+      // click that opens one must not pass it by — the sidebar's own menu
+      // buttons stop it the same way. Without this the menu opens and is swept
+      // away in the same dispatch, which is exactly what the guard saw.
+      e.stopPropagation();
+      const now = (Shell.state && Shell.state.permission) || "";
+      const items = (Shell.PERMISSIONS || []).map((p) => ({
+        run: p,
+        label: PERMISSION_LABELS[p] || p,
+        checked: p === now,
+      }));
+      openRowMenu(modeBtn, items, (item) => {
+        Shell.setPermission(item.run);
+        renderComposer();
+      });
+      modeBtn.setAttribute("aria-expanded", "true");
+    });
+  }
+  const modelBtn = $("model-btn");
+  if (modelBtn) {
+    modelBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openRowMenu(
+        modelBtn,
+        [{ run: "settings", label: "Change the model in Settings" }],
+        () => navTo("set-general")
+      );
+      modelBtn.setAttribute("aria-expanded", "true");
+    });
   }
 }
 
@@ -2804,6 +2902,7 @@ function renderAll() {
   renderMessages();
   renderStatus();
   renderSend();
+  renderComposer();
   renderQueue();
   tick();
 }
@@ -3491,11 +3590,13 @@ async function setArchived(id, archived) {
 async function forkChat(id) {
   try {
     const messages = await invoke("load_session", { id });
+    logf("info", "fork", `chat=${id} loaded=${(messages || []).length}`);
     // The backend refuses a branch before the first turn, and it is right to:
     // a branch at 0 is a blank chat, which is not what "fork this conversation"
     // can mean. Saying so here keeps the failure in the interface instead of in
     // a refused request.
     if (!messages || messages.length === 0) {
+      logf("info", "fork", `chat=${id} empty transcript, not forking`);
       state.error = tr("session.forkEmpty", "this chat has no turns to fork yet");
       renderSidebar();
       scheduleRepaint();
@@ -3505,11 +3606,13 @@ async function forkChat(id) {
       sessionId: id,
       index: (messages || []).length,
     });
+    logf("info", "fork", `chat=${id} -> ${fork && fork.id}`);
     await refreshSessions();
     state.sessions = [fork, ...state.sessions.filter((s) => s.id !== fork.id)];
     await switchSession(fork.id);
     renderAll();
   } catch (e) {
+    logf("error", "fork", `chat=${id} failed: ${e}`);
     state.error = String(e);
     renderSidebar();
     scheduleRepaint();
@@ -3570,6 +3673,7 @@ function startRename(id) {
 /* One place that turns a menu entry into the action it names, so the row menu
    and the keyboard chords cannot drift apart. */
 function runSessionAction(s, run) {
+  logf("info", "row-action", `${run} chat=${s.id} title=${JSON.stringify(s.title || "")}`);
   if (run === "pin") return void setPinned(s.id, !s.pinned);
   if (run === "rename") return void startRename(s.id);
   if (run === "fork") return void forkChat(s.id);
@@ -3584,15 +3688,22 @@ function activeSession() {
 }
 
 async function deleteSession(id) {
-  if (!window.confirm("Move this chat to the trash? You can restore it from settings."))
-    return;
+  // Two lines around the confirm on purpose: if the log shows "asking" but
+  // never "confirm=", the dialog call itself never returned — which is the
+  // shape a webview without a confirm-panel delegate has.
+  logf("info", "delete", `chat=${id} asking confirm`);
+  const sure = window.confirm("Move this chat to the trash? You can restore it from settings.");
+  logf("info", "delete", `chat=${id} confirm=${sure}`);
+  if (!sure) return;
   state.error = null;
   try {
     await invoke("delete_session", { id });
+    logf("info", "delete", `chat=${id} backend=ok`);
   } catch (e) {
     // A refusal is not a delete: the chat is still there, so its transcript, its
     // stream and its queued turns are still there too. Forgetting them here would
     // lose a chat the backend still holds.
+    logf("error", "delete", `chat=${id} backend=refused: ${e}`);
     reportError(e);
     renderStatus();
     return;
@@ -5721,8 +5832,37 @@ document.addEventListener("keydown", (e) => {
     if (!s) return;
     e.preventDefault();
     void forkChat(s.id);
+  } else if (key === "p") {
+    // The document column's two doors, on the chords its cards advertise:
+    // the file list and a page. Both belong to the column, not to a chat, so
+    // they answer with no session open.
+    e.preventDefault();
+    navTo("files-section");
+  } else if (key === "t") {
+    e.preventDefault();
+    Shell.promptBrowser();
   }
 });
+
+/* The Start surface's doors (rev 122). The shell draws the launcher and hands
+   over an action, never a command name, so the column stays presentation and
+   what a door *does* stays this app's business (Part II §15). */
+Shell.on("start-action", (payload) => {
+  const action = payload && payload.action;
+  if (action === "files") navTo("files-section");
+  else if (action === "terminal") void attachTermSession();
+  else if (action === "browser" && payload.url) void openExternal(payload.url);
+});
+
+/* A bare host is a host: "example.com" typed into the Browser card must not
+   become a relative URL the opener rejects. */
+function openExternal(url) {
+  const target = /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : "https://" + url;
+  return invoke("open_url", { url: target }).catch((err) => {
+    reportError(err);
+    renderStatus();
+  });
+}
 
 /* A labelled checkbox for the workspace form. */
 function workspaceCheck(form, cls, label, checked) {

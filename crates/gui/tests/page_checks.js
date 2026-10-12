@@ -381,7 +381,7 @@
       `choosing 中文 translates the chrome (${shippedTab}→${zhTab}, nav=${zhNav})`,
       zhTab === "对话" &&
         zhNav === "工作区" &&
-        /发送消息/.test(d.getElementById("input").placeholder) &&
+        /输入消息或任务/.test(d.getElementById("input").placeholder) &&
         /^zh/i.test(d.documentElement.lang),
     );
     // The claim is "one source of truth", so assert the choice reached the
@@ -405,7 +405,7 @@
     assert(
       `switching back restores the shipped strings (${tabLabel()})`,
       tabLabel() === shippedTab &&
-        /Send a message/.test(d.getElementById("input").placeholder) &&
+        /Message or run a task/.test(d.getElementById("input").placeholder) &&
         /^en/i.test(d.documentElement.lang) &&
         !!shell &&
         shell.state.language === "en",
@@ -2516,6 +2516,65 @@
     assert(
       `and the first message of an empty workspace starts its chat (${chatCmds.join(",")})`,
       chatCmds.includes("create_session") && chatCmds.includes("send_message"),
+    );
+
+    // ---- rev 122: the middle column and the right column, to the reference
+    // The head is two lines: the chat's own controls, then the views it can be
+    // read as. Asserting the shape, because "the tabs are in the header" was
+    // true of both arrangements and would have passed either way.
+    assert(
+      `the head is two rows: the chat's controls, then its views (${d.querySelectorAll("#chat-head > *").length})`,
+      !!d.querySelector("#chat-head .head-row") &&
+        d.getElementById("center-tabs").parentElement.id === "chat-head" &&
+        d.getElementById("center-tabs").previousElementSibling.classList.contains("head-row") &&
+        !!d.querySelector("#chat-head .head-row #chat-title") &&
+        !!d.querySelector("#chat-head .head-row #stream-chip"),
+    );
+    // The composer is one rounded box whose foot carries both facts and the one
+    // button; the field is inside it rather than beside it.
+    assert(
+      `the composer is one box with a foot (${d.getElementById("composer").children.length})`,
+      d.getElementById("input").parentElement.id === "composer" &&
+        d.getElementById("composer-foot").parentElement.id === "composer" &&
+        !!d.querySelector("#composer-foot #mode-btn") &&
+        !!d.querySelector("#composer-foot #model-btn") &&
+        !!d.querySelector("#composer-foot #send") &&
+        !!d.querySelector("#composer-foot #attach-btn"),
+    );
+    // The mode chip is the permission's own control: it names what the shell
+    // holds, and picking another one changes the shell.
+    const modeChip = d.getElementById("mode-btn");
+    const modeLabel = d.getElementById("mode-label");
+    assert(
+      `the mode chip names the shell's permission (${modeLabel.textContent})`,
+      modeLabel.textContent === "Workspace Write" && Shell.state.permission === "workspace-write",
+    );
+    // The menu is read in the same pass that opened it: the sidebar's own
+    // checks do the same, because a flush between the two closes it.
+    modeChip.click();
+    const modeItems = [...d.querySelectorAll(".row-menu-item")].map((b) => b.dataset.run);
+    const readOnlyItem = [...d.querySelectorAll(".row-menu-item")].find(
+      (b) => b.dataset.run === "read-only"
+    );
+    if (readOnlyItem) readOnlyItem.click();
+    await flush();
+    assert(
+      `picking another mode changes it and the chip follows (${Shell.state.permission}/${modeLabel.textContent}/items=${modeItems.join(",")})`,
+      Shell.state.permission === "read-only" && modeLabel.textContent === "Read only",
+    );
+    // Docking is the order of a flex sibling: the column really changes sides
+    // beside the chat, and comes back.
+    if (!Shell.state.docOpen) Shell.toggleDoc();
+    Shell.setDoc(360);
+    const docPanelEl = d.getElementById("doc-panel");
+    const mainEl = d.getElementById("main");
+    Shell.setDocDock("left");
+    const dockedLeft = docPanelEl.getBoundingClientRect().left < mainEl.getBoundingClientRect().left;
+    Shell.setDocDock("right");
+    const dockedRight = docPanelEl.getBoundingClientRect().left > mainEl.getBoundingClientRect().left;
+    assert(
+      `docking moves the column beside the chat and back (left=${dockedLeft}, right=${dockedRight})`,
+      dockedLeft && dockedRight,
     );
 
   } catch (err) {

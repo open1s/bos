@@ -488,14 +488,27 @@ body.resizing #doc-panel { transition: none; }
   min-width: 0;
 }
 
+/* The head is two lines, the way the reference reads: the chat's name and its
+   controls on the first, and the views it can be read as on the second — the
+   tabs sit on the head's own border, so the active one underlines the pane it
+   opens rather than floating in the middle of the row. */
 #chat-head {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 20px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  padding: 10px 20px 0;
   border-bottom: 1px solid var(--border);
 }
+
+.head-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: var(--space-2);
+}
+
+.head-gap { flex: 1; }
 
 #chat-title {
   font-weight: 600;
@@ -530,32 +543,44 @@ body.resizing #doc-panel { transition: none; }
   scroll-behavior: auto;
 }
 
-/* Center tab strip (Chat | Trajectory): a segmented switch in the header.
-   Inactive tabs are plain dim text; the active one reads as a surface, and
-   the focus ring lands on whichever tab owns the strip (roving tabindex). */
+/* Center tab strip (Chat | Trajectory): two words on the head's bottom border,
+   the active one underlined — the same reading as the reference's tabs. The
+   focus ring still lands on whichever tab owns the strip (roving tabindex). */
 .center-tabs {
   flex: none;
   display: flex;
-  gap: var(--space-1);
-  padding: 2px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--card);
+  gap: var(--space-4);
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
 }
 
 .center-tab {
+  position: relative;
+  padding: 4px 2px 8px;
+  border: none;
+  border-radius: 0;
   background: transparent;
-  border: 0;
-  border-radius: var(--radius-xs);
-  color: var(--faint);
+  color: var(--dim);
   font-family: inherit;
-  font-size: 12px;
-  padding: 3px 10px;
+  font-size: var(--font-ui);
   cursor: pointer;
 }
 
 .center-tab:hover { color: var(--text); }
-.center-tab.active { color: var(--text); background: var(--active); }
+.center-tab.active { color: var(--accent); background: transparent; }
+
+.center-tab.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: var(--accent);
+}
+
 .center-tab:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
 
 /* Trajectory: the same history read as steps. It shares the transcript's
@@ -666,10 +691,15 @@ body.resizing #doc-panel { transition: none; }
   border-bottom-right-radius: 4px;
 }
 
+/* The assistant's answer is the page's own text: no card, no outline, the full
+   width of the transcript — the rows are what carries the structure, the way
+   the reference reads. The user's turn keeps its bubble, because that one *is*
+   a quoted object and not part of the page (rev 122). */
 .msg.assistant .bubble {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-bottom-left-radius: 4px;
+  max-width: 100%;
+  padding: 0;
+  background: transparent;
+  border: none;
 }
 
 .bubble .reasoning {
@@ -799,35 +829,91 @@ body.resizing #doc-panel { transition: none; }
 
 /* ---------- composer ---------- */
 
+/* The composer is one rounded box, the way the reference draws it: the field
+   on top, and a foot carrying the two facts a turn needs — what this chat may
+   do, and which model does it — beside the one button that starts it. */
 #composer {
   display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  padding: 12px 20px 8px;
-  border-top: 1px solid var(--border);
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 20px 6px;
+  padding: 10px 12px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--input);
 }
 
+#composer:focus-within { border-color: var(--accent); }
+
 #input {
-  flex: 1;
   resize: none;
   min-height: 44px;
   max-height: 180px;
-  padding: 11px 13px;
+  padding: 2px 4px 0;
+  border: none;
   border-radius: var(--radius-md);
-  border: 1px solid var(--border);
-  background: var(--input);
+  background: transparent;
   color: var(--text);
   font: inherit;
   line-height: 1.45;
   outline: none;
 }
 
-#input:focus { border-color: var(--accent); }
 #input::placeholder { color: var(--faint); }
 
-#send { min-width: 76px; height: 44px; }
+#composer-foot { display: flex; align-items: center; gap: var(--space-2); }
+.comp-gap { flex: 1; }
 
-.attach-btn { height: 44px; width: 40px; font-size: 16px; }
+.comp-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--hover);
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.comp-icon:hover { background: var(--active); color: var(--text); }
+
+.comp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 28px;
+  padding: 0 var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--font-ui);
+  cursor: pointer;
+}
+
+.comp-chip:hover { background: var(--hover); color: var(--text); }
+.comp-chev { width: 14px; height: 14px; }
+
+.comp-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+}
+
+/* Stop is the same button carrying the other glyph — the reference's square,
+   not a red fill: a turn in flight is normal, not an error. */
+#send.comp-send.stop { background: var(--accent); color: #fff; }
+#send.comp-send:disabled { background: var(--hover); color: var(--faint); cursor: default; }
 
 /* Attached images wait in a strip above the input: one flat chip each, the
    picture itself for recognition, an ✕ to take it back. */
@@ -904,6 +990,12 @@ body.resizing #doc-panel { transition: none; }
 
 #status-left span, #status-right span { margin-left: 12px; }
 #status-left span:first-child, #status-right span:first-child { margin-left: 0; }
+
+/* One dotted line of facts, the way the reference's footer reads. The
+   separators are decoration, so the sheet draws them and they never enter the
+   text a check reads (a pseudo-element is not textContent). */
+#status-left span + span::before,
+#status-right span + span::before { content: "· "; color: var(--faint); }
 
 #status-right .tools { color: var(--success); }
 #status-right .usage { color: var(--dim); }
@@ -1738,6 +1830,19 @@ body.resizing #doc-panel { transition: none; }
 .doc-close:hover { opacity: 1; background: var(--hover); }
 .doc-actions { display: flex; align-items: center; gap: var(--space-1); }
 
+/* Start names the column; the documents beside it are the tabs. */
+.doc-tab.doc-title {
+  gap: var(--space-2);
+  max-width: none;
+  padding: 2px 4px;
+  color: var(--text);
+  font-size: calc(var(--font-ui) + 2px);
+}
+
+.doc-tab.doc-title .ico { width: 18px; height: 18px; color: var(--dim); }
+.doc-tab.doc-title:hover { background: transparent; }
+.doc-tab.doc-title.active { background: transparent; border-color: transparent; }
+
 .doc-path {
   padding: 6px var(--space-3);
   border-bottom: 1px solid var(--border);
@@ -1763,18 +1868,129 @@ body.resizing #doc-panel { transition: none; }
   word-break: break-word;
 }
 
-.doc-start { display: flex; flex-direction: column; gap: var(--space-2); }
-.doc-row { display: flex; gap: var(--space-3); font-size: var(--font-ui); }
-.doc-key { flex: 0 0 84px; color: var(--faint); }
+/* The Start surface: a compass where a document would be, and the three ways
+   to put one in the column. The hero absorbs the slack so the cards sit where
+   the reference puts them, and each card carries its chord, so the gesture and
+   the key are learned in the same glance (rev 122). */
+.doc-start {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-height: 100%;
+}
 
-.doc-value {
+.start-hero {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 96px;
+  padding: var(--space-5) 0;
+}
+
+.doc-start .start-compass {
+  width: 72px;
+  height: 72px;
+  color: var(--border);
+  stroke-width: 1.1;
+}
+
+.start-cards { display: flex; flex-direction: column; gap: var(--space-2); }
+
+.start-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
   color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.start-card:hover { background: var(--hover); border-color: var(--border-strong); }
+.start-card .start-card-ico { width: 22px; height: 22px; stroke-width: 1.5; }
+.start-card .start-card-ico.files { color: var(--warn); }
+.start-card .start-card-ico.term,
+.start-card .start-card-ico.web { color: var(--accent); }
+
+.start-card-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.start-card-title { font-size: var(--content-font-size); }
+
+.start-card-sub {
+  color: var(--dim);
+  font-size: var(--font-ui);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.doc-hint { color: var(--dim); font-size: var(--font-ui); line-height: 1.5; }
+.start-card-key { flex: none; color: var(--faint); font-size: var(--font-ui); }
+
+/* The Browser card asks for the page it is about to open. The field replaces
+   the card's own contents, so the card stays exactly one target. */
+.start-card .start-url { display: none; }
+.start-card.open .start-card-ico,
+.start-card.open .start-card-body,
+.start-card.open .start-card-key { display: none; }
+.start-card.open .start-url { display: flex; flex: 1; gap: var(--space-1); }
+
+.start-url-input {
+  flex: 1;
+  min-width: 0;
+  height: var(--control-h);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--input);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--font-ui);
+}
+
+.start-url-go {
+  flex: none;
+  height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--hover);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--font-ui);
+  cursor: pointer;
+}
+
+.start-url-go:hover { background: var(--active); }
+
+/* Docking is the order of a flex sibling: the column, its divider and the
+   sidebar change places without the DOM moving and without recomputing any
+   geometry. The edge moves to the side that now faces the chat. */
+#app[data-doc-dock="left"] #sidebar,
+#app[data-doc-dock="left"] #divider-left { order: -2; }
+
+#app[data-doc-dock="left"] #divider-right,
+#app[data-doc-dock="left"] #doc-panel,
+#app[data-doc-dock="left"] #panel-host { order: -1; }
+
+#app[data-doc-dock="left"] #doc-panel {
+  border-left: none;
+  border-right: 1px solid var(--border);
+}
+
+.doc-head .doc-act { padding: 2px 6px; }
+.doc-act[hidden] { display: none; }
 .doc-error { color: var(--error); font-size: var(--font-ui); }
 .head-toggle { padding: 2px 6px; font-size: 14px; }
 

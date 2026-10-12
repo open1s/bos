@@ -600,6 +600,12 @@ const Shell = (() => {
       const tab = document.createElement("button");
       tab.type = "button";
       tab.className = "doc-tab" + ((activeDoc || "start") === doc.id ? " active" : "");
+      // Start is the column's name, not one of its documents: it carries the
+      // compass and no tab chrome, the way the reference's header reads.
+      if (doc.id === "start") {
+        tab.classList.add("doc-title");
+        tab.appendChild(panelIcon("compass"));
+      }
       tab.setAttribute("role", "tab");
       tab.setAttribute("aria-selected", String((activeDoc || "start") === doc.id));
       tab.appendChild(document.createTextNode(doc.title || doc.id));
@@ -623,40 +629,203 @@ const Shell = (() => {
     });
   };
 
+  /* The column's icons: the same 24-grid outline the rest of the chrome draws
+     (createElementNS, stroked in currentColor), written here because this set —
+     a compass, the dock glyphs, a folder, a terminal, a globe — belongs to this
+     surface. */
+  const PANEL_ICONS = {
+    compass: [
+      "M12 3.4a8.6 8.6 0 1 1 0 17.2 8.6 8.6 0 0 1 0-17.2z",
+      "M15.2 8.8 10.5 10.5 8.8 15.2l4.7-1.7z",
+    ],
+    dockLeft: [
+      "M4.6 5.4h14.8A1.6 1.6 0 0 1 21 7v10a1.6 1.6 0 0 1-1.6 1.6H4.6A1.6 1.6 0 0 1 3 17V7a1.6 1.6 0 0 1 1.6-1.6z",
+      "M9.6 5.4v13.2",
+    ],
+    dockRight: [
+      "M4.6 5.4h14.8A1.6 1.6 0 0 1 21 7v10a1.6 1.6 0 0 1-1.6 1.6H4.6A1.6 1.6 0 0 1 3 17V7a1.6 1.6 0 0 1 1.6-1.6z",
+      "M14.4 5.4v13.2",
+    ],
+    expand: [
+      "M9.4 4.6H4.6V9.4",
+      "M14.6 19.4h4.8v-4.8",
+      "M19.4 9.4V4.6h-4.8",
+      "M4.6 14.6v4.8h4.8",
+    ],
+    reload: ["M19.4 12a7.4 7.4 0 1 1-2.2-5.2", "M19.6 4.6v4.8h-4.8"],
+    folder: [
+      "M3 7.6A1.6 1.6 0 0 1 4.6 6h3.6L10.4 8.2h9A1.6 1.6 0 0 1 21 9.8v7.6A1.6 1.6 0 0 1 19.4 19H4.6A1.6 1.6 0 0 1 3 17.4z",
+    ],
+    terminal: [
+      "M4 6.4h16A1.6 1.6 0 0 1 21.6 8v8a1.6 1.6 0 0 1-1.6 1.6H4A1.6 1.6 0 0 1 2.4 16V8A1.6 1.6 0 0 1 4 6.4z",
+      "M6.4 10.4l2.4 2-2.4 2",
+      "M12.4 14.4h5.2",
+    ],
+    globe: [
+      "M12 3.6a8.4 8.4 0 1 1 0 16.8 8.4 8.4 0 0 1 0-16.8z",
+      "M3.6 12h16.8",
+      "M12 3.6c2.2 2.3 3.3 5.1 3.3 8.4S14.2 18.1 12 20.4c-2.2-2.3-3.3-5.1-3.3-8.4S9.8 5.9 12 3.6z",
+    ],
+  };
+  const panelIcon = (name, cls) => {
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("class", "ico" + (cls ? " " + cls : ""));
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    for (const d of PANEL_ICONS[name] || []) {
+      const p = document.createElementNS(ns, "path");
+      p.setAttribute("d", d);
+      svg.appendChild(p);
+    }
+    return svg;
+  };
+
+  /* The column's arrangement. Docking is the order of a flex sibling, so it is
+     an attribute on the frame and nothing moves in the DOM; expanding keeps the
+     width it replaced instead of recomputing what the width should have been. */
+  let docDock = "right";
+  let docWide = false;
+  let docWidePrev = 0;
+
+  const markDock = () => {
+    const pairs = [
+      ["doc-dock-left", docDock === "left"],
+      ["doc-dock-right", docDock === "right"],
+      ["doc-wide", docWide],
+    ];
+    for (const [id, on] of pairs) {
+      const el = document.getElementById(id);
+      if (el) el.setAttribute("aria-pressed", String(on));
+    }
+  };
+
+  const setDocDock = (side) => {
+    docDock = side === "left" ? "left" : "right";
+    if (app) app.setAttribute("data-doc-dock", docDock);
+    markDock();
+  };
+
+  const toggleDocWide = () => {
+    if (docWide) {
+      docWide = false;
+      setDoc(docWidePrev || Math.round(appWidth() * 0.32));
+    } else {
+      docWidePrev = docWidthFor();
+      docWide = true;
+      setDoc(Math.max(Math.round(appWidth() * 0.44), 420));
+    }
+    markDock();
+  };
+
+  /* The Browser card's second door: from the keyboard the column may be closed
+     or holding a document, and either one is in the way of a field that has to
+     be typed into. */
+  const promptBrowser = () => {
+    if (!state.docOpen) toggleDoc();
+    if (activeDoc) {
+      activeDoc = null;
+      renderDoc();
+    }
+    if (revealBrowser) revealBrowser();
+  };
+
+  /* One launcher card: an icon, what it opens, the line that says what that
+     buys, and the chord that reaches it. The card is the button, so the whole
+     row is the target rather than the words inside it. */
+  const startCard = (action, icon, title, sub, keys, kind) => {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "start-card";
+    card.dataset.act = action;
+    card.appendChild(panelIcon(icon, kind ? "start-card-ico " + kind : "start-card-ico"));
+    const body = document.createElement("span");
+    body.className = "start-card-body";
+    const t = document.createElement("span");
+    t.className = "start-card-title";
+    t.textContent = title;
+    const s = document.createElement("span");
+    s.className = "start-card-sub";
+    s.textContent = sub;
+    body.appendChild(t);
+    body.appendChild(s);
+    card.appendChild(body);
+    if (keys) {
+      const k = document.createElement("span");
+      k.className = "start-card-key";
+      k.textContent = keys;
+      card.appendChild(k);
+    }
+    return card;
+  };
+
+  /* The Browser card asks for a page before it can open one, so it carries its
+     own one-line field: the card is still the whole target, and the field is
+     what the card was missing. */
+  const browserField = (card, emit_) => {
+    const form = document.createElement("form");
+    form.className = "start-url";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "start-url-input";
+    input.spellcheck = false;
+    input.autocomplete = "off";
+    input.setAttribute("aria-label", "Web address");
+    input.placeholder = "example.com";
+    const go = document.createElement("button");
+    go.type = "submit";
+    go.className = "start-url-go";
+    go.textContent = "Open";
+    form.appendChild(input);
+    form.appendChild(go);
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      const url = input.value.trim();
+      if (!url) return;
+      input.value = "";
+      emit_({ action: "browser", url });
+      card.classList.remove("open");
+    });
+    form.addEventListener("click", (ev) => ev.stopPropagation());
+    card.appendChild(form);
+    card.classList.add("has-url");
+    const open = () => {
+      card.classList.add("open");
+      input.focus();
+    };
+    card.revealUrl = open;
+    card.addEventListener("click", open);
+    return card;
+  };
+
+  /* The empty document column is the launcher: a compass where a document would
+     be, and the three ways to put something in the column. What a door *does*
+     is the app's business, so the card hands over an action and never a command
+     name (Part II §15). */
+  let revealBrowser = null;
   const renderStart = () => {
     const box = document.createElement("div");
     box.className = "doc-start";
-    // The shipped lockup, served from the frontend root (icons/ ships next to
-    // index.html), so the empty document column still says whose harness it is.
-    const logo = document.createElement("img");
-    logo.className = "doc-logo";
-    logo.src = "icons/bos-harness-logo.svg";
-    logo.alt = "BOS Harness";
-    logo.width = 232;
-    box.appendChild(logo);
-    const add = (label, value) => {
-      const row = document.createElement("div");
-      row.className = "doc-row";
-      const k = document.createElement("span");
-      k.className = "doc-key";
-      k.textContent = label;
-      const v = document.createElement("span");
-      v.className = "doc-value";
-      // Untrusted values are inserted as text, never as markup.
-      v.textContent = value || "\u2014";
-      row.appendChild(k);
-      row.appendChild(v);
-      box.appendChild(row);
-    };
-    add("Workspace", state.context.workspace);
-    add("Session", state.context.session);
-    add("Model", state.context.model);
-    add("Task", state.task.status + (state.task.phase ? ` \u00b7 ${state.task.phase}` : ""));
-    const hint = document.createElement("p");
-    hint.className = "doc-hint";
-    hint.textContent =
-      "No document open. Open one from a tool call, a file mention or the file list.";
-    box.appendChild(hint);
+    const hero = document.createElement("div");
+    hero.className = "start-hero";
+    hero.appendChild(panelIcon("compass", "start-compass"));
+    box.appendChild(hero);
+    const cards = document.createElement("div");
+    cards.className = "start-cards";
+    cards.appendChild(
+      startCard("files", "folder", "Workspace files",
+        "Browse files in this session's workspace", "\u2318 P", "files")
+    );
+    cards.appendChild(
+      startCard("terminal", "terminal", "New terminal",
+        "Run commands in the session workspace", "", "term")
+    );
+    const browser = startCard("browser", "globe", "Browser", "Browse web pages", "\u2318 T", "web");
+    browserField(browser, emit);
+    revealBrowser = () => browser.revealUrl && browser.revealUrl();
+    cards.appendChild(browser);
+    box.appendChild(cards);
     return box;
   };
 
@@ -664,6 +833,9 @@ const Shell = (() => {
     renderDocTabs();
     if (!docBody) return;
     docBody.textContent = "";
+    // Reload only means something over a document; the launcher has none.
+    const reload = document.getElementById("doc-refresh");
+    if (reload) reload.hidden = !activeDoc;
     const doc = documents.find((d) => d.id === activeDoc);
     if (!doc) {
       if (docPath) docPath.textContent = "";
@@ -771,22 +943,30 @@ const Shell = (() => {
     docTabs.setAttribute("role", "tablist");
     const actions = document.createElement("div");
     actions.className = "doc-actions";
-    const refresh = document.createElement("button");
-    refresh.id = "doc-refresh";
-    refresh.type = "button";
-    refresh.className = "btn btn-ghost";
-    refresh.title = "Refresh document";
-    refresh.textContent = "\u21bb";
-    refresh.addEventListener("click", () => emit("document", { action: "refresh", id: activeDoc }));
-    const hide = document.createElement("button");
-    hide.id = "doc-collapse";
-    hide.type = "button";
-    hide.className = "btn btn-ghost";
-    hide.title = "Hide document panel";
-    hide.textContent = "\u00bb";
-    hide.addEventListener("click", toggleDoc);
-    actions.appendChild(refresh);
-    actions.appendChild(hide);
+    /* The column's own controls, in the reference's three shapes — where the
+       column sits and whether it takes the middle — because the arrangement is
+       what a header of a docked column is for. Reload stays (a document can
+       change on disk) and hides while the launcher is up, where there is
+       nothing to reload. */
+    const act = (id, icon, label, run) => {
+      const b = document.createElement("button");
+      b.id = id;
+      b.type = "button";
+      b.className = "btn btn-ghost doc-act";
+      b.title = label;
+      b.setAttribute("aria-label", label);
+      b.appendChild(panelIcon(icon));
+      b.addEventListener("click", run);
+      actions.appendChild(b);
+      return b;
+    };
+    act("doc-refresh", "reload", "Reload the document",
+      () => emit("document", { action: "refresh", id: activeDoc }));
+    act("doc-dock-left", "dockLeft", "Dock the document panel on the left",
+      () => setDocDock("left"));
+    act("doc-wide", "expand", "Expand the document panel", toggleDocWide);
+    act("doc-dock-right", "dockRight", "Dock the document panel on the right",
+      () => setDocDock("right"));
     head.appendChild(docTabs);
     head.appendChild(actions);
     docPath = document.createElement("div");
@@ -810,6 +990,10 @@ const Shell = (() => {
     /* The built-in surface registers itself through the public seam, so the
        registry is exercised by the product rather than only by tests. */
     registerPanel({ id: "document", title: "Documents", kind: "right" });
+    // The default arrangement is written once at mount, so the frame always
+    // carries the attribute the stylesheet reads rather than relying on a
+    // missing attribute meaning "right".
+    setDocDock(docDock);
 
     /* DSH ui-layout: Mod+B toggles the sidebar. It yields to a control that has
        its own meaning for the chord — an editable field, or the terminal, where
@@ -1152,12 +1336,18 @@ const Shell = (() => {
     setWorkDetails,
     setCodingView,
     setLanguage,
+    // The permission vocabulary travels with the state it belongs to: the
+    // composer's mode menu is built from it, so there is one list of modes.
+    PERMISSIONS,
     setPermission,
     setSidebar,
     setDoc,
     toggleSidebar,
     closeDrawer,
     toggleDoc,
+    setDocDock,
+    toggleDocWide,
+    promptBrowser,
     setLayoutScope,
     openDocument,
     closeDocument,
