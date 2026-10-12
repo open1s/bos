@@ -217,7 +217,7 @@ impl SessionRecord {
         let now = unix_now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
-            title: "New chat".to_string(),
+            title: "New Session".to_string(),
             created_at: now,
             updated_at: now,
             workspace: String::new(),

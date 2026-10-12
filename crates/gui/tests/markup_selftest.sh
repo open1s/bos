@@ -237,12 +237,6 @@ grep -qE '"\/new", hint: "Start a new chat", run: \(\) => newChat\(\)' $JS \
 # listener that follows the button's construction, because the row's "…" menu
 # offers the same action and would satisfy a document-wide grep on its own
 # (measured: rewiring the "+" to newChat() left such a check green).
-# The folder and the disclosure share one slot in a workspace row, which takes both
-# ends: the stylesheet hides the folder only on a row the code marked foldable, so a
-# row that cannot fold must not hover its folder away for a triangle it does not have.
-grep -qF '.ws-head.foldable:hover .ws-folder { display: none; }' $CSSFILE \
-  && grep -qF 'head.classList.add("foldable")' $JS \
-  && ok || bad "the row's folder and its disclosure must trade one slot under the pointer"
 WS_NEW_BLOCK=$(grep -A 9 'const add = el("button", "ws-act ws-new")' $JS)
 case "$WS_NEW_BLOCK" in
   *'void newSessionIn(group.id);'*) ok ;;
@@ -250,6 +244,21 @@ case "$WS_NEW_BLOCK" in
 esac
 grep -qE 'add.setAttribute\("aria-keyshortcuts", "Meta\+N Control\+N"\)' $JS \
   && ok || bad "that row control must advertise the shortcut it answers to"
+# The disclosure has to read at rest, its two states have to be two different icons, and
+# its triangle has to be big enough to see: the user reported the small stroked one, so
+# its size is asserted rather than left to taste. The state pair is checked where it is
+# drawn (the page guard flips a row and compares the two shapes); here the rule, the size
+# and the pair the code picks are read.
+grep -qF '.ws-fold { display: inline-flex; }' $CSSFILE \
+  && grep -qF '.ws-fold .ico { width: 18px; height: 18px; }' $CSSFILE \
+  && grep -qF 'ico(folded ? ICONS.triRight : ICONS.triDown, true)' $JS \
+  && ok || bad "the disclosure must read at rest, in two icons, big enough to see"
+# A streaming chat, and the workspace row that owns it, take the success colour. The
+# classes the code sets are checked where they are set (the page guard); the colours are
+# a stylesheet fact, and that is here — a class no rule paints is not a colour.
+grep -qF '.session-row.working .title { color: var(--success); }' $CSSFILE \
+  && grep -qF '.ws-head.working .ws-folder { color: var(--success); }' $CSSFILE \
+  && ok || bad "a working chat and its workspace must take the success colour"
 
 
 # --- M13 polish: the chrome the polish layer drives -------------------------

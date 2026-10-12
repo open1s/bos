@@ -151,6 +151,27 @@
     type("slow please");
     sendBtn.click();
     await waitFor(() => sendBtn.classList.contains("stop"), "the slow turn to start");
+    /* rev 119: a streaming chat is the one row in the list that is doing something, so
+       it and the workspace row that owns it read as working while it runs — and stop
+       when it ends. This is the live path: the state arrives through send_message's
+       answer and the backend's events, not through a fixture writing state.streams. */
+    const workingRows = () => {
+      const row = d.querySelector("#session-list .session-row.working");
+      if (!row) return null;
+      let h = row.previousElementSibling;
+      while (h && !h.classList.contains("ws-head")) h = h.previousElementSibling;
+      return { row, head: h };
+    };
+    const during = workingRows();
+    assert(
+      `working: the streaming chat and its workspace row read as working (${
+        during ? during.row.className + " / " + (during.head ? during.head.className : "no head") : "no working row"
+      })`,
+      !!during &&
+        !!during.head &&
+        during.head.classList.contains("working") &&
+        !!during.row.querySelector(".sess-mark.live"),
+    );
     type("queued follow-up");
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     await waitFor(
@@ -176,6 +197,7 @@
       /you said: queued follow-up/.test(messagesText()) &&
         d.getElementById("queue-list").classList.contains("hidden"),
     );
+    assert("working: a settled chat stops reading as working", !workingRows());
 
     /* ---- stop: cancelling mid-stream settles the turn ------------------ */
     type("slow again");

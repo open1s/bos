@@ -178,6 +178,11 @@ body.resizing #doc-panel { transition: none; }
   color: var(--text);
 }
 
+/* The one row in this list that is *doing* something: its marker fills and its title
+   turns, so a streaming chat reads at a glance instead of only through a colour on an
+   8px ring (rev 119). */
+.session-row.working .title { color: var(--success); }
+
 .session-row .time {
   font-size: 11px;
   color: var(--faint);
@@ -1857,7 +1862,11 @@ body.resizing #doc-panel { transition: none; }
    reference sidebar draws a folder on every row and the ▸/▾ only under the pointer,
    so a row that cannot fold never loses its folder to an unreachable triangle. */
 .ws-folder { flex: none; display: inline-flex; color: var(--dim); }
-.ws-head.foldable:hover .ws-folder { display: none; }
+/* A chat inside is streaming: the folder takes the success colour, so the workspace
+   that owns the work is visible with its group still closed (rev 119). */
+.ws-head.working .ws-folder { color: var(--success); }
+/* The column a row that cannot fold keeps, so every name starts at the same x. */
+.ws-head .ws-fold-gap { flex: none; width: 18px; }
 /* The model field in the workspace form. The header's own model chip is gone (§24.4),
    so this is the only .ws-model left; the form's field keeps the shape it had. */
 .ws-model {
@@ -1883,6 +1892,12 @@ body.resizing #doc-panel { transition: none; }
    affordances, and the ⊕ is how a chat is started in a specific workspace. */
 .ws-new, .ws-menu { display: inline-flex; padding: 0 3px; }
 .ws-new .ico, .ws-menu .ico { width: 15px; height: 15px; }
+/* The disclosure is the third control that reads at rest, and the one that must: a
+   collapsed group and an open one are two different icons, not two states a hover
+   apart. It is drawn solid and larger than the row's outline icons — the small
+   stroked triangle this row used to carry is what the user could not see (rev 119). */
+.ws-fold { display: inline-flex; }
+.ws-fold .ico { width: 18px; height: 18px; }
 .ws-act:hover { color: var(--text); }
 /* A preset is the one row the sidebar still draws under its list: the
    Add-workspace *dialog* is reached from the section header's folder-plus only,
@@ -3049,6 +3064,7 @@ body.resizing #doc-panel { transition: none; }
   stroke-linecap: round;
   stroke-linejoin: round;
 }
+.ico-solid { fill: currentColor; stroke: none; }
 .set-icon { display: inline-flex; align-items: center; justify-content: center; }
 .cap-title .ico, .btn .ico { width: 14px; height: 14px; }
 .btn .ico { vertical-align: -2px; }

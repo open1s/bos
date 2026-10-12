@@ -926,6 +926,7 @@ affordance and a rerun of every structural assertion, not a silent shrink.
 | 116 | 2026-10-12 | **The workspace row showed the model and put its gestures on the left; the user drew a box around the two and said "don't show model info here", "move them to where the model is".** A row is about the workspace, not about the model the chat in use happens to run on, and asking the row to answer both made the model a chip fighting the name for the left edge while `+` and `…` sat before it. The chip is gone and the two gestures are where it was: `name  +  …  ●  count`, with the name keeping the flex so the row still reads left to right, the fold (on hover, and only for a group that can fold) still leading the name, and the model left to the status line, which names it for the chat in use. The `.ws-model` stylesheet rule stays because the workspace *form's* model field borrows the class; the header no longer draws one. Evidence: the page guard asserts the row's order directly (`name < + < … < dot < count`, a fold if any ahead of the name, and no `.ws-model` inside the header), which is a check that fails if the chip comes back or the buttons move back. |
 | 117 | 2026-10-12 | **Adding a workspace also started a chat in it; the user called it a bug ("添加工作区会缺省添加一个chat session，这是bug，需要修复").** The promise was old and explicit — "a workspace with no chat gets one: the composer is the workspace's front door" — but the door was opened for the reader at the moment the *folder* was added, so every new workspace arrived holding a "New chat" nobody had asked for, and every visit to an empty workspace left another one behind. The create moved to where the question is: `syncTranscriptToWorkspace` now leaves an empty workspace empty (no open chat, the transcript's own "New conversation" hint, the row's `⊕` still aiming at it), and the composer's first message starts the chat — `sendText` creates one and sends into it when nothing is open, exactly as `⊕` / Cmd+N / `/new` do. Nothing else creates a chat for the reader. Evidence: the live guard counts `create_session` across the folder-plus's pick and asserts the transcript is the empty hint (the bridge's `create_workspace` seeds no session, so the pick either creates one or does not); the page guard counts the round trips around the same gesture and then sends the first message, which must create *and* send. Both go red when the create is put back in the snapshot applier. |
 | 118 | 2026-10-12 | **The sidebar's icons were font glyphs, so its rows read differently from the reference the user is matching ("根据设计图…图标和显示效果要尽量保真").** The head already spoke the right language — the search, view and folder-plus controls are inline SVG outlines on a 24-grid (`class="ico"`, stroked in `currentColor`) — while the rows below it used `"+"`, `"…"` and no folder at all, so a workspace row led with nothing and its add-session control was a font's plus. The row now leads with the folder (the disclosure takes that slot under the pointer, and a row that cannot fold keeps its folder rather than trading it for a triangle it does not have), and its two controls are the reference's: `⋯` and then the `⊕` of "a chat in this workspace", in that order, with the icon set built by one `ico()` helper over `createElementNS` (no markup strings, so the set cannot disagree with itself). The active row's tint, the hollow/filled session marker and the always-visible pin were already right and are untouched. Evidence: the page guard's anatomy check now names the folder and asserts the reference's order (`[folder, fold], name, ⋯, ⊕, [dot,] count`), which fails if the folder goes, if the two controls swap back, or if a model chip returns; the row's own `+` block stays greppable in `markup_selftest.sh` (its anchor moved to the construction line the icon made), and its click, aria-label and keyshortcut assertions are unchanged. |
+| 119 | 2026-10-12 | **The row's expanded and collapsed states looked alike, and the triangle was too small to see ("需要区别工作区的展开/收起，使用不同的图标…三角形图标太小了").** The disclosure was the text glyphs `▸`/`▾` at the row's 11px, hidden until hover, so a collapsed group and an open one were one hover apart from each other, and the glyph was about five pixels of ink. It is now two *drawn* icons — a solid right triangle for closed, a solid down triangle for open — at 18px against the row's 15px outline icons, visible without a hover (that is the point: a state you must hover to learn is not legible), and the column it occupies is kept on a row that cannot fold so names still align. **A chat that is streaming is the one row in this list doing something, so it is now the one row that takes the success colour**: its marker fills (as before), its title turns, and the workspace row that owns it paints its folder green — the third signal, and the only one that survives the group being closed (`streamOf` over each of the group's sessions, so a folded workspace still says it is working in there). Both halves are checked where each can be seen: the page guard flips a disclosure and asserts the icon actually changes (and comes back), then sets a stream and asserts the class reaches both the chat's row and its workspace's row and leaves when the stream ends; `markup_selftest.sh` reads the rules that make the triangle visible at rest, asserts the 18px size the user asked for, and reads both `--success` rules, because a class no rule paints is not a colour. Evidence: injecting "one icon for both states" reddens the page check (it compares the two `d` attributes), and hiding the disclosure at rest reddens the markup check. |
 
 
 ## 9. Evidence status
@@ -1876,11 +1877,11 @@ never fatal.
 
 ```
 Workspaces                                    🔍  ⚙  📁+
-📁 bos                                             ⋯  ⊕  ●  2
+▾ 📁 bos                                           ⋯  ⊕  ●  2
     ○ gui transcript work         ☆              2m        …
-    ○ plan for M8                                1h        …
+    ● streaming chat              ☆              now       …
     ⧉ Archived (2)
-▸ harness-notes
+▸ 📁 harness-notes
 [ + New workspace ]
 ──────────────
 BOS  ◐  EN          ← the sidebar ends here (rev 110)
@@ -1899,17 +1900,23 @@ its `☆` is the pin's own control, so the state is one click away instead of tw
 archived chat is not in a group at all — the `⧉ Archived (n)` disclosure is the only
 place it is still counted, which is what makes "archived" mean something. **A workspace
 with no chats is still drawn**, because a folder that was just added has to be visible
-(and be a place for `+` to aim at) before anyone starts a chat in it.
+(and be a place for `⊕` to aim at) before anyone starts a chat in it.
 
 A workspace row is the switcher, and it is drawn the way the reference sidebar draws
-one: it leads with the **folder's own icon** (the disclosure `▸`/`▾` takes that slot
-while the row is under the pointer, so a row that cannot fold keeps its folder), shows
-the root on hover, expands to its sessions, and carries the reference's two gestures on
-the right — `⋯` (the menu below) and then `⊕` (a chat in *this* workspace) — where the
-bound model used to sit. Every icon here is the header's own language: an outline on a
-24-grid stroked in `currentColor` and built with `createElementNS`, not a font's idea of
-"+", "…" or a folder (rev 118). The model is **not** on the row: a row is about the
-workspace, and the model of the chat in use is the status line's job. The menu still
+one: it opens with its **disclosure** — two solid triangles, `▸` closed and `▾` open,
+drawn large enough to read at rest, because expanded and collapsed are two states and a
+state you must hover to learn is not legible (rev 119) — then the **folder's own icon**,
+then the name. It shows the root on hover, expands to its sessions, and carries the
+reference's two gestures on the right — `⋯` (the menu below) and then `⊕` (a chat in
+*this* workspace) — where the bound model used to sit; a row that cannot fold keeps the
+disclosure's column with a spacer, so every name starts at the same x. Every icon here is
+the header's own language: drawn on a 24-grid in `currentColor` with `createElementNS`,
+not a font's idea of "+", "…", "▸" or a folder (rev 118). A chat that is **streaming** is
+the one row in the list that is doing something, so it is the one row that takes the
+success colour: its marker fills, its title turns, and the workspace row that owns it
+paints its folder the same way — the work is visible with the group still closed, which a
+closed group could not say otherwise (rev 119). The model is **not** on the row: a row is
+about the workspace, and the model of the chat in use is the status line's job. The menu still
 holds rename / set-root / duplicate / remove (remove asks what happens to its sessions:
 keep them in a rescued workspace or delete them). Session search stays global but
 its results are grouped by workspace. The nav entries below the list keep opening

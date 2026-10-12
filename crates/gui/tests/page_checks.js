@@ -1837,10 +1837,9 @@
         // own position is checked where it exists (and exactly one row must have it).
         (at("dot") === -1 || at("+") < at("dot")) &&
         at("+") < at("count") &&
-        (at("fold") === -1 || at("fold") < at("name")) &&
-        // The stylesheet takes the folder away on hover only for a row the code
-        // marked; a disclosure without that class would hover its folder into nothing.
-        (!h.querySelector(".ws-fold") || h.classList.contains("foldable")) &&
+        // The disclosure comes first — the state reads before the identity — and a row
+        // that cannot fold simply has none (it keeps the column with a spacer).
+        (at("fold") === -1 || at("fold") < at("folder")) &&
         !h.querySelector(".ws-model")
       );
     };
@@ -1850,7 +1849,7 @@
     const wshHeads = [...d.querySelectorAll("#session-list .ws-head")];
     const wshRows = wshHeads.map((h) => [...h.children].map(label).join(","));
     assert(
-      `every workspace row reads [folder, fold], name, …, +, [dot,] count (${wshRows.join(" | ")})`,
+      `every workspace row reads [fold, folder], name, …, +, [dot,] count (${wshRows.join(" | ")})`,
       wshHeads.length >= 2 &&
         wshHeads.every(reads) &&
         wshRows.filter((r) => r.includes("dot")).length === 1,
@@ -1859,6 +1858,58 @@
       w.model = hadModels[i];
     });
     renderSidebar();
+    // rev 119: the disclosure is the one control that must read *before* the pointer
+    // arrives, so its two states are two different icons. The stylesheet is what keeps
+    // it visible at rest (markup_selftest.sh reads that rule and its size); what only
+    // this layer can show is that the two states really are two *different* shapes —
+    // flipping a row has to change the icon, and flipping it back has to restore it.
+    const dOf = () => {
+      const h = [...d.querySelectorAll("#session-list .ws-head")].find((x) => x.querySelector(".ws-fold"));
+      return h ? h.querySelector(".ws-fold .ico path").getAttribute("d") : "";
+    };
+    const flipFold = async () => {
+      const h = [...d.querySelectorAll("#session-list .ws-head")].find((x) => x.querySelector(".ws-fold"));
+      h.querySelector(".ws-fold").click();
+      await flush();
+    };
+    const arrowOpen = dOf();
+    await flipFold();
+    const arrowShut = dOf();
+    await flipFold();
+    const arrowBack = dOf();
+    assert(
+      `the disclosure's two states are two different icons (${arrowOpen} vs ${arrowShut}, back to ${arrowBack})`,
+      !!arrowOpen && !!arrowShut && arrowOpen !== arrowShut && arrowBack === arrowOpen,
+    );
+    // rev 119: a chat that is streaming is the one row in this list that is doing
+    // something, so it and the workspace that owns it take the success colour. The
+    // colour is a stylesheet fact (markup_selftest.sh reads both rules); the state has
+    // to reach both rows, and has to leave them when the stream ends — which is what a
+    // fixture that can set a stream proves.
+    const liveId = d.querySelector("#session-list .session-row").dataset.id;
+    state.streams[liveId] = { session_id: liveId, gen: 1 };
+    renderAll();
+    const liveRow = d.querySelector(`#session-list .session-row[data-id="${liveId}"]`);
+    const headOf = (row) => {
+      let n = row.previousElementSibling;
+      while (n && !n.classList.contains("ws-head")) n = n.previousElementSibling;
+      return n;
+    };
+    const liveHead = headOf(liveRow);
+    assert(
+      `a streaming chat and its workspace row both read as working (${liveRow.className} / ${liveHead ? liveHead.className : "no head"})`,
+      liveRow.classList.contains("working") &&
+        !!liveRow.querySelector(".sess-mark.live") &&
+        !!liveHead &&
+        liveHead.classList.contains("working"),
+    );
+    delete state.streams[liveId];
+    renderAll();
+    assert(
+      "a finished chat stops reading as working",
+      !d.querySelector("#session-list .session-row.working") &&
+        !d.querySelector("#session-list .ws-head.working"),
+    );
 
     const wsMenuBtn = d.querySelector("#session-list .ws-menu");
     wsMenuBtn.click();

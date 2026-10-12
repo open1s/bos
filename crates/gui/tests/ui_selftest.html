@@ -563,13 +563,32 @@ window.addEventListener("error", (e) => {
         );
         openWorkspaceForm("remove", "w1");
         assert(
-          "removing a workspace asks what to do with its chats",
-          // Scoped to the form: `.ws-name` is also the sidebar header's name
-          // span, so an unscoped search would pass or fail on whether any
-          // workspace happened to be drawn behind the form.
-          !!document.querySelector(".ws-del-chats") && !document.querySelector(".ws-form .ws-name"),
+          "removing the only workspace says its chats go with it — there is nowhere to keep them",
+          // Scoped to the form: `.ws-name` is also the sidebar header's name span, so
+          // an unscoped search would pass or fail on whether any workspace happened to
+          // be drawn behind the form. With one workspace there is no choice to offer,
+          // and §24.6 wants that *said* rather than silently deleted (rev 115).
+          !document.querySelector(".ws-form .ws-name") &&
+            !document.querySelector(".ws-form .ws-del-chats") &&
+            /last workspace/.test(
+              (document.querySelector(".ws-form .ws-form-hint") || {}).textContent || "",
+            ),
         );
         closeWorkspaceForm();
+        // …and with a successor there *is* a choice, which is the other half of the
+        // same rule: a fixture that only ever holds one workspace cannot see either.
+        state.workspaces = [
+          { id: "w1", name: "bos", root: "/p/bos", model: "m1" },
+          { id: "w2", name: "two", root: "/p/two", model: "" },
+        ];
+        openWorkspaceForm("remove", "w1");
+        assert(
+          "removing one of two workspaces asks what to do with its chats",
+          !!document.querySelector(".ws-form .ws-del-chats") &&
+            !document.querySelector(".ws-form .ws-name"),
+        );
+        closeWorkspaceForm();
+        state.workspaces = [{ id: "w1", name: "bos", root: "/p/bos", model: "m1" }];
         assert(
           "closing the form leaves the list as it was — no add row returns",
           !sessionList.querySelector(".ws-add") && !document.querySelector(".ws-form"),
@@ -902,19 +921,30 @@ window.addEventListener("error", (e) => {
         state.collapsed = {};
         renderSidebar();
         R.foldRowsBefore = sessionList.querySelectorAll(".session-row").length;
+        // The marker is a drawn triangle now, not a text glyph, and the two states are
+        // two different shapes: reading textContent would have kept passing with the icon
+        // deleted, and could never tell "open" from "closed" (rev 119).
+        const foldIcon = () => {
+          const p = sessionList.querySelector(".ws-fold .ico path");
+          return p ? p.getAttribute("d") : "none";
+        };
+        R.foldIconOpen = foldIcon();
         const foldButton = sessionList.querySelector(".ws-fold");
         if (foldButton) foldButton.dispatchEvent(new Event("click"));
         R.foldRowsAfter = sessionList.querySelectorAll(".session-row").length;
-        R.foldMarker = (sessionList.querySelector(".ws-fold") || {}).textContent || "none";
+        R.foldIconShut = foldIcon();
+        R.foldMarker = `${R.foldIconOpen}->${R.foldIconShut}`;
         // A repaint (a stream tick, a search keystroke) must not spring it open.
         renderSidebar();
         R.foldRowsRepaint = sessionList.querySelectorAll(".session-row").length;
         assert(
-          `a workspace group folds away and stays folded (rows=${R.foldRowsBefore}->${R.foldRowsAfter}, after repaint=${R.foldRowsRepaint}, marker=${R.foldMarker})`,
+          `a workspace group folds away and stays folded, with the disclosure switching shape (rows=${R.foldRowsBefore}->${R.foldRowsAfter}, after repaint=${R.foldRowsRepaint}, icon=${R.foldMarker})`,
           R.foldRowsBefore === 1 &&
             R.foldRowsAfter === 0 &&
             R.foldRowsRepaint === 0 &&
-            R.foldMarker === "▸",
+            R.foldIconOpen !== "none" &&
+            R.foldIconShut !== "none" &&
+            R.foldIconOpen !== R.foldIconShut,
         );
         state.workspaces = kept3.workspaces;
         state.sessions = kept3.sessions;

@@ -176,10 +176,10 @@ const clip = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
    language instead of a font's idea of "+", "…" and a folder (§24.4). Built with
    createElementNS rather than innerHTML, because a string of markup is a second
    place the icon set can disagree with itself. */
-function ico(paths) {
+function ico(paths, solid) {
   const ns = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(ns, "svg");
-  svg.setAttribute("class", "ico");
+  svg.setAttribute("class", solid ? "ico ico-solid" : "ico");
   svg.setAttribute("viewBox", "0 0 24 24");
   svg.setAttribute("aria-hidden", "true");
   svg.setAttribute("focusable", "false");
@@ -197,6 +197,11 @@ const ICONS = {
   plusCircle: ["M12 4.4a7.6 7.6 0 1 1 0 15.2 7.6 7.6 0 0 1 0-15.2z", "M12 8.8v6.4M8.8 12h6.4"],
   // Three dots, drawn as zero-length strokes with the round cap they inherit.
   dots: ["M7 12h.01M12 12h.01M17 12h.01"],
+  // The disclosure's two states, as two solid triangles: a collapsed group points
+  // right, an open one points down, and the shape carries the state because the
+  // user could not see the small stroked triangle the row used to have (rev 119).
+  triRight: ["M9.2 6.4 17.6 12 9.2 17.6z"],
+  triDown: ["M6.4 9.2 17.6 9.2 12 17.6z"],
 };
 
 /* What a chat's row offers, in one place and free of the DOM.
@@ -1261,7 +1266,7 @@ function archivedRow(s) {
   row.appendChild(when);
   const back = el("button", "sess-restore", tr("session.restore", "Restore"));
   back.type = "button";
-  back.setAttribute("aria-label", `Restore ${s.title || "New chat"}`);
+  back.setAttribute("aria-label", `Restore ${s.title || "New Session"}`);
   back.addEventListener("click", (e) => {
     e.stopPropagation();
     void setArchived(s.id, false);
@@ -1269,7 +1274,7 @@ function archivedRow(s) {
   row.appendChild(back);
   const more = el("button", "sess-menu", "…");
   more.type = "button";
-  more.setAttribute("aria-label", `Actions for ${s.title || "New chat"}`);
+  more.setAttribute("aria-label", `Actions for ${s.title || "New Session"}`);
   more.setAttribute("aria-haspopup", "menu");
   more.setAttribute("aria-expanded", "false");
   more.addEventListener("click", (e) => {
@@ -1340,17 +1345,15 @@ function renderSidebar() {
       // draws it. The disclosure takes that slot while the row is hovered (the class
       // below is what lets the stylesheet do that without guessing), so a nested list
       // is still openable without a second column of glyphs (§24.4).
-      const folder = el("span", "ws-folder");
-      folder.appendChild(ico(ICONS.folder));
-      head.appendChild(folder);
       const canFold = view.group !== "workspace" || group.id === state.activeWorkspace;
       folded =
         !!state.collapsed[group.id] ||
         (view.group === "workspace" && group.id !== state.activeWorkspace);
       if (canFold) {
-        const fold = el("button", "ws-act ws-fold", folded ? "▸" : "▾");
-        // The glyph is the whole label, so it needs a name of its own — the title
-        // is a tooltip, and a screen reader does not read one as a name.
+        const fold = el("button", "ws-act ws-fold");
+        fold.appendChild(ico(folded ? ICONS.triRight : ICONS.triDown, true));
+        // The icon is the whole label, so it needs a name of its own — the title is
+        // a tooltip, and a screen reader does not read one as a name.
         fold.setAttribute("aria-label", folded ? `Show ${group.name}'s chats` : `Hide ${group.name}'s chats`);
         fold.setAttribute("aria-expanded", folded ? "false" : "true");
         fold.title = folded ? "Show this workspace's chats" : "Hide them";
@@ -1361,9 +1364,19 @@ function renderSidebar() {
           state.collapsed[group.id] = !folded;
           renderSidebar();
         });
-        head.classList.add("foldable");
         head.appendChild(fold);
+      } else {
+        // A row that cannot fold keeps the column, so every name starts at the same x:
+        // an unfolderable row is aligned with the foldable ones, not shifted left.
+        head.appendChild(el("span", "ws-fold-gap"));
       }
+      // Then the workspace's own folder, the way the reference sidebar draws it.
+      const folder = el("span", "ws-folder");
+      folder.appendChild(ico(ICONS.folder));
+      head.appendChild(folder);
+      // A chat inside is streaming: the folder takes the success colour, so the
+      // workspace that owns the work is visible with its group still closed.
+      if (group.sessions.some((s) => streamOf(s.id))) head.classList.add("working");
       head.appendChild(el("span", "ws-name", clip(group.name, 18)));
       // The two gestures the reference sidebar puts on a row, in its order: the menu
       // first, and the row's own "start a chat here" (the ⊕) last, nearest the edge.
@@ -1420,6 +1433,9 @@ function renderSidebar() {
     // ring is decoration, so the state is also spelled out for a screen reader
     // instead of being carried by colour alone.
     const live = !!streamOf(s.id);
+    // The row carries the state as well as its marker: a streaming chat's title takes
+    // the success colour, so the list says which chat is working without a hover.
+    if (live) row.classList.add("working");
     const mark = el("span", "sess-mark" + (live ? " live" : ""));
     mark.setAttribute("aria-hidden", "true");
     row.appendChild(mark);
@@ -3799,6 +3815,10 @@ async function sendText(text, sessionId = state.activeId, truncateFrom = null, i
     renderStatus();
     renderSend();
     renderQueue();
+    // The sidebar carries the stream state too (a working chat's marker, and its own
+    // workspace's row), so it has to be told the turn started — no other repaint
+    // reaches it, and the colour a user asked for would arrive late or not at all.
+    renderSidebar();
     tick();
     return true;
   } catch (err) {
@@ -3874,6 +3894,7 @@ async function regenerate() {
     state.streams[state.activeId] = streaming;
     renderStatus();
     renderSend();
+    renderSidebar();
     tick();
   } catch (err) {
     // The store is the source of truth; adopt whatever it now contains.
