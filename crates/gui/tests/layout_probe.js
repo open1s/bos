@@ -217,19 +217,37 @@
     // Measure the settled layout, not the animation: the transition would make
     // the rect depend on when the probe happens to look. The motion itself is not
     // measured here and is not claimed to be.
+    /* A drawer that opens without the list it exists for is the defect this probe
+       was blind to: it measured the box, and the box was right. Ask what the fold
+       was hiding, and ask whether honouring the request also armed a rail the window
+       cannot justify — the flag that used to outlive the window it was made in. */
+    const list = document.getElementById("session-list");
+    const listShown = () => !!list && getComputedStyle(list).display !== "none";
+    const armed = () =>
+      typeof Shell !== "undefined" && Shell.state ? !!Shell.state.sidebarCollapsed : null;
     const transition = sb.style.transition;
     sb.style.transition = "none";
     const before = sb.getBoundingClientRect();
+    const closedList = listShown();
+    const armedBefore = armed();
     toggle.click();
     const opened = sb.classList.contains("open");
+    const mode = document.getElementById("app").dataset.sidebar;
+    const openList = listShown();
     const after = sb.getBoundingClientRect();
     const expanded = toggle.getAttribute("aria-expanded");
+    /* Read the flag *between* the two clicks: a write that is a toggle returns to
+       where it started by the time it is closed again, so only the moment the drawer
+       is open can tell "honoured the request" from "armed a rail as well". */
+    const armedOpen = armed();
     toggle.click();
     const reclosed = sb.classList.contains("open");
+    const armedAfter = armed();
     sb.style.transition = transition;
-    return { present: true, opened, closedLeft: Math.round(before.left),
-             openLeft: Math.round(after.left), openWidth: Math.round(after.width),
-             expanded, reclosed };
+    return { present: true, opened, mode, closedList, openList,
+             closedLeft: Math.round(before.left), openLeft: Math.round(after.left),
+             openWidth: Math.round(after.width), expanded, reclosed,
+             armedBefore, armedOpen, armedAfter };
   }
   window.__layoutMeasure = function () { report(measure()); return measure(); };
   report(measure());

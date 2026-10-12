@@ -89,6 +89,17 @@
     Shell.toggleSidebar();
     check("rail collapses sidebar", px(app.style.getPropertyValue("--sidebar-w")) === 56);
     check("rail hides session list", css(document.getElementById("session-list"), "display") === "none");
+    /* The ☰ is the door out of a rail wherever the rail came from: at 721-1023px the
+       fold is the window's doing, and at 1440px it is the user's own — and in both the
+       button is the only way back. A max-width 720px rule hid it in exactly the band
+       where the column cannot be opened in flow, which is the corner that shipped and
+       had no way out of it (rev 120). */
+    check(
+      "a railed column keeps its ☰",
+      css(document.getElementById("sidebar-toggle"), "display") !== "none",
+      css(document.getElementById("sidebar-toggle"), "display"),
+    );
+    Shell.toggleSidebar();
 
     // --- theming, typography, presentation ---------------------------------
     Shell.setAppearance("light");

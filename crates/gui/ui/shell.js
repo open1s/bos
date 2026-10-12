@@ -113,6 +113,10 @@ const Shell = (() => {
     sidebar: SIDEBAR_DEFAULT,
     doc: 0, // 0 = derive from the ratio
     sidebarCollapsed: false,
+    /* Whether the folded column is let out over the centre. Transient on purpose:
+       it belongs to the window that cannot hold the column in flow, not to the
+       user's layout, so it is neither persisted nor restored. */
+    drawerOpen: false,
     docOpen: true,
     appearance: isOneOf(savedUi.appearance, APPEARANCES, "system"),
     fontSize: clamp(Number(savedUi.fontSize) || 14, 10, 22),
@@ -338,12 +342,24 @@ const Shell = (() => {
     }
     const showDoc = state.docOpen && width >= COMPACT_AT && geo.canShow;
     const collapse = state.sidebarCollapsed || width < COMPACT_AT;
+    /* A drawer is only ever a folded column, and only where the column cannot be in
+       flow: a window with room says what it means with the rail, so a flag left over
+       from a narrow window cannot resurrect an overlay on a wide one. */
+    if (width >= COMPACT_AT && state.drawerOpen) state.drawerOpen = false;
+    const drawer = state.drawerOpen && width < COMPACT_AT;
     app.dataset.doc = showDoc ? "open" : "closed";
-    app.dataset.sidebar = collapse ? "rail" : "expanded";
+    app.dataset.sidebar = drawer ? "drawer" : collapse ? "rail" : "expanded";
+    /* The drawer's visible state, written in one place: the class, the attribute and
+       the button's aria all describe the same fact, and one function owns all three. */
+    const sbEl = document.getElementById("sidebar");
+    if (sbEl) sbEl.classList.toggle("open", drawer);
     /* A column that is gone cannot still own the active surface. */
     if (activePanel === "document" && !showDoc) activePanel = null;
     app.dataset.panel = activePanelId();
-    app.style.setProperty("--sidebar-w", `${collapse ? SIDEBAR_RAIL : state.sidebar}px`);
+    app.style.setProperty(
+      "--sidebar-w",
+      `${drawer || !collapse ? state.sidebar : SIDEBAR_RAIL}px`,
+    );
     app.style.setProperty("--doc-w", `${showDoc ? geo.width : 0}px`);
     const left = document.getElementById("divider-left");
     const right = document.getElementById("divider-right");
@@ -364,8 +380,20 @@ const Shell = (() => {
     const docToggle = document.getElementById("doc-toggle");
     if (docToggle) docToggle.setAttribute("aria-pressed", String(showDoc));
     const railToggle = document.getElementById("sidebar-toggle");
-    if (railToggle) railToggle.setAttribute("aria-pressed", String(!collapse));
-    emit("layout", { sidebar: state.sidebar, doc: showDoc ? geo.width : 0, open: showDoc, collapse, tight: !geo.canShow });
+    if (railToggle) {
+      railToggle.setAttribute("aria-pressed", String(!collapse));
+      /* The ☰ is the drawer's control where there is a drawer and the rail's where
+         there is not, so it reports the one that is actually in play. */
+      railToggle.setAttribute("aria-expanded", String(drawer));
+    }
+    emit("layout", {
+      sidebar: state.sidebar,
+      doc: showDoc ? geo.width : 0,
+      open: showDoc,
+      collapse,
+      drawer,
+      tight: !geo.canShow,
+    });
   };
 
   const setSidebar = (px) => {
@@ -378,9 +406,26 @@ const Shell = (() => {
     persistLayout();
     applyLayout();
   };
+  /* One request — "show me the column" — answered two ways, because a window can
+     answer it two ways. With room, the column folds to the rail and back. Without
+     room (under COMPACT_AT) it cannot be in flow at all, so the same request lets it
+     out over the centre. Flipping the persisted rail flag there was the bug: the flag
+     outlives the window that justified it, so the strip followed the user to a wide
+     screen — and a rail hides the chat list, which left no way back to it (rev 120). */
   const toggleSidebar = () => {
-    state.sidebarCollapsed = !state.sidebarCollapsed;
-    persistLayout();
+    if (appWidth() < COMPACT_AT) {
+      state.drawerOpen = !state.drawerOpen;
+    } else {
+      state.sidebarCollapsed = !state.sidebarCollapsed;
+      state.drawerOpen = false;
+      persistLayout();
+    }
+    applyLayout();
+  };
+  /* Picking a chat is what the drawer was for: the list is the means, not the end. */
+  const closeDrawer = () => {
+    if (!state.drawerOpen) return;
+    state.drawerOpen = false;
     applyLayout();
   };
   const toggleDoc = () => {
@@ -1111,6 +1156,7 @@ const Shell = (() => {
     setSidebar,
     setDoc,
     toggleSidebar,
+    closeDrawer,
     toggleDoc,
     setLayoutScope,
     openDocument,

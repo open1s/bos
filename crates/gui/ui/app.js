@@ -6884,17 +6884,16 @@ $("session-view").addEventListener("click", (e) => {
 // Narrow windows turn the sidebar into a drawer (see the 720px rules): the
 // button opens it, and picking a chat closes it, because the point of that tap is
 // the chat rather than the list it came from.
-const sidebarToggle = $("sidebar-toggle");
+// The ☰ belongs to the shell now: it folds the column where there is room for that
+// and lets it out over the centre where there is not (Shell.toggleSidebar), and the
+// shell writes the class and the aria that describe it. A second handler here is
+// what made one click both open the drawer *and* arm a rail the user then could not
+// leave once the window widened (rev 120).
 const sidebarEl = $("sidebar");
-if (sidebarToggle && sidebarEl) {
-  const setDrawer = (open) => {
-    sidebarEl.classList.toggle("open", open);
-    sidebarToggle.setAttribute("aria-expanded", open ? "true" : "false");
-  };
-  sidebarToggle.addEventListener("click", () => setDrawer(!sidebarEl.classList.contains("open")));
+if (sidebarEl) {
   sidebarEl.addEventListener("click", (event) => {
     const row = event.target.closest ? event.target.closest(".session-row") : null;
-    if (row) setDrawer(false);
+    if (row) Shell.closeDrawer();
   });
 }
 

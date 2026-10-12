@@ -1932,30 +1932,45 @@ body.resizing #doc-panel { transition: none; }
   background: transparent; color: var(--dim); }
 .load-earlier:hover { color: var(--text); }
 
-/* Narrow windows: below this width the sidebar is not squeezed into the chat
-   area, it slides over it on purpose, and this button is the way back. A
-   squeezed sidebar keeps every element inside the viewport — which is why the
-   layout guard measures the box's width against its rows, not its overflow — and
-   leaves a chat list that cannot be read or clicked. */
+/* The ☰ is the door out of a folded column, and the *state* shows it, not a width:
+   at 721-1023px the column is a 56px rail whose chat list is hidden, and at any
+   width a manual rail is the user's own fold. Keying the button to a max-width hid
+   the only way back exactly where the column cannot be opened in flow, and the
+   layout guard asserted that absence, which is how the corner shipped (rev 120). */
 #sidebar-toggle { display: none; }
+[data-sidebar="rail"] #sidebar-toggle,
+[data-sidebar="drawer"] #sidebar-toggle { display: inline-flex; align-items: center; }
+
+@media (max-width: 1023px) {
+  /* `min-width: 0` lets main take the window, and clipping here stops the main's
+     min-content width from turning the whole app into something that can be panned
+     sideways — the guard caught exactly that when the drawer landed. */
+  #main { min-width: 0; }
+  #app { overflow-x: hidden; }
+  /* Below the breakpoint the closed column is parked off the left edge, and a parked
+     element is still scrollable area: without this, the whole app can be panned
+     sideways into empty space. The guard asks the browser to scroll rather than
+     reading `scrollWidth`, which is how this was found. */
+  html, body { overflow-x: clip; }
+  /* The drawer: the folded column let out over the centre, out of flow so the chat
+     is not squeezed and at full width so the list the rail hides can be read. It is
+     the same box in both narrow bands. */
+  [data-sidebar="drawer"] #sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0; width: 280px; max-width: 82vw;
+    z-index: 40; border-right: 1px solid var(--border-strong);
+  }
+}
+
+/* Below this width even the rail would leave too little chat to read, so the closed
+   column hangs off the left edge and slides in: it is not squeezed into the chat
+   area, it covers it on purpose, and the ☰ is the way back. */
 @media (max-width: 720px) {
-  #sidebar-toggle { display: inline-flex; align-items: center; }
   #sidebar {
     position: fixed; left: 0; top: 0; bottom: 0; width: 280px; max-width: 82vw;
     z-index: 40; transform: translateX(-101%); transition: transform .16s ease;
     border-right: 1px solid var(--border-strong);
   }
   #sidebar.open { transform: none; }
-  /* `min-width: 0` lets main take the window, and clipping here stops the
-     main's min-content width from turning the whole app into something that can
-     be panned sideways — the guard caught exactly that when the drawer landed. */
-  #main { min-width: 0; }
-  #app { overflow-x: hidden; }
-  /* The parked drawer hangs off the left edge, and a parked element is still
-     scrollable area: without this, the whole app can be panned sideways into
-     empty space. The guard asks the browser to scroll rather than reading
-     `scrollWidth`, which is how this was found. */
-  html, body { overflow-x: clip; }
 }
 
 /* Config-profile chips: a name is typed by clicking, never remembered. */

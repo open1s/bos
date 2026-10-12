@@ -69,12 +69,27 @@ PY
   echo "$line" | grep -q "scrolledX=0" || { echo "[layout]  WIDE: the window can be panned sideways"; fail=1; }
   echo "$line" | grep -q "offscreen=\[\]" || { echo "[layout]  WIDE: elements leave the viewport"; fail=1; }
   echo "$line" | grep -q "modalOutside=\[\]" || { echo "[layout]  WIDE: the settings modal leaves the viewport"; fail=1; }
-  if echo "$line" | grep -q "'present': True"; then
-    echo "$line" | grep -Eq "'opened': True, 'closedLeft': -[0-9]+, 'openLeft': 0, 'openWidth': 2[0-9][0-9], 'expanded': 'true', 'reclosed': False" \
-      || { echo "[layout]  WIDE: the drawer does not open, or does not close"; fail=1; }
-  fi
-  if [ "$(echo "$line" | sed -n 's/.*width=\([0-9]*\).*/\1/p')" -gt 720 ]; then
-    echo "$line" | grep -q "'present': False" || { echo "[layout]  WIDE: the drawer shows on a wide window"; fail=1; }
+  # The ☰ is shown by the layout *state*, not a width: at 721-1023px the column is a
+  # 56px rail whose chat list is hidden, so the door must be there and must bring the
+  # list back. Requiring its absence above 720px is what let that corner ship — the
+  # band that needed the door most was the one the guard forbade it in (rev 120).
+  W="$(echo "$line" | sed -n 's/.*width=\([0-9]*\).*/\1/p')"
+  if [ "$W" -gt 1023 ]; then
+    echo "$line" | grep -q "'present': False" || { echo "[layout]  WIDE: the ☰ must not be offered where the column has room to stay open"; fail=1; }
+  else
+    echo "$line" | grep -Eq "'present': True, 'opened': True, 'mode': 'drawer'" \
+      || { echo "[layout]  WIDE: the ☰ must be offered where the column folds, and must open it"; fail=1; }
+    echo "$line" | grep -q "'closedList': False" || { echo "[layout]  WIDE: a folded column at rest must not show a chat list it cannot fit"; fail=1; }
+    echo "$line" | grep -q "'openList': True" || { echo "[layout]  WIDE: the drawer must bring back the chat list it exists for"; fail=1; }
+    echo "$line" | grep -Eq "'openLeft': 0, 'openWidth': 2[0-9][0-9], 'expanded': 'true', 'reclosed': False" \
+      || { echo "[layout]  WIDE: the drawer does not open over the centre, or does not close"; fail=1; }
+    echo "$line" | grep -q "'armedBefore': False, 'armedOpen': False, 'armedAfter': False" \
+      || { echo "[layout]  WIDE: opening the drawer must not arm a rail the window cannot justify"; fail=1; }
+    if [ "$W" -le 720 ]; then
+      echo "$line" | grep -Eq "'closedLeft': -[0-9]+" || { echo "[layout]  WIDE: a parked drawer must hang off the left edge"; fail=1; }
+    else
+      echo "$line" | grep -q "'closedLeft': 0" || { echo "[layout]  WIDE: the rail must stay in flow above 720px"; fail=1; }
+    fi
   fi
   echo "$line" | grep -q "sidebarSqueezed=False" || { echo "[layout]  WIDE: the chat list is squeezed into an unreadable box"; fail=1; }
   echo "$line" | grep -q "painted=\[\]" || { echo "[layout]  WIDE: something in the UI paints a shadow, a blur or a gradient"; fail=1; }
