@@ -45,7 +45,7 @@
     check("pane toggles mounted", !!document.getElementById("sidebar-toggle") && !!document.getElementById("doc-toggle"));
     check("sidebar expanded at 1440px", app.dataset.sidebar === "expanded", app.dataset.sidebar);
     check("doc panel open at 1440px", app.dataset.doc === "open");
-    check("default sidebar 280px", px(app.style.getPropertyValue("--sidebar-w")) === 280, app.style.getPropertyValue("--sidebar-w"));
+    check("default sidebar 348px", px(app.style.getPropertyValue("--sidebar-w")) === 348, app.style.getPropertyValue("--sidebar-w"));
 
     // --- clamping ----------------------------------------------------------
     Shell.setSidebar(9999);
@@ -183,7 +183,7 @@
     };
     Shell.setSidebar(320);
     Shell.setLayoutScope("/ws/a");
-    check("scope swap adopts defaults", Shell.state.sidebar === 280 && Shell.state.docOpen === true, Shell.state.sidebar);
+    check("scope swap adopts defaults", Shell.state.sidebar === 348 && Shell.state.docOpen === true, Shell.state.sidebar);
     Shell.setSidebar(360);
     Shell.toggleDoc();
     check(
@@ -191,7 +191,7 @@
       JSON.parse(Shell.storage.get("bos.layout.v1:/ws/a") || "null").sidebar === 360,
     );
     Shell.setLayoutScope("/ws/b");
-    check("second workspace starts at defaults", Shell.state.sidebar === 280 && Shell.state.docOpen === true);
+    check("second workspace starts at defaults", Shell.state.sidebar === 348 && Shell.state.docOpen === true);
     Shell.setLayoutScope("/ws/a");
     check("returning restores that workspace", Shell.state.sidebar === 360 && Shell.state.docOpen === false);
     Shell.setLayoutScope("/ws/a");

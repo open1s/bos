@@ -164,14 +164,18 @@
       return { row, head: h };
     };
     const during = workingRows();
+    const liveChip = during ? during.row.querySelector(".row-live") : null;
     assert(
-      `working: the streaming chat and its workspace row read as working (${
+      `working: the streaming chat and its workspace row read as working, and the row says so in words (chip="${liveChip ? liveChip.textContent : "none"}", i18n=${liveChip ? liveChip.getAttribute("data-i18n") : "none"}) (${
         during ? during.row.className + " / " + (during.head ? during.head.className : "no head") : "no working row"
       })`,
       !!during &&
         !!during.head &&
         during.head.classList.contains("working") &&
-        !!during.row.querySelector(".sess-mark.live"),
+        !!during.row.querySelector(".sess-mark.live") &&
+        !!liveChip &&
+        /^(Running|进行中)$/.test(liveChip.textContent) &&
+        liveChip.getAttribute("data-i18n") === "row.running",
     );
     type("queued follow-up");
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
@@ -200,10 +204,57 @@
     );
     assert("working: a settled chat stops reading as working", !workingRows());
 
+    /* ---- H2: the clock the reference shows while a turn is in flight ------- */
+    const streamLine = () => d.getElementById("stream-line");
+    assert(
+      `H2: an idle chat draws no deep-diving line (hidden=${streamLine().classList.contains("hidden")}, timers=${window.__streamLineTimers()})`,
+      streamLine().classList.contains("hidden") && window.__streamLineTimers() === 0,
+    );
+    type("slow clock please");
+    sendBtn.click();
+    await waitFor(() => sendBtn.classList.contains("stop"), "the clocked turn to start");
+    await waitFor(
+      () =>
+        !streamLine().classList.contains("hidden") &&
+        /Deep diving for/.test(streamLine().textContent),
+      "the deep-diving line to appear while the turn streams",
+    );
+    assert(
+      `H2: the line states the turn it belongs to, and owns one interval (text="${streamLine().textContent}", timers=${window.__streamLineTimers()})`,
+      /^Deep diving for \d+s ···$/.test(streamLine().textContent) &&
+        window.__streamLineTimers() === 1,
+    );
+    const workingBadge = () => d.getElementById("working-badge");
+    assert(
+      `W1: the badge names the working chat while it streams (hidden=${workingBadge().classList.contains("hidden")}, state="${d.getElementById("working-state").textContent}")`,
+      !workingBadge().classList.contains("hidden") &&
+        d.getElementById("working-state").textContent.trim() === "Working",
+    );
+    d.getElementById("working-close").click();
+    assert(
+      `W1: ✕ hides the card and leaves the turn running (hidden=${workingBadge().classList.contains("hidden")}, stillStreaming=${sendBtn.classList.contains("stop")})`,
+      workingBadge().classList.contains("hidden") && sendBtn.classList.contains("stop"),
+    );
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the clocked turn to finish");
+    assert(
+      `H2: the line leaves with the turn and takes its interval along (hidden=${streamLine().classList.contains("hidden")}, timers=${window.__streamLineTimers()})`,
+      streamLine().classList.contains("hidden") && window.__streamLineTimers() === 0,
+    );
+
     /* ---- stop: cancelling mid-stream settles the turn ------------------ */
     type("slow again");
     sendBtn.click();
     await waitFor(() => sendBtn.classList.contains("stop"), "the second slow turn to start");
+    // The badge was hidden for the *previous* stream only, so nothing the reader
+    // does brings it back here: the next turn's own first event must.
+    await waitFor(
+      () => !workingBadge().classList.contains("hidden"),
+      "the next turn to bring the badge back by itself",
+    );
+    assert(
+      `W1: the next turn brings the badge back by itself (hidden=${workingBadge().classList.contains("hidden")})`,
+      !workingBadge().classList.contains("hidden"),
+    );
     sendBtn.click(); // the button is now Stop
     await waitFor(() => LIVE.called("stop_streaming").length === 1, "stop_streaming to fire");
     assert(
@@ -217,6 +268,10 @@
     assert(
       "stop: the partial text stays on screen and the composer is free again",
       /chunk 0/.test(messagesText()) && !sendBtn.classList.contains("stop"),
+    );
+    assert(
+      `W1: stopping clears the badge (hidden=${workingBadge().classList.contains("hidden")})`,
+      workingBadge().classList.contains("hidden"),
     );
     await waitFor(
       () => !LIVE.lastArgs("send_message") ||
@@ -861,6 +916,44 @@
         insightRow("goal") === "active · 3/12",
     );
 
+    /* G1: the bar is the goal's persistent entry — the same value the card paints,
+       one row above the composer, with the card still owning every action. */
+    const goalBar = d.getElementById("goal-bar");
+    const goalBarObjective = d.getElementById("goal-bar-objective");
+    assert(
+      `G1: the bar shows the goal the card holds, not a second copy of it (hidden=${goalBar.classList.contains("hidden")}, text="${goalBarObjective.textContent}")`,
+      !goalBar.classList.contains("hidden") &&
+        goalBarObjective.textContent === "ship the streaming harness",
+    );
+    /* The bar's buttons are doors onto the card's own controls. The card is painted
+       on screen whenever a goal exists, so "the card is open" cannot distinguish a
+       click; the *editor form* can — it starts closed and only the card's own ✎ opens
+       it. So the precondition is the form, and it is asserted rather than assumed. */
+    const goalForm = d.getElementById("goal-form");
+    if (!goalForm.classList.contains("hidden")) {
+      d.getElementById("goal-cancel").click();
+      await waitFor(
+        () => goalForm.classList.contains("hidden"),
+        "the card's editor to close",
+      );
+    }
+    assert(
+      `G1: the card's editor is closed before the bar's ✎ is clicked (form=${goalForm.classList.contains("hidden")})`,
+      goalForm.classList.contains("hidden"),
+    );
+    d.getElementById("goal-bar-edit").click();
+    await waitFor(
+      () => !goalForm.classList.contains("hidden"),
+      "the bar's ✎ to open the card's own editor",
+    );
+    assert(
+      `G1: ✎ opens the card's own editor rather than one of its own (form=${!goalForm.classList.contains("hidden")})`,
+      !goalForm.classList.contains("hidden"),
+    );
+    // ⓘ is left unchecked on purpose: with a goal, the card is on screen either way,
+    // so a click on it cannot be distinguished here. A check that cannot fail is
+    // worse than a documented gap — the details view itself is M11's.
+
     d.getElementById("insight-evaluate").click();
     await waitFor(() => LIVE.called("evaluate_transcript").length === 1, "the score to be asked for");
     await waitFor(
@@ -1044,7 +1137,7 @@
     const footText = foots.length ? foots[0].textContent : "";
     assert(
       `a turn that finished through stream-finished states its duration (${footText})`,
-      foots.length >= 1 && /^Completed in \d+(m \d+)?s$/.test(footText),
+      foots.length >= 1 && /^Completed\d+(m \d+)?s$/.test(footText),
     );
     const answerRows = d.querySelectorAll("#messages .msg.assistant");
     assert(
@@ -1239,6 +1332,94 @@
         /4 of 12/.test(d.getElementById("goal-rounds").textContent),
     );
 
+    /* T5: how a turn ended is on the foot, in words, ahead of its duration. The
+       streaming half belongs to the page layer; what only this layer can show is the
+       two states a *finish* writes — and that a stop is inferred from the button,
+       because the backend does not report yet how a turn ended (§5.3). */
+    const footChip = () => {
+      const foot = [...d.querySelectorAll("#messages .turn-foot")].pop();
+      return foot ? foot.querySelector(".turn-state") : null;
+    };
+    // A foot is only drawn under lastAssistant, and a streaming draft row is not that,
+    // so the state word for a turn in flight belongs on the stream row — which is what
+    // the transcript's foot is mid-turn. This layer is the only one that can see it.
+    const streamChip = () => {
+      const row = d.getElementById("stream-foot");
+      return row && !row.classList.contains("hidden") ? row.querySelector(".turn-state") : null;
+    };
+    type("t5 normal finish");
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await waitFor(() => !!streamChip(), "the streaming state chip to appear");
+    assert(
+      `T5: a turn in flight says Running on the stream row (chip="${streamChip() ? streamChip().textContent : "none"}", i18n=${streamChip() ? streamChip().getAttribute("data-i18n") : "none"})`,
+      !!streamChip() &&
+        streamChip().textContent === "Running" &&
+        streamChip().getAttribute("data-i18n") === "turn.running",
+    );
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the T5 turn to finish");
+    repaint();
+    await waitFor(
+      () => !!footChip() && footChip().textContent === "Completed",
+      "the foot to say Completed",
+    );
+    const doneChip = footChip();
+    assert(
+      `T5: a finished turn's foot says Completed ahead of its duration (chip="${doneChip.textContent}", next="${doneChip.nextElementSibling && doneChip.nextElementSibling.className}", i18n=${doneChip.getAttribute("data-i18n")})`,
+      doneChip.textContent === "Completed" &&
+        doneChip.getAttribute("data-i18n") === "turn.state.completed" &&
+        !!doneChip.nextElementSibling &&
+        doneChip.nextElementSibling.classList.contains("turn-duration"),
+    );
+    type("t5 stopped turn");
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await waitFor(() => sendBtn.classList.contains("stop"), "the T5 stop turn to stream");
+    sendBtn.click();
+    await waitFor(() => (footChip() || {}).textContent === "Stopped", "the foot to say Stopped");
+    const haltChip = footChip();
+    assert(
+      `T5: a turn the stop button ended says Stopped and admits why it knows (chip="${haltChip.textContent}", title="${haltChip.title.slice(0, 44)}")`,
+      haltChip.textContent === "Stopped" &&
+        haltChip.getAttribute("data-i18n") === "turn.stopped" &&
+        /^Stopped for this turn/.test(haltChip.title),
+    );
+
+  /* G1's 🗑, right after the only checks that use the goal, and inside the try on purpose: it clears the session's
+     goal, so every check that runs against the goal must already have run — the
+     hygiene asserts above are the only checks after it, and they do not touch the
+     goal. #goal-delete calls saveGoal("", null), which invokes set_goal with an empty
+     objective and the backend reads that as "delete": there is no confirmation dialog
+     on this path, so the claim is the call itself rather than a dialog step. */
+  {
+    const goalBarEl = d.getElementById("goal-bar");
+    const goalFormEl = d.getElementById("goal-form");
+    // The card disables its action buttons while its form is up, and a disabled
+    // button dispatches no click, so the delegated 🗑 needs the form closed first.
+    if (!goalFormEl.classList.contains("hidden")) {
+      d.getElementById("goal-cancel").click();
+      await waitFor(
+        () => goalFormEl.classList.contains("hidden"),
+        "the card's editor to close before 🗑",
+      );
+    }
+    assert(
+      `G1: the card is not in edit mode before 🗑 (form=${goalFormEl.classList.contains("hidden")}, deleteDisabled=${d.getElementById("goal-delete").disabled})`,
+      goalFormEl.classList.contains("hidden") && !d.getElementById("goal-delete").disabled,
+    );
+    const setGoalBefore = LIVE.called("set_goal").length;
+    d.getElementById("goal-bar-clear").click();
+    await waitFor(
+      () => LIVE.called("set_goal").length > setGoalBefore,
+      "the bar's 🗑 to reach the card's delete path",
+    );
+    repaint();
+    const clearArgs = LIVE.lastArgs("set_goal") || {};
+    assert(
+      `G1: 🗑 lands on the card's own delete call and the bar goes with the goal (objective=${JSON.stringify(clearArgs.objective)}, calls=${LIVE.called("set_goal").length - setGoalBefore}, barHidden=${goalBarEl.classList.contains("hidden")})`,
+      LIVE.called("set_goal").length === setGoalBefore + 1 &&
+        clearArgs.objective === "" &&
+        goalBarEl.classList.contains("hidden"),
+    );
+  }
     /* ---- settings: live read, live write, live memories, MCP line ------ */
     const modal = d.getElementById("settings-modal");
     const setModel = d.getElementById("set-model");
@@ -2366,6 +2547,7 @@
       false,
     );
   }
+
   const pre = d.createElement("pre");
   pre.id = "result";
   pre.textContent = JSON.stringify(R);

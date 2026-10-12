@@ -74,7 +74,8 @@ window.addEventListener("error", (e) => {
         "set-files", "set-instructions", "set-memory", "set-memory-path",
         "set-model", "set-skills-dir", "set-system", "set-temperature",
         "set-workspace", "settings-cancel", "settings-form", "settings-modal",
-        "status-left", "status-right", "stream-chip",
+        "status-left", "status-right", "stream-chip", "stream-line",
+        "working-badge", "working-close", "working-state", "working-stop", "working-title",
         "term-kill", "term-open", "workspace-add-primary",
       ];
       const root = document.getElementById("root");
@@ -2472,6 +2473,90 @@ window.addEventListener("error", (e) => {
             .join(",") === "6,4"
             ? "PASS"
             : "FAIL (archived list)";
+
+        // ---- 26. H2: the deep-diving clock lives as long as the turn does ---
+        {
+          const line = document.getElementById("stream-line");
+          R.streamLineIdle = renderStreamLine() ?? window.__streamLineTimers();
+          assert(
+            `H2: an idle chat leaves the line hidden and owns no interval (hidden=${line.classList.contains("hidden")}, timers=${window.__streamLineTimers()})`,
+            line.classList.contains("hidden") && window.__streamLineTimers() === 0,
+          );
+          const h2PrevActive = state.activeId;
+          state.activeId = "h2";
+          state.streams = state.streams || {};
+          state.streams.h2 = { session_id: "h2", gen: 1 };
+          state.turnStarted = state.turnStarted || {};
+          state.turnStarted.h2 = Date.now() - 78000;
+          renderStreamLine();
+          assert(
+            `H2: a streaming turn draws the clock with that turn's own elapsed time (text="${line.textContent}", timers=${window.__streamLineTimers()})`,
+            !line.classList.contains("hidden") &&
+              line.textContent === "Deep diving for 1m 18s ···" &&
+              window.__streamLineTimers() === 1,
+          );
+          renderStreamLine();
+          renderStreamLine();
+          assert(
+            `H2: repainting while streaming keeps exactly one interval (timers=${window.__streamLineTimers()})`,
+            window.__streamLineTimers() === 1,
+          );
+          delete state.streams.h2;
+          renderStreamLine();
+          assert(
+            `H2: the turn's end takes the clock and its interval with it (hidden=${line.classList.contains("hidden")}, timers=${window.__streamLineTimers()})`,
+            line.classList.contains("hidden") && window.__streamLineTimers() === 0,
+          );
+          state.activeId = h2PrevActive;
+        }
+
+        // ---- 27. W1: the floating Working badge -----------------------------
+        {
+          const badge = document.getElementById("working-badge");
+          const stateText = document.getElementById("working-state");
+          const prevActive = state.activeId;
+          state.activeId = "w1";
+          state.sessions = [{ id: "w1", title: "A chat whose title is long enough to clip at thirty" }];
+          state.streams = state.streams || {};
+          state.streams.w1 = { session_id: "w1", gen: 1 };
+          renderWorkingBadge();
+          R.w1BadgeVisible = !badge.classList.contains("hidden");
+          assert(
+            `W1: a streaming chat shows the badge with its name and "Working" (hidden=${badge.classList.contains("hidden")}, title="${document.getElementById("working-title").textContent}", state="${stateText.textContent}")`,
+            !badge.classList.contains("hidden") &&
+              document.getElementById("working-title").textContent.length === 30 &&
+              document.getElementById("working-title").textContent.endsWith("…"),
+          );
+          // The copy itself is the shipped markup's (`data-i18n="working.badge"`);
+          // this fixture mounts bare hosts, so the live guard reads the real word.
+          assert(
+            `W1: the badge's state line belongs to the shipped markup, not to this fixture (text="${stateText.textContent}")`,
+            stateText.textContent === "",
+          );
+          // ✕ hides this stream's card and only this one: the dismissal is keyed by
+          // the stream's gen, so the next turn's badge needs no flag cleared.
+          document.getElementById("working-close").click();
+          R.w1DismissedHidden = badge.classList.contains("hidden");
+          assert(
+            `W1: ✕ hides the badge for this stream only (hidden=${badge.classList.contains("hidden")}, dismissed=${JSON.stringify(window.__workingDismissed())})`,
+            badge.classList.contains("hidden") &&
+              window.__workingDismissed() &&
+              window.__workingDismissed().gen === 1,
+          );
+          state.streams.w1 = { session_id: "w1", gen: 2 }; // the next turn
+          renderWorkingBadge();
+          assert(
+            `W1: the next turn brings it back without a flag being cleared (hidden=${badge.classList.contains("hidden")}, gen=${state.streams.w1.gen})`,
+            !badge.classList.contains("hidden"),
+          );
+          delete state.streams.w1;
+          renderWorkingBadge();
+          assert(
+            `W1: a settled chat draws no badge (hidden=${badge.classList.contains("hidden")})`,
+            badge.classList.contains("hidden"),
+          );
+          state.activeId = prevActive;
+        }
 
         R.failures = Object.values(R.checks).filter((v) => v.startsWith("FAIL")).length;
         const pre = document.createElement("pre");

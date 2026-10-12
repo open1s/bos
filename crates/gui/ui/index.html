@@ -17,6 +17,15 @@
           <span class="brand-word">BOS</span>
           <span class="brand-pill" data-i18n="brand.pill">HARNESS</span>
         </span>
+        <button id="side-new-session" class="side-new" type="button" disabled
+                data-i18n-aria="side.newSession"
+                data-i18n-title="side.newSession" aria-label="New Session" title="New Session">
+          <svg class="ico" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false">
+            <circle cx="8" cy="8" r="6.4" fill="none" stroke="currentColor" stroke-width="1.3" />
+            <path d="M8 5.3v5.4M5.3 8h5.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+          </svg>
+          <span data-i18n="side.newSession">New Session</span>
+        </button>
       </div>
       <div class="side-section" id="side-workspaces">
         <div class="side-section-head">
@@ -36,7 +45,13 @@
         <input id="session-search" class="session-search" type="search"
                data-i18n-placeholder="search.placeholder" data-i18n-aria="search.aria"
                placeholder="Search chats…" aria-label="Search chats" spellcheck="false" hidden />
-        <div id="session-list" class="session-list"></div>
+        <div
+          id="session-list"
+          class="session-list"
+          role="tree"
+          aria-label="Sessions"
+          data-i18n-aria="side.sessionsTree"
+        ></div>
       </div>
       <div class="sidebar-foot">
         <div class="side-user">
@@ -69,9 +84,33 @@
           <button type="button" id="tab-chat" class="center-tab active" role="tab" aria-selected="true" aria-controls="messages" tabindex="0" data-i18n="tab.chat">Chat</button>
           <button type="button" id="tab-trajectory" class="center-tab" role="tab" aria-selected="false" aria-controls="trajectory" tabindex="-1" data-i18n="tab.trajectory">Trajectory</button>
         </div>
+
+      <div id="working-badge" class="working-badge hidden" role="status" aria-live="polite">
+        <button type="button" id="working-close" class="working-btn" data-i18n-aria="working.closeAria" data-i18n-title="working.closeAria" aria-label="Hide the working badge" title="Hide the working badge">✕</button>
+        <span class="working-text">
+          <span id="working-title" class="working-title"></span>
+          <span id="working-state" class="working-state" data-i18n="working.badge">Working</span>
+        </span>
+        <button type="button" id="working-stop" class="working-btn" data-i18n-aria="working.stopAria" data-i18n-title="working.stopAria" aria-label="Stop generating" title="Stop generating"><svg class="ico" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor"/></svg></button>
+      </div>
       </header>
 
       <div id="messages" role="tabpanel" aria-labelledby="tab-chat" tabindex="0"></div>
+
+      <div id="stream-foot" class="stream-foot hidden">
+        <span class="turn-state turn-state-running" data-i18n="turn.running">Running</span>
+        <div id="stream-line" class="stream-line" role="status" aria-live="polite"></div>
+      </div>
+
+      <div id="goal-bar" class="goal-bar hidden" role="region" data-i18n-aria="goal.barAria" aria-label="Ongoing Goal">
+        <span class="goal-bar-mark" aria-hidden="true">◎</span>
+        <span class="goal-bar-label" data-i18n="goal.barLabel">Ongoing Goal</span>
+        <button type="button" id="goal-bar-objective" class="goal-bar-objective"></button>
+        <span class="goal-bar-gap"></span>
+        <button type="button" id="goal-bar-info" class="goal-bar-btn" data-i18n-aria="goal.infoAria" data-i18n-title="goal.infoAria" aria-label="Goal details" title="Goal details">ⓘ</button>
+        <button type="button" id="goal-bar-edit" class="goal-bar-btn" data-i18n-aria="goal.editAria" data-i18n-title="goal.editAria" aria-label="Edit the goal" title="Edit the goal">✎</button>
+        <button type="button" id="goal-bar-clear" class="goal-bar-btn" data-i18n-aria="goal.clearAria" data-i18n-title="goal.clearAria" aria-label="Clear the goal" title="Clear the goal">🗑</button>
+      </div>
 
       <section id="trajectory" class="hidden" role="tabpanel" aria-labelledby="tab-trajectory" tabindex="0"></section>
 

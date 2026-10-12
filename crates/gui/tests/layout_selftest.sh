@@ -86,7 +86,7 @@ PY
       || { echo "[layout]  WIDE: the ☰ must be offered where the column folds, and must open it"; fail=1; }
     echo "$line" | grep -q "'closedList': False" || { echo "[layout]  WIDE: a folded column at rest must not show a chat list it cannot fit"; fail=1; }
     echo "$line" | grep -q "'openList': True" || { echo "[layout]  WIDE: the drawer must bring back the chat list it exists for"; fail=1; }
-    echo "$line" | grep -Eq "'openLeft': 0, 'openWidth': 2[0-9][0-9], 'expanded': 'true', 'reclosed': False" \
+    echo "$line" | grep -Eq "'openLeft': 0, 'openWidth': 3[0-9][0-9], 'expanded': 'true', 'reclosed': False" \
       || { echo "[layout]  WIDE: the drawer does not open over the centre, or does not close"; fail=1; }
     echo "$line" | grep -q "'armedBefore': False, 'armedOpen': False, 'armedAfter': False" \
       || { echo "[layout]  WIDE: opening the drawer must not arm a rail the window cannot justify"; fail=1; }
@@ -109,6 +109,64 @@ PY
   echo "$attach" | grep -q '"stripBackAfterPalette": true' || { echo "[layout]  WIDE: the attach strip does not come back after the palette closes"; fail=1; }
   echo "$attach" | grep -q '"chipsAfterRemove": 1' || { echo "[layout]  WIDE: the chip's remove control does not remove its own chip"; fail=1; }
   echo "$attach" | grep -q '"hiddenWhenEmpty": true' || { echo "[layout]  WIDE: the empty strip must hide and disable Send again"; fail=1; }
+  tok="$(python3 - "$DOM" <<'PY'
+import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r'<[a-zA-Z]+[^>]*\bid="result-tokens"[^>]*>(.*?)</[a-zA-Z]+>', raw, re.S)
+if not m:
+    print("tokens=missing")
+    raise SystemExit
+print("tokens=" + json.dumps(json.loads(m.group(1))))
+PY
+)"
+  echo "[layout] $tok"
+  # §3B.6/§3B.7 — the measured reference numbers. Each one names itself, so a
+  # drift says which value moved rather than that "the tokens changed".
+  echo "$tok" | grep -q '"accent": "#4176e6"' || { echo "[layout]  §3B: accent is not #4176e6"; fail=1; }
+  echo "$tok" | grep -q '"sidebarBg": "#e8e9eb"' || { echo "[layout]  §3B: the sidebar background is not #e8e9eb"; fail=1; }
+  echo "$tok" | grep -q '"selected": "#dddee1"' || { echo "[layout]  §3B: a selected row is not #dddee1"; fail=1; }
+  echo "$tok" | grep -q '"text": "#0f1115"' || { echo "[layout]  §3B: primary text is not #0f1115"; fail=1; }
+  echo "$tok" | grep -q '"dim": "#6b7280"' || { echo "[layout]  §3B: muted text is not #6b7280"; fail=1; }
+  echo "$tok" | grep -q '"tokenSidebarW": 348' || { echo "[layout]  §3B: the sidebar token is not 348px"; fail=1; }
+  echo "$tok" | grep -q '"rowH": 44' || { echo "[layout]  §3B: a session row is not on a 44px pitch"; fail=1; }
+  echo "$tok" | grep -q '"rowFont": 15' || { echo "[layout]  §3B: a session row does not read at 15px"; fail=1; }
+  echo "$tok" | grep -q '"sidebarFont": 15' || { echo "[layout]  §3B: the sidebar does not inherit the 15px row type"; fail=1; }
+  # W1 — the badge's top is stated as 200px below the tab divider, so the check
+  # states that *difference*: a head that changes height moves the badge with it.
+  badge="$(python3 - "$DOM" <<'PY'
+import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r'<[a-zA-Z]+[^>]*\bid="result-tokens"[^>]*>(.*?)</[a-zA-Z]+>', raw, re.S)
+t = json.loads(m.group(1))
+out = []
+if t.get("badgeW") is None or abs(t["badgeW"] - 265) > 2:
+    out.append(f"the working badge is not 265px wide (w={t.get('badgeW')})")
+if t.get("badgeRightInset") is None or abs(t["badgeRightInset"] - 27) > 2:
+    out.append(f"the working badge is not 27px from the column's right edge (inset={t.get('badgeRightInset')})")
+if t.get("badgeTop") is None or t.get("headH") is None or abs((t["badgeTop"] - t["headH"]) - 200) > 2:
+    out.append(f"the working badge is not 200px below the tab divider (top={t.get('badgeTop')}, headH={t.get('headH')})")
+print("\n".join(out))
+PY
+)"
+  if [ -n "$badge" ]; then echo "$badge" | while IFS= read -r l; do echo "[layout]  §3B: $l"; done; fail=1; fi
+  # C1b — the send circle: 42×42, 16 from the composer's right edge, 12 from its
+  # bottom. Its numbers are named so a drift says which one moved.
+  send="$(python3 - "$DOM" <<'PY'
+import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r'<[a-zA-Z]+[^>]*\bid="result-tokens"[^>]*>(.*?)</[a-zA-Z]+>', raw, re.S)
+t = json.loads(m.group(1))
+out = []
+if t.get("sendW") != 42 or t.get("sendH") != 42:
+    out.append(f"the send button is not a 42x42 circle (w={t.get('sendW')}, h={t.get('sendH')})")
+if t.get("sendRightInset") is None or abs(t["sendRightInset"] - 16) > 2:
+    out.append(f"the send button is not 16px from the composer's right edge (inset={t.get('sendRightInset')})")
+if t.get("sendBottomInset") is None or abs(t["sendBottomInset"] - 12) > 2:
+    out.append(f"the send button is not 12px from the composer's bottom (inset={t.get('sendBottomInset')})")
+print("\n".join(out))
+PY
+)"
+  if [ -n "$send" ]; then echo "$send" | while IFS= read -r l; do echo "[layout]  §3B: $l"; done; fail=1; fi
   doc="$(python3 - "$DOM" <<'PY'
 import json, re, sys
 raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()

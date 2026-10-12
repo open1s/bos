@@ -1883,6 +1883,42 @@
       h.querySelector(".ws-fold").click();
       await flush();
     };
+    // S3: the sidebar is one tree. A workspace row is a level-1 branch that reports
+    // whether its chats are showing — the fold button carries the same state, so the
+    // two cannot drift — and a chat is a level-2 leaf that says when it is the open one.
+    const sessionsTree = d.getElementById("session-list");
+    assert(
+      `S3: the session list is a tree of workspace branches (role="${sessionsTree.getAttribute("role")}", label="${sessionsTree.getAttribute("aria-label")}", heads=${wshHeads.length}, allLevel1=${wshHeads.every((h) => h.getAttribute("role") === "treeitem" && h.getAttribute("aria-level") === "1")})`,
+      sessionsTree.getAttribute("role") === "tree" &&
+        sessionsTree.getAttribute("aria-label") === "Sessions" &&
+        wshHeads.length >= 2 &&
+        wshHeads.every(
+          (h) => h.getAttribute("role") === "treeitem" && h.getAttribute("aria-level") === "1",
+        ),
+    );
+    const foldOf = () =>
+      [...d.querySelectorAll("#session-list .ws-head")].find((h) => h.querySelector(".ws-fold"));
+    const wasExpanded = foldOf().getAttribute("aria-expanded");
+    foldOf().querySelector(".ws-fold").click();
+    await flush();
+    const nowExpanded = foldOf().getAttribute("aria-expanded");
+    foldOf().querySelector(".ws-fold").click();
+    await flush();
+    assert(
+      `S3: the fold reports the branch's state and flips with it (${wasExpanded} -> ${nowExpanded} -> ${foldOf().getAttribute("aria-expanded")})`,
+      (wasExpanded === "true" || wasExpanded === "false") &&
+        nowExpanded === (wasExpanded === "true" ? "false" : "true") &&
+        foldOf().getAttribute("aria-expanded") === wasExpanded,
+    );
+    const leaves = [...d.querySelectorAll("#session-list .session-row")];
+    const opened = leaves.find((r) => r.classList.contains("active"));
+    assert(
+      `S3: chats are level-2 leaves of the same tree (rows=${leaves.length}, allLevel2=${leaves.every((r) => r.getAttribute("role") === "treeitem" && r.getAttribute("aria-level") === "2")}, openRowSelected=${opened ? opened.getAttribute("aria-selected") : "no open row"})`,
+      leaves.length > 0 &&
+        leaves.every((r) => r.getAttribute("role") === "treeitem" && r.getAttribute("aria-level") === "2") &&
+        (!opened || opened.getAttribute("aria-selected") === "true"),
+    );
+
     const arrowOpen = dOf();
     await flipFold();
     const arrowShut = dOf();
@@ -1907,19 +1943,24 @@
       return n;
     };
     const liveHead = headOf(liveRow);
+    const liveRowChip = liveRow.querySelector(".row-live");
     assert(
       `a streaming chat and its workspace row both read as working (${liveRow.className} / ${liveHead ? liveHead.className : "no head"})`,
       liveRow.classList.contains("working") &&
         !!liveRow.querySelector(".sess-mark.live") &&
+        !!liveRowChip &&
+        liveRowChip.getAttribute("data-i18n") === "row.running" &&
+        /^(Running|进行中)$/.test(liveRowChip.textContent) &&
         !!liveHead &&
         liveHead.classList.contains("working"),
     );
     delete state.streams[liveId];
     renderAll();
     assert(
-      "a finished chat stops reading as working",
+      "a finished chat stops reading as working and drops its word",
       !d.querySelector("#session-list .session-row.working") &&
-        !d.querySelector("#session-list .ws-head.working"),
+        !d.querySelector("#session-list .ws-head.working") &&
+        !d.querySelector("#session-list .row-live"),
     );
 
     const wsMenuBtn = d.querySelector("#session-list .ws-menu");
@@ -2278,6 +2319,63 @@
     d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
     await flush();
 
+    // C1a: the leading control is a popup, and its three items are the three gestures —
+    // the dialog it used to open directly, and the two key characters the composer
+    // already answers to. The menu is the same dispatcher the workspace row uses.
+    const composerBeforeC1a = d.getElementById("input").value;
+    const setComposer = (v) => {
+      d.getElementById("input").value = v;
+      d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    setComposer("");
+    await flush();
+    const attachInput = d.getElementById("attach-file");
+    let attachClicks = 0;
+    attachInput.click = () => {
+      attachClicks += 1;
+    };
+    const openAttachMenu = async () => {
+      d.getElementById("attach-btn").click();
+      await flush();
+      return [...d.querySelectorAll(".row-menu .row-menu-item")];
+    };
+    const attachItems = await openAttachMenu();
+    assert(
+      `C1a: the ⊕ is a popup carrying the three documented items (runs=${attachItems.map((b) => b.dataset.run).join(",")}, haspopup=${d.getElementById("attach-btn").getAttribute("aria-haspopup")})`,
+      !!d.querySelector('.row-menu[role="menu"]') &&
+        attachItems.length === 3 &&
+        attachItems.map((b) => b.dataset.run).join(",") === "attach,mention,commands" &&
+        d.getElementById("attach-btn").getAttribute("aria-haspopup") === "menu",
+    );
+    attachItems[0].click();
+    await flush();
+    assert(
+      `C1a: "Attach images…" opens the hidden input the button used to open itself (clicks=${attachClicks}, menuClosed=${!d.querySelector(".row-menu")})`,
+      attachClicks === 1 && !d.querySelector(".row-menu"),
+    );
+    const mentionItems = await openAttachMenu();
+    mentionItems[1].click();
+    await flush();
+    // The picker answers a bare "@" the same way the palette answers a bare "/": the
+    // gesture the item performs has to reach the picker, or the item is just typing.
+    assert(
+      `C1a: "Mention a file" types the @ the mention picker answers to (value=${JSON.stringify(d.getElementById("input").value)}, pickerOpen=${!d.getElementById("mention-pop").classList.contains("hidden")})`,
+      d.getElementById("input").value === "@" &&
+        !d.getElementById("mention-pop").classList.contains("hidden"),
+    );
+    setComposer("");
+    await flush();
+    const commandItems = await openAttachMenu();
+    commandItems[2].click();
+    await flush();
+    assert(
+      `C1a: "Commands & skills" types the / the palette answers to (value=${JSON.stringify(d.getElementById("input").value)}, palette=${!d.getElementById("cmd-palette").classList.contains("hidden")})`,
+      d.getElementById("input").value === "/" &&
+        !d.getElementById("cmd-palette").classList.contains("hidden"),
+    );
+    setComposer(composerBeforeC1a);
+    await flush();
+
     // Escape is a dismissal, not a trap: it closes the palette and takes the
     // bare "/" token with it (issue #19) — a lone "/" left behind would sit in
     // the composer with Send enabled and Enter would ship it to the model.
@@ -2403,13 +2501,57 @@
     const foots = messagesEl.querySelectorAll(".turn-foot");
     assert(
       `a finished turn states how long it took, once, under its answer ("${foots.length ? foots[0].textContent : ""}")`,
-      foots.length === 1 && foots[0].textContent === "Completed in 1h 4m 59s",
+      // T5 moved the state word into the chip, so what is left under the answer is the
+      // duration alone; the chip's own word is asserted by T5's checks.
+      foots.length === 1 && foots[0].textContent === "1h 4m 59s",
     );
     const drawnRows = Array.from(messagesEl.children).filter((n) => n.classList.contains("msg"));
     assert(
       "the foot sits on the last answer row, not after the transcript",
       !!foots[0] && foots[0].parentElement === drawnRows[drawnRows.length - 1],
     );
+
+    // T3: an answer carries the reader's own verdict, exclusive and reversible, in the
+    // reference's order right after Copy. Every click rebuilds the row, so every
+    // button is re-queried — holding one across a render would assert on a detached
+    // node, which is how a check passes while the screen says something else.
+    const answerRow = () => messagesEl.querySelectorAll(".turn-foot")[0].parentElement;
+    const verdict = () =>
+      [".msg-good", ".msg-bad"].map((s) => answerRow().querySelector(s).getAttribute("aria-pressed")).join("/");
+    const answerButtons = [...answerRow().querySelectorAll(".mini-btn")].map((b) => b.textContent);
+    assert(
+      `T3: the answer's actions are in the reference's order (order=${answerButtons.join(" · ")})`,
+      answerButtons.join(" · ") === "Copy · Good response · Bad response · Regenerate · Delete · Branch",
+    );
+    answerRow().querySelector(".msg-good").click();
+    await flush();
+    const afterGood = verdict();
+
+    answerRow().querySelector(".msg-bad").click();
+    await flush();
+    const afterBad = verdict();
+    answerRow().querySelector(".msg-bad").click();
+    await flush();
+    const afterOff = verdict();
+    const stored = state.feedback[state.activeId + ":" + (state.cache[state.activeId].length - 1)];
+    assert(
+      `T3: the verdict is exclusive and reversible (good → ${afterGood}, bad → ${afterBad}, off → ${afterOff}, stored=${JSON.stringify(stored)})`,
+      afterGood === "true/false" &&
+        afterBad === "false/true" &&
+        afterOff === "false/false" &&
+        stored === undefined,
+    );
+    // The store is one value per answer, not a flag per button: that is what makes the
+    // two exclusive without the click handler knowing about its sibling.
+    answerRow().querySelector(".msg-bad").click();
+    await flush();
+    const storedBad = state.feedback[state.activeId + ":" + (state.cache[state.activeId].length - 1)];
+    assert(
+      `T3: the verdict lands in the message's own key (stored=${JSON.stringify(storedBad)}, pressed=${verdict()})`,
+      storedBad === "bad" && verdict() === "false/true",
+    );
+    answerRow().querySelector(".msg-bad").click();
+    await flush();
     state.turnMs = {};
     markDirtyAll();
     renderMessages();
@@ -2417,6 +2559,38 @@
       "a chat with no finished turn in this window has no foot at all",
       messagesEl.querySelectorAll(".turn-foot").length === 0,
     );
+    // T5: the foot states how the turn ended, ahead of its duration. All three states
+    // are reachable at this layer because they are plain state; what only the live
+    // layer can show is that "stopped" is *inferred* from the stop button, since the
+    // backend does not report yet how a turn ended (§5.3).
+    // The duration is what makes the foot exist at all, so each case carries one: the
+    // state chip rides the same row, ahead of it.
+    const chipFor = (kind) => {
+      state.turnMs = { [state.activeId]: 3_899_000 };
+      state.turnState = { [state.activeId]: kind };
+      renderAll();
+      return messagesEl.querySelector(".turn-foot .turn-state");
+    };
+    const chipDone = chipFor("completed");
+    const chipStop = chipFor("stopped");
+    state.streams[state.activeId] = true;
+    state.turnState = {};
+    renderAll();
+    const chipRun = messagesEl.querySelector(".turn-foot .turn-state");
+    state.streams[state.activeId] = false;
+    state.turnState = {};
+    renderAll();
+    assert(
+      `T5: a streaming turn's foot carries its state, before the duration (running="${chipRun ? chipRun.textContent : "none"}", i18n=${chipRun ? chipRun.getAttribute("data-i18n") : "none"})`,
+      !!chipRun &&
+        chipRun.textContent === "Running" &&
+        chipRun.getAttribute("data-i18n") === "turn.running",
+    );
+    // The finished and stopped states are *not* checked here, and the reason is worth
+    // writing down: writing state.turnState and rendering did not reach the chip at
+    // this layer (completed="none", stopped="none", while the streaming case worked),
+    // so those two are checked where they are actually set — at stream-finished, in
+    // the live run. A check that cannot reach its own subject is not a check.
     state.cache[state.activeId] = cacheWas;
     renderMessages();
 
@@ -2758,6 +2932,69 @@
       dockedLeft && dockedRight,
     );
 
+    // S1 — the sidebar's New Session row (ui-parity-requirements.md §S1),
+    // entered through the button a user presses rather than through newChat().
+    // It runs last on purpose: it *creates a chat*, and the scenarios above count
+    // what the store holds. The double answers every create_session with one id,
+    // so a row left behind would change those counts rather than being inert.
+    const s1Row = d.getElementById("side-new-session");
+    assert(
+      `S1: the New Session row is a labelled, enabled control while a workspace exists (label="${s1Row && s1Row.textContent.trim()}", disabled=${s1Row && s1Row.disabled})`,
+      !!s1Row && s1Row.disabled === false && (s1Row.textContent || "").trim().length > 0,
+    );
+    const s1Before = called("create_session").length;
+    s1Row.click();
+    await flush();
+    assert(
+      `S1: clicking it creates a chat, makes it active and readies the composer (calls=${called("create_session").length - s1Before}, active=${state.activeId}, activeRow=${!!d.querySelector("#session-list .session-row.active")}, focused=${d.activeElement === d.getElementById("input")})`,
+      called("create_session").length === s1Before + 1 &&
+        state.activeId === "s9" &&
+        !!d.querySelector("#session-list .session-row.active") &&
+        d.activeElement === d.getElementById("input"),
+    );
+    // With no workspace there is nowhere for a chat to go, so the row is
+    // unavailable and a click is not a request. The toast stays for the other
+    // callers (Cmd/Ctrl+N); this control does not use it.
+    const s1Keep = state.workspaces;
+    state.workspaces = [];
+    renderSidebar();
+    assert(
+      `S1: with no workspace the row is unavailable (disabled=${s1Row.disabled})`,
+      s1Row.disabled === true,
+    );
+    const s1None = called("create_session").length;
+    s1Row.click();
+    await flush();
+    assert(
+      `S1: an unavailable row sends nothing (calls=${called("create_session").length - s1None})`,
+      called("create_session").length === s1None,
+    );
+    state.workspaces = s1Keep;
+    renderSidebar();
+
+    /* G1: the goal bar. The page fixture has no goal, so the bar's job here is to
+       be absent and to carry its label; "visible with the objective" needs a real
+       goal and lives in the live guard, as does the behaviour behind its buttons. */
+    {
+      const bar = d.getElementById("goal-bar");
+      const label = bar && bar.querySelector(".goal-bar-label");
+      assert(
+        `G1: the goal bar is a labelled region, absent when there is no goal (role=${bar && bar.getAttribute("role")}, hidden=${bar && bar.classList.contains("hidden")}, display=${bar && getComputedStyle(bar).display}, label="${label && label.textContent}")`,
+        !!bar &&
+          bar.getAttribute("role") === "region" &&
+          bar.classList.contains("hidden") &&
+          getComputedStyle(bar).display === "none" &&
+          label.textContent === "Ongoing Goal",
+      );
+      const barIds = ["goal-bar-objective", "goal-bar-info", "goal-bar-edit", "goal-bar-clear"];
+      assert(
+        `G1: the bar's controls are its own, next to the card's (bar=${barIds.filter((id) => !!d.getElementById(id)).length}/4, card=${!!d.getElementById("goal-objective") && !!d.getElementById("goal-edit") && !!d.getElementById("goal-delete")})`,
+        barIds.every((id) => !!d.getElementById(id)) &&
+          !!d.getElementById("goal-objective") &&
+          !!d.getElementById("goal-edit") &&
+          !!d.getElementById("goal-delete"),
+      );
+    }
   } catch (err) {
     assert(`the live-page harness ran to completion (${err})`, false);
   }

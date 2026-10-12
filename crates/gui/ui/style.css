@@ -20,6 +20,7 @@
   --user-bubble: #2c3a5c;
   --code-bg: #101010;
   --accent-soft: rgba(79, 125, 255, 0.22);
+  --side-new: #2f2f2f;
 
   /* Semantic layer: new components use these, never raw values (Part II §14.2). */
   --space-1: 4px;
@@ -33,10 +34,14 @@
   --radius-lg: 12px;
   --control-h: 30px;
   --font-ui: 13px;
+  /* Sidebar metrics, measured off the reference (§3B.2): rows sit on a 44px
+     pitch and read at 15px, where a 13px list read as a compact rail. */
+  --side-font: 15px;
+  --side-row-h: 44px;
   --content-font-size: 14px;
   --divider-w: 5px;
   --focus-ring: #4176e6;
-  --sidebar-w: 280px;
+  --sidebar-w: 348px;
   --doc-w: 0px;
   /* Frame clearances, cloned from DSH's ui-layout contract: the reserved strip
      below the window's top edge, the extra inset an overlay adds for dialogs and
@@ -50,24 +55,25 @@
 
 [data-theme="light"] {
   --bg: #ffffff;
-  --sidebar: #f6f7f9;
+  --sidebar: #e8e9eb;
   --hover: #eceef2;
-  --active: #e2e6ee;
+  --active: #dddee1;
   --card: #ffffff;
   --input: #ffffff;
   --border: #d8dbe2;
   --border-strong: #b3b8c4;
-  --accent: #3558d6;
-  --accent-hover: #2a49b8;
-  --text: #1b1d21;
-  --dim: #5c6270;
+  --accent: #4176e6;
+  --accent-hover: #3567d4;
+  --text: #0f1115;
+  --dim: #6b7280;
   --faint: #8a90a0;
   --error: #c62828;
   --success: #1b7f4b;
   --warn: #9a6b00;
   --user-bubble: #e6ecff;
   --code-bg: #f6f7f9;
-  --accent-soft: rgba(53, 88, 214, 0.16);
+  --accent-soft: rgba(65, 118, 230, 0.16);
+  --side-new: #f2f3f5;
 }
 
 * { box-sizing: border-box; }
@@ -109,6 +115,7 @@ html, body {
   flex-direction: column;
   flex: 0 0 var(--sidebar-w);
   width: var(--sidebar-w);
+  font-size: var(--side-font);
   min-width: 0;
   overflow: hidden;
   background: var(--sidebar);
@@ -127,6 +134,10 @@ html, body {
   padding: var(--space-3) var(--space-1);
 }
 [data-sidebar="rail"] .brand { font-size: 12px; }
+/* The rail's own rule is "navigation stays reachable, labels step aside": the
+   New Session row keeps its icon and gives up its name, like the rest of the rail. */
+[data-sidebar="rail"] .side-new { padding: 0; }
+[data-sidebar="rail"] .side-new > span { display: none; }
 body.resizing,
 body.resizing * { cursor: col-resize !important; }
 body.resizing #sidebar,
@@ -134,8 +145,9 @@ body.resizing #doc-panel { transition: none; }
 
 .sidebar-head {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
   padding: 16px 14px 12px;
 }
 
@@ -149,6 +161,29 @@ body.resizing #doc-panel { transition: none; }
   color: var(--text);
 }
 
+/* S1: the reference's New Session control — a full-width, borderless row directly
+   under the brand (§3B.2). It is not a second folder-plus: that one adds a
+   workspace and lives in the Workspaces header, while this one adds a chat to the
+   workspace already active — the row action the reference puts within reach. */
+.side-new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: 34px;
+  padding: 0 var(--space-3);
+  background: var(--side-new);
+  color: var(--text);
+  border: 0;
+  border-radius: var(--radius-md);
+  font: inherit;
+  cursor: pointer;
+}
+.side-new:hover:not(:disabled) { background: var(--hover); }
+.side-new:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.side-new:disabled { color: var(--faint); cursor: default; }
+
 .session-list {
   flex: 1;
   overflow-y: auto;
@@ -160,6 +195,7 @@ body.resizing #doc-panel { transition: none; }
   align-items: center;
   gap: 6px;
   padding: 8px 10px 8px 24px;
+  min-height: var(--side-row-h);
   margin-bottom: 2px;
   border-left: 2px solid transparent;
   border-radius: var(--radius-md);
@@ -482,6 +518,7 @@ body.resizing #doc-panel { transition: none; }
 /* ---------- chat column ---------- */
 
 #main {
+  position: relative; /* W1's badge is pinned inside this column */
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -493,6 +530,7 @@ body.resizing #doc-panel { transition: none; }
    tabs sit on the head's own border, so the active one underlines the pane it
    opens rather than floating in the middle of the row. */
 #chat-head {
+  position: relative; /* W1's badge hangs off this box's bottom edge */
   display: flex;
   flex-direction: column;
   align-items: stretch;
@@ -539,8 +577,65 @@ body.resizing #doc-panel { transition: none; }
 #messages {
   flex: 1;
   overflow-y: auto;
-  padding: 20px 24px 12px;
+  /* §3B.5: the content column is measured at 64, not 24 — the transcript, H2's
+     line and G1's bar all read from the same edge as the reference's. */
+  padding: 20px 64px 12px;
   scroll-behavior: auto;
+}
+
+/* W1: the floating card the reference shows while a turn streams — the chat's
+   name, "Working", and the two round buttons that stop or hide it. Flat: a card
+   fill and a 1px border where the reference used a shadow. Pinned top-right; the
+   reference's card drifts with the scroll, which is not a state worth copying. */
+.working-badge {
+  position: absolute;
+  /* 200px below the tab divider, stated against the head itself: the head grows
+     taller when the window is narrow, and the reference's number does not move. */
+  top: calc(100% + 200px);
+  right: 27px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 265px;
+  padding: var(--space-2) var(--space-3);
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+}
+.working-text { flex: 1; min-width: 0; }
+.working-title {
+  display: block;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.working-state { display: block; color: var(--dim); font-size: var(--font-ui); }
+.working-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--hover);
+  color: var(--dim);
+  cursor: pointer;
+}
+.working-btn:hover { background: var(--active); color: var(--text); }
+.working-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* H2: how long the turn in flight has been working, stated where the reference
+   states it — at the transcript's foot, above the composer, in the accent. It is
+   a live region, and it is *absent* when nothing streams rather than showing 0s. */
+.stream-line {
+  flex: none;
+  padding: 0 24px 4px;
+  color: var(--accent);
+  font-size: var(--font-ui);
 }
 
 /* Center tab strip (Chat | Trajectory): two words on the head's bottom border,
@@ -836,7 +931,8 @@ body.resizing #doc-panel { transition: none; }
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin: 0 20px 6px;
+  /* §3B.5: the composer sits 40 from the column's edges, just inside the 64. */
+  margin: 0 40px 6px;
   padding: 10px 12px 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -844,6 +940,53 @@ body.resizing #doc-panel { transition: none; }
 }
 
 #composer:focus-within { border-color: var(--accent); }
+
+/* G1: the one-row Ongoing Goal bar above the composer — the persistent entry the
+   goal card's header chip will retire behind. Same 64 edge as the transcript. */
+.goal-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 44px;
+  margin: 0 64px var(--space-2);
+  padding: 0 var(--space-2) 0 var(--space-3);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+.goal-bar-mark { color: var(--accent); }
+.goal-bar-label { font-weight: 600; white-space: nowrap; }
+.goal-bar-objective {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.goal-bar-objective:hover { color: var(--accent); }
+.goal-bar-gap { flex: 1; }
+.goal-bar-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+}
+.goal-bar-btn:hover { background: var(--hover); color: var(--text); }
+.goal-bar-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 #input {
   resize: none;
@@ -909,9 +1052,10 @@ body.resizing #doc-panel { transition: none; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  min-width: 34px;
-  height: 34px;
+  /* C1b: the reference's 42px circle — the foot row's one filled control. */
+  width: 42px;
+  min-width: 42px;
+  height: 42px;
   padding: 0;
   border: none;
   border-radius: 50%;
@@ -919,8 +1063,12 @@ body.resizing #doc-panel { transition: none; }
 
 /* Stop is the same button carrying the other glyph — the reference's square,
    not a red fill: a turn in flight is normal, not an error. */
+/* The spec states the circle's *own* insets inside the composer (16 right, 12
+   bottom); the composer's padding is 12/8, so the difference belongs to this
+   button rather than to every control in the box. */
+.comp-send { margin: 0 3px 3px 0; }
 #send.comp-send.stop { background: var(--accent); color: #fff; }
-#send.comp-send:disabled { background: var(--hover); color: var(--faint); cursor: default; }
+#send.comp-send:disabled { background: var(--card); color: var(--dim); cursor: default; }
 
 /* Attached images wait in a strip above the input: one flat chip each, the
    picture itself for recognition, an ✕ to take it back. */
@@ -1407,6 +1555,32 @@ body.resizing #doc-panel { transition: none; }
   font-size: 11.5px;
   color: var(--faint);
 }
+/* T5: how the turn ended, ahead of its duration. Flat — one border, one colour — and
+   the state is a word as well, so nothing here depends on a colour being read. */
+/* T5: the stream line's row. The state word sits beside the deep-diving sentence while a
+   turn is in flight, because the foot under an answer does not exist yet — this row *is*
+   the transcript's foot mid-turn. One row, so the chip reads at the footer's left. */
+.stream-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.turn-state {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 15px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--dim);
+}
+/* T3: the verdict reads as pressed in the accent, the same colour hover and focus
+   use, so the state is not carried by a colour only. */
+.msg-good[aria-pressed="true"],
+.msg-bad[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+.turn-state-completed { color: var(--success); }
+.turn-state-running { color: var(--accent); }
 
 .code-tools { display: inline-flex; align-items: center; gap: var(--space-2); }
 
@@ -2138,7 +2312,7 @@ body.resizing #doc-panel { transition: none; }
    about the workspace, and the status line names the model of the chat in use (§24.4). */
 .ws-head {
   display: flex; align-items: center; gap: 6px; padding: 8px 10px 4px;
-  color: var(--dim); font-size: 11px; letter-spacing: .02em; text-transform: none;
+  color: var(--dim); font-size: var(--side-font); letter-spacing: .02em; text-transform: none;
 }
 .ws-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The workspace's folder, at rest, in the slot the disclosure takes on hover: the
@@ -2239,7 +2413,7 @@ body.resizing #doc-panel { transition: none; }
      is not squeezed and at full width so the list the rail hides can be read. It is
      the same box in both narrow bands. */
   [data-sidebar="drawer"] #sidebar {
-    position: fixed; left: 0; top: 0; bottom: 0; width: 280px; max-width: 82vw;
+    position: fixed; left: 0; top: 0; bottom: 0; width: var(--sidebar-w); max-width: 82vw;
     z-index: 40; border-right: 1px solid var(--border-strong);
   }
 }
@@ -2249,7 +2423,7 @@ body.resizing #doc-panel { transition: none; }
    area, it covers it on purpose, and the ☰ is the way back. */
 @media (max-width: 720px) {
   #sidebar {
-    position: fixed; left: 0; top: 0; bottom: 0; width: 280px; max-width: 82vw;
+    position: fixed; left: 0; top: 0; bottom: 0; width: var(--sidebar-w); max-width: 82vw;
     z-index: 40; transform: translateX(-101%); transition: transform .16s ease;
     border-right: 1px solid var(--border-strong);
   }
@@ -3175,6 +3349,18 @@ body.resizing #doc-panel { transition: none; }
 .sess-mark.live {
   border-color: var(--success);
   background: var(--success);
+}
+/* The streaming chat's word, next to its marker: the same state, readable without a
+   hover and without sight. Flat — one border, one colour, no shadow. */
+.row-live {
+  flex: none;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 15px;
+  color: var(--success);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
 }
 .vh {
   position: absolute;

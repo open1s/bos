@@ -175,17 +175,27 @@ grep -qE '"\/files", hint: "[^"]*", run: \(\) => navTo\("files-section"\)' $JS \
   && ok || bad "/files must open the Files section, not a removed sidebar toggle"
 
 # --- the Workspaces header carries search, a view menu, and add (rev 111/112) -
-# It was "New session", then a labelled button with a row of its own, then an
-# icon in the brand row for one round; it is the folder-plus in the header of the
-# section it adds to now, as the design shows, and the brand row is the brand
-# alone again. Two identical folder-plus glyphs 40 px apart are a duplicate, not
-# a shortcut, so the count of them is asserted too.
+# The head holds the brand and, since S1, the reference's New Session row. That
+# row is *not* a second folder-plus: the folder-plus adds a workspace and lives in
+# the Workspaces header, so the two are told apart by id and by label rather than
+# by a glyph count. (Rev 111 removed an unlabelled icon from this row for exactly
+# that reason — this one is the labelled row the reference itself draws.)
 SIDEBAR_HEAD=$(sed -n '/<div class="sidebar-head">/,/<\/div>/p' $HTML)
 case "$SIDEBAR_HEAD" in
   '') bad "the sidebar head row must exist" ;;
-  *'workspace-add-primary'*) bad "the brand row holds the brand alone; the folder-plus moved to the Workspaces header" ;;
+  *'workspace-add-primary'*) bad "the folder-plus belongs to the Workspaces header, not to the brand row" ;;
   *) ok ;;
 esac
+case "$SIDEBAR_HEAD" in
+  *'id="side-new-session"'*'data-i18n="side.newSession"'*) ok ;;
+  *) bad "the brand row must hold the New Session row, labelled through the i18n marks" ;;
+esac
+NEW_SESSION_COUNT=$(grep -c 'id="side-new-session"' $HTML)
+case "$NEW_SESSION_COUNT" in
+  1) ok ;;
+  *) bad "the New Session row must appear exactly once (found $NEW_SESSION_COUNT)" ;;
+esac
+
 # Scoped to the section header's own action row: this is an assertion about that
 # row rather than about the document. (The opening tags wrap, so the id and the
 # class are matched as positions in the block, not as one tag.)

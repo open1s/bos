@@ -18,11 +18,11 @@ const Shell = (() => {
 
   const SIDEBAR_MIN = 264;
   const SIDEBAR_MAX = 420;
-  const SIDEBAR_DEFAULT = 280;
+  const SIDEBAR_DEFAULT = 348;
   const SIDEBAR_RAIL = 56;
   /* Right-column and frame geometry, cloned from DSH's ui-layout contract (see
      docs/dsh-ui-reference/dsh-client-ui-layout/README.md): the sidebar spans
-     264-420px at a 280px default with a 56px rail, the right column opens at 45%
+     264-420px at a 348px default with a 56px rail, the right column opens at 45%
      of the viewport and never exceeds 70%, the centre keeps 400px, and below
      1024px the sidebar auto-collapses. */
   const DOC_DEFAULT_RATIO = 0.45;

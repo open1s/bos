@@ -64,6 +64,9 @@ const state = {
   cache: {},             // sessionId -> [ChatMessage]
   streams: {},           // sessionId -> {session_id, gen, started_at} (many may stream)
   usage: null,           // {prompt, completion} | null
+  // T3: the reader's own verdict on an answer, "sessionId:index" -> "good" | "bad".
+  // Local by necessity: no command the UI can reach writes a message's meta yet (§5.1).
+  feedback: {},
   toolCount: 0,
   error: null,
   model: "",
@@ -1294,6 +1297,8 @@ function sessionViewMenu(anchor) {
    the row and its "…" menu lead back to the live list. */
 function archivedRow(s) {
   const row = el("div", "session-row archived-row");
+  row.setAttribute("role", "treeitem");
+  row.setAttribute("aria-level", "2");
   row.dataset.id = s.id;
   row.appendChild(el("span", "sess-mark"));
   row.appendChild(el("span", "title", clip(s.title, 24)));
@@ -1330,6 +1335,10 @@ function renderSidebar() {
   // here rather than in a second place that could drift out of step.
   renderWorkspaceManager();
   renderSearchHits();
+  /* S1: a chat needs a workspace to live in — with none, the row says so by
+     being unavailable rather than by answering a click with a toast. */
+  const newSession = $("side-new-session");
+  if (newSession) newSession.disabled = state.workspaces.length === 0;
   const q = state.search.trim().toLowerCase();
   const visible = state.sessions.filter(
     (s) => !q || (s.title || "New chat").toLowerCase().includes(q),
@@ -1406,6 +1415,12 @@ function renderSidebar() {
         // an unfolderable row is aligned with the foldable ones, not shifted left.
         head.appendChild(el("span", "ws-fold-gap"));
       }
+      // The group is a branch of the sessions tree: a workspace row is a level-1 item
+      // and says whether its chats are showing. The fold button reports the same state
+      // as its own control, so the two can never disagree.
+      head.setAttribute("role", "treeitem");
+      head.setAttribute("aria-level", "1");
+      head.setAttribute("aria-expanded", folded ? "false" : "true");
       // Then the workspace's own folder, the way the reference sidebar draws it.
       const folder = el("span", "ws-folder");
       folder.appendChild(ico(ICONS.folder));
@@ -1462,6 +1477,11 @@ function renderSidebar() {
       continue;
     }
     const row = el("div", "session-row" + (s.id === state.activeId ? " active" : ""));
+    // A chat is a leaf of the same tree, one level under its workspace, and the open
+    // chat says so to a screen reader the way the highlight says it visually.
+    row.setAttribute("role", "treeitem");
+    row.setAttribute("aria-level", "2");
+    if (s.id === state.activeId) row.setAttribute("aria-selected", "true");
     // The row names the chat it stands for, so a check can address one chat
     // instead of matching its clipped title.
     row.dataset.id = s.id;
@@ -1475,6 +1495,14 @@ function renderSidebar() {
     const mark = el("span", "sess-mark" + (live ? " live" : ""));
     mark.setAttribute("aria-hidden", "true");
     row.appendChild(mark);
+    // A streaming chat says so in words as well as in colour: the chip carries the
+    // state the marker carries, and it is readable without hovering and without
+    // sight. Any session streams, not only the active one.
+    if (live) {
+      const chip = el("span", "row-live", tr("row.running", "Running"));
+      chip.setAttribute("data-i18n", "row.running");
+      row.appendChild(chip);
+    }
     row.appendChild(el("span", "title", clip(s.title, 24)));
     // In one list the row has no workspace header above it, so it carries the
     // workspace itself: a chip, not a second name in the title.
@@ -1483,7 +1511,6 @@ function renderSidebar() {
         el("span", "sess-ws-chip", clip(wsNames.get(s.workspace) || s.workspace || "Default", 14)),
       );
     }
-    if (live) row.appendChild(el("span", "vh", "streaming"));
     // The star is the pin's own control, so the state is one click from the row
     // instead of two: it reads as pressed to a screen reader and stays visible
     // when the row is not hovered, which a hover-only affordance never can.
@@ -1940,6 +1967,22 @@ function buildBubble(m, showCaret, opts) {
     acts.appendChild(copyBtn);
     hasActs = true;
   }
+  if (opts && opts.feedbackAt !== undefined) {
+    // T3: the reader's verdict, exclusive and reversible, in the reference's order
+    // right after Copy: Copy · Good · Bad · Regenerate · Delete · Branch.
+    const fbBtn = (kind, label) => {
+      const b = el("button", "mini-btn msg-" + kind, label);
+      b.type = "button";
+      const on = opts.feedback === kind;
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+      b.title = label;
+      b.addEventListener("click", () => setFeedback(state.activeId, opts.feedbackAt, on ? "" : kind));
+      return b;
+    };
+    acts.appendChild(fbBtn("good", tr("msg.good", "Good response")));
+    acts.appendChild(fbBtn("bad", tr("msg.bad", "Bad response")));
+    hasActs = true;
+  }
   if (opts && opts.regen) {
     const regenBtn = el("button", "mini-btn", "Regenerate");
     regenBtn.type = "button";
@@ -1981,6 +2024,22 @@ function buildBubble(m, showCaret, opts) {
   }
   if (hasActs) bubble.appendChild(acts);
   return bubble;
+}
+
+/* T3: one verdict per answer, so it is one value per key rather than a flag per
+   button — exclusivity is then a property of the store, not of the click handler. */
+function feedbackOf(sessionId, index) {
+  return (state.feedback || {})[sessionId + ":" + index] || "";
+}
+function setFeedback(sessionId, index, value) {
+  state.feedback = state.feedback || {};
+  const key = sessionId + ":" + index;
+  if (value) state.feedback[key] = value;
+  else delete state.feedback[key];
+  // renderMessages() reuses every row above its dirty cursor without asking that
+  // row's signature, so a bare repaint would keep drawing the old aria-pressed.
+  markDirty(index);
+  renderMessages();
 }
 
 /* Edit-and-resend: the backend truncates the stored history at `index`,
@@ -2194,6 +2253,10 @@ function messageSignature(m, opts, editingHere) {
     // A row that gains or loses its turn foot is not the same row: without this
     // the cached DOM would keep a duration the session no longer states.
     opts.foot || "",
+    // T3: a verdict is part of the row's identity for the same reason — without it
+    // the cached row kept aria-pressed="false" after the reader had pressed Good,
+    // which is exactly what the page guard caught.
+    opts.feedback || "",
   ].join("~");
 }
 
@@ -2427,8 +2490,103 @@ function turnDurationText(ms) {
 function turnFootText() {
   const ms = (state.turnMs || {})[state.activeId];
   if (!ms) return "";
-  return tr("turn.completed", "Completed in {d}").replace("{d}", turnDurationText(ms));
+  // T5: the state word lives in the chip ahead of this, so what is left is the
+  // duration alone. The old sentence put two "Completed"s on one line.
+  return turnDurationText(ms);
 }
+
+/* The turns the stop button ended, by chat. The backend does not yet report how a
+   turn ended (§5.3), so until it does a stop is the one state BSH infers — from the
+   button having been pressed for that turn — and the chip says as much in its title
+   rather than pretending to know. */
+const stoppedTurns = new Set();
+
+/* T5: how this turn ended, in words, ahead of the duration. "Running" while the chat
+   streams; otherwise the state the finish recorded. Nothing is invented for a chat
+   whose turn state was never seen: a reloaded transcript has no foot either. */
+function turnStateChip(sessionId) {
+  const running = sessionId === state.activeId && !!streamOf(sessionId);
+  const kind = running ? "running" : (state.turnState || {})[sessionId];
+  if (!kind) return null;
+  // The finished state needs its own key: `turn.completed` is the duration sentence
+  // ("Completed in 3s") that this chip sits ahead of, and one key cannot be both.
+  const key = kind === "completed" ? "turn.state.completed" : "turn." + kind;
+  const word = kind === "running" ? "Running" : kind === "stopped" ? "Stopped" : "Completed";
+  const chip = el("span", "turn-state turn-state-" + kind, tr(key, word));
+  chip.setAttribute("data-i18n", key);
+  if (kind === "stopped") {
+    chip.title = tr(
+      "turn.stoppedNote",
+      "Stopped for this turn; the backend does not report yet how a turn ended",
+    );
+  }
+  return chip;
+}
+
+/* H2: the line the reference draws while a turn is in flight — "Deep diving for
+   7m 48s ···", in the accent, at the transcript's foot. Its one interval lives
+   only while the line is visible: the perf soak counts work, and an interval left
+   behind would keep a dead chat's clock ticking. The text is written only when it
+   changes, so a streaming burst does not turn the clock into a DOM mutator. */
+let streamLineTimer = null;
+let streamLineText = "";
+function renderStreamLine() {
+  const line = $("stream-line");
+  if (!line) return;
+  if (!streamOf(state.activeId)) {
+    if (streamLineTimer !== null) {
+      clearInterval(streamLineTimer);
+      streamLineTimer = null;
+    }
+    line.classList.add("hidden");
+    const row = $("stream-foot");
+    if (row) row.classList.add("hidden");
+    return;
+  }
+  const startedAt = (state.turnStarted || {})[state.activeId] || Date.now();
+  const text = tr("stream.deepDiving", "Deep diving for {d} ···").replace(
+    "{d}",
+    turnDurationText(Date.now() - startedAt),
+  );
+  if (text !== streamLineText) {
+    streamLineText = text;
+    line.textContent = text;
+  }
+  line.classList.remove("hidden");
+  const row = $("stream-foot");
+  if (row) row.classList.remove("hidden");
+  if (streamLineTimer === null) streamLineTimer = setInterval(renderStreamLine, 1000);
+}
+/* The guard's window on that one timer: 0 when idle, 1 while a turn streams. */
+window.__streamLineTimers = () => (streamLineTimer === null ? 0 : 1);
+
+/* W1: the floating card that names the chat in flight and offers its stop. It
+   belongs to the *stream*, not to the session: ✕ hides this stream's card while
+   the turn keeps running, and since a new turn has a new gen the card comes back
+   on its own — there is no flag anyone has to remember to clear. */
+let workingDismissed = null; // { sessionId, gen } of the stream the reader hid
+function renderWorkingBadge() {
+  const box = $("working-badge");
+  if (!box) return;
+  const live = streamOf(state.activeId);
+  const dismissed =
+    !!workingDismissed &&
+    !!live &&
+    workingDismissed.sessionId === state.activeId &&
+    workingDismissed.gen === live.gen;
+  if (!live || dismissed) {
+    box.classList.add("hidden");
+    return;
+  }
+  const session = (state.sessions || []).find((s) => s.id === state.activeId);
+  const title = (session && session.title) || "";
+  const shown = title.length > 30 ? title.slice(0, 29) + "…" : title;
+  const titleEl = $("working-title");
+  if (titleEl && titleEl.textContent !== shown) titleEl.textContent = shown;
+  box.classList.remove("hidden");
+}
+/* The guard's window on the dismissal: null when none is in force. */
+window.__workingDismissed = () => workingDismissed;
 
 function renderMessages() {
   growDrawn = true; // the previous growth, if any, has now been drawn
@@ -2548,6 +2706,13 @@ function renderMessages() {
       // The foot rides the last answer, so the row's own signature carries it:
       // when the duration arrives the row is rebuilt, with no second pass.
       foot: abs === lastAssistant ? footText : "",
+      // The state is part of the foot's identity: a running row and a finished row
+      // are not the same row, and the cached window must not keep drawing the old one.
+      footState: abs === lastAssistant ? turnStateChip(state.activeId) : null,
+      // T3: an answer carries the reader's own note; it rides the row's signature so
+      // changing it rebuilds that one row instead of leaving a stale aria-pressed.
+      feedbackAt: m.role === "Assistant" && !!m.text ? abs : undefined,
+      feedback: m.role === "Assistant" && !!m.text ? feedbackOf(state.activeId, abs) : "",
       edit: m.role === "User" && (!!m.text || (m.images || []).length),
       del: true,
       branch: abs > 0,
@@ -2564,7 +2729,12 @@ function renderMessages() {
       } else {
         row.appendChild(buildBubble(m, showCaret, opts));
       }
-      if (opts.foot) row.appendChild(el("div", "turn-foot", opts.foot));
+      if (opts.foot || opts.footState) {
+        const foot = el("div", "turn-foot");
+        if (opts.footState) foot.appendChild(opts.footState);
+        if (opts.foot) foot.appendChild(el("span", "turn-duration", opts.foot));
+        row.appendChild(foot);
+      }
       // Swap the rebuilt row in place, so a change mid-transcript cannot
       // shift every row after it (a tool result landing in message 2 of 5000).
       if (entry && entry.el.parentNode === messagesEl) entry.el.replaceWith(row);
@@ -2957,6 +3127,10 @@ function renderAll() {
   renderSend();
   renderComposer();
   renderQueue();
+  // H2's clock and W1's badge belong to whichever chat is on screen: a switch, a
+  // stop and a delete all come through here, and both follow in one pass.
+  renderStreamLine();
+  renderWorkingBadge();
   tick();
 }
 
@@ -3268,6 +3442,19 @@ function renderGoal(goal) {
   const g = goal || null;
   const meta = g ? GOAL_STATES[g.state] || GOAL_STATES.active : null;
   r.card.classList.toggle("hidden", !g && !state.goalOpen);
+  // G1: one row above the composer, painted from the same goal value as the card
+  // (the spec's "one repaint path"). The bar exists only while a goal does; the
+  // card still owns every action, and the bar's buttons delegate to its controls.
+  const bar = $("goal-bar");
+  if (bar) {
+    bar.classList.toggle("hidden", !g);
+    const obj = $("goal-bar-objective");
+    if (obj) {
+      const text = g ? g.objective || "" : "";
+      if (obj.textContent !== text) obj.textContent = text;
+      obj.title = text;
+    }
+  }
   goalFail("");
   if (!g) {
     r.icon.textContent = "◎";
@@ -3987,7 +4174,35 @@ function clearAttachments() {
 
 function bindAttachments() {
   if (!attachBtn || !attachFile) return;
-  attachBtn.addEventListener("click", () => attachFile.click());
+  /* C1a: the leading control is a popup button, not a bare attach. Both gestures its
+     menu offers are gestures the composer already has — "@" opens the mention picker
+     and "/" opens the palette — so a menu item and a keystroke cannot drift apart, and
+     the file dialog is the same hidden input this button used to open directly. */
+  attachBtn.setAttribute("aria-haspopup", "menu");
+  attachBtn.setAttribute("aria-label", tr("composer.addFiles", "Add files or run commands"));
+  attachBtn.setAttribute("data-i18n-aria", "composer.addFiles");
+  const intoComposer = (text) => {
+    input.value = input.value ? `${input.value} ${text}` : text;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.focus();
+  };
+  attachBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (rowMenu && rowMenu.anchor === attachBtn) return void closeRowMenu(true);
+    openRowMenu(
+      attachBtn,
+      [
+        { run: "attach", label: tr("composer.attachImages", "Attach images…") },
+        { run: "mention", label: tr("composer.mentionFile", "Mention a file") },
+        { run: "commands", label: tr("composer.commands", "Commands & skills") },
+      ],
+      (item) => {
+        if (item.run === "attach") attachFile.click();
+        else if (item.run === "mention") intoComposer("@");
+        else if (item.run === "commands") intoComposer("/");
+      },
+    );
+  });
   attachFile.addEventListener("change", () => {
     addAttachments(attachFile.files);
     attachFile.value = "";
@@ -4021,6 +4236,7 @@ bindAttachments();
 /* Stop just this chat's turn; background streams keep going. The Stop button
    takes this path, and a stop also cancels that chat's waiting queue. */
 async function stopStream() {
+  stoppedTurns.add(state.activeId);
   const id = state.activeId;
   delete state.queue[id];
   await invoke("stop_streaming", { sessionId: id }).catch(() => {});
@@ -4498,6 +4714,9 @@ let mentionFetch = null; // debounce timer for search_files
 function mentionToken() {
   const caret = input.selectionStart ?? input.value.length;
   const before = input.value.slice(0, caret);
+  // MENTION_RE already accepts a bare "@" (an empty query), which is what lets the
+  // ⊕'s "Mention a file" reach the picker; an earlier attempt to special-case that
+  // here was removed after its injection stayed green — it changed nothing.
   const m = MENTION_RE.exec(before);
   if (!m) return null;
   return { query: m[1], atStart: before.length - m[1].length - 1 };
@@ -4520,7 +4739,9 @@ function syncMention() {
     closeMention();
     return;
   }
-  if (state.mentionDismissed === tok.query) return; // Esc dismissed it
+  // Esc dismisses a *query*; an empty one is not a query, or a bare "@" could never
+  // reopen the picker after the token it dismissed had gone away.
+  if (tok.query && state.mentionDismissed === tok.query) return; // Esc dismissed it
   if (state.mention && state.mention.query === tok.query) return; // unchanged
   state.mention = {
     query: tok.query,
@@ -6434,6 +6655,10 @@ listen("agent-event", (event) => {
   } else {
     scheduleRepaint();
   }
+  // The first event of a turn is when the clock appears, so the line is updated
+  // here rather than waiting for the next repaint.
+  renderStreamLine();
+  renderWorkingBadge();
 });
 
 listen("stream-finished", async (event) => {
@@ -6444,6 +6669,9 @@ listen("stream-finished", async (event) => {
     state.turnMs = state.turnMs || {};
     state.turnMs[p.session_id] = Date.now() - startedAt;
     delete state.turnStarted[p.session_id];
+    // T5: how the turn ended. A stop is the client's own record (see stoppedTurns).
+    state.turnState = state.turnState || {};
+    state.turnState[p.session_id] = stoppedTurns.delete(p.session_id) ? "stopped" : "completed";
     // The last row now states something new, so it is not the same row: without
     // this the transcript's cached window would go on drawing the old one.
     if (p.session_id === state.activeId) markDirtyAll();
@@ -6465,6 +6693,10 @@ listen("stream-finished", async (event) => {
   // newer stream's entry.
   const s = state.streams[p.session_id];
   if (s && s.gen === p.gen) delete state.streams[p.session_id];
+  // The turn is over: the foot's clock goes with it, in the same pass that learns
+  // the turn ended (the interval would otherwise notice a second later).
+  renderStreamLine();
+  renderWorkingBadge();
   // Terminal task event: `gen` orders it, so a stale finish for a superseded
   // turn cannot regress a newer task's state (Part II §12.3).
   Shell.applyTaskEvent({
@@ -6557,12 +6789,27 @@ messagesEl.addEventListener("click", async (ev) => {
   }
 });
 
-/* The sidebar's prominent action adds a workspace, not a chat (rev 111): with no
-   workspace configured there is nothing for a chat to belong to, and a chat is
-   started from a workspace row's "+", Cmd/Ctrl+N, or the palette's /new. It asks
-   the system's folder panel directly (rev 114), because a workspace *is* a
-   folder and the folder is therefore the first question — not a form about one. */
+/* The folder-plus is the *workspace* action (rev 111/114): a workspace is a folder,
+   so it asks the system's panel directly rather than opening a form about one.
+   S1 (ui-parity-requirements.md, rev 3) puts the reference's New Session row back
+   under the brand: the reference's primary action is a chat, and rev 111's
+   objection was a second *folder-plus glyph* 40px away — this control is a
+   labelled row of its own, and the two are told apart by name, not by glyph. */
 $("workspace-add-primary").addEventListener("click", () => void addWorkspaceFromPanel());
+$("side-new-session")?.addEventListener("click", () => void newChat());
+$("working-close")?.addEventListener("click", () => {
+  const live = streamOf(state.activeId);
+  // The turn keeps running; only this card is hidden, and only for this stream.
+  if (live) workingDismissed = { sessionId: state.activeId, gen: live.gen };
+  renderWorkingBadge();
+});
+// G1: the bar's controls are doors onto the card's own controls, so the delete
+// confirmation, the editor focus and the details view stay single-sourced.
+$("goal-bar-objective")?.addEventListener("click", () => $("goal-edit")?.click());
+$("goal-bar-edit")?.addEventListener("click", () => $("goal-edit")?.click());
+$("goal-bar-info")?.addEventListener("click", () => $("goal-open")?.click());
+$("goal-bar-clear")?.addEventListener("click", () => $("goal-delete")?.click());
+$("working-stop")?.addEventListener("click", () => void stopStream());
 $("open-settings").addEventListener("click", () => openSettings());
 
 /* Sidebar navigation opens the panel that owns the thing instead of inventing a

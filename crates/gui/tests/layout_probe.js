@@ -249,7 +249,104 @@
              openWidth: Math.round(after.width), expanded, reclosed,
              armedBefore, armedOpen, armedAfter };
   }
-  (function () {
+  /* §3B parity tokens: the reference's measured numbers, read back as computed
+   values so the guard can name the one that drifted. Dark is deliberately not
+   matched yet (§3B.6: no dark capture exists). */
+(function () {
+  function swatch() {
+    const probe = document.createElement("div");
+    probe.setAttribute("data-theme", "light");
+    probe.style.display = "none";
+    document.body.appendChild(probe);
+    const cs = getComputedStyle(probe);
+    const get = (k) => cs.getPropertyValue(k).trim();
+    const out = {
+      accent: get("--accent"),
+      sidebarBg: get("--sidebar"),
+      selected: get("--active"),
+      text: get("--text"),
+      dim: get("--dim"),
+    };
+    probe.remove();
+    return out;
+  }
+  /* The stylesheet's own computation for a real row: the empty probe page has no
+     sessions, and a token that no selector applies is a number, not a metric. */
+  function rowBox() {
+    const row = document.createElement("div");
+    row.className = "session-row";
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = "probe";
+    row.appendChild(title);
+    const host = document.getElementById("sidebar") || document.body;
+    row.style.visibility = "hidden";
+    host.appendChild(row);
+    const out = {
+      rowH: Math.round(row.getBoundingClientRect().height),
+      rowFont: Math.round(parseFloat(getComputedStyle(title).fontSize)),
+    };
+    row.remove();
+    return out;
+  }
+  function measureTokens() {
+    const app = document.getElementById("app");
+    const sb = document.getElementById("sidebar");
+    const cs = app ? getComputedStyle(app) : null;
+    const rootCs = getComputedStyle(document.documentElement);
+    return Object.assign(swatch(), rowBox(), {
+      // The token is the parity number; #app's inline value is whatever state the
+      // window is in right now (348 expanded, 56 railed), so both are reported.
+      tokenSidebarW: Math.round(parseFloat(rootCs.getPropertyValue("--sidebar-w"))),
+      appSidebarW: cs ? Math.round(parseFloat(cs.getPropertyValue("--sidebar-w"))) : null,
+      sideRowH: cs ? cs.getPropertyValue("--side-row-h").trim() : null,
+      sidebarFont: sb ? Math.round(parseFloat(getComputedStyle(sb).fontSize)) : null,
+      ...badgeBox(),
+    });
+  }
+  /* W1's badge, measured as if it were showing: `hidden` means no box, and the
+     spec's numbers are about where it lands, not about whether it is out. `headH`
+     rides along because the badge's top is stated as 200px below the tab divider. */
+  function badgeBox() {
+    const box = document.getElementById("working-badge");
+    const head = document.getElementById("chat-head");
+    if (!box) return {};
+    const wasHidden = box.classList.contains("hidden");
+    if (wasHidden) box.classList.remove("hidden");
+    const r = box.getBoundingClientRect();
+    const main = document.getElementById("main").getBoundingClientRect();
+    if (wasHidden) box.classList.add("hidden");
+    // C1b: the send circle is measured against the composer it sits in, since the
+    // spec states its size and its insets rather than a row position.
+    const send = document.getElementById("send");
+    const composer = document.getElementById("composer");
+    const sr = send ? send.getBoundingClientRect() : null;
+    const cr = composer ? composer.getBoundingClientRect() : null;
+    return {
+      headH: head ? Math.round(head.getBoundingClientRect().height) : null,
+      badgeW: Math.round(r.width),
+      badgeTop: Math.round(r.top),
+      badgeRightInset: Math.round(main.right - r.right),
+      sendW: sr ? Math.round(sr.width) : null,
+      sendH: sr ? Math.round(sr.height) : null,
+      sendRightInset: sr && cr ? Math.round(cr.right - sr.right) : null,
+      sendBottomInset: sr && cr ? Math.round(cr.bottom - sr.bottom) : null,
+    };
+  }
+  function reportTokens() {
+    const old = document.getElementById("result-tokens");
+    if (old) old.remove();
+    const pre = document.createElement("pre");
+    pre.style.cssText = "position:absolute;left:-99999px;top:0;margin:0;";
+    pre.id = "result-tokens";
+    pre.textContent = JSON.stringify(measureTokens());
+    document.body.insertBefore(pre, document.body.firstChild);
+  }
+  if (document.body) reportTokens();
+  window.addEventListener("load", reportTokens);
+})();
+
+(function () {
   // The document toggle belongs to the head's own control row, on its right edge.
   // It was once appended to `#chat-head`, the column that holds the row and the
   // tabs, so it painted as a full-width block *under the tabs* (rev 124) — the
@@ -286,6 +383,11 @@
     const old = document.getElementById("result-doc");
     if (old) old.remove();
     const pre = document.createElement("pre");
+    /* A probe that reports *inside* the flow reports on a page the guard then
+       measures: a long JSON line here made the document 178px wider than the
+       window and reddened "the window can be panned sideways". Off-flow, like
+       the probe's own report elements. */
+    pre.style.cssText = "position:absolute;left:-99999px;top:0;margin:0;";
     pre.id = "result-doc";
     pre.textContent = JSON.stringify(measureDoc());
     // First child, not last: the dump for the narrowest window is the largest DOM,
@@ -309,6 +411,11 @@ window.__layoutMeasure = function () { report(measure()); return measure(); };
     const old = document.getElementById("result-doc");
     if (old) old.remove();
     const pre = document.createElement("pre");
+    /* A probe that reports *inside* the flow reports on a page the guard then
+       measures: a long JSON line here made the document 178px wider than the
+       window and reddened "the window can be panned sideways". Off-flow, like
+       the probe's own report elements. */
+    pre.style.cssText = "position:absolute;left:-99999px;top:0;margin:0;";
     pre.id = "result-doc";
     let body;
     try {
