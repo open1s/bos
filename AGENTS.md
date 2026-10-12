@@ -440,6 +440,39 @@ msedgedriver). `BOS_APP_BINARY` picks the build, `TAURI_DRIVER_URL` attaches to 
 running driver. Do not try to make it run on macOS — that is a documented
 platform limit, and `live_selftest.sh` covers the same intent here.
 
+### The real window on macOS: Open Computer Use (`open-computer-use` / `ocu`)
+
+The e2e suite above cannot run here, but the **real window can still be driven**,
+and this is the layer to reach for when a claim is about the shipped bundle rather
+than a fixture: whether the accessibility tree names a control the way a screen
+reader reads it, whether the running app really subscribed to its events (a missing
+Tauri capability is invisible to every fixture — see rev 123), whether a rebuilt
+`target/debug/BOS.app` still paints after a UI change. Ask before clicking in a
+session the user is working in; read before you write.
+
+```sh
+sw_vers -productVersion        # the macOS runtime needs 14.0 or newer
+ocu doctor                     # accessibility/screenRecording; opens onboarding if missing
+ocu capabilities --json
+ocu call list_apps
+ocu call get_app_state --args '{"app":"BOS"}'
+ocu call get_app_state --args '{"app":"BOS","text_limit":1000}'
+ocu call --calls '[{"tool":"get_app_state","args":{"app":"BOS"}},
+                   {"tool":"click","args":{"app":"BOS","element_index":"20"}}]'
+```
+
+`element_index` values belong to one `get_app_state` result: re-read before acting
+and never guess one across a rebuild. On macOS the pointer is global, so a `drag`
+needs `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` and the user's explicit
+say-so; the semantic tools (`set_value`, element `click`, `type_text`, `press_key`)
+do not move it.
+
+It is also how to study the **reference** UI this repo mirrors: the DeepSeek Harness
+checkout at `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh` is
+an asar archive, *not* a directory, so `ls`/`grep`/the grep tool cannot read it —
+`ocu call get_app_state --args '{"app":"DeepSeek Harness"}'` (or a screenshot) is the
+ground truth for its layout, its control names and its wording.
+
 ---
 
 ## Key Patterns
