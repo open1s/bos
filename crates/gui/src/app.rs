@@ -619,6 +619,22 @@ fn list_sessions(state: State<'_, Arc<GuiState>>) -> Result<Vec<SessionSummary>,
 #[tauri::command]
 fn create_session(state: State<'_, Arc<GuiState>>) -> Result<SessionSummary, String> {
     let inner = state.lock()?;
+    create_session_in(&inner)
+}
+
+fn create_session_in(inner: &Inner) -> Result<SessionSummary, String> {
+    // A chat belongs to a workspace, and a registry with none has nowhere to put
+    // one: the sidebar's own invitation is the way in (§24.6). Refused here as
+    // well as in the UI, because the record would otherwise be a chat no row can
+    // ever show. A dangling active id counts as none.
+    if !inner
+        .settings
+        .workspaces
+        .iter()
+        .any(|w| w.id == inner.settings.active_workspace)
+    {
+        return Err("add a workspace before starting a chat".to_string());
+    }
     // Sessions own their agent (and plan) from the first build — nothing to
     // reset on a brand-new id.
     let mut record = SessionRecord::new();
@@ -2727,25 +2743,38 @@ fn rewrite_workspace(
     Ok(())
 }
 
-/// Remove a workspace. The last one cannot go — the GUI always needs one to work
-/// in — and its sessions are either deleted with it or re-homed to the workspace
-/// that takes over, which the caller chooses explicitly (§24.6).
-#[tauri::command]
-fn remove_workspace(
-    state: State<'_, Arc<GuiState>>,
-    id: String,
-    delete_sessions: bool,
-) -> Result<Settings, String> {
-    let mut inner = state.lock()?;
+/// Remove a workspace: drop the row, decide who takes over its chats, and either
+/// delete them or re-home them.
+///
+/// The last one can go too — a registry with none is a state the sidebar has a
+/// face for, not an error (§24.6) — but with no workspace left there is nowhere to
+/// re-home its chats, so *that* removal refuses the keep policy instead of
+/// dropping the chats silently, and deletes them only when asked to.
+///
+/// Like [`rewrite_workspace`], this deliberately does **not** write the settings file, so a
+/// test can drive the whole rule without rewriting the user's registry; the
+/// command saves after this returns.
+fn remove_workspace_in(inner: &mut Inner, id: &str, delete_sessions: bool) -> Result<(), String> {
     if !inner.settings.workspaces.iter().any(|w| w.id == id) {
         return Err(format!("unknown workspace '{id}'"));
     }
-    if inner.settings.workspaces.len() <= 1 {
-        return Err("the last workspace cannot be removed".to_string());
+    let remaining: Vec<String> = inner
+        .settings
+        .workspaces
+        .iter()
+        .filter(|w| w.id != id)
+        .map(|w| w.id.clone())
+        .collect();
+    if remaining.is_empty() && !delete_sessions {
+        return Err(
+            "the last workspace has nowhere to keep its chats: delete them with it".to_string(),
+        );
     }
+    // The first workspace left takes over, so the app is never left pointing at
+    // one that is gone; with none left there is nothing to point at.
+    let fallback = remaining.first().cloned().unwrap_or_default();
     inner.settings.workspaces.retain(|w| w.id != id);
-    inner.settings.active_workspace = inner.settings.workspaces[0].id.clone();
-    let fallback = inner.settings.active_workspace.clone();
+    inner.settings.active_workspace = fallback.clone();
     for mut record in inner.store.load_all() {
         if record.workspace != id {
             continue;
@@ -2757,6 +2786,19 @@ fn remove_workspace(
             let _ = inner.store.save(&record);
         }
     }
+    Ok(())
+}
+
+/// Remove a workspace, then persist the registry and drop the agents the removed
+/// workspace's choices had built.
+#[tauri::command]
+fn remove_workspace(
+    state: State<'_, Arc<GuiState>>,
+    id: String,
+    delete_sessions: bool,
+) -> Result<Settings, String> {
+    let mut inner = state.lock()?;
+    remove_workspace_in(&mut inner, &id, delete_sessions)?;
     inner.settings.save().map_err(|e| e.to_string())?;
     inner.settings_gen = inner.settings_gen.wrapping_add(1);
     inner.agent_cache.clear();
@@ -4703,10 +4745,74 @@ mod tests {
         assert!(store.move_to("missing-session", "workspace-b").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn the_last_workspace_can_be_removed_and_a_chat_needs_one_to_live_in() {
+        let mut inner = Inner::new();
+        let dir = private_store("remove-last");
+        inner.store = crate::session::SessionStore::new(&dir);
+        let mut settings = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        settings
+            .workspaces
+            .push(crate::settings::Workspace::adopted_from(
+                &settings, "one", 1,
+            ));
+        settings
+            .workspaces
+            .push(crate::settings::Workspace::adopted_from(
+                &settings, "two", 2,
+            ));
+        settings.active_workspace = "one".to_string();
+        inner.settings = settings;
+
+        // A chat is born into the workspace in use.
+        let chat = create_session_in(&inner).expect("a workspace owns it");
+        assert_eq!(chat.workspace, "one");
+        assert_eq!(inner.store.load_all().len(), 1);
+
+        // Removing the active workspace hands its chats to the one that is left.
+        remove_workspace_in(&mut inner, "one", false).expect("removed");
+        assert_eq!(inner.settings.workspaces.len(), 1);
+        assert_eq!(inner.settings.active_workspace, "two");
+        assert_eq!(
+            inner.store.load(&chat.id).expect("kept").workspace,
+            "two",
+            "the chat moved house"
+        );
+
+        // The last one has nowhere to keep a chat, so the keep policy is refused —
+        // and the refusal writes nothing at all, which is the difference between a
+        // refusal and a silent delete.
+        let err = remove_workspace_in(&mut inner, "two", false).expect_err("nowhere to keep it");
+        assert!(err.contains("nowhere to keep"), "{err}");
+        assert_eq!(inner.settings.workspaces.len(), 1, "the row stayed");
+        assert_eq!(inner.settings.active_workspace, "two", "and stayed active");
+        assert!(inner.store.load(&chat.id).is_some(), "and the chat stayed");
+
+        // Deleting them with it is what that refusal asks for.
+        remove_workspace_in(&mut inner, "two", true).expect("removed");
+        assert!(inner.settings.workspaces.is_empty());
+        assert!(inner.settings.active_workspace.is_empty());
+        assert!(inner.store.load_all().is_empty(), "the chats went with it");
+
+        // With no workspace left a chat has nowhere to be created: the refusal the
+        // sidebar's invitation replaces.
+        let err = create_session_in(&inner).expect_err("no workspace");
+        assert!(err.contains("add a workspace"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The settings a migrated install reads as: a file from before workspaces
+    /// existed, which adopts one. A fresh `Settings::default()` is a *new* install instead,
+    /// and one whose last workspace was removed stays without any (§24.6).
+    fn installed_settings() -> crate::settings::Settings {
+        let mut s = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        s.schema_version = crate::settings::UNVERSIONED_SETTINGS;
+        s
+    }
 
     #[test]
     fn a_workspace_can_be_pointed_at_its_own_model() {
-        let mut s = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        let mut s = installed_settings();
         s.migrate();
         let id = s.workspaces[0].id.clone();
         s.set_workspace_runtime(
@@ -4755,7 +4861,7 @@ mod tests {
 
     #[test]
     fn saving_a_preset_copies_the_workspace_and_refuses_a_duplicate_name() {
-        let mut s = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        let mut s = installed_settings();
         s.migrate();
         s.workspaces[0].model = "m/x".to_string();
         let ws_id = s.workspaces[0].id.clone();
@@ -4778,7 +4884,7 @@ mod tests {
 
     #[test]
     fn applying_a_preset_creates_a_divergent_workspace() {
-        let mut s = crate::settings::Settings::from_config_value(&serde_json::Value::Null);
+        let mut s = installed_settings();
         s.migrate();
         let mut w = s.workspaces[0].clone();
         w.model = "preset/model".to_string();

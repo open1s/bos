@@ -776,6 +776,13 @@
         truncated: 0,
         unreadable: 0,
       }),
+      remove_workspace: {
+        workspaces: [],
+        active_workspace: "",
+        presets: [],
+        model: "glm-4.7",
+        context_budget: 8192,
+      },
       create_workspace: {
         workspaces: [
           { id: "w1", name: "bos", root: "/tmp/bos", model: "" },
@@ -2293,6 +2300,95 @@
       calls.length === before && /Open a chat first/.test(d.getElementById("ctx-note").textContent),
     );
     state.activeId = restoreSession;
+
+    // Removing the *last* workspace (rev 115, §24.6). The fixture has three, so
+    // this drives the registry down to the state the user was in — one left — and
+    // then to none, which is the state the panel had no face for before.
+    const wholeRegistry = state.workspaces;
+    const wholeActive = state.activeWorkspace;
+    const wholeSessions = state.sessions;
+    const lastOne = state.workspaces[0];
+    state.workspaces = [lastOne];
+    state.activeWorkspace = lastOne.id;
+    openWorkspaceForm("remove", lastOne.id);
+    const lastForm = d.querySelector("#session-list .ws-form");
+    assert(
+      `the last workspace's remove form states where its chats go instead of offering a choice (${
+        lastForm.querySelector(".ws-form-hint") ? lastForm.querySelector(".ws-form-hint").textContent.slice(0, 48) : "no hint"
+      })`,
+      !!lastForm.querySelector(".ws-form-hint") && !lastForm.querySelector(".ws-del-chats"),
+    );
+    const beforeLast = calls.length;
+    lastForm.querySelector(".ws-form-go").click();
+    await flush();
+    const lastRemove = lastArgs("remove_workspace");
+    assert(
+      `and sends deleteSessions for it even though no box was ticked (${JSON.stringify(lastRemove)})`,
+      called("remove_workspace").length === 1 &&
+        lastRemove.id === lastOne.id &&
+        lastRemove.deleteSessions === true,
+    );
+
+    // An emptied registry is a state with a face: the invitation is the
+    // folder-plus's own gesture, and nothing creates a chat into the void.
+    // The chats went with it (the fixture's answer to the removal above), so the
+    // sessions go too: a registry with none and sessions still pointing at the
+    // removed row is a different state, and one that deliberately still draws
+    // them, because §24.6's keep path leaves a chat reachable.
+    state.workspaces = [];
+    state.sessions = [];
+    state.wsEdit = null;
+    state.activeId = null;
+    renderSidebar();
+    const emptyState = d.querySelector("#session-list .ws-empty");
+    assert(
+      `an emptied registry invites a folder rather than drawing nothing (${
+        emptyState ? emptyState.textContent.trim().slice(0, 48) : "nothing drawn"
+      })`,
+      !!emptyState &&
+        !!emptyState.querySelector(".ws-empty-add") &&
+        !d.querySelector("#session-list .ws-head .ws-name"),
+    );
+    const beforePick = called("choose_folder").length;
+    emptyState.querySelector(".ws-empty-add").click();
+    await flush();
+    assert(
+      "the invitation asks the platform for a folder",
+      called("choose_folder").length === beforePick + 1,
+    );
+
+    // The pick above *became* a workspace, so a chat in it is right. The void is
+    // the state with no workspace at all, which is what the three gestures that
+    // used to create one blindly now refuse.
+    state.workspaces = [];
+    state.activeWorkspace = "";
+    state.activeId = null;
+    renderSidebar();
+    const beforeVoid = calls.length;
+    void newChat();
+    await flush();
+    assert(
+      `no chat is created into the void (${calls.slice(beforeVoid).filter((c) => c.cmd === "create_session").length} create_session calls)`,
+      calls.slice(beforeVoid).every((c) => c.cmd !== "create_session"),
+    );
+    await sendText("hello");
+    assert(
+      "and the composer refuses to send into it",
+      calls.slice(beforeVoid).every((c) => c.cmd !== "send_message"),
+    );
+    assert(
+      `the refusal is said out loud, not swallowed (${
+        [...d.querySelectorAll(".toast")]
+          .map((t) => t.textContent)
+          .filter((t) => /Add a workspace first/.test(t))
+          .join(" / ")
+          .slice(0, 56)
+      })`,
+      [...d.querySelectorAll(".toast")].some((t) => /Add a workspace first/.test(t.textContent)),
+    );
+    state.workspaces = wholeRegistry;
+    state.activeWorkspace = wholeActive;
+    state.sessions = wholeSessions;
 
   } catch (err) {
     assert(`the live-page harness ran to completion (${err})`, false);

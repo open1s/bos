@@ -151,6 +151,22 @@
     // had no entry here, so the Add-workspace dialog and the active-workspace dot
     // stayed English in a Chinese UI. Found by widening the completeness check
     // from the markup's `data-i18n` marks to every key app.js asks for.
+    // A registry with no workspace is a state the sidebar has a face for: the
+    // last one can be removed, and then the invitation is the whole panel (§24.6).
+    "ws.none.hint": {
+      en: "A workspace is a folder. Add one to work in it.",
+      zh: "工作区就是一个文件夹。添加一个开始工作。",
+    },
+    "ws.none.chat": {
+      en: "Add a workspace first: a chat belongs to one",
+      zh: "请先添加工作区：对话属于工作区",
+    },
+    // The last removal has no successor to re-home chats to, so the form states
+    // what happens instead of offering a choice it cannot honour.
+    "ws.remove.last": {
+      en: "This is the last workspace: its chats go with it, because there is no workspace left to keep them in.",
+      zh: "这是最后一个工作区：它的对话会一起删除，因为没有其他工作区可以保留它们。",
+    },
     "ws.active": { en: "Active workspace", zh: "当前工作区" },
     "ws.add": { en: "New workspace", zh: "新建工作区" },
     "ws.add.root": { en: "Choose a root folder for this workspace", zh: "为该工作区选择根目录" },

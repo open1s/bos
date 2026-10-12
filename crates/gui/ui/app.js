@@ -816,7 +816,12 @@ function submitWorkspaceForm(form) {
   const root = (form.querySelector(".ws-root") || {}).value || "";
   if (mode === "remove") {
     const del = form.querySelector(".ws-del-chats");
-    return workspaceCommand(invoke("remove_workspace", { id, deleteSessions: !!(del && del.checked) }));
+    // The last workspace has no successor to keep its chats in, so the form
+    // offers no choice there and the payload says what will happen (§24.6).
+    const last = (state.workspaces || []).length <= 1;
+    return workspaceCommand(
+      invoke("remove_workspace", { id, deleteSessions: last ? true : !!(del && del.checked) }),
+    );
   }
   if (mode === "create") {
     return workspaceCommand(invoke("create_workspace", { name, root }));
@@ -894,12 +899,28 @@ function workspaceFormEl(workspace) {
   const form = el("div", "ws-form");
   if (mode === "remove") {
     form.appendChild(el("div", "ws-form-title", `Remove “${workspace.name}”?`));
-    const label = el("label", "ws-form-row");
-    const del = el("input", "ws-del-chats");
-    del.type = "checkbox";
-    label.appendChild(del);
-    label.appendChild(el("span", "", "delete its chats too"));
-    form.appendChild(label);
+    // "Keep them in a rescued workspace" needs a rescued workspace. The last one
+    // has none, so the choice is not offered — it is stated, because a silent
+    // delete is the one outcome §24.6 rules out (§24.6).
+    if ((state.workspaces || []).length <= 1) {
+      form.appendChild(
+        el(
+          "div",
+          "ws-form-hint",
+          tr(
+            "ws.remove.last",
+            "This is the last workspace: its chats go with it, because there is no workspace left to keep them in.",
+          ),
+        ),
+      );
+    } else {
+      const label = el("label", "ws-form-row");
+      const del = el("input", "ws-del-chats");
+      del.type = "checkbox";
+      label.appendChild(del);
+      label.appendChild(el("span", "", "delete its chats too"));
+      form.appendChild(label);
+    }
     const remove = el("button", "ws-form-go danger", state.wsBusy ? "…" : "Remove");
     remove.addEventListener("click", () => submitWorkspaceForm(form));
     form.appendChild(remove);
@@ -1421,6 +1442,24 @@ function renderSidebar() {
     row.addEventListener("click", () => switchSession(s.id));
     sessionList.appendChild(row);
     }
+  }
+  // No workspace at all is a state with a face: nothing can run, no chat has a
+  // home, and the one gesture that changes that is the folder-plus this panel
+  // already has (§24.6).
+  if (!state.workspaces.length) {
+    const empty = el("div", "ws-empty");
+    empty.appendChild(
+      el(
+        "div",
+        "ws-empty-hint",
+        tr("ws.none.hint", "A workspace is a folder. Add one to work in it."),
+      ),
+    );
+    const add = el("button", "ws-empty-add", tr("btn.addWorkspace", "Add a workspace"));
+    add.type = "button";
+    add.addEventListener("click", () => void addWorkspaceFromPanel());
+    empty.appendChild(add);
+    sessionList.appendChild(empty);
   }
   if (state.wsEdit) {
     const known = state.workspaces.find((w) => w.id === state.wsEdit.id);
@@ -3221,6 +3260,17 @@ async function reloadSessionList() {
    message. */
 async function syncTranscriptToWorkspace() {
   const here = state.activeWorkspace;
+  // With no workspace there is nowhere for a chat to live, so this does not
+  // invent one: the transcript empties out and the sidebar asks for a folder
+  // instead (§24.6). The backend refuses the same create.
+  if (!here) {
+    state.activeId = null;
+    state.promptNav = null;
+    clearAttachments();
+    forgetSkillScope();
+    renderAll();
+    return;
+  }
   const mine = state.sessions.filter(
     (s) => !s.archived && (s.workspace || here) === here,
   );
@@ -3301,6 +3351,12 @@ async function newSessionIn(workspaceId) {
 }
 
 async function newChat() {
+  // A chat belongs to a workspace; with none there is nowhere to put it, and the
+  // backend refuses — so say why rather than letting the refusal surface raw.
+  if (!state.activeWorkspace) {
+    toast(tr("ws.none.chat", "Add a workspace first: a chat belongs to one"));
+    return;
+  }
   const s = await invoke("create_session");
   state.sessions.unshift(s);
   state.activeId = s.id;
@@ -3666,6 +3722,10 @@ function queueFollowUp(text, images) {
    index on before pushing the pair; the backend drops the same tail from
    the stored record, so a failed invoke must splice the saved rows back. */
 async function sendText(text, sessionId = state.activeId, truncateFrom = null, images = []) {
+  if (!sessionId || !state.activeWorkspace) {
+    toast(tr("ws.none.chat", "Add a workspace first: a chat belongs to one"));
+    return false;
+  }
   const msgs = state.cache[sessionId] || (state.cache[sessionId] = []);
   const removed = truncateFrom != null ? msgs.splice(truncateFrom) : null;
   msgs.push({ role: "User", text, reasoning: "", tools: [], images, error: null });

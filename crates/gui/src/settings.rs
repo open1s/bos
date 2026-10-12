@@ -792,7 +792,12 @@ impl Settings {
     /// idempotent, a second call advances nothing and reports `false`.
     pub(crate) fn migrate(&mut self) -> bool {
         let before = self.schema_version;
-        if self.workspaces.is_empty() {
+        // A file from before workspaces existed has none to rescue, so it adopts
+        // the install's settings as one. A file at the current schema already has
+        // an answer — including the empty one, because the last workspace can be
+        // removed (§24.6) — and adopting one there would make that removal a
+        // promise the next load breaks.
+        if self.workspaces.is_empty() && before < SETTINGS_SCHEMA_VERSION {
             let now = crate::session::unix_now();
             self.workspaces
                 .push(Workspace::adopted_from(self, "default", now));
@@ -802,7 +807,14 @@ impl Settings {
             .iter()
             .any(|w| w.id == self.active_workspace)
         {
-            self.active_workspace = self.workspaces[0].id.clone();
+            // No workspace at all is a real state: nothing is active, the globals
+            // still apply (effective falls back to them), and the sidebar asks for
+            // a folder instead of inventing one.
+            self.active_workspace = self
+                .workspaces
+                .first()
+                .map(|w| w.id.clone())
+                .unwrap_or_default();
         }
         self.schema_version = SETTINGS_SCHEMA_VERSION;
         self.schema_version != before
@@ -1173,7 +1185,7 @@ mod tests {
 
     #[test]
     fn a_workspace_runtime_payload_covers_the_policy_fields() {
-        let mut settings = Settings::default();
+        let mut settings = unversioned_settings();
         settings.migrate();
         let id = settings.workspaces[0].id.clone();
         let before = settings.effective();
@@ -1211,7 +1223,7 @@ mod tests {
 
     #[test]
     fn a_workspace_runtime_payload_can_flip_the_memory_switch() {
-        let mut settings = Settings::default();
+        let mut settings = unversioned_settings();
         settings.migrate();
         let id = settings.workspaces[0].id.clone();
         let before = settings.effective().memory_enabled;
@@ -1236,7 +1248,7 @@ mod tests {
 
     #[test]
     fn a_workspace_can_keep_its_own_skills_dir() {
-        let mut settings = Settings::default();
+        let mut settings = unversioned_settings();
         settings.migrate();
         let global = settings.skills_dir.clone();
         let id = settings.workspaces[0].id.clone();
@@ -1258,9 +1270,9 @@ mod tests {
 
     #[test]
     fn a_workspace_can_keep_its_own_memory_file() {
-        let mut settings = Settings::default();
-        // A fresh `Settings` carries no workspaces until `migrate` adopts one for
-        // the current folder.
+        let mut settings = unversioned_settings();
+        // A file from before workspaces existed carries none until `migrate`
+        // adopts one for the current folder.
         settings.migrate();
         let global = settings.memory_path.clone();
         let id = settings.workspaces[0].id.clone();
@@ -1288,6 +1300,16 @@ mod tests {
             "bos-gui-settings-{name}-{}.toml",
             std::process::id()
         ))
+    }
+
+    /// A settings file from before workspaces existed. `migrate` adopts one for the
+    /// install, which is the shape most of these fixtures mean; a fresh
+    /// `Settings::default()` is a *new* install instead, and one whose last
+    /// workspace was removed is believed and stays without any (§24.6).
+    fn unversioned_settings() -> Settings {
+        let mut s = Settings::default();
+        s.schema_version = UNVERSIONED_SETTINGS;
+        s
     }
 
     #[test]
@@ -1415,8 +1437,29 @@ mod tests {
     }
 
     #[test]
+    fn an_emptied_registry_is_not_refilled_with_a_default_workspace() {
+        // A file at the current schema is believed about its workspaces, including
+        // the empty answer: removing the last one must not be undone by the next
+        // load (§24.6).
+        let mut s = Settings::default();
+        assert!(!s.migrate(), "an already-current file advances nothing");
+        assert!(s.workspaces.is_empty(), "no workspace is invented");
+        assert!(s.active_workspace.is_empty(), "and none is active");
+        // The globals still apply with no workspace to fold over them, which is
+        // what keeps a workspace-less app usable.
+        assert_eq!(s.effective().model, s.model);
+        assert!(s.effective_api_key().is_empty());
+
+        // The one case that does adopt: a file that predates workspaces.
+        let mut old = unversioned_settings();
+        assert!(old.migrate(), "the version advances");
+        assert_eq!(old.workspaces.len(), 1);
+        assert_eq!(old.active_workspace, "default");
+    }
+
+    #[test]
     fn memory_defaults_to_one_file_and_follows_a_workspace_that_opts_out() {
-        let mut s = Settings::from_config_value(&serde_json::Value::Null);
+        let mut s = unversioned_settings();
         s.migrate();
         let shared = memory_file(&s);
         assert!(shared.ends_with("gui/memory.jsonl"), "{shared:?}");
@@ -1453,7 +1496,7 @@ mod tests {
 
     #[test]
     fn effective_for_resolves_a_workspace_that_is_not_active() {
-        let mut s = Settings::from_config_value(&serde_json::Value::Null);
+        let mut s = unversioned_settings();
         s.migrate();
         let mut w = Workspace::adopted_from(&s, "second", 1);
         w.model = "second/model".to_string();
@@ -1466,7 +1509,7 @@ mod tests {
 
     #[test]
     fn migration_copies_globals_without_flipping_capabilities() {
-        let mut s = Settings::from_config_value(&serde_json::Value::Null);
+        let mut s = unversioned_settings();
         s.model = "example/model".to_string();
         s.bash_workspace = "/tmp/ws".to_string();
         s.bash_enabled = false;
@@ -1497,7 +1540,7 @@ mod tests {
 
     #[test]
     fn effective_settings_apply_the_workspace_and_inherit_blanks() {
-        let mut s = Settings::from_config_value(&serde_json::Value::Null);
+        let mut s = unversioned_settings();
         s.model = "global/model".to_string();
         s.bash_workspace = "/global".to_string();
         s.migrate();
@@ -1519,7 +1562,7 @@ mod tests {
 
     #[test]
     fn an_unknown_active_workspace_falls_back_to_the_first() {
-        let mut s = Settings::from_config_value(&serde_json::Value::Null);
+        let mut s = unversioned_settings();
         s.migrate();
         s.active_workspace = "gone".to_string();
         s.migrate();
@@ -1565,7 +1608,7 @@ mod tests {
         // The workspace with the folder is deliberately **not** the active one:
         // the `BOS_*` environment overrides reach the active workspace, and a test
         // that cannot tell the file from an override is a test of neither.
-        let mut settings = Settings::from_config_value(&serde_json::Value::Null);
+        let mut settings = unversioned_settings();
         settings.migrate();
         let mut other = settings.workspaces[0].clone();
         other.id = "second".to_string();
