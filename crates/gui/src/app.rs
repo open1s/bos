@@ -15,7 +15,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::caps::{self, Capabilities};
 use crate::runner::{AgentEvent, Runner};
-use crate::session::{unix_now, ChatMessage, Role, SessionRecord, SessionStore};
+use crate::session::{
+    unix_now, ChatMessage, LogMarker, MessageMeta, MessageUsage, Role, SessionRecord, SessionStore,
+};
 use crate::settings::Settings;
 
 /// An in-flight streaming turn.
@@ -29,6 +31,21 @@ struct Streaming {
     started_at: u64,
     /// Background job (M7) that mirrors this stream's output for `jobs_list`.
     job: String,
+}
+
+/// The stop the user aimed at `gen`, if that is the turn being asked about.
+///
+/// A stop names the turn it was aimed at rather than the session, because a session can
+/// have a newer turn in flight by the time an older one finishes; taking it is what stops
+/// one press from marking a turn the user never stopped. A stop named for another
+/// generation is left where it is, so the turn it does name still finds it.
+fn take_stop(stops: &mut HashMap<String, u64>, session_id: &str, gen: u64) -> bool {
+    if stops.get(session_id) == Some(&gen) {
+        stops.remove(session_id);
+        true
+    } else {
+        false
+    }
 }
 
 /// One cached per-session agent: built for a settings generation, carrying
@@ -59,6 +76,9 @@ struct Inner {
     runner: Runner,
     /// In-flight streams by session id: several sessions stream at once.
     streaming: HashMap<String, Streaming>,
+    /// Sessions the user stopped, and the stream generation that stop was aimed at.
+    /// Read once by the finishing turn whose generation it names (5.3).
+    stop_requested: HashMap<String, u64>,
     stream_gen: u64,
     /// Per-server results of the most recent MCP connect pass.
     mcp_status: Vec<crate::mcp::McpStatus>,
@@ -102,6 +122,9 @@ impl Inner {
             app_handle: None,
             runner: Runner::new(),
             streaming: HashMap::new(),
+    // 5.3: the stop the user asked for, by the generation it was aimed at. Keyed by
+    // generation rather than merely by session so a stop cannot leak onto the next turn.
+    stop_requested: HashMap::new(),
             stream_gen: 0,
             mcp_status: Vec::new(),
             mcp_connecting: false,
@@ -600,6 +623,13 @@ struct StreamFinished {
     prompt_tokens: Option<u64>,
     /// Completion tokens likewise.
     completion_tokens: Option<u64>,
+    /// Prompt tokens the provider served from its prompt cache, when it reported
+    /// any. Absent means unknown, and the foot states that as a dash.
+    cache_read_tokens: Option<u64>,
+    /// Whether the user stopped this turn (5.3). The one thing this claims is that the
+    /// stop reached this turn and no other: a turn the runner ended for any other reason
+    /// - a provider error, a shutdown - is not "stopped" and does not say so here.
+    cancelled: bool,
 }
 
 /// List all sessions, most recently active first.
@@ -1345,6 +1375,15 @@ fn goal_action(
         ));
     }
     let updated = goal.clone();
+    // T4: an advance is a transition between turns, so there is no message to carry it
+    // yet. The record keeps it until the next turn is written - and keeps it in the log
+    // even if no turn ever comes, which writing it onto the message now could not.
+    if action == "advance" {
+        record.pending_marker = Some(LogMarker {
+            kind: "goal_advanced".to_string(),
+            at: unix_now(),
+        });
+    }
     inner
         .store
         .save(&record)
@@ -1525,6 +1564,34 @@ fn truncate_session(
         .save(&record)
         .map_err(|err| format!("failed to persist: {err}"))?;
     Ok(record.messages.len())
+}
+
+/// Record the reader's own verdict on one answer.
+///
+/// Local only: the transcript file is the only place it lives and nothing syncs
+/// it, which §5.5 states as a choice rather than an omission. Refusals are the
+/// method's business — this only finds the chat and persists what it wrote.
+#[tauri::command]
+fn set_message_feedback(
+    state: State<'_, Arc<GuiState>>,
+    session_id: String,
+    index: usize,
+    feedback: Option<String>,
+) -> Result<(), String> {
+    let inner = state.lock()?;
+    let mut record = inner
+        .store
+        .load_all()
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+    record.set_feedback(index, feedback)?;
+    record.touch();
+    inner
+        .store
+        .save(&record)
+        .map_err(|err| format!("failed to persist: {err}"))?;
+    Ok(())
 }
 
 /// How many turns this chat's last compaction folded away.
@@ -2243,6 +2310,13 @@ fn stop_streaming(
         Some(id) => {
             if let Some(broker) = inner.broker(&id) {
                 broker.reject_all();
+            }
+            // 5.3: record the stop against the generation it is aimed at, before the
+            // runner is stopped, so the finishing turn can tell that a stop arrived
+            // rather than inferring it from a client-side press.
+            if let Some(stream) = inner.streaming.get(&id) {
+                let gen = stream.gen;
+                inner.stop_requested.insert(id.clone(), gen);
             }
             inner.runner.stop(&id);
             // The stream's job settles as interrupted, matching what the user
@@ -3671,6 +3745,9 @@ fn spawn_forwarder(
         let mut error_buf: Option<String> = None;
         // What the provider said the turn cost, carried to `stream-finished`.
         let mut usage: Option<(u64, u64)> = None;
+        let mut cache_read_tokens: Option<u64> = None;
+        // 5.3: whether this turn was stopped, read where the stream's own record is read.
+        let mut cancelled = false;
         loop {
             let Ok(event) = rx.recv().await else {
                 break;
@@ -3820,8 +3897,31 @@ fn spawn_forwarder(
                     // source: a local estimate would drift from the provider's own
                     // count exactly when the context is close to its limit.
                     usage = agent.last_token_usage();
+                    cache_read_tokens = agent.last_stream_cache_tokens();
+                    // Section 5.2: the session's all-time figure has to survive a
+                    // reload, so the turn's own tokens are written onto the message the
+                    // provider answered with. A re-opened chat then re-sums them
+                    // instead of estimating a number nobody measured.
+                    // T4: the advance is drawn above the first turn after it, so the
+                    // record waits until there is a turn to carry it, and taking it is
+                    // what makes it appear once - a re-open reads it off the message.
+                    // This sits outside the usage branch on purpose: a turn can report
+                    // no tokens and still be the turn the marker belongs above.
+                    if let Some(last) = record.messages.last_mut() {
+                        let meta = last.meta.get_or_insert_with(MessageMeta::default);
+                        if let Some(marker) = record.pending_marker.take() {
+                            meta.marker = Some(marker);
+                        }
+                        if let Some((prompt_tokens, completion_tokens)) = usage {
+                            meta.usage = Some(MessageUsage {
+                                prompt_tokens,
+                                completion_tokens,
+                            });
+                        }
+                    }
                     let _ = inner.store.save(&record);
                 }
+                cancelled = take_stop(&mut inner.stop_requested, &session_id, gen);
                 if inner
                     .streaming
                     .get(&session_id)
@@ -3843,6 +3943,8 @@ fn spawn_forwarder(
                 gen,
                 prompt_tokens,
                 completion_tokens,
+                cache_read_tokens,
+                cancelled,
             },
         );
     });
@@ -4254,6 +4356,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             send_message,
             retry_last,
             truncate_session,
+            set_message_feedback,
             compacted_archive,
             archived_messages,
             session_overview,
@@ -5055,6 +5158,34 @@ mod tests {
     }
     use super::*;
 
+    /// 5.3: a stop names the turn it was aimed at. A later turn has its own generation, so
+    /// an old stop must not mark it - that is what makes the payload's flag trustworthy
+    /// rather than merely present, and it is the rule, not the storage, that this asserts.
+    #[test]
+    fn a_stop_is_taken_only_by_the_generation_it_named() {
+        let mut stops = HashMap::new();
+        stops.insert("s1".to_string(), 7);
+        assert!(take_stop(&mut stops, "s1", 7), "the turn it named takes it");
+        assert!(!take_stop(&mut stops, "s1", 7), "and takes it only once");
+        assert!(stops.is_empty(), "a taken stop is gone");
+    }
+
+    #[test]
+    fn a_stop_named_for_another_turn_is_left_for_that_turn() {
+        let mut stops = HashMap::new();
+        stops.insert("s1".to_string(), 7);
+        assert!(!take_stop(&mut stops, "s1", 8), "a newer turn is not stopped by it");
+        assert_eq!(stops.get("s1"), Some(&7), "it still belongs to turn 7");
+        assert!(take_stop(&mut stops, "s1", 7), "and turn 7 still finds it");
+    }
+
+    #[test]
+    fn a_session_nobody_stopped_is_not_reported_stopped() {
+        let mut stops = HashMap::new();
+        stops.insert("s1".to_string(), 7);
+        assert!(!take_stop(&mut stops, "s2", 7), "another session's stop is not this one's");
+        assert!(!take_stop(&mut HashMap::new(), "s1", 7), "and no stop at all is not one");
+    }
     fn record_with(messages: Vec<ChatMessage>) -> SessionRecord {
         let mut record = SessionRecord::new();
         record.messages = messages;

@@ -369,10 +369,10 @@
     // The fixture is deliberately minimal and has no footer, so build the one
     // slot the registry targets; the shipped footer is asserted by the
     // shipped-page harness instead.
-    let bar = document.getElementById("status-right");
+    let bar = document.getElementById("statusbar");
     if (!bar) {
       bar = document.createElement("span");
-      bar.id = "status-right";
+      bar.id = "statusbar";
       document.body.appendChild(bar);
     }
     Shell.addStatusItem("harness-a", { label: "jobs", value: 1 });

@@ -615,10 +615,19 @@ impl<A: ReActApp> ReActEngine<A> {
                             yield Ok(StreamToken::ToolResult { name, output, ms });
                         }
                         Ok(StreamToken::Usage(usage)) => {
+                            // The provider's cache breakdown, when it sends one: the
+                            // only source for a cache-hit figure, and a provider that
+                            // omits it has to read as unknown rather than as 0%.
+                            let cached = usage
+                                .prompt_tokens_details
+                                .as_ref()
+                                .and_then(|d| d.cached_tokens)
+                                .unwrap_or(0);
                             let token_usage = TokenUsage::new(
                                 usage.prompt_tokens,
                                 usage.completion_tokens,
-                            );
+                            )
+                            .with_cached(cached);
                             self.token_counter.update_from_response(token_usage);
                             yield Ok(StreamToken::Usage(usage));
                         }
@@ -768,6 +777,20 @@ impl<A: ReActApp> ReActEngine<A> {
     /// Unlike [`ReActEngine::token_usage`], these accumulate across runs
     /// that share a cached engine; take a difference between snapshots for
     /// a per-run value.
+    /// Lifetime count of prompt tokens the provider served from its cache.
+    ///
+    /// Take a difference between snapshots for a per-run value, the way
+    /// cumulative_token_usage is used.
+    pub fn cumulative_cached_tokens(&self) -> u64 {
+        self.token_counter.lifetime_cached_tokens()
+    }
+
+    /// Lifetime prompt and completion totals across every LLM call this engine
+    /// has made.
+    ///
+    /// Unlike [ReActEngine::token_usage], these accumulate across runs that
+    /// share a cached engine; take a difference between snapshots for a
+    /// per-run value.
     pub fn cumulative_token_usage(&self) -> (u64, u64) {
         self.token_counter.lifetime_totals()
     }

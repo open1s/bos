@@ -23,6 +23,7 @@ if [ "${1:-}" = "--self-test" ]; then
   trap 'rm -rf "$P"' EXIT
   mkdir -p "$P/src" "$P/ui"
   cp "$here/../src/app.rs" "$P/src/app.rs"
+  cp "$here/../src/session.rs" "$P/src/session.rs"
   cp "$here"/../ui/*.js "$P/ui/"
   python3 - "$P/src/app.rs" <<'PLANT'
 import sys
@@ -68,10 +69,26 @@ unreachable = [c for c in registered if c not in called]
 phantom = [c for c in called_names if c not in registered]
 where = ",".join(sorted({p.split('/')[-1] for p in called.values() for p in p}))
 
+# Section 5.2: a turn's usage crosses a crate boundary as JSON, so the writer's field
+# names and the reader's are one contract. A reader on a different key finds a message
+# that spent something and calls it zero - a measurement nobody made, and worse than the
+# dash it replaces. Both directions are read from source, the way the names above are.
+writer = open('src/session.rs', encoding='utf-8').read()
+reader = chr(10).join(open(p, encoding='utf-8').read() for p in js_files)
+usage_drift = []
+if 'pub(crate) prompt_tokens: u64' not in writer or 'pub(crate) completion_tokens: u64' not in writer:
+    usage_drift.append('session.rs lost the usage fields')
+if 'u.prompt_tokens' not in reader or 'u.completion_tokens' not in reader:
+    usage_drift.append('the reader no longer reads prompt_tokens/completion_tokens')
+if re.search(r'u[.]prompt[^_]', reader):
+    usage_drift.append('the reader reads a key the writer never emits')
+if usage_drift:
+    print('[wiring]  FAIL: the usage keys do not agree across the wire: ' + '; '.join(usage_drift))
+
 print(f'[wiring] registered={len(registered)} invoked={len(called_names)} from={where} '
       f'unreachable={unreachable} phantom={phantom}')
-print(f'[wiring] failures: {1 if (unreachable or phantom) else 0}')
-sys.exit(1 if (unreachable or phantom) else 0)
+print(f'[wiring] failures: {1 if (unreachable or phantom or usage_drift) else 0}')
+sys.exit(1 if (unreachable or phantom or usage_drift) else 0)
 PY
 
 # The plan status vocabulary exists twice - PLAN_ICONS in the UI and the planning

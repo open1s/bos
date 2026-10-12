@@ -125,14 +125,26 @@ pub struct TokenUsage {
     pub completion_tokens: u32,
     /// Prompt plus completion tokens.
     pub total_tokens: u32,
+    /// Prompt tokens the provider served from its own prompt cache.
+    pub cached_tokens: u32,
 }
 
 impl TokenUsage {
+    /// State how many prompt tokens came from the provider's cache.
+    ///
+    /// Kept off TokenUsage::new so every existing caller keeps building the
+    /// value it built before a cache was ever reported.
+    pub fn with_cached(mut self, cached: u32) -> Self {
+        self.cached_tokens = cached;
+        self
+    }
+
     /// Build usage from prompt and completion counts, summing the total.
     pub fn new(prompt: u32, completion: u32) -> Self {
         Self {
             prompt_tokens: prompt,
             completion_tokens: completion,
+            cached_tokens: 0,
             total_tokens: prompt + completion,
         }
     }
@@ -211,6 +223,7 @@ pub struct TokenCounter {
     session_start_tokens: u64,
     total_prompt_tokens: AtomicU64,
     total_completion_tokens: AtomicU64,
+    total_cached_tokens: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -222,6 +235,8 @@ pub struct AtomicTokenUsage {
     pub completion_tokens: AtomicU32,
     /// Atomic total token count.
     pub total_tokens: AtomicU32,
+    /// Atomic cached prompt token count.
+    pub cached_tokens: AtomicU32,
 }
 
 impl Default for AtomicTokenUsage {
@@ -237,6 +252,7 @@ impl AtomicTokenUsage {
             prompt_tokens: AtomicU32::new(0),
             completion_tokens: AtomicU32::new(0),
             total_tokens: AtomicU32::new(0),
+            cached_tokens: AtomicU32::new(0),
         }
     }
 
@@ -248,6 +264,8 @@ impl AtomicTokenUsage {
             .store(usage.completion_tokens, Ordering::Relaxed);
         self.total_tokens
             .store(usage.total_tokens, Ordering::Relaxed);
+        self.cached_tokens
+            .store(usage.cached_tokens, Ordering::Relaxed);
     }
 
     /// Read the counters as a [`TokenUsage`].
@@ -256,6 +274,7 @@ impl AtomicTokenUsage {
             prompt_tokens: self.prompt_tokens.load(Ordering::Relaxed),
             completion_tokens: self.completion_tokens.load(Ordering::Relaxed),
             total_tokens: self.total_tokens.load(Ordering::Relaxed),
+            cached_tokens: self.cached_tokens.load(Ordering::Relaxed),
         }
     }
 }
@@ -270,6 +289,7 @@ impl TokenCounter {
             session_start_tokens: 0,
             total_prompt_tokens: AtomicU64::new(0),
             total_completion_tokens: AtomicU64::new(0),
+            total_cached_tokens: AtomicU64::new(0),
         }
     }
 
@@ -284,6 +304,8 @@ impl TokenCounter {
             .fetch_add(u64::from(usage.prompt_tokens), Ordering::Relaxed);
         self.total_completion_tokens
             .fetch_add(u64::from(usage.completion_tokens), Ordering::Relaxed);
+        self.total_cached_tokens
+            .fetch_add(u64::from(usage.cached_tokens), Ordering::Relaxed);
         self.current_usage.set(usage);
         self.total_requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -304,6 +326,18 @@ impl TokenCounter {
     ///
     /// Unlike [`TokenCounter::usage`], which reports only the current
     /// request, these sums accumulate for as long as the counter exists.
+    /// Lifetime count of prompt tokens the provider served from its cache.
+    ///
+    /// Zero for a provider that never reports the breakdown, which is why the
+    /// caller states a cache hit as a dash rather than as 0%.
+    pub fn lifetime_cached_tokens(&self) -> u64 {
+        self.total_cached_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Lifetime prompt and completion totals across every recorded request.
+    ///
+    /// Unlike [TokenCounter::usage], which reports only the current request,
+    /// these sums accumulate for as long as the counter exists.
     pub fn lifetime_totals(&self) -> (u64, u64) {
         (
             self.total_prompt_tokens.load(Ordering::Relaxed),
@@ -380,5 +414,24 @@ impl TokenCounter {
 impl Default for TokenCounter {
     fn default() -> Self {
         Self::with_default()
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn a_provider_cache_breakdown_is_counted_and_absent_means_unknown() {
+        let counter = TokenCounter::with_default();
+        assert_eq!(counter.lifetime_cached_tokens(), 0, "nothing reported yet");
+        counter.update_from_response(TokenUsage::new(120, 45).with_cached(96));
+        assert_eq!(counter.lifetime_cached_tokens(), 96);
+        // A provider that reports no breakdown leaves the count where it was: the
+        // caller has to be able to tell "nothing was cached" from "not reported",
+        // and the foot states the second as a dash rather than as 0%.
+        counter.update_from_response(TokenUsage::new(10, 2));
+        assert_eq!(counter.lifetime_cached_tokens(), 96);
+        assert_eq!(counter.lifetime_totals(), (130, 47));
     }
 }

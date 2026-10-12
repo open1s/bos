@@ -234,6 +234,9 @@ pub struct Agent {
     context_cache: std::sync::Mutex<Option<AgentReactContext>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     last_stream_tokens: std::sync::Mutex<Option<(u64, u64)>>,
+    /// Cached prompt tokens from the same stream, when the provider reported them.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    last_stream_cache_tokens: std::sync::Mutex<Option<u64>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     last_stream_tool_calls: std::sync::Mutex<u64>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
@@ -272,6 +275,7 @@ impl Agent {
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
+            last_stream_cache_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0),
             last_stream_tool_time: std::sync::Mutex::new(std::time::Duration::ZERO),
         }
@@ -564,6 +568,12 @@ impl Agent {
     /// Token usage from the most recent stream, if any.
     pub fn last_token_usage(&self) -> Option<(u64, u64)> {
         *self.last_stream_tokens.lock().unwrap()
+    }
+
+    /// Prompt tokens the provider served from its cache in the most recent
+    /// stream, if the provider reported the breakdown at all.
+    pub fn last_stream_cache_tokens(&self) -> Option<u64> {
+        *self.last_stream_cache_tokens.lock().unwrap()
     }
 
     /// Number of tool calls seen in the most recent stream.
@@ -950,6 +960,7 @@ impl Clone for Agent {
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
+            last_stream_cache_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0),
             last_stream_tool_time: std::sync::Mutex::new(std::time::Duration::ZERO),
         }

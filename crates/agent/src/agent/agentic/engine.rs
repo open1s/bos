@@ -401,6 +401,7 @@ impl Agent {
         // Snapshot engine counters before the run so the values stored for
         // this stream describe this run, not the engine's whole lifetime.
         let (pre_prompt_tokens, pre_completion_tokens) = engine.cumulative_token_usage();
+        let pre_cached_tokens = engine.cumulative_cached_tokens();
         let pre_tool_calls = engine.tool_call_count();
         let pre_tool_time = engine.tool_time();
 
@@ -421,6 +422,8 @@ impl Agent {
             {
                 let mut ts = self.last_stream_tokens.lock().unwrap();
                 *ts = Some((0, 0));
+                let mut cs = self.last_stream_cache_tokens.lock().unwrap();
+                *cs = Some(0);
                 let mut tc = self.last_stream_tool_calls.lock().unwrap();
                 *tc = 0;
                 let mut tt = self.last_stream_tool_time.lock().unwrap();
@@ -502,8 +505,12 @@ impl Agent {
                 );
                 let tool_calls = engine.tool_call_count().saturating_sub(pre_tool_calls);
                 let tool_time = engine.tool_time().saturating_sub(pre_tool_time);
+                let cached_tokens =
+                    engine.cumulative_cached_tokens().saturating_sub(pre_cached_tokens);
                 let mut ts = self.last_stream_tokens.lock().unwrap();
                 *ts = Some(tokens);
+                let mut cs = self.last_stream_cache_tokens.lock().unwrap();
+                *cs = Some(cached_tokens);
                 let mut tc = self.last_stream_tool_calls.lock().unwrap();
                 *tc = tool_calls;
                 let mut tt = self.last_stream_tool_time.lock().unwrap();

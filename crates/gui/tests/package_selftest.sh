@@ -164,5 +164,21 @@ PY
 printf '%s\n' "$perm" | grep -Eq 'core:(default|event:(default|allow-listen))' \
   && ok || bad "no capability grants the event channel: every listen() is refused at runtime"
 
+# H0: the window has to overlay its title bar, or the webview is pushed down by the
+# native strip and every y-target in the layout spec is off by its height. This is a
+# native key, so no fixture can see it: the config is where it can be checked, and a
+# key silently dropped here is a layout regression nothing else would catch.
+chrome="$(python3 - "$PWD" <<'PY'
+import json, os, sys
+conf = json.loads(open(os.path.join(sys.argv[1], "tauri.conf.json"), encoding="utf-8").read())
+win = (conf.get("app", {}).get("windows") or [{}])[0]
+print(f'{win.get("titleBarStyle")}|{win.get("hiddenTitle")}')
+PY
+)"
+case "$chrome" in
+  "Overlay|True") ok ;;
+  *) bad "H0: the window does not overlay its title bar (titleBarStyle|hiddenTitle=$chrome)" ;;
+esac
+
 echo "[package] checks=$checks failures=$fail"
 [ "$fail" = 0 ]

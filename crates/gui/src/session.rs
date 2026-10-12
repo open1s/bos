@@ -18,6 +18,20 @@ pub(crate) enum Role {
     Assistant,
 }
 
+/// A goal transition recorded against the session's log (T4).
+///
+/// It is not a turn: the transcript draws it as a pill, and every count in the page
+/// filters to User and Assistant, so it cannot enter one. The backend keeps it on the
+/// record until the first turn after the advance is written - which is where the
+/// reference draws it - and older session files simply have none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LogMarker {
+    /// What happened. Only `goal_advanced` is produced today.
+    pub(crate) kind: String,
+    /// Unix seconds when it happened.
+    pub(crate) at: u64,
+}
+
 /// A tool invocation surfaced while streaming a response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ToolEvent {
@@ -57,6 +71,40 @@ pub(crate) struct ChatMessage {
     /// Error description when the turn failed.
     #[serde(default)]
     pub(crate) error: Option<String>,
+    /// What the reader has said about this message. Local: nothing syncs it, and
+    /// the transcript file is the only place it lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) meta: Option<MessageMeta>,
+}
+
+/// The reader's own notes about one message.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct MessageMeta {
+    /// A goal transition the reader should see above this turn (T4). It rides on the
+    /// message for the same reason the token count does: the transcript is what the UI
+    /// reloads, so anything the UI has to show again after a re-open belongs here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) marker: Option<LogMarker>,
+    /// \`"good"\` or \`"bad"\`; absent once the reader takes the verdict back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) feedback: Option<String>,
+    /// What this turn cost, when the provider reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) usage: Option<MessageUsage>,
+}
+
+/// What one turn cost, as the provider counted it.
+///
+/// It lives on the message so a re-opened chat can add up what a session has
+/// spent with no engine left to ask: the transcript is the only thing here that
+/// outlives the process, and a figure that has to be re-estimated after a reload
+/// is a figure that changes when nobody did any work.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct MessageUsage {
+    /// Prompt tokens billed for this turn.
+    pub(crate) prompt_tokens: u64,
+    /// Completion tokens billed for this turn.
+    pub(crate) completion_tokens: u64,
 }
 
 impl ChatMessage {
@@ -69,6 +117,7 @@ impl ChatMessage {
             tools: Vec::new(),
             images: Vec::new(),
             error: None,
+            meta: None,
         }
     }
 
@@ -88,6 +137,7 @@ impl ChatMessage {
             tools: Vec::new(),
             images: Vec::new(),
             error: None,
+            meta: None,
         }
     }
 
@@ -186,6 +236,12 @@ pub(crate) struct SessionRecord {
     /// have none).
     #[serde(default)]
     pub(crate) goal: Option<Goal>,
+    /// A goal transition waiting for the turn that will carry it (T4). The advance
+    /// happens between turns, so there is no message to put it on yet; the finish
+    /// handler moves it onto the first one it writes, and taking it is what makes it
+    /// appear exactly once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_marker: Option<LogMarker>,
     /// Whether the sidebar floats this chat above the others in its workspace.
     ///
     /// A pin is presentation, not configuration: it changes no model, no tool
@@ -224,6 +280,8 @@ impl SessionRecord {
             messages: Vec::new(),
             plan: Vec::new(),
             goal: None,
+            // A fresh session has had no goal transition to carry (T4).
+            pending_marker: None,
             pinned: false,
             archived_at: None,
             archived: Vec::new(),
@@ -259,6 +317,9 @@ impl SessionRecord {
             // A branch stays in the workspace its parent was written in, so the
             // fork cannot silently change the agent's tools or model.
             workspace: self.workspace.clone(),
+            // The branch carries the plan but not a goal transition waiting for a turn
+            // the branch has not written yet: the parent's next turn is where it belongs.
+            pending_marker: None,
             messages: self.messages[..index].to_vec(),
             plan: self.plan.clone(),
             // A branch inherits the goal it was branched from: the work is still
@@ -335,6 +396,41 @@ impl SessionRecord {
         self.messages.truncate(index);
         Ok(self.messages.len())
     }
+
+    /// Record, change, or clear the reader's own verdict on one message.
+    ///
+    /// An unknown value is refused rather than stored: the transcript is the only
+    /// copy, so a typo would be permanent. \`None\` is the third click, which takes
+    /// the verdict back.
+    pub(crate) fn set_feedback(
+        &mut self,
+        index: usize,
+        value: Option<String>,
+    ) -> Result<(), String> {
+        match value.as_deref() {
+            None | Some("good") | Some("bad") => {}
+            Some(other) => return Err(format!("unknown verdict: {other}")),
+        }
+        let message = self
+            .messages
+            .get_mut(index)
+            .ok_or_else(|| format!("no message at {index}"))?;
+        match value {
+            Some(value) => {
+                message
+                    .meta
+                    .get_or_insert_with(MessageMeta::default)
+                    .feedback = Some(value);
+            }
+            None => {
+                if let Some(meta) = message.meta.as_mut() {
+                    meta.feedback = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
 }
 
 /// Current time in unix seconds.
@@ -1055,6 +1151,97 @@ mod tests {
     }
 
     #[test]
+    fn set_feedback_records_replaces_and_clears() {
+        let mut record = SessionRecord::new();
+        record.messages.push(ChatMessage::assistant());
+
+        record.set_feedback(0, Some("good".into())).expect("good");
+        assert_eq!(
+            record.messages[0]
+                .meta
+                .as_ref()
+                .and_then(|m| m.feedback.as_deref()),
+            Some("good")
+        );
+
+        // The two verdicts share one slot: that is what makes them exclusive, and
+        // it is a property of the store rather than of whoever drew the buttons.
+        record.set_feedback(0, Some("bad".into())).expect("bad");
+        assert_eq!(
+            record.messages[0]
+                .meta
+                .as_ref()
+                .and_then(|m| m.feedback.as_deref()),
+            Some("bad")
+        );
+
+        // The third click takes it back.
+        record.set_feedback(0, None).expect("clear");
+        assert_eq!(
+            record.messages[0]
+                .meta
+                .as_ref()
+                .and_then(|m| m.feedback.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn set_feedback_refuses_what_it_cannot_mean() {
+        let mut record = SessionRecord::new();
+        record.messages.push(ChatMessage::assistant());
+
+        // A value the UI never sends is refused rather than stored: the transcript
+        // is the only copy, so a typo there would be permanent.
+        assert!(record.set_feedback(0, Some("great".into())).is_err());
+        assert!(record.messages[0].meta.is_none());
+
+        // An index past the end names a message that is not there.
+        assert!(record.set_feedback(9, Some("good".into())).is_err());
+    }
+
+    #[test]
+    fn a_verdict_round_trips_and_an_older_transcript_still_loads() {
+        let mut record = SessionRecord::new();
+        record.messages.push(ChatMessage::assistant());
+        record.set_feedback(0, Some("good".into())).expect("good");
+
+        let json = serde_json::to_string(&record).expect("serialize");
+        let back: SessionRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.messages[0]
+                .meta
+                .as_ref()
+                .and_then(|m| m.feedback.as_deref()),
+            Some("good")
+        );
+
+        // Additive because the field is an Option: serde loads a missing Option as
+        // None even without an attribute, which an injection proved by removing the
+        // attribute and watching this stay green. The attribute pair is about the
+        // *write* side, asserted below.
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("json value");
+        let removed = value["messages"][0]
+            .as_object_mut()
+            .expect("a message object")
+            .remove("meta");
+        assert!(removed.is_some(), "the verdict must be in the JSON at all");
+        let legacy: SessionRecord = serde_json::from_value(value).expect("legacy loads");
+        assert!(legacy.messages[0].meta.is_none());
+
+        // The write side, which is the half the attribute actually buys: a message
+        // nobody has judged carries no `meta` key at all, so this change cannot churn
+        // every transcript file in the store just by existing.
+        let mut unjudged = SessionRecord::new();
+        unjudged.messages.push(ChatMessage::assistant());
+        let plain = serde_json::to_string(&unjudged).expect("serialize");
+        assert!(
+            !plain.contains("\"meta\""),
+            "an unjudged message must write no meta key: {plain}"
+        );
+    }
+
+    #[test]
     fn truncate_from_drops_tail_and_keeps_prefix() {
         let mut record = SessionRecord::new();
         record.messages.push(ChatMessage::user("one"));
@@ -1623,5 +1810,54 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod usage_tests {
+    use super::{ChatMessage, LogMarker, MessageMeta};
+
+    #[test]
+    fn the_marker_rides_on_the_message_and_survives_a_round_trip() {
+        let mut message = ChatMessage::user("hi");
+        message.meta = Some(MessageMeta {
+            marker: Some(LogMarker {
+                kind: "goal_advanced".to_string(),
+                at: 1_760_000_000,
+            }),
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&message).expect("serialize");
+        let back: ChatMessage = serde_json::from_str(&json).expect("deserialize");
+        let marker = back.meta.and_then(|m| m.marker).expect("the marker survives");
+        assert_eq!(marker.kind, "goal_advanced");
+        assert_eq!(marker.at, 1_760_000_000);
+    }
+
+    #[test]
+    fn a_meta_without_a_marker_writes_none() {
+        let json = serde_json::to_string(&MessageMeta::default()).expect("serialize");
+        assert!(!json.contains("marker"), "empty meta stays empty: {json}");
+    }
+
+    use super::*;
+
+    #[test]
+    fn a_turns_usage_rides_on_the_message_and_survives_a_round_trip() {
+        let mut message = ChatMessage::user("hi");
+        assert!(message.meta.is_none(), "nothing spent yet");
+        message.meta.get_or_insert_with(MessageMeta::default).usage =
+            Some(MessageUsage { prompt_tokens: 120, completion_tokens: 45 });
+        let json = serde_json::to_string(&message).expect("serialises");
+        assert!(json.contains("prompt_tokens"), "the field is written: {json}");
+        let back: ChatMessage = serde_json::from_str(&json).expect("deserialises");
+        let usage = back.meta.expect("meta").usage.expect("usage");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (120, 45));
+        // A message with no usage must not grow an empty one on the way back, or a
+        // re-opened chat would count a turn that never ran.
+        let bare = ChatMessage::user("hi");
+        let json = serde_json::to_string(&bare).expect("serialises");
+        assert!(!json.contains("usage"), "an empty usage is not written: {json}");
     }
 }

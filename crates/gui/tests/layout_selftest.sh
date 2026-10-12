@@ -48,8 +48,10 @@ b = d["boxes"]
 def box(k):
     v = b.get(k)
     return "none" if not v else f"{v[0]}..{v[0]+v[2]}({v[2]}x{v[3]})"
+head = b.get("chat-head")
+headTop = "none" if not head else head[1]
 print(f'width={d["viewport"]} doc={d["docClientW"]}/{d["docScrollW"]} '
-      f'sidebar={box("sidebar")} main={box("main")} composer={box("composer")} '
+      f'headTop={headTop} sidebar={box("sidebar")} main={box("main")} composer={box("composer")} '
       f'statusbar={box("statusbar")} offscreen=[{",".join(d["offscreen"])}] '
       f'sidebarSqueezed={d.get("sidebarSqueezed")} rows={d.get("sidebarRows")} '
       f'modalCard={d["modal"]["card"]} modalOutside=[{",".join(d["modal"]["outside"])}] '
@@ -73,6 +75,16 @@ PY
   echo "$line" | grep -q "doc=[0-9]*/[0-9]*" || fail=1
   echo "$line" | grep -q "scrolledX=0" || { echo "[layout]  WIDE: the window can be panned sideways"; fail=1; }
   echo "$line" | grep -q "offscreen=\[\]" || { echo "[layout]  WIDE: elements leave the viewport"; fail=1; }
+  # H0: the native title strip is an overlay now, so the webview starts at the top of
+  # the window and the in-app header owns y0 (the reference's header row is y0-50).
+  # A header below 44 means a strip's worth of space came back into the page. The
+  # overlay itself is a native key, guarded where the config lives (package_selftest);
+  # this is the half a browser can see, and it is the half that regresses in CSS.
+  headTop="$(printf '%s' "$line" | sed -n 's/.*headTop=\([-0-9]*\).*/\1/p')"
+  if [ -z "$headTop" ] || [ "$headTop" -ge 44 ]; then
+    echo "[layout]  WIDE: H0 - the header does not own the top of the window (headTop=$headTop, wanted < 44)"
+    fail=1
+  fi
   echo "$line" | grep -q "modalOutside=\[\]" || { echo "[layout]  WIDE: the settings modal leaves the viewport"; fail=1; }
   # The ☰ is shown by the layout *state*, not a width: at 721-1023px the column is a
   # 56px rail whose chat list is hidden, so the door must be there and must bring the

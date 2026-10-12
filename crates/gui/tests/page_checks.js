@@ -506,7 +506,7 @@
 
     // The shipped footer accepts an item from any surface, and removing it
     // leaves the footer as it was.
-    const shippedBar = d.getElementById("status-right");
+    const shippedBar = d.getElementById("statusbar");
     const added =
       typeof Shell !== "undefined" &&
       typeof Shell.addStatusItem === "function" &&
@@ -560,6 +560,17 @@
     };
     const calls = [];
     const fixtures = {
+      set_message_feedback: () => null,
+      // T4: the goal machine's one transition this round drives. The answer is the
+      // advanced state (two rounds), and the check asserts the argument that was sent
+      // rather than teaching this fixture to vary by it.
+      goal_action: {
+        state: "active",
+        objective: "Ship T4",
+        rounds: 2,
+        max_rounds: 40,
+        blocked_reason: null,
+      },
       jobs_list: [
         { id: "j1", label: "cargo test", kind: "shell", state: "running", started_at: 100, finished_at: null, bytes: 2048, dropped_bytes: 0, error: null },
         { id: "j2", label: "lint", kind: "run", state: "failed", started_at: 100, finished_at: 105, bytes: 512, dropped_bytes: 0, error: "exit 1" },
@@ -2546,9 +2557,476 @@
     answerRow().querySelector(".msg-bad").click();
     await flush();
     const storedBad = state.feedback[state.activeId + ":" + (state.cache[state.activeId].length - 1)];
+    // B1-B3: the three centered popups, from numbers the fixture states exactly.
+    const priorId = state.activeId;
+    const priorTools = state.toolCount;
+    const priorBudget = state.budget;
+    const priorUsage = state.usage;
+    const priorRate = state.tokRate;
+    const priorHit = state.cacheHit;
+    state.activeId = "page-checks-b";
+    state.cache["page-checks-b"] = [
+      { role: "User", text: "abcd", reasoning: null, tools: [], error: null },
+      { role: "Assistant", text: "efgh", reasoning: null, tools: [], error: null },
+    ];
+    state.toolCount = 2;
+    state.budget = 200;
+    state.usage = { prompt: 100, completion: 25 };
+    state.tokRate = undefined;
+    state.cacheHit = undefined;
+    window.renderStatus();
+    const statTextOf = (id) => document.getElementById(id).querySelector(".stat-text").textContent;
+    assert(
+      `B1: the bar states the session's turns and steps, and a dash where no turn has produced a rate (${statTextOf("stat-turns")})`,
+      statTextOf("stat-turns") === "1 turns 2 steps · — tok/s",
+    );
+  // S5: the avatar row is the account menu. It is built from the shared row-menu
+  // renderer, so what is asserted is the contract the app promises every menu: the four
+  // items, Escape closes it, and focus comes back to the row that opened it. A menu that
+  // closes but leaves focus on the floor is a keyboard trap for the next Tab.
+  const account = d.getElementById("side-account");
+  assert(
+    "S5: the avatar row is a menu button (haspopup=" + account.getAttribute("aria-haspopup") +
+      ", expanded=" + account.getAttribute("aria-expanded") + ")",
+    account.getAttribute("aria-haspopup") === "menu" &&
+      account.getAttribute("aria-expanded") === "false",
+  );
+  account.click();
+  await flush();
+  const accountItems = Array.from(d.querySelectorAll(".row-menu .row-menu-item"));
+  assert(
+    "S5: the account menu lists its four items (" +
+      accountItems.map((b) => b.textContent.trim()).join(" / ") + ")",
+    accountItems.length === 4 &&
+      accountItems.map((b) => b.textContent.trim()).join(" / ") ===
+        "Settings / Keyboard shortcuts / Theme / Language",
+  );
+  assert(
+    "S5: an open account menu says so (aria-expanded=" + account.getAttribute("aria-expanded") + ")",
+    account.getAttribute("aria-expanded") === "true",
+  );
+  const openAccountMenu = d.querySelector(".row-menu");
+  if (openAccountMenu) {
+    openAccountMenu.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  }
+  await flush();
+  assert(
+    "S5: Escape closes the account menu and returns focus to the row (menu=" +
+      !!d.querySelector(".row-menu") + ", focus=" + (d.activeElement && d.activeElement.id) + ")",
+    !d.querySelector(".row-menu") && d.activeElement === account,
+  );
+  // The Settings item has to reach Settings, not merely be labelled "Settings": the
+  // proof is a pane that lays out, which is false while the modal is closed. Close it
+  // first, so the pane that lays out afterwards can only be this item's doing - an
+  // earlier check having left the modal open would make the assertion unfalsifiable.
+  window.closeSettings();
+  await flush();
+  account.click();
+  await flush();
+  const settingsItem = Array.from(d.querySelectorAll(".row-menu .row-menu-item"))
+    .find((b) => b.textContent.trim() === "Settings");
+  if (settingsItem) settingsItem.click();
+  await flush();
+  await flush();
+  const shownPane = Array.from(d.querySelectorAll(".set-pane"))
+    .find((pane) => getComputedStyle(pane).display !== "none" && pane.getBoundingClientRect().height > 0);
+  assert(
+    "S5: the Settings item opens Settings (laid-out pane=" + (shownPane && shownPane.id) +
+      ", item=" + !!settingsItem + ")",
+    !!settingsItem && !!shownPane,
+  );
+  window.closeSettings();
+
+  // S2: the sidebar's three global-panel rows navigate into the settings pane that
+  // owns each area. The row is clicked the way a user clicks it, and the check reads
+  // the two effects that matter - the pane it lands on and the tab the rail marks as
+  // selected - because a row wired to the wrong section still opens Settings, and a
+  // check that only asked whether Settings opened would pass for the wrong reason.
+  const priorTab = d.querySelector(".set-tab.active");
+  const priorSection = priorTab ? priorTab.dataset.section : null;
+  for (const [buttonId, sectionId] of [
+    ["nav-plugins", "cap-list"],
+    ["nav-automation", "jobs-section"],
+    ["nav-mcp", "set-mcp"],
+  ]) {
+    d.getElementById(buttonId).click();
+    await flush();
+    await flush();
+    const tab = d.getElementById("set-tab-" + sectionId);
+    const pane = d.querySelector("#" + sectionId + ".set-pane.active");
+    assert(
+      "S2: the " + buttonId + " row lands on " + sectionId + " (selected=" +
+        (tab && tab.getAttribute("aria-selected")) + ", paneActive=" + !!pane + ")",
+      !!tab && tab.getAttribute("aria-selected") === "true" && !!pane,
+    );
+  }
+  if (priorSection) window.focusSection(priorSection);
+  window.closeSettings();
+
+    // A reported cache hit renders as the provider's own share. The arithmetic that
+    // turns a cache read over a prompt into that percentage lives in the finish
+    // handler, where only the live layer can reach it; what this states is that a
+    // percentage the session holds is drawn as one, with its percent sign.
+    state.cacheHit = 80;
+    window.renderStatus();
+    assert(
+      `B2: a reported cache hit is stated as a percentage (${statTextOf("stat-tokens")})`,
+      statTextOf("stat-tokens") === "— tok · Cache hit 80%",
+    );
+    // Section 5.2: in a fresh process the session has no accumulator, so the total
+    // comes from the transcript's own meta.usage - the field the finish handler writes
+    // onto the message. Both halves matter here: that the sum is read at all, and that
+    // it is read off the field names the store actually carries.
+    const priorCacheForUsage = state.cache[state.activeId];
+    const priorTotalsForUsage = state.usageTotals;
+    state.usageTotals = {};
+    state.cache[state.activeId] = [
+      { role: "User", text: "hi" },
+      {
+        role: "Assistant",
+        text: "hello",
+        meta: { usage: { prompt_tokens: 120, completion_tokens: 45 } },
+      },
+    ];
+    window.renderStatus();
+    assert(
+      "§5.2: a reloaded transcript's own meta.usage is what the total counts (" +
+        statTextOf("stat-tokens") + ")",
+      /165 tok/.test(statTextOf("stat-tokens")),
+    );
+    state.cache[state.activeId] = priorCacheForUsage;
+    state.usageTotals = priorTotalsForUsage;
+    window.renderStatus();
+    // T6: the chip at the end of a turn. This is the one check here that has to draw a
+    // transcript of its own, and the checks after it read the rows that were already on
+    // screen - so those nodes are kept and put back at the end, listeners and all.
+    const priorRowsForT6 = Array.from(messagesEl.children);
+    // The fixture hands the transcript two turns'
+    // worth of the same meta.usage, and the assertions are about what a reader sees:
+    // the footer states what the session had spent *through that turn*, and the panel
+    // splits it into the turn's own arrows beside the session total.
+    state.usageTotals = {};
+    state.cache[state.activeId] = [
+      { role: "User", text: "hi" },
+      { role: "Assistant", text: "T6 fixture: first answer", meta: { usage: { prompt_tokens: 100, completion_tokens: 20 } } },
+      { role: "User", text: "T6 fixture: again" },
+      { role: "Assistant", text: "T6 fixture: second answer", meta: { usage: { prompt_tokens: 40, completion_tokens: 5 } } },
+    ];
+    window.renderMessages();
+    await flush();
+    const usageChips = Array.from(d.querySelectorAll(".msg-usage"));
+    assert(
+      "T6: a finished turn carries the session's usage through it (" +
+        usageChips.map((c) => c.textContent.trim()).join(" / ") + ")",
+      usageChips.length === 2 &&
+        usageChips[0].textContent.trim() === "Usage 120 tok" &&
+        usageChips[1].textContent.trim() === "Usage 165 tok" &&
+        /^Usage \d+(\.\d+)?[KM]? tok$/.test(usageChips[1].textContent.trim()),
+    );
+    usageChips[1].click();
+    await flush();
+    const usagePop = d.querySelector(".usage-pop");
+    const usageLines = usagePop
+      ? Array.from(usagePop.querySelectorAll(".usage-row")).map((r) => r.textContent.trim())
+      : [];
+    assert(
+      "T6: the panel splits the turn's own numbers from the session's (" +
+        usageLines.join(" | ") + ")",
+      !!usagePop &&
+        usagePop.getAttribute("role") === "dialog" &&
+        usageChips[1].getAttribute("aria-expanded") === "true" &&
+        usageLines[0].includes("↑ 40") &&
+        usageLines[0].includes("↓ 5") &&
+        usageLines[1].includes("165"),
+    );
+    d.querySelector(".msg-usage").dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    d.querySelector(".usage-pop").dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    await flush();
+    assert(
+      "T6: Escape closes the panel and hands the keyboard back to the chip (panel=" +
+        !!d.querySelector(".usage-pop") + ", focus=" + (d.activeElement && d.activeElement.className) + ")",
+      !d.querySelector(".usage-pop") && d.activeElement === usageChips[1],
+    );
+    // The meter inside the panel is a provider round trip, so it is read once per open
+    // and never per repaint - the same flat rule the status popups obey. Two opens and
+    // one repaint between them must cost exactly two reads.
+    const meterCallsAtOpen = called("token_meter").length;
+    usageChips[1].click();
+    await flush();
+    await flush();
+    window.renderMessages();
+    await flush();
+    await flush();
+    const meterCallsAfterOneOpenAndARepaint = called("token_meter").length;
+    usageChips[1].click();
+    await flush();
+    usageChips[1].click();
+    await flush();
+    await flush();
+    assert(
+      "T6: the panel's meter is read once per open and not per repaint (reads=" +
+        (meterCallsAfterOneOpenAndARepaint - meterCallsAtOpen) + " then " +
+        (called("token_meter").length - meterCallsAfterOneOpenAndARepaint) + ")",
+      meterCallsAfterOneOpenAndARepaint - meterCallsAtOpen === 1 &&
+        called("token_meter").length - meterCallsAfterOneOpenAndARepaint === 1,
+    );
+    window.closeUsagePop(false);
+    state.usageTotals = {};
+    state.cache[state.activeId] = [
+      { role: "User", text: "hi" },
+      { role: "Assistant", text: "T6 fixture: nothing measured here" },
+    ];
+    window.renderMessages();
+    await flush();
+    assert(
+      "T6: a session that has spent nothing carries no usage chip (" +
+        d.querySelectorAll(".msg-usage").length + " chips)",
+      d.querySelectorAll(".msg-usage").length === 0,
+    );
+    state.cache[state.activeId] = priorCacheForUsage;
+    state.usageTotals = priorTotalsForUsage;
+    // Rebuilding from the cache is not enough: the row signatures are deliberately
+    // lossy, so a fixture row and a real one can pair up. The nodes go back instead.
+    window.renderMessages();
+    messagesEl.replaceChildren(...priorRowsForT6);
+    // T7: an attachment is a button that opens the original in the document panel. The
+    // assertions are the reference's own promise: the row shows a thumbnail and the
+    // name, the click titles a tab with that name, and the panel holds the same payload
+    // at the panel's width. The DOM goes back afterwards, for the same reason as above.
+    const priorRowsForT7 = Array.from(messagesEl.children);
+    const priorActiveForT7 = state.activeId;
+    state.cache[state.activeId] = [
+      { role: "User", text: "", images: ["data:image/png;base64,iVBORw0KGgo="] },
+      { role: "Assistant", text: "here is the picture" },
+    ];
+    window.renderMessages();
+    await flush();
+    const imageBtn = d.querySelector("#messages .msg-image");
+    const imageName = imageBtn ? imageBtn.querySelector(".msg-image-name") : null;
+    assert(
+      "T7: an attachment renders as a button with its thumbnail and name (" +
+        (imageName ? imageName.textContent : "none") + ")",
+      !!imageBtn &&
+        imageBtn.tagName === "BUTTON" &&
+        !!imageBtn.querySelector("img.msg-img") &&
+        imageBtn.querySelector("img.msg-img").getAttribute("src").startsWith("data:image/png;base64,") &&
+        imageName.textContent === "image-1.png" &&
+        imageBtn.title === "View full image: image-1.png",
+    );
+    imageBtn.click();
+    await flush();
+    const docTab = d.querySelector("#doc-tabs .doc-tab.active");
+    const docPic = d.querySelector("#doc-body img.doc-img, .doc-body img.doc-img");
+    assert(
+      "T7: the click opens the original in a tab named for it (" +
+        (docTab ? docTab.textContent.trim() : "no tab") + ")",
+      !!docTab &&
+        // The tab carries its own close control, so the name is the text around it.
+        docTab.textContent.replace(/\u00d7/g, "").trim() === "image-1.png" &&
+        !!docPic &&
+        docPic.getAttribute("src") === "data:image/png;base64,iVBORw0KGgo=" &&
+        docPic.getAttribute("alt") === "image-1.png",
+    );
+    state.activeId = priorActiveForT7;
+    state.cache[priorActiveForT7] = state.cache[priorActiveForT7] || [];
+    window.renderMessages();
+    messagesEl.replaceChildren(...priorRowsForT7);
+    // W2: the mascot is the one thing on screen driven by a stream that states nothing
+    // at all. renderAll is the app's own pass - a switch, a stop and a delete all come
+    // through it - so the check enters there rather than calling the badge's renderer,
+    // which would prove only that the renderer works when it is called. Visibility is
+    // read rather than opacity: the 120ms transition means an opacity read right after
+    // the class flips is still on its way to the new value.
+    const mascot = d.getElementById("brand-avatar");
+    const mascotShown = () => {
+      const cs = getComputedStyle(mascot);
+      return cs.visibility === "visible" && mascot.classList.contains("on");
+    };
+    // renderAll re-renders the transcript too, so the rows go back afterwards for the
+    // same reason they did above: the checks after this one read the rows on screen.
+    const priorRowsForW2 = Array.from(messagesEl.children);
+    const priorStreamsForW2 = state.streams;
+    state.streams = {};
+    state.streams[state.activeId] = { session_id: state.activeId, gen: 1 };
+    window.renderAll();
+    assert(
+      "W2: a streaming turn shows the mascot (visibility=" + getComputedStyle(mascot).visibility +
+        ", hidden=" + mascot.getAttribute("aria-hidden") + ", pe=" +
+        getComputedStyle(mascot).pointerEvents + ")",
+      !!mascot &&
+        mascotShown() &&
+        mascot.getAttribute("aria-hidden") === "true" &&
+        mascot.getAttribute("alt") === "" &&
+        getComputedStyle(mascot).pointerEvents === "none" &&
+        mascot.getAttribute("width") === "64" &&
+        mascot.getAttribute("height") === "64",
+    );
+    state.streams = priorStreamsForW2;
+    window.renderAll();
+    assert(
+      "W2: an idle chat shows none (visibility=" + getComputedStyle(mascot).visibility + ")",
+      !mascotShown(),
+    );
+    messagesEl.replaceChildren(...priorRowsForW2);
+    // C3: the placeholder is the reference's own sentence, and the language toggle swaps
+    // it. The Enter hint moved to the title, so the check asks for both: the two lines of
+    // the sentence, and the hint still reachable without being a clause of it.
+    const composerIn = d.getElementById("input");
+    const priorLangForC3 = window.Polish.lang();
+    window.Polish.setLang("zh");
+    const zhLines = composerIn.placeholder.split("\n");
+    assert(
+      "C3: the zh toggle swaps the placeholder (lines=" + JSON.stringify(zhLines) + ", title=" +
+        composerIn.title + ")",
+      zhLines.length === 2 &&
+        zhLines[0] === "输入消息或任务，" &&
+        zhLines[1] === "/ 命令，@ 文件或会话" &&
+        composerIn.placeholder.indexOf("Enter") === -1 &&
+        composerIn.title === "Enter = 发送 · Shift+Enter = 换行",
+    );
+    window.Polish.setLang(priorLangForC3);
+    assert(
+      "C3: and back to the English sentence, hint still in the title (" +
+        composerIn.placeholder.split("\n")[0] + ")",
+      composerIn.placeholder.split("\n")[0] === "Message or run a task," &&
+        composerIn.title === "Enter = send · Shift+Enter = newline",
+    );
+    // C4: the chip shows the segment that names the model, and the control keeps the id
+    // a reader cannot see. A switch has to update both, which is why the second model is
+    // a different length and has no vendor path at all - a chip that kept the old value
+    // anywhere, in either place, shows up as one of these two assertions failing.
+    const priorModelForC4 = state.model;
+    state.model = "nvidia/z-ai/glm-5.3-flash";
+    window.renderComposer();
+    const modelLabelEl = d.getElementById("model-label");
+    const modelBtnEl = d.getElementById("model-btn");
+    assert(
+      "C4: the chip shows the short name and the control the full id (chip=" +
+        modelLabelEl.textContent + ", title=" + modelBtnEl.title + ")",
+      modelLabelEl.textContent === "glm-5.3-flash" &&
+        modelLabelEl.textContent.indexOf("/") === -1 &&
+        modelBtnEl.title === "Model: nvidia/z-ai/glm-5.3-flash" &&
+        modelBtnEl.getAttribute("aria-label") === "Model: nvidia/z-ai/glm-5.3-flash",
+    );
+    state.model = "deepseek-v4.1-flash";
+    window.renderComposer();
+    assert(
+      "C4: switching the model updates both (chip=" + modelLabelEl.textContent + ", aria=" +
+        modelBtnEl.getAttribute("aria-label") + ")",
+      modelLabelEl.textContent === "deepseek-v4.1-flash" &&
+        modelBtnEl.title === "Model: deepseek-v4.1-flash" &&
+        modelBtnEl.getAttribute("aria-label") === "Model: deepseek-v4.1-flash",
+    );
+    state.model = priorModelForC4;
+    window.renderComposer();
+    // T4: the goal transition is drawn between turns, which the page can only reach
+    // through the bar's own advance button - the record itself belongs to a turn that
+    // does not exist yet, so the check drives the gesture the reader makes and then looks
+    // for the pill where the next turn will be. The turn count is asserted unchanged
+    // because the marker is not a turn: it must not enter the transcript as one.
+    const goalAdvance = d.getElementById("goal-advance");
+    const priorGoalForT4 = state.goal;
+    const priorMarkersForT4 = state.pendingMarkers;
+    // The transcript has to have something in it: renderMessages draws the empty state and
+    // returns, so a session with no messages has nowhere to put a pill between turns.
+    const priorActiveForT4 = state.activeId;
+    const hadCacheForT4 = Object.prototype.hasOwnProperty.call(state.cache, state.activeId);
+    const priorCacheForT4 = state.cache[state.activeId];
+    // The rows on screen are borrowed here too: this block repaints #messages from its own
+    // cache, and the checks after it read whatever is there.
+    const priorRowsForT4 = Array.from(messagesEl.children);
+    state.cache[state.activeId] = [{ role: "User", text: "advance the goal" }];
+    window.renderMessages();
+    state.goal = { state: "active", objective: "Ship T4", rounds: 1, max_rounds: 40, blocked_reason: null };
+    window.renderGoal(state.goal);
+    const answersBeforeT4 = d.querySelectorAll("#messages .msg.assistant").length;
+    assert(
+      "T4: the goal bar offers the advance the transition needs (disabled=" +
+        (goalAdvance ? goalAdvance.disabled : "no button") + ")",
+      !!state.activeId && !!goalAdvance && goalAdvance.disabled === false,
+    );
+    goalAdvance.click();
+    await flush();
+    await flush();
+    const markerEl = d.querySelector("#messages .msg-marker");
+    // The pill can only be drawn if the gesture recorded itself against the transcript it
+    // was made in, so this states that precondition in a check of its own rather than
+    // letting it hide inside the pill's assertion.
+    const pendingT4 = (state.pendingMarkers || {})[state.activeId];
+    assert(
+      "T4: the advance is recorded against the transcript's own length (pending=" +
+        JSON.stringify(pendingT4) + ", len=" + (state.cache[state.activeId] || []).length + ")",
+      !!pendingT4 && pendingT4.after === (state.cache[state.activeId] || []).length,
+    );
+    assert(
+      "T4: the advance draws a centered pill between turns (" +
+        (markerEl ? markerEl.textContent : "none") + ", calls=" +
+        called("goal_action").length + ", last=" + JSON.stringify(lastArgs("goal_action")),
+      !!markerEl &&
+        /^Continuing goal \d\d-\d\d \d\d:\d\d$/.test(markerEl.textContent) &&
+        markerEl.getAttribute("role") === "note" &&
+        !markerEl.classList.contains("msg") &&
+        d.querySelectorAll("#messages .msg.assistant").length === answersBeforeT4 &&
+        called("goal_action").length === 1 &&
+        lastArgs("goal_action").action === "advance",
+    );
+    state.pendingMarkers = priorMarkersForT4;
+    state.goal = priorGoalForT4;
+    if (hadCacheForT4) state.cache[priorActiveForT4] = priorCacheForT4;
+    else delete state.cache[priorActiveForT4];
+    window.renderGoal(state.goal);
+    window.renderMessages();
+    messagesEl.replaceChildren(...priorRowsForT4);
+    state.cacheHit = priorHit;
+    window.renderStatus();
+    assert(
+      `B2: the token popup dashes a total nothing has counted and the cache hit no backend reports (${statTextOf("stat-tokens")})`,
+      statTextOf("stat-tokens") === "— tok · Cache hit —",
+    );
+    // estimateTokens("abcd") = ceil(4/4) = 1, +4 per message → 10 of a 200 budget.
+    assert(
+      `B3: the context popup is the estimator over the budget (${statTextOf("stat-ctx")})`,
+      statTextOf("stat-ctx") === "5% of context used",
+    );
+    document.getElementById("stat-ctx").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    for (let i = 0; i < 8; i += 1) await Promise.resolve();
+    const ctxSelected = document
+      .getElementById("set-tab-context-section")
+      .getAttribute("aria-selected");
+    assert(
+      `B3: the context popup goes to the section that explains it (selected=${ctxSelected})`,
+      ctxSelected === "true",
+    );
+    // Put the page back: this check moved the active chat, the budget, the usage
+    // figures and opened Settings, and the checks after it read every one of those.
+    // That is the cost of a check that has to lie to itself to see a gesture.
+    delete state.cache["page-checks-b"];
+    state.activeId = priorId;
+    state.toolCount = priorTools;
+    state.budget = priorBudget;
+    state.usage = priorUsage;
+    state.tokRate = priorRate;
+    state.cacheHit = priorHit;
+    window.closeSettings();
+    window.renderStatus();
     assert(
       `T3: the verdict lands in the message's own key (stored=${JSON.stringify(storedBad)}, pressed=${verdict()})`,
       storedBad === "bad" && verdict() === "false/true",
+    );
+    // The render cannot see persistence — the row draws from the in-memory store
+    // either way — so the round trip is the observable, the same way the skill
+    // pane's cache had to be checked by counting calls and not by looking.
+    const fbCalls = called("set_message_feedback");
+    assert(
+      `T3: the verdict is sent to the transcript that has to hold it (calls=${fbCalls.length}, last=${JSON.stringify(lastArgs("set_message_feedback"))})`,
+      fbCalls.length >= 1 &&
+        lastArgs("set_message_feedback").sessionId === state.activeId &&
+        lastArgs("set_message_feedback").index === state.cache[state.activeId].length - 1 &&
+        lastArgs("set_message_feedback").feedback === "bad",
     );
     answerRow().querySelector(".msg-bad").click();
     await flush();
@@ -2595,12 +3073,16 @@
     renderMessages();
 
     // M6 — context: token meter, compaction, and a spilled output.
+    // Scoped to this gesture: the meter is read once per open, and another panel (T6's
+    // chip) legitimately reads it once for its own open - so the question here is what
+    // *this* refresh cost, not what the run has spent.
+    const meterCallsBefore = called("token_meter").length;
     await refreshContext();
     const meterText = d.getElementById("token-meter").textContent;
     const compactText = d.getElementById("compact-status").textContent;
     assert(
       `M6: the token meter shows the estimate and the reconciliation (${meterText.replace(/\s+/g, " ").slice(0, 72)})`,
-      called("token_meter").length === 1 &&
+      called("token_meter").length === meterCallsBefore + 1 &&
         lastArgs("token_meter").session_id === "e2e" &&
         lastArgs("token_meter").provider_tokens === null &&
         /1234 tok/.test(meterText) &&

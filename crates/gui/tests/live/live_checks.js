@@ -135,10 +135,12 @@
         !sendBtn.classList.contains("stop"),
     );
     assert(
-      `stream: the usage line reports the provider's tokens (${
-        [...d.querySelectorAll("#status-right .usage")].map((u) => u.textContent).join("|")})`,
-      /↑ 120 ↓ 45 tok/.test(
-        [...d.querySelectorAll("#status-right .usage")].map((u) => u.textContent).join("|")),
+      `stream: the usage meter reports the provider's tokens (${
+        [...d.querySelectorAll("#usage-meter-host .usage-meter")].map((u) => u.textContent).join("|")})`,
+      // The meter moved into the tokens popup's panel (B2); it is painted by the
+      // status pass whether or not that panel is open, so the text is here to read.
+      /in 120 · out 45/.test(
+        [...d.querySelectorAll("#usage-meter-host .usage-meter")].map((u) => u.textContent).join("|")),
     );
     await waitFor(
       () => /Hello, world/.test((d.getElementById("chat-title") || {}).textContent || "") ||
@@ -309,11 +311,12 @@
     repaint();
     await waitFor(() => /wrote 2 bytes/.test(messagesText()), "the tool result to land");
     assert(
-      `approval: the tool result attaches to the turn and the counter counts it (${
-        [...d.querySelectorAll("#status-right .tools")].map((t) => t.textContent).join("|")})`,
+      `approval: the tool result attaches to the turn and the step counter counts it (${
+        (d.getElementById("stat-turns") || {}).textContent})`,
       /wrote 2 bytes/.test(messagesText()) && /12 ms/.test(messagesText()) &&
-        /⚙ 1 tool call/.test(
-          [...d.querySelectorAll("#status-right .tools")].map((t) => t.textContent).join("|")),
+        // The foot states steps in popup #1 now, from the same state.toolCount the
+        // old right-hand span read.
+        /1 steps/.test((d.getElementById("stat-turns") || {}).textContent || ""),
     );
 
     type("write a second file");
@@ -452,15 +455,15 @@
     type("this send will fail");
     sendBtn.click();
     await waitFor(
-      () => [...d.querySelectorAll("#status-right .err")].some((e) =>
+      () => [...d.querySelectorAll("#status-left .err")].some((e) =>
         /provider offline \(injected\)/.test(e.textContent)),
       "the error to reach the status line",
     );
     assert(
       `error: the failed send reports itself (err=${
-        [...d.querySelectorAll("#status-right .err")].map((e) => e.textContent).join("|")})`,
+        [...d.querySelectorAll("#status-left .err")].map((e) => e.textContent).join("|")})`,
       /provider offline \(injected\)/.test(
-        [...d.querySelectorAll("#status-right .err")].map((e) => e.textContent).join("|")),
+        [...d.querySelectorAll("#status-left .err")].map((e) => e.textContent).join("|")),
     );
     await sleep(300);
     assert(
@@ -1144,6 +1147,56 @@
       "the foot rides the last answer row, not the transcript",
       !!foots[0] && foots[0].parentElement === answerRows[answerRows.length - 1],
     );
+
+    /* ---- B1/B2: the foot's two numbers across a turn that finishes ---- */
+    const barTextOf = (id) => {
+      const btn = d.getElementById(id);
+      const slot = btn && btn.querySelector(".stat-text");
+      return slot ? slot.textContent : "";
+    };
+    const totalOf = () => {
+      let m = /^([\d.]+)k tok/.exec(barTextOf("stat-tokens"));
+      if (m) return Math.round(parseFloat(m[1]) * 1000);
+      m = /^([\d.]+) tok/.exec(barTextOf("stat-tokens"));
+      return m ? Number(m[1]) : null;
+    };
+    // Start this check's own count at nothing. Earlier turns in this run have already
+    // pushed the foot's figure past 1k, where it is *rounded* ("1.6k"), and a delta
+    // read off a rounded total measures the rounding, not the tokens that landed.
+    state.usageTotals = state.usageTotals || {};
+    delete state.usageTotals[state.activeId];
+    // renderStatus, not repaint: repaint() redraws the transcript and leaves the foot
+    // showing whatever the last pass wrote, which is how this check first read a
+    // number it had just deleted.
+    renderStatus();
+    const beforeTotal = totalOf();
+    type("count this turn");
+    sendBtn.click();
+    await waitFor(() => sendBtn.classList.contains("stop"), "the counted turn to start");
+    await waitFor(() => !sendBtn.classList.contains("stop"), "the counted turn to end");
+    repaint();
+    const afterTotal = totalOf();
+    assert(
+      `B2: the token popup counts the turn that just finished from nothing (before=${beforeTotal}, after=${afterTotal}, counter=${JSON.stringify(state.usageTotals[state.activeId])}, msgs=${(state.cache[state.activeId] || []).length}, withUsage=${(state.cache[state.activeId] || []).filter((m) => m.meta && m.meta.usage).length})`,
+      beforeTotal === null && afterTotal === 165,
+    );
+    assert(
+      `B2: the cache hit is the provider's own cached share (${barTextOf("stat-tokens")})`,
+      /Cache hit 80%/.test(barTextOf("stat-tokens")),
+    );
+    const turnMs = (state.turnMs || {})[state.activeId];
+    const rateText = barTextOf("stat-turns");
+    const rateMatch = /· ([\d.]+) tok\/s$/.exec(rateText);
+    const rate = rateMatch ? Number(rateMatch[1]) : NaN;
+    // The transcript's own duration is whole seconds, and virtual time ends this turn
+    // in about 200 ms, so the denominator has to be the clock the app kept. The
+    // numerator is the bridge's own 45 either way, so a wrong token field, a ms/s
+    // mix-up or a rate that is never set all still miss.
+    assert(
+      `B1: the bar's rate is the turn's completion tokens over its own duration (${rateText}, turnMs=${turnMs})`,
+      Number.isFinite(turnMs) && turnMs > 0 && Number.isFinite(rate) &&
+        Math.abs(rate - 45 / (turnMs / 1000)) / (45 / (turnMs / 1000)) < 0.02,
+    );
     assert(
       `M7: Stop interrupts the job and the list refreshes to that state (args=${
         JSON.stringify(LIVE.lastArgs("job_interrupt"))}, states=${jobStates().join(",")})`,
@@ -1335,7 +1388,7 @@
     /* T5: how a turn ended is on the foot, in words, ahead of its duration. The
        streaming half belongs to the page layer; what only this layer can show is the
        two states a *finish* writes — and that a stop is inferred from the button,
-       because the backend does not report yet how a turn ended (§5.3). */
+       because the turn's own record says so: the backend reports it now (§5.3). */
     const footChip = () => {
       const foot = [...d.querySelectorAll("#messages .turn-foot")].pop();
       return foot ? foot.querySelector(".turn-state") : null;
@@ -1380,7 +1433,7 @@
       `T5: a turn the stop button ended says Stopped and admits why it knows (chip="${haltChip.textContent}", title="${haltChip.title.slice(0, 44)}")`,
       haltChip.textContent === "Stopped" &&
         haltChip.getAttribute("data-i18n") === "turn.stopped" &&
-        /^Stopped for this turn/.test(haltChip.title),
+        /^Stopped: the turn ended/.test(haltChip.title),
     );
 
   /* G1's 🗑, right after the only checks that use the goal, and inside the try on purpose: it clears the session's
@@ -1483,14 +1536,14 @@
         /^m-\d+$/.test((LIVE.lastArgs("forget_memory") || {}).id || ""),
     );
     await waitFor(
-      () => /mcp 1\/1/.test(d.getElementById("status-right").textContent),
+      () => /mcp 1\/1/.test(d.getElementById("status-left").textContent),
       "the mcp line to reach the status bar",
     );
     assert(
       `settings: the MCP status answers with connected servers (${
-        [...d.querySelectorAll("#status-right .mcp")].map((m) => m.textContent).join("|")})`,
+        [...d.querySelectorAll("#status-left .mcp")].map((m) => m.textContent).join("|")})`,
       /⛁ mcp 1\/1/.test(
-        [...d.querySelectorAll("#status-right .mcp")].map((m) => m.textContent).join("|")),
+        [...d.querySelectorAll("#status-left .mcp")].map((m) => m.textContent).join("|")),
     );
     setModel.value = "glm-4.7";
     d.getElementById("settings-form").dispatchEvent(
@@ -1956,8 +2009,8 @@
       await settle();
       await settle();
       assert(
-        `M9: a refused pin reports itself (${(d.getElementById("status-right").textContent || "").trim()})`,
-        /pinned is refused for now/.test(d.getElementById("status-right").textContent),
+        `M9: a refused pin reports itself (${(d.getElementById("status-left").textContent || "").trim()})`,
+        /pinned is refused for now/.test(d.getElementById("status-left").textContent),
       );
       d.querySelector(`#session-list .session-row[data-id="${targetId}"] .sess-pin`).click();
       await waitFor(
@@ -1968,7 +2021,7 @@
       await settle();
       assert(
         "M9: the next attempt clears the verdict of the last one",
-        !/pinned is refused for now/.test(d.getElementById("status-right").textContent),
+        !/pinned is refused for now/.test(d.getElementById("status-left").textContent),
       );
       // A refused delete is not a delete: the chat stays in the sidebar, the reason
       // is shown, and nothing local is thrown away for a chat the backend still has.
@@ -1992,8 +2045,8 @@
       await settle();
       await settle();
       assert(
-        `M9: a refused delete keeps the chat and says why (${(d.getElementById("status-right").textContent || "").trim()})`,
-        /the trash is closed for now/.test(d.getElementById("status-right").textContent) &&
+        `M9: a refused delete keeps the chat and says why (${(d.getElementById("status-left").textContent || "").trim()})`,
+        /the trash is closed for now/.test(d.getElementById("status-left").textContent) &&
           !!d.querySelector(`#session-list .session-row[data-id="${targetId}"]`) &&
           LIVE.sessions().some((x) => x.id === targetId),
       );
@@ -2476,6 +2529,42 @@
         /^data:image\/png;base64,/.test(attachArgs.images[0]),
     );
     await waitFor(() => !sendBtn.classList.contains("stop"), "the image turn to finish");
+    // The finished turn re-reads the store and re-renders the transcript, and under
+    // virtual time the frame that would draw it never fires - so ask for the paint the
+    // way every other check here does, instead of waiting for a frame that is not coming.
+    repaint();
+    const msgImageBtn = d.querySelector("#messages .msg.user .msg-image");
+    const msgImg = d.querySelector("#messages .msg.user .msg-img");
+    // The row has to be on screen before anything about its button can be judged. This
+    // says so in one named check instead of throwing, because the reason it is missing
+    // is the row, not the button - an image-only turn currently leaves #messages empty
+    // (rows=0) both during and after the turn, which is a gap of its own, filed rather
+    // than papered over here.
+    assert(
+      "attach: the image-only turn leaves a user row to open (rows=" +
+        d.querySelectorAll("#messages .msg").length + ")",
+      !!msgImageBtn,
+    );
+    if (msgImageBtn) {
+      msgImageBtn.click();
+      await waitFor(
+        () => d.querySelector("#doc-tabs .doc-tab.active"),
+        "the attachment to open in the document panel",
+      );
+      const imageTab = d
+        .querySelector("#doc-tabs .doc-tab.active")
+        .textContent.replace(/\u00d7/g, "")
+        .trim();
+      const imageInPanel = !!d.querySelector("#doc-body img.doc-img, .doc-body img.doc-img");
+      assert(
+        "attach: clicking the image opens the original in the panel (tab=" + imageTab +
+          ", img=" + imageInPanel + ")",
+        msgImageBtn.tagName === "BUTTON" &&
+          imageTab === "image-1.png" &&
+          imageInPanel &&
+          !msgImg.classList.contains("zoomed"),
+      );
+    }
     // A finished turn re-reads the store: the picture must still be there.
     await waitFor(
       () => d.querySelector("#messages .msg.user .msg-img"),
@@ -2484,17 +2573,6 @@
     assert(
       "attach: the stored turn re-renders its image in the user bubble",
       !!d.querySelector("#messages .msg.user .msg-img"),
-    );
-    const msgImg = d.querySelector("#messages .msg.user .msg-img");
-    msgImg.click();
-    assert(
-      "attach: clicking the image zooms it in place (no navigation)",
-      msgImg.classList.contains("zoomed"),
-    );
-    msgImg.click();
-    assert(
-      "attach: a second click returns the image to its thumbnail",
-      !msgImg.classList.contains("zoomed"),
     );
     // And a queued follow-up keeps its attachment through the wait.
     type("slow with image");

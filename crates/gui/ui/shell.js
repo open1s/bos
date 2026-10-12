@@ -852,8 +852,19 @@ const Shell = (() => {
     }
     const pre = document.createElement("pre");
     pre.className = "doc-text";
-    pre.textContent = doc.text || ""; // inert: document text is untrusted
-    docBody.appendChild(pre);
+    if (doc.img) {
+      // T7: a picture opened from a transcript renders here at the panel's width. The
+      // source is our own payload (a data URL carried by the message) and the alt is the
+      // name the row shows, so the panel states what the bubble stated.
+      const pic = document.createElement("img");
+      pic.className = "doc-img";
+      pic.src = doc.img;
+      pic.alt = doc.title;
+      docBody.appendChild(pic);
+    } else {
+      pre.textContent = doc.text || ""; // inert: document text is untrusted
+      docBody.appendChild(pre);
+    }
   };
 
   const openDocument = (doc) => {
@@ -863,6 +874,7 @@ const Shell = (() => {
       title: doc.title || doc.path || doc.id,
       path: doc.path || "",
       text: doc.text || "",
+      img: doc.img || "",
       error: doc.error || "",
     };
     const at = documents.findIndex((d) => d.id === entry.id);
@@ -1219,7 +1231,11 @@ const Shell = (() => {
   const statusRegistry = new Map();
 
   const statusHost = () => {
-    const bar = document.getElementById("status-right");
+    /* The footer itself, not the notices span: `renderStatus` clears the span it
+       hands to `renderArchived` and then to the notice list on every repaint, so a
+       host mounted inside it was created, seen once and wiped by the next frame.
+       Mounting on the footer keeps a registered item where it was put. */
+    const bar = document.getElementById("statusbar");
     if (!bar) return null;
     let host = document.getElementById("status-items");
     if (!host) {

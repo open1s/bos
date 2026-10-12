@@ -149,7 +149,12 @@ const input = $("input");
 const queueList = $("queue-list");
 const sendBtn = $("send");
 const statusLeft = $("status-left");
-const statusRight = $("status-right");
+const statusBar = $("status-bar");
+const statPops = {
+  turns: $("stat-turns"),
+  tokens: $("stat-tokens"),
+  ctx: $("stat-ctx"),
+};
 const modal = $("settings-modal");
 const settingsForm = $("settings-form");
 const setModel = $("set-model");
@@ -336,7 +341,7 @@ function estimateTokens(text) {
 function estimateContext() {
   let tokens = 0;
   for (const m of activeMsgs()) {
-    if ((m.role === "user" || m.role === "assistant") && m.text) {
+    if ((m.role === "User" || m.role === "Assistant") && m.text) {
       tokens += estimateTokens(m.text) + 4;
     }
   }
@@ -1915,23 +1920,70 @@ function actionsReady() {
   return !streamOf(state.activeId) && !state.compacting[state.activeId];
 }
 
+/* An attachment's name. A message stores its pictures as data URLs, which carry a
+   media type and no filename at all, so the name states what is true - the kind and the
+   position - rather than inventing a file the reader never chose. */
+function attachmentName(url, index) {
+  const raw = String(url || "");
+  if (raw.startsWith("data:image/")) {
+    const kind = raw.slice("data:image/".length).split(/[;,]/, 1)[0].toLowerCase();
+    return "image-" + (index + 1) + "." + (kind === "jpeg" ? "jpg" : kind);
+  }
+  const base = raw.split("?")[0].split("/").pop();
+  return base || "image-" + (index + 1);
+}
+
+/* T4: a goal transition drawn where the next turn will be. It is not a turn - no bubble,
+   no footer, no actions - and every count in the page filters to User and Assistant, so
+   it cannot enter one. The pill the reader just caused and the pill a re-opened chat
+   reads off a message are the same element built from the same fields. */
+function markerPill(rec) {
+  const pill = el("div", "msg-marker");
+  pill.setAttribute("role", "note");
+  const at = rec && rec.at ? fmtTime(rec.at) : "";
+  pill.textContent = tr("goal.continuing", "Continuing goal {t}").replace("{t}", at).trim();
+  return pill;
+}
+
+/* The marker the reader just caused, held client-side until a turn lands. The count it
+   was taken at is the whole condition: when the transcript grows, this stops drawing and
+   the durable record the backend attached to that turn takes over - so nothing has to
+   remember to clear it. */
+function pendingMarker(sessionId) {
+  const pending = state.pendingMarkers && state.pendingMarkers[sessionId];
+  const msgs = state.cache[sessionId] || [];
+  return pending && pending.after === msgs.length ? pending : null;
+}
+
 function buildBubble(m, showCaret, opts) {
   const bubble = el("div", "bubble");
   if (m.reasoning) bubble.appendChild(el("div", "reasoning", m.reasoning));
   for (const t of m.tools || []) {
     bubble.appendChild(buildToolCard(t));
   }
-  // Attachments render above the text, thumbnail-sized; a click enlarges the
-  // image in place (the class toggles, so no navigation and no new window).
-  for (const url of m.images || []) {
+  // T7: an attachment is a button, not a picture that happens to be clickable. The
+  // reference labels it `image.png, click to view original` (dsh:62) and opens the
+  // original in the document panel (dsh:235), where it can be read at full size beside
+  // the answer - an enlargement inside the row could never be bigger than the row.
+  (m.images || []).forEach((url, index) => {
+    const name = attachmentName(url, index);
     const img = document.createElement("img");
     img.className = "msg-img";
     img.src = url;
-    img.alt = "attached image";
+    img.alt = name;
     img.loading = "lazy";
-    img.addEventListener("click", () => img.classList.toggle("zoomed"));
-    bubble.appendChild(img);
-  }
+    const open = el("button", "msg-image");
+    open.type = "button";
+    open.title = tr("msg.viewImage", "View full image: {n}").replace("{n}", name);
+    open.appendChild(img);
+    open.appendChild(el("span", "msg-image-name", name));
+    open.addEventListener("click", () =>
+      // Keyed by content, so reopening the same picture replaces its tab instead of
+      // stacking a second one with the same name.
+      Shell.openDocument({ id: "img:" + name + ":" + sigOf(url), title: name, path: name, img: url }),
+    );
+    bubble.appendChild(open);
+  });
   if (m.text || showCaret) {
     const text = el("div", "text");
     if (m.text) {
@@ -1983,6 +2035,23 @@ function buildBubble(m, showCaret, opts) {
     acts.appendChild(fbBtn("bad", tr("msg.bad", "Bad response")));
     hasActs = true;
   }
+  if (opts && opts.usage && opts.usage.through !== undefined) {
+    // T6: a finished turn ends with the reference's own chip (dsh:391). The number is
+    // what the session had spent *through this turn*, which a footer has to say from the
+    // transcript after a reload - so it sums the same meta.usage the store carries. A
+    // session that has spent nothing gets no chip at all, rather than a confident 0 tok.
+    const usageBtn = el(
+      "button",
+      "mini-btn msg-usage",
+      tr("usage.total", "Usage {n} tok").replace("{n}", fmtTokens(opts.usage.through)),
+    );
+    usageBtn.type = "button";
+    usageBtn.setAttribute("aria-haspopup", "dialog");
+    usageBtn.setAttribute("aria-expanded", "false");
+    usageBtn.addEventListener("click", () => void openUsagePop(usageBtn, opts.usage));
+    acts.appendChild(usageBtn);
+    hasActs = true;
+  }
   if (opts && opts.regen) {
     const regenBtn = el("button", "mini-btn", "Regenerate");
     regenBtn.type = "button";
@@ -2031,15 +2100,28 @@ function buildBubble(m, showCaret, opts) {
 function feedbackOf(sessionId, index) {
   return (state.feedback || {})[sessionId + ":" + index] || "";
 }
-function setFeedback(sessionId, index, value) {
+async function setFeedback(sessionId, index, value) {
   state.feedback = state.feedback || {};
   const key = sessionId + ":" + index;
+  const before = state.feedback[key] || "";
+  // The row draws from the store, so the verdict shows before the round trip ends;
+  // the transcript is what makes it outlive the session. A refusal puts the row
+  // back, because a verdict no transcript holds is worse than no verdict.
   if (value) state.feedback[key] = value;
   else delete state.feedback[key];
   // renderMessages() reuses every row above its dirty cursor without asking that
   // row's signature, so a bare repaint would keep drawing the old aria-pressed.
   markDirty(index);
   renderMessages();
+  try {
+    await invoke("set_message_feedback", { sessionId, index, feedback: value || null });
+  } catch (err) {
+    if (before) state.feedback[key] = before;
+    else delete state.feedback[key];
+    markDirty(index);
+    renderMessages();
+    toast(`Feedback not saved: ${err}`);
+  }
 }
 
 /* Edit-and-resend: the backend truncates the stored history at `index`,
@@ -2517,7 +2599,7 @@ function turnStateChip(sessionId) {
   if (kind === "stopped") {
     chip.title = tr(
       "turn.stoppedNote",
-      "Stopped for this turn; the backend does not report yet how a turn ended",
+      "Stopped: the turn ended because you pressed Stop",
     );
   }
   return chip;
@@ -2569,6 +2651,11 @@ function renderWorkingBadge() {
   const box = $("working-badge");
   if (!box) return;
   const live = streamOf(state.activeId);
+  // W2: the mascot follows the *stream*, not the dismissal. Hiding the card is a
+  // statement about the card, and the reference keeps the character on screen until
+  // the turn ends - so this sits above the early return rather than inside it.
+  const mascot = $("brand-avatar");
+  if (mascot) mascot.classList.toggle("on", !!live);
   const dismissed =
     !!workingDismissed &&
     !!live &&
@@ -2711,6 +2798,12 @@ function renderMessages() {
       footState: abs === lastAssistant ? turnStateChip(state.activeId) : null,
       // T3: an answer carries the reader's own note; it rides the row's signature so
       // changing it rebuilds that one row instead of leaving a stale aria-pressed.
+      // T6: the footing chip's two numbers, read from the transcript at row-build time
+      // so the row's own signature changes when the session's total does.
+      usage:
+        m.role === "Assistant" && !!m.text
+          ? { through: usageThrough(state.activeId, abs), turn: (m.meta && m.meta.usage) || null }
+          : undefined,
       feedbackAt: m.role === "Assistant" && !!m.text ? abs : undefined,
       feedback: m.role === "Assistant" && !!m.text ? feedbackOf(state.activeId, abs) : "",
       edit: m.role === "User" && (!!m.text || (m.images || []).length),
@@ -2741,6 +2834,11 @@ function renderMessages() {
       entry = { el: row, sig };
       rowCache.set(key, entry);
     }
+    // T4: a durable marker - the record the backend attached to this turn - is drawn
+    // above it, which is where the reference puts it and where the reader saw it before
+    // the re-open. The pill is built fresh each pass and the reconcile removes the
+    // previous one, because it only ever appears in desired once.
+    if (m.meta && m.meta.marker) desired.push(markerPill(m.meta.marker));
     desired.push(entry.el);
   }
 
@@ -2774,6 +2872,19 @@ function renderMessages() {
     const next = node.nextSibling;
     node.remove();
     node = next;
+  }
+
+  // T4: the pending marker sits outside the row window, because the window holds turns and
+  // this is not one. It is drawn after the reconcile - which is also what takes the last
+  // pass's copy away, so what is on screen is always this pass's - and it stops being drawn
+  // once the transcript grows, which is when the durable pill takes over.
+  const stalePill = messagesEl.querySelector(".msg-marker.is-pending");
+  if (stalePill) stalePill.remove();
+  const pendingNow = pendingMarker(state.activeId);
+  if (pendingNow) {
+    const pill = markerPill(pendingNow);
+    pill.classList.add("is-pending");
+    messagesEl.appendChild(pill);
   }
 
   // Everything on screen is validated now; the next frame starts with an empty
@@ -2907,33 +3018,21 @@ function renderLoadEarlier(windowStart) {
 ensureScrollGrow();
 
 function renderStatus() {
+  /* The foot keeps the BSH-only notices at its left end, outside the centered
+     group (matrix b4): archived, compacting, mcp, errors. `renderArchived` clears
+     the host it is handed, so it runs first and the static notices land after it —
+     the same lost-update trap the meter fell into when two writers shared one. */
   statusLeft.textContent = "";
-  // The model is named once, on the composer's chip, where it is also changed
-  // (rev 122); the foot says how much work there is instead.
+  renderArchived(statusLeft, state.archived, () => void openArchivedView(), restoreArchived);
   statusLeft.appendChild(
     el("span", "", `${state.sessions.length} chat${state.sessions.length === 1 ? "" : "s"}`)
   );
   renderSessionStats(statusLeft, state.overview);
-
-  statusRight.textContent = "";
-  renderArchived(statusRight, state.archived, () => void openArchivedView(), restoreArchived);
-  // After *both* clears, not just this one: `renderUsage` appends its meter to
-  // this very element, and `renderArchived` clears the host it is handed too, so
-  // a meter written between the two clears is built and thrown away on every
-  // frame — which is what happened during a stream. Two writers and one element
-  // is a lost update; the fixture's direct `renderUsage()` call could not see it,
-  // so its check now goes through this pass.
-  renderUsage();
-  if (state.toolCount > 0) {
-    statusRight.appendChild(
-      el("span", "tools", `⚙ ${state.toolCount} tool call${state.toolCount === 1 ? "" : "s"}`)
-    );
-  }
   if (state.compacting[state.activeId]) {
-    statusRight.appendChild(el("span", "ctx", "⧗ compacting…"));
+    statusLeft.appendChild(el("span", "ctx", "⧗ compacting…"));
   }
   if (state.initializing) {
-    statusRight.appendChild(el("span", "ctx", "⧗ generating AGENTS.md…"));
+    statusLeft.appendChild(el("span", "ctx", "⧗ generating AGENTS.md…"));
   }
   const mcp = state.mcpStatus;
   if (mcp && mcp.servers && mcp.servers.length) {
@@ -2943,33 +3042,227 @@ function renderStatus() {
     const failed = mcp.servers.find((s) => s.enabled && !s.connected);
     const span = el("span", failed && !mcp.connecting ? "err" : "mcp", text);
     if (failed && failed.error) span.title = failed.error;
-    statusRight.appendChild(span);
-  }
-  const budget = state.budget || 0;
-  if (budget > 0) {
-    const used = estimateContext();
-    const ratio = used / budget;
-    const cls =
-      ratio >= 0.9 ? "ctx ctx-err" : ratio >= 0.7 ? "ctx ctx-warn" : "ctx ctx-ok";
-    const span = el("span", cls, `ctx ~${fmtTokens(used)}/${fmtTokens(budget)}`);
-    span.title =
-      `Estimated outgoing context (~${used} of ${budget} token budget); ` +
-      "older messages are compacted into a summary above the budget";
-    statusRight.appendChild(span);
-  }
-  if (state.usage) {
-    const u = state.usage;
-    statusRight.appendChild(
-      el("span", "usage", `↑ ${u.prompt} ↓ ${u.completion} tok`)
-    );
+    statusLeft.appendChild(span);
   }
   if (state.error) {
-    statusRight.appendChild(el("span", "err", clip(state.error, 160)));
+    statusLeft.appendChild(el("span", "err", clip(state.error, 160)));
   }
+  // The meter belongs to popup #2 but is painted by this pass: one writer per
+  // frame keeps it fresh for the moment the panel opens, and keeps the defect
+  // this pass was fixed for — a helper whose span a later clear threw away —
+  // from coming back. Restructuring this body dropped this call once, and the
+  // ui fixture caught it by reading a meter that had stopped moving.
+  renderUsage();
+  renderStatusBar();
   // The composer's chips read two of the same facts this foot does, and every
   // path that refreshes the foot has just changed one of them (a saved model
   // most of all), so they are repainted together rather than drifting apart.
   renderComposer();
+}
+
+
+/* The reference's three centered popups (b1-b3): turns/steps/rate, tokens/cache,
+   and the context meter. Each renders from its own numbers so a stats bug cannot
+   disturb the notices at the foot's left end, and each is filled whether or not
+   its panel has ever been opened — the panel is a view of this text, not its home. */
+function statText(key, vars, fallback) {
+  let out = tr(key, fallback);
+  for (const [name, value] of Object.entries(vars)) {
+    out = out.split("{" + name + "}").join(String(value));
+  }
+  return out;
+}
+
+/* A number the bar can state, or the reference's own dash when it cannot: "—"
+   means "no backend yet" (cache-hit, §5.4) or "no turn has finished". A zero
+   drawn where a dash belongs reads as a measurement, which is the one thing it
+   is not. */
+function statDash(value, render) {
+  return value === null || value === undefined || value === "" ? "—" : render(value);
+}
+
+/* The dash is not a number, so it must not wear the number's percent sign: the
+   reference's own dash stands for the whole "42%" it cannot state. */
+function cacheText(text) {
+  return text.replace("—%", "—");
+}
+
+function renderStatusBar() {
+  const msgs = activeMsgs();
+  const turns = msgs.filter((m) => m.role === "User").length;
+  const steps = state.toolCount || 0;
+  const rate = statDash(state.tokRate, (v) => (v >= 100 ? String(Math.round(v)) : v.toFixed(1)));
+  const total = statDash(usageTotal(state.activeId), (v) => fmtTokens(v));
+  const cache = statDash(state.cacheHit, (v) => String(Math.round(v)));
+  const pct = Math.round((estimateContext() / (state.budget || 1)) * 100);
+
+  const fill = (button, text) => {
+    if (!button) return;
+    // A fixture may carry the button without its inner span, and the text *is* the
+    // label: falling back to the button keeps a partial page rendering instead of
+    // taking the whole fixture down with a null dereference.
+    const slot = button.querySelector(".stat-text") || button;
+    slot.textContent = text;
+    button.setAttribute("aria-label", text);
+    button.title = text;
+  };
+  fill(
+    statPops.turns,
+    statText("status.turns", { t: turns, s: steps }, "{t} turns {s} steps") +
+      " · " +
+      statText("status.rate", { r: rate }, "{r} tok/s"),
+  );
+  fill(
+    statPops.tokens,
+    statText("status.tokTotal", { n: total }, "{n} tok") +
+      " · " +
+      cacheText(statText("status.cacheHit", { p: cache }, "Cache hit {p}%")),
+  );
+  fill(statPops.ctx, statText("status.ctxPct", { p: pct }, "{p}% of context used"));
+  if (statPops.ctx) {
+    statPops.ctx.classList.toggle("ctx-warn", pct >= 70 && pct < 90);
+    statPops.ctx.classList.toggle("ctx-err", pct >= 90);
+  }
+
+  // Popup #1 reads the same two numbers the button states, so the breakdown and
+  // the summary can never disagree.
+  const turnsPop = $("stat-turns-pop");
+  if (turnsPop) {
+    turnsPop.textContent = "";
+    turnsPop.appendChild(el("div", "stat-pop-line", '' + turns + " user ask" + (turns === 1 ? "" : "s")));
+    turnsPop.appendChild(el("div", "stat-pop-line", '' + steps + " tool call" + (steps === 1 ? "" : "s")));
+    turnsPop.appendChild(
+      el("div", "stat-pop-hint", "Per-turn detail lives in each answer's tool rows (Trajectory)."),
+    );
+  }
+}
+
+/* The session's running total, re-derived from the transcript when the messages
+   themselves carry it (T3's meta is the same seam), so a reload does not reset a
+   number the reader watched climb. */
+function usageTotal(sessionId) {
+  if (state.usageTotals && state.usageTotals[sessionId] !== undefined) {
+    return state.usageTotals[sessionId];
+  }
+  let seen = false;
+  let sum = 0;
+  for (const m of state.cache[sessionId] || []) {
+    // The keys are the ones the finish handler writes through the store
+    // (prompt_tokens / completion_tokens, matching the rest of the wire). Reading a
+    // different pair here finds a message that spent something and calls it 0 - a
+    // measurement nobody made, which is worse than the dash.
+    const u = m && m.meta && m.meta.usage;
+    if (u) {
+      seen = true;
+      sum += (u.prompt_tokens || 0) + (u.completion_tokens || 0);
+    }
+  }
+  // Nothing observed and nothing carried is not zero tokens — it is an unknown, and
+  // the bar says so with the same dash it uses for a missing rate. A zero here would
+  // read as a measurement of a transcript nobody has counted yet.
+  return seen ? sum : undefined;
+}
+
+/* What the session had spent through one turn. usageTotal answers "how much so far",
+   which is a different question from "how much by the end of *this* turn", and only the
+   transcript can answer the second one after a reload - so the prefix of the same
+   meta.usage the store carries is summed. A prefix with nothing to add is undefined
+   rather than 0, because turns finished before that field existed were never counted. */
+function usageThrough(sessionId, index) {
+  const msgs = state.cache[sessionId] || [];
+  let seen = false;
+  let sum = 0;
+  for (let i = 0; i <= index && i < msgs.length; i++) {
+    const u = msgs[i] && msgs[i].meta && msgs[i].meta.usage;
+    if (u) {
+      seen = true;
+      sum += (u.prompt_tokens || 0) + (u.completion_tokens || 0);
+    }
+  }
+  return seen ? sum : undefined;
+}
+
+/* The chip's panel. One at a time, Escape or a click outside closes it, and the meter
+   inside it is read once per open - a repaint must never ask the provider for numbers
+   it already has. */
+let usagePop = null;
+
+function closeUsagePop(refocus) {
+  if (!usagePop) return false;
+  const { panel, anchor, off } = usagePop;
+  panel.remove();
+  if (off) off();
+  if (anchor) anchor.setAttribute("aria-expanded", "false");
+  usagePop = null;
+  if (refocus && anchor) anchor.focus();
+  return true;
+}
+
+async function fillUsageMeter(host) {
+  if (!state.activeId) return;
+  try {
+    renderTokenMeter(
+      host,
+      await invoke("token_meter", { session_id: state.activeId, provider_tokens: null }),
+    );
+  } catch (err) {
+    host.textContent = String(err);
+  }
+  if (!host.textContent.trim()) host.classList.add("hidden");
+}
+
+async function openUsagePop(anchor, usage) {
+  if (usagePop && usagePop.anchor === anchor) {
+    closeUsagePop(true);
+    return;
+  }
+  closeUsagePop(false);
+  const panel = el("div", "usage-pop");
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-label", tr("usage.total", "Usage {n} tok").replace("{n}", fmtTokens(usage.through)));
+  const line = (key, value) => {
+    const row = el("div", "usage-row");
+    row.appendChild(el("span", "usage-key", key));
+    row.appendChild(el("span", "usage-val", value));
+    panel.appendChild(row);
+  };
+  const turn = usage.turn;
+  line(
+    tr("usage.thisTurn", "This turn"),
+    turn
+      ? "↑ " + fmtTokens(turn.prompt_tokens) + " · ↓ " + fmtTokens(turn.completion_tokens)
+      : tr("usage.none", "not reported"),
+  );
+  const session = usageTotal(state.activeId);
+  line(tr("usage.session", "Session"), fmtTokens(session === undefined ? usage.through : session));
+  const meter = el("div", "usage-meter");
+  panel.appendChild(meter);
+  document.body.appendChild(panel);
+  const box = anchor.getBoundingClientRect();
+  const size = panel.getBoundingClientRect();
+  const left = Math.min(
+    Math.max(6, box.left),
+    Math.max(6, document.documentElement.clientWidth - size.width - 6),
+  );
+  const below = box.bottom + 4;
+  panel.style.left = Math.round(left) + "px";
+  panel.style.top =
+    Math.round(below + size.height > window.innerHeight - 6 ? Math.max(6, box.top - size.height - 4) : below) + "px";
+  anchor.setAttribute("aria-expanded", "true");
+  const onKey = (ev) => {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeUsagePop(true);
+    }
+  };
+  const onOut = (ev) => {
+    if (!panel.contains(ev.target) && ev.target !== anchor) closeUsagePop(false);
+  };
+  panel.addEventListener("keydown", onKey);
+  document.addEventListener("click", onOut, true);
+  usagePop = { panel, anchor, off: () => document.removeEventListener("click", onOut, true) };
+  void fillUsageMeter(meter);
 }
 
 /* The composer's one button: send while the chat is idle, stop while a turn is
@@ -3000,12 +3293,30 @@ const PERMISSION_LABELS = {
 
 let composerChipsWired = false;
 
+/* C4: the part of a model id that names the model. Ids are paths -
+   `nvidia/z-ai/glm-5.3-flash` - and only the last segment fits a chip; the whole path
+   stays on the control's title and aria-label, so nothing is lost, only shortened. The
+   list that picks the model still shows full ids, because that is where a reader is
+   choosing between them. */
+const shortModelId = (id) => String(id || "").split("/").pop() || String(id || "");
+
 function renderComposer() {
   const modeLabel = $("mode-label");
   const modelLabel = $("model-label");
   const permission = (Shell.state && Shell.state.permission) || "";
   if (modeLabel) modeLabel.textContent = PERMISSION_LABELS[permission] || permission;
-  if (modelLabel) modelLabel.textContent = state.model || "no model";
+  if (modelLabel) {
+    const full = state.model || "";
+    modelLabel.textContent = full ? shortModelId(full) : "no model";
+    // The control keeps the whole id: a chip reading `glm-5.3-flash` cannot tell two
+    // vendors apart, and a screen reader should hear what a hovering reader can see.
+    const modelBtn = $("model-btn");
+    if (modelBtn) {
+      const named = full ? "Model: " + full : "The model this workspace runs";
+      modelBtn.title = named;
+      modelBtn.setAttribute("aria-label", named);
+    }
+  }
   // Wired on the first paint rather than at parse time: this module may run
   // before the markup it names (the page harness assembles it into the head),
   // and a listener attached to nothing fails silently.
@@ -3538,6 +3849,23 @@ async function refreshGoal(id) {
    that does not apply comes back as a sentence rather than a silent no-op. */
 async function goalAction(action, reason) {
   if (!state.activeId) return false;
+  // T4: the marker is a statement about the gesture, so it lands with the gesture instead
+  // of after the round trip - a reader who pressed advance sees the goal continue at once.
+  // The catch takes it back if the backend refuses, which is what stops an optimistic pill
+  // from outliving a transition that never happened.
+  const markIt = action === "advance";
+  if (markIt) {
+    state.pendingMarkers = state.pendingMarkers || {};
+    state.pendingMarkers[state.activeId] = {
+      kind: "goal_advanced",
+      at: Math.floor(Date.now() / 1000),
+      after: (state.cache[state.activeId] || []).length,
+    };
+    // The transcript itself did not change, so the dirty cursor would let this pass stop
+    // early and never reach the marker. The marker is a change to the transcript's shape.
+    markDirtyAll();
+    renderMessages();
+  }
   try {
     state.goal = await invoke("goal_action", {
       sessionId: state.activeId,
@@ -3547,6 +3875,11 @@ async function goalAction(action, reason) {
     renderGoal(state.goal);
     return true;
   } catch (err) {
+    if (markIt && state.pendingMarkers) {
+      delete state.pendingMarkers[state.activeId];
+      markDirtyAll();
+      renderMessages();
+    }
     goalFail(String(err));
     return false;
   }
@@ -3711,6 +4044,16 @@ async function loadActive() {
   } catch (_) {
     state.cache[state.activeId] = [];
   }
+  // T3: the verdict rides the transcript, on the message's own `meta`, so a
+  // re-opened chat shows the Good/Bad the reader left. Clearing the keys this chat
+  // no longer carries matters as much: a stale verdict would attach to whatever
+  // message later took that index.
+  (state.cache[state.activeId] || []).forEach((m, i) => {
+    const key = `${state.activeId}:${i}`;
+    const fb = m && m.meta && m.meta.feedback;
+    if (fb) state.feedback[key] = fb;
+    else delete state.feedback[key];
+  });
   void loadArchived(state.activeId);
   void loadOverview(state.activeId);
 }
@@ -6661,17 +7004,48 @@ listen("agent-event", (event) => {
   renderWorkingBadge();
 });
 
+/* T5 / 5.3: how a turn ended, from the two sources that can know. The backend's own
+   `cancelled` leads - it is written where the stop was honoured, so it survives a reload
+   and a stop the client never saw - and the client's press is the second source, kept
+   because a backend that predates the flag must not have every stopped turn called
+   completed. It is a function so each source can be pinned on its own: the live suite's
+   stop check presses Stop, which makes both true at once and cannot tell them apart. */
+function turnVerdict(payload, pressedStop) {
+  return (payload && payload.cancelled) || pressedStop ? "stopped" : "completed";
+}
+
 listen("stream-finished", async (event) => {
   const p = event.payload;
   // How long the turn took, for the row the transcript draws under its answer.
   const startedAt = (state.turnStarted || {})[p.session_id];
   if (startedAt) {
+    const ms = Date.now() - startedAt;
     state.turnMs = state.turnMs || {};
-    state.turnMs[p.session_id] = Date.now() - startedAt;
+    state.turnMs[p.session_id] = ms;
     delete state.turnStarted[p.session_id];
-    // T5: how the turn ended. A stop is the client's own record (see stoppedTurns).
+    // B1: the reference's rate, computed once here rather than per frame —
+    // completion tokens over the wall time the turn took, which is the same clock
+    // the row under the answer states.
+    if (p.completion_tokens != null && ms > 0) {
+      state.tokRate = p.completion_tokens / (ms / 1000);
+    }
+    // B2: the chat's running total, accumulated at each finish so a reader watches
+    // it climb. §5.2's all-time counter is the other half (T6); this one is per chat
+    // and lives in memory, so a reload falls back to whatever the messages carry.
+    state.usageTotals = state.usageTotals || {};
+    state.usageTotals[p.session_id] =
+      (state.usageTotals[p.session_id] || 0) +
+      (p.prompt_tokens || 0) +
+      (p.completion_tokens || 0);
+    // T5 / 5.3: how the turn ended. The backend's own `cancelled` leads, because it is
+    // written where the stop was honoured - so it survives a reload, a second window, and
+    // a stop the client never saw. The client's press stays as the second source on
+    // purpose: a backend that predates the flag must not have every stopped turn called
+    // completed, and the two are independent - the live guard pins a turn the *backend*
+    // cancelled with no press at all, so removing either source reddens a check of its own.
+    const pressedStop = stoppedTurns.delete(p.session_id);
     state.turnState = state.turnState || {};
-    state.turnState[p.session_id] = stoppedTurns.delete(p.session_id) ? "stopped" : "completed";
+    state.turnState[p.session_id] = turnVerdict(p, pressedStop);
     // The last row now states something new, so it is not the same row: without
     // this the transcript's cached window would go on drawing the old one.
     if (p.session_id === state.activeId) markDirtyAll();
@@ -6679,6 +7053,13 @@ listen("stream-finished", async (event) => {
   // The provider's count for the turn that just ended; absent when it reported none.
   if (p.session_id === state.activeId) {
     state.usage = { prompt: p.prompt_tokens || 0, completion: p.completion_tokens || 0 };
+    // B2's other half: the provider's own cache breakdown, when it sent one. A
+    // provider that reports no breakdown means unknown, not 0% — the foot states
+    // that as the dash, and a zero here would claim a measurement nobody made.
+    state.cacheHit =
+      p.cache_read_tokens != null && p.prompt_tokens > 0
+        ? Math.round((p.cache_read_tokens / p.prompt_tokens) * 100)
+        : undefined;
     renderStatus();
   }
   // The server denied that chat's pending approvals when its stream ended.
@@ -7312,8 +7693,77 @@ function fmtTokens(n) {
 /* The token meter. It reports the provider's own numbers rather than an estimate,
    and warns at 80% of the context budget, which is the point where the next turn
    is more likely to be compacted than answered. */
+/* The reference's three popups (b1-b3) share one open/close pair: one panel at a
+   time, Escape or a click outside closes it, and the button reports whether its
+   own panel is out. #3 opens no panel at all — it goes to the context section,
+   which is where the numbers it summarizes are explained. */
+const statPanels = {
+  turns: $("stat-turns-pop"),
+  tokens: $("stat-tokens-pop"),
+};
+
+function closeStatPops() {
+  for (const [name, panel] of Object.entries(statPanels)) {
+    // A fixture is a partial page: the bar may not be there at all, and a mount
+    // that assumes it is would take the whole fixture down at load time.
+    if (!panel || !statPops[name]) continue;
+    panel.classList.add("hidden");
+    statPops[name].setAttribute("aria-expanded", "false");
+  }
+}
+
+async function fillTokenPop() {
+  const host = $("stat-token-meter");
+  if (!state.activeId) {
+    host.textContent = "Open a chat first — the meter describes one conversation.";
+    return;
+  }
+  try {
+    renderTokenMeter(
+      host,
+      await invoke("token_meter", { session_id: state.activeId, provider_tokens: null }),
+    );
+  } catch (err) {
+    host.textContent = String(err);
+  }
+}
+
+function toggleStatPop(name) {
+  const panel = statPanels[name];
+  const willOpen = panel.classList.contains("hidden");
+  closeStatPops();
+  if (!willOpen) return;
+  panel.classList.remove("hidden");
+  statPops[name].setAttribute("aria-expanded", "true");
+  if (name === "tokens") void fillTokenPop();
+}
+
+function openStatSection() {
+  closeStatPops();
+  void openSettings()
+    .then(() => navTo("context-section"))
+    .catch(() => {});
+}
+
+function wireStatPops() {
+  if (!statPops.turns || !statPops.tokens || !statPops.ctx) return;
+  statPops.turns.addEventListener("click", () => toggleStatPop("turns"));
+  statPops.tokens.addEventListener("click", () => toggleStatPop("tokens"));
+  statPops.ctx.addEventListener("click", () => openStatSection());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeStatPops();
+  });
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest || !e.target.closest(".stat-slot")) closeStatPops();
+  });
+}
+
+wireStatPops();
+
+
+wireAccountMenu();
 function renderUsage() {
-  const host = $("status-right");
+  const host = $("usage-meter-host");
   if (!host) return;
   let meter = host.querySelector(".usage-meter");
   if (!meter) {
@@ -7406,6 +7856,61 @@ function focusSection(sectionId) {
   // A fixture (or older markup) may still hand over a plain element.
   const plain = document.getElementById(sectionId);
   if (plain) plain.scrollIntoView({ block: "start" });
+}
+
+// S2: the sidebar's three global-panel rows open the settings pane that owns each
+// area. navTo already does the two things a row needs (open Settings, then focus
+// the section and select its tab), so the rows are pure navigation and hold no
+// state of their own.
+const SIDE_PANEL_TARGETS = {
+  "nav-plugins": "cap-list",
+  "nav-automation": "jobs-section",
+  "nav-mcp": "set-mcp",
+};
+for (const [buttonId, sectionId] of Object.entries(SIDE_PANEL_TARGETS)) {
+  const button = document.getElementById(buttonId);
+  if (button) button.addEventListener("click", () => navTo(sectionId));
+}
+
+// S5: the avatar row is the account menu (the reference's dsh:42), built from the
+// shared row-menu renderer - so Escape closes it, the arrow walk moves through it and
+// focus returns to the row through the same contract as every other menu here. The
+// four items are controls that already exist rather than new ones: Settings, the
+// shortcut reference, and the header's theme cycle and language toggle, reached
+// through Polish's public setters. The standalone gear stays (documented deviation).
+const ACCOUNT_ITEMS = [
+  { key: "account.settings", fallback: "Settings", run: "settings" },
+  { key: "account.shortcuts", fallback: "Keyboard shortcuts", run: "shortcuts" },
+  { key: "account.theme", fallback: "Theme", run: "theme" },
+  { key: "account.lang", fallback: "Language", run: "lang" },
+];
+
+function accountPick(run) {
+  if (run === "settings") void openSettings();
+  else if (run === "shortcuts" && window.Polish && window.Polish.openShortcuts) window.Polish.openShortcuts();
+  else if (run === "theme" && window.Polish && window.Polish.cycleTheme) window.Polish.cycleTheme();
+  else if (run === "lang" && window.Polish && window.Polish.setLang) {
+    window.Polish.setLang(window.Polish.lang && window.Polish.lang() === "zh" ? "en" : "zh");
+  }
+}
+
+function wireAccountMenu() {
+  const button = document.getElementById("side-account");
+  if (!button || button.dataset.wired === "1") return;
+  button.dataset.wired = "1";
+  button.addEventListener("click", (e) => {
+    e.stopPropagation();
+    // The renderer owns Escape, the arrow walk and the refocus; toggling
+    // aria-expanded is the caller's half of that contract.
+    if (rowMenu && rowMenu.anchor === button) {
+      closeRowMenu(true);
+      return;
+    }
+    button.setAttribute("aria-expanded", "true");
+    openRowMenu(button, ACCOUNT_ITEMS.map((i) => ({ label: tr(i.key, i.fallback), run: i.run })), (picked) => {
+      accountPick(picked.run);
+    });
+  });
 }
 
 function navTo(sectionId) {

@@ -434,5 +434,16 @@ PYEOF
 )
 [ -z "$dollar_hash" ] && ok || bad "a '#' selector passed to \$ (getElementById, not querySelector): $dollar_hash"
 
+# C3: the composer's placeholder is the reference's sentence, and the textarea carries
+# the marks that let the language toggle rewrite it. It is compared against polish.js's
+# own English string as well as the literal attribute, so the two cannot drift apart;
+# and the Enter hint is checked to be in the title, because it used to be the last
+# clause of the placeholder, where a narrow composer cut it off mid-sentence.
+if grep -qF 'placeholder="Message or run a task,&#10;/ commands, @ files or sessions"' $HTML    && grep -q 'data-i18n-placeholder="composer.placeholder"' $HTML    && grep -qF 'en: "Message or run a task,' ui/polish.js    && grep -qF '/ commands, @ files or sessions",' ui/polish.js    && grep -qF 'title="Enter = send · Shift+Enter = newline"' $HTML    && grep -q 'data-i18n-title="composer.enterHint"' $HTML    && grep -qF '"composer.enterHint": { en: "Enter = send' ui/polish.js; then
+  ok
+else
+  bad "the composer placeholder is not the reference sentence, or its Enter hint is not in the title (C3)"
+fi
+
 echo "[markup] checks=$checks failures=$fail"
 [ "$fail" = 0 ]

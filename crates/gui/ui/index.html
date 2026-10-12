@@ -27,6 +27,31 @@
           <span data-i18n="side.newSession">New Session</span>
         </button>
       </div>
+      <nav class="side-panels" id="side-panels" aria-label="Global panels">
+        <button id="nav-plugins" class="side-panel" type="button">
+          <svg class="ico" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false">
+            <path d="M6 1.8v3.1M10 1.8v3.1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            <path d="M4.4 4.9h7.2v3.4a3.6 3.6 0 0 1-7.2 0z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+            <path d="M8 11.9v2.3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+          </svg>
+          <span data-i18n="nav.plugins">Plugins</span>
+        </button>
+        <button id="nav-automation" class="side-panel" type="button">
+          <svg class="ico" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false">
+            <circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.3" />
+            <path d="M8 4.4V8l2.5 1.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <span data-i18n="nav.automation">Automation tasks</span>
+        </button>
+        <button id="nav-mcp" class="side-panel" type="button">
+          <svg class="ico" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false">
+            <rect x="1.6" y="5.4" width="4.6" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3" />
+            <rect x="9.8" y="5.4" width="4.6" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3" />
+            <path d="M6.2 8h3.6" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+          </svg>
+          <span data-i18n="nav.mcpConnectors">MCP connectors</span>
+        </button>
+      </nav>
       <div class="side-section" id="side-workspaces">
         <div class="side-section-head">
           <span class="side-section-title" data-i18n="side.workspaces">Workspaces</span>
@@ -54,10 +79,11 @@
         ></div>
       </div>
       <div class="sidebar-foot">
-        <div class="side-user">
+        <button id="side-account" class="side-user" type="button" aria-haspopup="menu"
+                aria-expanded="false" aria-label="Account menu" data-i18n-aria="side.account">
           <span class="side-avatar" aria-hidden="true">B</span>
           <span class="side-user-name" id="side-user-name" data-i18n="side.local">Local workspace</span>
-        </div>
+        </button>
         <button id="open-settings" class="btn btn-ghost" title="Settings" aria-label="Settings"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 15.6a3.6 3.6 0 1 0 0-7.2 3.6 3.6 0 0 0 0 7.2z"/><path d="M12 2.6v2.8M12 18.6v2.8M2.6 12h2.8M18.6 12h2.8M5.4 5.4l2 2M16.6 16.6l2 2M18.6 5.4l-2 2M7.4 16.6l-2 2"/></svg></button>
       </div>
     </aside>
@@ -93,6 +119,10 @@
         </span>
         <button type="button" id="working-stop" class="working-btn" data-i18n-aria="working.stopAria" data-i18n-title="working.stopAria" aria-label="Stop generating" title="Stop generating"><svg class="ico" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor"/></svg></button>
       </div>
+      <!-- W2: the mascot that says a turn is in flight. It is decoration, so it is
+           aria-hidden and cannot be clicked through; the badge beside it is the control. -->
+      <img id="brand-avatar" class="brand-avatar" src="icons/bos-harness-icon.svg"
+           alt="" width="64" height="64" aria-hidden="true" />
       </header>
 
       <div id="messages" role="tabpanel" aria-labelledby="tab-chat" tabindex="0"></div>
@@ -206,7 +236,7 @@
         </div>
         <div id="queue-list" class="queue-list hidden" aria-label="Queued messages"></div>
         <div id="attach-strip" class="attach-strip hidden" aria-label="Attached images"></div>
-        <textarea id="input" rows="1" aria-controls="cmd-list" aria-expanded="false" aria-keyshortcuts="Enter Shift+Enter" data-i18n-placeholder="composer.placeholder" placeholder="Message or run a task&#10;/ commands &amp; skills · @ file mentions · paste or drop images · Enter = send · Shift+Enter = newline"></textarea>
+        <textarea id="input" rows="1" aria-controls="cmd-list" aria-expanded="false" aria-keyshortcuts="Enter Shift+Enter" data-i18n-placeholder="composer.placeholder" placeholder="Message or run a task,&#10;/ commands, @ files or sessions" data-i18n-title="composer.enterHint" title="Enter = send · Shift+Enter = newline"></textarea>
         <div id="composer-foot">
           <button id="attach-btn" class="comp-icon" type="button"
                   data-i18n-aria="attach.aria" data-i18n-title="attach.title"
@@ -226,7 +256,30 @@
 
       <footer id="statusbar">
         <span id="status-left"></span>
-        <span id="status-right"></span>
+        <div id="status-bar" class="status-bar">
+          <div class="stat-slot">
+            <button type="button" id="stat-turns" class="stat-pop" aria-haspopup="dialog">
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.6"/><path d="M8 4.6v3.6l2.4 1.5"/></svg>
+              <span class="stat-text"></span>
+            </button>
+            <div id="stat-turns-pop" class="stat-pop-panel hidden" role="dialog"></div>
+          </div>
+          <div class="stat-slot">
+            <button type="button" id="stat-tokens" class="stat-pop" aria-haspopup="dialog">
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><ellipse cx="8" cy="3.8" rx="5.2" ry="1.9"/><path d="M2.8 3.8v8.4c0 1 2.3 1.9 5.2 1.9s5.2-.9 5.2-1.9V3.8"/></svg>
+              <span class="stat-text"></span>
+            </button>
+            <div id="stat-tokens-pop" class="stat-pop-panel hidden" role="dialog">
+              <span id="usage-meter-host"></span>
+              <div id="stat-token-meter" class="stat-meter"></div>
+            </div>
+          </div>
+          <div class="stat-slot">
+            <button type="button" id="stat-ctx" class="stat-pop" aria-haspopup="dialog">
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="5.6"/><circle cx="8" cy="8" r="2"/></svg>
+              <span class="stat-text"></span>
+            </button>
+          </div></div>
       </footer>
     </main>
   </div>

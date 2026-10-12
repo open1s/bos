@@ -1125,11 +1125,6 @@ body.resizing #doc-panel { transition: none; }
   cursor: zoom-in;
 }
 
-.msg-img.zoomed {
-  max-width: min(560px, 100%);
-  max-height: 60vh;
-  cursor: zoom-out;
-}
 
 /* ---------- status bar ---------- */
 
@@ -1143,24 +1138,16 @@ body.resizing #doc-panel { transition: none; }
   color: var(--faint);
 }
 
-#status-left span, #status-right span { margin-left: 12px; }
-#status-left span:first-child, #status-right span:first-child { margin-left: 0; }
+#status-left span { margin-left: 12px; }
+#status-left span:first-child { margin-left: 0; }
 
 /* One dotted line of facts, the way the reference's footer reads. The
    separators are decoration, so the sheet draws them and they never enter the
    text a check reads (a pseudo-element is not textContent). */
 #status-left span + span::before,
-#status-right span + span::before { content: "· "; color: var(--faint); }
 
-#status-right .tools { color: var(--success); }
-#status-right .usage { color: var(--dim); }
-#status-right .err { color: var(--error); }
 
 /* Context-budget meter: green-ish while the transcript fits the budget. */
-#status-right .ctx { color: var(--faint); font-variant-numeric: tabular-nums; }
-#status-right .ctx-ok { color: var(--dim); }
-#status-right .ctx-warn { color: var(--warn); }
-#status-right .ctx-err { color: var(--error); }
 
 /* ---------- settings modal ---------- */
 
@@ -3552,3 +3539,227 @@ body.resizing #doc-panel { transition: none; }
 .set-icon { display: inline-flex; align-items: center; justify-content: center; }
 .cap-title .ico, .btn .ico { width: 14px; height: 14px; }
 .btn .ico { vertical-align: -2px; }
+
+/* The reference's three centered popups (b1-b3). The BSH-only notices keep the
+   foot's left end, outside this group, so the group is centered by the space they
+   leave and never rewrapped by their growth: one line, no dividers, spacing only. */
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0 auto;
+  min-width: 0;
+}
+.stat-pop {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: var(--control-h);
+  max-width: 100%;
+  padding: 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--dim);
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 90ms ease, border-color 90ms ease;
+}
+.stat-pop svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+}
+.stat-pop .stat-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stat-pop:hover,
+.stat-pop:focus-visible {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.stat-pop.ctx-warn { color: var(--warn); }
+.stat-pop.ctx-err { color: var(--error); }
+
+/* The popup panels (b1-b3) anchor to the button that opened them, above the foot.
+   Flat like everything else: one fill, one border, no shadow — the border IS the
+   edge, which is what the overlay rule says to use instead. */
+.stat-slot {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+}
+.stat-pop-panel {
+  position: absolute;
+  bottom: calc(100% + var(--space-2));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  min-width: 200px;
+  max-width: 320px;
+  padding: var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--dim);
+  font-size: var(--font-ui);
+  text-align: left;
+}
+.stat-pop-line {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.stat-pop-hint {
+  margin-top: var(--space-2);
+  color: var(--faint);
+}
+.stat-pop-panel .stat-meter {
+  margin-top: var(--space-2);
+}
+
+/* S2: the sidebar's global-panels nav. Three rows under New Session that open the
+ * settings pane which owns each area, mirroring the reference's dsh:9-11. The rows
+ * are the flat recipe: one solid hover fill, no border, a token radius. */
+.side-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-3) var(--space-1);
+}
+.side-panel {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-height: 30px;
+  padding: 0 var(--space-2);
+  background: none;
+  color: var(--text);
+  border: 0;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.side-panel:hover { background: var(--hover); }
+.side-panel:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.side-panel .ico { flex: none; color: var(--faint); }
+
+/* S5: the avatar row is the account menu button now (the reference's dsh:42). It
+ * keeps the row's own look and gains the flat hover/focus the rest of the chrome has;
+ * the menu it opens is the shared row menu, so none of that styling lives here. */
+button.side-user {
+  width: 100%;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+button.side-user:hover { background: var(--hover); }
+button.side-user:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* T6: the usage chip's panel. Flat like every other overlay: one solid fill, one
+   border, no shadow - on a dark background the edge is the depth cue. */
+.usage-pop {
+  position: fixed;
+  z-index: 92;
+  min-width: 200px;
+  padding: 8px 10px;
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+.usage-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 2px 0;
+}
+.usage-key {
+  color: var(--faint);
+}
+.usage-val {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.usage-meter {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+/* T7: an attachment is a button that carries its own name. Flat like the rest of the
+   chrome: no shadow, one hover colour, and the picture keeps the thumbnail size until
+   the document panel shows it full. */
+button.msg-image {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.msg-image-name {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--faint);
+}
+.msg-image:hover .msg-image-name,
+.msg-image:focus-visible .msg-image-name {
+  color: var(--accent);
+}
+.doc-img {
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+/* W2: the brand mascot, top-right of the transcript while a turn streams. It states
+   nothing - it is decoration with no label - and it cannot be clicked through, so the
+   badge below it stays the only control. Flat like the rest: no shadow, and the one
+   transition is the 120ms opacity the spec allows (the reduced-motion block below
+   neutralises it like every other transition here). */
+.brand-avatar {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 20px;
+  width: 64px;
+  height: 64px;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 120ms linear;
+}
+.brand-avatar.on {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* T4: the goal transition, centered between turns. Flat like everything else: one solid
+   fill, one border, no shadow, and it is deliberately narrow - it is a note between two
+   turns, not a row of them. */
+.msg-marker {
+  align-self: center;
+  margin: var(--space-2) auto;
+  padding: 2px var(--space-3);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--faint);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}

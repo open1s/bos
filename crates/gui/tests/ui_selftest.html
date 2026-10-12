@@ -1115,16 +1115,20 @@ window.addEventListener("error", (e) => {
 
         // ---- 22. the token meter ---------------------------------------
         const kept7 = { usage: state.usage, budget: state.budget };
-        let statusRight = document.getElementById("status-right");
-        if (!statusRight) {
-          statusRight = document.createElement("span");
-          statusRight.id = "status-right";
-          document.body.appendChild(statusRight);
+        // The meter lives in the tokens popup's panel now, so the fixture mounts the
+        // host the shipped markup offers it (#usage-meter-host) rather than a span of
+        // its own: a check that invents its own host cannot see where the page puts
+        // one, which is how the meter passed for months without ever painting.
+        let meterHost = document.getElementById("usage-meter-host");
+        if (!meterHost) {
+          meterHost = document.createElement("div");
+          meterHost.id = "usage-meter-host";
+          document.body.appendChild(meterHost);
         }
         state.budget = 0;
         state.usage = { prompt: 12345, completion: 678 };
         renderUsage();
-        const meter = statusRight.querySelector(".usage-meter");
+        const meter = meterHost.querySelector(".usage-meter");
         const noBudget = { text: meter ? meter.textContent : "none", near: meter ? meter.classList.contains("near-limit") : null };
         state.budget = 14000;
         renderUsage();
@@ -1151,7 +1155,7 @@ window.addEventListener("error", (e) => {
         state.usage = { prompt: 12345, completion: 678 };
         state.budget = 14000;
         renderStatus();
-        const meterAfter = statusRight.querySelector(".usage-meter");
+        const meterAfter = meterHost.querySelector(".usage-meter");
         assert(
           `the token meter survives the status line's own clear (text="${
             meterAfter ? meterAfter.textContent : "none"
@@ -2557,6 +2561,29 @@ window.addEventListener("error", (e) => {
           );
           state.activeId = prevActive;
         }
+
+        /* T5 / 5.3: how a turn ended, the one decision two sources feed. Each source is
+           pinned here on its own, which the live suite's stop check cannot do: it presses
+           Stop, so both sources are true at once and a defect in either stays invisible. */
+        assert(
+          "5.3: a turn the backend cancelled says stopped with no press (verdict=" +
+            turnVerdict({ cancelled: true }, false) + ")",
+          turnVerdict({ cancelled: true }, false) === "stopped",
+        );
+        assert(
+          "5.3: a turn the user stopped says stopped with no backend flag (verdict=" +
+            turnVerdict({}, true) + ")",
+          turnVerdict({}, true) === "stopped",
+        );
+        assert(
+          "5.3: a turn nobody stopped is completed (verdict=" + turnVerdict({}, false) + ")",
+          turnVerdict({}, false) === "completed",
+        );
+        assert(
+          "5.3: a payload that carries no flag at all is not a stop (verdict=" +
+            turnVerdict(undefined, false) + ")",
+          turnVerdict(undefined, false) === "completed",
+        );
 
         R.failures = Object.values(R.checks).filter((v) => v.startsWith("FAIL")).length;
         const pre = document.createElement("pre");

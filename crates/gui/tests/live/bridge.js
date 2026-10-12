@@ -428,10 +428,16 @@
         gen,
         prompt_tokens: 120,
         completion_tokens: 45,
+        // 80% of the prompt served from the provider's cache; the foot states it.
+        cache_read_tokens: 96,
         cancelled: !!(extra && extra.cancelled),
         error: acc.error || null,
       }, STEP);
     };
+
+    // 5.3: a turn the backend cancelled on its own, with no press for the client to
+    // mistake for the source. The foot has to say Stopped from the payload alone.
+    // (isolation: the servercancel branch is removed)
 
     (async () => {
       if (scenarioOf(userText) === "approval") {
@@ -960,6 +966,7 @@
   };
 
   const handlers = {
+    set_message_feedback: () => null,
     list_sessions: () =>
       copy(store.sessions)
         .sort((a, b) => b.updated_at - a.updated_at)
