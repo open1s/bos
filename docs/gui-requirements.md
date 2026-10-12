@@ -2557,5 +2557,11 @@ built *after* that reassignment, so it opened `dom500.html`, which nobody had wr
 The app was never wrong and the assertion was never relaxed; the dump path is now captured
 once (`DOM`) before the reassignment and all three readers take that. A path recomputed
 from a mutable loop variable fails for a reason that has nothing to do with what it checks.
+Green at the end of the round: `markup` 93/0, `page` 176/0, `ui` 165/0, `shell` 95/0,
+`layout` 0 at four widths (the 420px window reports the 500px its stylesheet clamps to),
+`package` 17/0, `perf` 19/0, and `live` 148 with its one pre-existing red — the image
+bubble that has never rendered from the store. Read out of the running app, not a fixture:
+`toggle button ▤ Help: Toggle document panel, Value: on`, `pop up button More actions for
+this chat`, `pop up button Pick a skill`.
 
 
