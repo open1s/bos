@@ -249,7 +249,76 @@
              openWidth: Math.round(after.width), expanded, reclosed,
              armedBefore, armedOpen, armedAfter };
   }
-  window.__layoutMeasure = function () { report(measure()); return measure(); };
+  (function () {
+  // The document toggle belongs to the head's own control row, on its right edge.
+  // It was once appended to `#chat-head`, the column that holds the row and the
+  // tabs, so it painted as a full-width block *under the tabs* (rev 124) — the
+  // reported bug, and exactly what a number beats a screenshot for.
+  function measureDoc() {
+    const btn = document.getElementById("doc-toggle");
+    const row = document.querySelector("#chat-head .head-row");
+    if (!btn || !row) return { present: false };
+    const b = btn.getBoundingClientRect();
+    const r = row.getBoundingClientRect();
+    const tabs = document.getElementById("chat-tabs");
+    const t = tabs ? tabs.getBoundingClientRect() : null;
+    return {
+      present: true,
+      // Below a certain width the head hides its controls outright; a display:none
+      // button is 0-wide at the origin, which is a layout choice, not this bug.
+      visible: b.width > 0 && b.height > 0,
+      inRow:
+        b.top >= r.top - 1 && b.bottom <= r.bottom + 1 &&
+        b.left >= r.left - 1 && b.right <= r.right + 1,
+      atRight: b.right >= r.right - 8,
+      notABar: b.width < r.width - 40,
+      aboveTabs: !t || b.bottom <= t.top + 1,
+      w: Math.round(b.width),
+      rowW: Math.round(r.width),
+    };
+  }
+  window.__docProbe = measureDoc;
+
+  function reportDoc() {
+    // One element, written twice: at 560px and 500px the page's load event never
+    // fires at all (the main report below is parse-time for the same reason), and
+    // a measurement registered only on load was simply absent there.
+    const old = document.getElementById("result-doc");
+    if (old) old.remove();
+    const pre = document.createElement("pre");
+    pre.id = "result-doc";
+    pre.textContent = JSON.stringify(measureDoc());
+    // First child, not last: the dump for the narrowest window is the largest DOM,
+    // and its tail is where a serialized page gets cut off.
+    document.body.insertBefore(pre, document.body.firstChild);
+  }
+  if (document.body) reportDoc();
+  window.addEventListener("load", reportDoc);
+})();
+
+window.__layoutMeasure = function () { report(measure()); return measure(); };
   report(measure());
   window.addEventListener("load", () => report(measure()));
+})();
+
+/* Last resort: at one width the report above never reached the DOM, and a probe that
+   vanishes looks exactly like a page that never ran. This always writes one — with the
+   reason, if there is one — so a missing measurement can be told from a bad one. */
+(function () {
+  function write(extra) {
+    const old = document.getElementById("result-doc");
+    if (old) old.remove();
+    const pre = document.createElement("pre");
+    pre.id = "result-doc";
+    let body;
+    try {
+      body = window.__docProbe ? window.__docProbe() : { present: false, error: "probe not exposed" };
+    } catch (e) {
+      body = { present: false, error: String(e && e.message ? e.message : e) };
+    }
+    pre.textContent = JSON.stringify(Object.assign({}, body, extra || {}));
+    document.body.insertBefore(pre, document.body.firstChild);
+  }
+  write();
+  window.addEventListener("load", () => write());
 })();

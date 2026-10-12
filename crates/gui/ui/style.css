@@ -898,6 +898,13 @@ body.resizing #doc-panel { transition: none; }
 .comp-chip:hover { background: var(--hover); color: var(--text); }
 .comp-chev { width: 14px; height: 14px; }
 
+/* The header's live chips: the jobs count is a button (it opens the pane it
+   counts), the ⋯ is the same size as the other header controls. */
+.head-chip { cursor: pointer; }
+#chat-more { font-size: 15px; line-height: 1; }
+.comp-skill { gap: 2px; }
+.comp-plus { color: var(--faint); }
+
 .comp-send {
   display: inline-flex;
   align-items: center;
@@ -1393,7 +1400,35 @@ body.resizing #doc-panel { transition: none; }
   font-size: 11.5px;
   cursor: pointer;
 }
+/* The finished turn's duration, under its answer: a plain row rather than a
+   button, the way the reference states it (there, a disabled one). */
+.turn-foot {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.code-tools { display: inline-flex; align-items: center; gap: var(--space-2); }
+
+.code-expand {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  border-radius: var(--radius-xs);
+  padding: 1px 6px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.code-copy::before { content: none; }
+.code-expand:hover { color: var(--text); border-color: var(--accent); }
 .code-copy:hover { color: var(--text); border-color: var(--accent); }
+
+/* A tall listing is clamped until it is asked for whole: the head says how long
+   it is, and ⤢ shows the rest without pushing the conversation around. */
+.md-code code { max-height: 260px; overflow-y: auto; }
+.md-code.expanded code { max-height: none; }
 
 .bubble-actions {
   display: flex;

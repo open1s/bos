@@ -25,6 +25,28 @@
     "tab.chat": { en: "Chat", zh: "对话" },
     "tab.trajectory": { en: "Trajectory", zh: "轨迹" },
     "tabs.label": { en: "Conversation views", zh: "会话视图" },
+    // The middle panel's own chrome, after the reference: a background-jobs chip
+    // and a "⋯" beside the chat title, a "+ Skill" in the composer foot. The
+    // count is a placeholder so a translator keeps the number inside the phrase.
+    "jobs.chip": { en: "{n} background job running", zh: "{n} 个后台任务运行中" },
+    "jobs.chipPlural": { en: "{n} background jobs running", zh: "{n} 个后台任务运行中" },
+    "jobs.chipTitle": { en: "Background jobs (Settings)", zh: "后台任务（设置）" },
+    "jobs.chipAria": { en: "Background jobs", zh: "后台任务" },
+    "chat.moreAria": { en: "More actions for this chat", zh: "这个会话的更多操作" },
+    "chat.moreTitle": { en: "More actions", zh: "更多操作" },
+    "composer.skill": { en: "Skill", zh: "技能" },
+    // A fenced block, after the reference: an unlabelled fence is a "Code block",
+    // and the head carries the expand affordance beside the copy.
+    "code.block": { en: "Code block", zh: "代码块" },
+    // The finished turn's duration; {d} is "1h 4m 59s".
+    "turn.completed": { en: "Completed in {d}", zh: "耗时 {d}" },
+    "code.copy": { en: "Copy", zh: "复制" },
+    "code.copied": { en: "Copied", zh: "已复制" },
+    "code.copyFailed": { en: "Copy failed", zh: "复制失败" },
+    "code.expand": { en: "Expand code block", zh: "展开代码块" },
+    "code.collapse": { en: "Collapse code block", zh: "收起代码块" },
+    "composer.skillAria": { en: "Pick a skill", zh: "选择技能" },
+    "composer.skillTitle": { en: "Pick a skill (the same list as typing /)", zh: "选择技能（与输入 / 相同）" },
     "btn.addWorkspace": { en: "Add Workspace", zh: "添加工作区" },
     // The head's sliders: it names three choices at once (how the chats are
     // grouped, in what order, and which archived ones are listed), so the name

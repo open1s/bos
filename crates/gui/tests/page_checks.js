@@ -942,6 +942,8 @@
       evaluate_transcript: { session_id: "e2e", score: 88, grade: "B+", reasons: ["2 blank assistant turns"], signals: { turns: 4 } },
       replay_session: { session_id: "e2e", title: "t", workspace: "/w", entries: [{ order: 1, index: 0, role: "user", text: "hi", reasoning: "", tools: [{ name: "bash", args: "{}", failed: false, ms: 1200 }], error: null, archived: false }], metrics: { turns: 4, user_turns: 2, assistant_turns: 2, archived_turns: 0, tool_calls: 1, tool_failures: 0, tool_ms_total: 1200, tool_ms_missing: 0, errors: 0, blank_turns: 0, estimated_tokens: 1234 } },
       export_bundle: { path: "/tmp/bos-bundle.zip", bytes: 4096, schema_version: 1, entries: 5, files: [{ name: "transcript.json", size: 100, crc32: "ab" }] },
+      export_session: "/tmp/e2e.md",
+      export_chat: "/tmp/e2e-chat.zip",
       compact_now: { session_id: "e2e", title: "t", messages: 4, live_messages: 0, archived_messages: 4, estimated_tokens: 10, budget_tokens: 8192, over_budget: false, can_compact: false, compacting: false, refusal: null },
       restore_compacted: 4,
     };
@@ -2246,6 +2248,177 @@
       `M7: stopping a job calls job_interrupt with that id (${lastArgs("job_interrupt") && lastArgs("job_interrupt").id})`,
       called("job_interrupt").length === 1 && lastArgs("job_interrupt").id === "j1",
     );
+
+    // The middle panel's own chrome, after the reference: a background-jobs chip
+    // beside the title, a "+ Skill" in the composer foot, and a "⋯" that reaches
+    // the chat's menu. Each check drives the control, not the function under it.
+    const jobsChip = d.getElementById("jobs-chip");
+    assert(
+      `the jobs chip counts what has not finished, and shows itself to say it (${jobsChip.textContent})`,
+      // The fixture lists two jobs, one of them finished: the chip is about the
+      // work still running, so it says one rather than two.
+      !jobsChip.classList.contains("hidden") && jobsChip.textContent === "1 background job running",
+    );
+
+    // The composer keeps whatever an earlier check typed; the gesture under test
+    // is the button's, so start from an empty one and put the text back after.
+    const composerWas = d.getElementById("input").value;
+    d.getElementById("input").value = "";
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    d.getElementById("skill-btn").click();
+    await flush();
+    assert(
+      `"+ Skill" performs the slash that opens the palette (${JSON.stringify(d.getElementById("input").value)}, open=${!d.getElementById("cmd-palette").classList.contains("hidden")})`,
+      d.getElementById("input").value === "/" &&
+        !d.getElementById("cmd-palette").classList.contains("hidden") &&
+        d.querySelectorAll("#cmd-list li").length > 0,
+    );
+    d.getElementById("input").value = composerWas;
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+
+    // Escape is a dismissal, not a trap: it closes the palette and takes the
+    // bare "/" token with it (issue #19) — a lone "/" left behind would sit in
+    // the composer with Send enabled and Enter would ship it to the model.
+    const escWas = d.getElementById("input").value;
+    d.getElementById("input").value = "/";
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    d.getElementById("input").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flush();
+    assert(
+      `Escape closes the palette and takes the bare "/" with it (input=${JSON.stringify(d.getElementById("input").value)}, open=${!d.getElementById("cmd-palette").classList.contains("hidden")})`,
+      d.getElementById("input").value === "" &&
+        d.getElementById("cmd-palette").classList.contains("hidden"),
+    );
+    // A token the user may still be editing is text, not a trap: "/sta"
+    // survives the same Escape.
+    d.getElementById("input").value = "/sta";
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    d.getElementById("input").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flush();
+    assert(
+      `Escape keeps a token that has a name (${JSON.stringify(d.getElementById("input").value)})`,
+      d.getElementById("input").value === "/sta" &&
+        d.getElementById("cmd-palette").classList.contains("hidden"),
+    );
+    d.getElementById("input").value = escWas;
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+
+    // Two commands cannot share one name (issue #18): the palette offered
+    // "/export" twice and the bare-token dispatcher always found the first,
+    // so the ZIP export was unreachable. The names are unique, and each token
+    // now reaches its own command through the same gesture the user makes.
+    const cmdNames = BUILTIN_COMMANDS.map((c) => c.name);
+    assert(
+      `no two built-in commands share a name (${new Set(cmdNames).size}/${cmdNames.length})`,
+      cmdNames.length > 0 && new Set(cmdNames).size === cmdNames.length,
+    );
+    const expWas = d.getElementById("input").value;
+    d.getElementById("input").value = "/export";
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    d.getElementById("input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await flush();
+    assert(
+      `"/export" runs the Markdown export (export_session calls: ${called("export_session").length})`,
+      called("export_session").length === 1 && called("export_chat").length === 0,
+    );
+    d.getElementById("input").value = "/export-zip";
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    d.getElementById("input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await flush();
+    assert(
+      `"/export-zip" runs the ZIP export for the open chat (${lastArgs("export_chat") && lastArgs("export_chat").sessionId})`,
+      called("export_chat").length === 1 &&
+        lastArgs("export_chat").sessionId === state.activeId,
+    );
+    d.getElementById("input").value = expWas;
+    d.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+
+    // The header's ⋯ acts on the chat the sidebar says is open, so point that at
+    // a real one from the list (this harness moves it by hand elsewhere too).
+    const activeWas = state.activeId;
+    // This harness does not run the app's init(), so ask for the sidebar's list
+    // the way switching a chat does — the menu needs a chat to act on.
+    await refreshSessions();
+    const chatForMenu = state.sessions.find((s) => !s.archived);
+    state.activeId = chatForMenu ? chatForMenu.id : activeWas;
+    d.getElementById("chat-more").click();
+    await flush();
+    const headerMenu = d.querySelector(".row-menu");
+    const headerRuns = Array.from(d.querySelectorAll(".row-menu .row-menu-item")).map((b) => b.dataset.run);
+    assert(
+      `the header's ⋯ opens the chat's own menu (${headerRuns.join(",")})`,
+      !!headerMenu && headerRuns.length >= 4 && ["rename", "fork", "delete"].every((run) => headerRuns.includes(run)),
+    );
+    if (headerMenu) headerMenu.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flush();
+    assert("one Escape closes the ⋯ menu", d.querySelectorAll(".row-menu").length === 0);
+    state.activeId = activeWas;
+
+    // The reference labels a fenced block — an unlabelled fence says "Code
+    // block" — and puts an expand beside the copy.
+    messagesEl.insertAdjacentHTML("beforeend", renderMarkdown("\`\`\`js\nconst a = 1;\n\`\`\`"));
+    messagesEl.insertAdjacentHTML("beforeend", renderMarkdown("\`\`\`\nplain\n\`\`\`"));
+    const blocks = messagesEl.querySelectorAll(".md-code");
+    const labelled = blocks[blocks.length - 2];
+    const nameless = blocks[blocks.length - 1];
+    const namedText = labelled.querySelector(".code-lang").textContent;
+    const namelessText = nameless.querySelector(".code-lang").textContent;
+    assert(
+      `a fence names its language, and an unlabelled one is not just "code" (${namedText} / ${namelessText})`,
+      namedText === "js" && namelessText.length > 0 && namelessText !== "code",
+    );
+    const foldBtn = labelled.querySelector(".code-expand");
+    foldBtn.click();
+    await flush();
+    assert(
+      `the head's expand unfolds the block and says so (expanded=${labelled.classList.contains("expanded")}, aria=${foldBtn.getAttribute("aria-expanded")})`,
+      labelled.classList.contains("expanded") && foldBtn.getAttribute("aria-expanded") === "true",
+    );
+    foldBtn.click();
+    await flush();
+    assert("clicking it again folds the block back", !labelled.classList.contains("expanded"));
+    labelled.remove();
+    nameless.remove();
+
+    // A finished turn states its duration under the answer it produced — the
+    // reference's "Completed in …" row. The duration is session state and the
+    // transcript is the cache, so the check hands the pass both and asks it to
+    // draw; the messages below carry the bridge's own shape.
+    const cacheWas = state.cache[state.activeId];
+    state.cache[state.activeId] = [
+      { role: "User", text: "where were we", images: [] },
+      { role: "Assistant", text: "here", reasoning: "", tools: [], error: null },
+    ];
+    state.turnMs = { [state.activeId]: 3_899_000 };
+    markDirtyAll();
+    renderMessages();
+    const foots = messagesEl.querySelectorAll(".turn-foot");
+    assert(
+      `a finished turn states how long it took, once, under its answer ("${foots.length ? foots[0].textContent : ""}")`,
+      foots.length === 1 && foots[0].textContent === "Completed in 1h 4m 59s",
+    );
+    const drawnRows = Array.from(messagesEl.children).filter((n) => n.classList.contains("msg"));
+    assert(
+      "the foot sits on the last answer row, not after the transcript",
+      !!foots[0] && foots[0].parentElement === drawnRows[drawnRows.length - 1],
+    );
+    state.turnMs = {};
+    markDirtyAll();
+    renderMessages();
+    assert(
+      "a chat with no finished turn in this window has no foot at all",
+      messagesEl.querySelectorAll(".turn-foot").length === 0,
+    );
+    state.cache[state.activeId] = cacheWas;
+    renderMessages();
 
     // M6 — context: token meter, compaction, and a spilled output.
     await refreshContext();

@@ -1039,12 +1039,16 @@ const Shell = (() => {
       const docToggle = document.createElement("button");
       docToggle.id = "doc-toggle";
       docToggle.type = "button";
-      docToggle.className = "btn btn-ghost head-toggle";
+      docToggle.className = "mini-btn head-toggle";
       docToggle.title = "Toggle document panel";
       docToggle.textContent = "\u25a4";
       docToggle.addEventListener("click", toggleDoc);
       head0.insertBefore(railToggle, head0.firstChild);
-      head0.appendChild(docToggle);
+      /* In the row of controls at the top right of the conversation, beside the
+         theme and language buttons. Appending it to the header itself made it a
+         full-width block of its own, under the tabs, instead of a control. */
+      const headRow = head0.querySelector(".head-row");
+      (headRow || head0).appendChild(docToggle);
     }
 
     drag(left, (ev) => setSidebar(ev.clientX - app.getBoundingClientRect().left), (why) => {

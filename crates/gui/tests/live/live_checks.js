@@ -990,8 +990,14 @@
     );
 
     /* ---- M7: jobs — list, a bounded tail, and stopping one ------------ */
+    // The chip reads the list at boot (rev 124), so the count at this point is
+    // no longer one: what this proves is that *opening the pane* reads it.
+    const jobsAtOpen = LIVE.called("jobs_list").length;
     openPane("jobs-section");
-    await waitFor(() => LIVE.called("jobs_list").length === 1, "the job list to be read");
+    await waitFor(
+      () => LIVE.called("jobs_list").length > jobsAtOpen,
+      "the job list to be read on open",
+    );
     await waitFor(() => d.querySelectorAll("#jobs-list .job-row").length === 2, "two rows");
     const jobStates = () =>
       [...d.querySelectorAll("#jobs-list .job-row")].map(
@@ -1019,12 +1025,32 @@
         /dropped/.test(detail),
     );
 
+    const jobsBeforeStop = LIVE.called("jobs_list").length;
     [...d.getElementById("job-detail").querySelectorAll("button")].find(
       (b) => b.textContent === "Stop",
     ).click();
     await waitFor(() => LIVE.called("job_interrupt").length === 1, "the stop to cross");
-    await waitFor(() => LIVE.called("jobs_list").length === 2, "the list to refresh");
+    await waitFor(
+      () => LIVE.called("jobs_list").length > jobsBeforeStop,
+      "the list to refresh after the stop",
+    );
     await waitFor(() => jobStates()[0] === "interrupted", "the row to show it stopped");
+
+    // The turn that just finished states its own duration, under its answer.
+    // This is the half the page layer cannot reach: there the duration is handed
+    // to the renderer, here it has to be produced by the event that ends a turn.
+    repaint();
+    const foots = d.querySelectorAll("#messages .turn-foot");
+    const footText = foots.length ? foots[0].textContent : "";
+    assert(
+      `a turn that finished through stream-finished states its duration (${footText})`,
+      foots.length >= 1 && /^Completed in \d+(m \d+)?s$/.test(footText),
+    );
+    const answerRows = d.querySelectorAll("#messages .msg.assistant");
+    assert(
+      "the foot rides the last answer row, not the transcript",
+      !!foots[0] && foots[0].parentElement === answerRows[answerRows.length - 1],
+    );
     assert(
       `M7: Stop interrupts the job and the list refreshes to that state (args=${
         JSON.stringify(LIVE.lastArgs("job_interrupt"))}, states=${jobStates().join(",")})`,

@@ -1639,10 +1639,19 @@ function inlineMd(src) {
    adds fixed tags. */
 function codeBlockHtml(lang, code) {
   const esc = (s) => String(s).replace(/>/g, "&gt;");
+  // The reference names an unlabelled fence "Code block" and puts an expand
+  // beside the copy, so a long listing is one click from being read whole.
+  const expand = tr("code.expand", "Expand code block");
   return (
     '<pre class="md-code"><div class="code-head"><span class="code-lang">' +
-    esc(lang || "code") +
-    '</span><button type="button" class="code-copy">Copy</button></div><code>' +
+    esc(lang || tr("code.block", "Code block")) +
+    '</span><span class="code-tools"><button type="button" class="code-expand" aria-expanded="false" aria-label="' +
+    expand +
+    '" title="' +
+    expand +
+    '">\u2922</button><button type="button" class="code-copy">' +
+    tr("code.copy", "Copy") +
+    "</button></span></div><code>" +
     esc(code.replace(/\n$/, "")) +
     "</code></pre>"
   );
@@ -1763,7 +1772,7 @@ async function copyText(text) {
 function flash(btn, msg) {
   btn.textContent = msg;
   setTimeout(() => {
-    btn.textContent = "Copy";
+    btn.textContent = tr("code.copy", "Copy");
   }, 1200);
 }
 
@@ -2182,6 +2191,9 @@ function messageSignature(m, opts, editingHere) {
     tools,
     opts.showCaret ? 1 : 0,
     editingHere ? 1 : 0,
+    // A row that gains or loses its turn foot is not the same row: without this
+    // the cached DOM would keep a duration the session no longer states.
+    opts.foot || "",
   ].join("~");
 }
 
@@ -2396,6 +2408,28 @@ function bindCenterTabs() {
 }
 bindCenterTabs();
 
+/* How long a turn took, stated the way the reference states it: "1h 4m 59s". */
+function turnDurationText(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const parts = [];
+  if (h) parts.push(h + "h");
+  if (h || m) parts.push(m + "m");
+  parts.push(s + "s");
+  return parts.join(" ");
+}
+
+/* The row under a finished turn. It lives in session state rather than in the
+   stored transcript: a reload has no foot until a turn runs in that chat again,
+   and inventing one from the message's own timestamps would be a different claim. */
+function turnFootText() {
+  const ms = (state.turnMs || {})[state.activeId];
+  if (!ms) return "";
+  return tr("turn.completed", "Completed in {d}").replace("{d}", turnDurationText(ms));
+}
+
 function renderMessages() {
   growDrawn = true; // the previous growth, if any, has now been drawn
   // The trajectory reads the same cache, so every transcript repaint — stream
@@ -2446,6 +2480,9 @@ function renderMessages() {
       break;
     }
   }
+  // A finished turn says how long it took, under the answer it produced. Only
+  // while this chat is idle: a running turn has no duration to state yet.
+  const footText = idle ? turnFootText() : "";
 
   // Presentation flags decide per-row affordances (regenerate, edit, delete,
   // branch) and the caret, so a change in any of them invalidates every row.
@@ -2508,6 +2545,9 @@ function renderMessages() {
       // one message short — without the message it was taken from.
       branchIndex: abs + 1,
       regen: abs === lastAssistant && (!!m.text || (m.images || []).length),
+      // The foot rides the last answer, so the row's own signature carries it:
+      // when the duration arrives the row is rebuilt, with no second pass.
+      foot: abs === lastAssistant ? footText : "",
       edit: m.role === "User" && (!!m.text || (m.images || []).length),
       del: true,
       branch: abs > 0,
@@ -2524,6 +2564,7 @@ function renderMessages() {
       } else {
         row.appendChild(buildBubble(m, showCaret, opts));
       }
+      if (opts.foot) row.appendChild(el("div", "turn-foot", opts.foot));
       // Swap the rebuilt row in place, so a change mid-transcript cannot
       // shift every row after it (a tool result landing in message 2 of 5000).
       if (entry && entry.el.parentNode === messagesEl) entry.el.replaceWith(row);
@@ -3803,6 +3844,59 @@ const attachStrip = $("attach-strip");
 const attachBtn = $("attach-btn");
 const attachFile = $("attach-file");
 
+/* The reference's composer foot carries a "+ Skill" beside the tool chip. Skills
+   are already reachable by typing "/", so the button performs that gesture: the
+   palette it opens is the one the keyboard opens, and the two cannot drift. */
+const skillBtn = $("skill-btn");
+if (skillBtn) {
+  skillBtn.addEventListener("click", () => {
+    input.value = input.value ? `${input.value} /` : "/";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.focus();
+  });
+}
+
+/* The header's "⋯" is the sidebar row's menu aimed at the chat that is open:
+   one dispatcher, two doors, so they cannot disagree about what a chat offers. */
+const chatMore = $("chat-more");
+if (chatMore) {
+  // The document-level handler that closes a floating menu treats a click that
+  // reaches it as "outside", and this click is still bubbling when the menu
+  // appears — so the opener stops it, the way every other menu opener does.
+  chatMore.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const s = activeSession();
+    if (!s) return;
+    chatMore.setAttribute("aria-expanded", "true");
+    openRowMenu(chatMore, sessionMenu(s), (item) => {
+      chatMore.setAttribute("aria-expanded", "false");
+      runSessionAction(s, item.run);
+    });
+  });
+}
+
+/* How much work is still running in the background, where the reference keeps
+   it: beside the title, and hidden when there is none. A job is running while it
+   has no finish time — the same test `renderJobs` draws its rows from. */
+const jobsChip = $("jobs-chip");
+function renderJobsChip(running) {
+  if (!jobsChip) return;
+  const one = running === 1;
+  const text = tr(
+    one ? "jobs.chip" : "jobs.chipPlural",
+    one ? "{n} background job running" : "{n} background jobs running",
+  );
+  jobsChip.textContent = text.replace("{n}", String(running));
+  jobsChip.classList.toggle("hidden", running === 0);
+}
+if (jobsChip) {
+  jobsChip.addEventListener("click", () => {
+    openSettings()
+      .then(() => refreshJobs())
+      .catch(() => {});
+  });
+}
+
 /* Read a dropped/pasted image into a data URL, downscaling big frames first:
    a 4K screenshot at full size is megabytes of base64 for no extra meaning. */
 function imageFileToDataUrl(file) {
@@ -4015,6 +4109,10 @@ async function sendText(text, sessionId = state.activeId, truncateFrom = null, i
   renderAll();
 
   try {
+    // Time the turn from the moment it is sent: the transcript's foot says how
+    // long it took, and a send that never starts a stream is not a finished turn.
+    state.turnStarted = state.turnStarted || {};
+    state.turnStarted[sessionId] = Date.now();
     const streaming = await invoke("send_message", {
       sessionId,
       text,
@@ -4149,7 +4247,7 @@ const BUILTIN_COMMANDS = [
     run: reviewDiff,
   },
   { name: "/term", hint: "Attach an interactive shell for this workspace (survives a reload)", run: () => void attachTermSession() },
-  { name: "/export", hint: "Keep this chat as a ZIP file", run: () => void openExportView() },
+  { name: "/export-zip", hint: "Keep this chat as a ZIP file", run: () => void openExportView() },
   { name: "/settings", hint: "Open settings & capabilities", run: () => openSettings() },
   { name: "/goal", hint: "Set or review the goal for this chat", run: () => openGoal() },
   {
@@ -4296,6 +4394,19 @@ function closePalette() {
   paletteEl.classList.add("hidden");
   input.setAttribute("aria-expanded", "false");
   input.removeAttribute("aria-activedescendant");
+}
+
+/* Escape is a dismissal, not a trap: it closes the palette and takes a bare
+   command token with it (issue #19). The "/" the + Skill button inserts — or
+   the user typed — would otherwise sit in the composer with Send enabled, and
+   Enter would ship it to the model. A token with a name ("/sta") stays: that
+   is text the user is still editing. */
+function dismissPalette() {
+  closePalette();
+  if (input.value === "/") input.value = "";
+  else if (input.value.endsWith(" /")) input.value = input.value.slice(0, -2);
+  else return;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 function renderPalette() {
@@ -6252,6 +6363,10 @@ function scheduleRepaint() {
 
 listen("agent-event", (event) => {
   const p = event.payload;
+  // A turn can also begin without this window sending it (a queued message, a
+  // background chat), so the first event of a session is the fallback start.
+  state.turnStarted = state.turnStarted || {};
+  if (!state.turnStarted[p.session_id]) state.turnStarted[p.session_id] = Date.now();
   const msgs = ensureSessionCache(p.session_id);
   if (!msgs) return;
   const last = msgs[msgs.length - 1];
@@ -6323,6 +6438,16 @@ listen("agent-event", (event) => {
 
 listen("stream-finished", async (event) => {
   const p = event.payload;
+  // How long the turn took, for the row the transcript draws under its answer.
+  const startedAt = (state.turnStarted || {})[p.session_id];
+  if (startedAt) {
+    state.turnMs = state.turnMs || {};
+    state.turnMs[p.session_id] = Date.now() - startedAt;
+    delete state.turnStarted[p.session_id];
+    // The last row now states something new, so it is not the same row: without
+    // this the transcript's cached window would go on drawing the old one.
+    if (p.session_id === state.activeId) markDirtyAll();
+  }
   // The provider's count for the turn that just ended; absent when it reported none.
   if (p.session_id === state.activeId) {
     state.usage = { prompt: p.prompt_tokens || 0, completion: p.completion_tokens || 0 };
@@ -6401,10 +6526,25 @@ listen("init-finished", (event) => {
 /* Delegated: bubbles are rebuilt on every event, so per-render listeners
    would leak; these handle clicks inside re-rendered content instead. */
 messagesEl.addEventListener("click", async (ev) => {
+  const expandBtn = ev.target.closest(".code-expand");
+  if (expandBtn) {
+    const pre = expandBtn.closest(".md-code");
+    if (pre) {
+      const open = pre.classList.toggle("expanded");
+      expandBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      expandBtn.textContent = open ? "\u2921" : "\u2922";
+      const label = open ? tr("code.collapse", "Collapse code block") : tr("code.expand", "Expand code block");
+      expandBtn.setAttribute("aria-label", label);
+      expandBtn.title = label;
+    }
+    return;
+  }
   const codeBtn = ev.target.closest(".code-copy");
   if (codeBtn) {
     const codeEl = codeBtn.closest("pre") && codeBtn.closest("pre").querySelector("code");
-    if (codeEl) flash(codeBtn, (await copyText(codeEl.textContent)) ? "Copied" : "Copy failed");
+    if (codeEl) {
+      flash(codeBtn, (await copyText(codeEl.textContent)) ? tr("code.copied", "Copied") : tr("code.copyFailed", "Copy failed"));
+    }
     return;
   }
   const link = ev.target.closest("a[href]");
@@ -7209,13 +7349,13 @@ input.addEventListener("keydown", (e) => {
     }
     if (e.key === "Escape") {
       e.preventDefault();
-      closePalette();
+      dismissPalette();
       return;
     }
   }
   if (open && e.key === "Escape") {
     e.preventDefault();
-    closePalette();
+    dismissPalette();
     return;
   }
   // @file picker (palette wins when both would be open — they are disjoint
@@ -7877,6 +8017,9 @@ async function init() {
     // restart opens on the view they left, not on the default and a jump.
     restoreSessionView();
     await refreshSessions();
+    // The header's jobs chip is filled from the same read the settings pane
+    // uses, so the two can never disagree about what is still running.
+    void refreshJobs();
     const streams = await invoke("current_stream");
     for (const s of streams) {
       state.streams[s.session_id] = s;
@@ -8011,6 +8154,7 @@ async function refreshJobs() {
   try {
     const jobs = await invoke("jobs_list");
     const n = renderJobs(host, jobs);
+    renderJobsChip(jobs.filter((job) => !job.finished_at).length);
     panelNote("jobs-count", n ? `${n} shown` : "");
     return n;
   } catch (err) {
