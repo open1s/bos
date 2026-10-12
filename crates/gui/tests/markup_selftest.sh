@@ -237,7 +237,13 @@ grep -qE '"\/new", hint: "Start a new chat", run: \(\) => newChat\(\)' $JS \
 # listener that follows the button's construction, because the row's "…" menu
 # offers the same action and would satisfy a document-wide grep on its own
 # (measured: rewiring the "+" to newChat() left such a check green).
-WS_NEW_BLOCK=$(grep -A 8 'el("button", "ws-act ws-new", "+")' $JS)
+# The folder and the disclosure share one slot in a workspace row, which takes both
+# ends: the stylesheet hides the folder only on a row the code marked foldable, so a
+# row that cannot fold must not hover its folder away for a triangle it does not have.
+grep -qF '.ws-head.foldable:hover .ws-folder { display: none; }' $CSSFILE \
+  && grep -qF 'head.classList.add("foldable")' $JS \
+  && ok || bad "the row's folder and its disclosure must trade one slot under the pointer"
+WS_NEW_BLOCK=$(grep -A 9 'const add = el("button", "ws-act ws-new")' $JS)
 case "$WS_NEW_BLOCK" in
   *'void newSessionIn(group.id);'*) ok ;;
   *) bad "a workspace row's + must still start a session in that workspace" ;;

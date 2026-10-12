@@ -804,6 +804,10 @@
       set_session_pinned: { id: "s1", title: "pinned chat", updated_at: 300, workspace: "w1", pinned: false, archived: false },
       set_session_archived: { id: "s2", title: "plain chat", updated_at: 200, workspace: "w1", pinned: false, archived: true },
       create_session: { id: "s9", title: "New chat", updated_at: 400, workspace: "w1", pinned: false, archived: false },
+      // The composer's first message in an empty workspace reaches this one, so it
+      // needs an answer: a runaway stream with no summary is what a settled fixture
+      // cannot fake by omission (it crashed the harness instead).
+      send_message: { session_id: "s9", turn: 1, started_ms: Date.now(), text: "" },
       set_active_workspace: { workspaces: [{ id: "w1", name: "bos", root: "/tmp/bos", model: "" }], active_workspace: "w1", presets: [], model: "m", context_budget: 8192 },
       skill_activation: {
         now_ms: Date.now(),
@@ -1807,6 +1811,55 @@
         .filter((c) => c.cmd === "set_active_workspace").length === 0 &&
         calls.slice(homeCalls).some((c) => c.cmd === "create_session"),
     );
+    // The row's anatomy, which the user drew a box around (rev 116) and then asked to
+    // match the reference sidebar's icons (rev 117): a folder at rest, the name, then
+    // the menu and the row's own ⊕ in the reference's order, then the active dot and
+    // the chat count. No model on the row — so the first workspace is given one first,
+    // because "no chip" on a row with no model to show is a check that could not fail.
+    const label = (n) =>
+      n.classList.contains("ws-name") ? "name"
+        : n.classList.contains("ws-new") ? "+"
+          : n.classList.contains("ws-menu") ? "…"
+            : n.classList.contains("ws-fold") ? "fold"
+              : n.classList.contains("ws-folder") ? "folder"
+                : n.classList.contains("ws-dot") ? "dot"
+                  : n.classList.contains("ws-count") ? "count"
+                    : n.className;
+    const reads = (h) => {
+      const order = [...h.children].map(label);
+      const at = (k) => order.indexOf(k);
+      return (
+        at("folder") > -1 &&
+        at("folder") < at("name") &&
+        at("name") < at("…") &&
+        at("…") < at("+") &&
+        // Every row has a count; only the active one carries the dot, so the dot's
+        // own position is checked where it exists (and exactly one row must have it).
+        (at("dot") === -1 || at("+") < at("dot")) &&
+        at("+") < at("count") &&
+        (at("fold") === -1 || at("fold") < at("name")) &&
+        // The stylesheet takes the folder away on hover only for a row the code
+        // marked; a disclosure without that class would hover its folder into nothing.
+        (!h.querySelector(".ws-fold") || h.classList.contains("foldable")) &&
+        !h.querySelector(".ws-model")
+      );
+    };
+    const hadModels = state.workspaces.map((w) => w.model);
+    if (state.workspaces.length) state.workspaces[0].model = "glm-4.7";
+    renderSidebar();
+    const wshHeads = [...d.querySelectorAll("#session-list .ws-head")];
+    const wshRows = wshHeads.map((h) => [...h.children].map(label).join(","));
+    assert(
+      `every workspace row reads [folder, fold], name, …, +, [dot,] count (${wshRows.join(" | ")})`,
+      wshHeads.length >= 2 &&
+        wshHeads.every(reads) &&
+        wshRows.filter((r) => r.includes("dot")).length === 1,
+    );
+    state.workspaces.forEach((w, i) => {
+      w.model = hadModels[i];
+    });
+    renderSidebar();
+
     const wsMenuBtn = d.querySelector("#session-list .ws-menu");
     wsMenuBtn.click();
     const wsItems = [...d.querySelectorAll(".row-menu .row-menu-item")];
@@ -2389,6 +2442,30 @@
     state.workspaces = wholeRegistry;
     state.activeWorkspace = wholeActive;
     state.sessions = wholeSessions;
+
+    // Adding a workspace creates a workspace, not a chat (rev 117 — the user's bug:
+    // "adding a workspace adds a chat session by default"). The round trips are the
+    // observable, because a settled fixture draws the same sidebar either way.
+    const addStart = calls.length;
+    await addWorkspaceFromPanel();
+    await flush();
+    const addCmds = calls.slice(addStart).map((c) => c.cmd);
+    assert(
+      `the folder-plus creates the workspace and no chat with it (${addCmds.join(",")})`,
+      addCmds.includes("choose_folder") &&
+        addCmds.includes("create_workspace") &&
+        !addCmds.includes("create_session"),
+    );
+    // Nothing is open after it, so the composer is the door: the same create, at the
+    // moment something is actually asked.
+    const chatStart = calls.length;
+    await sendText("hello");
+    await flush();
+    const chatCmds = calls.slice(chatStart).map((c) => c.cmd);
+    assert(
+      `and the first message of an empty workspace starts its chat (${chatCmds.join(",")})`,
+      chatCmds.includes("create_session") && chatCmds.includes("send_message"),
+    );
 
   } catch (err) {
     assert(`the live-page harness ran to completion (${err})`, false);

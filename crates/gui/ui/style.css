@@ -1845,12 +1845,21 @@ body.resizing #doc-panel { transition: none; }
 .set-tab:hover { color: var(--text); background: var(--hover, rgba(255,255,255,.06)); }
 .set-tab:focus-visible { outline: 2px solid var(--focus-ring, #6c8ebf); outline-offset: 1px; }
 
-/* Workspace headers in the left panel: the name, its bound model, the chat count. */
+/* Workspace headers in the left panel: the name on the left, the row's two gestures
+   and the chat count on the right. A bound model is deliberately not here — the row is
+   about the workspace, and the status line names the model of the chat in use (§24.4). */
 .ws-head {
   display: flex; align-items: center; gap: 6px; padding: 8px 10px 4px;
   color: var(--dim); font-size: 11px; letter-spacing: .02em; text-transform: none;
 }
 .ws-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The workspace's folder, at rest, in the slot the disclosure takes on hover: the
+   reference sidebar draws a folder on every row and the ▸/▾ only under the pointer,
+   so a row that cannot fold never loses its folder to an unreachable triangle. */
+.ws-folder { flex: none; display: inline-flex; color: var(--dim); }
+.ws-head.foldable:hover .ws-folder { display: none; }
+/* The model field in the workspace form. The header's own model chip is gone (§24.4),
+   so this is the only .ws-model left; the form's field keeps the shape it had. */
 .ws-model {
   max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   padding: 1px 6px; border-radius: 999px; background: var(--hover, rgba(255,255,255,.06));
@@ -1864,13 +1873,16 @@ body.resizing #doc-panel { transition: none; }
 
 /* Workspace actions and the inline workspace form (no native dialogs). */
 .ws-act {
-  display: none; border: 0; background: transparent; color: var(--dim);
+  display: none; align-items: center; border: 0; background: transparent; color: var(--dim);
   cursor: pointer; font-size: 11px; padding: 0 2px; line-height: 1;
 }
-.ws-head:hover .ws-act { display: inline; }
+/* inline-flex, not inline: every one of these controls now holds an SVG, and an
+   inline box would sit the icon on the text baseline instead of centring it. */
+.ws-head:hover .ws-act { display: inline-flex; }
 /* The two the header keeps are always visible: they are the reference sidebar's
-   affordances, and the "+" is how a chat is started in a specific workspace. */
-.ws-new, .ws-menu { display: inline; font-size: 13px; padding: 0 3px; }
+   affordances, and the ⊕ is how a chat is started in a specific workspace. */
+.ws-new, .ws-menu { display: inline-flex; padding: 0 3px; }
+.ws-new .ico, .ws-menu .ico { width: 15px; height: 15px; }
 .ws-act:hover { color: var(--text); }
 /* A preset is the one row the sidebar still draws under its list: the
    Add-workspace *dialog* is reached from the section header's folder-plus only,

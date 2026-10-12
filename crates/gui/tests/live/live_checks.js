@@ -1878,6 +1878,7 @@
       closeSettings();
       closeAddWorkspace();
       await sleep(20);
+      const chatsBeforePick = LIVE.called("create_session").length;
       LIVE.answerNext("choose_folder", "/home/e2e/bos");
       d.getElementById("workspace-add-primary").click();
       await waitFor(
@@ -1899,6 +1900,15 @@
         !!made &&
           LIVE.settings().active_workspace === made.id &&
           [...d.querySelectorAll("#session-list .ws-name")].some((n) => n.textContent === "bos"),
+      );
+      // Adding a folder starts a workspace and nothing else (rev 117): the chat a
+      // fresh workspace used to come with was a record of a question nobody asked,
+      // so the round trips and the transcript are both asserted here.
+      repaint();
+      assert(
+        `M9: adding the folder starts no chat of its own (${LIVE.called("create_session").length} creates, transcript "${d.getElementById("messages").textContent.trim().slice(0, 24)}")`,
+        LIVE.called("create_session").length === chatsBeforePick &&
+          /New conversation/.test(d.getElementById("messages").textContent),
       );
       // A folder that is already a workspace — the one that is *not* active here —
       // is focused rather than recorded twice: with a panel, one click on a folder

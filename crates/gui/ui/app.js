@@ -171,6 +171,34 @@ function el(tag, cls, text) {
 
 const clip = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
 
+/* The row's own icons, drawn the way the header's are written in the markup: an
+   outline on a 24-grid, stroked in currentColor, so the sidebar speaks one icon
+   language instead of a font's idea of "+", "…" and a folder (§24.4). Built with
+   createElementNS rather than innerHTML, because a string of markup is a second
+   place the icon set can disagree with itself. */
+function ico(paths) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("class", "ico");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  for (const d of paths) {
+    const p = document.createElementNS(ns, "path");
+    p.setAttribute("d", d);
+    svg.appendChild(p);
+  }
+  return svg;
+}
+const ICONS = {
+  // The folder is the header's folder-plus without its plus: a workspace *is* a folder.
+  folder: ["M3 7.6A1.6 1.6 0 0 1 4.6 6h3.6L10.4 8.2h9A1.6 1.6 0 0 1 21 9.8v7.6A1.6 1.6 0 0 1 19.4 19H4.6A1.6 1.6 0 0 1 3 17.4z"],
+  // A plus inside a ring: the row's own "start a chat here", the reference's ⊕.
+  plusCircle: ["M12 4.4a7.6 7.6 0 1 1 0 15.2 7.6 7.6 0 0 1 0-15.2z", "M12 8.8v6.4M8.8 12h6.4"],
+  // Three dots, drawn as zero-length strokes with the round cap they inherit.
+  dots: ["M7 12h.01M12 12h.01M17 12h.01"],
+};
+
 /* What a chat's row offers, in one place and free of the DOM.
  *
  * The labels flip with the chat's own state (a pinned chat offers "Unpin", an
@@ -1288,8 +1316,11 @@ function renderSidebar() {
     // it from outside that block (the flat list has no headers at all).
     let folded = false;
     if (!flat) {
-      // The header is the workspace switcher's anchor: root on hover, bound model
-      // beside the name so the panel answers "which model am I about to use?".
+      // The header is the workspace switcher's anchor: the root on hover, and the
+      // two gestures the reference sidebar puts on a row. They sit on the right,
+      // where the bound model used to be — the row is about the workspace, and the
+      // model of the chat in use is the status line's job (§24.4) — so the name
+      // keeps the left edge to itself.
       const head = el("div", "ws-head");
       head.title = group.root
         ? `${group.root} — click to switch`
@@ -1302,37 +1333,16 @@ function renderSidebar() {
         head.setAttribute("aria-current", "true");
       }
       head.addEventListener("click", () => switchWorkspace(group.id));
-      // The header keeps the two gestures the reference sidebar puts here: "+"
-      // starts a chat in *this* workspace, and "…" holds everything else. The
-      // rename and remove forms are unchanged; they are just reached from a menu
-      // now, so the header is not a row of glyphs whose meaning has to be guessed.
-      const add = el("button", "ws-act ws-new", "+");
-      add.setAttribute("aria-label", `New session in ${group.name}`);
-      add.title = `${tr("ws.new", "New session")} (Cmd/Ctrl+N)`;
-      add.setAttribute("aria-keyshortcuts", "Meta+N Control+N");
-      add.addEventListener("click", (e) => {
-        e.stopPropagation();
-        void newSessionIn(group.id);
-      });
-      head.appendChild(add);
-      const more = el("button", "ws-act ws-menu", "…");
-      more.setAttribute("aria-label", `${group.name} actions`);
-      more.setAttribute("aria-haspopup", "menu");
-      more.setAttribute("aria-expanded", "false");
-      more.title = tr("ws.actions", "Workspace actions");
-      more.addEventListener("click", (e) => {
-        e.stopPropagation();
-        if (rowMenu && rowMenu.anchor === more) return void closeRowMenu(true);
-        openRowMenu(more, workspaceMenu(group), (item) => {
-          if (item.run === "new") void newSessionIn(group.id);
-          else if (item.run === "rename") openWorkspaceForm("edit", group.id);
-          else if (item.run === "delete") openWorkspaceForm("remove", group.id);
-        });
-      });
-      head.appendChild(more);
       // "WorkSpace" keeps every workspace as a row and opens only the active one,
       // so switching workspace is what opens a group; a fold the person set by
       // hand still wins inside the group it was set on.
+      // The row leads with the workspace's own folder, the way the reference sidebar
+      // draws it. The disclosure takes that slot while the row is hovered (the class
+      // below is what lets the stylesheet do that without guessing), so a nested list
+      // is still openable without a second column of glyphs (§24.4).
+      const folder = el("span", "ws-folder");
+      folder.appendChild(ico(ICONS.folder));
+      head.appendChild(folder);
       const canFold = view.group !== "workspace" || group.id === state.activeWorkspace;
       folded =
         !!state.collapsed[group.id] ||
@@ -1351,10 +1361,41 @@ function renderSidebar() {
           state.collapsed[group.id] = !folded;
           renderSidebar();
         });
+        head.classList.add("foldable");
         head.appendChild(fold);
       }
       head.appendChild(el("span", "ws-name", clip(group.name, 18)));
-      if (group.model) head.appendChild(el("span", "ws-model", clip(group.model, 16)));
+      // The two gestures the reference sidebar puts on a row, in its order: the menu
+      // first, and the row's own "start a chat here" (the ⊕) last, nearest the edge.
+      // Rename, set-root and the remove form are unchanged; they are reached from the
+      // menu, so the header is not a row of glyphs whose meaning has to be guessed.
+      const more = el("button", "ws-act ws-menu");
+      more.appendChild(ico(ICONS.dots));
+      more.setAttribute("aria-label", `${group.name} actions`);
+      more.setAttribute("aria-haspopup", "menu");
+      more.setAttribute("aria-expanded", "false");
+      more.title = tr("ws.actions", "Workspace actions");
+      more.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (rowMenu && rowMenu.anchor === more) return void closeRowMenu(true);
+        openRowMenu(more, workspaceMenu(group), (item) => {
+          if (item.run === "new") void newSessionIn(group.id);
+          else if (item.run === "rename") openWorkspaceForm("edit", group.id);
+          else if (item.run === "delete") openWorkspaceForm("remove", group.id);
+        });
+      });
+      head.appendChild(more);
+      const add = el("button", "ws-act ws-new");
+      add.appendChild(ico(ICONS.plusCircle));
+      add.setAttribute("aria-label", `New session in ${group.name}`);
+      add.title = `${tr("ws.new", "New session")} (Cmd/Ctrl+N)`;
+      add.setAttribute("aria-keyshortcuts", "Meta+N Control+N");
+      add.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void newSessionIn(group.id);
+      });
+      head.appendChild(add);
+
       if (group.id === state.activeWorkspace) {
         const dot = el("span", "ws-dot", "●");
         dot.setAttribute("aria-hidden", "true");
@@ -3247,17 +3288,16 @@ async function reloadSessionList() {
 }
 
 /* One rule decides which chat is open, because a chat's workspace decides the
-   model, tools and skills that run it (§24.6): the transcript must always show
-   a chat of the workspace in use. Keep the open chat while it belongs here;
-   else the newest live chat of this workspace (pins first, the sidebar's own
-   order); else create one — which is the "create session for workspace" step,
-   done for the reader rather than left to be discovered.
+   model, tools and skills that run it (§24.6): the transcript shows a chat of the
+   workspace in use — or nothing, when that workspace has no chat yet. Keep the
+   open chat while it belongs here; else the newest live chat of this workspace
+   (pins first, the sidebar's own order); else **no chat at all**, because starting
+   one is a gesture — the row's `+`, Cmd/Ctrl+N, `/new`, or the first message typed
+   into the composer — and not a side effect of looking at a folder (rev 117).
 
-   Every workspace command funnels through here (applyWorkspaceSnapshot), so
-   creating a workspace ends inside its own fresh chat, switching workspaces
-   lands in that workspace's chat, and no snapshot can leave a transcript of
-   workspace A on screen while workspace B's agent would answer the next
-   message. */
+   Every workspace command funnels through here (applyWorkspaceSnapshot), so no
+   snapshot can leave a transcript of workspace A on screen while workspace B's
+   agent would answer the next message. */
 async function syncTranscriptToWorkspace() {
   const here = state.activeWorkspace;
   // With no workspace there is nowhere for a chat to live, so this does not
@@ -3282,14 +3322,19 @@ async function syncTranscriptToWorkspace() {
     return;
   }
   const pick = mine.find((s) => s.pinned) || mine[0];
-  if (pick) {
-    state.activeId = pick.id;
-  } else {
-    // A chat cannot exist without a workspace, but a workspace with no chat
-    // gets one: the composer is the workspace's front door.
-    state.sessions.unshift(await invoke("create_session"));
-    state.activeId = state.sessions[0].id;
+  if (!pick) {
+    // A workspace with no chat keeps none: adding a folder, or switching to an
+    // empty workspace, leaves the panel as empty as it found it, and the composer's
+    // first message (or the row's "+") is what starts a chat. The reader did not ask
+    // a question, so there is nothing to record a "New chat" about (rev 117).
+    state.activeId = null;
+    state.promptNav = null;
+    clearAttachments();
+    forgetSkillScope();
+    renderAll();
+    return;
   }
+  state.activeId = pick.id;
   resetWindow(); // a widened window belonged to the chat that was open
   state.promptNav = null; // so did the history walk
   clearAttachments(); // so did the composer's staged images
@@ -3722,9 +3767,17 @@ function queueFollowUp(text, images) {
    index on before pushing the pair; the backend drops the same tail from
    the stored record, so a failed invoke must splice the saved rows back. */
 async function sendText(text, sessionId = state.activeId, truncateFrom = null, images = []) {
-  if (!sessionId || !state.activeWorkspace) {
+  if (!state.activeWorkspace) {
     toast(tr("ws.none.chat", "Add a workspace first: a chat belongs to one"));
     return false;
+  }
+  if (!sessionId) {
+    // The composer is the workspace's front door: the first message of an empty
+    // workspace starts its chat here, at the moment something is actually asked,
+    // rather than when the folder was added (rev 117).
+    await newChat();
+    sessionId = state.activeId;
+    if (!sessionId) return false;
   }
   const msgs = state.cache[sessionId] || (state.cache[sessionId] = []);
   const removed = truncateFrom != null ? msgs.splice(truncateFrom) : null;
