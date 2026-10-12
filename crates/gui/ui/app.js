@@ -3435,28 +3435,41 @@ async function newChat() {
   input.focus();
 }
 
+/* A refused row action has to reach the screen, and it has to be *this* attempt's
+   answer: a status that outlives the action it described is a rumour, and a
+   swallowed failure reads as success. So each action clears the status before it
+   tries, reports the refusal where status is drawn, and repaints on the way out
+   so a later success clears the verdict of the last one. */
+function reportError(e) {
+  state.error = String(e);
+}
+
 /* A pin is presentation, so it is the one row action that does not wait for a
    turn to finish; the backend is the authority on that rule, and this only
    reports what it says. */
 async function setPinned(id, pinned) {
+  state.error = null;
   try {
     await invoke("set_session_pinned", { id, pinned });
   } catch (e) {
-    state.error = String(e);
+    reportError(e);
   }
   await refreshSessions();
   renderSidebar();
+  renderStatus();
 }
 
 /* Archive hides a chat without destroying it. Hiding the chat you are looking
    at would leave the transcript on screen for a chat the sidebar no longer
    lists, so the archive moves to a chat that is still listed. */
 async function setArchived(id, archived) {
+  state.error = null;
   try {
     await invoke("set_session_archived", { id, archived });
   } catch (e) {
-    state.error = String(e);
+    reportError(e);
     renderSidebar();
+    renderStatus();
     return;
   }
   if (archived && id === state.activeId) {
@@ -3530,15 +3543,16 @@ function startRename(id) {
     if (done) return;
     done = true;
     const title = input.value;
+    state.error = null;
     try {
       await invoke("rename_session", { id, title });
-      state.error = null;
     } catch (e) {
-      state.error = String(e);
+      reportError(e);
     }
     await refreshSessions();
     renderSidebar();
     renderTitle();
+    renderStatus();
   };
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
@@ -3572,12 +3586,23 @@ function activeSession() {
 async function deleteSession(id) {
   if (!window.confirm("Move this chat to the trash? You can restore it from settings."))
     return;
-  await invoke("delete_session", { id }).catch(() => {});
+  state.error = null;
+  try {
+    await invoke("delete_session", { id });
+  } catch (e) {
+    // A refusal is not a delete: the chat is still there, so its transcript, its
+    // stream and its queued turns are still there too. Forgetting them here would
+    // lose a chat the backend still holds.
+    reportError(e);
+    renderStatus();
+    return;
+  }
   delete state.cache[id];
   delete state.streams[id]; // backend stopped it if it was streaming
   delete state.queue[id];
   await refreshSessions();
   renderAll();
+  renderStatus();
 }
 
 /* ---------- image attachments ----------

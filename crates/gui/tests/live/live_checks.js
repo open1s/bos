@@ -1712,6 +1712,54 @@
           LIVE.sessions().find((x) => x.id === targetId).pinned === true,
       );
 
+      // A refused pin says so where status lives, and the next attempt owns the
+      // verdict: a stale error from an earlier action must not be read as this
+      // one's answer, and a swallowed failure must not read as success.
+      const pinsBefore = LIVE.called("set_session_pinned").length;
+      LIVE.failNext("set_session_pinned", "pinned is refused for now");
+      d.querySelector(`#session-list .session-row[data-id="${targetId}"] .sess-pin`).click();
+      await waitFor(
+        () => LIVE.called("set_session_pinned").length === pinsBefore + 1,
+        "the refused pin to reach the backend",
+      );
+      await settle();
+      await settle();
+      assert(
+        `M9: a refused pin reports itself (${(d.getElementById("status-right").textContent || "").trim()})`,
+        /pinned is refused for now/.test(d.getElementById("status-right").textContent),
+      );
+      d.querySelector(`#session-list .session-row[data-id="${targetId}"] .sess-pin`).click();
+      await waitFor(
+        () => LIVE.called("set_session_pinned").length === pinsBefore + 2,
+        "the next pin to reach the backend",
+      );
+      await settle();
+      await settle();
+      assert(
+        "M9: the next attempt clears the verdict of the last one",
+        !/pinned is refused for now/.test(d.getElementById("status-right").textContent),
+      );
+      // A refused delete is not a delete: the chat stays in the sidebar, the reason
+      // is shown, and nothing local is thrown away for a chat the backend still has.
+      window.confirm = () => true;
+      const delsBefore = LIVE.called("delete_session").length;
+      LIVE.failNext("delete_session", "the trash is closed for now");
+      d.querySelector(`#session-list .session-row[data-id="${targetId}"] .sess-menu`).click();
+      const delItem = d.querySelector('.row-menu [data-run="delete"]');
+      if (delItem) delItem.click();
+      await waitFor(
+        () => LIVE.called("delete_session").length === delsBefore + 1,
+        "the refused delete to reach the backend",
+      );
+      await settle();
+      await settle();
+      assert(
+        `M9: a refused delete keeps the chat and says why (${(d.getElementById("status-right").textContent || "").trim()})`,
+        /the trash is closed for now/.test(d.getElementById("status-right").textContent) &&
+          !!d.querySelector(`#session-list .session-row[data-id="${targetId}"]`) &&
+          LIVE.sessions().some((x) => x.id === targetId),
+      );
+      closeRowMenu(false);
       // ⌘G renames the open chat in place. Dispatched on the document, the way
       // a real chord arrives when focus is not in a field.
       const openId = activeRow().dataset.id;
