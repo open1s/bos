@@ -16,7 +16,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::caps::{self, Capabilities};
 use crate::runner::{AgentEvent, Runner};
 use crate::session::{
-    unix_now, ChatMessage, LogMarker, MessageMeta, MessageUsage, Role, SessionRecord, SessionStore,
+    unix_now, ChatMessage, MessageMeta, MessageUsage, Role, SessionRecord, SessionStore,
 };
 use crate::settings::Settings;
 
@@ -1379,10 +1379,7 @@ fn goal_action(
     // yet. The record keeps it until the next turn is written - and keeps it in the log
     // even if no turn ever comes, which writing it onto the message now could not.
     if action == "advance" {
-        record.pending_marker = Some(LogMarker {
-            kind: "goal_advanced".to_string(),
-            at: unix_now(),
-        });
+        record.mark_advanced();
     }
     inner
         .store
@@ -3907,11 +3904,9 @@ fn spawn_forwarder(
                     // what makes it appear once - a re-open reads it off the message.
                     // This sits outside the usage branch on purpose: a turn can report
                     // no tokens and still be the turn the marker belongs above.
+                    record.apply_pending_marker();
                     if let Some(last) = record.messages.last_mut() {
                         let meta = last.meta.get_or_insert_with(MessageMeta::default);
-                        if let Some(marker) = record.pending_marker.take() {
-                            meta.marker = Some(marker);
-                        }
                         if let Some((prompt_tokens, completion_tokens)) = usage {
                             meta.usage = Some(MessageUsage {
                                 prompt_tokens,

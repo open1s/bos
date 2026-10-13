@@ -56,6 +56,17 @@
     // so the off-screen check above is blind to it: the text overflows its own
     // box instead. That is a chat list nobody can read, and it is invisible in a
     // screenshot of the shell too.
+    // B1-B3: the three stat popups are a group centred in the footer, and that is a
+    // claim about geometry nothing else measures. The offset is reported so a drift
+    // says how far it moved instead of only that it did.
+    const bar = document.getElementById("statusbar");
+    const statGroup = document.getElementById("status-bar");
+    if (bar && statGroup) {
+      const br = bar.getBoundingClientRect(), gr = statGroup.getBoundingClientRect();
+      const off = Math.round((gr.left + gr.width / 2) - (br.left + br.width / 2));
+      out.statusOffset = off;
+      out.statusCentered = Math.abs(off) <= 24;
+    } else { out.statusOffset = null; out.statusCentered = false; }
     const sb = document.getElementById("sidebar");
     if (sb) {
       const open = sb.classList.contains("open");

@@ -458,6 +458,33 @@ window.addEventListener("error", (e) => {
         R.diffDels = msgsEl.querySelectorAll(".d-del").length;
         R.diffCtx = msgsEl.querySelectorAll(".d-ctx").length;
         assert("tool card renders", R.toolCards === 1, `cards=${R.toolCards}`);
+
+        // T1: the row shape - glyph, kind word, a dot, then the one-line summary, with a
+        // path drawn in the code face. The assertions are on the spans the restyle adds,
+        // and on the two things the restyle must not touch: expansion and a plain command.
+        {
+          const head = msgsEl.querySelector(".tool-head");
+          const text = (sel) => (head.querySelector(sel) || {}).textContent;
+          R.toolRowShape = [text(".tool-glyph"), text(".tool-kind"), text(".tool-dot"), text(".tool-summary")].join("|");
+          assert("T1: the tool row reads glyph, kind, dot, summary", R.toolRowShape === ">_|Bash|\u00b7|git diff", R.toolRowShape);
+          assert("T1: a command with an argument is not dressed as a path",
+            !head.querySelector(".tool-summary").classList.contains("is-path"));
+          assert("T1: expanding the card still shows the output", !!msgsEl.querySelector(".tool-body"));
+        }
+        state.cache["selftest"] = [{
+          role: "Assistant", text: "read it", reasoning: "", error: null,
+          tools: [{ name: "Read", args: '{"path":"crates/gui/ui/app.js"}', output: null, ms: null, open: false }],
+        }];
+        renderMessages();
+        {
+          const head = msgsEl.querySelector(".tool-head");
+          const sum = head.querySelector(".tool-summary");
+          R.toolPathRow = head.querySelector(".tool-kind").textContent + "|" + sum.textContent + "|" + sum.classList.contains("is-path");
+          assert("T1: a path is drawn in the code face over a dotted underline",
+            R.toolPathRow === "Read|crates/gui/ui/app.js|true", R.toolPathRow);
+          assert("T1: the neutral glyph stands in for a kind the reference does not name",
+            head.querySelector(".tool-glyph").textContent.length > 0);
+        }
         assert("unified diff is colored",
           R.diffAdds === 1 && R.diffDels === 1 && R.diffCtx === 3,
           `add=${R.diffAdds} del=${R.diffDels} ctx=${R.diffCtx}`);

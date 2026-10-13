@@ -75,7 +75,12 @@
       "boot: the seeded transcript renders user, assistant and a timed tool row",
       /Design the streaming harness/.test(messagesText()) &&
         /Drafting the plan now\./.test(messagesText()) &&
-        /read_file/.test(messagesText()) &&
+        // T1: the collapsed row leads with the reference\u0027s kind word and a glyph, so
+        // it says "Read" - the tool\u0027s own name is what the card shows once opened, and a
+        // tool the reference does not name keeps its own name on the row. Scoped to the
+        // row itself: the same text elsewhere in the transcript would not prove this.
+        /Read/.test((d.querySelector("#messages .tool-head") || {}).textContent || "") &&
+        !!d.querySelector("#messages .tool-head .tool-glyph") &&
         /42 ms/.test(messagesText()),
     );
     // The tool's output lives behind the collapsed card; opening it is how a

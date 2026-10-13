@@ -2308,8 +2308,53 @@
     assert(
       `the jobs chip counts what has not finished, and shows itself to say it (${jobsChip.textContent})`,
       // The fixture lists two jobs, one of them finished: the chip is about the
-      // work still running, so it says one rather than two.
-      !jobsChip.classList.contains("hidden") && jobsChip.textContent === "1 background job running",
+      // work still running, so it says one rather than two. The caret is the chip's own
+      // statement that it opens something (H1), so it is part of the text.
+      !jobsChip.classList.contains("hidden") && jobsChip.textContent === "1 background job running \u2304",
+    );
+    // The other half of the chip: nothing running is a chip that is not there. Calling the
+    // renderer is the honest layer for a pure render - the fixture cannot ship a second,
+    // empty job list, and a chip that is absent is not a state a click can reach.
+    window.renderJobsChip(0);
+    assert(
+      `the jobs chip hides itself when nothing is running (hidden=${jobsChip.classList.contains("hidden")})`,
+      jobsChip.classList.contains("hidden"),
+    );
+    window.renderJobsChip(1); // put back what the panel checks after this one read
+    assert(
+      `the jobs chip comes back when a job is running again (text=${jobsChip.textContent})`,
+      !jobsChip.classList.contains("hidden") && jobsChip.textContent === "1 background job running \u2304",
+    );
+
+    // H1: the chip is a preview of the pane, so its popover has to carry the pane\u0027s rows.
+    // The fixture\u0027s two jobs are the two states the spec names, and a pick has to land in
+    // the pane - the chip is not a second manager. The menu is document-level and a
+    // check earlier in this file may have left one open, so this starts from none: what
+    // the assertions below see has to be the menu this click created.
+    closeRowMenu(false);
+    // The precondition, in the assertion rather than in a comment: if a menu is already
+    // on the page the click below cannot be what put it there, and the check would pass
+    // for the wrong reason.
+    const menusBefore = d.querySelectorAll(".row-menu").length;
+    jobsChip.click();
+    await flush();
+    const jobsMenu = d.querySelector(".row-menu");
+    const jobsItems = jobsMenu ? Array.from(jobsMenu.querySelectorAll(".row-menu-item")) : [];
+    assert(
+      `H1: the chip opens a popover listing the pane\u0027s jobs (menus before=${menusBefore}, ${jobsItems.map((b) => b.textContent).join(" / ")})`,
+      menusBefore === 0 &&
+        !!jobsMenu &&
+        jobsItems.length === 2 &&
+        jobsItems[0].textContent === "cargo test \u00b7 running" &&
+        jobsItems[1].textContent === "lint \u00b7 failed" &&
+        jobsChip.getAttribute("aria-expanded") === "true",
+    );
+    if (jobsItems.length) jobsItems[1].click();
+    await flush();
+    const jobsPane = d.getElementById("jobs-section");
+    assert(
+      `H1: picking a job lands in the jobs pane (active=${jobsPane ? jobsPane.classList.contains("active") : "no pane"}, expanded=${jobsChip.getAttribute("aria-expanded")})`,
+      !!jobsPane && jobsPane.classList.contains("active") && jobsChip.getAttribute("aria-expanded") === "false",
     );
 
     // The composer keeps whatever an earlier check typed; the gesture under test
@@ -2973,6 +3018,32 @@
         d.querySelectorAll("#messages .msg.assistant").length === answersBeforeT4 &&
         called("goal_action").length === 1 &&
         lastArgs("goal_action").action === "advance",
+    );
+    // The durable half. A reopened chat loads the turn with the marker the backend
+    // attached to it, and the pill has to come back from that record - so the pending
+    // hint is cleared first: the assertion below can only be satisfied by `meta.marker`,
+    // which is the path a reload takes and the one the page guard never drove.
+    const durableAt = 1750000000;
+    state.pendingMarkers = {};
+    state.cache[state.activeId] = [
+      { role: "User", text: "advance the goal" },
+      {
+        role: "Assistant",
+        text: "done",
+        meta: { marker: { kind: "goal_advanced", at: durableAt } },
+      },
+    ];
+    window.renderMessages();
+    const durableEl = d.querySelector("#messages .msg-marker");
+    assert(
+      "T4: a reopened chat redraws the marker from the turn's own record (pill=" +
+        (durableEl ? durableEl.textContent : "none") + ", rendered=" +
+        d.querySelectorAll("#messages .msg.assistant").length + " answers)",
+      !!durableEl &&
+        durableEl.textContent === "Continuing goal " + fmtTime(durableAt) &&
+        durableEl.getAttribute("role") === "note" &&
+        !durableEl.classList.contains("msg") &&
+        d.querySelectorAll("#messages .msg.assistant").length === 1,
     );
     state.pendingMarkers = priorMarkersForT4;
     state.goal = priorGoalForT4;

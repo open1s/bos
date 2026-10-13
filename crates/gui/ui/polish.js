@@ -29,6 +29,7 @@
     // and a "⋯" beside the chat title, a "+ Skill" in the composer foot. The
     // count is a placeholder so a translator keeps the number inside the phrase.
     "jobs.chip": { en: "{n} background job running", zh: "{n} 个后台任务运行中" },
+"jobs.menu.empty": { en: "No background jobs yet", zh: "暂无后台任务" },
     "jobs.chipPlural": { en: "{n} background jobs running", zh: "{n} 个后台任务运行中" },
     "jobs.chipTitle": { en: "Background jobs (Settings)", zh: "后台任务（设置）" },
     "jobs.chipAria": { en: "Background jobs", zh: "后台任务" },

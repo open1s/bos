@@ -1861,13 +1861,48 @@ function renderToolOutput(output) {
   return box;
 }
 
+/* T1: the kind word and glyph a tool row leads with. The names BSH registers tools
+   under are the reference\u0027s own kinds; anything else keeps the neutral glyph rather
+   than being mislabelled as one of them. */
+const TOOL_GLYPHS = { Bash: ">_", Edit: "\u270e", Write: "#", Read: "\u25a4", Think: "\u229e", other: "\u229e" };
+function toolKind(t) {
+  const name = (t && t.name ? String(t.name) : "").toLowerCase();
+  if (name.indexOf("bash") === 0 || name.indexOf("shell") === 0) return "Bash";
+  if (name.indexOf("edit") === 0 || name.indexOf("patch") === 0) return "Edit";
+  if (name.indexOf("write") === 0 || name.indexOf("code") === 0) return "Write";
+  if (name.indexOf("read") === 0 || name.indexOf("view") === 0) return "Read";
+  if (name.indexOf("think") === 0 || name.indexOf("reason") === 0) return "Think";
+  return "other";
+}
+/* A summary that is a path and nothing else, or ends in a file extension, is drawn in
+   the code face: that is what makes a row scannable at a glance, and it is the one
+   styling the reference\u0027s rows apply to arguments. */
+function looksLikePath(s) {
+  const t = String(s || "").trim();
+  if (!t || t.split(" ").length > 1) return false;
+  return /[\/\\]/.test(t) || /\.[A-Za-z0-9]{1,6}$/.test(t);
+}
+
 function buildToolCard(t) {
   const card = el("div", "tool-card");
   const head = el("button", "tool-head");
   head.type = "button";
   head.setAttribute("aria-expanded", t.open ? "true" : "false");
-  head.appendChild(el("span", "tool-name", t.name));
-  head.appendChild(el("span", "tool-args", toolArgsSummary(t.args)));
+  // T1: the reference\u0027s row shape - glyph, kind word, then the one-line summary after
+  // a dot, with a path drawn in the code face over a dotted underline. The glyphs are
+  // text on purpose: the reference\u0027s own rows read `# Code`, `\u270e Edit`, `>_. Bash`,
+  // and an icon font would say the same thing with less meaning. The classes the old
+  // checks select by are kept on the spans that carry the same text.
+  const kind = toolKind(t);
+  head.appendChild(el("span", "tool-glyph", TOOL_GLYPHS[kind] || TOOL_GLYPHS.other));
+  // The kind word is the reference\u0027s label, but a tool the reference does not name
+  // keeps its own: a row that reads "other" would hide which tool ran.
+  head.appendChild(el("span", "tool-name tool-kind", kind === "other" ? t.name || "tool" : kind));
+  head.appendChild(el("span", "tool-dot", "\u00b7"));
+  const summary = toolArgsSummary(t.args);
+  const sum = el("span", "tool-args tool-summary", summary);
+  if (looksLikePath(summary)) sum.classList.add("is-path");
+  head.appendChild(sum);
   const done = t.output != null;
   head.appendChild(
     el("span", "tool-badge" + (done ? " done" : " running"),
@@ -4416,14 +4451,33 @@ function renderJobsChip(running) {
     one ? "jobs.chip" : "jobs.chipPlural",
     one ? "{n} background job running" : "{n} background jobs running",
   );
-  jobsChip.textContent = text.replace("{n}", String(running));
+  // H1: the caret is what says the chip opens something. It is added here rather than
+  // in the markup so a hidden chip carries no stray glyph.
+  jobsChip.textContent = text.replace("{n}", String(running)) + " \u2304";
   jobsChip.classList.toggle("hidden", running === 0);
+}
+/* H1: the chip is a preview of the jobs pane, not a second manager. Its rows are the
+   pane\u0027s own rows - a job\u0027s label and its state word - and picking one lands in the
+   pane, which stays where work is stopped, read and cleared. */
+function jobsMenuLabel(job) {
+  const chip = jobStateChip(job);
+  const state = chip ? chip.textContent : "";
+  return clip(job.label || job.id, 34) + (state ? " \u00b7 " + state : "");
+}
+function openJobsMenu() {
+  invoke("jobs_list")
+    .then((jobs) => {
+      const items = (jobs || []).map((job) => ({ label: jobsMenuLabel(job), run: job.id }));
+      if (!items.length) {
+        items.push({ label: tr("jobs.menu.empty", "No background jobs yet"), run: "" });
+      }
+      openRowMenu(jobsChip, items, () => navTo("jobs-section"));
+    })
+    .catch(() => {});
 }
 if (jobsChip) {
   jobsChip.addEventListener("click", () => {
-    openSettings()
-      .then(() => refreshJobs())
-      .catch(() => {});
+    openJobsMenu();
   });
 }
 

@@ -52,7 +52,7 @@ head = b.get("chat-head")
 headTop = "none" if not head else head[1]
 print(f'width={d["viewport"]} doc={d["docClientW"]}/{d["docScrollW"]} '
       f'headTop={headTop} sidebar={box("sidebar")} main={box("main")} composer={box("composer")} '
-      f'statusbar={box("statusbar")} offscreen=[{",".join(d["offscreen"])}] '
+      f'statusbar={box("statusbar")} statusOffset={d.get("statusOffset")} statusCentered={d.get("statusCentered")} offscreen=[{",".join(d["offscreen"])}] '
       f'sidebarSqueezed={d.get("sidebarSqueezed")} rows={d.get("sidebarRows")} '
       f'modalCard={d["modal"]["card"]} modalOutside=[{",".join(d["modal"]["outside"])}] '
       f'painted=[{",".join(d.get("painted", []))}] '
@@ -110,6 +110,10 @@ PY
   fi
   echo "$line" | grep -q "sidebarSqueezed=False" || { echo "[layout]  WIDE: the chat list is squeezed into an unreadable box"; fail=1; }
   echo "$line" | grep -q "painted=\[\]" || { echo "[layout]  WIDE: something in the UI paints a shadow, a blur or a gradient"; fail=1; }
+  # B1-B3 own the footer's group: the three stat popups sit centred in the bar. The
+  # number is named so a drift reads as how far it moved.
+  statusOffset="$(printf '%s' "$line" | sed -n 's/.*statusOffset=\([-0-9]*\).*/\1/p')"
+  echo "$line" | grep -q "statusCentered=True" || { echo "[layout]  B1-B3: the status group is not centred in the footer (offset=${statusOffset}px)"; fail=1; }
   # The attach strip is only visible with images staged, which the empty-window
   # measures above never produce — these are its own assertions.
   echo "$attach" | grep -q '"present": true' || { echo "[layout]  WIDE: the attach probe did not run"; fail=1; }

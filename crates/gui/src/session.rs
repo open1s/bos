@@ -304,6 +304,30 @@ impl SessionRecord {
     /// copied into a fresh record — new id, `"… (branch)"` title, current
     /// timestamps — so both histories survive. The plan snapshot carries over
     /// because the branch continues the same work.
+    /// T4: an advance happens between turns, so there is no message to carry it yet.
+    /// The record holds it until one is written - and keeps it in the log even if no
+    /// turn ever comes, which writing it onto a message now could not.
+    pub(crate) fn mark_advanced(&mut self) {
+        self.pending_marker = Some(LogMarker {
+            kind: "goal_advanced".to_string(),
+            at: unix_now(),
+        });
+    }
+
+    /// Hand the pending transition to the newest message and report the one that
+    /// landed. An advance waiting with no message yet is left pending rather than
+    /// dropped, and taking it is what makes it appear exactly once: after that a
+    /// re-open reads it off the message.
+    pub(crate) fn apply_pending_marker(&mut self) -> Option<LogMarker> {
+        if self.messages.is_empty() {
+            return None;
+        }
+        let marker = self.pending_marker.take()?;
+        let last = self.messages.last_mut().expect("the length was checked above");
+        last.meta.get_or_insert_with(MessageMeta::default).marker = Some(marker.clone());
+        Some(marker)
+    }
+
     pub(crate) fn fork_from(&self, index: usize) -> Result<Self, String> {
         let n = self.messages.len();
         if index == 0 {
@@ -1837,6 +1861,32 @@ mod usage_tests {
         let marker = back.meta.and_then(|m| m.marker).expect("the marker survives");
         assert_eq!(marker.kind, "goal_advanced");
         assert_eq!(marker.at, 1_760_000_000);
+    }
+
+    #[test]
+    fn an_advance_waits_for_a_turn_and_lands_once() {
+        let mut record = SessionRecord::new();
+        record.mark_advanced();
+        // No turn yet: the transition is kept, not dropped on the floor.
+        assert!(record.apply_pending_marker().is_none());
+        assert!(
+            record.pending_marker.is_some(),
+            "an advance with no turn to carry it must stay pending"
+        );
+        record.messages.push(ChatMessage::user("hi"));
+        let landed = record.apply_pending_marker().expect("the next turn carries it");
+        assert_eq!(landed.kind, "goal_advanced");
+        assert!(record.pending_marker.is_none());
+        let meta = record.messages.last().and_then(|m| m.meta.as_ref()).expect("meta");
+        assert_eq!(meta.marker.as_ref().map(|m| m.kind.as_str()), Some("goal_advanced"));
+        // Once: a later turn has nothing to carry, and the message keeps its marker.
+        assert!(record.apply_pending_marker().is_none());
+        let again = record
+            .messages
+            .last()
+            .and_then(|m| m.meta.as_ref())
+            .and_then(|m| m.marker.as_ref());
+        assert_eq!(again.map(|m| m.kind.as_str()), Some("goal_advanced"));
     }
 
     #[test]

@@ -3763,3 +3763,12 @@ button.msg-image {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
 }
+
+/* T1: the tool row reads glyph, kind, then the one-line summary after a dot.
+   The glyphs are text on purpose: no asset, no icon font, and the same shape as the
+   reference, whose rows read `# Code`, ✎ Edit, >_. Bash. A path is drawn in the code
+   face over a dotted underline - the one styling those rows give arguments. */
+.tool-glyph, .tool-kind { color: var(--dim); }
+.tool-dot { color: --faint; margin: 0 6px; }
+.tool-summary { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-summary.is-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; border-bottom: 1px dotted --faint; }
