@@ -1312,7 +1312,7 @@ function archivedRow(s) {
   row.appendChild(when);
   const back = el("button", "sess-restore", tr("session.restore", "Restore"));
   back.type = "button";
-  back.setAttribute("aria-label", `Restore ${s.title || "New Session"}`);
+  back.setAttribute("aria-label", `Restore ${s.title || "New chat"}`);
   back.addEventListener("click", (e) => {
     e.stopPropagation();
     void setArchived(s.id, false);
@@ -1320,7 +1320,7 @@ function archivedRow(s) {
   row.appendChild(back);
   const more = el("button", "sess-menu", "…");
   more.type = "button";
-  more.setAttribute("aria-label", `Actions for ${s.title || "New Session"}`);
+  more.setAttribute("aria-label", `Actions for ${s.title || "New chat"}`);
   more.setAttribute("aria-haspopup", "menu");
   more.setAttribute("aria-expanded", "false");
   more.addEventListener("click", (e) => {

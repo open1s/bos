@@ -65,6 +65,9 @@
       );
 
       const cost = { messages: 0, sidebar: 0, transcript: 0, term: 0 };
+      // Structural records live under a derived key, so the counters are spelled out
+      // here rather than left to be created by the first += (which would be NaN).
+      for (const k of ["sidebar", "transcript", "term"]) cost[k + "Struct"] = 0;
       const repaint = window.renderMessages;
       window.renderMessages = function () {
         cost.messages++;
@@ -81,14 +84,18 @@
         // happens across an `await`, which is everything the soak does.
         const mo = new MutationObserver((records) => {
           cost[key] += records.length;
+          cost[key + "Struct"] += records.filter((r) => r.type === "childList").length;
         });
         mo.observe(node, { childList: true, subtree: true, characterData: true, attributes: true });
         observers[key] = mo;
       };
       const mutations = (key) => {
-        cost[key] += observers[key].takeRecords().length;
+        const queued = observers[key].takeRecords();
+        cost[key] += queued.length;
+        cost[key + "Struct"] += queued.filter((r) => r.type === "childList").length;
         return cost[key];
       };
+      const structural = (key) => cost[key + "Struct"];
       const transcript = document.getElementById("messages");
       observe(transcript, "transcript");
       observe(document.getElementById("session-list"), "sidebar");
@@ -111,6 +118,7 @@
       const BURST = 400;
       const repaintsBefore = cost.messages;
       const sidebarBefore = mutations("sidebar");
+      const sidebarStructBefore = structural("sidebar");
       const mutationsBefore = mutations("transcript");
       for (let i = 0; i < BURST; i++) {
         emit("agent-event", { session_id: seeded.active, kind: "text", text: ` t${i}` });
@@ -135,10 +143,17 @@
         transcript.textContent.includes(" t399") && mutationsDuring > 0 && mutationsDuring <= 60,
         `${mutationsDuring} DOM mutations across ${transcript.children.length} rows, tail visible=${transcript.textContent.includes(" t399")}`
       );
+      // A rebuild of the list replaces rows - that is childList records, however few,
+      // and it is the cost this check is about. The row also carries a live age in its
+      // label, so the tick that refreshes it is expected to touch an attribute; the
+      // bound is what separates one refresh per frame from one per streamed delta.
+      const sidebarTotal = mutations("sidebar") - sidebarBefore;
+      const sidebarStruct = structural("sidebar") - sidebarStructBefore;
       check(
         "streaming does not rebuild the chat list",
-        mutations("sidebar") === sidebarBefore,
-        `${mutations("sidebar") - sidebarBefore} mutations of #session-list`
+        sidebarStruct === 0 && sidebarTotal <= 2,
+        `${sidebarTotal} mutations of #session-list, ${sidebarStruct} structural - ` +
+          "a rebuild replaces rows, a tick's label refresh touches one attribute"
       );
 
       /* ---- a chatty shell catches up once per frame, and stays bounded - */

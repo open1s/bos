@@ -198,12 +198,12 @@
     };
   };
 
-  const mkSession = (title, msgs) => {
+  const mkSession = (title, msgs, workspace = "w-main") => {
     const s = {
       id: `live-${nextId++}`,
       title,
       updated_at: nowSec(),
-      workspace: "w-main",
+      workspace,
       pinned: false,
       archived: false,
     };
@@ -971,7 +971,13 @@
       copy(store.sessions)
         .sort((a, b) => b.updated_at - a.updated_at)
         .map(summaryOf),
-    create_session: () => summaryOf(mkSession("New chat", [])),
+    // The chat lands in the workspace the user is in, because the real command does.
+    // A create that hard-codes the main workspace is a chat the page will not show
+    // while another one is active - correctly, a transcript of one workspace must not
+    // sit under another - and the reader is left with an empty panel beside a turn
+    // that did run.
+    create_session: () =>
+      summaryOf(mkSession("New chat", [], store.settings.active_workspace || "w-main")),
     // The three the sidebar's row menu reaches. They answer with the summary the
     // Rust command answers with, so the page redraws from the backend's word
     // rather than from what it hoped happened.

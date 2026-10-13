@@ -65,12 +65,12 @@ From `AGENTS.md`, enforced by guards:
 
 | # | Element | DSH (evidence) | BSH today | Status |
 |---|---|---|---|---|
-| s1 | Primary **New Session** button under the logo | `dsh:7`, full-width `⊕ New Session` (`dsh_main.png`) | only inside the workspace row (`ws-act ws-new`, app.js:1437) | ⬜ **S1** |
-| s2 | Global panels nav: **Plugins / Automation tasks / MCP 连接器** | `dsh:9-11` | none (doors live in Settings) | ⬜ **S2** |
+| s1 | Primary **New Session** button under the logo | `dsh:7`, full-width `⊕ New Session` (`dsh_main.png`) | only inside the workspace row (`ws-act ws-new`, app.js:1437) | ✅ **S1** |
+| s2 | Global panels nav: **Plugins / Automation tasks / MCP 连接器** | `dsh:9-11` | none (doors live in Settings) | ✅ **S2** |
 | s3 | "Workspaces" section label + search / view-options / add-workspace icon buttons | `dsh:12-17` | ✅ same trio (`#sessions-search`, `#session-view`, `#workspace-add-primary`) | ✅ |
-| s4 | Session list as an **outline tree**: expandable workspace rows, sessions nested & indented, folder icons | `dsh:18-41` (role `outline`, rows `(expanded)`) | flat groups under `.ws-head` (groupSessions, app.js:407) | ⬜ **S3** |
-| s5 | Per-row **Running** chip + spinner on a streaming session, age right-aligned | `dsh:23-26` ("Running · title · 59min") | only `vh` text "streaming" (app.js:1486); age exists | ⬜ **S4** |
-| s6 | Bottom **Account menu** popup (avatar + name) | `dsh:42` "Account menu" | letter avatar + "Local workspace" + separate Settings gear | ⬜ **S5** |
+| s4 | Session list as an **outline tree**: expandable workspace rows, sessions nested & indented, folder icons | `dsh:18-41` (role `outline`, rows `(expanded)`) | flat groups under `.ws-head` (groupSessions, app.js:407) | ✅ **S3** |
+| s5 | Per-row **Running** chip + spinner on a streaming session, age right-aligned | `dsh:23-26` ("Running · title · 59min") | only `vh` text "streaming" (app.js:1486); age exists | ✅ **S4** |
+| s6 | Bottom **Account menu** popup (avatar + name) | `dsh:42` "Account menu" | letter avatar + "Local workspace" + separate Settings gear | ✅ **S5** |
 | s7 | Search field placeholder "Search session names" | `dsh:15` | "Search chats…" | ⏭ keep BSH wording (s13 tracks correctness, not wording) |
 | s8 | Collapse-sidebar button at sidebar's top-right | `dsh:6` | `#sidebar-toggle` in the chat header + ⌘/Ctrl+B | ⏭ keep (equivalent door, one owner — rev pqunloww) |
 | s9 | Brand: deepseek wordmark + HARNESS pill | screenshot | BOS mark + BOS + HARNESS pill | ⏭ own brand |
@@ -88,7 +88,7 @@ From `AGENTS.md`, enforced by guards:
 | h7 | "Open right sidebar" | `dsh:53` | `#doc-toggle` ▤ (relocated to the control row by the in-flight change) | 🔄 fork |
 | h8 | Chat \| Trajectory tab strip (selected = accent underline) | `dsh:54-56` | `#tab-chat` / `#tab-trajectory` | ✅ |
 | h9 | idle/streaming chip, ◎ goal chip, Theme, EN | none in DSH | `#stream-chip`, `#goal-open`, theme, lang | ⏭ BSH extras — keep; (goal chip revisit with **G1**) |
-| h10 | "Deep diving for {d} ···" live line | screenshot + `dsh:2892-2893` — sits at the **bottom of the transcript**, above the goal bar, accent-colored | none | ⬜ **H2** (listed here because it reads as header chrome; implemented as transcript footer) |
+| h10 | "Deep diving for {d} ···" live line | screenshot + `dsh:2892-2893` — sits at the **bottom of the transcript**, above the goal bar, accent-colored | none | ✅ **H2** (listed here because it reads as header chrome; implemented as transcript footer) |
 
 ### Transcript
 
@@ -96,40 +96,40 @@ From `AGENTS.md`, enforced by guards:
 |---|---|---|---|---|
 | t1 | "Load earlier" | `dsh:61` | exists (rev 74 window + spacer) | ✅ |
 | t2 | User row: timestamp, Copy, image thumbnails | `dsh:62-66,101-105` | Copy/Edit/Delete row (38-40) | ✅ (BSH keeps Edit/Delete — BSH extra) |
-| t3 | Per-tool-call rows: `# Code · title`, `✎ Edit · path`, `>_. Bash · cmd`, `⊞ Think · …` (icon + kind + one-line summary; paths monospace dotted-underlined; indented; expandable) | screenshot + `dsh:78-233` | collapsed `.tool-head` cards per tool | ⬜ **T1** (restyle, keep behavior) |
+| t3 | Per-tool-call rows: `# Code · title`, `✎ Edit · path`, `>_. Bash · cmd`, `⊞ Think · …` (icon + kind + one-line summary; paths monospace dotted-underlined; indented; expandable) | screenshot + `dsh:78-233` | collapsed `.tool-head` cards per tool | 🔄 **T1** - the fork owns the tool-row/footer area (§9); do not re-implement |
 | t4 | `<｜DSML｜ calls>` markers | throughout | — | ⏭ DeepSeek-proprietary marker; BSH renders its real tools instead |
-| t5 | "Analysis completed" chip after reasoning | `dsh:76` | reasoning folds into the message | ⬜ optional **T2** (only if BSH message model carries a reasoning-complete event) |
-| t6 | Turn footer: timestamp · Good/Bad toggles · "Branch into a new conversation" | `dsh:387-390` | Copy / Regenerate / Delete / Branch (57-60) | ⬜ **T3** (add Good/Bad; keep Regenerate/Delete — BSH extras) |
-| t7 | "Continuing goal" marker on the first turn after a goal advance | `dsh:943` | none | ⬜ **T4** (P2) |
-| t8 | Run-state chips: `Running` / `Completed` / `Stopped` per turn | `dsh:67,565-566,2888` | stream-chip covers live state only; "Completed in" row 🔄 fork | ⬜ **T5** (Stopped needs backend gap §5.3) |
+| t5 | "Analysis completed" chip after reasoning | `dsh:76` | reasoning folds into the message | ⏭ optional **T2** - nothing in BSH says reasoning *ended*: a message carries the reasoning text, not the moment it stops, so the chip would state an event this backend never sends. See §8. |
+| t6 | Turn footer: timestamp · Good/Bad toggles · "Branch into a new conversation" | `dsh:387-390` | Copy / Regenerate / Delete / Branch (57-60) | ✅ **T3** (add Good/Bad; keep Regenerate/Delete — BSH extras) |
+| t7 | "Continuing goal" marker on the first turn after a goal advance | `dsh:943` | none | ✅ **T4** (P2) |
+| t8 | Run-state chips: `Running` / `Completed` / `Stopped` per turn | `dsh:67,565-566,2888` | stream-chip covers live state only; "Completed in" row 🔄 fork | ✅ **T5** (Stopped now carries the backend's own `cancelled` flag - §5.3) |
 | t9 | "Completed in {d}" disabled-pill under a finished turn | `dsh:68,947` | 🔄 fork (`turnDurationText`, app.js:2412) | 🔄 do not re-implement |
-| t10 | Per-turn **Usage N tok** popup | `dsh:391,558,1133` | none (meter lives in the status bar) | ⬜ **T6** (P2) |
-| t11 | Inline images: "image.png, click to view original" + "View full image" | `dsh:62,235` | inline render, no viewer | ⬜ **T7** (P2: click → doc-panel preview via existing `Shell.openDocument`) |
-| t12 | Floating **Working** badge (right side, above composer): session title, "Working", stop + dismiss | screenshot | none | ⬜ **W1** |
-| t13 | Mascot avatar (animated brand character) top-right while streaming | screenshot | none | ⬜ **W2** (P2, static own-brand SVG) |
+| t10 | Per-turn **Usage N tok** popup | `dsh:391,558,1133` | none (meter lives in the status bar) | ✅ **T6** (P2) |
+| t11 | Inline images: "image.png, click to view original" + "View full image" | `dsh:62,235` | inline render, no viewer | ✅ **T7** (P2: click → doc-panel preview via existing `Shell.openDocument`) |
+| t12 | Floating **Working** badge (right side, above composer): session title, "Working", stop + dismiss | screenshot | none | ✅ **W1** |
+| t13 | Mascot avatar (animated brand character) top-right while streaming | screenshot | none | ✅ **W2** (P2, static own-brand SVG) |
 
 ### Goal bar
 
 | # | Element | DSH | BSH today | Status |
 |---|---|---|---|---|
-| g1 | Compact one-line bar above the composer: `◎ Ongoing Goal · objective(truncate) · ⓘ · ✎ · 🗑` | `dsh:2894-2900` + screenshot | full M3 card toggled by `#goal-open` header chip (app.js:3263-3390) | ⬜ **G1** (card stays as the expanded detail) |
+| g1 | Compact one-line bar above the composer: `◎ Ongoing Goal · objective(truncate) · ⓘ · ✎ · 🗑` | `dsh:2894-2900` + screenshot | full M3 card toggled by `#goal-open` header chip (app.js:3263-3390) | ✅ **G1** (card stays as the expanded detail) |
 
 ### Composer
 
 | # | Element | DSH | BSH today | Status |
 |---|---|---|---|---|
-| c1 | Foot order: `⊕` (Add files or run commands, **popup**) · `🛡 Workspace Write ⌄` · `+ Skill` … `model ⌄` · circular send/stop | `dsh:2903-2907` + screenshot | `+ attach` (plain button) · mode popup · skill popup · model popup · glyph Send | ⬜ **C1** (⊕ becomes a popup; send becomes circular — **C2**) |
-| c2 | Placeholder one-liner: "Message or run a task, / commands, @ files or sessions" | `dsh:2902` | long multi-line placeholder incl. Enter hints | ⬜ **C3** (P2: shorten to reference wording; move Enter hints into `title`/`aria-describedby`) |
-| c3 | Model shown as short name + chevron ("deepseek-v4.1-flash") | `dsh:2906` | full id `nvidia/z-ai/glm-5.3-flash` | ⬜ **C4** (P2: display after last `/`, full id in title+aria) |
+| c1 | Foot order: `⊕` (Add files or run commands, **popup**) · `🛡 Workspace Write ⌄` · `+ Skill` … `model ⌄` · circular send/stop | `dsh:2903-2907` + screenshot | `+ attach` (plain button) · mode popup · skill popup · model popup · glyph Send | ✅ **C1** (⊕ becomes a popup; send becomes circular — **C2**) |
+| c2 | Placeholder one-liner: "Message or run a task, / commands, @ files or sessions" | `dsh:2902` | long multi-line placeholder incl. Enter hints | ✅ **C3** (P2: shorten to reference wording; move Enter hints into `title`/`aria-describedby`) |
+| c3 | Model shown as short name + chevron ("deepseek-v4.1-flash") | `dsh:2906` | full id `nvidia/z-ai/glm-5.3-flash` | ✅ **C4** (P2: display after last `/`, full id in title+aria) |
 | c4 | Stop-generating while streaming (button becomes stop) | `dsh:2907` | ✅ same button swaps Send/Stop | ✅ |
 
 ### Status bar (centre column bottom)
 
 | # | Element | DSH | BSH today | Status |
 |---|---|---|---|---|
-| b1 | Popup: `⊙ {n} turns {n} steps · {n} tok/s` | `dsh:2908-2910` | one dense left/right text line (`#status-left`/`#status-right`, app.js:2739) | ⬜ **B1** |
-| b2 | Popup: `▤ {n} tok · Cache hit {n}%` | `dsh:2911-2913` | `↑ {p} ↓ {c} tok` span only | ⬜ **B2** (cache-hit = §5.4) |
-| b3 | Popup: `{n}% of context used` | `dsh:2914` | `ctx ~{used}/{budget}` span | ⬜ **B3** |
+| b1 | Popup: `⊙ {n} turns {n} steps · {n} tok/s` | `dsh:2908-2910` | one dense left/right text line (`#status-left`/`#status-right`, app.js:2739) | ✅ **B1** |
+| b2 | Popup: `▤ {n} tok · Cache hit {n}%` | `dsh:2911-2913` | `↑ {p} ↓ {c} tok` span only | ✅ **B2** (cache-hit = §5.4) |
+| b3 | Popup: `{n}% of context used` | `dsh:2914` | `ctx ~{used}/{budget}` span | ✅ **B3** |
 | b4 | BSH-only notices: compacting…, mcp n/n, errors, archived, token meter | — | present | ⏭ keep — parked at the bar's left end (documented deviation) |
 
 ## 3B. Layout & style spec (pixel-measured)
@@ -828,31 +828,37 @@ Two sub-requirements; ship together (one foot row).
 
 ## 6. Acceptance strategy (summary)
 
-| Requirement | ui | markup | page | layout | live |
-|---|---|---|---|---|---|
-| S1 New Session | – | id+i18n | click→create_session | – | – |
-| S2 nav | – | – | navTo targets | – | – |
-| S3 tree | – | roles | expanded flips | – | – |
-| S4 Running chip | fixture | – | – | – | stream in/out |
-| S5 account menu | – | – | items+focus | – | – |
-| H1 jobs dropdown | – | – | popover+nav | – | – |
-| H2 deep-diving line | – | i18n | appear/hide+timer | – | slow turn |
-| T1 tool rows | fixture | textContent | – | – | – |
-| T3 Good/Bad | – | – | meta+exclusive | – | – |
-| T5 state chips | – | – | 3 states | – | stop case |
-| T6 usage popup | – | – | label+popover | – | – |
-| T7 image viewer | – | – | tab opens | – | – |
-| W1 Working badge | fixture | a11y names | – | – | slow/stop/dismiss |
-| W2 avatar | – | – | in/out | – | – |
-| G1 goal bar | – | i18n | 5 actions | – | – |
-| C1a ⊕ menu | – | – | 3 items | – | – |
-| C1b circle send | states | – | – | 42px@4 widths | – |
-| C3/C4 wording | – | strings | zh swap | – | – |
-| B1-B3 status bar | fixture | a11y | texts+popover | centered@4 | – |
-| §3B tokens (accent/sidebar/selected/text) | – | – | – | computed styles@2 widths | – |
-| §3B insets & boxes | – | – | – | inset 64/40, goal h44, send 42 @4 widths | – |
-| H0 overlay titlebar | – | – | – | `#chat-title` top<44 | – |
+| Requirement | ui | markup | page | layout | live | perf |
+|---|---|---|---|---|---|---|
+| S1 New Session | – | id+i18n | click→create_session | – | – | – |
+| S2 nav | – | – | navTo targets | – | – | – |
+| S3 tree | – | roles | expanded flips | – | – | – |
+| S4 Running chip | fixture | – | – | – | stream in/out | – |
+| S5 account menu | – | – | items+focus | – | – | – |
+| H1 jobs dropdown | – | – | popover+nav | – | – | – |
+| H2 deep-diving line | – | i18n | appear/hide+timer | – | slow turn | – |
+| T1 tool rows | fixture | textContent | – | – | – | – |
+| T3 Good/Bad | – | – | meta+exclusive | – | – | – |
+| T4 Continuing-goal marker | – | i18n | advance→pill, call | – | – | – |
+| T5 state chips | – | i18n | 3 states | – | stop case | – |
+| T6 usage popup | – | – | label+popover | – | – | – |
+| T7 image viewer | – | titles | tab opens | – | paste→send→reload→open | – |
+| W1 Working badge | fixture | a11y names | – | – | slow/stop/dismiss | – |
+| W2 avatar | – | – | in/out | – | – | – |
+| G1 goal bar | – | i18n | 5 actions | – | – | – |
+| C1a ⊕ menu | – | – | 3 items | – | – | – |
+| C1b circle send | states | – | – | 42px@4 widths | – | – |
+| C3/C4 wording | – | strings | zh swap | – | – | – |
+| B1-B3 status bar | fixture | a11y | texts+popover | centered@4 | – | – |
+| §3B tokens (accent/sidebar/selected/text) | – | – | – | computed styles@2 widths | – | – |
+| §3B insets & boxes | – | – | – | inset 64/40, goal h44, send 42 @4 widths | – | – |
+| H0 overlay titlebar | – | – | – | `#chat-title` top<44 | – | – |
+| §5.3 `cancelled` flag | `turnVerdict` per source | – | – | – | stop path | – |
+| streaming cost (frames / rows / list) | – | – | – | – | – | 400-event burst, structural list records |
 
+The Rust side carries its own unit tests where the rule is a rule rather than a
+render: the §5.3 stop is taken only by the generation it named, the turn markers
+round-trip, and the default title is the one the rest of the app says (`lib`).
 Every new check: **write it red first** (remove the feature → confirm FAIL →
 restore), per `AGENTS.md`. Long falsification batches: managed background
 jobs, byte-snapshot every touched file, print the diff names at the end.
@@ -885,6 +891,7 @@ centre-column item; sidebar (S1–S5) and status bar (B1–B3) are free.
 | `PTC mode` chip (dsh:48) | no BSH concept maps; composer already exposes the real access mode |
 | `1 subagent` popup (dsh:47) | no subagent surface yet — revisit with delegation UI |
 | `<｜DSML｜ calls>` markers | DeepSeek-proprietary protocol artifact |
+| "Analysis completed" chip (dsh:76) | nothing tells BSH that reasoning *ended* - the message carries the reasoning text, not the moment it stops, so the chip would state an event this backend never sends |
 | Reference shadow/rounded-blur styling | BSH flat rule (guards fail on shadows) — border substitute |
 | Mascot animation (W2 static only) | decorative motion must respect `prefers-reduced-motion` |
 | ~~Traffic-light/titlebar layout~~ | promoted to **H0** (P2) — the missing strip is a real layout delta (§3B.1); if the overlay fails on macOS it returns here as a documented deviation |
@@ -914,7 +921,7 @@ guarded**; the change id is named so a reader can look at the diff.
 | 3 | S5 | account menu popup | ✅ | The avatar row is `<button id="side-account" aria-haspopup="menu" aria-expanded="false">` keeping its avatar + `Local workspace` visual, and it opens the shared row menu (the reference's dsh:42) with four items: Settings (`openSettings`), Keyboard shortcuts (`Polish.openShortcuts`), Theme (`Polish.cycleTheme`) and Language (`Polish.setLang` toggle). Escape closes it and focus returns to the row through `closeRowMenu(true)` - the same contract every menu here obeys. The standalone Settings gear stays (documented deviation). Page layer: five checks (haspopup + collapsed state, the four items and their order, `aria-expanded` while open, Escape + focus back on `#side-account`, and the Settings item laying out a pane with the modal closed first so the assertion can fail). Falsified by making Escape not refocus (reddens this and the existing keyboard-back check) and by pointing the Settings item at the theme cycle. |
 | 3 | T1 | tool-call rows in reference style | 🔄 fork | the fork owns the tool-row/footer area — check before starting |
 | 3 | T6 | per-turn Usage popup | ✅ | Each finished turn's footer carries `Usage {n} tok` as `<button class="mini-btn msg-usage" aria-haspopup="dialog">`, where `{n}` is what the session had spent **through that turn** (see the refinement in §4: the accumulator already holds the finished turn, so adding `state.usage` again would count it twice). Clicking it opens a flat `role="dialog"` panel with the turn's own `↑ prompt · ↓ completion` beside the session total, plus the `token_meter` reading - read **once per open**, never per repaint. A session that has spent nothing carries no chip at all, and a turn whose usage the store never recorded says "not reported" rather than 0. Escape closes it and focus returns to the chip. **Five page checks** (the two labels with the first-turn sum, the panel's split + `aria-expanded`, Escape + focus, one meter read per open across a repaint, and no chip on an empty session), **falsified three ways** with `restored clean: yes`: stating the session total instead of the turn's own reddens the label check; drawing the chip on a turn that measured nothing reddens the empty-session check (and T3's action-order check, which reads the same footer); reading the meter on every repaint reddens the `reads=1` clause with `reads=2`. |
-| 3 | T7 | image viewer | ✅ | A message's attachment is now `<button class="msg-image" title="View full image: <name>">` carrying the thumbnail and the derived name, and its click calls `Shell.openDocument({id: "img:…", title: name, path: name, img: url})` - the same document panel the tool results use, which grew an `<img class="doc-img">` branch for it (our own payload, `alt` = the name). The old click-to-zoom-in-place is gone, along with its dead `.zoomed` rule and the two live assertions that described it. **Page layer**: two checks (the button + thumbnail + `image-1.png` + the title, then the active `#doc-tabs` tab named `image-1.png` with the same `src` and `alt` laid out in the panel), **falsified three ways** with `restored clean: yes` - not a button reddens the render check, naming the tab `attached image` reddens the tab check, and removing the panel's picture branch reddens it too from the other side of the crate boundary. **One red stays, and it is not this item's**: the live guard's image section reports `attach: the image-only turn leaves a user row to open (rows=0)` - an image-only turn leaves `#messages` empty both during and after the turn, before any button exists to click. It used to die as an anonymous `TypeError` inside the same wait; it now says which thing is missing. Filed, not papered over: the T7 viewer assertions sit behind that row and run only when it is there. |
+| 3 | T7 | image viewer | ✅ | A message's attachment is now `<button class="msg-image" title="View full image: <name>">` carrying the thumbnail and the derived name, and its click calls `Shell.openDocument({id: "img:…", title: name, path: name, img: url})` - the same document panel the tool results use, which grew an `<img class="doc-img">` branch for it (our own payload, `alt` = the name). The old click-to-zoom-in-place is gone, along with its dead `.zoomed` rule and the two live assertions that described it. **Page layer**: two checks (the button + thumbnail + `image-1.png` + the title, then the active `#doc-tabs` tab named `image-1.png` with the same `src` and `alt` laid out in the panel), **falsified three ways** with `restored clean: yes` - not a button reddens the render check, naming the tab `attached image` reddens the tab check, and removing the panel's picture branch reddens it too from the other side of the crate boundary. **No red of this item is left.** The live image section runs its viewer assertions end to end: its earlier `rows=0` was not an empty-transcript gap in the page - the double created the chat in the wrong workspace, so the page correctly showed none (rev 38) - and with that fixed the live suite is `0 / 171`, this section included. |
 | 3 | W2 | brand avatar while streaming | ✅ | `<img id="brand-avatar" class="brand-avatar" src="icons/bos-harness-icon.svg" width=64 height=64 alt="" aria-hidden="true">` inside `#chat-head`, so it sits where the reference puts it - top-right of the transcript, above the W1 badge (y125-215 against the badge's y295-355). Visibility follows the **stream**, not the badge's dismissal: hiding the card is a statement about the card, so the toggle sits above `renderWorkingBadge`'s early return and the character stays until the turn ends. `pointer-events: none`, and the one transition is the 120ms opacity the spec allows (neutralised by the existing reduced-motion block like every other transition). **Two page checks** entering through `renderAll()` - the app's own pass, which is what a switch, a stop and a delete come through - **falsified three ways** with `restored clean: yes`: never removing the class reddens the idle check, dropping `pointer-events` reddens the streaming check (`pe=auto`), and giving it an `alt` while dropping `aria-hidden` reddens it too (`hidden=null`). The markup layer sees none of the three, which is why the check lives at the page. |
 | 3 | C3 | placeholder wording | ✅ | The textarea ships the reference's sentence - `Message or run a task,` / `/ commands, @ files or sessions` (zh: `输入消息或任务，` / `/ 命令，@ 文件或会话`) - and the Enter hint moved into its `title` behind a new `composer.enterHint` mark instead of riding as the fourth clause of the placeholder, which is what the wrap pressure in issue #14 cut off mid-sentence. **Two layers, and the falsification batch showed exactly which is blind to what.** `markup_selftest` compares the shipped attribute against the literal sentence *and* against polish.js's own English line, so the two cannot drift apart; `page_selftest` toggles the language and reads the rendered value (zh two lines, then back to English). Restoring the old long placeholder reddens **markup only** - once `setLang` has run, the applier has overwritten the DOM attribute from polish.js, so the page never sees the shipped string - and editing polish.js's zh sentence reddens **page only**. Putting the hint back *inside* the placeholder reddens markup (the attribute) and is invisible to the page for the same reason, while deleting the `title` reddens the page's two title assertions. Four injections, each caught, none of them by a check that could not have failed. |
 | 3 | C4 | model chip short name | ✅ | The chip's visible text is the segment after the last `/` (`glm-5.3-flash`) via `shortModelId`, and only when there is no model at all does it still say `no model`; the button keeps the whole id in its `title` *and* its `aria-label` (`Model: nvidia/z-ai/glm-5.3-flash`), so a chip that cannot tell two vendors apart is still announced and still hoverable in full. The list the chip leads to (it opens the sidebar's row menu into Settings, since the model is a setting) is untouched by this item. **Two page checks**: the chip with a three-segment id - asserting the visible text carries no `/` while both the title and the aria-label carry the id - and then a *second, different* model with no path at all, which is what proves the update is not one-way: code that only ever writes when the label is empty passes the first check and fails this one. **Falsified three ways** with `restored clean: yes` - naming the whole path in the chip (`chip=nvidia/z-…`), dropping the `aria-label` (`aria=null`), and leaving the title stale each redden the checks above. |
@@ -979,3 +986,4 @@ instance the user is running — that is the only one whose window `ocu` can see
 | 35 | 2026-10-13 | **C4 landed: the chip says the model's name, the control keeps its id.** `#model-label` now shows `shortModelId`'s last segment and `#model-btn` carries `Model: <full id>` in both its `title` and its `aria-label`, while the empty case still says `no model`. The reference's split is worth restating because it is the whole item: a chip cannot hold a three-segment path, but shortening the *visible* text is only honest if the full string survives where a reader - hovering or hearing it - can still reach it. **The second check earns its place by being a different shape.** The first sets a three-segment id and asserts the no-slash chip plus the full title and aria-label; the second sets a model with *no* path and re-asserts both places. On its own the first cannot catch a one-way update (code that writes the label only when it is empty would pass it, because the previous value in the fixture is not the value being asserted) - that is a real defect class, not a hypothetical, and it is the kind a fixture with one model hides. **Falsification did what the row claims**: naming the whole path reddens the first check (`chip=nvidia/z-…`), deleting the `aria-label` write reddens both (`aria=null`), and deleting the `title` write reddens both with a stale title. The list the chip opens is a row menu into Settings and is deliberately untouched, so the "popup still shows full ids" half of the spec is a statement about a surface this item does not own. |
 | 36 | 2026-10-13 | **T4 landed: a goal transition is a note between turns, and a row window is not a transcript.** The advance appends a `LogMarker` to the record, the finish handler moves it onto the first turn it writes (as `MessageMeta.marker`, next to the token count and for the same reason), and the transcript draws it - once - as a centered pill. **Three things the round paid for, each found by a check refusing to pass.** First, `#messages` is a *window of turns*: the reconcile removes every node that is not in `desired`, and a pill that is not a turn has no row to ride, so appending it in the millisecond before the reconcile is the same as deleting it. It is drawn after the reconcile now, and the next pass removes the previous copy, which makes the on-screen state always this pass's. Second - and this is the one worth remembering - **a change to the transcript's shape must mark it dirty**. The transcript's *messages* had not changed when the marker appeared, so the dirty cursor let the render pass stop early and the pill was never reached at all: the injection that removed the `markDirtyAll()` call reddened the check, which is how the call was found to be load-bearing rather than decorative. Third, the marker is a statement about the *gesture*, so it lands with the gesture instead of after the round trip, and the catch takes it back if the backend refuses - an optimistic pill that outlives a transition that never happened is the same family as the stale global status. **Two smaller things about checks.** A failure that says only `(none)` is a failure nobody can act on, so the precondition - "the gesture recorded itself against the transcript's own length" - became a named check of its own instead of a clause inside the pill's assertion; the pill's assertion kept the `called`/`lastArgs` read-back, which is what proved the command really was sent as `advance`. And the function-shaped fixture was the wrong tool here: the page dispatcher's per-argument support belongs to the folder chooser, so the fixture is a plain object and the *argument* is asserted through `lastArgs` instead - a better check anyway, because it tests what was asked rather than what was answered. |
 | 37 | 2026-10-13 | **§5.3 landed, and the round mostly learned where a check belongs.** `stream-finished` carries a `cancelled` flag now, written where the stop was honoured and keyed to the *generation* it was aimed at (`take_stop`), so one press cannot mark a later turn and a re-open still knows. Three unit tests pin that rule and a generation-blind match reddens the one about another turn. **The lesson is the check that passed for the wrong reason.** The first live check for the backend source went green - because the foot it read still belonged to the *stopped* turn above it, so the stale verdict satisfied it; moved beside a completed turn it failed truthfully, which is the honest state: the live double cannot separate the two sources at all, since its pressed turn makes both true at once. That is not a reason to accept the live check; it is the reason the decision is a pure function (`turnVerdict`) now, guarded in `ui_selftest` per source - dropping `payload.cancelled` reddens exactly the backend case and leaves the press case green, which no live check could show. **Second, a guard is not a playground.** Adding one turn to the live suite moved its outcome from 168 checks to 122 and then to 94, because each turn spends virtual time and a `waitFor` that times out ends the run; and running `ui_selftest.sh 200` produced a red in a *different* check, the reload-pairing one, which is written for the default 5000 - the guard as the harness runs it is the guard that means something. Both were self-inflicted, both were found by isolating against a reverted tree rather than by arguing, and both are why this round's own additions moved down a layer instead of up. |
+| 38 | 2026-10-13 | **The two "pre-existing reds" were one bug in the double, and the perf guard had never been run.** The live suite ends at `0 / 171` - its first all-green run here - because the image-only turn was never a page defect: the double built every chat in `w-main`, so a chat created while another workspace was active was correctly not shown, and the reader got an empty panel beside a turn that did run. A temporary probe printed `active: null` with that chat's messages sitting in the cache, which is what pointed at the workspace filter rather than the renderer; rev 32's "empty-transcript gap of its own" was my diagnosis, not the behaviour, and this is the correction. **Second: a guard nobody runs is not a guard.** `perf_selftest.sh` was `1 / 19` - S4's live age in the session row mutates one `aria-label`, and the check asserted *zero* mutations of the list, which one attribute write fails as surely as a rebuild. It now counts structural records (`childList`, drained on both the callback and `takeRecords` paths) separately and bounds the attributes: injected into the frame it reddens at once (`306 mutations, 305 structural`) while the tick's label refresh passes at `0 / 19`. **Also:** `SessionRecord::new` said "New Session" where `derive_title`, the sidebar and the header all say "New chat" (the button is the only thing named "New Session"), which had left a unit test red. **And §3's status column was audited against §9** - 21 stale cells claimed items that have been green for rounds, T2 now names its reason (§8), and every cell states the row's real status. |

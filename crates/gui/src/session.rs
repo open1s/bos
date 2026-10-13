@@ -273,7 +273,11 @@ impl SessionRecord {
         let now = unix_now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
-            title: "New Session".to_string(),
+            // The title a fresh chat carries until its first message names it. It is
+            // "New chat" and not "New Session" because that is what the sidebar, the
+            // header and this file's own derive_title() all call an unnamed chat - the
+            // button that creates one is the only thing named "New Session".
+            title: "New chat".to_string(),
             created_at: now,
             updated_at: now,
             workspace: String::new(),
