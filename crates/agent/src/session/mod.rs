@@ -77,11 +77,6 @@ impl AgentState {
 pub struct SessionSerializer;
 
 impl SessionSerializer {
-    /// Build a fresh state for `agent_id`.
-    pub fn new_state(agent_id: String, _workspace: Option<String>) -> AgentState {
-        AgentState::new(agent_id)
-    }
-
     /// Refresh the timestamp and message count on `state`.
     pub fn update_metadata(state: &mut AgentState) {
         state.metadata.updated_at = current_timestamp();

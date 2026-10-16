@@ -44,6 +44,9 @@ impl OpenRouterVendor {
 impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
     for OpenRouterVendor
 {
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        LlmClient::<S, C>::list_models(&self.inner).await
+    }
     async fn complete(
         &self,
         persona: Option<String>,

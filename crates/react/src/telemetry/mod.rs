@@ -148,11 +148,6 @@ impl TokenUsage {
             total_tokens: prompt + completion,
         }
     }
-
-    /// Roughly estimate tokens as one quarter of the byte length.
-    pub fn estimate_from_text(text: &str) -> u32 {
-        (text.len() / 4) as u32
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,7 +215,6 @@ pub struct TokenCounter {
     config: TokenBudgetConfig,
     current_usage: AtomicTokenUsage,
     total_requests: AtomicU64,
-    session_start_tokens: u64,
     total_prompt_tokens: AtomicU64,
     total_completion_tokens: AtomicU64,
     total_cached_tokens: AtomicU64,
@@ -286,7 +280,6 @@ impl TokenCounter {
             config,
             current_usage: AtomicTokenUsage::new(),
             total_requests: AtomicU64::new(0),
-            session_start_tokens: 0,
             total_prompt_tokens: AtomicU64::new(0),
             total_completion_tokens: AtomicU64::new(0),
             total_cached_tokens: AtomicU64::new(0),
@@ -307,18 +300,6 @@ impl TokenCounter {
         self.total_cached_tokens
             .fetch_add(u64::from(usage.cached_tokens), Ordering::Relaxed);
         self.current_usage.set(usage);
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Estimate prompt usage from `prompt_text` and count the request.
-    pub fn estimate_and_update(&self, prompt_text: &str) {
-        let estimated = TokenUsage::estimate_from_text(prompt_text);
-        let current = self.current_usage.get();
-        self.total_prompt_tokens
-            .fetch_add(u64::from(estimated), Ordering::Relaxed);
-        let new_usage =
-            TokenUsage::new(current.prompt_tokens + estimated, current.completion_tokens);
-        self.current_usage.set(new_usage);
         self.total_requests.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -359,17 +340,6 @@ impl TokenCounter {
             )
     }
 
-    /// Roll current usage into the session total and reset it.
-    pub fn reset_session(&mut self) {
-        self.session_start_tokens += self.current_usage.get().total_tokens as u64;
-        self.current_usage.set(TokenUsage::default());
-    }
-
-    /// Total tokens seen since the session began.
-    pub fn session_total_tokens(&self) -> u64 {
-        self.session_start_tokens + self.current_usage.get().total_tokens as u64
-    }
-
     /// Number of requests recorded.
     pub fn total_requests(&self) -> u64 {
         self.total_requests.load(Ordering::Relaxed)
@@ -393,21 +363,6 @@ impl TokenCounter {
     /// The configured budget.
     pub fn config(&self) -> &TokenBudgetConfig {
         &self.config
-    }
-
-    /// Set the request token ceiling.
-    pub fn set_max_tokens(&mut self, max: u32) {
-        self.config.max_request_tokens = max;
-    }
-
-    /// Set the warning threshold percentage.
-    pub fn set_warning_threshold(&mut self, percent: u8) {
-        self.config.warning_threshold_percent = percent;
-    }
-
-    /// Enable or disable auto-compaction.
-    pub fn set_auto_compact(&mut self, enabled: bool) {
-        self.config.auto_compact = enabled;
     }
 }
 

@@ -108,18 +108,6 @@ impl StdioTransport {
         Ok(())
     }
 
-    /// Ensure `buffer` holds at least `min_capacity` bytes, then read a line.
-    pub async fn recv_line_with_capacity(
-        &mut self,
-        buffer: &mut String,
-        min_capacity: usize,
-    ) -> Result<(), TransportError> {
-        if buffer.capacity() < min_capacity {
-            buffer.reserve(min_capacity - buffer.capacity());
-        }
-        self.recv_line(buffer).await
-    }
-
     /// Kill the server process.
     pub async fn shutdown(mut self) -> Result<(), TransportError> {
         let _ = self.child.kill().await;

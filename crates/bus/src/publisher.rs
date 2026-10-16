@@ -31,14 +31,6 @@ impl Publisher {
         Ok(self)
     }
 
-    /// Create a publisher directly from a session and topic
-    pub fn from_session(topic: impl Into<String>, session: Arc<Session>) -> Self {
-        Self {
-            topic: topic.into(),
-            session: Some(session),
-        }
-    }
-
     /// Publish a message to the topic
     pub async fn publish<T>(&self, payload: &T) -> Result<(), ZenohError>
     where

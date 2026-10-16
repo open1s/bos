@@ -53,18 +53,6 @@ impl WorkspaceValidator {
         }
     }
 
-    /// Allow or deny symlinks.
-    pub fn with_symlinks(mut self, allow: bool) -> Self {
-        self.allow_symlinks = allow;
-        self
-    }
-
-    /// Allow or deny absolute paths.
-    pub fn with_absolute_paths(mut self, allow: bool) -> Self {
-        self.allow_absolute_paths = allow;
-        self
-    }
-
     fn normalize_path(path: &Path) -> Result<PathBuf, SecurityError> {
         let canonical = fs::canonicalize(path).map_err(SecurityError::Io)?;
         Ok(canonical)

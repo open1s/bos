@@ -679,11 +679,6 @@ impl PluginRegistry {
     }
   }
 
-  /// Clone the underlying registry.
-  pub fn clone_inner(&self) -> InnerPluginRegistry {
-    self.inner.clone()
-  }
-
   /// The underlying registry.
   pub fn inner(&self) -> &InnerPluginRegistry {
     &self.inner

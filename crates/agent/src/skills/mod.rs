@@ -186,11 +186,6 @@ impl SkillLoader {
         self.discovered.values().collect()
     }
 
-    /// Check if a skill exists
-    pub fn has_skill(&self, name: &str) -> bool {
-        self.discovered.contains_key(name)
-    }
-
     fn parse_metadata(path: &Path) -> Option<SkillMetadata> {
         let content = std::fs::read_to_string(path).ok()?;
         let (frontmatter, _) = Self::parse_frontmatter(&content)?;
@@ -242,63 +237,6 @@ impl SkillLoader {
             }
         }
         content.to_string()
-    }
-}
-
-/// Skill injector - formats skills for system prompt injection
-pub struct SkillInjector {
-    compact: bool,
-}
-
-/// Formatting options for skill injection.
-#[derive(Debug, Clone)]
-pub struct InjectionOptions {
-    /// Emit names only instead of full descriptions.
-    pub compact: bool,
-}
-
-impl InjectionOptions {
-    /// Options that emit names only.
-    pub fn compact() -> Self {
-        Self { compact: true }
-    }
-}
-
-impl SkillInjector {
-    /// Create an injector that emits full descriptions.
-    pub fn new() -> Self {
-        Self { compact: false }
-    }
-
-    /// Create an injector from explicit [`InjectionOptions`].
-    pub fn with_options(options: InjectionOptions) -> Self {
-        Self {
-            compact: options.compact,
-        }
-    }
-
-    /// Render the `<available_skills>` block, or an empty string when there are none.
-    pub fn inject_available(&self, skills: &[SkillMetadata]) -> String {
-        if skills.is_empty() {
-            return String::new();
-        }
-
-        let mut xml = String::from("<available_skills>\n");
-        for skill in skills {
-            if self.compact {
-                xml.push_str(&format!("- {}\n", skill.name));
-            } else {
-                xml.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
-            }
-        }
-        xml.push_str("</available_skills>");
-        xml
-    }
-}
-
-impl Default for SkillInjector {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -6,8 +6,7 @@
 use crate::error::{ConfigError, ConfigResult};
 use crate::types::{ConfigFormat, ConfigMergeStrategy, ConfigMetadata, ConfigSource};
 use log::{debug, info, warn};
-use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Collects configuration sources and merges them into one JSON document.
 #[derive(Clone)]
@@ -46,16 +45,6 @@ impl ConfigLoader {
     pub fn add_file(mut self, path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_string_lossy().to_string();
         self.sources.push(ConfigSource::File(path));
-        self.cached_config = None;
-        self
-    }
-
-    /// Append several config files.
-    pub fn add_files(mut self, paths: Vec<PathBuf>) -> Self {
-        for path in paths {
-            self.sources
-                .push(ConfigSource::File(path.to_string_lossy().to_string()));
-        }
         self.cached_config = None;
         self
     }
@@ -105,16 +94,6 @@ impl ConfigLoader {
     pub fn add_file_mut(&mut self, path: impl AsRef<Path>) -> &mut Self {
         let path = path.as_ref().to_string_lossy().to_string();
         self.sources.push(ConfigSource::File(path));
-        self.cached_config = None;
-        self
-    }
-
-    /// Mutable variant of [`ConfigLoader::add_files`].
-    pub fn add_files_mut(&mut self, paths: Vec<PathBuf>) -> &mut Self {
-        for path in paths {
-            self.sources
-                .push(ConfigSource::File(path.to_string_lossy().to_string()));
-        }
         self.cached_config = None;
         self
     }
@@ -203,16 +182,6 @@ impl ConfigLoader {
                 "config load finished but produced no cached value"
             ))
         })
-    }
-
-    /// Load and deserialize the merged config into `T`.
-    pub async fn load_typed<T>(&mut self) -> ConfigResult<T>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
-        let value = self.load().await?;
-        let config: T = serde_json::from_value(value.clone()).map_err(ConfigError::Json)?;
-        Ok(config)
     }
 
     /// The last merged value, if a load has run.
@@ -585,6 +554,7 @@ impl Default for ConfigLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn test_load_config() {

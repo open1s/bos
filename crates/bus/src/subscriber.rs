@@ -16,9 +16,6 @@ pub struct Subscriber<T> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-/// Convenient alias for reading code
-pub type TopicSubscriber<T> = Subscriber<T>;
-
 impl<T> Subscriber<T>
 where
     T: Archive + Send + 'static,
@@ -53,16 +50,6 @@ where
         Ok(self)
     }
 
-    /// Create a subscriber directly from a session and topic
-    pub async fn from_session(
-        topic: impl Into<String>,
-        session: Arc<Session>,
-    ) -> Result<Self, ZenohError> {
-        let mut sub = Self::new(topic);
-        sub.init(session).await?;
-        Ok(sub)
-    }
-
     /// Receive the next message (returns None if subscriber not initialized)
     pub async fn recv(&mut self) -> Option<T> {
         let subscriber = self.subscriber.as_mut()?;
@@ -76,18 +63,6 @@ where
             }
             Err(_) => None,
         }
-    }
-
-    /// Receive with a callback that gets the raw Sample
-    pub async fn recv_with_handle<F>(&mut self, handle: F) -> Result<(), ZenohError>
-    where
-        F: Fn(Sample),
-    {
-        let subscriber = self.subscriber.as_mut().ok_or(ZenohError::NotConnected)?;
-
-        let sample = subscriber.recv_async().await?;
-        handle(sample);
-        Ok(())
     }
 
     /// Spawn a task that invokes `handler` for every decoded message.
@@ -166,23 +141,4 @@ where
     fn default() -> Self {
         Self::new("default/subscriber")
     }
-}
-
-/// Spawn a task that forwards every decoded message to `handler`.
-pub fn subscriber_receiver<T, F>(
-    mut subscriber: Subscriber<T>,
-    mut handler: F,
-) -> JoinHandle<Result<(), String>>
-where
-    F: FnMut(T) + Send + 'static,
-    T: Archive + Send + 'static,
-    T::Archived: Deserialize<T, HighDeserializer<Error>>,
-{
-    let handle: tokio::task::JoinHandle<Result<_, String>> = tokio::spawn(async move {
-        while let Some(query) = subscriber.recv().await {
-            handler(query);
-        }
-        Ok(())
-    });
-    handle
 }

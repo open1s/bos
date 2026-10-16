@@ -17,7 +17,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use react::engine::{ReActEngine, ReActEngineBuilder};
-use react::llm::vendor::{DeepSeekVendor, LlmRouter, NvidiaVendor, OpenAiClient, OpenRouterVendor};
+use react::llm::vendor::{
+    AnthropicVendor, DeepSeekVendor, LlmRouter, NvidiaVendor, OpenAiClient, OpenRouterVendor,
+};
 use react::llm::{
     Content, LlmError as ReactLlmError, LlmResponse as ReactLlmResponse,
     TokenStream as ReactTokenStream, TokenStream,
@@ -79,6 +81,11 @@ pub struct AgentConfig {
     pub timeout_secs: u64,
     /// Maximum ReAct steps before the run is stopped.
     pub max_steps: usize,
+    /// Run one response's tool calls concurrently instead of one at a time.
+    ///
+    /// Off by default: a sequential batch keeps the hook and session order a
+    /// caller may depend on.
+    pub parallel_tool_calls: bool,
     /// API protocol selection: `"chat"` (default, `/chat/completions`) or
     /// `"responses"` (`/v1/responses`). Kept as a string so it archives cleanly
     /// under qserde/rkyv.
@@ -107,6 +114,7 @@ impl Default for AgentConfig {
             max_tokens: None,
             timeout_secs: 60,
             max_steps: 10,
+            parallel_tool_calls: false,
             api_mode: "chat".to_string(),
             reasoning_effort: None,
             circuit_breaker: None,
@@ -162,6 +170,11 @@ impl AgentConfig {
     /// Set the maximum ReAct step count.
     pub fn max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
+        self
+    }
+    /// Run one response's tool calls concurrently instead of one at a time.
+    pub fn parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.parallel_tool_calls = parallel;
         self
     }
     /// `"chat"` (default) or `"responses"`.

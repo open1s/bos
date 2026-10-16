@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use log::info;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::llm::vendor::responses::ResponsesTransport;
@@ -332,10 +332,76 @@ impl OpenAiVendor {
     }
 }
 
+impl OpenAiVendor {
+    /// The wire path a model list is read from.
+    ///
+    /// The endpoint may or may not carry a trailing slash, and a doubled
+    /// slash is what some gateways reject, so the suffix is stripped first.
+    pub fn models_url(&self) -> String {
+        let endpoint = self.endpoint.as_str();
+        let endpoint = endpoint.strip_suffix('/').unwrap_or(endpoint);
+        format!("{}/models", endpoint)
+    }
+
+    /// Ask the provider which model identifiers it offers.
+    ///
+    /// This is the wire call behind a model picker. A provider that does not
+    /// implement GET /models answers with an HTTP failure, which surfaces as
+    /// [LlmError::Http] rather than an empty list, so a caller never paints an
+    /// empty catalog over a refusal.
+    pub async fn fetch_model_ids(&self) -> Result<Vec<String>, LlmError> {
+        let response = self
+            .client
+            .get(self.models_url())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(LlmError::Http(format!("HTTP {}: {}", status, body)));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+        parse_model_ids(&body)
+    }
+}
+
+/// One entry of a GET /models response.
+#[derive(Deserialize)]
+struct ModelEntry {
+    /// The identifier the provider accepts as a model.
+    id: String,
+}
+
+/// A GET /models response body.
+#[derive(Deserialize)]
+struct ModelListBody {
+    /// The models the provider offers.
+    data: Vec<ModelEntry>,
+}
+
+/// Read the model identifiers out of a GET /models body.
+///
+/// A malformed body is a [LlmError::Parse], never an empty list: a caller
+/// painting a picker has to tell "the provider lists nothing" from "this is
+/// not a model list at all".
+fn parse_model_ids(body: &str) -> Result<Vec<String>, LlmError> {
+    let parsed: ModelListBody =
+        serde_json::from_str(body).map_err(|e| LlmError::Parse(e.to_string()))?;
+    Ok(parsed.data.into_iter().map(|entry| entry.id).collect())
+}
+
 #[async_trait]
 impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
     for OpenAiVendor
 {
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        self.fetch_model_ids().await
+    }
     async fn complete(
         &self,
         persona: Option<String>,
@@ -345,6 +411,12 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
     ) -> LlmResponseResult {
         if request.model.is_empty() {
             request.model = self.model.clone();
+        }
+        if request.api_mode == ApiMode::Anthropic {
+            return Err(LlmError::Other(
+                "the Anthropic Messages protocol needs a vendor that speaks /v1/messages"
+                    .to_string(),
+            ));
         }
         if request.api_mode == ApiMode::Responses {
             return ResponsesTransport::new(
@@ -430,6 +502,12 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
     ) -> Result<TokenStream, LlmError> {
         if request.model.is_empty() {
             request.model = self.model.clone();
+        }
+        if request.api_mode == ApiMode::Anthropic {
+            return Err(LlmError::Other(
+                "the Anthropic Messages protocol needs a vendor that speaks /v1/messages"
+                    .to_string(),
+            ));
         }
         if request.api_mode == ApiMode::Responses {
             return ResponsesTransport::new(
@@ -699,6 +777,9 @@ impl OpenAiClient {
 impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, C>
     for OpenAiClient
 {
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        LlmClient::<S, C>::list_models(&self.inner).await
+    }
     async fn complete(
         &self,
         persona: Option<String>,
@@ -844,5 +925,76 @@ mod tests {
         }
 
         println!("{:?}", outcome);
+    }
+
+    /// A model list is either read faithfully or reported as unparsable; an
+    /// empty provider answer stays an empty list instead of hiding behind the
+    /// same error as a body that is not a model list.
+    #[test]
+    fn parse_model_ids_reads_the_openai_list() {
+        let body = r#"{"object":"list","data":[{"id":"gpt-4o"},{"id":"o3-mini"}]}"#;
+        assert_eq!(super::parse_model_ids(body).unwrap(), ["gpt-4o", "o3-mini"]);
+        assert_eq!(
+            super::parse_model_ids(r#"{"data":[]}"#).unwrap(),
+            Vec::<String>::new(),
+            "a provider with nothing to list is not an error"
+        );
+        assert!(matches!(
+            super::parse_model_ids("not json"),
+            Err(crate::llm::LlmError::Parse(_))
+        ));
+    }
+
+    /// Both endpoint spellings reach the same path, so a trailing slash does
+    /// not produce the double slash some gateways reject.
+    #[test]
+    fn models_url_joins_with_exactly_one_slash() {
+        let bare = OpenAiVendor::new(
+            "https://api.example.com/v1".to_string(),
+            "m".to_string(),
+            "k".to_string(),
+        );
+        assert_eq!(bare.models_url(), "https://api.example.com/v1/models");
+        let slashed = OpenAiVendor::new(
+            "https://api.example.com/v1/".to_string(),
+            "m".to_string(),
+            "k".to_string(),
+        );
+        assert_eq!(slashed.models_url(), "https://api.example.com/v1/models");
+    }
+    #[tokio::test]
+    async fn anthropic_mode_is_refused_by_the_openai_transports() {
+        let vendor = OpenAiVendor::new(
+            "https://endpoint.invalid".to_string(),
+            "gpt-test".to_string(),
+            "test-key".to_string(),
+        );
+        let request = || LlmRequest {
+            model: "gpt-test".to_string(),
+            input: Content::text("hi"),
+            api_mode: crate::llm::ApiMode::Anthropic,
+            ..Default::default()
+        };
+        let outcome = vendor
+            .complete(
+                None,
+                request(),
+                &mut LlmSession::new(),
+                &mut LlmContext::default(),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(crate::llm::LlmError::Other(_))),
+            "the OpenAI vendor must refuse the Anthropic Messages protocol, not speak Chat"
+        );
+        let streamed = vendor
+            .stream_complete(
+                None,
+                request(),
+                &mut LlmSession::new(),
+                &mut LlmContext::default(),
+            )
+            .await;
+        assert!(streamed.is_err(), "the streaming path must refuse it too");
     }
 }

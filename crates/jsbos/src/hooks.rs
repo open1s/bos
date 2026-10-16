@@ -162,16 +162,6 @@ impl HookRegistry {
     }
   }
 
-  /// Clone the underlying registry.
-  pub fn clone_inner(&self) -> InnerHookRegistry {
-    self.inner.clone()
-  }
-
-  /// Mutable access to the underlying registry.
-  pub fn inner_mut(&mut self) -> &mut InnerHookRegistry {
-    &mut self.inner
-  }
-
   #[napi]
   /// Register `callback` for `event`.
   pub async fn register(

@@ -2,10 +2,8 @@
 
 use crate::agent::hooks::HookRegistry;
 use crate::agent::plugin::PluginRegistry;
-use crate::OpenAiMessage;
 use react::engine::ReactError;
 use react::llm::types::{ReactContext, ReactSession};
-use react::llm::vendor::ToolCall;
 use react::llm::{
     Content, ContentPart, Instruction, LlmMessage as Message, LlmRequest as ReactLlmRequest,
     LlmResponse as ReactLlmResponse, LlmTool, Rule, Skill,
@@ -15,13 +13,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::future::Future;
 use std::sync::Arc;
-
-fn content_to_string(content: &Content) -> String {
-    match content {
-        Content::Text(s) => s.clone(),
-        Content::Parts(parts) => serde_json::to_string(parts).unwrap_or_default(),
-    }
-}
 
 fn content_to_summary_string(content: &Content) -> String {
     match content {
@@ -94,12 +85,6 @@ impl AgentSession {
         self.update_metadata();
     }
 
-    /// Append a system message.
-    pub fn add_system(&mut self, profile: String) {
-        self.messages.push(Message::System { content: profile });
-        self.update_metadata();
-    }
-
     /// Append an assistant message.
     pub fn add_assistant(&mut self, content: String) {
         self.messages.push(Message::Assistant { content });
@@ -122,91 +107,6 @@ impl AgentSession {
     pub fn restore_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
         self.update_metadata();
-    }
-
-    /// Borrow the conversation history.
-    pub fn history_ref(&self) -> &[Message] {
-        &self.messages
-    }
-
-    /// Render the history as OpenAI chat messages.
-    pub fn to_api_format(&self) -> Vec<OpenAiMessage> {
-        let mut api_messages = Vec::with_capacity(self.messages.len());
-        self.extend_api_format(&mut api_messages);
-        api_messages
-    }
-
-    /// Append the history to `target` as OpenAI chat messages.
-    pub fn extend_api_format(&self, target: &mut Vec<OpenAiMessage>) {
-        target.reserve(self.messages.len());
-        for message in &self.messages {
-            match message {
-                Message::User { content } => {
-                    target.push(OpenAiMessage {
-                        role: "user".to_string(),
-                        content: Some(content_to_string(content)),
-                        tool_calls: None,
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-                Message::System { content } => {
-                    target.push(OpenAiMessage {
-                        role: "system".to_string(),
-                        content: Some(content.clone()),
-                        tool_calls: None,
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-                Message::Assistant { content } => {
-                    target.push(OpenAiMessage {
-                        role: "assistant".to_string(),
-                        content: Some(content.clone()),
-                        tool_calls: None,
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-                Message::AssistantToolCall {
-                    tool_call_id,
-                    name,
-                    args,
-                } => {
-                    target.push(OpenAiMessage {
-                        role: "assistant".to_string(),
-                        content: None,
-                        tool_calls: Some(vec![ToolCall {
-                            id: tool_call_id.clone(),
-                            r#type: "function".to_string(),
-                            function: react::llm::vendor::FunctionCall {
-                                name: Some(name.clone()),
-                                arguments: Some(args.to_string()),
-                            },
-                        }]),
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-                Message::ToolResult {
-                    tool_call_id: _,
-                    content,
-                } => {
-                    target.push(OpenAiMessage {
-                        role: "tool".to_string(),
-                        content: Some(content.clone()),
-                        tool_calls: None,
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-            }
-        }
     }
 
     /// Number of messages.
@@ -813,121 +713,9 @@ impl MessageContext {
         });
     }
 
-    /// Append a system message.
-    pub fn add_system(&mut self, profile: String) {
-        self.messages.push(Message::System { content: profile });
-    }
-
     /// Append an assistant message.
     pub fn add_assistant(&mut self, content: String) {
         self.messages.push(Message::Assistant { content });
-    }
-
-    /// Append `chunk` to the trailing assistant message, or start one.
-    pub fn append_assistant_chunk(&mut self, chunk: &str) {
-        match self.messages.last_mut() {
-            Some(Message::Assistant { content }) => content.push_str(chunk),
-            _ => self.messages.push(Message::Assistant {
-                content: chunk.to_string(),
-            }),
-        }
-    }
-
-    /// Record an assistant tool call.
-    pub fn add_tool_call(&mut self, tool_call_id: String, name: String, args: serde_json::Value) {
-        self.messages.push(Message::AssistantToolCall {
-            tool_call_id,
-            name,
-            args,
-        });
-    }
-
-    /// Record a tool result.
-    pub fn add_tool_result(&mut self, name: String, content: String) {
-        self.messages.push(Message::ToolResult {
-            tool_call_id: name,
-            content,
-        });
-    }
-
-    /// Render the history as OpenAI chat messages.
-    pub fn to_api_format(&self) -> Vec<OpenAiMessage> {
-        let mut api_messages = Vec::with_capacity(self.messages.len());
-        self.extend_api_format(&mut api_messages);
-        api_messages
-    }
-
-    /// Append the history to `target` as OpenAI chat messages.
-    pub fn extend_api_format(&self, target: &mut Vec<OpenAiMessage>) {
-        target.reserve(self.messages.len());
-        for message in &self.messages {
-            match message {
-                Message::User { content } => {
-                    target.push(OpenAiMessage {
-                        role: "user".to_string(),
-                        content: Some(content_to_string(content)),
-                        tool_calls: None,
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-                Message::System { content } => {
-                    target.push(OpenAiMessage {
-                        role: "system".to_string(),
-                        content: Some(content.clone()),
-                        tool_calls: None,
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-                Message::Assistant { content } => {
-                    target.push(OpenAiMessage {
-                        role: "assistant".to_string(),
-                        content: Some(content.clone()),
-                        tool_calls: None,
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-                Message::AssistantToolCall {
-                    tool_call_id,
-                    name,
-                    args,
-                } => {
-                    target.push(OpenAiMessage {
-                        role: "assistant".to_string(),
-                        content: None,
-                        tool_calls: Some(vec![ToolCall {
-                            id: tool_call_id.clone(),
-                            r#type: "function".to_string(),
-                            function: react::llm::vendor::FunctionCall {
-                                name: Some(name.clone()),
-                                arguments: Some(args.to_string()),
-                            },
-                        }]),
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-                Message::ToolResult {
-                    tool_call_id: _,
-                    content,
-                } => {
-                    target.push(OpenAiMessage {
-                        role: "tool".to_string(),
-                        content: Some(content.clone()),
-                        tool_calls: None,
-                        function_call: None,
-                        reasoning_content: None,
-                        extra: serde_json::Value::Object(serde_json::Map::new()),
-                    });
-                }
-            }
-        }
     }
 
     /// Number of messages.

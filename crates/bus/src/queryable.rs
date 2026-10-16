@@ -84,17 +84,6 @@ where
         self
     }
 
-    /// Attach a streaming handler that may reply many times.
-    pub fn with_stream_handler<F, Fut>(mut self, handler: F) -> Self
-    where
-        F: Fn(Q, tokio::sync::mpsc::Sender<Result<R, ZenohError>>) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
-    {
-        let handler: StreamHandler<Q, R> = Box::new(move |q, tx| Box::pin(handler(q, tx)));
-        self.stream_handler = Some(handler);
-        self
-    }
-
     /// Declare the underlying Zenoh queryable.
     pub async fn init(&mut self, session: &Arc<Session>) -> Result<(), ZenohError> {
         let queryable = session

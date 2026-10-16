@@ -216,11 +216,6 @@ impl PyHookRegistry {
     pub fn inner(&self) -> Arc<InnerRegistry> {
         self.inner.clone()
     }
-
-    /// Clone the underlying registry.
-    pub fn to_hook_registry(&self) -> InnerRegistry {
-        self.inner.as_ref().clone()
-    }
 }
 
 #[pymethods]

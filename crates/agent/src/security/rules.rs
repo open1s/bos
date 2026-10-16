@@ -210,12 +210,6 @@ impl ToolRule {
         }
     }
 
-    /// Use an explicit rule id instead of the generated one.
-    pub fn with_id(mut self, id: impl Into<String>) -> Self {
-        self.id = id.into();
-        self
-    }
-
     /// Restrict the rule to `scope`.
     pub fn with_scope(mut self, scope: RuleScope) -> Self {
         self.scope = scope;
@@ -440,13 +434,6 @@ impl RuleSet {
             .lock()
             .map(|ring| ring.iter().cloned().collect())
             .unwrap_or_default()
-    }
-
-    /// Drop every audit entry.
-    pub fn clear_audit(&self) {
-        if let Ok(mut ring) = self.audit.lock() {
-            ring.clear();
-        }
     }
 
     /// Current audit ring capacity.

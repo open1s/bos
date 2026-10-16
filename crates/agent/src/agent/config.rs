@@ -21,20 +21,6 @@ pub struct TomlToolRef {
     pub schema: Option<serde_json::Value>,
 }
 
-impl TomlToolRef {
-    /// Render this tool as an OpenAI function definition.
-    pub fn to_openai_tool(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description.clone().unwrap_or_default(),
-                "parameters": self.schema.clone().unwrap_or(serde_json::json!({"type": "object", "properties": {}}))
-            }
-        })
-    }
-}
-
 /// Agent configuration as read from TOML.
 #[derive(Debug, Deserialize, Clone)]
 pub struct TomlAgentConfig {
@@ -94,6 +80,9 @@ impl From<TomlAgentConfig> for AgentConfig {
             max_tokens: t.max_tokens,
             timeout_secs: t.timeout_secs,
             max_steps: t.max_steps.unwrap_or(10),
+            // A TOML agent config carries no switch for this yet; the host sets
+            // the field on the AgentConfig it builds directly.
+            parallel_tool_calls: false,
             api_mode: t.api_mode.unwrap_or_default(),
             reasoning_effort: t.reasoning_effort,
             circuit_breaker: None,
@@ -133,14 +122,6 @@ impl TomlAgentBuilder {
     pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
-    }
-
-    /// The configured tools as OpenAI function definitions, if any.
-    pub fn config_tools(&self) -> Option<Vec<serde_json::Value>> {
-        self.config
-            .tools
-            .as_ref()
-            .map(|tools| tools.iter().map(|t| t.to_openai_tool()).collect())
     }
 
     /// DeepSeek natively supports the Responses API; default to it unless the

@@ -207,14 +207,6 @@ impl ToolRegistry {
         self.register(ToolVariant::Async(t));
     }
 
-    /// Every registered tool as an OpenAI definition.
-    pub fn to_openai_tools(&self) -> Vec<ToolDefinition> {
-        self.tools
-            .iter()
-            .map(|entry| entry.value().to_openai_definition())
-            .collect()
-    }
-
     /// Call a tool by name with JSON input.
     pub async fn call(&self, name: &str, input: &Value) -> Result<Value, ToolError> {
         if let Some(tool) = self.tools.get(name) {

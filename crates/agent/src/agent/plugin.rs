@@ -63,20 +63,6 @@ impl LlmRequestWrapper {
             metadata: std::collections::HashMap::new(),
         }
     }
-
-    /// Convert back into an [`LlmRequest`](react::llm::LlmRequest).
-    pub fn into_request(self) -> react::llm::LlmRequest {
-        react::llm::LlmRequest {
-            model: self.model,
-            input: self.input,
-            temperature: self.temperature,
-            max_tokens: self.max_tokens,
-            top_p: self.top_p,
-            top_k: self.top_k,
-            reasoning_effort: self.reasoning_effort,
-            api_mode: self.api_mode,
-        }
-    }
 }
 
 /// A plugin-facing view of an LLM response.
@@ -206,16 +192,6 @@ impl ToolCallWrapper {
             metadata: std::collections::HashMap::new(),
         }
     }
-
-    /// Create a wrapper from borrowed tool-call fields.
-    pub fn from_tool_call(name: &str, args: &serde_json::Value, id: Option<&str>) -> Self {
-        Self {
-            name: name.to_string(),
-            args: args.clone(),
-            id: id.map(|s| s.to_string()),
-            metadata: std::collections::HashMap::new(),
-        }
-    }
 }
 
 /// A plugin-facing view of a tool result.
@@ -252,17 +228,6 @@ impl ToolResultWrapper {
                 error: Some(e.to_string()),
                 metadata: std::collections::HashMap::new(),
             },
-        }
-    }
-
-    /// Convert back into a `Result`.
-    pub fn into_result(self) -> Result<serde_json::Value, react::tool::ToolError> {
-        if self.success {
-            Ok(self.result)
-        } else {
-            Err(react::tool::ToolError::Failed(
-                self.error.unwrap_or_else(|| "Unknown error".to_string()),
-            ))
         }
     }
 }

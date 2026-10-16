@@ -6,7 +6,7 @@ use crate::llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, Strea
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::runtime::{HookDecision, ReActApp};
 use crate::telemetry::{Telemetry, TelemetryEvent, TokenBudgetReport, TokenCounter, TokenUsage};
-use crate::tool::registry::{AsyncTool, FnTool, ToolVariant};
+use crate::tool::registry::{FnTool, ToolVariant};
 use crate::tool::{Tool, ToolRegistry};
 use async_stream::stream;
 use bus::Bus;
@@ -38,6 +38,7 @@ pub struct ReActEngine<A: ReActApp> {
     llm: Box<dyn LlmClient<A::Session, A::Context> + Send + Sync>,
     tools: Arc<ToolRegistry>,
     max_steps: usize,
+    parallel_tool_calls: bool,
     telemetry: Telemetry,
     llm_timeout_secs: u64,
     model: String,
@@ -56,6 +57,7 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     llm: Option<Box<dyn LlmClient<A::Session, A::Context>>>,
     tools: ToolRegistry,
     max_steps: usize,
+    parallel_tool_calls: bool,
     telemetry: Telemetry,
     resilience: Option<ReActResilience>,
     llm_timeout_secs: u64,
@@ -73,19 +75,9 @@ impl<A: ReActApp> ReActEngine<A> {
         ReActEngineBuilder::new()
     }
 
-    /// The manager tracking in-flight tool calls.
-    pub fn tool_run_manager(&self) -> &ToolRunManager {
-        &self.run_manager
-    }
-
     /// Register a synchronous tool at runtime.
     pub fn register_tool(&self, t: Box<dyn Tool>) {
         self.tools.register_sync(t);
-    }
-
-    /// Register an asynchronous tool at runtime.
-    pub fn register_async_tool(&self, t: Box<dyn AsyncTool>) {
-        self.tools.register_async(t);
     }
 
     /// Inject `__call_id__` into the input JSON so the tool can observe its
@@ -182,6 +174,10 @@ impl<A: ReActApp> ReActEngine<A> {
                         let message = &choice.message;
 
                         if let Some(tool_calls) = &message.tool_calls {
+                            // Phase A: every call of this response is parsed and
+                            // passes its before-hook first. The hooks take the
+                            // session, so they stay in the model own order.
+                            let mut batch: Vec<(String, String, serde_json::Value)> = Vec::new();
                             for tc in tool_calls {
                                 found_tool_call = true;
                                 let call_id = tc.id.clone();
@@ -202,7 +198,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                         session.push(LlmMessage::ToolResult {
                                             tool_call_id: call_id,
                                             content: format!(
-                                                "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.\n\nskill_dir: {}\n\n{}",
+                                                "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.
+
+skill_dir: {}
+
+{}",
                                                 skill_name, cached_skill.skill_dir, cached_skill.instructions
                                             ),
                                         });
@@ -228,14 +228,54 @@ impl<A: ReActApp> ReActEngine<A> {
                                     }
                                 }
 
-                                let tool_started = Instant::now();
-                                let mut result = self.call_tool(&name, &mut args, &call_id).await;
-                                self.tool_call_count.fetch_add(1, Ordering::Relaxed);
-                                self.tool_time_nanos.fetch_add(
-                                    tool_started.elapsed().as_nanos() as u64,
-                                    Ordering::Relaxed,
-                                );
+                                batch.push((name, call_id, args));
+                            }
 
+                            // The calls of one response do not depend on each
+                            // other, so a batch of more than one runs concurrently
+                            // when the caller asked for it (see AgentConfig). Each
+                            // call keeps its own mutable args, so a tool that
+                            // rewrites its input is read back the way it left it.
+                            let results: Vec<Result<serde_json::Value, ReactError>> =
+                                if self.parallel_tool_calls && batch.len() > 1 {
+                                    let batch_started = Instant::now();
+                                    let this: &Self = &*self;
+                                    let joined = futures::future::join_all(batch.iter_mut().map(
+                                        |entry: &mut (String, String, serde_json::Value)| {
+                                            let (name, call_id, args) =
+                                                (&entry.0, &entry.1, &mut entry.2);
+                                            async move { this.call_tool(name, args, call_id).await }
+                                        },
+                                    ))
+                                    .await;
+                                    self.tool_call_count
+                                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                                    self.tool_time_nanos.fetch_add(
+                                        batch_started.elapsed().as_nanos() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    joined
+                                } else {
+                                    let mut out = Vec::with_capacity(batch.len());
+                                    for (name, call_id, args) in batch.iter_mut() {
+                                        let tool_started = Instant::now();
+                                        let result = self.call_tool(name, args, call_id).await;
+                                        self.tool_call_count.fetch_add(1, Ordering::Relaxed);
+                                        self.tool_time_nanos.fetch_add(
+                                            tool_started.elapsed().as_nanos() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                        out.push(result);
+                                    }
+                                    out
+                                };
+
+                            // Hooks and the session keep the model's order, so what
+                            // the transcript records does not depend on which call
+                            // finished first.
+                            for ((name, call_id, args), mut result) in
+                                batch.into_iter().zip(results)
+                            {
                                 match self
                                     .react_app
                                     .after_tool_result(
@@ -800,11 +840,6 @@ impl<A: ReActApp> ReActEngine<A> {
         self.token_counter.report()
     }
 
-    /// Reset the token counter for a new session
-    pub fn reset_token_counter(&mut self) {
-        self.token_counter = TokenCounter::with_default();
-    }
-
     /// Get the number of tool calls made during this session.
     pub fn tool_call_count(&self) -> u64 {
         self.tool_call_count.load(Ordering::Relaxed)
@@ -817,16 +852,6 @@ impl<A: ReActApp> ReActEngine<A> {
     /// a per-run value.
     pub fn tool_time(&self) -> std::time::Duration {
         std::time::Duration::from_nanos(self.tool_time_nanos.load(Ordering::Relaxed))
-    }
-
-    /// Reset the tool call counter.
-    pub fn reset_tool_call_count(&self) {
-        self.tool_call_count.store(0, Ordering::Relaxed);
-    }
-
-    /// The shared stop flag.
-    pub fn get_stop_flag(&self) -> Arc<AtomicBool> {
-        self.stop_flag.clone()
     }
 
     /// Set the shared stop flag.

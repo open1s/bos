@@ -134,11 +134,6 @@ impl JsonRpcResponse {
             error: Some(error),
         }
     }
-
-    /// Whether this response carries an error.
-    pub fn is_error(&self) -> bool {
-        self.error.is_some()
-    }
 }
 
 impl JsonRpcError {
@@ -155,24 +150,6 @@ impl JsonRpcError {
     pub fn invalid_request(msg: impl Into<String>) -> Self {
         Self {
             code: -32600,
-            message: msg.into(),
-            data: None,
-        }
-    }
-
-    /// A `-32601` method-not-found error.
-    pub fn method_not_found(method: impl Into<String>) -> Self {
-        Self {
-            code: -32601,
-            message: method.into(),
-            data: None,
-        }
-    }
-
-    /// A `-32602` invalid-params error.
-    pub fn invalid_params(msg: impl Into<String>) -> Self {
-        Self {
-            code: -32602,
             message: msg.into(),
             data: None,
         }

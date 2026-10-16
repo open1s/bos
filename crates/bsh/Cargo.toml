@@ -1,0 +1,52 @@
+[package]
+name = "bsh"
+description = "BOS Harness - native desktop shell on the BOS framework, built with GPUI Kit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "bsh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bsh"
+path = "src/main.rs"
+
+[dependencies]
+# One UI dependency: gpui-kit re-exports gpui, gpui-base, gpui-component and the
+# default assets, and pins the matching GPUI release.
+gpui-kit = "=0.7.3"
+
+# The BOS framework, used directly (no intermediate shell crate).
+agent = { path = "../agent" }
+react = { path = "../react" }
+logging = { path = "../logging" }
+config = { path = "../config" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+async-channel = { workspace = true }
+uuid = { workspace = true }
+shellexpand = { workspace = true }
+rust-i18n = "4.2.4"
+dirs = "7.0.0"
+
+[dev-dependencies]
+# The same package the kit aliases as gpui, with GPUI test hooks enabled: the
+# shell is booted headlessly and its controls are clicked by debug selector.
+gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
+
+# A bare `bsh` binary has no bundle, so macOS would draw a generic Dock tile;
+# assets::install_dock_icon hands AppKit the .icns compiled into the binary
+# instead. Versions match what gpui-pre-macos already pulls in, so they unify.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", features = ["NSData"] }

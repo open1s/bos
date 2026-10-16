@@ -64,11 +64,6 @@ impl CombineResource {
             .insert(uri, Arc::new(Mutex::new(handler)));
     }
 
-    /// Number of child nodes.
-    pub async fn child_count(&self) -> usize {
-        self.children.lock().await.len()
-    }
-
     /// Child slots in stable URI order (stale-free snapshot; the map lock is
     /// released before any child is touched, so child calls can never
     /// deadlock against the combine node itself).

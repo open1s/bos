@@ -59,32 +59,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Register a synchronous tool under `namespace_toolname`.
-    pub fn register_with_namespace(
-        &mut self,
-        tool: Arc<dyn Tool>,
-        namespace: &str,
-    ) -> Result<(), ToolError> {
-        let namespaced_name = format!("{}_{}", namespace, tool.name());
-        let schema = tool.json_schema();
-        self.schema_cache.insert(namespaced_name.clone(), schema);
-        self.tools.insert(namespaced_name, tool);
-        Ok(())
-    }
-
-    /// Register an asynchronous tool under `namespace_toolname`.
-    pub fn register_async_with_namespace(
-        &mut self,
-        tool: Arc<dyn AsyncTool>,
-        namespace: &str,
-    ) -> Result<(), ToolError> {
-        let namespaced_name = format!("{}_{}", namespace, tool.name());
-        let schema = tool.json_schema();
-        self.schema_cache.insert(namespaced_name.clone(), schema);
-        self.async_tools.insert(namespaced_name, tool);
-        Ok(())
-    }
-
     /// Look up a synchronous tool by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
@@ -180,11 +154,6 @@ impl ToolRegistry {
         self.mcp_tool_entries()
     }
 
-    /// Names of MCP prompts; see `mcp_prompt_entries`.
-    pub fn mcp_prompt_names(&self) -> Vec<String> {
-        self.mcp_tool_names.iter().cloned().collect()
-    }
-
     /// Find an async tool by exact name or suffix match
     fn find_async_tool(&self, name: &str) -> Option<Arc<dyn AsyncTool>> {
         // Try exact match first
@@ -242,39 +211,6 @@ impl ToolRegistry {
 
         super::validate_args(&schema, args)?;
         tool.run(args)
-    }
-
-    /// Render the tools as OpenAI function-calling definitions.
-    pub fn to_openai_format(&self) -> Vec<serde_json::Value> {
-        let mut result: Vec<serde_json::Value> = self
-            .tools
-            .values()
-            .map(|tool| {
-                let desc = tool.description();
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name(),
-                        "description": desc,
-                        "parameters": tool.json_schema()
-                    }
-                })
-            })
-            .collect();
-
-        result.extend(self.async_tools.values().map(|tool| {
-            let desc = tool.description();
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name(),
-                    "description": desc,
-                    "parameters": tool.json_schema()
-                }
-            })
-        }));
-
-        result
     }
 }
 

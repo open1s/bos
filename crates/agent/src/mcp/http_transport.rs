@@ -106,33 +106,9 @@ impl HttpTransport {
         Ok(body_str)
     }
 
-    /// Override the MCP session id.
-    pub fn set_session_id(&self, id: String) {
-        *self.session_id.lock().unwrap() = Some(id);
-    }
-
     /// The current MCP session id, if any.
     pub fn session_id(&self) -> Option<String> {
         self.session_id.lock().unwrap().clone()
-    }
-
-    /// Send `DELETE` to end the session and clear the stored id.
-    pub async fn terminate_session(&self) -> Result<(), HttpTransportError> {
-        let base_url = self.base_url.clone();
-        let session_id = self.session_id.lock().unwrap().clone();
-        *self.session_id.lock().unwrap() = None;
-
-        if let Some(id) = session_id {
-            tokio::task::spawn_blocking(move || {
-                ureq::delete(&base_url)
-                    .header("Mcp-Session-Id", &id)
-                    .call()
-                    .ok();
-            })
-            .await
-            .ok();
-        }
-        Ok(())
     }
 
     fn parse_sse_response(&self, text: &str) -> Result<String, HttpTransportError> {

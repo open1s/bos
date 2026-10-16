@@ -78,12 +78,6 @@ impl ResilienceConfig {
         self.circuit_breaker = config;
         self
     }
-
-    /// Builder-style method to set rate limiter config.
-    pub fn with_rate_limiter(mut self, config: RateLimiterConfig) -> Self {
-        self.rate_limiter = config;
-        self
-    }
 }
 
 /// Circuit breaker states.

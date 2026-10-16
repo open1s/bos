@@ -47,16 +47,6 @@ impl QserdeError {
     pub fn backend(msg: impl Into<String>) -> Self {
         Self::Backend(msg.into())
     }
-
-    /// Whether this is a serialize error.
-    pub fn is_serialize_error(&self) -> bool {
-        matches!(self, QserdeError::Serialize(_))
-    }
-
-    /// Whether this is a deserialize error.
-    pub fn is_deserialize_error(&self) -> bool {
-        matches!(self, QserdeError::Deserialize(_))
-    }
 }
 
 /// Result type using QserdeError

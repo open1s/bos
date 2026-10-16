@@ -1219,3 +1219,28 @@ fn test_agent_config_fallbacks_default_empty_and_setter() {
     assert_eq!(config.fallbacks[0].model, "local/backup");
     assert_eq!(config.fallbacks[0].base_url, "http://127.0.0.1:1/v1");
 }
+
+#[test]
+fn build_vendor_routes_the_anthropic_prefix_to_the_messages_vendor() {
+    let config = AgentConfig {
+        name: "anthropic-agent".to_string(),
+        model: "anthropic/claude-3-5-sonnet-latest".to_string(),
+        ..Default::default()
+    };
+    let (name, vendor) = super::llm::build_vendor(&config);
+    assert_eq!(name, "anthropic");
+    assert_eq!(vendor.provider_name(), "anthropic");
+    assert!(vendor.supports_tools());
+}
+
+#[test]
+fn build_vendor_keeps_openai_as_the_unprefixed_default() {
+    let config = AgentConfig {
+        name: "plain-agent".to_string(),
+        model: "gpt-4".to_string(),
+        ..Default::default()
+    };
+    let (name, vendor) = super::llm::build_vendor(&config);
+    assert_eq!(name, "openai");
+    assert_eq!(vendor.provider_name(), "openai");
+}

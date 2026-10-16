@@ -16,13 +16,6 @@ pub enum HookDecision {
     Error(String),
 }
 
-impl HookDecision {
-    /// Whether this decision allows execution to continue.
-    pub fn is_continue(&self) -> bool {
-        matches!(self, HookDecision::Continue)
-    }
-}
-
 /// Hooks invoked around each step of the ReAct loop.
 pub trait ReActApp: Send + Sync {
     /// Conversation state type used by the app.

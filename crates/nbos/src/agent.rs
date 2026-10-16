@@ -543,6 +543,7 @@ impl From<PyAgentConfig> for AgentConfig {
             max_tokens: value.max_tokens,
             timeout_secs: value.timeout_secs,
             max_steps: value.max_steps,
+            parallel_tool_calls: false,
             api_mode: value.api_mode,
             reasoning_effort: value.reasoning_effort,
             circuit_breaker,

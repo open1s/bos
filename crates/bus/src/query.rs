@@ -36,16 +36,6 @@ impl Query {
         Ok(self)
     }
 
-    /// Create a query client directly from a session and topic
-    pub async fn from_session(
-        topic: impl Into<String>,
-        session: Arc<Session>,
-    ) -> Result<Self, ZenohError> {
-        let mut query = Self::new(topic);
-        query.session = Some(session);
-        Ok(query)
-    }
-
     /// Send a query with string payload
     pub async fn query<Q, R>(&self, payload: &Q) -> Result<R, ZenohError>
     where

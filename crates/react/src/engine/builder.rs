@@ -7,6 +7,7 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             llm: None,
             tools: ToolRegistry::new(),
             max_steps: 10,
+            parallel_tool_calls: false,
             telemetry: Telemetry::new(),
             resilience: None,
             llm_timeout_secs: 120,
@@ -38,21 +39,18 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         self
     }
 
-    /// Wrap and register a synchronous tool.
-    pub fn with_sync_tool(self, t: Box<dyn Tool>) -> Self {
-        self.tools.register_sync(t);
-        self
-    }
-
-    /// Wrap and register an asynchronous tool.
-    pub fn with_async_tool(self, t: Box<dyn AsyncTool>) -> Self {
-        self.tools.register_async(t);
-        self
-    }
-
     /// Set the maximum number of ReAct steps.
     pub fn max_steps(mut self, steps: usize) -> Self {
         self.max_steps = steps;
+        self
+    }
+
+    /// Run one response's tool calls concurrently instead of one at a time.
+    ///
+    /// Off by default: a sequential batch keeps the hook and session order a
+    /// caller may depend on, and a batch of one behaves the same either way.
+    pub fn parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.parallel_tool_calls = parallel;
         self
     }
 
@@ -141,6 +139,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             llm,
             tools,
             max_steps: self.max_steps,
+            parallel_tool_calls: self.parallel_tool_calls,
             telemetry: self.telemetry,
             llm_timeout_secs: self.llm_timeout_secs,
             model: self.model,

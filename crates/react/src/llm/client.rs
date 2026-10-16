@@ -44,4 +44,15 @@ pub trait LlmClient<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext
     fn provider_name(&self) -> &'static str {
         "unknown"
     }
+    /// List the model identifiers the provider offers, when it can.
+    ///
+    /// The default is a refusal, not an empty list, so a caller can tell a
+    /// provider that does not implement GET /models from one that offers
+    /// nothing. Vendors that speak the endpoint override it; a router that
+    /// does not know which of its vendors is meant keeps the default.
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        Err(LlmError::Other(
+            "this vendor does not implement GET /models".to_string(),
+        ))
+    }
 }

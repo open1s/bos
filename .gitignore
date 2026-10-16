@@ -70,6 +70,7 @@ __pycache__/
 *.tmp
 *.temp
 .tmp-gui-home/
+.tmp-ref/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -107,3 +108,6 @@ $RECYCLE.BIN/
 # Git worktrees
 .worktrees/
 .opencode
+
+# Generated: the shipped reference bundle corpus (regenerate with the extract-asar.py recipe)
+docs/ui-mirror/reference/pkgs/

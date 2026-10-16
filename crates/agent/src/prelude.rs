@@ -18,7 +18,7 @@ pub use crate::metrics::{CallMetrics, MetricsCollector};
 pub use crate::security::{SecurityError, WorkspaceValidator};
 pub use crate::session::manager::SessionError;
 pub use crate::session::{SessionConfig, SessionManager, SessionSummary};
-pub use crate::skills::{SkillContent, SkillError, SkillInjector, SkillLoader, SkillMetadata};
+pub use crate::skills::{SkillContent, SkillError, SkillLoader, SkillMetadata};
 pub use crate::tools::bash::BashExecutionResult;
 pub use crate::tools::{AsyncFunctionTool, AsyncTool, BashTool, Tool, ToolRegistry};
 pub use react::llm::vendor::OpenAiVendor;

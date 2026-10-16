@@ -5,14 +5,12 @@
 //! Also supports publishing events to the bus for external notification.
 
 use async_trait::async_trait;
-use bus::Publisher;
 use futures::FutureExt;
 use react::runtime::ReActApp;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::agent::context::{AgentReactContext, AgentSession};
@@ -148,8 +146,6 @@ type HookMap = HashMap<HookEvent, Vec<Arc<dyn AgentHook>>>;
 #[derive(Default, Clone)]
 pub struct HookRegistry {
     hooks: Arc<Mutex<HookMap>>,
-    bus_enabled: Arc<AtomicBool>,
-    bus_publishers: Arc<Mutex<HashMap<HookEvent, Publisher>>>,
 }
 
 impl HookRegistry {
@@ -170,12 +166,6 @@ impl HookRegistry {
         hooks.get(event).cloned().unwrap_or_default()
     }
 
-    /// Whether any hook is registered for `event`.
-    pub fn has_hooks(&self, event: &HookEvent) -> bool {
-        let hooks = self.hooks.lock().unwrap();
-        hooks.get(event).map(|v| !v.is_empty()).unwrap_or(false)
-    }
-
     /// Blocking alias for [`HookRegistry::register`].
     pub fn register_blocking(&self, event: HookEvent, hook: Arc<dyn AgentHook>) {
         self.register(event, hook);
@@ -184,16 +174,6 @@ impl HookRegistry {
     /// Blocking alias for [`HookRegistry::get_hooks`].
     pub fn get_hooks_blocking(&self, event: &HookEvent) -> Vec<Arc<dyn AgentHook>> {
         self.get_hooks(event)
-    }
-
-    /// Blocking alias for [`HookRegistry::has_hooks`].
-    pub fn has_hooks_blocking(&self, event: &HookEvent) -> bool {
-        self.has_hooks(event)
-    }
-
-    /// Blocking alias for [`HookRegistry::trigger`].
-    pub fn trigger_blocking(&self, event: HookEvent, context: HookContext) -> HookDecision {
-        block_on_future(self.trigger(event, context))
     }
 
     /// Trigger all hooks for an event and aggregate decisions
@@ -244,27 +224,6 @@ impl HookRegistry {
     /// Blocking alias for [`HookRegistry::trigger_all`].
     pub fn trigger_all_blocking(&self, event: HookEvent, context: HookContext) {
         block_on_future(self.trigger_all(event, context))
-    }
-
-    /// Enable bus publishing for this registry
-    pub fn enable_bus(&self, enabled: bool) {
-        self.bus_enabled.store(enabled, Ordering::Release);
-    }
-
-    /// Check if bus is enabled
-    pub fn is_bus_enabled(&self) -> bool {
-        self.bus_enabled.load(Ordering::Acquire)
-    }
-
-    /// Lock-free check of the bus-enabled flag.
-    pub fn is_bus_enabled_fast(&self) -> bool {
-        self.bus_enabled.load(Ordering::Acquire)
-    }
-
-    /// Register a publisher for a specific event type
-    pub fn register_bus_publisher(&self, event: HookEvent, publisher: Publisher) {
-        let mut publishers = self.bus_publishers.lock().unwrap();
-        publishers.insert(event, publisher);
     }
 
     /// Unregister all hooks for an event

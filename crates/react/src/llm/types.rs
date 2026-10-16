@@ -104,16 +104,6 @@ impl Binary {
             }
         }
     }
-
-    /// Consume the binary and return its URL.
-    pub fn into_url(self) -> String {
-        match self.source {
-            BinarySource::Url(url) => url,
-            BinarySource::Base64(b64_content) => {
-                format!("data:{};base64,{}", self.content_type, b64_content)
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -188,11 +178,6 @@ impl Content {
         Content::Parts(vec![ContentPart::Binary {
             binary: Binary::from_url(content_type, url, None),
         }])
-    }
-
-    /// Whether this is plain text.
-    pub fn is_text_only(&self) -> bool {
-        matches!(self, Content::Text(_))
     }
 
     /// The text, if this is plain text.
@@ -459,12 +444,6 @@ impl LlmMessage {
     pub fn user_image(url: impl Into<String>) -> Self {
         Self::User {
             content: Content::image(url),
-        }
-    }
-    /// Create a user message holding base64 audio.
-    pub fn user_audio(data: impl Into<String>, format: &str) -> Self {
-        Self::User {
-            content: Content::audio(data, format),
         }
     }
     /// Create an assistant message.
@@ -784,6 +763,8 @@ pub enum ApiMode {
     Chat,
     /// OpenAI Responses API (`/v1/responses`).
     Responses,
+    /// Anthropic Messages API (`/v1/messages`).
+    Anthropic,
 }
 
 impl ApiMode {
@@ -792,6 +773,7 @@ impl ApiMode {
         match self {
             ApiMode::Chat => "chat",
             ApiMode::Responses => "responses",
+            ApiMode::Anthropic => "anthropic",
         }
     }
 
@@ -799,6 +781,7 @@ impl ApiMode {
     pub fn from_name(s: &str) -> Self {
         match s {
             "responses" => ApiMode::Responses,
+            "anthropic" => ApiMode::Anthropic,
             _ => ApiMode::Chat,
         }
     }
@@ -943,5 +926,19 @@ impl ReactSession for LlmSession {
 
     fn history(&self) -> Option<&[LlmMessage]> {
         Some(&*self.history)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiMode;
+
+    #[test]
+    fn api_mode_round_trips_through_its_wire_name() {
+        for mode in [ApiMode::Chat, ApiMode::Responses, ApiMode::Anthropic] {
+            assert_eq!(ApiMode::from_name(mode.as_str()), mode);
+        }
+        // An unknown name falls back to chat rather than failing.
+        assert_eq!(ApiMode::from_name("nonsense"), ApiMode::Chat);
     }
 }

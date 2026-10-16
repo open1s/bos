@@ -553,12 +553,6 @@ impl MixedExtractorV2 {
 
         Some(typed)
     }
-
-    /// Discard buffered state in both extractors.
-    pub fn reset_typed(&mut self) {
-        self.json.reset();
-        self.xml.reset();
-    }
 }
 
 fn find_tag_end(buf: &[u8], mut i: usize) -> usize {

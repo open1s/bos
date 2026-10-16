@@ -1,0 +1,190 @@
+//! The GPUI Kit shell.
+//!
+//! One view (Shell) owns the state and renders five regions plus overlays;
+//! each region lives in its own module as an impl block on Shell.
+
+mod command_menu;
+pub(crate) mod composer;
+mod fish;
+pub(crate) mod header;
+pub(crate) mod hero;
+pub(crate) mod meter;
+mod session_menu;
+
+pub(crate) mod queue_dock;
+pub(crate) mod settings;
+pub(crate) mod shell;
+#[cfg(test)]
+mod shell_tests;
+pub(crate) mod sidebar;
+pub(crate) mod statusbar;
+pub(crate) mod todo_panel;
+pub(crate) mod transcript;
+
+use gpui_kit::*;
+
+/// Conditional builders, missing from this GPUI revision.
+///
+/// GPUI 0.3.x removed Div::when; the shell uses it on nearly every row, so it
+/// is reintroduced here for both the plain and the stateful builder.
+pub(crate) trait DivExt: Sized {
+    /// Apply the builder only when the condition holds.
+    fn when(self, condition: bool, f: impl FnOnce(Self) -> Self) -> Self {
+        if condition {
+            f(self)
+        } else {
+            self
+        }
+    }
+
+    /// Apply the builder with a value that may be absent.
+    fn when_some<T>(self, value: Option<T>, f: impl FnOnce(Self, T) -> Self) -> Self {
+        match value {
+            Some(value) => f(self, value),
+            None => self,
+        }
+    }
+}
+
+impl DivExt for Div {}
+impl<E> DivExt for Stateful<E> {}
+
+/// A styled text leaf.
+pub(crate) fn txt(text: impl Into<SharedString>, size: f32, color: u32) -> Div {
+    div()
+        .text_size(px(size))
+        .text_color(rgb(color))
+        .child(text.into())
+}
+
+/// A styled glyph leaf, for the few marks that are text rather than icons.
+pub(crate) fn glyph(text: &'static str, size: f32, color: u32) -> Div {
+    div().text_size(px(size)).text_color(rgb(color)).child(text)
+}
+
+/// The bundled Lucide icon names.
+///
+/// This is the asset crate's full catalog; the component crate's enum of the
+/// same name is only the subset its own widgets use.
+pub(crate) use gpui_kit::assets::IconName;
+
+/// A line icon sized and coloured like the text around it.
+///
+/// The renderer takes its size and colour from the inherited text style, so
+/// the returned row only has to set them.
+pub(crate) fn icon(name: IconName, size: f32, color: u32) -> Div {
+    div().text_size(px(size)).text_color(rgb(color)).child(name)
+}
+
+/// The reference draws its hairlines at `.5px`, which the kit's whole-pixel
+/// border macros cannot express, so the measured width goes straight into the
+/// refinement. The kit's border macros are whole-pixel only.
+pub(crate) fn hairline_bottom<E: Styled>(mut element: E) -> E {
+    element.style().border_widths.bottom = Some(px(0.5).into());
+    element
+}
+
+/// A `.5px` border on every side; see [`hairline_bottom`].
+pub(crate) fn hairline_all<E: Styled>(mut element: E) -> E {
+    let width = Some(px(0.5).into());
+    let style = element.style();
+    style.border_widths.top = width;
+    style.border_widths.right = width;
+    style.border_widths.bottom = width;
+    style.border_widths.left = width;
+    element
+}
+
+/// A `.5px` border on the left only; see [`hairline_bottom`].
+pub(crate) fn hairline_left<E: Styled>(mut element: E) -> E {
+    element.style().border_widths.left = Some(px(0.5).into());
+    element
+}
+
+/// A `.5px` border on the top only; see [`hairline_bottom`].
+///
+/// The queue dock rules its rows apart with an inset top shadow, which GPUI has
+/// no equivalent for, so the measured `.5px` goes on the row's own top edge.
+pub(crate) fn hairline_top<E: Styled>(mut element: E) -> E {
+    element.style().border_widths.top = Some(px(0.5).into());
+    element
+}
+
+/// A `.5px` border on every side but the bottom; see [`hairline_bottom`].
+///
+/// The queue dock's ring is `border-bottom: none`: its bottom edge tucks under
+/// the composer card, which is what keeps the panel's bottom corners square.
+pub(crate) fn hairline_no_bottom<E: Styled>(mut element: E) -> E {
+    let width = Some(px(0.5).into());
+    let style = element.style();
+    style.border_widths.top = width;
+    style.border_widths.right = width;
+    style.border_widths.left = width;
+    element
+}
+
+/// What the command line asked the window to do.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Startup {
+    /// Open the settings dialog as the window appears, on this rail index.
+    pub(crate) settings: Option<usize>,
+}
+
+impl Startup {
+    /// Read the flags. Unknown flags are ignored here; `--help` is answered
+    /// by the binary before the window is built.
+    pub(crate) fn from_args() -> Self {
+        let settings = std::env::args().skip(1).find_map(|arg| {
+            let value = arg.strip_prefix("--settings")?;
+            let id = value.strip_prefix('=').unwrap_or("account");
+            Some(settings::section_index(id).unwrap_or(0))
+        });
+        Self { settings }
+    }
+}
+
+/// Open the window and run the application.
+pub(crate) fn run(startup: Startup) {
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        // QuitMode::Default resolves to Explicit on macOS (gpui-pre app.rs:
+        // the window-close path only quits when `cfg!(not(target_os =
+        // "macos"))`), so closing the last window left the process running -
+        // no window, but a live menu bar and Dock tile. bsh is a
+        // single-window app: closing the window must exit it.
+        .with_quit_mode(QuitMode::LastWindowClosed)
+        .run(move |cx| {
+            // Before init: the platform has created the shared application by
+            // now (see assets::install_dock_icon for the ordering), and the
+            // Dock tile should be ours from the first frame.
+            crate::assets::install_dock_icon();
+            // Launched from a shell the process is not the frontmost app, so its
+            // window can sit fully occluded behind another one; asking to activate is
+            // what a bundled launch does for us, and a photograph of the window needs
+            // it on screen (CG reports only unoccluded windows).
+            cx.activate(true);
+            gpui_kit::init(cx);
+            gpui_kit::open_window(
+                WindowOptions {
+                    // The reference is a frameless window: its content starts at y=0 and
+                    // the traffic lights sit inside the sidebar own top strip.
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(160.0), px(160.0)),
+                        size(px(1280.0), px(820.0)),
+                    ))),
+                    // The reference shows its traffic lights inside the sidebar own top
+                    // strip, so the title bar is transparent and the lights are placed
+                    // where the reference measures them.
+                    titlebar: Some(TitlebarOptions {
+                        title: None,
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(14.0), px(18.0))),
+                    }),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| shell::Shell::new(window, startup.settings, cx)),
+            )
+            .expect("bsh opens its window");
+        });
+}

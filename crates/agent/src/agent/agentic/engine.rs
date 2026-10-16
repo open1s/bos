@@ -64,6 +64,7 @@ impl Agent {
             .resilience(self.resilience.clone())
             .llm_timeout(self.config.timeout_secs)
             .max_steps(self.config.max_steps)
+            .parallel_tool_calls(self.config.parallel_tool_calls)
             .model(self.config.model.clone())
             .app(app);
 

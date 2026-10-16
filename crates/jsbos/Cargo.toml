@@ -25,7 +25,6 @@ napi = { version = "3", features = ["async", "serde-json", "tokio_rt"] }
 napi-derive = "3"
 async-trait = "0.1"
 futures = { workspace = true }
-uuid = { workspace = true }
 
 [build-dependencies]
 napi-build = "2"

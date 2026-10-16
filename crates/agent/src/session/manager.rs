@@ -62,22 +62,6 @@ impl SessionManager {
         })
     }
 
-    /// Set and timestamp the stored message count for a session.
-    pub async fn update_message_count(
-        &self,
-        agent_id: &str,
-        count: usize,
-    ) -> Result<(), SessionError> {
-        let mut cache = self.cache.write().await;
-        if let Some(state) = cache.get_mut(agent_id) {
-            state.message_count = count;
-            state.updated_at = current_timestamp();
-            Ok(())
-        } else {
-            Err(SessionError::NotFound(agent_id.to_string()))
-        }
-    }
-
     /// Remove a session, failing if it does not exist.
     pub async fn delete(&self, agent_id: &str) -> Result<(), SessionError> {
         let mut cache = self.cache.write().await;

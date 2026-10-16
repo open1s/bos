@@ -61,24 +61,6 @@ impl LlmProvider {
         self
     }
 
-    /// Register the DeepSeek vendor when `model` is `deepseek/...`.
-    pub fn with_deepseek(&mut self, model: &str, base_url: &str, api_key: &str) -> &mut Self {
-        if !model.starts_with("deepseek/") {
-            return self;
-        }
-
-        let model = model.strip_prefix("deepseek/").unwrap_or(model);
-        self.register_vendor(
-            "deepseek".into(),
-            Box::new(DeepSeekVendor::new(
-                base_url.to_string(),
-                model.to_string(),
-                api_key.to_string(),
-            )),
-        );
-        self
-    }
-
     /// Register the OpenRouter vendor when `model` is `openrouter/...`.
     pub fn with_openrouter(&mut self, model: &str, base_url: &str, api_key: &str) -> &mut Self {
         if !model.starts_with("openrouter/") {
@@ -104,6 +86,10 @@ impl LlmProvider {
 /// `api_mode` is left untouched: every vendor (including DeepSeek, which
 /// supports both `/responses` and `/chat/completions`) honors the configured
 /// `api_mode` verbatim.
+///
+/// The exception is the `anthropic/` prefix: that vendor speaks the Messages
+/// protocol at `/v1/messages`, which is not one of the OpenAI modes, so it
+/// ignores `api_mode` entirely.
 pub fn build_vendor(
     config: &AgentConfig,
 ) -> (String, Box<dyn LlmClient<AgentSession, AgentReactContext>>) {
@@ -128,6 +114,12 @@ pub fn build_vendor(
             config.api_key.clone(),
         )),
         "openrouter" => Box::new(OpenRouterVendor::new(
+            config.base_url.clone(),
+            model_name,
+            config.api_key.clone(),
+        )),
+        "anthropic" => Box::new(AnthropicVendor::new(
+            std::sync::Arc::new(reqwest::Client::new()),
             config.base_url.clone(),
             model_name,
             config.api_key.clone(),

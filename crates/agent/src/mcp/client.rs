@@ -199,11 +199,6 @@ impl McpClient {
         self.initialized.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Whether the client is initialized and usable.
-    pub fn is_healthy(&self) -> bool {
-        self.is_initialized()
-    }
-
     /// Get detailed health status of the MCP client
     pub fn health_status(&self) -> McpHealthStatus {
         let state = self.state.lock().unwrap().clone();
@@ -257,22 +252,6 @@ impl McpClient {
                 Err(e)
             }
         }
-    }
-
-    /// Record that the connection failed with `error`.
-    pub fn mark_failed(&self, error: impl Into<String>) {
-        let msg = error.into();
-        *self.state.lock().unwrap() = ConnectionState::Failed(msg.clone());
-        *self.last_error.lock().unwrap() = Some(msg);
-    }
-
-    /// Ping the server, returning whether it responded.
-    pub async fn health_check(&self) -> Result<bool, McpError> {
-        if !self.is_initialized() {
-            return Ok(false);
-        }
-        let resp = self.call("ping", None).await?;
-        Ok(resp.error.is_none())
     }
 
     /// List the tools the server exposes.

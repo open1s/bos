@@ -130,12 +130,6 @@ impl McpPolicy {
         self
     }
 
-    /// Append a prebuilt rule.
-    pub fn add_rule(&mut self, rule: McpRule) -> &mut Self {
-        self.rules.push(rule);
-        self
-    }
-
     /// Decide whether `server`/`tool` is allowed.
     ///
     /// A matching deny beats a matching allow; otherwise a matching allow wins;

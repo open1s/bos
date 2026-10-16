@@ -100,25 +100,11 @@ impl MetricsCollector {
         m.llm_errors += 1;
     }
 
-    /// Record one tool invocation and its duration.
-    pub fn record_tool_call(&self, time: Duration) {
-        let mut m = self.inner.lock().unwrap();
-        m.tool_invocation_count += 1;
-        m.total_tool_time += time;
-    }
-
     /// Record several tool invocations and their combined duration.
     pub fn record_tool_calls(&self, count: u64, total_time: Duration) {
         let mut m = self.inner.lock().unwrap();
         m.tool_invocation_count += count;
         m.total_tool_time += total_time;
-    }
-
-    /// Add token counts without recording a call.
-    pub fn record_tokens(&self, input: u64, output: u64) {
-        let mut m = self.inner.lock().unwrap();
-        m.total_input_tokens += input;
-        m.total_output_tokens += output;
     }
 
     /// Copy the current metrics.
