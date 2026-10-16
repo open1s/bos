@@ -858,12 +858,18 @@ impl Shell {
             .items_end()
             .gap(px(36.0))
             .child(entry("tab-chat", "tab.chat", Tab::Chat, cx))
-            .child(entry(
-                "tab-trajectory",
-                "tab.trajectory",
-                Tab::Trajectory,
-                cx,
-            ))
+            // The reference renders the trajectory tab only while its own
+            // `developerTools` preference (Show coding view) is on; measured
+            // in `dsh-client-ui-conversation`, whose header does
+            // `if (!developerTools) return null` for this entry.
+            .when(self.state.settings.developer_tools, |strip| {
+                strip.child(entry(
+                    "tab-trajectory",
+                    "tab.trajectory",
+                    Tab::Trajectory,
+                    cx,
+                ))
+            })
     }
 
     /// A small square icon button in the title row.

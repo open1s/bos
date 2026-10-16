@@ -124,4 +124,81 @@ mod tests {
     fn unknown_keys_pass_through() {
         assert_eq!(tr(Lang::En, "nope.missing"), "nope.missing");
     }
+
+    /// A key that is missing is INVISIBLE to the compiler but visible to the
+    /// user: `tr` returns the key itself, so a namespace slip ships the raw text
+    /// "settings.presetReadOnly" as a button label. That is not a hypothesis -
+    /// the composer chip did exactly that for a round, and the shortcuts row
+    /// asked for `settings.shortcutsDesc` where the key is
+    /// `settings.shortcutsDescription`. Both were caught only by resolving the
+    /// key at runtime, which is what this does for the whole General pane.
+    ///
+    /// The list is the pane's own vocabulary, including the keys built
+    /// dynamically (`appearance_row` picks a cube label by theme mode and the
+    /// permission rows go through `permission_label_key`), which is exactly the
+    /// class the compiler cannot gather. Keep it in step when a row is added.
+    #[test]
+    fn general_pane_keys_resolve_in_both_locales() {
+        for key in [
+            // The pane frame and its own rows.
+            "settings.general",
+            "settings.generalHint",
+            "settings.general.currentVersion",
+            "settings.openConfig",
+            "settings.revealFailed",
+            // Permission, including the three labels the chip builds by mode.
+            "settings.permission",
+            "permission.description",
+            "permission.presetReadOnly",
+            "permission.presetWorkspaceWrite",
+            "permission.presetFullAccess",
+            "permission.confirmTitle",
+            "permission.confirmDescription",
+            "permission.confirmAcknowledge",
+            "permission.confirmCancel",
+            "permission.confirmEnable",
+            // Language and appearance, whose cube labels are chosen by mode.
+            "settings.language",
+            "settings.appearance",
+            "settings.modeLight",
+            "settings.modeDark",
+            "settings.modeSystem",
+            "settings.fontSize",
+            "settings.fontSizeHint",
+            "settings.fontSizeUnit",
+            // Work details.
+            "settings.transcriptTitle",
+            "settings.transcriptDescription",
+            "settings.transcriptCompact",
+            "settings.transcriptStandard",
+            "settings.transcriptDetailed",
+            "settings.transcriptVerbose",
+            // The coding-view switch.
+            "settings.developerToolsTitle",
+            "settings.developerToolsDescription",
+            "settings.developerToolsError",
+            // Shortcuts - the row whose hint was mis-namespaced.
+            "settings.shortcutsTitle",
+            "settings.shortcutsDescription",
+            "settings.shortcutsView",
+            "settings.shortcutsUnbound",
+            // Link opening and the busy-state Enter behavior.
+            "settings.linksTitle",
+            "settings.linksDescription",
+            "settings.linksSidebar",
+            "settings.linksNewTab",
+            "settings.enterTitle",
+            "settings.enterDescription",
+            "settings.enterQueue",
+            "settings.enterSteer",
+            // Performance.
+            "settings.performanceTitle",
+            "settings.performanceDescription",
+            "settings.performanceCompact",
+            "settings.performanceDetailed",
+        ] {
+            assert_ne!(tr(Lang::En, key), key, "{key} missing from en");
+            assert_ne!(tr(Lang::Zh, key), key, "{key} missing from zh");
+        }
+    }
 }

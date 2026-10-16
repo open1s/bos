@@ -50,14 +50,20 @@ struct ModelChipData {
 }
 
 /// Ask for files and mention them in the composer.
-/// The modes the permission chip's menu offers, in menu order.
+/// The permission modes the chip's menu offers, in the reference's own order.
 ///
-/// The chip, the General pane's choice row and the tools all read the one
-/// `bash_enabled` field, so the menu cannot drift from what is in force.
-pub(crate) fn permission_modes() -> [(bool, &'static str); 2] {
+/// The reference's `PRESET_LABEL_KEYS` map is read-only, then
+/// workspace-write, then full access, so the menu draws that order and the
+/// General pane's row reads the same list. The chip and the pane both write
+/// `Settings.permission`, which is the one field `caps::build_agent` obeys.
+pub(crate) fn permission_modes() -> [(&'static str, &'static str); 3] {
     [
-        (true, permission_label_key(true)),
-        (false, permission_label_key(false)),
+        (crate::caps::READ_ONLY, "permission.presetReadOnly"),
+        (
+            crate::caps::WORKSPACE_WRITE,
+            "permission.presetWorkspaceWrite",
+        ),
+        (crate::caps::FULL_ACCESS, "permission.presetFullAccess"),
     ]
 }
 
@@ -94,12 +100,34 @@ fn chip_label(label: impl Into<SharedString>, weight: FontWeight) -> Div {
 }
 
 impl Shell {
-    /// Write the permission mode the composer chip offers. It is the same field
-    /// the General pane's choice row writes, so the chip and that row can never
-    /// disagree about what the tools are allowed to do.
-    pub(crate) fn set_permission(&mut self, write: bool, cx: &mut Context<Self>) {
-        self.state.draft_mut().bash_enabled = write;
+    /// Write the permission mode the composer chip offers.
+    ///
+    /// It is the same field the General pane's choice row writes, so the chip
+    /// and that row can never disagree about what the tools are allowed to do.
+    /// Full access goes through the reference's own gate rather than landing
+    /// here: `request_permission` is the one entry point both controls call,
+    /// and it is what keeps the confirmation from being a pane-only ritual.
+    pub(crate) fn set_permission(&mut self, permission: &str, cx: &mut Context<Self>) {
+        self.state.draft_mut().permission = permission.to_string();
         cx.notify();
+    }
+
+    /// Select a permission mode, opening the risk gate when the mode needs one.
+    ///
+    /// The reference's `choose` returns early on the current value and routes
+    /// `danger-full-access` to `RiskConfirmation` instead of writing it, so
+    /// the gate cannot be skipped by choosing it from a different control.
+    pub(crate) fn request_permission(&mut self, permission: &str, cx: &mut Context<Self>) {
+        if self.state.draft().permission == permission {
+            return;
+        }
+        if permission == crate::caps::FULL_ACCESS {
+            self.permission_acknowledged = false;
+            self.permission_confirm = Some(permission.to_string());
+            cx.notify();
+            return;
+        }
+        self.set_permission(permission, cx);
     }
 }
 
@@ -133,14 +161,15 @@ pub(crate) fn model_choices(models: &[String], current: &str) -> Vec<(String, bo
 
 /// The locale key for the permission mode the tools actually obey.
 ///
-/// The same value the General pane's choice row writes: write grants the shell
-/// and the file tools, read withholds both. The chip must name whichever one is
-/// in force, because it is the only place the mode is visible while typing.
-pub(crate) fn permission_label_key(write: bool) -> &'static str {
-    if write {
-        "composer.workspaceWrite"
-    } else {
-        "settings.permRead"
+/// The same value the General pane's choice row writes, and the reference's own
+/// `PRESET_LABEL_KEYS` fallback for a value it does not know: an unrecognised
+/// mode names the confined one, because that is the mode the build falls back
+/// to and the chip must not claim more access than the tools have.
+pub(crate) fn permission_label_key(permission: &str) -> &'static str {
+    match permission {
+        crate::caps::READ_ONLY => "permission.presetReadOnly",
+        crate::caps::FULL_ACCESS => "permission.presetFullAccess",
+        _ => "permission.presetWorkspaceWrite",
     }
 }
 
@@ -148,7 +177,7 @@ impl Shell {
     /// The composer card under the conversation.
     pub(crate) fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // The chip names the mode the tools obey, not a fixed label.
-        let write = self.state.draft().bash_enabled;
+        let permission = self.state.draft().permission.clone();
         let lang = self.state.lang;
         let streaming = self.state.any_streaming();
         let can_send = !self.composer_value.trim().is_empty();
@@ -212,7 +241,7 @@ impl Shell {
                             super::command_menu::toggle_action,
                             cx,
                         ))
-                        .child(self.permission_chip(write, streaming, lang, cx))
+                        .child(self.permission_chip(permission, streaming, lang, cx))
                         .child(div().flex_1())
                         .child(self.model_chip(
                             ModelChipData {
@@ -416,7 +445,7 @@ impl Shell {
     /// stands in).
     fn permission_chip(
         &self,
-        write: bool,
+        permission: String,
         streaming: bool,
         lang: crate::i18n::Lang,
         cx: &mut Context<Self>,
@@ -431,7 +460,7 @@ impl Shell {
             CHIP_CAP,
         )
         .child(chip_label(
-            lang.tr(permission_label_key(write)),
+            lang.tr(permission_label_key(&permission)),
             FontWeight::MEDIUM,
         ))
         .child(
@@ -448,9 +477,9 @@ impl Shell {
                         let pick = shell.clone();
                         menu = menu.item(
                             PopupMenuItem::new(lang.tr(key))
-                                .checked(value == write)
+                                .checked(value == permission)
                                 .on_click(move |_, _window, cx| {
-                                    pick.update(cx, |this, cx| this.set_permission(value, cx));
+                                    pick.update(cx, |this, cx| this.request_permission(value, cx));
                                 }),
                         );
                     }

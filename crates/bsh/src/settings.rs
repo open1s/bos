@@ -298,6 +298,22 @@ pub(crate) struct Settings {
     /// The conversation content size in px (the reference Font size setting).
     #[serde(default = "default_content_font_size")]
     pub(crate) content_font_size: u32,
+    /// How much of a turn the conversation renders: "compact", "standard",
+    /// "detailed" or "verbose" (the reference's Work details row).
+    #[serde(default = "default_transcript_view")]
+    pub(crate) transcript_view: String,
+    /// Where a link in a message opens: "sidebar" or "new-tab".
+    #[serde(default = "default_link_opening")]
+    pub(crate) link_opening: String,
+    /// What Enter does while a turn streams: "queue" or "steer".
+    #[serde(default = "default_composer_enter")]
+    pub(crate) composer_enter: String,
+    /// How much performance and usage detail to show: "compact" or "detailed".
+    #[serde(default = "default_performance_usage")]
+    pub(crate) performance_usage: String,
+    /// Show the coding view: the trajectory tab and the Agent preset switch.
+    #[serde(default = "default_developer_tools")]
+    pub(crate) developer_tools: bool,
     /// The interface language: "en" or "zh".
     #[serde(default = "default_lang")]
     pub(crate) lang: String,
@@ -326,6 +342,10 @@ pub(crate) struct Settings {
     pub(crate) web_tools_enabled: bool,
     /// Require approval before side-effecting tools run.
     pub(crate) require_approval: bool,
+    /// The default permission mode for new sessions, the reference's own
+    /// trinary: "read-only", "workspace-write" or "danger-full-access".
+    #[serde(default = "default_permission")]
+    pub(crate) permission: String,
     /// Where skill folders live.
     pub(crate) skills_dir: String,
     /// Send-side token ceiling; 0 disables compaction.
@@ -403,6 +423,38 @@ fn default_max_steps() -> usize {
     10
 }
 
+/// The reference's own default permission mode for a new session.
+fn default_permission() -> String {
+    "workspace-write".to_string()
+}
+
+/// The desktop shell's measured Work details default, which is `dshDesktop`
+/// in the reference's `TranscriptViewPolicy` rather than the shared
+/// `DEFAULT_TRANSCRIPT_VIEW_MODE`.
+fn default_transcript_view() -> String {
+    DEFAULT_TRANSCRIPT_VIEW.to_string()
+}
+
+/// Where a message's links open; the reference's measured default.
+fn default_link_opening() -> String {
+    "sidebar".to_string()
+}
+
+/// What Enter does while a turn streams; the reference's measured default.
+fn default_composer_enter() -> String {
+    "queue".to_string()
+}
+
+/// How much performance and usage detail to show; the reference's default.
+fn default_performance_usage() -> String {
+    "detailed".to_string()
+}
+
+/// The reference's `DeveloperToolsSettingsFields` default, which is on.
+fn default_developer_tools() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -411,6 +463,11 @@ impl Default for Settings {
             content_width: None,
             sidebar_width: None,
             content_font_size: 14,
+            transcript_view: default_transcript_view(),
+            link_opening: default_link_opening(),
+            composer_enter: default_composer_enter(),
+            performance_usage: default_performance_usage(),
+            developer_tools: default_developer_tools(),
             lang: "en".to_string(),
             model: "gpt-4o".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
@@ -424,6 +481,7 @@ impl Default for Settings {
             file_tools_enabled: true,
             web_tools_enabled: true,
             require_approval: true,
+            permission: default_permission(),
             skills_dir: "~/.bos/skills".to_string(),
             context_budget: 32768,
             shell_timeout_secs: 300,
@@ -447,6 +505,80 @@ impl Default for Settings {
             api_mode: String::new(),
             session_sort: String::new(),
             profiles: Vec::new(),
+        }
+    }
+}
+
+/// How a completed turn's process steps group, from the reference's own
+/// `stepGrouping` vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepGrouping {
+    /// Every step folds under one disclosure.
+    Collapsed,
+    /// A closed turn keeps the history it accumulated while it ran.
+    History,
+    /// Every step stands on its own.
+    None,
+}
+
+/// The reference's `TranscriptViewPolicy`, measured from its
+/// `dsh-client-ui-chat` bundle.
+///
+/// `derivePresentationPolicy` is a pure table lookup, and none of its readers
+/// compares the mode enum, so these four readings are the whole vocabulary:
+/// completed turns fold, the running turn keeps its steps, a settled reasoning
+/// block keeps its preview, and a turn's steps group by one of three rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranscriptPolicy {
+    /// Fold a completed turn's live process away.
+    pub(crate) fold_completed_turns: bool,
+    /// How a completed turn's steps group.
+    pub(crate) step_grouping: StepGrouping,
+    /// Keep the running turn's own steps visible while it streams.
+    pub(crate) live_process_detail: bool,
+    /// Keep a settled reasoning block's one-line preview.
+    pub(crate) settled_reasoning_preview: bool,
+}
+
+/// The mode a client that saves nothing starts on.
+///
+/// The bundle's own `DEFAULT_TRANSCRIPT_VIEW_MODE` is `detailed`, but that is
+/// the non-Desktop-Web default; the desktop shell ships `standard`, so the
+/// desktop reading is the one this shell uses.
+pub(crate) const DEFAULT_TRANSCRIPT_VIEW: &str = "standard";
+
+impl TranscriptPolicy {
+    /// The policy a stored mode resolves to, legacy spellings included.
+    ///
+    /// `normal` and `expanded` are a two-mode generation's saved values: the
+    /// reference reads both as `detailed`, never offers them and never writes
+    /// them back. An unknown mode falls back to the desktop default.
+    pub(crate) fn resolve(mode: &str) -> Self {
+        match mode {
+            "compact" => Self {
+                fold_completed_turns: true,
+                step_grouping: StepGrouping::Collapsed,
+                live_process_detail: false,
+                settled_reasoning_preview: false,
+            },
+            "detailed" | "normal" | "expanded" => Self {
+                fold_completed_turns: true,
+                step_grouping: StepGrouping::History,
+                live_process_detail: true,
+                settled_reasoning_preview: true,
+            },
+            "verbose" => Self {
+                fold_completed_turns: false,
+                step_grouping: StepGrouping::None,
+                live_process_detail: false,
+                settled_reasoning_preview: true,
+            },
+            _ => Self {
+                fold_completed_turns: true,
+                step_grouping: StepGrouping::Collapsed,
+                live_process_detail: true,
+                settled_reasoning_preview: true,
+            },
         }
     }
 }
@@ -482,6 +614,8 @@ pub(crate) struct Effective {
     pub(crate) bash_enabled: bool,
     /// Register the filesystem tools.
     pub(crate) file_tools_enabled: bool,
+    /// The default permission mode for new sessions.
+    pub(crate) permission: String,
     /// Skills directory.
     pub(crate) skills_dir: String,
     /// Send-side token ceiling.
@@ -492,6 +626,10 @@ pub(crate) struct Effective {
     pub(crate) tool_output_cap: usize,
     /// Attach memory.
     pub(crate) memory_enabled: bool,
+    /// How much of a turn the conversation renders.
+    pub(crate) transcript_view: TranscriptPolicy,
+    /// How much performance and usage detail to show.
+    pub(crate) performance_usage: String,
     /// Tool names switched off.
     pub(crate) disabled_tools: Vec<String>,
     /// Skill names switched off.
@@ -883,11 +1021,14 @@ impl Settings {
             api_mode: self.api_mode.clone(),
             bash_enabled: self.bash_enabled,
             file_tools_enabled: self.file_tools_enabled,
+            permission: self.permission.clone(),
             skills_dir: self.skills_dir.clone(),
             context_budget: self.context_budget,
             shell_timeout_secs: self.shell_timeout_secs,
             tool_output_cap: self.tool_output_cap,
             memory_enabled: self.memory_enabled,
+            transcript_view: TranscriptPolicy::resolve(&self.transcript_view),
+            performance_usage: self.performance_usage.clone(),
             disabled_tools: self.disabled_tools.clone(),
             disabled_skills: self.disabled_skills.clone(),
         };
@@ -1378,6 +1519,53 @@ mod tests {
             Err(super::ScheduleRefusal::Prompt)
         );
         assert!(settings.schedules.is_empty(), "a refused task is not kept");
+    }
+
+    #[test]
+    fn the_work_details_modes_are_the_references_own_table() {
+        use super::{StepGrouping, TranscriptPolicy};
+        let compact = TranscriptPolicy::resolve("compact");
+        assert!(compact.fold_completed_turns);
+        assert_eq!(compact.step_grouping, StepGrouping::Collapsed);
+        assert!(!compact.live_process_detail);
+        assert!(!compact.settled_reasoning_preview);
+
+        let standard = TranscriptPolicy::resolve("standard");
+        assert!(standard.fold_completed_turns);
+        assert_eq!(standard.step_grouping, StepGrouping::Collapsed);
+        assert!(standard.live_process_detail);
+        assert!(standard.settled_reasoning_preview);
+
+        let detailed = TranscriptPolicy::resolve("detailed");
+        assert!(detailed.fold_completed_turns);
+        assert_eq!(detailed.step_grouping, StepGrouping::History);
+        assert!(detailed.live_process_detail);
+        assert!(detailed.settled_reasoning_preview);
+
+        let verbose = TranscriptPolicy::resolve("verbose");
+        assert!(!verbose.fold_completed_turns);
+        assert_eq!(verbose.step_grouping, StepGrouping::None);
+        assert!(!verbose.live_process_detail);
+        assert!(verbose.settled_reasoning_preview);
+    }
+
+    #[test]
+    fn a_legacy_work_details_value_reads_as_detailed() {
+        let detailed = super::TranscriptPolicy::resolve("detailed");
+        for legacy in ["normal", "expanded"] {
+            assert_eq!(
+                super::TranscriptPolicy::resolve(legacy),
+                detailed,
+                "{legacy} is a saved value of the two-mode generation"
+            );
+        }
+        assert_eq!(
+            super::TranscriptPolicy::resolve("standard"),
+            super::TranscriptPolicy::resolve("not-a-mode"),
+            "an unknown mode falls back to the desktop default"
+        );
+        assert_eq!(super::DEFAULT_TRANSCRIPT_VIEW, "standard");
+        assert_eq!(super::default_transcript_view(), "standard");
     }
 
     #[test]

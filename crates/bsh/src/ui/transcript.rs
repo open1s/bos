@@ -2,6 +2,18 @@
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::text::{markdown, TextViewStyle};
+
+/// What a click on a link in a message does.
+///
+/// The reference routes this through its `linkOpening` preference: `new-tab`
+/// hands the URL to the system browser and `sidebar` loads it in the in-app
+/// sidebar browser. This shell has no in-app browser host - `gpui-pre` ships no
+/// webview - so both values land on the external channel, which is the one link
+/// seam `App::open_url` actually offers. Before this the text views carried no
+/// handler at all, so a link was inert.
+fn open_link(url: &SharedString, _event: &ClickEvent, _window: &mut Window, cx: &mut App) {
+    cx.open_url(url);
+}
 use gpui_kit::*;
 use std::sync::Arc;
 
@@ -170,8 +182,26 @@ impl Shell {
                 )
                 .into_any_element(),
         );
+        // `foldCompletedTurns` folds every closed turn but never the one still
+        // streaming, so the last turn stays open while it runs.
+        let folded = self
+            .state
+            .settings
+            .effective()
+            .transcript_view
+            .fold_completed_turns;
+        let live = self
+            .state
+            .active_id
+            .as_deref()
+            .is_some_and(|id| self.state.is_streaming(id));
+        let last = session.messages.len().saturating_sub(1);
         for (index, message) in session.messages.iter().enumerate() {
-            rows.push(self.message_row(index, message, cx).into_any_element());
+            let settled = folded && !(live && index == last);
+            rows.push(
+                self.message_row(index, message, settled, cx)
+                    .into_any_element(),
+            );
         }
         // The reference puts a turn-jump rail down the transcript's right edge.
         // The scroll handle records each child's painted bounds, so a tick can jump
@@ -488,7 +518,7 @@ impl Shell {
         for (index, message) in session.messages.iter().enumerate() {
             for (tool_index, tool) in message.tools.iter().enumerate() {
                 rows.push(
-                    self.tool_row(index, tool_index, tool, cx)
+                    self.tool_row(index, tool_index, tool, false, cx)
                         .into_any_element(),
                 );
             }
@@ -511,10 +541,14 @@ impl Shell {
     }
 
     /// One message.
+    /// `folded` is the policy a completed turn folds under: the reference's
+    /// `foldCompletedTurns` reading, which suppresses a settled turn's live
+    /// process while leaving the running turn's rows alone.
     fn message_row(
         &self,
         index: usize,
         message: &ChatMessage,
+        folded: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if message.role == Role::User {
@@ -548,10 +582,10 @@ impl Shell {
         let mut column = div().w_full().flex().flex_col().gap(px(8.0));
 
         if !message.reasoning.is_empty() {
-            column = column.child(self.think_row(index, message, cx));
+            column = column.child(self.think_row(index, message, folded, cx));
         }
 
-        if message.text.is_empty() && message.error.is_none() {
+        if message.text.is_empty() && message.error.is_none() && !folded {
             column = column.child(
                 div()
                     .flex()
@@ -573,6 +607,7 @@ impl Shell {
         } else {
             column = column.child(
                 markdown(message.text.clone())
+                    .on_link_click(open_link)
                     .style(self.markdown_style())
                     .line_height(px(theme::body_line_at(
                         self.state.settings.content_font_size,
@@ -585,7 +620,7 @@ impl Shell {
         }
 
         for (tool_index, tool) in message.tools.iter().enumerate() {
-            column = column.child(self.tool_row(index, tool_index, tool, cx));
+            column = column.child(self.tool_row(index, tool_index, tool, folded, cx));
         }
 
         if let Some(error) = &message.error {
@@ -619,6 +654,7 @@ impl Shell {
         &self,
         index: usize,
         message: &ChatMessage,
+        folded: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let content = self.state.settings.content_font_size;
@@ -626,7 +662,12 @@ impl Shell {
         let small = theme::small_size_at(content);
         let quiet = theme::faint();
         let hover = theme::muted();
-        let open = self.think_open.contains(&index);
+        // The reference's preview is `!expanded && summary !== "" && (running ||
+        // policy.settledReasoningPreview)`, so a policy without the preview shows
+        // the settled block's title alone rather than a summary it drops.
+        let preview = self.state.settings.effective().transcript_view;
+        let open =
+            self.think_open.contains(&index) || (folded && !preview.settled_reasoning_preview);
         let summary = think_summary(&message.reasoning);
         let group = SharedString::from(format!("think-{index}"));
         let row = div()
@@ -736,6 +777,7 @@ impl Shell {
                     .pl(px(22.0 + theme::delta_at(content)))
                     .child(
                         markdown(message.reasoning.clone())
+                            .on_link_click(open_link)
                             .style(self.markdown_style())
                             .line_height(px(theme::summary_line_at(content)))
                             .text_size(px(small))
@@ -832,13 +874,19 @@ impl Shell {
                     })),
             )
             .child(div().flex_1())
-            .when(usage > 0, |row| {
-                row.child(txt(
-                    format!("{usage} {}", self.state.lang.tr("turn.tokens")),
-                    theme::CHIP_SIZE,
-                    theme::faint(),
-                ))
-            })
+            // Performance & usage: the reference's `Compact` mode keeps the
+            // per-turn usage reading to itself, so the footer's own token figure
+            // is the row the preference governs.
+            .when(
+                usage > 0 && self.state.settings.effective().performance_usage != "compact",
+                |row| {
+                    row.child(txt(
+                        format!("{usage} {}", self.state.lang.tr("turn.tokens")),
+                        theme::CHIP_SIZE,
+                        theme::faint(),
+                    ))
+                },
+            )
     }
 
     /// One collapsible tool row.
@@ -847,9 +895,15 @@ impl Shell {
         message_index: usize,
         tool_index: usize,
         tool: &ToolEvent,
+        folded: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let open = self.state.tool_open(message_index, tool_index);
+        // `liveProcessDetail` keeps the running turn's own steps open; the modes
+        // that drop it (`compact`, `verbose`) fold a completed turn's tool bodies
+        // the same way the reference's `stepGrouping: collapsed` does.
+        let preview = self.state.settings.effective().transcript_view;
+        let open = self.state.tool_open(message_index, tool_index)
+            || (folded && preview.live_process_detail);
         let name = tool.name.clone();
         let args = tool.args.clone();
         let output = tool.output.clone();

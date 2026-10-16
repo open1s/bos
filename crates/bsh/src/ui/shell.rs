@@ -57,6 +57,26 @@ pub(crate) struct Shell {
     pub(crate) task_filter: usize,
     /// The task whose delete control is awaiting confirmation.
     pub(crate) task_delete: Option<String>,
+    /// The permission mode awaiting the full-access risk gate, if any.
+    pub(crate) permission_confirm: Option<String>,
+    /// Whether the risk gate's acknowledgement box is ticked. The gate's own
+    /// confirm stays disabled until it is, like the reference's.
+    pub(crate) permission_acknowledged: bool,
+    /// Set when the Show coding view toggle could not be saved, so the row can
+    /// report the reference's own `developerTools.error` beside it.
+    pub(crate) developer_tools_failed: bool,
+    /// Whether the Keyboard shortcuts disclosure is open. The reference opens a
+    /// shortcut sheet here; this shell has no key bindings to edit, so the row
+    /// stays a disclosure and says what it can honestly report.
+    pub(crate) shortcuts_open: bool,
+    /// Set when the header action could not reach the settings file. The
+    /// reference prints its own inline `openDocument.error` beside the button.
+    pub(crate) config_open_failed: bool,
+    /// Whether the Models pane's add-provider card is open. The reference
+    /// swaps its dashed Add button for the card, so the two never show at once.
+    pub(crate) models_add_open: bool,
+    /// Whether the Models editor's Customized settings fold is open.
+    pub(crate) models_advanced_open: bool,
     /// The transcript scroll position, so the turn rail can jump within it.
     pub(crate) transcript_scroll: ScrollHandle,
     /// The transcript content height as of the last frame. Following the tail
@@ -332,6 +352,13 @@ impl Shell {
             task_every,
             task_filter: 0,
             task_delete: None,
+            permission_confirm: None,
+            permission_acknowledged: false,
+            developer_tools_failed: false,
+            shortcuts_open: false,
+            config_open_failed: false,
+            models_add_open: false,
+            models_advanced_open: false,
             composer_value: String::new(),
             caps: Vec::new(),
             plugins: Vec::new(),
@@ -639,6 +666,12 @@ impl Shell {
         cx.notify();
     }
 
+    /// The one reveal path: the header action and the account pane's button
+    /// both land here, so the inline error and the notice cannot disagree.
+    pub(crate) fn open_config(&mut self, cx: &mut Context<Self>) {
+        super::settings::reveal_config_shared(self, cx);
+    }
+
     /// Send the composer's text, or queue it while the session is running.
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_string();
@@ -649,6 +682,12 @@ impl Shell {
         // Measured: the reference queues a submission while its session is
         // already running instead of opening a second turn over the same
         // transcript, which is what its queue dock lists.
+        // The reference's own EnterBehaviorRow picks the channel: Queue holds
+        // the text for the next turn, which is what the dock lists. Steer has
+        // no backing seam - `Runner` exposes only spawn/stop and
+        // `Agent::stream` takes no mid-turn input - so that mode records the
+        // same submission as an ordinary queue row and the preferences pane
+        // reports the gap rather than claiming a delivery it cannot make.
         if let Some(id) = self.state.active_id.clone() {
             if self.state.is_streaming(&id) {
                 self.state.enqueue(&id, text, attachments);
@@ -1184,6 +1223,21 @@ impl Render for Shell {
             } else {
                 None
             };
+        // The full-access risk gate is reachable from the General pane's row and
+        // from the composer chip, so it is hosted here rather than inside either.
+        let confirm_permission = if self.permission_confirm.is_some() {
+            Some(self.render_permission_confirm(cx))
+        } else {
+            None
+        };
+        // The provider delete confirmation: the card it guards stays in the
+        // list and the reference's own dialog is drawn over the panel.
+        let confirm_provider_delete =
+            if self.state.overlay == Overlay::Settings && self.state.removing_provider.is_some() {
+                Some(self.render_provider_delete(cx))
+            } else {
+                None
+            };
         div()
             .id("shell-frame")
             .flex()
@@ -1211,5 +1265,7 @@ impl Render for Shell {
             })
             .when_some(overlay, |root, overlay| root.child(overlay))
             .when_some(confirm_delete, |root, confirm| root.child(confirm))
+            .when_some(confirm_permission, |root, confirm| root.child(confirm))
+            .when_some(confirm_provider_delete, |root, confirm| root.child(confirm))
     }
 }

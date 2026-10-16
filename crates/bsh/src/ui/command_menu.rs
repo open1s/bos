@@ -200,7 +200,7 @@ fn starts_token(text: &str, index: usize) -> bool {
     text[..index]
         .chars()
         .next_back()
-        .map_or(true, char::is_whitespace)
+        .is_none_or(char::is_whitespace)
 }
 
 /// The reference source's own trigger: the `@` that starts the draft's active
@@ -272,9 +272,8 @@ impl CommandMenu {
     /// `+`-opened card also closes once ordinary text is typed.
     pub(crate) fn sync(&mut self, text: &str) {
         let command = slash_query(text).is_some();
-        let reference = at_query(text).map_or(false, |query| {
-            query.starts_with('"') || !query.contains(char::is_whitespace)
-        });
+        let reference = at_query(text)
+            .is_some_and(|query| query.starts_with('"') || !query.contains(char::is_whitespace));
         let reference_later = match (
             text.rfind('/').filter(|index| starts_token(text, *index)),
             text.rfind('@').filter(|index| starts_token(text, *index)),
@@ -316,9 +315,7 @@ impl Shell {
     /// keeps every row and the first row starts active, as the reference's own
     /// open does.
     pub(crate) fn command_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(trigger) = self.command_menu.trigger else {
-            return None;
-        };
+        let trigger = self.command_menu.trigger?;
         let lang = self.state.lang;
         let rows = self.card_rows(trigger);
         // A filter that shrank under the highlight parks it back on the top.
@@ -481,7 +478,8 @@ impl Shell {
                     .collect()
             }
             Trigger::Reference => {
-                self.reference_rows(&at_query(&self.composer_value).unwrap_or(""))
+                let query = at_query(&self.composer_value).unwrap_or("");
+                self.reference_rows(query)
             }
         }
     }

@@ -1,9 +1,11 @@
 //! Building the chat agent from settings.
 //!
 //! The agent is rebuilt on every turn from the persisted settings, so a
-//! settings change reaches the very next send without an app restart. Read-only
-//! tools are registered directly; the approval gate for side-effecting tools is
-//! the next increment (the setting is honoured by the build inputs it reads).
+//! settings change reaches the very next send without an app restart. How much
+//! the agent may do is the permission mode, and every arm of it lands on a real
+//! seam: Read Only withholds the side-effecting tools from the request, Workspace
+//! Write confines the shell and the file tools to the active workspace, and Full
+//! access releases both.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +16,34 @@ use agent::{Agent, AgentConfig, ToolError};
 
 use crate::plugins::{self, PluginInfo};
 use crate::settings::{Effective, Settings};
+
+/// The permission mode that confines a turn to the active workspace.
+pub(crate) const WORKSPACE_WRITE: &str = "workspace-write";
+
+/// The permission mode that withholds every side-effecting tool.
+pub(crate) const READ_ONLY: &str = "read-only";
+
+/// The permission mode that releases the workspace confinement.
+pub(crate) const FULL_ACCESS: &str = "danger-full-access";
+
+/// Whether a permission mode confines a turn to the active workspace.
+///
+/// Confined is what installs the shell's `WorkspaceValidator` and gives the file
+/// tools their root; the released mode passes `None` to both, and
+/// `BashTool::with_config` then leaves its validator unset, which is the switch
+/// that drops the destructive and elevated-privilege guards.
+pub(crate) fn is_confined(permission: &str) -> bool {
+    permission != FULL_ACCESS
+}
+
+/// Whether a permission mode lets a turn write anything at all.
+///
+/// Read Only withholds the shell and the file writer, so an uncooperative model
+/// cannot reach them: they are absent from the request rather than refused at
+/// call time.
+pub(crate) fn allows_writes(permission: &str) -> bool {
+    permission != READ_ONLY
+}
 
 /// A capability the built agent exposes, for the settings inventory.
 #[derive(Debug, Clone)]
@@ -80,9 +110,26 @@ pub(crate) fn build_agent(settings: &Settings) -> BuiltAgent {
     };
     let mut bundles: Vec<plugins::Bundle> = Vec::new();
 
-    if eff.bash_enabled && !off("bash") {
+    // The permission mode is the reference's own trinary, and each arm lands on
+    // a real seam rather than a label:
+    //
+    // - Read Only withholds the two side-effecting tool families, so the shell
+    //   and every write are absent from the request, not merely refused.
+    // - Workspace Write is the confined build: the shell validator and the file
+    //   tools' root are both installed.
+    // - Full access hands the shell `workspace_root: None`, which is the one
+    //   switch that drops BashTool's destructive and elevated-privilege guards,
+    //   and releases the file tools' escape refusal.
+    let confined = is_confined(&eff.permission);
+    let writes = allows_writes(&eff.permission);
+
+    if eff.bash_enabled && writes && !off("bash") {
         let config = agent::tools::bash::BashToolConfig {
-            workspace_root: root.as_ref().map(|r| r.to_string_lossy().to_string()),
+            workspace_root: if confined {
+                root.as_ref().map(|r| r.to_string_lossy().to_string())
+            } else {
+                None
+            },
             timeout_secs: eff.shell_timeout_secs,
             ..Default::default()
         };
@@ -90,12 +137,13 @@ pub(crate) fn build_agent(settings: &Settings) -> BuiltAgent {
         bundles.push(plugins::Bundle::new("shell", vec![tool]));
     }
     if eff.file_tools_enabled {
+        let files_root = if confined { root.clone() } else { None };
         let mut files: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
         if !off("read_file") {
             files.push(Arc::new(read_file_tool(root.clone())));
         }
-        if !off("write_file") {
-            files.push(Arc::new(write_file_tool(root.clone())));
+        if writes && !off("write_file") {
+            files.push(Arc::new(write_file_tool(files_root.clone())));
         }
         if !off("list_dir") {
             files.push(Arc::new(list_dir_tool(root.clone())));
@@ -345,7 +393,7 @@ fn open_memory(settings: &Settings) -> Option<Arc<dyn MemoryStore>> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_agent;
+    use super::{allows_writes, build_agent, is_confined, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE};
     use crate::settings::Settings;
 
     /// The meter's tools figure is the serialized request array: nonzero for a
@@ -552,6 +600,70 @@ mod tests {
         assert!(
             shell.tools.is_empty(),
             "the registry must hold none of its tools, and caps adds exactly those"
+        );
+    }
+
+    /// Read Only is not a label: the side-effecting tools never reach the
+    /// request, so the registry is smaller than the confined build's and holds
+    /// neither the shell nor the file writer.
+    #[test]
+    fn read_only_withholds_the_side_effecting_tools() {
+        let confined = Settings {
+            skills_dir: String::new(),
+            memory_enabled: false,
+            ..Settings::default()
+        };
+        let read_only = Settings {
+            permission: READ_ONLY.to_string(),
+            ..confined.clone()
+        };
+
+        let names = |settings: &Settings| {
+            let built = build_agent(settings);
+            let mut names: Vec<String> = built
+                .plugins
+                .iter()
+                .flat_map(|plugin| plugin.tools.clone())
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            names(&confined),
+            vec![
+                "bash".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+                "update_plan".to_string(),
+                "write_file".to_string(),
+            ]
+        );
+        assert_eq!(
+            names(&read_only),
+            vec![
+                "list_dir".to_string(),
+                "read_file".to_string(),
+                "update_plan".to_string(),
+            ],
+            "Read Only must drop the shell and the writer, and keep the readers"
+        );
+    }
+
+    /// Full access is the mode that releases the confinement, and the shell's
+    /// own config is where it lands: `workspace_root: None` is what leaves
+    /// `BashTool`'s validator unset and drops its two guards.
+    #[test]
+    fn full_access_releases_the_workspace_confinement() {
+        assert!(is_confined(WORKSPACE_WRITE));
+        assert!(is_confined("something-unknown"));
+        assert!(!is_confined(FULL_ACCESS));
+        assert!(allows_writes(WORKSPACE_WRITE));
+        assert!(allows_writes(FULL_ACCESS));
+        assert!(!allows_writes(READ_ONLY));
+        assert!(
+            allows_writes("something-unknown"),
+            "only Read Only withholds the writers"
         );
     }
 

@@ -5,18 +5,21 @@
 //! Cancel/Save pair at the foot. Everything edits a draft, so nothing reaches
 //! the agent until Save; Cancel drops the draft.
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputContentType, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::shell::Shell;
 use super::{hairline_all, hairline_bottom, icon, txt, DivExt, IconName};
-use crate::i18n::{tr, Lang};
+use crate::i18n::{tr, tr_args, Lang};
 use crate::settings::Settings;
 use crate::theme;
 
 /// The rail, in display order; the index is the section number narrowest the
 /// state stores. Public within the crate so the command line can deep-link.
-pub(crate) const SECTIONS: [&str; 15] = [
+pub(crate) const SECTIONS: [&str; 14] = [
     "settings.account",
     "settings.general",
     "settings.models",
@@ -26,7 +29,6 @@ pub(crate) const SECTIONS: [&str; 15] = [
     "settings.agent-loop",
     "settings.mcp",
     "settings.archived-sessions",
-    "settings.presentation",
     "settings.workspaces",
     "settings.context",
     "settings.agent-presets",
@@ -47,14 +49,13 @@ pub(crate) const NAV: [&str; 5] = ["account", "general", "models", "plugins", "a
 /// the inventory tab first (`settings.plugins.tab`, order 10), then the plugin
 /// packages' cards (Shell 10, Agent loop 20), then the panes DSH reaches from
 /// its sidebar rather than from a settings cell.
-pub(crate) const VIEWS: [&str; 10] = [
+pub(crate) const VIEWS: [&str; 9] = [
     "plugin-inventory",
     "shell",
     "agent-loop",
     "tools",
     "mcp",
     "archived-sessions",
-    "presentation",
     "workspaces",
     "context",
     "automation",
@@ -256,12 +257,49 @@ fn font_size_action(shell: &mut Shell, delta: i32, cx: &mut Context<Shell>) {
     cx.notify();
 }
 
-/// Grant or withhold the shell and write tools.
+/// The reference's own label for a permission preset.
+///
+/// Routed through the composer chip's single namer so the pane and the chip
+/// cannot drift apart.
+fn preset_label(lang: Lang, permission: &str) -> String {
+    tr(lang, super::composer::permission_label_key(permission))
+}
+
+/// Choose the default permission mode for new sessions.
+///
+/// The reference's trinary, measured verbatim in
+/// `dsh-client-ui-permission-presets`: `read-only`, `workspace-write` and
+/// `danger-full-access`. Full access goes through `request_permission` rather
+/// than landing here, so the risk gate cannot be skipped from the pane either.
 fn permission_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
-    let write = key == "write";
+    shell.request_permission(key, cx);
+}
+
+/// Write one of the General pane's string preferences.
+fn preference_action(
+    shell: &mut Shell,
+    field: fn(&mut crate::settings::Settings) -> &mut String,
+    value: &str,
+    cx: &mut Context<Shell>,
+) {
     let draft = shell.state.draft_mut();
-    draft.bash_enabled = write;
-    draft.file_tools_enabled = write;
+    if field(draft) == value {
+        return;
+    }
+    *field(draft) = value.to_string();
+    cx.notify();
+}
+
+/// Show or hide the coding view, and save it at once.
+///
+/// Measured: `DeveloperToolsRow` writes through the controller rather than into a
+/// draft, and reports `developerTools.error` inline when the write fails, so a
+/// refusal is visible on the row instead of looking like it worked.
+fn developer_tools_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
+    shell.state.draft_mut().developer_tools = on;
+    if shell.state.settings.save().is_err() {
+        shell.developer_tools_failed = true;
+    }
     cx.notify();
 }
 
@@ -277,21 +315,56 @@ fn api_mode_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
 }
 
 /// Attach or detach the memory store.
-fn memory_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
-    shell.state.draft_mut().memory_enabled = key == "on";
+fn memory_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
+    shell.state.draft_mut().memory_enabled = on;
     cx.notify();
 }
 
-/// Reveal the settings file in the platform's file browser.
-fn open_config_action(shell: &mut Shell, cx: &mut Context<Shell>) {
+/// How much of a tool call the transcript shows.
+///
+/// The reference's own modes, measured from its `TranscriptViewPolicy`
+/// (`compact | standard | detailed | verbose`, with `normal` and `expanded`
+/// kept as legacy spellings) and applied by `derivePresentationPolicy`, which
+/// decides completed-turn folding, step grouping, whether a live process step is
+/// shown and whether a settled reasoning block keeps its preview.
+fn transcript_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
+    preference_action(shell, |settings| &mut settings.transcript_view, key, cx);
+}
+
+/// Where a link in the transcript opens.
+fn link_opening_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
+    preference_action(shell, |settings| &mut settings.link_opening, key, cx);
+}
+
+/// What Enter does while a turn streams.
+fn composer_enter_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
+    preference_action(shell, |settings| &mut settings.composer_enter, key, cx);
+}
+
+/// How much performance and usage detail the footer shows.
+fn performance_usage_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
+    preference_action(shell, |settings| &mut settings.performance_usage, key, cx);
+}
+
+/// The one reveal path the account pane's button and the header action share.
+///
+/// The failure is recorded on the shell as well as shown as a notice, because
+/// the header action prints the reference's own inline error beside the button.
+pub(crate) fn reveal_config_shared(shell: &mut Shell, cx: &mut Context<Shell>) {
     let lang = shell.state.lang;
     match crate::settings::reveal_config() {
-        Ok(()) => shell
-            .state
-            .notice(tr(lang, "settings.openedConfig").to_string()),
-        Err(error) => shell
-            .state
-            .notice(format!("{} {error}", tr(lang, "settings.revealFailed"))),
+        Ok(()) => {
+            shell.config_open_failed = false;
+            shell
+                .state
+                .notice(tr(lang, "settings.openedConfig").to_string());
+        }
+        Err(error) => {
+            shell.config_open_failed = true;
+            shell
+                .state
+                .notice(format!("{} {error}", tr(lang, "settings.revealFailed")));
+        }
     }
     cx.notify();
 }
@@ -299,22 +372,12 @@ fn open_config_action(shell: &mut Shell, cx: &mut Context<Shell>) {
 /// The editable fields whose shipped default the dialog can restore.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
-    /// The model id.
-    Model,
-    /// The API base URL.
-    BaseUrl,
-    /// The API key.
-    ApiKey,
-    /// The system prompt.
-    SystemPrompt,
     /// The shell command timeout.
     ShellTimeout,
     /// The per-stream output cap.
     OutputCap,
     /// The ReAct step ceiling.
     MaxSteps,
-    /// The name a new provider is saved under.
-    ProviderName,
     /// The context budget.
     Budget,
     /// The cap on completion tokens per turn.
@@ -326,14 +389,9 @@ impl Field {
     fn default_text(self) -> String {
         let default = Settings::default();
         match self {
-            Field::Model => default.model,
-            Field::BaseUrl => default.base_url,
-            Field::ApiKey => default.api_key,
-            Field::SystemPrompt => default.system_prompt,
             Field::ShellTimeout => default.shell_timeout_secs.to_string(),
             Field::OutputCap => default.tool_output_cap.to_string(),
             Field::MaxSteps => default.max_steps.to_string(),
-            Field::ProviderName => String::new(),
             Field::Budget => default.context_budget.to_string(),
             Field::MaxTokens => default
                 .max_tokens
@@ -341,6 +399,58 @@ impl Field {
                 .unwrap_or_default(),
         }
     }
+}
+
+/// One button of the permission risk gate.
+///
+/// The reference draws both gate buttons from one component whose two
+/// minimum widths are measured (`.modalAction` is 72 for the cancel, and
+/// `.confirmAction` is 136 for the confirm), so the width travels with the
+/// label and the enablement rather than as three more positional arguments.
+struct GateButton {
+    /// The control id, stable for the click tests.
+    id: &'static str,
+    /// The button's own label, already localized.
+    label: SharedString,
+    /// Whether this is the filled confirm rather than the outline cancel.
+    primary: bool,
+    /// The measured minimum width for this position.
+    min_w: f32,
+    /// Whether the reference's acknowledgement has released the button.
+    enabled: bool,
+    /// The write the press performs.
+    action: fn(&mut Shell, &mut Context<Shell>),
+}
+
+/// One option of a [`SelectRow`]: the value the setting stores and the label
+/// the reference shows for it.
+///
+/// The pair is named because the option list outlives the call that built it -
+/// the kit's menu builder is static, so the list is owned before it is
+/// captured.
+type RowOption = (&'static str, String);
+
+/// Everything one General-pane select row needs: the control's own id and its
+/// two copy keys, the current value, the offered options and the write a pick
+/// performs.
+///
+/// The reference's own PreferenceRow is one component over one prop record, so
+/// the rows are data here too; a positional call with seven arguments was both
+/// hard to read and one over clippy's argument limit.
+struct SelectRow {
+    /// The control id, stable for the click tests.
+    id: &'static str,
+    /// The row's title key.
+    title: &'static str,
+    /// The row's description key, which the reference's LanguageRow alone
+    /// omits.
+    desc: Option<&'static str>,
+    /// The value the setting currently holds.
+    current: String,
+    /// The offered values and their labels, in the reference's own order.
+    options: Vec<RowOption>,
+    /// The write a pick performs.
+    action: fn(&mut Shell, &str, &mut Context<Shell>),
 }
 
 impl Shell {
@@ -420,7 +530,7 @@ impl Shell {
             .child(list);
 
         let (title, hint, content) = match section {
-            0 => self.section_account(cx),
+            0 => self.section_account(),
             1 => self.section_general(cx),
             2 => self.section_models(cx),
             3 => self.section_tools(cx),
@@ -429,11 +539,10 @@ impl Shell {
             6 => self.section_agent_loop(cx),
             7 => self.section_mcp(),
             8 => self.section_archived(cx),
-            9 => self.section_presentation(cx),
-            10 => self.section_workspaces(cx),
-            11 => self.section_context(cx),
-            12 => self.section_agent_presets(cx),
-            13 => self.section_builtin_plugins(cx),
+            9 => self.section_workspaces(cx),
+            10 => self.section_context(cx),
+            11 => self.section_agent_presets(cx),
+            12 => self.section_builtin_plugins(cx),
             _ => self.section_automation(cx),
         };
 
@@ -462,6 +571,7 @@ impl Shell {
                     .flex_1()
                     .min_w_0(),
             )
+            .child(self.document_action(cx))
             .child(
                 div()
                     .id("settings-close")
@@ -574,13 +684,25 @@ impl Shell {
                 .items_center()
                 .gap(px(8.0))
                 .border_color(rgb(theme::border_soft()))
+                // The label keeps its natural width and the control
+                // wraps instead. With the label as the flexible child a wide
+                // control - the four API-protocol chips - squeezed it to zero
+                // width, and the text then wrapped one character per line.
                 .child(
                     txt(tr(self.state.lang, label), 13.0, theme::text())
                         .font_weight(FontWeight::MEDIUM)
-                        .flex_1()
-                        .min_w_0(),
+                        .flex_none(),
                 )
-                .child(control),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .justify_end()
+                        .child(control),
+                ),
         )
         .into_any_element()
     }
@@ -765,60 +887,6 @@ impl Shell {
         .into_any_element()
     }
 
-    /// A segmented choice.
-    fn choice_row(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        current: &str,
-        options: &[(&'static str, &str)],
-        action: fn(&mut Shell, &str, &mut Context<Shell>),
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let mut group = div().flex().flex_row().gap(px(6.0));
-        for (key, text) in options.iter().copied() {
-            let selected = key == current;
-            group = group.child(
-                div()
-                    .id(SharedString::from(format!("{id}-{key}")))
-                    .debug_selector(move || format!("{id}-{key}"))
-                    .px(px(10.0))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(rgb(if selected {
-                        theme::accent()
-                    } else {
-                        theme::border()
-                    }))
-                    .bg(if selected {
-                        rgb(theme::accent())
-                    } else {
-                        rgb(theme::page())
-                    })
-                    .cursor_pointer()
-                    .hover(|s| {
-                        s.bg(rgb(if selected {
-                            theme::accent()
-                        } else {
-                            theme::hover()
-                        }))
-                    })
-                    .child(txt(
-                        text,
-                        theme::CHIP_SIZE,
-                        if selected {
-                            theme::page()
-                        } else {
-                            theme::muted()
-                        },
-                    ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| action(this, key, cx))),
-            );
-        }
-        self.settings_control_row(label, group)
-    }
-
     /// An editable text field.
     fn input_row(
         &self,
@@ -828,17 +896,6 @@ impl Shell {
         cx: &mut Context<Shell>,
     ) -> AnyElement {
         self.field_row(label, input, false, field, cx)
-    }
-
-    /// An editable field whose contents are masked on screen.
-    fn secret_row(
-        &self,
-        label: &'static str,
-        input: &Entity<InputState>,
-        field: Field,
-        cx: &mut Context<Shell>,
-    ) -> AnyElement {
-        self.field_row(label, input, true, field, cx)
     }
 
     /// The shared shape of the two: a label over a bordered, borderless-inner
@@ -929,43 +986,8 @@ impl Shell {
         .into_any_element()
     }
 
-    /// A button under the rows, for actions that are not themselves settings.
-    fn action_button(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        action: fn(&mut Shell, &mut Context<Self>),
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .flex()
-            .flex_row()
-            .mt(px(12.0))
-            .child(
-                div()
-                    .id(id)
-                    .px(px(12.0))
-                    .py(px(5.0))
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(rgb(theme::border()))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(txt(
-                        tr(self.state.lang, label),
-                        theme::CHIP_SIZE,
-                        theme::text(),
-                    ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| action(this, cx))),
-            )
-            .into_any_element()
-    }
-
     /// Account: identity, paths and the way to the configuration file.
-    fn section_account(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> (&'static str, &'static str, Vec<AnyElement>) {
+    fn section_account(&self) -> (&'static str, &'static str, Vec<AnyElement>) {
         let draft = self.state.draft();
         let effective = draft.effective();
         let rows = vec![
@@ -986,71 +1008,473 @@ impl Shell {
                 "settings.dataDir",
                 crate::settings::dir().display().to_string(),
             ),
-            self.action_button("open-config", "settings.openConfig", open_config_action, cx),
         ];
         ("settings.account", "settings.accountHint", rows)
     }
 
-    /// General: language, permission and memory.
+    /// The header's Open-configuration-file action, measured from the
+    /// reference's own `SettingsDocumentAction`: an error line beside an
+    /// outline button, and no action at all while the file cannot be reached.
+    fn document_action(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let failed = self.config_open_failed;
+        // The wrapper carries its own selector: the button below owns the
+        // `settings-open-config` id, and two elements answering the same
+        // selector would make the click test ambiguous.
+        let mut action = div()
+            .debug_selector(|| "settings-open-config-action".to_string())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .min_w_0();
+        if failed {
+            action = action.child(
+                div()
+                    .debug_selector(|| "settings-open-config-error".to_string())
+                    .max_w(px(180.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(txt(tr(lang, "settings.revealFailed"), 12.0, theme::error())),
+            );
+        }
+        action
+            .child(
+                div()
+                    .id("settings-open-config")
+                    .debug_selector(|| "settings-open-config".to_string())
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::hover())))
+                    .child(txt(tr(lang, "settings.openConfig"), 13.0, theme::text()))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.open_config(cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The reference's shared settings-row anatomy.
+    ///
+    /// Measured from `PreferenceRow.module.css`: `padding:16px 0` over a .5px
+    /// border-l2 rule, an 8px gap, a text block whose title is 14/22
+    /// label-primary over a 12/18 label-tertiary description and which carries a
+    /// 48px right pad, and whatever control the row owns.
+    fn preference_row(
+        &self,
+        title: &'static str,
+        desc: Option<&'static str>,
+        control: impl IntoElement,
+    ) -> AnyElement {
+        hairline_bottom(
+            div()
+                .py(px(16.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap(px(4.0))
+                        .min_w_0()
+                        .pr(px(48.0))
+                        .child(txt(tr(self.state.lang, title), 14.0, theme::text()))
+                        .children(
+                            desc.map(|key| txt(tr(self.state.lang, key), 12.0, theme::faint())),
+                        ),
+                )
+                .child(control),
+        )
+        .into_any_element()
+    }
+
+    /// The reference's own toggle, measured from `Switch.module.css`: a 36x20
+    /// track at a 999px radius and a 2px pad over a 16px thumb that slides 16px,
+    /// filled with brand-primary while checked and bordered in border-l3 while
+    /// not. gpui-kit ships no Switch, so this is a hand-built `role="switch"`
+    /// equivalent with the reference's own click rule (toggle on press).
+    fn switch(
+        &self,
+        id: &'static str,
+        checked: bool,
+        enabled: bool,
+        action: fn(&mut Shell, bool, &mut Context<Shell>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fill = if checked {
+            theme::accent()
+        } else {
+            theme::border_strong()
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .flex_none()
+            .w(px(36.0))
+            .h(px(20.0))
+            .p(px(2.0))
+            .rounded(px(999.0))
+            .bg(rgb(fill))
+            .when(enabled, |track| track.cursor_pointer())
+            .when(!enabled, |track| track.opacity(0.5))
+            .child(
+                div()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .rounded(px(999.0))
+                    .bg(rgb(theme::page()))
+                    .when(checked, |thumb| thumb.ml(px(16.0))),
+            )
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if enabled {
+                    action(this, !checked, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// The reference's select control, measured from `PreferenceRow.module.css`:
+    /// `height:36px`, `border-radius:radius-md`, `padding:0 14px`, a 12px gap,
+    /// 14/22 label-primary over the module-platform fill, the value then a
+    /// chevron, and the option list anchored to the row's end.
+    fn select_row(&self, row: SelectRow, cx: &mut Context<Self>) -> AnyElement {
+        let SelectRow {
+            id,
+            title,
+            desc,
+            current,
+            options,
+            action,
+        } = row;
+        let current = current.as_str();
+        let options = options.as_slice();
+        let shell = cx.entity();
+        let value = options
+            .iter()
+            .find(|(key, _)| *key == current)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_else(|| current.to_string());
+        // The kit's menu builder is `'static`, so the option list and the
+        // selected key are owned before they are captured.
+        let entries: Vec<(&'static str, String)> = options.to_vec();
+        let selected = current.to_string();
+        let control = Button::new(SharedString::from(id))
+            .ghost()
+            .h(px(36.0))
+            .px(px(14.0))
+            .rounded(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .bg(rgb(theme::selected_row()))
+            .cursor_pointer()
+            .child(txt(value, 14.0, theme::text()))
+            .child(icon(IconName::ChevronDown, 12.0, theme::caption()))
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let mut menu = menu.min_w(px(220.0));
+                for (key, text) in entries.iter() {
+                    let pick = shell.clone();
+                    let key = *key;
+                    menu = menu.item(
+                        PopupMenuItem::new(text.clone())
+                            .checked(*key == selected)
+                            .on_click(move |_, _window, cx| {
+                                pick.update(cx, |this, cx| action(this, key, cx))
+                            }),
+                    );
+                }
+                menu
+            });
+        self.preference_row(title, desc, control)
+    }
+
+    /// The reference's ShortcutsRow control, measured: a 36-tall button on the
+    /// module-platform fill at radius-md with a 90px minimum width, holding the
+    /// `shortcuts.view` label.
+    fn shortcuts_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let control = div()
+            .id("shortcuts-open")
+            .debug_selector(|| String::from("shortcuts-open"))
+            .flex_none()
+            .h(px(36.0))
+            .min_w(px(90.0))
+            .px(px(14.0))
+            .rounded(px(12.0))
+            .bg(rgb(theme::selected_row()))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .child(txt(tr(lang, "settings.shortcutsView"), 14.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.shortcuts_open = !this.shortcuts_open;
+                cx.notify();
+            }));
+        self.preference_row(
+            "settings.shortcutsTitle",
+            Some("settings.shortcutsDescription"),
+            control,
+        )
+    }
+
+    /// The reference's `CurrentVersionRow`: one text node and no control.
+    fn current_version_row(&self) -> AnyElement {
+        hairline_bottom(
+            div()
+                .debug_selector(|| String::from("general-item-current-version"))
+                .py(px(16.0))
+                .flex()
+                .items_center()
+                .border_color(rgb(theme::border_soft()))
+                .child(txt(
+                    tr_args(
+                        self.state.lang,
+                        "settings.general.currentVersion",
+                        &[("version", env!("CARGO_PKG_VERSION").to_string())],
+                    ),
+                    12.0,
+                    theme::faint(),
+                )),
+        )
+        .into_any_element()
+    }
+
+    /// General: the reference's own rows in its own order.
+    ///
+    /// Measured from `dsh-client-ui-settings-general`'s `settings.general.item`
+    /// registrations, sorted by order: permission (-20), language (0), appearance
+    /// (10), font-size (11), transcript-view (12), developer-tools (15),
+    /// shortcuts (16), link-opening (17), composer-enter (20), performance-usage
+    /// (30), current-version (100). `session-log-deepseek` (90) is host-gated in
+    /// the reference and renders nothing there, so it is not drawn here either.
+    /// The one row the reference does NOT carry in General is the free-text
+    /// section note, which its `GeneralSection` omits; the shell-only settings
+    /// moved to the Shell card see `section_shell`.
     fn section_general(
         &mut self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let lang = self.state.lang;
-        let write = self.state.draft().bash_enabled;
-        let memory = self.state.draft().memory_enabled;
-        let on = if memory { "on" } else { "off" };
-        let skills_dir = self.state.draft().skills_dir.clone();
+        let draft = self.state.draft().clone();
+        let permission = draft.permission.clone();
+        let language = if self.state.lang == Lang::Zh {
+            "zh"
+        } else {
+            "en"
+        };
+        let transcript = draft.transcript_view.clone();
+        let links = draft.link_opening.clone();
+        let enter = draft.composer_enter.clone();
+        let performance = draft.performance_usage.clone();
+        let developer_tools = draft.developer_tools;
+        let failed = self.developer_tools_failed;
         let mut rows = vec![
+            self.select_row(
+                SelectRow {
+                    id: "set-perm",
+                    title: "settings.permission",
+                    desc: Some("permission.description"),
+                    current: permission,
+                    options: vec![
+                        (
+                            crate::caps::READ_ONLY,
+                            preset_label(lang, crate::caps::READ_ONLY),
+                        ),
+                        (
+                            crate::caps::WORKSPACE_WRITE,
+                            preset_label(lang, crate::caps::WORKSPACE_WRITE),
+                        ),
+                        (
+                            crate::caps::FULL_ACCESS,
+                            preset_label(lang, crate::caps::FULL_ACCESS),
+                        ),
+                    ],
+                    action: permission_action,
+                },
+                cx,
+            ),
+            self.select_row(
+                SelectRow {
+                    id: "set-lang",
+                    title: "settings.language",
+                    // The one measured row with no description line.
+                    desc: None,
+                    current: language.to_string(),
+                    options: vec![
+                        ("en", String::from("English")),
+                        ("zh", String::from("中文")),
+                    ],
+                    action: language_action,
+                },
+                cx,
+            ),
             self.appearance_row(cx),
             self.font_size_row(cx),
-            self.choice_row(
-                "set-perm",
-                "settings.permission",
-                if write { "write" } else { "read" },
-                &[
-                    ("write", &tr(lang, "settings.permWrite")),
-                    ("read", &tr(lang, "settings.permRead")),
-                ],
-                permission_action,
-                cx,
-            ),
-            self.choice_row(
-                "set-memory",
-                "settings.memoryToggle",
-                on,
-                &[
-                    ("on", &tr(lang, "settings.on")),
-                    ("off", &tr(lang, "settings.off")),
-                ],
-                memory_action,
-                cx,
-            ),
-            self.settings_row("settings.skillsDir", skills_dir),
-            self.settings_row(
-                "settings.approvalOn",
-                if self.state.draft().require_approval {
-                    tr(lang, "settings.on").to_string()
-                } else {
-                    tr(lang, "settings.off").to_string()
+            self.select_row(
+                SelectRow {
+                    id: "set-transcript",
+                    title: "settings.transcriptTitle",
+                    desc: Some("settings.transcriptDescription"),
+                    current: transcript,
+                    options: vec![
+                        ("compact", tr(lang, "settings.transcriptCompact")),
+                        ("standard", tr(lang, "settings.transcriptStandard")),
+                        ("detailed", tr(lang, "settings.transcriptDetailed")),
+                        ("verbose", tr(lang, "settings.transcriptVerbose")),
+                    ],
+                    action: transcript_action,
                 },
+                cx,
             ),
-            self.settings_note("settings.pendingGate", true),
-            self.settings_note("settings.skillsNote", false),
+            self.developer_tools_row(developer_tools, failed, cx),
+            self.shortcuts_row(cx),
+            self.select_row(
+                SelectRow {
+                    id: "set-links",
+                    title: "settings.linksTitle",
+                    desc: Some("settings.linksDescription"),
+                    current: links,
+                    options: vec![
+                        ("sidebar", tr(lang, "settings.linksSidebar")),
+                        ("new-tab", tr(lang, "settings.linksNewTab")),
+                    ],
+                    action: link_opening_action,
+                },
+                cx,
+            ),
+            self.select_row(
+                SelectRow {
+                    id: "set-enter",
+                    title: "settings.enterTitle",
+                    desc: Some("settings.enterDescription"),
+                    current: enter,
+                    options: vec![
+                        ("queue", tr(lang, "settings.enterQueue")),
+                        ("steer", tr(lang, "settings.enterSteer")),
+                    ],
+                    action: composer_enter_action,
+                },
+                cx,
+            ),
+            self.select_row(
+                SelectRow {
+                    id: "set-perf",
+                    title: "settings.performanceTitle",
+                    desc: Some("settings.performanceDescription"),
+                    current: performance,
+                    options: vec![
+                        ("compact", tr(lang, "settings.performanceCompact")),
+                        ("detailed", tr(lang, "settings.performanceDetailed")),
+                    ],
+                    action: performance_usage_action,
+                },
+                cx,
+            ),
+            self.current_version_row(),
         ];
-        rows.push(
-            div()
-                .debug_selector(|| "general-item-current-version".to_string())
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .pt(px(12.0))
-                .child(txt(tr(lang, "settings.about"), 13.0, theme::text()))
-                .children(self.about_rows())
-                .child(self.settings_note("settings.aboutHint", false))
-                .into_any_element(),
-        );
+        if self.shortcuts_open {
+            rows.push(self.shortcuts_disclosure(cx));
+        }
         ("settings.general", "settings.generalHint", rows)
+    }
+
+    /// The Show coding view row: the 24px-gap variant of the shared anatomy,
+    /// whose error line is the reference's own `developerTools.error`.
+    fn developer_tools_row(&self, on: bool, failed: bool, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let mut text = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .gap(px(4.0))
+            .min_w_0()
+            .pr(px(48.0))
+            .child(txt(
+                tr(lang, "settings.developerToolsTitle"),
+                14.0,
+                theme::text(),
+            ))
+            .child(txt(
+                tr(lang, "settings.developerToolsDescription"),
+                12.0,
+                theme::faint(),
+            ));
+        if failed {
+            text = text.child(txt(
+                tr(lang, "settings.developerToolsError"),
+                12.0,
+                theme::error(),
+            ));
+        }
+        hairline_bottom(
+            div()
+                .py(px(16.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(24.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(text)
+                .child(self.switch(
+                    "settings-developer-tools",
+                    on,
+                    true,
+                    developer_tools_action,
+                    cx,
+                )),
+        )
+        .into_any_element()
+    }
+
+    /// What the reference's Keyboard shortcuts row opens, in the only form this
+    /// shell can honour: gpui-kit's keymap holds no bindings here (`bind_keys` is
+    /// never called in this crate), so there is nothing to edit and the row says
+    /// so with the reference's own `shortcuts.unbound` wording rather than
+    /// opening an empty editor.
+    fn shortcuts_disclosure(&self, cx: &Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let keys: Vec<String> = {
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            keymap
+                .bindings()
+                .map(|binding| {
+                    let chord: Vec<String> = binding
+                        .keystrokes()
+                        .iter()
+                        .map(|stroke| stroke.to_string())
+                        .collect();
+                    format!("{}  {}", chord.join(" "), binding.action().name())
+                })
+                .collect()
+        };
+        let mut body = div().flex().flex_col().gap(px(6.0)).pb(px(16.0));
+        if keys.is_empty() {
+            body = body.child(txt(
+                tr(lang, "settings.shortcutsUnbound"),
+                12.0,
+                theme::faint(),
+            ));
+        } else {
+            for line in keys {
+                body = body.child(txt(line, 12.0, theme::muted()));
+            }
+        }
+        body.into_any_element()
     }
 
     /// Models: the endpoint and the system prompt.
@@ -1115,292 +1539,654 @@ impl Shell {
         ("settings.agent-presets", "settings.agentPresetsHint", rows)
     }
 
+    /// The Models pane, in the reference's own three parts.
+    ///
+    /// Measured from `ModelsSection.module.css`: a `rows` list of provider cards
+    /// 8px apart with 12px above it, and one add block below. Each card is a
+    /// `rowCard` whose head is the provider's identity - its name, the `Custom`
+    /// tag for a hand-declared route, and the API-key dot - beside its Edit and
+    /// Delete actions, with the editor opening inside the same card. The add
+    /// block shows its Add button, or the add card while that is open, never both.
     fn section_models(
         &self,
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let inputs = &self.settings_inputs;
-        let draft = self.state.draft();
-        let active = draft.active_provider.clone();
         // Discovered profiles first, then saved ones; only the saved ones are
-        // bsh own rows to remove, because the rest are rewritten from the BOS
+        // bsh's own rows to remove, because the rest are rewritten from the BOS
         // config on every load.
-        let mut listed: Vec<(crate::settings::Profile, bool)> = draft
-            .profiles
-            .iter()
-            .map(|profile| (profile.clone(), false))
-            .collect();
-        listed.extend(
-            draft
-                .providers
+        let listed: Vec<(crate::settings::Profile, bool)> = {
+            let draft = self.state.draft();
+            let mut listed: Vec<(crate::settings::Profile, bool)> = draft
+                .profiles
                 .iter()
-                .map(|profile| (profile.clone(), true)),
-        );
-        let mut rows: Vec<AnyElement> = vec![
-            self.input_row("settings.modelId", &inputs.model, Field::Model, cx),
-            self.input_row("settings.baseUrl", &inputs.base_url, Field::BaseUrl, cx),
-            self.secret_row("settings.apiKey", &inputs.api_key, Field::ApiKey, cx),
-            self.input_row(
-                "settings.systemPrompt",
-                &inputs.system_prompt,
-                Field::SystemPrompt,
-                cx,
-            ),
-            self.choice_row(
-                "set-api-mode",
-                "settings.apiMode",
-                if draft.api_mode.is_empty() {
-                    "auto"
-                } else {
-                    draft.api_mode.as_str()
-                },
-                &[
-                    (
-                        "auto",
-                        &crate::i18n::tr(self.state.lang, "settings.apiAuto"),
-                    ),
-                    (
-                        "chat",
-                        &crate::i18n::tr(self.state.lang, "settings.apiChat"),
-                    ),
-                    (
-                        "responses",
-                        &crate::i18n::tr(self.state.lang, "settings.apiResponses"),
-                    ),
-                    (
-                        "anthropic",
-                        &crate::i18n::tr(self.state.lang, "settings.apiAnthropic"),
-                    ),
-                ],
-                api_mode_action,
-                cx,
-            ),
+                .map(|profile| (profile.clone(), false))
+                .collect();
+            listed.extend(
+                draft
+                    .providers
+                    .iter()
+                    .map(|profile| (profile.clone(), true)),
+            );
+            listed
+        };
+        let mut cards: Vec<AnyElement> = Vec::new();
+        for (index, (profile, removable)) in listed.iter().enumerate() {
+            cards.push(self.provider_card(profile, *removable, index, cx));
+        }
+        let rows: Vec<AnyElement> = vec![
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .mt(px(12.0))
+                .children(cards)
+                .into_any_element(),
+            self.add_provider_block(cx),
         ];
-        for (index, (profile, removable)) in listed.into_iter().enumerate() {
-            let selected = profile.name == active;
+        ("settings.models", "settings.modelsHint", rows)
+    }
+
+    /// One provider card: the measured `rowCard` head, and the editor under it
+    /// while this provider is the one being edited.
+    fn provider_card(
+        &self,
+        profile: &crate::settings::Profile,
+        removable: bool,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let open = self.state.editing_provider.as_deref() == Some(profile.name.as_str());
+
+        // `rowIdentity`: the name, the hand-declared tag, the API-key dot.
+        // bsh keeps "which endpoint the agent is built against" here, behind a
+        // click on the name, because its composer chip picks a MODEL and not a
+        // provider. The reference has no such control on this page - its model
+        // chip owns the choice - so this is the one BSH-only affordance on the
+        // card, and it deliberately adds no chrome of its own.
+        let select_name = profile.name.clone();
+        let mut identity = div()
+            .id(SharedString::from(format!("provider-{index}")))
+            .debug_selector(move || format!("provider-{index}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .min_w_0()
+            .cursor_pointer()
+            .child(txt(profile.name.clone(), 14.0, theme::text()).font_weight(FontWeight::MEDIUM));
+        if removable {
+            identity = identity.child(hairline_all(
+                div()
+                    .flex_none()
+                    .px(px(6.0))
+                    .py(px(1.0))
+                    .rounded(px(3.0))
+                    .border_color(rgb(theme::border()))
+                    .child(txt(tr(lang, "settings.customTag"), 11.0, theme::muted())),
+            ));
+        }
+        // The reference's dot is green only for a credential it confirmed
+        // present, and red only for a named reference it proved missing. bsh
+        // holds the key as a plain string and names no reference, so no state
+        // here could prove one missing and the missing dot is never drawn.
+        if !profile.api_key.trim().is_empty() {
+            identity = identity.child(
+                div()
+                    .debug_selector(move || format!("provider-key-{index}"))
+                    .flex_none()
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded_full()
+                    .bg(rgb(theme::success())),
+            );
+        }
+        identity = identity.on_click(cx.listener(move |this, _event, _window, cx| {
+            this.state.select_provider(&select_name);
+            cx.notify();
+        }));
+
+        // `rowActions`: 4px apart, pushed to the right edge.
+        let mut actions = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .ml_auto();
+        let edit_profile = profile.clone();
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!("provider-edit-{index}")))
+                .debug_selector(move || format!("provider-edit-{index}"))
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(28.0))
+                .px(px(10.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::hover())))
+                .child(txt(tr(lang, "settings.editProvider"), 12.0, theme::text()))
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    if this.state.editing_provider.as_deref() == Some(edit_profile.name.as_str()) {
+                        this.state.editing_provider = None;
+                        this.state.provider_refusal = None;
+                    } else {
+                        this.models_add_open = false;
+                        this.models_advanced_open = false;
+                        load_provider_into_form(this, &edit_profile, window, cx);
+                    }
+                    cx.notify();
+                })),
+        );
+        if removable {
             let name = profile.name.clone();
-            let endpoint = format!("{}  {}", profile.model, profile.base_url);
-            let mut row = div()
-                .py(px(6.0))
+            actions = actions.child(
+                div()
+                    .id(SharedString::from(format!("provider-remove-{index}")))
+                    .debug_selector(move || format!("provider-remove-{index}"))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::hover())))
+                    .child(txt(tr(lang, "settings.modelsRemove"), 12.0, theme::error()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.begin_provider_remove(&name);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut card = div().flex().flex_col().gap(px(12.0)).child(
+            div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.0))
-                .border_b_1()
-                .border_color(rgb(theme::border_soft()));
-            row = row.child(
+                .gap(px(10.0))
+                .child(identity)
+                .child(actions),
+        );
+        if open {
+            if let Some(key) = self.state.provider_refusal {
+                card = card.child(self.settings_note(key, true));
+            }
+            card = card.child(self.provider_editor(profile, cx));
+        }
+        hairline_all(
+            card.py(px(12.0))
+                .px(px(14.0))
+                .rounded(px(16.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border_soft())),
+        )
+        .into_any_element()
+    }
+
+    /// The editor a card opens: the reference's API-key field over its
+    /// Customized settings fold, with the Apply/Cancel pair under both.
+    fn provider_editor(
+        &self,
+        profile: &crate::settings::Profile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let inputs = &self.settings_inputs;
+        let mut body: Vec<AnyElement> = vec![self.editor_field(
+            "settings.apiKey",
+            self.editor_input(&inputs.api_key, "field-editor-api-key".to_string()),
+        )];
+
+        // The fold carries what the reference keeps behind it: the endpoint, the
+        // protocol, and the model catalog. Only the key shows above it.
+        let fold_open = self.models_advanced_open;
+        let mut fold = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .pt(px(10.0))
+            .border_t_1()
+            .border_color(rgb(theme::border_soft()))
+            .child(
                 div()
-                    .debug_selector(move || format!("provider-{index}"))
-                    .id(SharedString::from(format!("provider-{index}")))
+                    .id("models-customized")
+                    .debug_selector(|| "models-customized".to_string())
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
-                    .flex_1()
-                    .px(px(6.0))
-                    .py(px(4.0))
-                    .rounded(px(5.0))
-                    .when(selected, |element| element.bg(rgb(theme::selected_row())))
-                    .child(txt(profile.name.clone(), 13.0, theme::text()))
-                    .child(txt(endpoint, 12.0, theme::muted()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.select_provider(&name);
-                        cx.notify();
-                    })),
-            );
-            let edit_profile = profile.clone();
-            let edit_label = tr(self.state.lang, "settings.editProvider");
-            row = row.child(
-                div()
-                    .debug_selector(move || format!("provider-edit-{index}"))
-                    .id(SharedString::from(format!("provider-edit-{index}")))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(20.0))
-                    .px(px(4.0))
-                    .rounded(px(4.0))
-                    .child(txt(edit_label, 12.0, theme::muted()))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        load_provider_into_form(this, &edit_profile, window, cx);
-                        cx.notify();
-                    })),
-            );
-            if removable {
-                let name = profile.name.clone();
-                row = row.child(
-                    div()
-                        .debug_selector(move || format!("provider-remove-{index}"))
-                        .id(SharedString::from(format!("provider-remove-{index}")))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(px(20.0))
-                        .h(px(20.0))
-                        .rounded(px(4.0))
-                        .child(icon(IconName::X, 12.0, theme::muted()))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.state.begin_provider_remove(&name);
-                            cx.notify();
-                        })),
-                );
-            }
-            if self.state.removing_provider.as_deref() == Some(profile.name.as_str()) {
-                let lang = self.state.lang;
-                let has_key = !profile.api_key.is_empty();
-                let title = crate::i18n::tr_with(lang, "settings.deleteTitle", &profile.name);
-                let description = if has_key {
-                    crate::i18n::tr_with(
-                        lang,
-                        "settings.deleteDescriptionWithCredential",
-                        &profile.name,
+                    .gap(px(6.0))
+                    .cursor_pointer()
+                    .child(if fold_open {
+                        icon(IconName::ChevronDown, 12.0, theme::muted())
+                    } else {
+                        icon(IconName::ChevronRight, 12.0, theme::muted())
+                    })
+                    .child(
+                        txt(tr(lang, "settings.customized"), 12.0, theme::muted())
+                            .font_weight(FontWeight::MEDIUM),
                     )
-                } else {
-                    crate::i18n::tr_with(lang, "settings.deleteDescription", &profile.name)
-                };
-                let confirm_label =
-                    crate::i18n::tr_with(lang, "settings.deleteConfirm", &profile.name);
-                let cancel_label = crate::i18n::tr(lang, "settings.cancel");
-                let confirmed = profile.name.clone();
-                let confirm_button = div()
-                    .debug_selector(move || format!("provider-delete-confirm-{index}"))
-                    .id(SharedString::from(format!(
-                        "provider-delete-confirm-{index}"
-                    )))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(20.0))
-                    .px(px(6.0))
-                    .rounded(px(4.0))
-                    .child(txt(confirm_label, 12.0, theme::error()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.remove_provider(&confirmed);
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.models_advanced_open = !this.models_advanced_open;
                         cx.notify();
-                    }));
-                let cancel_button = div()
-                    .debug_selector(move || format!("provider-delete-cancel-{index}"))
-                    .id(SharedString::from(format!(
-                        "provider-delete-cancel-{index}"
-                    )))
+                    })),
+            );
+        if fold_open {
+            let mut inner: Vec<AnyElement> = vec![
+                self.editor_field(
+                    "settings.customBaseUrl",
+                    self.editor_input(&inputs.base_url, "field-editor-base-url".to_string()),
+                ),
+                self.editor_field("settings.apiMode", self.api_mode_choices(cx)),
+                txt(tr(lang, "settings.advancedHint"), 12.0, theme::faint()).into_any_element(),
+            ];
+            inner.extend(self.catalog_rows(cx));
+            inner.extend(self.models_picker_rows(cx));
+            fold = fold.child(
+                div()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(20.0))
-                    .px(px(6.0))
-                    .rounded(px(4.0))
-                    .child(txt(cancel_label, 12.0, theme::muted()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.cancel_provider_remove();
-                        cx.notify();
-                    }));
-                rows.push(
-                    div()
-                        .debug_selector(move || format!("provider-delete-{index}"))
-                        .id(SharedString::from(format!("provider-delete-{index}")))
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .rounded(px(6.0))
-                        .bg(rgb(theme::hover()))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(8.0))
-                                .child(txt(title, 12.0, theme::text()))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(confirm_button)
-                                        .child(cancel_button),
-                                ),
-                        )
-                        .child(txt(description, 11.0, theme::muted()))
-                        .into_any_element(),
-                );
-            } else {
-                rows.push(row.into_any_element());
-            }
+                    .flex_col()
+                    .gap(px(12.0))
+                    .pt(px(12.0))
+                    .children(inner),
+            );
         }
-        rows.push(self.input_row(
-            "settings.providerDisplayName",
-            &inputs.provider_name,
-            Field::ProviderName,
-            cx,
-        ));
-        rows.push(
+        body.push(fold.into_any_element());
+
+        let original = profile.name.clone();
+        let apply = div()
+            .id("models-apply")
+            .debug_selector(|| "models-apply".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(36.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::text()))
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.9))
+            .child(txt(tr(lang, "settings.apply"), 14.0, theme::page()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                let typed = this
+                    .settings_inputs
+                    .provider_name
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
+                this.settings_inputs.read(this.state.draft_mut(), cx);
+                let outcome = this.state.update_provider(&original, &typed);
+                this.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
+                if this.state.provider_refusal.is_none() {
+                    this.state.editing_provider = None;
+                }
+                cx.notify();
+            }));
+        let cancel = div()
+            .id("models-editor-cancel")
+            .debug_selector(|| "models-editor-cancel".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(36.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .child(txt(tr(lang, "settings.cancel"), 14.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.state.editing_provider = None;
+                this.state.provider_refusal = None;
+                cx.notify();
+            }));
+        body.push(
             div()
-                .debug_selector(|| "provider-add".to_string())
-                .id(SharedString::from("provider-add"))
-                .py(px(6.0))
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(6.0))
-                .child(icon(IconName::Plus, 12.0, theme::accent()))
-                .child(txt(
-                    tr(
-                        self.state.lang,
-                        if self.state.editing_provider.is_some() {
-                            "settings.saveProvider"
-                        } else {
-                            "settings.addModelProvider"
-                        },
-                    ),
-                    13.0,
-                    theme::accent(),
-                ))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    let typed = this
-                        .settings_inputs
-                        .provider_name
-                        .read(cx)
-                        .value()
-                        .trim()
-                        .to_string();
-                    let outcome = match this.state.editing_provider.clone() {
-                        Some(original) => this.state.update_provider(&original, &typed),
-                        None => this.state.add_provider(&typed),
-                    };
-                    this.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
-                    if this.state.provider_refusal.is_none() {
-                        this.state.editing_provider = None;
-                    }
-                    cx.notify();
-                }))
+                .justify_end()
+                .gap(px(8.0))
+                .child(cancel)
+                .child(apply)
                 .into_any_element(),
         );
-        if self.state.editing_provider.is_some() {
-            rows.push(
+
+        div()
+            .debug_selector(|| "provider-editor".to_string())
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded(px(16.0))
+            .bg(rgb(theme::new_session_fill()))
+            .child(
                 div()
-                    .debug_selector(|| "provider-cancel-edit".to_string())
-                    .id(SharedString::from("provider-cancel-edit"))
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(px(8.0))
+                    .child(
+                        txt(profile.name.clone(), 14.0, theme::text())
+                            .font_weight(FontWeight::MEDIUM),
+                    )
+                    .child(txt(profile.model.clone(), 12.0, theme::faint())),
+            )
+            .children(body)
+            .into_any_element()
+    }
+
+    /// One editor field: the measured `field` - a 12px/500 label over its
+    /// control, 6px apart.
+    fn editor_field(&self, label: &'static str, control: AnyElement) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .min_w_0()
+            .child(
+                txt(tr(self.state.lang, label), 12.0, theme::muted())
+                    .font_weight(FontWeight::MEDIUM),
+            )
+            .child(control)
+            .into_any_element()
+    }
+
+    /// The measured 32px editor input on the layer-1 fill.
+    fn editor_input(&self, input: &Entity<InputState>, id: String) -> AnyElement {
+        let selector = id.clone();
+        hairline_all(
+            div()
+                .id(SharedString::from(id))
+                .debug_selector(move || selector)
+                .h(px(32.0))
+                .rounded(px(8.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border()))
+                .child(Input::new(input).appearance(false)),
+        )
+        .into_any_element()
+    }
+
+    /// The API-protocol chips, stacked the way the reference stacks them.
+    fn api_mode_choices(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let current = {
+            let draft = self.state.draft();
+            if draft.api_mode.is_empty() {
+                "auto".to_string()
+            } else {
+                draft.api_mode.clone()
+            }
+        };
+        let options = [
+            ("auto", "settings.apiAuto"),
+            ("chat", "settings.apiChat"),
+            ("responses", "settings.apiResponses"),
+            ("anthropic", "settings.apiAnthropic"),
+        ];
+        let mut group = div().flex().flex_row().flex_wrap().gap(px(6.0));
+        for (key, label) in options {
+            let selected = key == current;
+            group = group.child(
+                div()
+                    .id(SharedString::from(format!("set-api-mode-{key}")))
+                    .debug_selector(move || format!("set-api-mode-{key}"))
+                    .px(px(10.0))
                     .py(px(4.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        theme::accent()
+                    } else {
+                        theme::border()
+                    }))
+                    .bg(rgb(if selected {
+                        theme::accent()
+                    } else {
+                        theme::page()
+                    }))
+                    .cursor_pointer()
+                    .hover(move |s| {
+                        s.bg(rgb(if selected {
+                            theme::accent()
+                        } else {
+                            theme::hover()
+                        }))
+                    })
                     .child(txt(
-                        tr(self.state.lang, "settings.cancelEdit"),
-                        12.0,
-                        theme::muted(),
+                        tr(lang, label),
+                        theme::CHIP_SIZE,
+                        if selected {
+                            theme::page()
+                        } else {
+                            theme::muted()
+                        },
                     ))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.editing_provider = None;
-                        this.state.provider_refusal = None;
-                        cx.notify();
-                    }))
-                    .into_any_element(),
+                        api_mode_action(this, key, cx);
+                    })),
             );
         }
-        if let Some(key) = self.state.provider_refusal {
-            rows.push(self.settings_note(key, true));
+        group.into_any_element()
+    }
+
+    /// The add block: the Add button, or the open add card.
+    fn add_provider_block(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        if !self.models_add_open {
+            return div()
+                .flex()
+                .child(hairline_all(
+                    div()
+                        .id("provider-add")
+                        .debug_selector(|| "provider-add".to_string())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(6.0))
+                        .flex_1()
+                        .min_w(px(180.0))
+                        .h(px(44.0))
+                        .rounded(px(16.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .border_color(rgb(theme::border()))
+                        .child(icon(IconName::Plus, 14.0, theme::text()))
+                        .child(txt(
+                            tr(lang, "settings.addModelProvider"),
+                            14.0,
+                            theme::text(),
+                        ))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.state.editing_provider = None;
+                            this.state.provider_refusal = None;
+                            this.models_add_open = true;
+                            this.models_advanced_open = false;
+                            cx.notify();
+                        })),
+                ))
+                .into_any_element();
         }
-        rows.extend(self.catalog_rows(cx));
-        rows.extend(self.models_picker_rows(cx));
-        ("settings.models", "settings.modelsHint", rows)
+
+        let inputs = &self.settings_inputs;
+        let original = self.state.editing_provider.clone().unwrap_or_default();
+        let create_label = tr(lang, "settings.createProvider");
+        let create = div()
+            .id("models-create")
+            .debug_selector(|| "models-create".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(36.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::text()))
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.9))
+            .child(txt(create_label, 14.0, theme::page()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                let typed = this
+                    .settings_inputs
+                    .provider_name
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
+                this.settings_inputs.read(this.state.draft_mut(), cx);
+                let outcome = if original.is_empty() {
+                    this.state.add_provider(&typed)
+                } else {
+                    this.state.update_provider(&original, &typed)
+                };
+                this.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
+                if this.state.provider_refusal.is_none() {
+                    this.state.editing_provider = None;
+                    this.models_add_open = false;
+                    this.models_advanced_open = false;
+                }
+                cx.notify();
+            }));
+        let cancel = div()
+            .id("models-add-cancel")
+            .debug_selector(|| "models-add-cancel".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(36.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .child(txt(tr(lang, "settings.cancel"), 14.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.models_add_open = false;
+                this.models_advanced_open = false;
+                this.state.editing_provider = None;
+                this.state.provider_refusal = None;
+                cx.notify();
+            }));
+
+        let panel: Vec<AnyElement> = vec![
+            self.editor_field(
+                "settings.customRoute",
+                self.editor_input(&inputs.provider_name, "field-provider-id".to_string()),
+            ),
+            self.editor_field(
+                "settings.modelId",
+                self.editor_input(&inputs.model, "field-new-model".to_string()),
+            ),
+            self.editor_field(
+                "settings.customBaseUrl",
+                self.editor_input(&inputs.base_url, "field-new-base-url".to_string()),
+            ),
+            self.editor_field(
+                "settings.apiKey",
+                self.editor_input(&inputs.api_key, "field-new-api-key".to_string()),
+            ),
+            self.editor_field("settings.apiMode", self.api_mode_choices(cx)),
+            txt(tr(lang, "settings.customRouteHint"), 12.0, theme::faint()).into_any_element(),
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap(px(8.0))
+                .child(cancel)
+                .child(create)
+                .into_any_element(),
+        ];
+
+        div()
+            .debug_selector(|| "models-add-card".to_string())
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded(px(16.0))
+            .bg(rgb(theme::new_session_fill()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap(px(8.0))
+                    .child(self.models_mode_switch())
+                    .child(txt(
+                        tr(lang, "settings.addCustomHint"),
+                        12.0,
+                        theme::faint(),
+                    )),
+            )
+            .child(div().flex().flex_col().gap(px(14.0)).children(panel))
+            .into_any_element()
+    }
+
+    /// The reference's SegmentedControl: a 4px-padded track on the hover fill
+    /// whose selected segment is a raised layer-1 pill.
+    ///
+    /// The catalog mode is disabled because bsh composes no provider directory,
+    /// so it has nothing to list. `addCatalogExhausted` - "Every catalog
+    /// provider is already configured." - is literally true here, and the
+    /// reference puts a disabled mode's reason in its hover text.
+    fn models_mode_switch(&self) -> AnyElement {
+        let lang = self.state.lang;
+        let mut track = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0))
+            .p(px(4.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::hover()));
+        let segments: [(&'static str, &'static str, bool); 2] = [
+            ("catalog", "settings.addCatalog", false),
+            ("custom", "settings.addCustom", true),
+        ];
+        for (id, label, selected) in segments {
+            let base = div()
+                .id(SharedString::from(format!("models-mode-{id}")))
+                .debug_selector(move || format!("models-mode-{id}"))
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(28.0))
+                .px(px(16.0))
+                .rounded(px(6.0));
+            let text = txt(
+                tr(lang, label),
+                theme::CHIP_SIZE,
+                if selected {
+                    theme::text()
+                } else {
+                    theme::muted()
+                },
+            );
+            let seg: AnyElement = if selected {
+                hairline_all(
+                    base.bg(rgb(theme::page()))
+                        .border_color(rgb(theme::border_soft())),
+                )
+                .child(text)
+                .into_any_element()
+            } else {
+                let reason = SharedString::from(tr(lang, "settings.addCatalogExhausted"));
+                base.opacity(0.4)
+                    .tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx))
+                    .child(text)
+                    .into_any_element()
+            };
+            track = track.child(seg);
+        }
+        track.into_any_element()
     }
 
     /// Tools and skills, with a switch each.
@@ -1935,6 +2721,17 @@ impl Shell {
                 Field::MaxSteps,
                 cx,
             ),
+            {
+                let on = self.state.draft().memory_enabled;
+                // The reference's General pane has no memory row, so this one
+                // carries the title alone: there is no measured description to
+                // quote and inventing one would be our copy, not its.
+                self.preference_row(
+                    "settings.memoryTitle",
+                    None,
+                    self.switch("settings-memory", on, true, memory_action, cx),
+                )
+            },
             {
                 let on = self.state.draft().parallel_tool_calls;
                 div()
@@ -2484,6 +3281,236 @@ impl Shell {
         self.task_delete = None;
         cx.notify();
     }
+    /// Flip the risk gate's acknowledgement box.
+    ///
+    /// Measured (`RiskConfirmation`): the box starts unticked every time the
+    /// gate opens, so acknowledging one mode never acknowledges the next one.
+    pub(crate) fn permission_toggle_acknowledged(&mut self, cx: &mut Context<Self>) {
+        self.permission_acknowledged = !self.permission_acknowledged;
+        cx.notify();
+    }
+
+    /// Confirm the gate: the mode is written only now, and only once the box is
+    /// ticked - which is what keeps the gate from being a second menu.
+    pub(crate) fn permission_confirm_enable(&mut self, cx: &mut Context<Self>) {
+        if !self.permission_acknowledged {
+            return;
+        }
+        if let Some(permission) = self.permission_confirm.take() {
+            self.permission_acknowledged = false;
+            self.set_permission(&permission, cx);
+        }
+        cx.notify();
+    }
+
+    /// Backing out leaves the current mode alone.
+    pub(crate) fn permission_cancel_confirm(&mut self, cx: &mut Context<Self>) {
+        self.permission_confirm = None;
+        self.permission_acknowledged = false;
+        cx.notify();
+    }
+
+    /// The full-access risk gate, drawn over the settings dialog.
+    ///
+    /// Measured (`RiskConfirmation`): the confirmation is `min(440px, 100%)`, its
+    /// warning block is a 10px-gap row whose 14px error-coloured mark sits 2px
+    /// down against a 14/22 secondary sentence, the acknowledgement is another
+    /// 10px-gap row 20px under it - a 16x16 box on a 14/22 primary label - and
+    /// the two actions are at least 72 and 136 wide. The enable action is drawn
+    /// disabled until the box is ticked, which is the reference's own
+    /// `disabled={!acknowledged}`, and the gate is the only path that writes
+    /// full access: the pane's row and the composer chip both route through
+    /// `request_permission`.
+    pub(crate) fn render_permission_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let acknowledged = self.permission_acknowledged;
+        let acknowledgement = div()
+            .id("permission-acknowledge")
+            .debug_selector(|| String::from("permission-acknowledge"))
+            .mt(px(20.0))
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(10.0))
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .mt(px(3.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(rgb(if acknowledged {
+                        theme::accent()
+                    } else {
+                        theme::border_strong()
+                    }))
+                    .bg(rgb(if acknowledged {
+                        theme::accent()
+                    } else {
+                        theme::page()
+                    }))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(acknowledged, |box_| {
+                        box_.child(icon(IconName::Check, 11.0, theme::page()))
+                    }),
+            )
+            .child(
+                txt(
+                    tr(lang, "permission.confirmAcknowledge"),
+                    14.0,
+                    theme::text(),
+                )
+                .flex_1()
+                .min_w_0(),
+            )
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.permission_toggle_acknowledged(cx);
+            }));
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(rgba(0x0F1115CC))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .debug_selector(|| String::from("permission-confirm-dialog"))
+                    .w(px(440.0))
+                    .p(px(18.0))
+                    .rounded(px(12.0))
+                    .bg(rgb(theme::page()))
+                    .border_1()
+                    .border_color(rgb(theme::border_strong()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(txt(
+                        tr(lang, "permission.confirmTitle"),
+                        15.0,
+                        theme::text(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .gap(px(10.0))
+                            .child(div().flex_none().mt(px(2.0)).child(icon(
+                                IconName::TriangleAlert,
+                                14.0,
+                                theme::error(),
+                            )))
+                            .child(
+                                txt(
+                                    tr(lang, "permission.confirmDescription"),
+                                    14.0,
+                                    theme::muted(),
+                                )
+                                .flex_1()
+                                .min_w_0(),
+                            ),
+                    )
+                    .child(acknowledgement)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(self.gate_button(
+                                GateButton {
+                                    id: "permission-confirm-cancel",
+                                    label: tr(lang, "permission.confirmCancel").into(),
+                                    primary: false,
+                                    min_w: 72.0,
+                                    enabled: true,
+                                    action: |shell, cx| shell.permission_cancel_confirm(cx),
+                                },
+                                cx,
+                            ))
+                            .child(self.gate_button(
+                                GateButton {
+                                    id: "permission-confirm-enable",
+                                    label: tr(lang, "permission.confirmEnable").into(),
+                                    primary: true,
+                                    min_w: 136.0,
+                                    enabled: acknowledged,
+                                    action: |shell, cx| shell.permission_confirm_enable(cx),
+                                },
+                                cx,
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One button of the risk gate, at its measured minimum width and disabled
+    /// until the reference's own acknowledgement has been ticked.
+    ///
+    /// The reference draws its two gate buttons from one component with two
+    /// measured minimum widths (72 for cancel, 136 for the confirm), so the
+    /// width travels with the label rather than as its own argument.
+    fn gate_button(&self, gate: GateButton, cx: &mut Context<Self>) -> AnyElement {
+        let GateButton {
+            id,
+            label,
+            primary,
+            min_w,
+            enabled,
+            action,
+        } = gate;
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .when(!enabled, |button| button.opacity(0.5).cursor_default())
+            .when(enabled, |button| button.cursor_pointer())
+            .min_w(px(min_w))
+            .px(px(16.0))
+            .h(px(30.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_1()
+            .border_color(rgb(if primary {
+                theme::accent()
+            } else {
+                theme::border()
+            }))
+            .bg(rgb(if primary {
+                theme::accent()
+            } else {
+                theme::page()
+            }))
+            .when(enabled, |button| {
+                button.hover(|s| {
+                    s.bg(rgb(if primary {
+                        theme::accent()
+                    } else {
+                        theme::hover()
+                    }))
+                })
+            })
+            .child(txt(
+                label,
+                13.0,
+                if primary {
+                    theme::page()
+                } else {
+                    theme::text()
+                },
+            ))
+            .on_click(cx.listener(move |this, _event, _window, cx| action(this, cx)))
+            .into_any_element()
+    }
 
     /// The delete confirmation, drawn over the settings dialog.
     pub(crate) fn render_task_delete(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2534,6 +3561,102 @@ impl Shell {
                                 true,
                                 cx,
                             )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The provider delete confirmation, drawn as a dialog over the settings
+    /// panel the way the reference draws its own delete modal. The card it
+    /// guards stays where it is; only the dialog is new.
+    pub(crate) fn render_provider_delete(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let name = self.state.removing_provider.clone().unwrap_or_default();
+        let has_credential = self
+            .state
+            .draft()
+            .providers
+            .iter()
+            .any(|profile| profile.name == name && !profile.api_key.trim().is_empty());
+        // The reference picks the description by whether a credential is
+        // configured, and labels the confirm with the provider's own name.
+        let title = crate::i18n::tr_with(lang, "settings.deleteTitle", &name);
+        let description = if has_credential {
+            crate::i18n::tr_with(lang, "settings.deleteDescriptionWithCredential", &name)
+        } else {
+            crate::i18n::tr_with(lang, "settings.deleteDescription", &name)
+        };
+        let confirm_label = crate::i18n::tr_with(lang, "settings.deleteConfirm", &name);
+        let confirmed = name.clone();
+        let confirm = div()
+            .id("provider-delete-confirm")
+            .debug_selector(|| String::from("provider-delete-confirm"))
+            .px(px(16.0))
+            .h(px(30.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .border_1()
+            .border_color(rgb(theme::accent()))
+            .bg(rgb(theme::accent()))
+            .hover(|s| s.opacity(0.9))
+            .child(txt(confirm_label, 13.0, theme::page()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.state.remove_provider(&confirmed);
+                cx.notify();
+            }));
+        let cancel = div()
+            .id("provider-delete-cancel")
+            .debug_selector(|| String::from("provider-delete-cancel"))
+            .px(px(16.0))
+            .h(px(30.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .child(txt(tr(lang, "settings.cancel"), 13.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.state.cancel_provider_remove();
+                cx.notify();
+            }));
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(rgba(0x0F1115CC))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .debug_selector(|| String::from("provider-delete-dialog"))
+                    .w(px(460.0))
+                    .p(px(18.0))
+                    .rounded(px(12.0))
+                    .bg(rgb(theme::page()))
+                    .border_1()
+                    .border_color(rgb(theme::border_strong()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(txt(title, 15.0, theme::text()))
+                    .child(txt(description, 12.5, theme::muted()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(cancel)
+                            .child(confirm),
                     ),
             )
             .into_any_element()
@@ -2887,50 +4010,6 @@ impl Shell {
             ),
         ];
         ("settings.context", "settings.contextHint", rows)
-    }
-
-    /// About: build facts and discovered endpoints.
-    /// How the interface looks and speaks.
-    fn section_presentation(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let rows = vec![self.choice_row(
-            "set-lang",
-            "settings.language",
-            &self.state.settings.lang.clone(),
-            &[("en", "English"), ("zh", "中文")],
-            language_action,
-            cx,
-        )];
-        ("settings.presentation", "settings.presentationHint", rows)
-    }
-
-    /// The About block: the reference draws it as General's own `current-version`
-    /// row group (`settings.general.item`, order 100), not as a rail cell.
-    fn about_rows(&self) -> Vec<AnyElement> {
-        let draft = self.state.draft();
-        let mut rows = vec![
-            self.settings_row("settings.version", env!("CARGO_PKG_VERSION").to_string()),
-            self.settings_row(
-                "settings.dataDir",
-                crate::settings::dir().display().to_string(),
-            ),
-            self.settings_row(
-                "settings.sessions",
-                self.state.store.sessions.len().to_string(),
-            ),
-        ];
-        if draft.profiles.is_empty() {
-            rows.push(self.settings_row("settings.profile", "-".to_string()));
-        }
-        for profile in &draft.profiles {
-            rows.push(self.settings_row(
-                "settings.profile",
-                format!("{}  -  {}", profile.name, profile.model),
-            ));
-        }
-        rows
     }
 }
 

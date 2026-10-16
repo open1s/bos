@@ -16,26 +16,26 @@ resolver = "2"
 
 [workspace.dependencies]
 tokio = { version = "1.52", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "1.1.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8+spec-1.1.0"
 serde_yaml = "0.9"
-dashmap = "6.1.0"
-anyhow = "1.0"
-thiserror = "2.0"
+dashmap = "6.2.1"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
 # 0.1.92 removed the #[must_use] it used to inject into async trait
 # methods, which trips clippy 1.99 double_must_use under -D warnings.
 async-trait = "0.1.92"
 tracing = "0.1"
-uuid = { version = "1.23", features = ["v4"] }
+uuid = { version = "1.28.0", features = ["v4"] }
 futures = "0.3"
-tokio-stream = "0.1"
+tokio-stream = "0.1.19"
 async-stream = "0.3"
-chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.13", features = ["json"] }
-zenoh = "1.9"
-rkyv = { version = "0.8.16", features = ["unaligned"] }
-rkyv_derive = "0.8.16"
+chrono = { version = "0.4.45", features = ["serde"] }
+reqwest = { version = "0.13.5", features = ["json"] }
+zenoh = "1.10.1"
+rkyv = { version = "0.8.18", features = ["unaligned"] }
+rkyv_derive = "0.8.18"
 notify = "8"
 async-channel = "2.5"
 shellexpand = "3.1"

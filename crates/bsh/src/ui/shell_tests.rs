@@ -33,6 +33,20 @@ impl Render for Harness {
     }
 }
 
+/// Pin the reference's own defaults on a test state.
+///
+/// `AppState::with_store` loads the real `~/.bos/bsh/settings.toml`, so a
+/// machine that has dragged its sidebar or stepped its font size would colour
+/// every measured chrome assertion with the developer's own values. A test that
+/// compares against a measured number calls this first, and the assertion then
+/// tests what the reference ships, not what this machine has drifted to.
+fn tests_pin_reference_defaults(state: &mut AppState) {
+    state.settings.content_font_size = crate::theme::CONTENT_DEFAULT;
+    state.settings.sidebar_width = None;
+    state.settings.content_width = None;
+    state.settings.theme_mode = "system".to_string();
+}
+
 /// A store rooted in the build directory: a test must never touch real sessions.
 /// The label keeps tests apart - they run in parallel inside one process.
 fn scratch_store(label: &str) -> Store {
@@ -804,7 +818,8 @@ fn header_panel_toggle_click_flips_the_sidebar(cx: &mut TestAppContext) {
 fn the_centre_column_takes_the_measured_chrome(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("centre-chrome"));
+        let mut state = AppState::with_store(scratch_store("centre-chrome"));
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -870,7 +885,8 @@ fn the_centre_column_takes_the_measured_chrome(cx: &mut TestAppContext) {
 fn the_sidebar_takes_the_measured_chrome(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("sidebar-chrome"));
+        let mut state = AppState::with_store(scratch_store("sidebar-chrome"));
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -1473,26 +1489,22 @@ fn provider_row_click_selects_the_endpoint(cx: &mut TestAppContext) {
     );
 
     let block = cx
-        .debug_bounds("provider-delete-1")
-        .expect("the confirmation block");
+        .debug_bounds("provider-delete-dialog")
+        .expect("the confirmation dialog");
     assert!(
-        cx.debug_bounds("provider-1").is_none(),
-        "the confirmation must replace the row it guards"
+        cx.debug_bounds("provider-1").is_some(),
+        "the reference confirms in a dialog, so the row it guards stays put"
     );
     let pane = cx.debug_bounds("settings-pane").expect("the pane");
     let pane_bottom = pane.origin.y + pane.size.height;
     assert!(
-        block.origin.y + px(8.0) < pane_bottom,
+        block.origin.y < pane_bottom,
         "the confirmation must stand where the row stood, inside the visible pane \
          (block {block:?}, pane {pane:?})"
     );
     let bounds = cx
-        .debug_bounds("provider-delete-confirm-1")
+        .debug_bounds("provider-delete-confirm")
         .expect("the confirm control");
-    eprintln!(
-        "bsh-delete block_y={:?} confirm_y={:?}",
-        block.origin.y, bounds.origin.y
-    );
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let saved = cx.update(|_, cx| shell.read(cx).state.draft().providers.clone());
@@ -1707,8 +1719,8 @@ fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
 }
 
 /// The permission chip changes the mode in place, like the reference's trigger:
-/// it opens the two-mode menu instead of navigating to the settings pane, and
-/// both modes are the ones the setting itself can hold.
+/// it opens the three-mode menu instead of navigating to the settings pane, and
+/// every mode is one the setting itself can hold.
 #[gpui::test]
 fn the_permission_chip_opens_the_mode_menu_in_place(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
@@ -1733,10 +1745,15 @@ fn the_permission_chip_opens_the_mode_menu_in_place(cx: &mut TestAppContext) {
     assert_eq!(
         super::composer::permission_modes(),
         [
-            (true, "composer.workspaceWrite"),
-            (false, "settings.permRead")
+            (crate::caps::READ_ONLY, "permission.presetReadOnly"),
+            (
+                crate::caps::WORKSPACE_WRITE,
+                "permission.presetWorkspaceWrite"
+            ),
+            (crate::caps::FULL_ACCESS, "permission.presetFullAccess"),
         ],
-        "and the menu offers exactly the modes the setting can hold"
+        "and the menu offers exactly the modes the setting can hold, in the \
+         reference's own order"
     );
 }
 
@@ -1745,13 +1762,56 @@ fn the_permission_chip_opens_the_mode_menu_in_place(cx: &mut TestAppContext) {
 #[test]
 fn the_permission_chip_names_the_mode() {
     assert_eq!(
-        crate::ui::composer::permission_label_key(true),
-        "composer.workspaceWrite"
+        crate::ui::composer::permission_label_key(crate::caps::READ_ONLY),
+        "permission.presetReadOnly"
     );
     assert_eq!(
-        crate::ui::composer::permission_label_key(false),
-        "settings.permRead"
+        crate::ui::composer::permission_label_key(crate::caps::WORKSPACE_WRITE),
+        "permission.presetWorkspaceWrite"
     );
+    assert_eq!(
+        crate::ui::composer::permission_label_key(crate::caps::FULL_ACCESS),
+        "permission.presetFullAccess"
+    );
+    assert_eq!(
+        crate::ui::composer::permission_label_key("not-a-mode"),
+        "permission.presetWorkspaceWrite",
+        "an unrecognised mode names the confined default the build falls back to"
+    );
+}
+/// Every permission label resolves to real copy, and the three modes differ.
+///
+/// These keys are built dynamically, so a namespace slip is invisible to the
+/// compiler: `tr` returns the key itself when it is missing, which is exactly
+/// how the composer chip once printed a raw "settings.presetReadOnly" to the
+/// user instead of "Read Only". Type-checking cannot catch that; this can.
+#[test]
+fn every_permission_label_resolves_to_copy() {
+    const MODES: [&str; 3] = [
+        crate::caps::READ_ONLY,
+        crate::caps::WORKSPACE_WRITE,
+        crate::caps::FULL_ACCESS,
+    ];
+    for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
+        for mode in MODES {
+            let key = crate::ui::composer::permission_label_key(mode);
+            let label = crate::i18n::tr(lang, key);
+            assert_ne!(label, key, "{key} is missing from the locale files");
+        }
+        for (_, key) in crate::ui::composer::permission_modes() {
+            let label = crate::i18n::tr(lang, key);
+            assert_ne!(label, key, "{key} is missing from the locale files");
+        }
+    }
+    let en = crate::i18n::Lang::En;
+    let labels = [
+        crate::i18n::tr(en, crate::ui::composer::permission_label_key(MODES[0])),
+        crate::i18n::tr(en, crate::ui::composer::permission_label_key(MODES[1])),
+        crate::i18n::tr(en, crate::ui::composer::permission_label_key(MODES[2])),
+    ];
+    assert_ne!(labels[0], labels[1], "each mode names itself");
+    assert_ne!(labels[1], labels[2], "each mode names itself");
+    assert_ne!(labels[0], labels[2], "each mode names itself");
 }
 
 /// The workspace tree opens in the order the sidebar last chose.
@@ -1842,6 +1902,144 @@ fn the_header_hides_the_open_control_without_a_workspace(cx: &mut TestAppContext
     );
 }
 
+/// The Models pane is the reference's card list, not the flat form it replaced:
+/// each provider is a card whose head carries its identity and its Edit/Delete
+/// actions, the editor opens inside that card with the key as its one primary
+/// field, and the add block is a single button that swaps for the add card.
+#[gpui::test]
+fn the_models_pane_is_the_reference_card_list(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("models-cards", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // Pin the indices: clear the discovered profiles so the saved provider is
+    // the first and only card.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.draft_mut().profiles = Vec::new();
+            this.state.draft_mut().providers = vec![profile("work", "https://work.example")];
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A collapsed card: the head, its two actions, and no editor under it.
+    assert!(
+        cx.debug_bounds("provider-0").is_some(),
+        "the provider card head"
+    );
+    assert!(
+        cx.debug_bounds("provider-edit-0").is_some(),
+        "its Edit action"
+    );
+    assert!(
+        cx.debug_bounds("provider-remove-0").is_some(),
+        "its Delete action"
+    );
+    assert!(
+        cx.debug_bounds("provider-editor").is_none(),
+        "the editor is not drawn until the card is opened"
+    );
+    // The one entry to the add flow is the add button.
+    assert!(cx.debug_bounds("provider-add").is_some(), "the add button");
+    assert!(
+        cx.debug_bounds("models-add-card").is_none(),
+        "the add card and its button never show together"
+    );
+
+    // Opening the editor folds everything but the key away.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.editing_provider = Some("work".to_string())
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("provider-editor").is_some(), "the editor");
+    assert!(
+        cx.debug_bounds("field-editor-api-key").is_some(),
+        "the API key is the editor's one primary field"
+    );
+    assert!(cx.debug_bounds("models-customized").is_some(), "its fold");
+    assert!(
+        cx.debug_bounds("models-apply").is_some()
+            && cx.debug_bounds("models-editor-cancel").is_some(),
+        "the Apply/Cancel pair"
+    );
+    assert!(
+        cx.debug_bounds("field-editor-base-url").is_none(),
+        "the fold hides the endpoint until it is opened"
+    );
+    assert!(
+        cx.debug_bounds("provider-0").is_some(),
+        "the card stays while its editor is open"
+    );
+
+    // The fold reveals the endpoint and the protocol.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.models_advanced_open = true);
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("field-editor-base-url").is_some(),
+        "the endpoint"
+    );
+    assert!(
+        cx.debug_bounds("set-api-mode-auto").is_some(),
+        "the protocol chips"
+    );
+
+    // The add block swaps its button for the card, whose mode switch offers the
+    // catalog disabled and the custom form selected.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.editing_provider = None;
+            this.models_add_open = true;
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("models-add-card").is_some(), "the add card");
+    assert!(
+        cx.debug_bounds("provider-add").is_none(),
+        "the button is gone while the card is open"
+    );
+    assert!(
+        cx.debug_bounds("models-mode-custom").is_some(),
+        "custom mode"
+    );
+    assert!(
+        cx.debug_bounds("models-mode-catalog").is_some(),
+        "catalog mode"
+    );
+    assert!(
+        cx.debug_bounds("models-create").is_some(),
+        "the create action"
+    );
+}
+
+/// General carries the reference's rows and stops at its own current-version
+/// line: the build facts bsh used to list there - the data directory, the
+/// session count and every discovered profile - are not part of that pane.
+#[gpui::test]
+fn the_general_pane_carries_no_build_facts(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("general-about", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("general-item-current-version").is_some(),
+        "the reference's own current-version row is still drawn"
+    );
+    assert!(
+        cx.debug_bounds("general-item-about").is_none(),
+        "the build-facts block must not be drawn"
+    );
+}
+
 /// The Models pane writes the API protocol, and automatic clears it again.
 #[gpui::test]
 fn api_protocol_row_writes_the_setting(cx: &mut TestAppContext) {
@@ -1851,6 +2049,18 @@ fn api_protocol_row_writes_the_setting(cx: &mut TestAppContext) {
         state.settings.api_mode = "chat".to_string();
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
         Harness { shell }
+    });
+    // The protocol chips sit in the provider editor's Customized settings fold,
+    // so seed a provider and open both before the first frame. The add card
+    // carries the same chips, but four fields above them puts the control past
+    // the window and the harness cannot press it.
+    cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |this, _| {
+            this.state.draft_mut().providers = vec![profile("work", "https://work.example")];
+            this.state.editing_provider = Some("work".to_string());
+            this.models_advanced_open = true;
+        });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
@@ -2003,7 +2213,8 @@ fn the_chat_column_takes_the_measured_clamp() {
 fn the_composer_stack_follows_the_measured_clamp(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("chat-clamp", 2);
+        let mut state = state_with_turns("chat-clamp", 2);
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -2288,7 +2499,8 @@ fn the_sidebar_fold_follows_the_auto_collapse_breakpoint() {
 fn the_narrow_viewport_auto_collapses_the_sidebar(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("sidebar-narrow", 2);
+        let mut state = state_with_turns("sidebar-narrow", 2);
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -2382,7 +2594,8 @@ fn the_sidebar_width_takes_the_measured_bounds() {
 fn the_sidebar_handle_takes_the_measured_strip(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("sidebar-strip", 2);
+        let mut state = state_with_turns("sidebar-strip", 2);
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -2414,7 +2627,8 @@ fn the_sidebar_handle_takes_the_measured_strip(cx: &mut TestAppContext) {
 fn the_sidebar_handle_drag_sets_and_stores_the_width(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("sidebar-drag", 2);
+        let mut state = state_with_turns("sidebar-drag", 2);
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -2727,11 +2941,15 @@ fn the_model_catalog_handlers_write_the_draft(cx: &mut TestAppContext) {
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The catalog belongs to the ACTIVE provider, which a real machine resolves
+    // from ~/.bos/conf/config.toml, so the test reads that provider rather than
+    // assuming the profile list is empty.
     let draft = |cx: &mut VisualTestContext| -> (Vec<String>, String) {
         cx.update(|_, cx| {
             let state = &harness.read(cx).shell.read(cx).state;
+            let provider = state.draft().active_provider.clone();
             (
-                state.draft().catalog("").to_vec(),
+                state.draft().catalog(&provider).to_vec(),
                 state.draft().model.clone(),
             )
         })
@@ -2784,6 +3002,11 @@ fn the_picker_search_narrows_the_candidates(cx: &mut TestAppContext) {
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     cx.update(|_, cx| {
         shell.update(cx, |this, _| {
+            // The picker is drawn inside a provider's editor, under its
+            // Customized settings fold, so seed a provider and open both.
+            this.state.draft_mut().providers = vec![profile("work", "https://work.example")];
+            this.state.editing_provider = Some("work".to_string());
+            this.models_advanced_open = true;
             this.models_fetched = Some(vec![
                 "gpt-4o".to_string(),
                 "o3".to_string(),
@@ -2879,7 +3102,10 @@ fn the_picker_adds_every_selected_fetched_model(cx: &mut TestAppContext) {
     let (models, ticked, closed) = cx.update(|_, cx| {
         let this = harness.read(cx).shell.read(cx);
         (
-            this.state.draft().catalog("").to_vec(),
+            this.state
+                .draft()
+                .catalog(&this.state.draft().active_provider)
+                .to_vec(),
             this.models_selected.len(),
             this.models_fetched.is_none(),
         )
@@ -2936,8 +3162,6 @@ fn the_plugin_keys_resolve_in_both_locales() {
         "settings.plugins",
         "settings.builtinPluginsHint",
         "settings.pluginViews",
-        "settings.about",
-        "settings.aboutHint",
         "settings.pluginEnabled",
         "settings.pluginDisabled",
         "settings.plugin-inventory",
@@ -3023,7 +3247,8 @@ fn the_provider_form_keys_resolve_in_both_locales() {
 fn the_font_size_stepper_moves_the_conversation_text(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("font-size"));
+        let mut state = AppState::with_store(scratch_store("font-size"));
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
         Harness { shell }
     });
@@ -3067,7 +3292,8 @@ fn the_font_size_stepper_moves_the_conversation_text(cx: &mut TestAppContext) {
 fn the_appearance_cubes_set_the_colour_mode(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("appearance-cubes"));
+        let mut state = AppState::with_store(scratch_store("appearance-cubes"));
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
         Harness { shell }
     });
@@ -3156,7 +3382,8 @@ fn the_settings_dialog_takes_the_measured_shape(cx: &mut TestAppContext) {
 fn the_markdown_scale_carries_the_reference_metrics(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("markdown-scale"));
+        let mut state = AppState::with_store(scratch_store("markdown-scale"));
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
         Harness { shell }
     });
@@ -3267,7 +3494,8 @@ fn the_plugin_list_filter_hides_rows_and_says_so(cx: &mut TestAppContext) {
 fn editing_a_provider_loads_it_into_the_form(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("provider-edit"));
+        let mut state = AppState::with_store(scratch_store("provider-edit"));
+        state.settings.providers.clear();
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
         Harness { shell }
     });
@@ -3332,10 +3560,12 @@ fn the_input_type_chips_write_the_draft(cx: &mut TestAppContext) {
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // Same as the catalog rows: the declaration lands on the active provider.
     let declared = |cx: &mut VisualTestContext| -> Vec<String> {
         cx.update(|_, cx| {
             let state = &harness.read(cx).shell.read(cx).state;
-            state.draft().input_types_for("", "o3").to_vec()
+            let provider = state.draft().active_provider.clone();
+            state.draft().input_types_for(&provider, "o3").to_vec()
         })
     };
     assert!(declared(cx).is_empty(), "a model declares nothing at first");
@@ -3498,7 +3728,8 @@ fn the_tick_switches_off_a_task_whose_session_is_gone(cx: &mut TestAppContext) {
 fn the_automation_pane_lists_a_task_from_the_draft(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("schedule-pane"));
+        let mut state = AppState::with_store(scratch_store("schedule-pane"));
+        state.settings.schedules.clear();
         let section = section_index("automation").expect("the rail index");
         let shell = cx.new(|cx| Shell::build_for_test(window, Some(section), state, cx));
         Harness { shell }
@@ -3550,7 +3781,8 @@ fn the_automation_pane_lists_a_task_from_the_draft(cx: &mut TestAppContext) {
 fn the_delete_control_asks_before_it_deletes(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("schedule-delete"));
+        let mut state = AppState::with_store(scratch_store("schedule-delete"));
+        state.settings.schedules.clear();
         let section = section_index("automation").expect("the rail index");
         let shell = cx.new(|cx| Shell::build_for_test(window, Some(section), state, cx));
         Harness { shell }
@@ -3861,6 +4093,7 @@ fn the_stat_pills_take_the_measured_chrome(cx: &mut TestAppContext) {
                 });
             }
         }
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -3979,6 +4212,7 @@ fn the_context_meter_opens_the_measured_breakdown_panel(cx: &mut TestAppContext)
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("context-meter", 1);
+        tests_pin_reference_defaults(&mut state);
         // The tool schemas are what a built agent measures, so the panel's two
         // priced buckets are the transcript and this figure.
         state.set_tools_schema(2_000);
@@ -4069,7 +4303,8 @@ fn the_context_meter_opens_the_measured_breakdown_panel(cx: &mut TestAppContext)
 fn the_hero_takes_the_measured_chrome(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("hero-chrome"));
+        let mut state = AppState::with_store(scratch_store("hero-chrome"));
+        tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -4346,18 +4581,21 @@ fn the_permission_chip_writes_the_mode_its_menu_offers(cx: &mut TestAppContext) 
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    let before = cx.update(|_, cx| shell.read(cx).state.draft().bash_enabled);
+    let before = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
     cx.update(|_, cx| {
-        shell.update(cx, |shell, cx| shell.set_permission(!before, cx));
+        shell.update(cx, |shell, cx| {
+            shell.set_permission(crate::caps::FULL_ACCESS, cx)
+        });
     });
-    let after = cx.update(|_, cx| shell.read(cx).state.draft().bash_enabled);
+    let after = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
     assert_eq!(
-        after, !before,
+        after,
+        crate::caps::FULL_ACCESS,
         "the write lands on the draft the General pane also writes"
     );
     assert_ne!(
-        super::composer::permission_label_key(before),
-        super::composer::permission_label_key(after),
+        super::composer::permission_label_key(&before),
+        super::composer::permission_label_key(&after),
         "and the chip's own label flips with it"
     );
 }
@@ -4880,5 +5118,159 @@ fn the_at_trigger_lists_workspace_files_and_sessions(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("composer-command-menu").is_none(),
         "a draft with no trigger closes the card"
+    );
+}
+
+/// The Show coding view toggle is the one General row that gates a real
+/// surface, so the click is pressed and the gate read back: developer tools
+/// off hides the trajectory tab (`header.rs`), and the draft is what the
+/// dialog writes.
+#[gpui::test]
+fn the_coding_view_toggle_gates_the_trajectory_tab(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("coding-view"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let before = cx.update(|_, cx| shell.read(cx).state.draft().developer_tools);
+    let track = cx
+        .debug_bounds("settings-developer-tools")
+        .expect("the toggle draws");
+    assert_eq!(track.size.width, px(36.0), "the reference's 36px track");
+    assert_eq!(track.size.height, px(20.0), "and its 20px height");
+    assert!(
+        cx.debug_bounds("tab-trajectory").is_some(),
+        "the trajectory tab is reachable while coding view is on"
+    );
+    cx.simulate_click(track.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let after = cx.update(|_, cx| shell.read(cx).state.draft().developer_tools);
+    assert_eq!(after, !before, "the toggle writes the setting it shows");
+    // The pane edits the draft and the header reads the committed setting, so
+    // an unsaved edit must NOT move the live gate - that is what the Save bar
+    // is for. Both halves are pinned: the draft moved above, and the gate
+    // responds to the committed value here. The committed value is set
+    // directly because `commit_settings` would write the real
+    // `~/.bos/bsh/settings.toml`.
+    assert!(
+        cx.debug_bounds("tab-trajectory").is_some(),
+        "an unsaved edit leaves the live gate alone"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.settings.developer_tools = false;
+            this.state.cancel_settings();
+            cx.notify();
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("tab-trajectory").is_none(),
+        "the committed setting is the one the tab gate reads"
+    );
+}
+
+/// The General pane's header action is the reference's own `openDocument`
+/// button: a 28-tall outline control beside the error line the reference
+/// carries. The click cannot be pressed here - it really would hand the
+/// settings file to the platform launcher - so the test pins the drawn shape
+/// and drives the one state `reveal_config_shared` sets on a refused open.
+#[gpui::test]
+fn the_general_header_carries_the_reference_document_action(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("open-config"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let button = cx
+        .debug_bounds("settings-open-config")
+        .expect("the header action draws once a config path resolves");
+    assert_eq!(button.size.height, px(28.0), "the outline control's height");
+    assert!(
+        cx.debug_bounds("settings-open-config-error").is_none(),
+        "and no error line while nothing has failed"
+    );
+    // `reveal_config_shared` is the one writer of this flag, on the Err arm of
+    // the launcher; driving it directly is how the error rendering is reached
+    // without handing the real path to `open`.
+    cx.update(|_, cx| shell.update(cx, |this, _cx| this.config_open_failed = true));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("settings-open-config-error").is_some(),
+        "a refused open surfaces the reference's own error line"
+    );
+}
+
+/// The risk gate is the only path that writes full access, and it stays shut
+/// until the reference's own acknowledgement is ticked - the enable action is
+/// drawn disabled, and the handler refuses even if it is reached.
+#[gpui::test]
+fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("risk-gate"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let before = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
+    // Open the gate the way the composer chip does, so this is the real route.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::FULL_ACCESS, cx)
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("permission-confirm-dialog").is_some(),
+        "full access opens the reference's own confirmation"
+    );
+    let currently = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
+    assert_eq!(currently, before, "nothing is written on the offer");
+    // The confirm is drawn disabled, and the handler refuses too.
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_confirm_enable(cx)));
+    let refused = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
+    assert_eq!(refused, before, "an unticked gate refuses, not writes");
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).permission_confirm.clone()),
+        Some(String::from(crate::caps::FULL_ACCESS)),
+        "and the gate stays open rather than silently closing"
+    );
+    // Tick the box on screen, then take the enable action.
+    let box_ = cx
+        .debug_bounds("permission-acknowledge")
+        .expect("the acknowledgement draws");
+    cx.simulate_click(box_.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).permission_acknowledged),
+        "the click ticks it"
+    );
+    let enable = cx
+        .debug_bounds("permission-confirm-enable")
+        .expect("the enable action draws");
+    cx.simulate_click(enable.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.draft().permission.clone()),
+        crate::caps::FULL_ACCESS,
+        "a ticked gate is the one write of full access"
+    );
+    assert!(
+        cx.debug_bounds("permission-confirm-dialog").is_none(),
+        "and the gate closes behind the write"
+    );
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).permission_acknowledged),
+        "the acknowledgement resets, so the next gate starts shut"
     );
 }
