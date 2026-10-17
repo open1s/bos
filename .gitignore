@@ -109,5 +109,11 @@ $RECYCLE.BIN/
 .worktrees/
 .opencode
 
+# The harness workspace: the configuration travels with the checkout (that is
+# how a second clone inherits the same agent setup, and it carries no
+# credentials by design), while this machine's sessions, plans and logs do not.
+.bsh/*
+!.bsh/settings/
+
 # Generated: the shipped reference bundle corpus (regenerate with the extract-asar.py recipe)
 docs/ui-mirror/reference/pkgs/

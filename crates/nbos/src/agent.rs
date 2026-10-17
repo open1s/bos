@@ -544,6 +544,7 @@ impl From<PyAgentConfig> for AgentConfig {
             timeout_secs: value.timeout_secs,
             max_steps: value.max_steps,
             parallel_tool_calls: false,
+            web_search: false,
             api_mode: value.api_mode,
             reasoning_effort: value.reasoning_effort,
             circuit_breaker,

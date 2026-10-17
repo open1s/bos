@@ -1,5 +1,17 @@
 use super::*;
 
+/// Whether the hosted web-search tool is offered on this request.
+///
+/// Both halves are required. The switch says the reader wants it; the protocol
+/// says the endpoint can carry it, because a hosted tool is an object only the
+/// Responses API understands - an OpenAI-compatible chat endpoint rejects the
+/// request outright, and the anthropic wire has no such field. Offering it on
+/// those would break every turn rather than add a feature, so the protocol is
+/// part of the rule and not a caller's problem to remember.
+fn offers_web_search(enabled: bool, api_mode: &str) -> bool {
+    enabled && api_mode == "responses"
+}
+
 impl Agent {
     /// Prepare context with tools and skills populated from the agent's state.
     /// Shared by react() and stream() to avoid code duplication.
@@ -31,6 +43,13 @@ impl Agent {
             }
 
             context.tools = tools;
+        }
+
+        // The hosted web-search tool is not in the registry, because nothing
+        // here runs it: the provider does, and returns the results in its own
+        // stream.
+        if offers_web_search(self.config.web_search, &self.config.api_mode) {
+            context.tools.push(react::llm::LlmTool::web_search(None));
         }
 
         if !self.skills.is_empty() {
@@ -538,5 +557,36 @@ impl Agent {
         };
 
         Box::pin(stream)
+    }
+}
+
+#[cfg(test)]
+mod web_tool_tests {
+    use super::offers_web_search;
+
+    /// The hosted web tool needs the switch AND a protocol that can carry it.
+    ///
+    /// A hosted tool is an object only the Responses API understands; offering it to
+    /// a chat-completions or anthropic endpoint would make every request fail rather
+    /// than add a capability, so the protocol is half of the rule.
+    #[test]
+    fn the_hosted_web_tool_needs_the_switch_and_the_protocol() {
+        assert!(
+            offers_web_search(true, "responses"),
+            "on, responses: offered"
+        );
+        assert!(
+            !offers_web_search(false, "responses"),
+            "off, responses: withdrawn"
+        );
+        assert!(
+            !offers_web_search(true, "chat"),
+            "on, chat: refused, the endpoint cannot carry a hosted tool"
+        );
+        assert!(
+            !offers_web_search(true, "anthropic"),
+            "on, anthropic: refused"
+        );
+        assert!(!offers_web_search(true, ""), "on, unset protocol: refused");
     }
 }

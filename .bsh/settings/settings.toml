@@ -1,0 +1,26 @@
+schema_version = 0
+
+[general]
+provider = "nvidia"
+model = "z-ai/glm-5.3-flash"
+active_session = "c2d1f1ab-1701-4fc8-9040-b54a54229fdf"
+
+[agent]
+system_prompt = "You are a helpful assistant."
+temperature = 0.7
+permission = "workspace-write"
+bash_enabled = true
+file_tools_enabled = true
+web_tools_enabled = true
+parallel_tool_calls = false
+memory_enabled = true
+context_budget = 32768
+max_steps = 10
+shell_timeout_secs = 300
+tool_output_cap = 16384
+mcp_servers = []
+
+[disabled]
+tools = []
+skills = []
+extentions = []

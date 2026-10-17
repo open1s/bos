@@ -705,7 +705,12 @@ impl Shell {
     }
 
     fn open_controls(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let root = self.state.settings.active_workspace.clone();
+        let root = self
+            .state
+            .settings
+            .active_workspace()
+            .map(|workspace| workspace.root.clone())
+            .unwrap_or_default();
         if root.trim().is_empty() {
             return None;
         }
@@ -862,7 +867,7 @@ impl Shell {
             // `developerTools` preference (Show coding view) is on; measured
             // in `dsh-client-ui-conversation`, whose header does
             // `if (!developerTools) return null` for this entry.
-            .when(self.state.settings.developer_tools, |strip| {
+            .when(self.state.draft().global.general.developer_tools, |strip| {
                 strip.child(entry(
                     "tab-trajectory",
                     "tab.trajectory",

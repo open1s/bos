@@ -311,7 +311,11 @@ impl Shell {
                                             .on_click(move |_, _window, cx| {
                                                 pick.update(cx, |this, cx| {
                                                     this.state.sort = option;
-                                                    this.state.settings.session_sort =
+                                                    this.state
+                                                        .settings
+                                                        .global
+                                                        .general
+                                                        .session_sort =
                                                         option.persisted().to_string();
                                                     let _ = this.state.settings.save();
                                                     cx.notify();
@@ -342,7 +346,7 @@ impl Shell {
             tree = tree.child(self.search_row());
         }
 
-        for workspace in &self.state.settings.workspaces {
+        for workspace in &self.state.settings.global.workspaces {
             let folded = self.state.collapsed.contains(&workspace.id);
             let name = workspace.name.clone();
             let ws_id = workspace.id.clone();
@@ -714,7 +718,7 @@ impl Shell {
                                 move |_, _window, cx| {
                                     toggle_shell.update(cx, |this, cx| {
                                         this.state.lang.toggle();
-                                        this.state.settings.lang =
+                                        this.state.settings.global.general.lang =
                                             this.state.lang.locale().to_string();
                                         let _ = this.state.settings.save();
                                         cx.notify();
@@ -725,7 +729,7 @@ impl Shell {
                                 move |_, window, cx| {
                                     look_shell.update(cx, |this, cx| {
                                         crate::theme::toggle(window, cx);
-                                        this.state.settings.theme_mode =
+                                        this.state.settings.global.general.theme_mode =
                                             crate::theme::mode(cx).to_string();
                                         let _ = this.state.settings.save();
                                         cx.notify();

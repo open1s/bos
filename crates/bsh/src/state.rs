@@ -185,14 +185,34 @@ pub(crate) struct AppState {
 impl AppState {
     /// Load the store and settings, guaranteeing an active session.
     pub(crate) fn new() -> Self {
-        Self::with_store(Store::open())
+        let settings = Settings::load();
+        let mut store = Store::open(&session_roots(&settings)).with_secrets(settings.secrets());
+        // A session whose workspace the registry no longer names is loaded and
+        // then filtered out of every sidebar row, so it is history the reader
+        // cannot reach. Attaching it to the workspace in use is the only thing
+        // that can happen to it.
+        store.rehome_orphans(&settings.global.general.active_workspace);
+        Self::assemble(store, settings)
     }
 
-    /// Build the state over an explicit store. `new` passes the one under the
-    /// user home; tests pass a scratch one so no real session file is written.
+    /// Build the state over an explicit store and the shipped defaults.
+    ///
+    /// Test-only: a scratch store is how a test keeps real session files out of
+    /// the user home, and `Settings::default()` is how it keeps that machine's
+    /// own configuration out of the assertions. Reading the real file here made
+    /// a measured copy assertion depend on the developer's language and context
+    /// budget - a green suite on one machine and a red one on the next.
+    /// `new` reads the settings first, because it needs the workspace registry
+    /// to know where the store is rooted, so it cannot come through here
+    /// without parsing the file twice.
+    #[cfg(test)]
     pub(crate) fn with_store(store: Store) -> Self {
-        let settings = Settings::load();
-        let lang = Lang::from_locale(&settings.lang);
+        Self::assemble(store, Settings::default())
+    }
+
+    /// Build the state from a store and the settings already in hand.
+    fn assemble(store: Store, settings: Settings) -> Self {
+        let lang = Lang::from_locale(&settings.global.general.lang);
         let mut state = Self {
             store,
             settings,
@@ -227,6 +247,17 @@ impl AppState {
             narrow_expanded: false,
             turn_started: None,
         };
+        // The registry is a fact about the launch, so it is settled before
+        // anything that depends on it reads it - a restored session is tagged
+        // with a workspace id, and the panes that show a workspace resolve that
+        // id through the registry.
+        state.settings.ensure_workspace();
+        // A scratch store is a scratch home: the settings a test moves are
+        // written beside the sessions it makes, never over the user's real
+        // configuration.
+        if state.store.is_scratch() {
+            state.settings.save_root = Some(state.store.root().to_path_buf());
+        }
         state.ensure_active();
         state
     }
@@ -274,9 +305,16 @@ impl AppState {
     /// Create a chat in the active workspace and select it.
     pub(crate) fn new_session(&mut self) -> Option<String> {
         self.settings.ensure_workspace();
-        let workspace = self.settings.active_workspace.clone();
+        // A session is tagged with the workspace's stable id, which is the key
+        // the sidebar and the restore filter both read. Tagging it with the
+        // root would make every new session invisible to both.
+        let workspace = self
+            .settings
+            .active_workspace()
+            .map(|record| record.id.clone())
+            .unwrap_or_default();
         let session = Session::new(
-            &workspace,
+            workspace.as_str(),
             crate::i18n::tr(self.lang, "row.newChat").as_str(),
         );
         let id = session.id.clone();
@@ -289,7 +327,13 @@ impl AppState {
     /// Select a session by id.
     /// Reopen the session the user was last in, else the newest one here.
     pub(crate) fn restore_session(&mut self) {
-        let remembered = self.settings.active_session.trim().to_string();
+        let remembered = self
+            .settings
+            .workspace
+            .general
+            .active_session
+            .trim()
+            .to_string();
         let archived: Vec<String> = self
             .store
             .archived()
@@ -303,7 +347,11 @@ impl AppState {
             self.select(&remembered);
             return;
         }
-        let workspace = self.settings.active_workspace.clone();
+        let workspace = self
+            .settings
+            .active_workspace()
+            .map(|record| record.id.clone())
+            .unwrap_or_default();
         let newest = self
             .store
             .in_workspace(&workspace)
@@ -320,7 +368,7 @@ impl AppState {
         if self.store.session(id).is_some() {
             self.active_id = Some(id.to_string());
             self.tab = Tab::Chat;
-            self.settings.active_session = id.to_string();
+            self.settings.workspace.general.active_session = id.to_string();
             let _ = self.settings.save();
         }
     }
@@ -331,7 +379,7 @@ impl AppState {
     /// sits under; bsh keeps the same session and moves its owning workspace,
     /// because the chat the editor sits over already exists.
     pub(crate) fn set_workspace(&mut self, workspace: &str) {
-        self.settings.active_workspace = workspace.to_string();
+        self.settings.global.general.active_workspace = workspace.to_string();
         if let Some(id) = self.active_id.clone() {
             if let Some(session) = self.store.session_mut(&id) {
                 session.workspace = workspace.to_string();
@@ -468,14 +516,14 @@ impl AppState {
             .map(|usage| usage.model.clone())
             .filter(|model| !model.is_empty());
         from_turn.or_else(|| {
-            let configured = self.settings.model.clone();
+            let configured = self.settings.effective().model;
             (!configured.is_empty()).then_some(configured)
         })
     }
 
     /// The last turn's prompt size and the context budget behind the meter.
     pub(crate) fn context_figures(&self) -> Option<(u64, u64)> {
-        let budget = self.settings.context_budget as u64;
+        let budget = self.settings.workspace.agent.context_budget as u64;
         let (prompt, _) = self.last_usage()?;
         (budget > 0 && prompt > 0).then_some((prompt, budget))
     }
@@ -659,7 +707,7 @@ impl AppState {
         let terminal = matches!(event, AgentEvent::Done | AgentEvent::Error(_));
         // Read before the session borrow: the usage that lands belongs to the
         // model the turn was sent to, which is what the status bar names.
-        let model = self.settings.model.clone();
+        let model = self.settings.effective().model;
         {
             let Some(session) = self.store.session_mut(id) else {
                 return;
@@ -848,8 +896,20 @@ impl AppState {
             self.settings = draft;
         }
         self.settings.ensure_workspace();
-        self.overlay = Overlay::None;
-        self.settings.save()
+        match self.settings.save() {
+            Ok(()) => {
+                self.overlay = Overlay::None;
+                Ok(())
+            }
+            Err(error) => {
+                // A refused write keeps the dialog open, with the draft the
+                // reader had, because the refusal is something they can fix in
+                // it - closing the pane over a notice would take the only place
+                // the fix can be made away with it.
+                self.draft = Some(self.settings.clone());
+                Err(error)
+            }
+        }
     }
 
     /// The settings being edited, falling back to the saved ones.
@@ -871,63 +931,177 @@ impl AppState {
     /// Switch one tool on or off in the draft.
     pub(crate) fn toggle_tool_off(&mut self, name: &str) {
         let draft = self.draft_mut();
-        match draft.disabled_tools.iter().position(|tool| tool == name) {
+        match draft
+            .workspace
+            .disabled
+            .tools
+            .iter()
+            .position(|tool| tool == name)
+        {
             Some(index) => {
-                draft.disabled_tools.remove(index);
+                draft.workspace.disabled.tools.remove(index);
             }
-            None => draft.disabled_tools.push(name.to_string()),
+            None => draft.workspace.disabled.tools.push(name.to_string()),
         }
     }
 
     /// Make one provider the endpoint the agent is built against.
+    ///
+    /// The workspace records which of the global providers it uses; it never
+    /// carries a second copy of the endpoint, so changing it here cannot drop
+    /// the credential.
     pub(crate) fn select_provider(&mut self, name: &str) {
-        self.draft_mut().active_provider = name.to_string();
-    }
-
-    /// Save the endpoint in the draft as a named provider, or say why it cannot
-    /// be saved.
-    ///
-    /// A refused call changes nothing, so pressing add with a name that is
-    /// already saved no longer quietly rewrites the provider behind it.
-    pub(crate) fn add_provider(
-        &mut self,
-        name: &str,
-    ) -> Result<(), crate::settings::ProviderRefusal> {
-        self.draft_mut().add_provider(name)
-    }
-    /// Update the provider behind the original name from the draft fields, or
-    /// say why it cannot be updated.
-    pub(crate) fn update_provider(
-        &mut self,
-        original: &str,
-        name: &str,
-    ) -> Result<(), crate::settings::ProviderRefusal> {
-        self.draft_mut().update_provider(original, name)
-    }
-
-    /// Load a provider into the draft and put the form into edit mode.
-    ///
-    /// The row may come from the BOS config rather than the draft, so the values
-    /// are handed in: saving then writes a draft provider that overrides the
-    /// configured one instead of silently doing nothing.
-    pub(crate) fn begin_provider_edit(&mut self, profile: &crate::settings::Profile) {
-        {
+        // The two halves move together. The workspace file refuses a selection
+        // that names a provider and no model, so writing the provider alone left
+        // the document uncommittable: creating a fresh provider made the NEXT
+        // save fail with "names only half a model", about a model the reader had
+        // never been asked for.
+        //
+        // A provider with no models yet leaves no selection at all, which is a
+        // state the file accepts and the composer already explains.
+        let first = self
+            .draft()
+            .global
+            .providers
+            .get(name)
+            .and_then(|provider| provider.models.keys().next().cloned());
+        // A provider with no models cannot be selected at all: the pair must be
+        // both or neither, so there is nothing to point the other half at. The
+        // selection is left where it was rather than emptied, so creating a
+        // provider does not silently drop the model the reader was using.
+        if let Some(model) = first {
             let draft = self.draft_mut();
-            draft.model = profile.model.clone();
-            draft.base_url = profile.base_url.clone();
-            draft.api_key = profile.api_key.clone();
+            draft.workspace.general.provider = name.to_string();
+            draft.workspace.general.model = model;
         }
-        self.editing_provider = Some(profile.name.clone());
+    }
+
+    /// Make one model the workspace's active choice, by nickname.
+    ///
+    /// The reference's model menu writes the same reference the workspace
+    /// resolves against: a provider id and the nickname it is filed under,
+    /// never a bare model string, so a rename does not orphan the choice.
+    pub(crate) fn select_model(&mut self, nickname: &str) {
+        self.draft_mut().workspace.general.model = nickname.to_string();
+    }
+    /// Save a provider into the global tree, or say why it cannot be saved.
+    ///
+    /// A refused call changes nothing, so pressing create with an id the tree
+    /// already holds no longer quietly rewrites the provider behind it.
+    pub(crate) fn add_custom_provider(
+        &mut self,
+        id: &str,
+        name: &str,
+        base_url: &str,
+        api_key: &str,
+        models: &[crate::settings::global::ModelEntry],
+    ) -> Result<(), crate::settings::provider::ProviderRefusal> {
+        if id.trim().is_empty() {
+            return Err(crate::settings::provider::ProviderRefusal::NameEmpty);
+        }
+        if self.draft_mut().global.providers.contains_key(id) {
+            return Err(crate::settings::provider::ProviderRefusal::IdTaken);
+        }
+        if base_url.trim().is_empty() {
+            return Err(crate::settings::provider::ProviderRefusal::NeedsBaseUrl);
+        }
+        if let Some(refusal) = crate::settings::provider::base_url_refusal(base_url) {
+            return Err(refusal);
+        }
+        if models.is_empty() {
+            return Err(crate::settings::provider::ProviderRefusal::NeedsModel);
+        }
+        self.draft_mut()
+            .global
+            .add_custom_provider(id, name, base_url, api_key, models);
+        Ok(())
+    }
+
+    /// Add a shipped family provider, taking its own endpoint and protocol.
+    ///
+    /// The catalogue route of the add card lands here: an id the tree already
+    /// holds is refused, because the id is the registry key the engine
+    /// registers the vendor under and two of them cannot share it.
+    pub(crate) fn add_shipped_provider(
+        &mut self,
+        id: &str,
+        api_key: &str,
+    ) -> Result<(), crate::settings::provider::ProviderRefusal> {
+        if self.draft_mut().global.providers.contains_key(id) {
+            return Err(crate::settings::provider::ProviderRefusal::IdTaken);
+        }
+        let Some((_, base_url, _)) = crate::settings::global::built_in(id) else {
+            return Err(crate::settings::provider::ProviderRefusal::NeedsModel);
+        };
+        self.draft_mut()
+            .global
+            .add_provider(id, "", base_url, api_key, &[]);
+        Ok(())
+    }
+
+    /// Switch one input type on one model leaf of a provider.
+    pub(crate) fn toggle_model_input(&mut self, provider: &str, key: &str, kind: &str) {
+        self.draft_mut().global.set_input_type(provider, key, kind);
+        self.provider_refusal = None;
+    }
+    /// Edit the connection and the model leaves of a provider already in the
+    /// tree.
+    pub(crate) fn set_provider_connection(&mut self, id: &str, base_url: &str, api_key: &str) {
+        self.draft_mut()
+            .global
+            .set_connection(id, base_url, api_key);
+    }
+
+    /// Rename a provider. The id is the wire prefix and never changes; the
+    /// display name is the pane's to edit.
+    pub(crate) fn set_provider_name(&mut self, id: &str, name: &str) {
+        self.draft_mut().global.set_provider_name(id, name);
+    }
+
+    /// Add one model leaf under a provider, or say why it is refused.
+    pub(crate) fn add_model(
+        &mut self,
+        provider: &str,
+        nickname: &str,
+        display: &str,
+        model: &str,
+        api_mode: &str,
+    ) -> Result<(), crate::settings::provider::ProviderRefusal> {
+        self.draft_mut()
+            .global
+            .add_model(provider, nickname, display, model, api_mode)
+    }
+
+    /// Replace one model leaf in place.
+    pub(crate) fn update_model(
+        &mut self,
+        provider: &str,
+        nickname: &str,
+        entry: &crate::settings::global::ModelEntry,
+    ) -> Result<(), crate::settings::provider::ProviderRefusal> {
+        self.draft_mut()
+            .global
+            .update_model(provider, nickname, entry)
+    }
+
+    /// Drop one model leaf; the connection is left alone.
+    pub(crate) fn remove_model(&mut self, provider: &str, nickname: &str) -> bool {
+        self.draft_mut().global.remove_model(provider, nickname)
+    }
+
+    /// Load a provider into the form and put the pane into edit mode.
+    pub(crate) fn begin_provider_edit(&mut self, id: &str) {
+        self.editing_provider = Some(id.to_string());
         self.provider_refusal = None;
         self.removing_provider = None;
     }
 
-    /// Drop a saved provider, clearing the selection if it was the active one.
+    /// Drop a provider from the global tree, clearing the selection when the
+    /// workspace had chosen it.
     pub(crate) fn remove_provider(&mut self, name: &str) {
         let draft = self.draft_mut();
-        draft.providers.retain(|saved| saved.name != name);
-        if draft.active_provider == name {
-            draft.active_provider.clear();
+        if draft.global.remove_provider(name) && draft.workspace.general.provider == name {
+            draft.workspace.general.provider.clear();
         }
         self.removing_provider = None;
     }
@@ -944,37 +1118,45 @@ impl AppState {
 
     /// Turn concurrent tool dispatch for one assistant turn on or off.
     pub(crate) fn set_parallel_tool_calls(&mut self, parallel: bool) {
-        self.draft_mut().parallel_tool_calls = parallel;
+        self.draft_mut().workspace.agent.parallel_tool_calls = parallel;
     }
 
-    /// Make one preset the agent the next turn is built from.
+    /// Make one preset the default a session takes when it names none.
     pub(crate) fn select_preset(&mut self, name: &str) {
-        self.draft_mut().preset = name.to_string();
+        self.draft_mut().global.default_preset = name.to_string();
     }
 
     /// Switch one plugin on or off in the draft.
     pub(crate) fn toggle_plugin_off(&mut self, name: &str) {
         let draft = self.draft_mut();
         match draft
-            .disabled_plugins
+            .workspace
+            .disabled
+            .extentions
             .iter()
             .position(|plugin| plugin == name)
         {
             Some(index) => {
-                draft.disabled_plugins.remove(index);
+                draft.workspace.disabled.extentions.remove(index);
             }
-            None => draft.disabled_plugins.push(name.to_string()),
+            None => draft.workspace.disabled.extentions.push(name.to_string()),
         }
     }
 
     /// Switch one skill on or off in the draft.
     pub(crate) fn toggle_skill_off(&mut self, name: &str) {
         let draft = self.draft_mut();
-        match draft.disabled_skills.iter().position(|skill| skill == name) {
+        match draft
+            .workspace
+            .disabled
+            .skills
+            .iter()
+            .position(|skill| skill == name)
+        {
             Some(index) => {
-                draft.disabled_skills.remove(index);
+                draft.workspace.disabled.skills.remove(index);
             }
-            None => draft.disabled_skills.push(name.to_string()),
+            None => draft.workspace.disabled.skills.push(name.to_string()),
         }
     }
 }
@@ -1181,6 +1363,18 @@ pub(crate) fn display_text(text: &str, attachments: &[Attachment]) -> String {
     format!("{}{}{}", text, "\n", names.join(" "))
 }
 
+/// The `(workspace id, root)` pairs the session store scatters sessions across.
+///
+/// The store is rooted per workspace, so a session file lives beside the
+/// workspace it belongs to; the registry is what turns an id into a path.
+fn session_roots(settings: &Settings) -> Vec<(String, String)> {
+    settings
+        .global
+        .workspaces
+        .iter()
+        .map(|workspace| (workspace.id.clone(), workspace.root.clone()))
+        .collect()
+}
 #[cfg(test)]
 mod tests {
     fn image_fixture() -> super::Attachment {
@@ -1281,7 +1475,22 @@ mod tests {
         let mut state = super::AppState::with_store(crate::store::Store::open_at(
             "target/bsh-status-home".into(),
         ));
-        state.settings.model = "first-model".to_string();
+        // The tree owns the model: the workspace records which one it uses, and
+        // the status bar reads the leaf the reference resolves to.
+        let mut global = state.settings.global.clone();
+        global.add_custom_provider(
+            "local",
+            "Local",
+            "https://local.example/v1",
+            "key",
+            &[
+                crate::settings::global::ModelEntry::named("first-model"),
+                crate::settings::global::ModelEntry::named("second-model"),
+            ],
+        );
+        state.settings.global = global;
+        state.settings.workspace.general.provider = "local".to_string();
+        state.settings.workspace.general.model = "first-model".to_string();
         assert_eq!(
             state.status_model().as_deref(),
             Some("first-model"),
@@ -1299,7 +1508,7 @@ mod tests {
         );
         assert_eq!(state.status_model().as_deref(), Some("first-model"));
 
-        state.settings.model = "second-model".to_string();
+        state.settings.workspace.general.model = "second-model".to_string();
         state.apply_event(
             &id,
             super::AgentEvent::Usage {
@@ -1321,7 +1530,7 @@ mod tests {
         let mut state = super::AppState::with_store(crate::store::Store::open_at(
             "target/bsh-status-empty".into(),
         ));
-        state.settings.model = String::new();
+        state.settings.workspace.general.model = String::new();
         assert_eq!(state.status_model(), None);
     }
 

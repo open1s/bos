@@ -41,10 +41,10 @@ impl Render for Harness {
 /// compares against a measured number calls this first, and the assertion then
 /// tests what the reference ships, not what this machine has drifted to.
 fn tests_pin_reference_defaults(state: &mut AppState) {
-    state.settings.content_font_size = crate::theme::CONTENT_DEFAULT;
-    state.settings.sidebar_width = None;
-    state.settings.content_width = None;
-    state.settings.theme_mode = "system".to_string();
+    state.settings.global.general.content_font_size = crate::theme::CONTENT_DEFAULT;
+    state.settings.global.general.sidebar_width = None;
+    state.settings.global.general.content_width = None;
+    state.settings.global.general.theme_mode = "system".to_string();
 }
 
 /// A store rooted in the build directory: a test must never touch real sessions.
@@ -1367,7 +1367,16 @@ fn plugin_switch_writes_the_disabled_plugin(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    let disabled = cx.update(|_, cx| shell.read(cx).state.draft().disabled_plugins.clone());
+    let disabled = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .disabled
+            .extentions
+            .clone()
+    });
     assert_eq!(
         disabled,
         vec!["shell".to_string()],
@@ -1382,7 +1391,7 @@ fn agent_loop_pane_loads_the_step_ceiling(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("agent-loop", 2);
-        state.settings.max_steps = 23;
+        state.settings.workspace.agent.max_steps = 23;
         let shell =
             cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
         Harness { shell }
@@ -1435,98 +1444,178 @@ fn plugins_row_opens_the_builtin_plugins_pane(cx: &mut TestAppContext) {
     );
 }
 
-/// The models pane lists the providers and a click makes one the endpoint the
-/// agent is built against, so the list is not decoration.
+/// The models pane is the reference card list: the head carries identity and
+/// the two actions, and delete asks before it drops a saved provider.
 #[gpui::test]
-fn provider_row_click_selects_the_endpoint(cx: &mut TestAppContext) {
+fn provider_cards_offer_edit_and_a_confirming_delete(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("provider-row", 2);
-        // Both kinds of row, with the discovered ones first, so the index each
-        // provider gets is pinned by the test rather than by this machine.
-        state.settings.profiles = vec![profile("discovered", "https://discovered")];
-        state.settings.providers = vec![profile("work", "https://work.example")];
-        state.settings.active_provider = String::new();
+        let state = state_with_turns("provider-card", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
         Harness { shell }
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // Two providers, so a delete that dropped every provider could not pass, and
+    // the tree order is pinned by the ids rather than by this machine.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "alpha",
+                "https://alpha.example",
+            );
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
 
-    let bounds = cx
+    // The head is identity, not a way to pick the endpoint: the reference has no
+    // such affordance, so pressing it must not select anything.
+    let head = cx
         .debug_bounds("provider-0")
-        .expect("the first provider row");
-    cx.simulate_click(bounds.center(), Modifiers::default());
+        .expect("the first provider card");
+    cx.simulate_click(head.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let active = cx.update(|_, cx| shell.read(cx).state.draft().active_provider.clone());
+    let editing = cx.update(|_, cx| shell.read(cx).state.editing_provider.clone());
+    assert_eq!(editing, None, "the head must not open the editor");
+    let keys: Vec<String> = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .providers
+            .keys()
+            .cloned()
+            .collect()
+    });
     assert_eq!(
-        active, "discovered",
-        "a discovered profile is selectable too, and it is the first row"
+        keys,
+        ["alpha".to_string(), "work".to_string()],
+        "the tree keeps both providers"
     );
 
-    let bounds = cx
-        .debug_bounds("provider-1")
-        .expect("the saved provider row");
-    cx.simulate_click(bounds.center(), Modifiers::default());
+    // Edit opens the editor inside that card.
+    let edit = cx
+        .debug_bounds("provider-edit-1")
+        .expect("the second card's Edit action");
+    cx.simulate_click(edit.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let active = cx.update(|_, cx| shell.read(cx).state.draft().active_provider.clone());
+    let editing = cx.update(|_, cx| shell.read(cx).state.editing_provider.clone());
     assert_eq!(
-        active, "work",
-        "the click must make this provider the endpoint"
+        editing.as_deref(),
+        Some("work"),
+        "Edit opens the editor for that provider"
+    );
+    assert!(
+        cx.debug_bounds("provider-editor").is_some(),
+        "the editor opens inside the card"
     );
 
-    let bounds = cx
+    // Delete asks in a dialog before it drops a saved provider.
+    let remove = cx
         .debug_bounds("provider-remove-1")
-        .expect("the remove control");
-    cx.simulate_click(bounds.center(), Modifiers::default());
+        .expect("the second card's Delete action");
+    cx.simulate_click(remove.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let saved = cx.update(|_, cx| shell.read(cx).state.draft().providers.clone());
+    let pending = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state.removing_provider.clone(),
+            state.draft().global.providers.len(),
+        )
+    });
     assert_eq!(
-        saved.len(),
-        1,
-        "the remove control must ask before it drops the saved provider"
+        pending,
+        (Some("work".to_string()), 2),
+        "the Delete action must ask before it drops the saved provider"
     );
-
-    let block = cx
-        .debug_bounds("provider-delete-dialog")
-        .expect("the confirmation dialog");
     assert!(
-        cx.debug_bounds("provider-1").is_some(),
-        "the reference confirms in a dialog, so the row it guards stays put"
+        cx.debug_bounds("provider-delete-dialog").is_some(),
+        "the reference confirms in a dialog"
     );
-    let pane = cx.debug_bounds("settings-pane").expect("the pane");
-    let pane_bottom = pane.origin.y + pane.size.height;
-    assert!(
-        block.origin.y < pane_bottom,
-        "the confirmation must stand where the row stood, inside the visible pane \
-         (block {block:?}, pane {pane:?})"
-    );
-    let bounds = cx
+    let confirm = cx
         .debug_bounds("provider-delete-confirm")
         .expect("the confirm control");
-    cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.simulate_click(confirm.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let saved = cx.update(|_, cx| shell.read(cx).state.draft().providers.clone());
+    let left = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state.removing_provider.clone(),
+            state.draft().global.providers.clone(),
+        )
+    });
+    assert_eq!(left.0, None, "the confirmation closes the pending delete");
     assert!(
-        saved.is_empty(),
-        "the confirm control must drop the saved provider"
+        !left.1.contains_key("work"),
+        "and the confirmed provider is dropped from the tree"
     );
-    let active = cx.update(|_, cx| shell.read(cx).state.draft().active_provider.clone());
-    assert_eq!(
-        active, "",
-        "dropping the active provider must clear the selection"
+    assert!(
+        left.1.contains_key("alpha"),
+        "the other provider stays where it was"
     );
 }
 
-/// A provider named for a test, so no real endpoint is needed.
-fn profile(name: &str, base_url: &str) -> crate::settings::Profile {
-    crate::settings::Profile {
-        name: name.to_string(),
-        model: format!("{name}-model"),
-        base_url: base_url.to_string(),
-        api_key: format!("{name}-key"),
-    }
+/// The refusal the backend computes is the sentence the pane draws: a row that
+/// repeats an id the tree already carries says so, in its own inline style,
+/// rather than leaving the apply looking broken.
+#[gpui::test]
+fn a_refused_apply_says_why(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("provider-refusal", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            let draft = this.state.draft_mut();
+            let mut global = draft.global.clone();
+            global.add_provider("work", "", "https://work.example/v1", "k", &[]);
+            let _ = global.add_model("work", "fast", "", "gpt-4o-mini", "");
+            draft.global = global;
+            this.state.editing_provider = Some("work".to_string());
+            this.reload_model_rows("work", window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("provider-refusal").is_none(),
+        "a freshly opened editor carries no refusal from a previous apply"
+    );
+
+    // A second row with the same API id the first one already carries.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.provider_refusal =
+                Some(crate::settings::provider::ProviderRefusal::ModelIdDuplicate.key());
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("provider-refusal").is_some(),
+        "the refusal is drawn in the editor, in the inline error style"
+    );
+}
+
+/// Seed one provider into the global tree the panes edit, with one model leaf
+/// so a workspace can name it.
+fn seed_provider(global: &mut crate::settings::global::GlobalSettings, id: &str, base_url: &str) {
+    global.add_provider(
+        id,
+        "",
+        base_url,
+        "",
+        &[crate::settings::global::ModelEntry::named(&format!(
+            "{id}-model"
+        ))],
+    );
 }
 
 /// The model chip opens its own menu in place, the way the reference's trigger
@@ -1658,14 +1747,16 @@ fn preset_row_click_selects_the_preset(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("preset-row", 2);
-        state.settings.presets = vec![agent::plugins::presets::Preset {
-            name: "careful".to_string(),
-            tools: vec!["bash".to_string()],
-            model: Some("careful-model".to_string()),
-            system_prompt: None,
-            max_steps: Some(4),
-        }];
-        state.settings.preset = String::new();
+        state.settings.global.presets.insert(
+            "careful".to_string(),
+            crate::settings::global::Preset {
+                name: Some("careful".to_string()),
+                plugins: vec!["bash".to_string()],
+                description: None,
+                order: None,
+            },
+        );
+        state.settings.global.default_preset = "careful".to_string();
         let shell =
             cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
         Harness { shell }
@@ -1676,13 +1767,13 @@ fn preset_row_click_selects_the_preset(cx: &mut TestAppContext) {
     let row = cx.debug_bounds("preset-0").expect("the preset row");
     cx.simulate_click(row.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let picked = cx.update(|_, cx| shell.read(cx).state.draft().preset.clone());
+    let picked = cx.update(|_, cx| shell.read(cx).state.draft().global.default_preset.clone());
     assert_eq!(picked, "careful", "the row must select the preset it shows");
 
     let clear = cx.debug_bounds("preset-default").expect("the default row");
     cx.simulate_click(clear.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let picked = cx.update(|_, cx| shell.read(cx).state.draft().preset.clone());
+    let picked = cx.update(|_, cx| shell.read(cx).state.draft().global.default_preset.clone());
     assert_eq!(picked, "", "the default row must clear the selection");
 }
 
@@ -1693,7 +1784,7 @@ fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("parallel-switch", 2);
-        state.settings.parallel_tool_calls = false;
+        state.settings.workspace.agent.parallel_tool_calls = false;
         let shell =
             cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
         Harness { shell }
@@ -1706,7 +1797,15 @@ fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
         .expect("the switch row");
     cx.simulate_click(row.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let on = cx.update(|_, cx| shell.read(cx).state.draft().parallel_tool_calls);
+    let on = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .parallel_tool_calls
+    });
     assert!(on, "the switch must turn concurrent dispatch on");
 
     let row = cx
@@ -1714,7 +1813,15 @@ fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
         .expect("the switch row again");
     cx.simulate_click(row.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let off = cx.update(|_, cx| shell.read(cx).state.draft().parallel_tool_calls);
+    let off = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .parallel_tool_calls
+    });
     assert!(!off, "pressing the switch again must turn it back off");
 }
 
@@ -1820,7 +1927,8 @@ fn the_sidebar_order_survives_a_restart(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("sort-restart", 1);
-        state.settings.session_sort = crate::store::SessionSort::Name.persisted().to_string();
+        state.settings.global.general.session_sort =
+            crate::store::SessionSort::Name.persisted().to_string();
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -1843,7 +1951,10 @@ fn the_header_offers_to_open_the_workspace(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("open-workspace", 1);
-        state.settings.active_workspace = "/tmp".to_string();
+        // The open controls resolve the active id through the registry, so the
+        // path the pane opens is the one a workspace record names.
+        let id = state.settings.note_workspace("scratch", "/tmp");
+        state.settings.global.general.active_workspace = id;
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -1855,12 +1966,26 @@ fn the_header_offers_to_open_the_workspace(cx: &mut TestAppContext) {
             .read(cx)
             .state
             .settings
+            .global
+            .general
             .active_workspace
             .clone()
     });
-    assert_eq!(
-        workspace, "/tmp",
+    assert!(
+        !workspace.is_empty(),
         "the scratch state must carry the workspace to open"
+    );
+    assert_eq!(
+        cx.update(|_, cx| harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .settings
+            .active_workspace()
+            .map(|record| record.root.clone())),
+        Some("/tmp".to_string()),
+        "and the id must resolve to the root the open control edits"
     );
     assert!(
         cx.debug_bounds("hdr-open").is_some(),
@@ -1877,7 +2002,7 @@ fn the_header_hides_the_open_control_without_a_workspace(cx: &mut TestAppContext
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("open-workspace-none", 1);
-        state.settings.active_workspace = String::new();
+        state.settings.global.general.active_workspace = String::new();
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -1889,6 +2014,8 @@ fn the_header_hides_the_open_control_without_a_workspace(cx: &mut TestAppContext
             .read(cx)
             .state
             .settings
+            .global
+            .general
             .active_workspace
             .clone()
     });
@@ -1915,12 +2042,14 @@ fn the_models_pane_is_the_reference_card_list(cx: &mut TestAppContext) {
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    // Pin the indices: clear the discovered profiles so the saved provider is
-    // the first and only card.
+    // Pin the indices: the seeded provider is the first and only card.
     cx.update(|_, cx| {
         shell.update(cx, |this, _| {
-            this.state.draft_mut().profiles = Vec::new();
-            this.state.draft_mut().providers = vec![profile("work", "https://work.example")];
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -1986,7 +2115,9 @@ fn the_models_pane_is_the_reference_card_list(cx: &mut TestAppContext) {
         "the endpoint"
     );
     assert!(
-        cx.debug_bounds("set-api-mode-auto").is_some(),
+        cx.debug_bounds("api-mode-chat").is_some()
+            && cx.debug_bounds("api-mode-responses").is_some()
+            && cx.debug_bounds("api-mode-anthropic").is_some(),
         "the protocol chips"
     );
 
@@ -2005,17 +2136,14 @@ fn the_models_pane_is_the_reference_card_list(cx: &mut TestAppContext) {
         "the button is gone while the card is open"
     );
     assert!(
-        cx.debug_bounds("models-mode-custom").is_some(),
-        "custom mode"
+        cx.debug_bounds("add-route-Custom").is_some(),
+        "the custom route"
     );
     assert!(
-        cx.debug_bounds("models-mode-catalog").is_some(),
-        "catalog mode"
+        cx.debug_bounds("add-route-Catalogue").is_some(),
+        "the catalogue route"
     );
-    assert!(
-        cx.debug_bounds("models-create").is_some(),
-        "the create action"
-    );
+    assert!(cx.debug_bounds("add-create").is_some(), "the create action");
 }
 
 /// General carries the reference's rows and stops at its own current-version
@@ -2040,32 +2168,34 @@ fn the_general_pane_carries_no_build_facts(cx: &mut TestAppContext) {
     );
 }
 
-/// The Models pane writes the API protocol, and automatic clears it again.
+/// The Models pane writes the API protocol on the family leaf, and the one the
+/// agent is built with is what the pane picked.
 #[gpui::test]
 fn api_protocol_row_writes_the_setting(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("api-mode", 1);
-        state.settings.api_mode = "chat".to_string();
+        let state = state_with_turns("api-mode", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
         Harness { shell }
     });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     // The protocol chips sit in the provider editor's Customized settings fold,
-    // so seed a provider and open both before the first frame. The add card
-    // carries the same chips, but four fields above them puts the control past
-    // the window and the harness cannot press it.
+    // so seed a provider and open both before the first frame.
     cx.update(|_, cx| {
-        let shell = harness.read(cx).shell.clone();
         shell.update(cx, |this, _| {
-            this.state.draft_mut().providers = vec![profile("work", "https://work.example")];
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
             this.state.editing_provider = Some("work".to_string());
             this.models_advanced_open = true;
-        });
+        })
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
     let bounds = cx
-        .debug_bounds("set-api-mode-responses")
+        .debug_bounds("api-mode-responses")
         .expect("the models pane must offer the Responses protocol");
     cx.simulate_click(bounds.center(), Modifiers::default());
     let mode = cx.update(|_, cx| {
@@ -2075,8 +2205,8 @@ fn api_protocol_row_writes_the_setting(cx: &mut TestAppContext) {
             .read(cx)
             .state
             .draft()
-            .api_mode
-            .clone()
+            .global
+            .family_protocol_of("work")
     });
     assert_eq!(
         mode, "responses",
@@ -2084,8 +2214,8 @@ fn api_protocol_row_writes_the_setting(cx: &mut TestAppContext) {
     );
 
     let bounds = cx
-        .debug_bounds("set-api-mode-auto")
-        .expect("the models pane must offer automatic");
+        .debug_bounds("api-mode-chat")
+        .expect("the models pane must offer the chat protocol");
     cx.simulate_click(bounds.center(), Modifiers::default());
     let mode = cx.update(|_, cx| {
         harness
@@ -2094,13 +2224,10 @@ fn api_protocol_row_writes_the_setting(cx: &mut TestAppContext) {
             .read(cx)
             .state
             .draft()
-            .api_mode
-            .clone()
+            .global
+            .family_protocol_of("work")
     });
-    assert!(
-        mode.is_empty(),
-        "automatic must clear the explicit protocol"
-    );
+    assert_eq!(mode, "chat", "picking chat writes it back");
 }
 
 /// The background jobs are the running turns the reader is not looking at,
@@ -2143,7 +2270,8 @@ fn the_header_counts_background_jobs(cx: &mut TestAppContext) {
         // The shell restores the session the settings name, so pin that to the
         // new one: the turn then runs in the session the reader is not looking
         // at, which is what makes it a background job.
-        state.settings.active_session = state.active_id.clone().expect("a session is active");
+        state.settings.workspace.general.active_session =
+            state.active_id.clone().expect("a session is active");
         state.streams.insert(running, 10);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -2253,14 +2381,17 @@ fn the_stored_content_width_wins_over_the_clamp(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("chat-stored", 2);
-        state.settings.content_width = Some(800.0);
+        state.settings.global.general.content_width = Some(800.0);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let (chat, stored) = cx.update(|_, cx| {
         let shell = harness.read(cx).shell.read(cx);
-        (shell.chat_w(), shell.state.settings.content_width)
+        (
+            shell.chat_w(),
+            shell.state.settings.global.general.content_width,
+        )
     });
     assert_eq!(chat, 800.0, "the stored width overrides the clamp's 920");
     assert_eq!(stored, Some(800.0));
@@ -2644,7 +2775,17 @@ fn the_sidebar_handle_drag_sets_and_stores_the_width(cx: &mut TestAppContext) {
     );
     cx.simulate_mouse_up(moved, gpui_kit::MouseButton::Left, Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let stored = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.settings.sidebar_width);
+    let stored = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .settings
+            .global
+            .general
+            .sidebar_width
+    });
     assert_eq!(stored, Some(320.0), "the store keeps base + dx");
     let column = cx.debug_bounds("sidebar").expect("the sidebar column");
     assert_eq!(column.size.width, px(320.0), "and the column followed it");
@@ -2711,7 +2852,10 @@ fn the_chat_handle_drag_sets_and_stores_the_width(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let (after, stored) = cx.update(|_, cx| {
         let shell = harness.read(cx).shell.read(cx);
-        (shell.chat_w(), shell.state.settings.content_width)
+        (
+            shell.chat_w(),
+            shell.state.settings.global.general.content_width,
+        )
     });
     assert_eq!(
         after,
@@ -2777,7 +2921,8 @@ fn the_jobs_trigger_takes_the_measured_chrome(cx: &mut TestAppContext) {
         let _ = state.new_session();
         // The turn belongs to the session the shell does not come back to, which
         // is what makes it a background job.
-        state.settings.active_session = state.active_id.clone().expect("a session is active");
+        state.settings.workspace.general.active_session =
+            state.active_id.clone().expect("a session is active");
         state.streams.insert(running, 10);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -2820,7 +2965,8 @@ fn the_jobs_trigger_opens_its_panel_in_place(cx: &mut TestAppContext) {
         let mut state = state_with_turns("jobs-open", 1);
         let running = state.active_id.clone().expect("a session is active");
         let _ = state.new_session();
-        state.settings.active_session = state.active_id.clone().expect("a session is active");
+        state.settings.workspace.general.active_session =
+            state.active_id.clone().expect("a session is active");
         state.streams.insert(running, 10);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -2853,7 +2999,7 @@ fn the_header_hides_the_job_chip_without_background_work(cx: &mut TestAppContext
         let running = state.active_id.clone().expect("a session is active");
         // The running turn belongs to the session the shell comes back to, so it
         // is the one on screen and not a background job.
-        state.settings.active_session = running.clone();
+        state.settings.workspace.general.active_session = running.clone();
         state.streams.insert(running, 10);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -2881,7 +3027,7 @@ fn only_the_system_mode_follows_a_live_appearance_change(cx: &mut TestAppContext
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("appearance", 1);
-        state.settings.theme_mode = "system".to_string();
+        state.settings.global.general.theme_mode = "system".to_string();
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -2902,7 +3048,7 @@ fn only_the_system_mode_follows_a_live_appearance_change(cx: &mut TestAppContext
     cx.update(|window, cx| {
         crate::theme::apply(pinned, window, cx);
         shell.update(cx, |this, cx| {
-            this.state.settings.theme_mode = pinned.to_string();
+            this.state.settings.global.general.theme_mode = pinned.to_string();
             this.appearance_changed(window, cx);
         });
     });
@@ -2915,7 +3061,7 @@ fn only_the_system_mode_follows_a_live_appearance_change(cx: &mut TestAppContext
     // System follows it, from whichever mode it was left on.
     cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.state.settings.theme_mode = "system".to_string();
+            this.state.settings.global.general.theme_mode = "system".to_string();
             this.appearance_changed(window, cx);
         });
     });
@@ -2926,67 +3072,560 @@ fn only_the_system_mode_follows_a_live_appearance_change(cx: &mut TestAppContext
     );
 }
 
-/// The catalog rows call three handlers, and each has to reach the draft the pane
-/// saves: add takes the typed id, a row selects itself as the active model, and
-/// the delete control drops just that id. The rows sit low in a pane that scrolls,
-/// and a clipped row cannot be clicked in the harness, so this drives the same
-/// handlers the controls call and reads the draft back.
+/// The model rows write the tree the pane saves: a typed id joins the catalog,
+/// a row selects itself as the active model, and the delete control drops just
+/// that id. The rows sit low in a pane that scrolls, and a clipped row cannot be
+/// clicked in the harness, so this drives the same handlers the controls call
+/// and reads the draft back.
 #[gpui::test]
 fn the_model_catalog_handlers_write_the_draft(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("catalog", 1);
-        state.settings.model = "gpt-4o".to_string();
+        state.settings.workspace.general.provider = "work".to_string();
+        state.settings.workspace.general.model = "gpt-4o".to_string();
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    // The catalog belongs to the ACTIVE provider, which a real machine resolves
-    // from ~/.bos/conf/config.toml, so the test reads that provider rather than
-    // assuming the profile list is empty.
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
+        })
+    });
+
+    // The catalog is the nicknames one provider carries, and the active model is
+    // the workspace reference.
     let draft = |cx: &mut VisualTestContext| -> (Vec<String>, String) {
         cx.update(|_, cx| {
             let state = &harness.read(cx).shell.read(cx).state;
-            let provider = state.draft().active_provider.clone();
             (
-                state.draft().catalog(&provider).to_vec(),
-                state.draft().model.clone(),
+                state.draft().catalog("work").to_vec(),
+                state.draft().workspace.general.model.clone(),
             )
         })
     };
 
     let (models, model) = draft(cx);
-    assert!(models.is_empty(), "a fresh catalog starts empty");
+    assert_eq!(
+        models,
+        ["work-model".to_string()],
+        "the seeded provider carries its one leaf"
+    );
     assert_eq!(model, "gpt-4o", "the seeded model is the active one");
 
-    // Adds keep insertion order and a repeat is refused, which is the answer the
-    // pane turns into its hint.
+    // Adds keep insertion order and a repeat of the same id is a merge, which is
+    // the answer the pane turns into its hint.
     cx.update(|_, cx| {
         shell.update(cx, |this, _| {
-            this.catalog_add("gpt-4o");
-            this.catalog_add("o3");
-            this.catalog_add("o3");
+            this.state
+                .draft_mut()
+                .global
+                .add_model("work", "o3", "", "o3", "")
+                .expect("first add");
+            this.state
+                .draft_mut()
+                .global
+                .add_model("work", "n", "", "o3", "")
+                .expect_err("a second key repeating the id is refused");
+            this.state
+                .draft_mut()
+                .global
+                .add_model("work", "o3", "", "o3", "")
+                .expect("re-adding under its own key merges");
+        })
+    });
+    let (models, _) = draft(cx);
+    assert_eq!(
+        models,
+        ["o3".to_string(), "work-model".to_string()],
+        "adds keep order and a repeat merges rather than duplicating"
+    );
+
+    // A row selects itself as the active model, which is what the model menu and
+    // the composer chip read.
+    cx.update(|_, cx| shell.update(cx, |this, _| this.state.select_model("o3")));
+    let (_, model) = draft(cx);
+    assert_eq!(model, "o3", "selecting a row makes it the model");
+
+    // Delete drops one id and leaves the active model where it was.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .draft_mut()
+                .global
+                .remove_model("work", "work-model");
         })
     });
     let (models, model) = draft(cx);
-    assert_eq!(
-        models,
-        ["gpt-4o".to_string(), "o3".to_string()],
-        "adds keep order and refuse a repeat"
-    );
-    assert_eq!(model, "gpt-4o", "adding a model does not switch to it");
-
-    // A row selects itself as the active model, which is what the Model ID row
-    // and the composer chip read.
-    cx.update(|_, cx| shell.update(cx, |this, _| this.catalog_select("o3")));
-    let (_, model) = draft(cx);
-    assert_eq!(model, "o3", "selecting a catalog row makes it the model");
-
-    // Delete drops one id and leaves the active model where it was.
-    cx.update(|_, cx| shell.update(cx, |this, _| this.catalog_remove("gpt-4o")));
-    let (models, model) = draft(cx);
     assert_eq!(models, ["o3".to_string()], "delete removes exactly one id");
     assert_eq!(model, "o3", "deleting does not move the active model");
+}
+
+/// A successful commit closes the dialog; the refusal half is pinned next to it.
+///
+/// `commit_settings` clears the overlay only after the write lands, so the pair
+/// is: refuse -> stays open with the draft; save -> closes. A save that left the
+/// pane up would look exactly like a refusal the reader cannot see the reason for.
+#[gpui::test]
+fn a_successful_commit_closes_the_dialog(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("commit-closes"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // A commit the scratch store can honour.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.open_settings();
+            this.state.draft_mut().workspace.agent.permission = crate::caps::READ_ONLY.to_string();
+            let committed = this.state.commit_settings();
+            assert!(committed.is_ok(), "the scratch store accepts the write");
+        })
+    });
+    let overlay = cx.update(|_, cx| format!("{:?}", harness.read(cx).shell.read(cx).state.overlay));
+    assert!(
+        !overlay.contains("Settings"),
+        "a successful save closes the dialog, got {overlay}"
+    );
+    let permission = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .settings
+            .workspace
+            .agent
+            .permission
+            .clone()
+    });
+    assert_eq!(
+        permission,
+        crate::caps::READ_ONLY,
+        "and the value is committed"
+    );
+}
+
+/// Picking a provider picks the pair, so the document stays committable.
+///
+/// The workspace file refuses a selection that names a provider and no
+/// model. Writing the provider alone made creating a fresh provider - the
+/// one flow that has no model yet - leave a document that could not be
+/// saved, and the refusal named a model the reader had never been asked for.
+#[test]
+fn selecting_a_provider_never_half_makes_the_selection() {
+    let mut state = AppState::with_store(scratch_store("select-pair"));
+    // A provider with NO models, which is what the catalogue route adds, and
+    // one that carries a model.
+    state
+        .draft_mut()
+        .global
+        .add_provider("bare", "", "https://bare.example", "k", &[]);
+    seed_provider(
+        &mut state.draft_mut().global,
+        "full",
+        "https://full.example",
+    );
+
+    // A provider with no models cannot be selected: the pair must be both
+    // or neither, and there is no model to point at. The previous selection
+    // is left alone, so creating a provider does not drop the working model.
+    state.select_provider("full");
+    let chosen = state.draft().workspace.general.model.clone();
+    state.select_provider("bare");
+    let draft = state.draft();
+    assert_eq!(
+        draft.workspace.general.provider, "full",
+        "a model-less provider does not become the selection"
+    );
+    assert_eq!(
+        draft.workspace.general.model, chosen,
+        "and it does not clear the model that was working"
+    );
+    assert!(
+        draft.workspace.validate().is_ok(),
+        "the document stays committable after creating a bare provider"
+    );
+
+    // A provider that has models moves both halves, to its first model.
+    state.select_provider("full");
+    let draft = state.draft();
+    assert_eq!(draft.workspace.general.provider, "full");
+    assert!(
+        !draft.workspace.general.model.is_empty(),
+        "the model half follows the provider half"
+    );
+    assert!(draft.workspace.validate().is_ok());
+}
+
+/// A refused write leaves the dialog open, with the draft still in hand.
+///
+/// The refusal is fixable in the pane, so closing it would take away the
+/// only place the fix can be made.
+#[test]
+fn a_refused_commit_keeps_the_dialog_open() {
+    let base = std::env::temp_dir().join(format!("bsh-refused-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("scratch");
+    // A regular file where the settings DIRECTORY would have to be: the
+    // write cannot create its parent, which is a failure the code path
+    // cannot paper over.
+    let blocker = base.join("blocked");
+    std::fs::write(&blocker, b"not a directory").expect("the blocker");
+
+    let mut state = AppState::with_store(scratch_store("refused-commit"));
+    state.draft_mut();
+    state.settings.save_root = Some(blocker);
+    state.open_settings();
+    state.draft_mut().workspace.agent.permission = crate::caps::READ_ONLY.to_string();
+
+    let refused = state.commit_settings();
+    assert!(refused.is_err(), "the write cannot land");
+    assert_eq!(
+        state.overlay,
+        Overlay::Settings,
+        "a refused save keeps the dialog open"
+    );
+    assert_eq!(
+        state.draft().workspace.agent.permission,
+        crate::caps::READ_ONLY,
+        "and the edits are still there to correct"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The web-search switch is a real control: it writes the draft the file gets.
+///
+/// The hosted tool has no local registrar, so it cannot appear in the capability
+/// list below it; without this row the setting would have no control at all and
+/// the tool would be on with nothing in the window to say so.
+#[gpui::test]
+fn the_tools_pane_switches_the_hosted_web_search(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("web-tools"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("tools"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let before = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .web_tools_enabled
+    });
+    assert!(before, "the shipped default offers web search");
+
+    let track = cx
+        .debug_bounds("settings-web-tools")
+        .expect("the switch draws in the Tools pane");
+    assert_eq!(track.size.width, px(36.0), "the shared 36px track");
+    cx.simulate_click(track.center(), Modifiers::default());
+    let after = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .web_tools_enabled
+    });
+    assert_eq!(after, !before, "the switch writes the setting it shows");
+
+    // And the agent the shell builds follows the draft.
+    let built = cx.update(|_, cx| {
+        crate::caps::build_agent(shell.read(cx).state.draft())
+            .agent
+            .config()
+            .web_search
+    });
+    assert!(!built, "the built agent follows the switch");
+}
+
+/// The save bar is pinned under the scrolling box, not carried in it.
+///
+/// Carried inside, the dialog's only committing control scrolled away with the
+/// section - in General at the reference window size it sat below the fold, so it
+/// could not be pressed without scrolling and the keyboard could not reach it.
+/// The discriminator is that a SHORT pane and a LONG pane put it in the same
+/// place; while it was a child of the scroller its y followed the content.
+#[gpui::test]
+fn the_save_bar_does_not_scroll_with_the_section(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let place = |cx: &mut TestAppContext, section: &'static str| -> f32 {
+        let (_harness, cx) = cx.add_window_view(move |window, cx| {
+            let state = AppState::with_store(scratch_store("save-bar"));
+            let shell =
+                cx.new(|cx| Shell::build_for_test(window, section_index(section), state, cx));
+            Harness { shell }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = cx
+            .debug_bounds("settings-save")
+            .expect("the save bar draws");
+        // The bar must be fully inside the window it was drawn in.
+        assert!(
+            bounds.origin.y > px(0.0),
+            "{section}: the save bar is laid out on screen"
+        );
+        // The harness window is 1640 wide and 900 tall in device pixels; the
+        // dialog is inset by 24 a side, so a bar pinned to the panel's foot sits
+        // near the bottom of that panel whatever the section holds.
+        f32::from(bounds.origin.y)
+    };
+
+    let short = place(cx, "models");
+    let tall = place(cx, "general");
+    assert!(
+        (short - tall).abs() < 40.0,
+        "the save bar sits in the same place whether the section is short or long \
+         (models {short}, general {tall}) - it is pinned, not scrolled with the content"
+    );
+}
+
+/// A cancelled dialog puts the previewed preferences back.
+///
+/// The language and the palette are shown before Save, so they live outside the
+/// draft; dropping the draft alone would leave a dialog that was merely trying a
+/// language on in that language. Cancel restores both from the committed tree.
+#[gpui::test]
+fn cancelling_settings_restores_the_previewed_language(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("cancel-preview", 1);
+        state.settings.global.general.lang = "en".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // What a language pick does while the dialog is open: the preview follows,
+    // and the draft carries the value Save would write.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.lang = crate::i18n::Lang::Zh;
+            this.state.draft_mut().global.general.lang = "zh".to_string();
+            cx.notify();
+        })
+    });
+    let previewed = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.lang);
+    assert_eq!(
+        previewed,
+        crate::i18n::Lang::Zh,
+        "the preview follows the pick"
+    );
+
+    // Cancel drops the draft AND puts the preview back.
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.cancel_settings(cx)));
+    let (lang, committed, draft_open) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        (
+            shell.state.lang,
+            shell.state.settings.global.general.lang.clone(),
+            shell.state.draft.is_some(),
+        )
+    });
+    assert_eq!(
+        lang,
+        crate::i18n::Lang::En,
+        "the dialog was cancelled, so the language it tried on is gone"
+    );
+    assert_eq!(committed, "en", "the committed document never moved");
+    assert!(!draft_open, "the draft is dropped");
+}
+/// The editor's add row draws the id it will add, and the press consumes it.
+///
+/// The button used to read fields the pane never drew, so it could only ever
+/// answer `settings.modelIdRequired` about text nobody could type. This pins
+/// both halves: the row is on screen, and an id typed into it is addable.
+#[gpui::test]
+fn the_editor_add_model_row_draws_the_id_it_adds(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("model-add-row", 1);
+        state.settings.workspace.general.provider = "work".to_string();
+        state.settings.workspace.general.model = "work-model".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // A provider has to exist before its editor can be opened, and it has to be
+    // seeded after the shell so `assemble` cannot reload over it.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
+            crate::ui::settings::load_provider_into_form(this, "work", window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // The id field is drawn, which is the half that was missing.
+    let field = cx
+        .debug_bounds("model-new-id")
+        .expect("the add row draws its id field");
+    assert!(
+        field.origin.y > px(0.0),
+        "the field is laid out inside the pane"
+    );
+
+    // An id typed in that field becomes a model of the open provider.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.new_model_id
+                .update(cx, |state, cx| state.set_value("o3", window, cx));
+            this.new_model_name
+                .update(cx, |state, cx| state.set_value("O3", window, cx));
+            this.state
+                .add_model("work", "o3", "O3", "o3", "")
+                .expect("the typed id is addable");
+            this.state.provider_refusal = None;
+            this.reload_model_rows("work", window, cx);
+            // The rows are rebuilt from the DRAFT, which is where every pane
+            // write lands; reading the saved tree here would re-echo the copy
+            // the reader has not applied yet and drop the row just added.
+            assert_eq!(
+                this.model_rows.len(),
+                2,
+                "the seeded model plus the added one are both rows"
+            );
+        })
+    });
+    let models = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .catalog("work")
+            .to_vec()
+    });
+    assert!(
+        models.contains(&"o3".to_string()),
+        "the typed id is a model of the provider, got {models:?}"
+    );
+
+    // The refusal stays the honest answer for an empty field, so the control is
+    // wired to what the reader typed rather than to a field that always reads empty.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            let empty = this.state.add_model("work", "", "", "", "");
+            this.state.provider_refusal = empty.err().map(|refusal| refusal.key());
+        })
+    });
+    let refusal = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.provider_refusal);
+    assert_eq!(
+        refusal,
+        Some("settings.modelIdRequired"),
+        "an empty id still refuses"
+    );
+}
+
+/// The catalogue route's provider chooser is the reference's `select`: one closed
+/// box naming a provider id, and the rest of the catalogue drawn only while it is
+/// open. A list of provider rows always on screen would be a different control,
+/// and the id is what the reader picks, because it is the key the wire carries.
+#[gpui::test]
+fn the_catalogue_provider_chooser_is_a_select_of_ids(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("catalogue-select", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    // The add card is what carries the catalogue route.
+    let add = cx.debug_bounds("provider-add").expect("the add control");
+    cx.simulate_click(add.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Closed: the box is on screen and the catalogue is not.
+    assert!(
+        cx.debug_bounds("catalogue-select").is_some(),
+        "the closed select names the provider it is set to"
+    );
+    let (choice, open, addable) = cx.update(|_, cx| {
+        let this = harness.read(cx).shell.read(cx);
+        (
+            this.catalogue_choice.clone(),
+            this.catalogue_open,
+            this.state.draft().global.addable_providers(),
+        )
+    });
+    assert!(!open, "the options stay closed until the box is pressed");
+    assert_eq!(
+        addable,
+        [
+            "deepseek".to_string(),
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "nvidia".to_string(),
+            "openrouter".to_string(),
+        ],
+        "the catalogue is every shipped provider the file has not got yet"
+    );
+    assert!(
+        cx.debug_bounds("catalogue-option-deepseek").is_none(),
+        "no option is drawn while the select is closed"
+    );
+    let _ = choice;
+
+    // A press opens it, and every id is an option.
+    let box_bounds = cx.debug_bounds("catalogue-select").expect("the select box");
+    cx.simulate_click(box_bounds.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "catalogue-option-deepseek",
+        "catalogue-option-openai",
+        "catalogue-option-anthropic",
+        "catalogue-option-nvidia",
+        "catalogue-option-openrouter",
+    ] {
+        let offered = cx.debug_bounds(selector);
+        assert!(
+            offered.is_some(),
+            "the open list offers {selector} as an option"
+        );
+    }
+
+    // Picking one is both the selection and the close.
+    let pick = cx
+        .debug_bounds("catalogue-option-nvidia")
+        .expect("the nvidia option");
+    cx.simulate_click(pick.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (choice, open) = cx.update(|_, cx| {
+        let this = harness.read(cx).shell.read(cx);
+        (this.catalogue_choice.clone(), this.catalogue_open)
+    });
+    assert_eq!(
+        choice.as_deref(),
+        Some("nvidia"),
+        "the pick selects that id"
+    );
+    assert!(!open, "and it closes again");
+    assert!(
+        cx.debug_bounds("catalogue-option-deepseek").is_none(),
+        "the options are drawn only while the select is open"
+    );
 }
 
 /// The picker carries the reference own candidate search, and it narrows the
@@ -3004,7 +3643,11 @@ fn the_picker_search_narrows_the_candidates(cx: &mut TestAppContext) {
         shell.update(cx, |this, _| {
             // The picker is drawn inside a provider's editor, under its
             // Customized settings fold, so seed a provider and open both.
-            this.state.draft_mut().providers = vec![profile("work", "https://work.example")];
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
             this.state.editing_provider = Some("work".to_string());
             this.models_advanced_open = true;
             this.models_fetched = Some(vec![
@@ -3016,11 +3659,11 @@ fn the_picker_search_narrows_the_candidates(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("fetched-2").is_some(),
+        cx.debug_bounds("fetch-2").is_some(),
         "all three candidates are listed"
     );
     assert!(
-        cx.debug_bounds("fetched-none").is_none(),
+        cx.debug_bounds("fetch-empty").is_none(),
         "and nothing is filtered yet"
     );
 
@@ -3030,16 +3673,13 @@ fn the_picker_search_narrows_the_candidates(cx: &mut TestAppContext) {
         })
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("fetch-0").is_some(), "the match is listed");
     assert!(
-        cx.debug_bounds("fetched-0").is_some(),
-        "the match is listed"
-    );
-    assert!(
-        cx.debug_bounds("fetched-1").is_none(),
+        cx.debug_bounds("fetch-1").is_none(),
         "and the other candidates are gone"
     );
     assert!(
-        cx.debug_bounds("fetched-none").is_none(),
+        cx.debug_bounds("fetch-empty").is_none(),
         "a match is not the no-match state"
     );
 
@@ -3050,10 +3690,10 @@ fn the_picker_search_narrows_the_candidates(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("fetched-none").is_some(),
+        cx.debug_bounds("fetch-empty").is_some(),
         "a query that matches nothing says so"
     );
-    assert!(cx.debug_bounds("fetched-0").is_none(), "with no rows left");
+    assert!(cx.debug_bounds("fetch-0").is_none(), "with no rows left");
 }
 
 /// The picker is the reference Choose models to add flow over a real GET
@@ -3065,7 +3705,8 @@ fn the_picker_adds_every_selected_fetched_model(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("picker", 1);
-        state.settings.model = "gpt-4o".to_string();
+        state.settings.workspace.general.provider = "work".to_string();
+        state.settings.workspace.general.model = "gpt-4o".to_string();
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
         Harness { shell }
     });
@@ -3073,6 +3714,12 @@ fn the_picker_adds_every_selected_fetched_model(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         shell.update(cx, |this, _| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
+            this.state.editing_provider = Some("work".to_string());
             this.models_fetched = Some(vec![
                 "gpt-4o".to_string(),
                 "o3".to_string(),
@@ -3097,23 +3744,26 @@ fn the_picker_adds_every_selected_fetched_model(cx: &mut TestAppContext) {
     assert_eq!(ticked, 2, "a second tick must untick the row");
     assert_eq!(pending, 3, "the fetched list stays the picker contents");
 
-    cx.update(|_, cx| shell.update(cx, |this, _| this.add_selected_models()));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| this.add_selected_models("work", window, cx))
+    });
 
     let (models, ticked, closed) = cx.update(|_, cx| {
         let this = harness.read(cx).shell.read(cx);
         (
-            this.state
-                .draft()
-                .catalog(&this.state.draft().active_provider)
-                .to_vec(),
+            this.state.draft().catalog("work").to_vec(),
             this.models_selected.len(),
             this.models_fetched.is_none(),
         )
     });
     assert_eq!(
         models,
-        ["llama".to_string(), "o3".to_string()],
-        "only the ticked ids join the catalog"
+        [
+            "llama".to_string(),
+            "o3".to_string(),
+            "work-model".to_string()
+        ],
+        "only the ticked ids join the catalog, beside the seed"
     );
     assert_eq!(ticked, 0, "the picker clears its ticks after adding");
     assert!(closed, "the picker closes once the ids are added");
@@ -3234,6 +3884,16 @@ fn the_provider_form_keys_resolve_in_both_locales() {
         "settings.noPlugins",
         "settings.fetchSearch",
         "settings.fetchEmpty",
+        "settings.fetching",
+        "settings.provider",
+        "settings.modelId",
+        "settings.apiKey",
+        "settings.create",
+        "settings.modelsEmpty",
+        "settings.add",
+        "settings.resetModels",
+        "settings.modelsCustomized",
+        "settings.modelsInherited",
     ] {
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             assert_ne!(crate::i18n::tr(lang, key), key, "missing locale value");
@@ -3255,23 +3915,43 @@ fn the_font_size_stepper_moves_the_conversation_text(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     assert_eq!(
-        cx.update(|_, cx| shell.read(cx).state.settings.content_font_size),
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .general
+            .content_font_size),
         14,
         "the General pane opens on the reference step"
     );
     let plus = cx.debug_bounds("font-increase").expect("the stepper draws");
     cx.simulate_click(plus.center(), Modifiers::default());
+    // The draft, because a pane edit is what Save later writes: the committed
+    // tree is deliberately untouched until then.
     assert_eq!(
-        cx.update(|_, cx| shell.read(cx).state.settings.content_font_size),
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .general
+            .content_font_size),
         15,
         "the plus control steps the conversation size"
     );
     assert_eq!(
-        crate::theme::body_size_at(
-            cx.update(|_, cx| shell.read(cx).state.settings.content_font_size)
-        ),
+        crate::theme::body_size_at(cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .draft()
+                .global
+                .general
+                .content_font_size
+        })),
         15.0,
-        "and the drawn text follows the setting"
+        "and the drawn text follows the setting, because the render reads the draft"
     );
     for _ in 0..20 {
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -3279,7 +3959,13 @@ fn the_font_size_stepper_moves_the_conversation_text(cx: &mut TestAppContext) {
         cx.simulate_click(next.center(), Modifiers::default());
     }
     assert_eq!(
-        cx.update(|_, cx| shell.read(cx).state.settings.content_font_size),
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .general
+            .content_font_size),
         crate::theme::CONTENT_MAX,
         "the stepper stops at the reference top"
     );
@@ -3300,7 +3986,14 @@ fn the_appearance_cubes_set_the_colour_mode(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     assert_eq!(
-        cx.update(|_, cx| shell.read(cx).state.settings.theme_mode.clone()),
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .settings
+            .global
+            .general
+            .theme_mode
+            .clone()),
         "system",
         "the pane opens on the reference's follow-system default"
     );
@@ -3318,7 +4011,14 @@ fn the_appearance_cubes_set_the_colour_mode(cx: &mut TestAppContext) {
     );
     cx.simulate_click(light.center(), Modifiers::default());
     assert_eq!(
-        cx.update(|_, cx| shell.read(cx).state.settings.theme_mode.clone()),
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .general
+            .theme_mode
+            .clone()),
         "light",
         "pressing the Light cube switches the mode"
     );
@@ -3483,56 +4183,35 @@ fn the_plugin_list_filter_hides_rows_and_says_so(cx: &mut TestAppContext) {
     );
 }
 
-/// The provider row own Edit control loads that provider into the form, so an
-/// existing provider can be changed instead of only added.
-///
-/// The control renders, but the harness cannot press it: the settings pane lays
-/// out at y=759 with the row right edge at x=1306, so a synthesized click there is
-/// a silent no-op rather than a failing assertion. The test drives the exact
-/// function the handler calls, and asserts the control is on screen.
+/// Edit opens the editor inside the card and loads that provider into the form,
+/// so the fields are bound to the row rather than a label that looks like one.
 #[gpui::test]
 fn editing_a_provider_loads_it_into_the_form(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = AppState::with_store(scratch_store("provider-edit"));
-        state.settings.providers.clear();
+        let state = state_with_turns("edit-provider", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
         Harness { shell }
     });
-    cx.update(|_, cx| {
-        let shell = harness.read(cx).shell.clone();
-        shell.update(cx, |this, _cx| {
-            this.state.draft_mut().base_url = "https://api.example/v1".to_string();
-            this.state.draft_mut().model = "deepseek-chat".to_string();
-            assert_eq!(this.state.add_provider("work"), Ok(()));
-            this.state.draft_mut().base_url = "https://elsewhere.example/v1".to_string();
-            this.state.draft_mut().model = "other-model".to_string();
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://api.example/v1",
+            );
+            load_provider_into_form(this, "work", window, cx);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    assert!(
-        cx.debug_bounds("provider-edit-0").is_some(),
-        "the provider row carries Edit"
-    );
 
-    let profile = crate::settings::Profile {
-        name: "work".to_string(),
-        model: "deepseek-chat".to_string(),
-        base_url: "https://api.example/v1".to_string(),
-        api_key: "sk-test".to_string(),
-    };
-    cx.update(|window, cx| {
-        shell.update(cx, |this, cx| {
-            load_provider_into_form(this, &profile, window, cx);
-        });
-    });
-    let (editing, base_url, model) = cx.update(|_, cx| {
-        let state = &shell.read(cx).state;
+    let (editing, route, base_url) = cx.update(|_, cx| {
+        let shell_ref = shell.read(cx);
         (
-            state.editing_provider.clone(),
-            state.draft().base_url.clone(),
-            state.draft().model.clone(),
+            shell_ref.state.editing_provider.clone(),
+            shell_ref.add_route.read(cx).value().to_string(),
+            shell_ref.add_base_url.read(cx).value().to_string(),
         )
     });
     assert_eq!(
@@ -3541,41 +4220,75 @@ fn editing_a_provider_loads_it_into_the_form(cx: &mut TestAppContext) {
         "Edit must put the form into edit mode"
     );
     assert_eq!(
+        route.as_str(),
+        "work",
+        "the key is the registry prefix, so it is fixed in the editor"
+    );
+    assert_eq!(
         base_url, "https://api.example/v1",
         "and load that provider base URL, not what the form showed"
     );
-    assert_eq!(model, "deepseek-chat", "and its model");
 }
 
-/// The Input types chips are the gate the attach path reads, so both handlers
-/// have to reach the draft the pane saves: Image off records text only, and
-/// Image back on records both.
+/// The input types are the gate the attach path reads, so both handlers have to
+/// reach the tree the pane saves: Image off records text only, and Image back on
+/// records both.
 #[gpui::test]
 fn the_input_type_chips_write_the_draft(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("input-types", 1);
-        state.settings.model = "o3".to_string();
+        state.settings.workspace.general.provider = "p".to_string();
+        state.settings.workspace.general.model = "o3".to_string();
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    // Same as the catalog rows: the declaration lands on the active provider.
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            // A leaf whose nickname is the API id, the way a fetched row lands.
+            this.state.draft_mut().global.add_custom_provider(
+                "p",
+                "P",
+                "https://p.example",
+                "",
+                &[crate::settings::global::ModelEntry::named("o3")],
+            );
+            this.state.editing_provider = Some("p".to_string());
+            this.reload_model_rows("p", window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // The declaration sits on the leaf, so an undeclared leaf takes both.
     let declared = |cx: &mut VisualTestContext| -> Vec<String> {
         cx.update(|_, cx| {
             let state = &harness.read(cx).shell.read(cx).state;
-            let provider = state.draft().active_provider.clone();
-            state.draft().input_types_for(&provider, "o3").to_vec()
+            state.draft().global.input_types_of("p", "o3").to_vec()
         })
     };
-    assert!(declared(cx).is_empty(), "a model declares nothing at first");
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.catalog_toggle_input("o3", "image", cx)));
+    assert_eq!(
+        declared(cx),
+        ["text".to_string(), "image".to_string()],
+        "an undeclared leaf names no input type, which the pane reads as both lit"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.toggle_model_input("p", "o3", "image")
+        })
+    });
     assert_eq!(
         declared(cx),
         ["text".to_string()],
         "Image off records text only"
     );
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.catalog_toggle_input("o3", "image", cx)));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.toggle_model_input("p", "o3", "image")
+        })
+    });
     assert_eq!(
         declared(cx),
         ["text".to_string(), "image".to_string()],
@@ -3697,15 +4410,19 @@ fn the_tick_switches_off_a_task_whose_session_is_gone(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("schedule-gone"));
-        state.settings.schedules.push(crate::settings::Schedule {
-            id: String::from("task-gone"),
-            name: String::from("Watch"),
-            prompt: String::from("Check the queue."),
-            session_id: String::from("no-such-session"),
-            every_seconds: 30,
-            enabled: true,
-            last_run: 0,
-        });
+        state
+            .settings
+            .global
+            .schedules
+            .push(crate::settings::Schedule {
+                id: String::from("task-gone"),
+                name: String::from("Watch"),
+                prompt: String::from("Check the queue."),
+                session_id: String::from("no-such-session"),
+                every_seconds: 30,
+                enabled: true,
+                last_run: 0,
+            });
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -3716,7 +4433,7 @@ fn the_tick_switches_off_a_task_whose_session_is_gone(cx: &mut TestAppContext) {
         shell.update(cx, |this, cx| this.check_schedules(cx));
     });
     let (enabled, ran) = cx.update(|_, cx| {
-        let task = &shell.read(cx).state.settings.schedules[0];
+        let task = &shell.read(cx).state.settings.global.schedules[0];
         (task.enabled, task.last_run)
     });
     assert!(!enabled, "a task with no session is switched off");
@@ -3729,7 +4446,7 @@ fn the_automation_pane_lists_a_task_from_the_draft(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("schedule-pane"));
-        state.settings.schedules.clear();
+        state.settings.global.schedules.clear();
         let section = section_index("automation").expect("the rail index");
         let shell = cx.new(|cx| Shell::build_for_test(window, Some(section), state, cx));
         Harness { shell }
@@ -3750,6 +4467,7 @@ fn the_automation_pane_lists_a_task_from_the_draft(cx: &mut TestAppContext) {
             let session_id = this.state.active_id.clone().expect("an active session");
             this.state
                 .draft_mut()
+                .global
                 .schedules
                 .push(crate::settings::Schedule {
                     id: String::from("task-1"),
@@ -3782,7 +4500,7 @@ fn the_delete_control_asks_before_it_deletes(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("schedule-delete"));
-        state.settings.schedules.clear();
+        state.settings.global.schedules.clear();
         let section = section_index("automation").expect("the rail index");
         let shell = cx.new(|cx| Shell::build_for_test(window, Some(section), state, cx));
         Harness { shell }
@@ -3795,6 +4513,7 @@ fn the_delete_control_asks_before_it_deletes(cx: &mut TestAppContext) {
             let session_id = this.state.active_id.clone().expect("an active session");
             this.state
                 .draft_mut()
+                .global
                 .schedules
                 .push(crate::settings::Schedule {
                     id: String::from("task-1"),
@@ -3818,7 +4537,7 @@ fn the_delete_control_asks_before_it_deletes(cx: &mut TestAppContext) {
         let shell = shell.read(cx);
         (
             shell.task_delete.clone(),
-            shell.state.draft().schedules.len(),
+            shell.state.draft().global.schedules.len(),
         )
     });
     assert_eq!(
@@ -3840,7 +4559,7 @@ fn the_delete_control_asks_before_it_deletes(cx: &mut TestAppContext) {
         let shell = shell.read(cx);
         (
             shell.task_delete.clone(),
-            shell.state.draft().schedules.len(),
+            shell.state.draft().global.schedules.len(),
         )
     });
     assert_eq!(pending, None, "cancelling closes the confirmation");
@@ -3862,7 +4581,7 @@ fn the_delete_control_asks_before_it_deletes(cx: &mut TestAppContext) {
         let shell = shell.read(cx);
         (
             shell.task_delete.clone(),
-            shell.state.draft().schedules.len(),
+            shell.state.draft().global.schedules.len(),
             shell.state.notice.clone(),
             shell.state.lang,
         )
@@ -4433,7 +5152,7 @@ fn the_hero_workspace_picker_moves_the_chat(cx: &mut TestAppContext) {
                 .expect("the session")
                 .workspace
                 .clone(),
-            this.state.settings.active_workspace.clone(),
+            this.state.settings.global.general.active_workspace.clone(),
         )
     });
     assert_eq!(session_ws, moved, "the chat moves with the pick");
@@ -4581,13 +5300,31 @@ fn the_permission_chip_writes_the_mode_its_menu_offers(cx: &mut TestAppContext) 
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    let before = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
+    let before = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .permission
+            .clone()
+    });
     cx.update(|_, cx| {
         shell.update(cx, |shell, cx| {
             shell.set_permission(crate::caps::FULL_ACCESS, cx)
         });
     });
-    let after = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
+    let after = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .permission
+            .clone()
+    });
     assert_eq!(
         after,
         crate::caps::FULL_ACCESS,
@@ -5051,9 +5788,10 @@ fn the_at_trigger_lists_workspace_files_and_sessions(cx: &mut TestAppContext) {
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("command-refs", 1);
         state.settings.ensure_workspace();
-        let active = state.settings.active_workspace.clone();
+        let active = state.settings.global.general.active_workspace.clone();
         if let Some(workspace) = state
             .settings
+            .global
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.id == active)
@@ -5136,7 +5874,7 @@ fn the_coding_view_toggle_gates_the_trajectory_tab(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    let before = cx.update(|_, cx| shell.read(cx).state.draft().developer_tools);
+    let before = cx.update(|_, cx| shell.read(cx).state.draft().global.general.developer_tools);
     let track = cx
         .debug_bounds("settings-developer-tools")
         .expect("the toggle draws");
@@ -5148,7 +5886,7 @@ fn the_coding_view_toggle_gates_the_trajectory_tab(cx: &mut TestAppContext) {
     );
     cx.simulate_click(track.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let after = cx.update(|_, cx| shell.read(cx).state.draft().developer_tools);
+    let after = cx.update(|_, cx| shell.read(cx).state.draft().global.general.developer_tools);
     assert_eq!(after, !before, "the toggle writes the setting it shows");
     // The pane edits the draft and the header reads the committed setting, so
     // an unsaved edit must NOT move the live gate - that is what the Save bar
@@ -5157,20 +5895,24 @@ fn the_coding_view_toggle_gates_the_trajectory_tab(cx: &mut TestAppContext) {
     // directly because `commit_settings` would write the real
     // `~/.bos/bsh/settings.toml`.
     assert!(
-        cx.debug_bounds("tab-trajectory").is_some(),
-        "an unsaved edit leaves the live gate alone"
+        cx.debug_bounds("tab-trajectory").is_none(),
+        "the gate follows the draft, so the reader sees the switch take effect"
     );
+    // Cancel drops the draft, and the preview goes back to the committed value.
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| {
-            this.state.settings.developer_tools = false;
-            this.state.cancel_settings();
-            cx.notify();
+            this.cancel_settings(cx);
         })
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.settings.global.general.developer_tools),
+        before,
+        "the committed value never moved"
+    );
     assert!(
-        cx.debug_bounds("tab-trajectory").is_none(),
-        "the committed setting is the one the tab gate reads"
+        cx.debug_bounds("tab-trajectory").is_some(),
+        "cancelling puts the preview back"
     );
 }
 
@@ -5222,7 +5964,16 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    let before = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
+    let before = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .permission
+            .clone()
+    });
     // Open the gate the way the composer chip does, so this is the real route.
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| {
@@ -5234,11 +5985,29 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
         cx.debug_bounds("permission-confirm-dialog").is_some(),
         "full access opens the reference's own confirmation"
     );
-    let currently = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
+    let currently = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .permission
+            .clone()
+    });
     assert_eq!(currently, before, "nothing is written on the offer");
     // The confirm is drawn disabled, and the handler refuses too.
     cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_confirm_enable(cx)));
-    let refused = cx.update(|_, cx| shell.read(cx).state.draft().permission.clone());
+    let refused = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .permission
+            .clone()
+    });
     assert_eq!(refused, before, "an unticked gate refuses, not writes");
     assert_eq!(
         cx.update(|_, cx| shell.read(cx).permission_confirm.clone()),
@@ -5261,7 +6030,14 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
     cx.simulate_click(enable.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert_eq!(
-        cx.update(|_, cx| shell.read(cx).state.draft().permission.clone()),
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .permission
+            .clone()),
         crate::caps::FULL_ACCESS,
         "a ticked gate is the one write of full access"
     );

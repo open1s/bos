@@ -111,6 +111,7 @@ impl Shell {
         let named = self
             .state
             .settings
+            .global
             .workspaces
             .iter()
             .find(|workspace| workspace.id == current)
@@ -127,6 +128,7 @@ impl Shell {
         let workspaces: Vec<(String, String)> = self
             .state
             .settings
+            .global
             .workspaces
             .iter()
             .map(|workspace| (workspace.id.clone(), workspace.name.clone()))

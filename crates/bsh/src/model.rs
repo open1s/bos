@@ -302,6 +302,23 @@ pub(crate) struct Session {
     /// Owning workspace id.
     #[serde(default)]
     pub(crate) workspace: String,
+    /// The provider this session runs under, as a reference into the global
+    /// provider tree. `None` takes the workspace's default.
+    ///
+    /// A reference, never a base URL or a key: the credential belongs to the
+    /// provider node, so rotating it must not have to rewrite every session.
+    #[serde(default)]
+    pub(crate) provider: Option<String>,
+    /// The model nickname inside that provider. `None` takes the workspace's.
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+    /// The preset this session runs, recorded when it is selected.
+    ///
+    /// A creation fact, and it outlives the blank window: the first turn and
+    /// every turn after it run under this composition, so it has to be
+    /// reconstructible from the session alone. `None` takes the user's default.
+    #[serde(default)]
+    pub(crate) agent_preset: Option<String>,
     /// The transcript.
     #[serde(default)]
     pub(crate) messages: Vec<ChatMessage>,
@@ -332,12 +349,43 @@ impl Session {
             created_at: at,
             updated_at: at,
             workspace: workspace.to_string(),
+            provider: None,
+            model: None,
+            agent_preset: None,
             messages: Vec::new(),
             plan: Vec::new(),
             goal: None,
             pinned: false,
             archived_at: None,
             archived: Vec::new(),
+        }
+    }
+
+    /// What this session contributes to resolution.
+    ///
+    /// A half-made model reference is no reference: a provider with no model
+    /// would resolve to nothing anyway, so it is reported as unchosen rather
+    /// than sent on to fail as an unknown name.
+    ///
+    /// In flight: the caps switch is what calls this. Until it lands the
+    /// method has no caller, so the allow marks an unfinished migration
+    /// rather than a decision.
+    #[allow(dead_code)]
+    pub(crate) fn choice(&self) -> crate::settings::resolve::SessionChoice {
+        let named = match (self.provider.as_deref(), self.model.as_deref()) {
+            (Some(provider), Some(model))
+                if !provider.trim().is_empty() && !model.trim().is_empty() =>
+            {
+                Some(crate::settings::global::ModelRef {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                })
+            }
+            _ => None,
+        };
+        crate::settings::resolve::SessionChoice {
+            model: named,
+            preset: self.agent_preset.clone().filter(|id| !id.trim().is_empty()),
         }
     }
 
@@ -391,7 +439,7 @@ impl Session {
 mod tests {
     use super::{
         price_block, price_system_prompt, price_tools, ChatMessage, ContextBreakdown, MessageUsage,
-        ToolEvent, UsageSummary,
+        Session, ToolEvent, UsageSummary,
     };
 
     /// A session file written before the model was recorded still loads.
@@ -482,5 +530,47 @@ mod tests {
         assert_eq!(breakdown.bucket(2), breakdown.messages);
         assert!(!breakdown.is_empty());
         assert!(ContextBreakdown::default().is_empty());
+    }
+
+    #[test]
+    fn a_session_file_written_before_the_reference_fields_still_loads() {
+        let json = r#"{"id":"a","title":"t","created_at":1,"updated_at":2,"workspace":"w"}"#;
+        let session: Session = serde_json::from_str(json).expect("an older file loads");
+        assert_eq!(session.provider, None);
+        assert_eq!(session.model, None);
+        assert_eq!(session.agent_preset, None);
+        assert_eq!(
+            session.choice(),
+            crate::settings::resolve::SessionChoice::default(),
+            "a session that names nothing contributes nothing"
+        );
+    }
+
+    #[test]
+    fn a_half_made_model_reference_is_not_a_choice() {
+        let mut session = Session::new("w", "t");
+        session.provider = Some("nvidia".to_string());
+        assert_eq!(
+            session.choice().model,
+            None,
+            "a provider with no model names nothing, so it is not sent on to \
+             fail as an unknown name"
+        );
+        session.model = Some("glm-5.3-flash".to_string());
+        assert_eq!(
+            session.choice().model.map(|m| m.model),
+            Some("glm-5.3-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn a_blank_preset_id_is_no_preset() {
+        let mut session = Session::new("w", "t");
+        session.agent_preset = Some("  ".to_string());
+        assert_eq!(
+            session.choice().preset,
+            None,
+            "the session passes the id on; resolve() is what applies the default"
+        );
     }
 }

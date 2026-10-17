@@ -1,5 +1,26 @@
 # bsh crate instructions
 
+## Gold requirement: win on performance and elegant usability
+
+**BSH wins by being extremely performant and elegantly usable, against the
+competition** (user requirement). Every change is judged against that, not only
+against feature parity. Three consequences:
+
+- **Performance is a requirement, not a polish pass.** The settings file is read
+  once per launch and per workspace switch, so parsing stays allocation-light and
+  the view never re-reads state it already holds. A re-parse per render, a full
+  walk of the session store per frame, or a synchronous disk read on the input
+  path is a defect, not a tradeoff to revisit later.
+- **Elegance is fewer concepts, not more decoration.** One source of truth per
+  fact, no control that only looks wired, no state a reader has to infer. A
+  refusal that says why beats a silent fallback; a pane that needs prose to
+  explain its own state has already lost.
+- **Parity is the floor, not the goal.** The reference sets the shape (the
+  standing rule below); beating it on speed and clarity is the point of the
+  crate.
+
+When a change trades one against the other, say which won and why.
+
 ## Standing rule: every UI increment ends with a gap check
 
 When a UI feature is finished in `bsh`, compare it against the real DeepSeek
@@ -778,3 +799,547 @@ the line instead of indenting it, and run clippy before claiming green.
   writes `value.mention` (quoted when the name has a space, `/`-suffixed for a
   directory), `reference_files` is the bounded workspace walk, and a directory row
   drills (`CardAction::Drill`) instead of inserting.
+
+Round 124 rebuilt the Models pane onto the tree-backed settings, and the work was
+mostly finding why six of the seven things it should do were silently not doing them.
+The single highest-value seam: the shipped presets name **bundles** (`shell`, `files`,
+`plan`) while `build_agent` compared a **tool** name (`bash`, `read_file`,
+`update_plan`) against them, so `off("bash")` read `!allowed.contains("bash")` ->
+`true` and every preset switched every tool off - `bundles` was empty on every build
+while every operand of the gate read green. The gate answers by bundle, the tool switch
+by tool (`off_bundle` / `off_tool`), and the two cannot lean on each other. Two traps
+that made the green probe misleading: the anchor string carried an apostrophe the
+comments did not, so an instrumentation splice silently matched nothing and reported
+a healthy file; and a probe `eprintln!` landed outside the `mod tests` it needed,
+which is the same mistake as a standalone `#[test]` at file end - append a probe
+INSIDE the module, with `crate::` absolute paths.
+
+Second seam, same shape: `Session::new(workspace)` stores whatever string it is handed,
+`new_session` passed the workspace's **root**, and the sidebar filters `in_workspace`
+by the registry's **id** - so every new session was invisible to the row it lived
+under and to `restore_session`. A session is tagged with the stable id, which is
+what `WorkspaceRef`'s own doc already said. Third: `ensure_workspace` set the active id
+to the first *registered* workspace but never *registered* one, so a fresh install
+had no root to confine its tools to and no session it could create; it now names the
+directory the launch came from, which is a fact about the launch rather than a seeded
+preference.
+
+Fourth: a test that changed a preference wrote the **user's real** configuration,
+because `save()` recomputed the path from a static. The file carried a workspace
+pointing at a test's temp directory, which is how the shell ended up confined to
+one. `Settings` now carries `save_root` (serde-skipped, so a location is never a
+setting) and `assemble` points it at the scratch store, which closes it for every
+test rather than for the one that was audited.
+
+The switch-over is complete: the three scoped `#![allow(dead_code)]` in the settings
+model are gone and clippy proves every definition in the tree is wired. What that
+exposed first was the **refusal seam** - `Refusal`, `ModelChoice::refusal` and
+`Resolution::refusal` were documented and unused, so a stale name was quietly
+substituted. `Settings::refusal()` now maps the three variants onto the composer's
+own keys (`composer.noModels` / `composer.modelUnavailable` /
+`composer.presetUnavailable`), `Shell::send` shows one instead of opening a turn
+against a model nobody chose, and the provider editor draws the refusal it already
+computed rather than making the reader guess why Apply did nothing. The pane's own
+head is identity - name, `Custom` tag, credential dot, Edit/Delete - with no way to
+select the endpoint by pressing it, because the reference has no such affordance.
+
+Switching-over also meant the input-type fold had to become a fact about the **id
+shape** (`contains('/'` folds) rather than about what a leaf declares: once no leaf
+auto-declared `text`, the old rule `case_insensitive = text_only_model(provider).is_none()`
+became tautological and every provider folded, which is the `ModelIdDuplicate` the
+user reported as the wrong model. The green suite is 254 passing, fmt/clippy/doc
+clean.
+
+
+Round 125 finished the add card the two screenshots disagreed on. The live pane
+drew the catalogue as a stack of clickable provider rows — a green-marked list of
+endpoints — while the reference draws one select.input.selectInput whose value is
+a provider **id** (an option element per addable row, value: row.entry.provider).
+The instruction was "Green marked should show as dropdown selections which is the
+provider id", and the two are different controls, not different ink: a list claims
+the screen the reference gives to the editor under it, and it reads as a set of
+choices to make rather than the one value a select holds.
+
+So catalogue_pick is now the measured control: a field column carrying the
+Provider label in the shared editor_field style, a 32px closed box at the
+selectInput metrics (.5px border-l4, radius-md, bg-layer-1, padding 0 10px with
+padding-right 32px, max-width 240px, a ChevronDown at 12) that toggles
+Shell::catalogue_open, and, only while open, one option row per
+addable_providers() id styled as candidateLabel (radius-md, 28px, padding 0 10px)
+that sets catalogue_choice and closes again. The chooser no longer prints the
+family name, because the id is the key the tree is written under and the prefix
+the engine's router registers — a reader who picks by family cannot tell which of
+two same-family providers they are editing. catalogue_open resets wherever
+catalogue_choice does, so a cancelled card never reopens the list.
+
+The same pass found three chrome gaps and closed two. The catalogue heading was a
+single modelsCustomized/modelsInherited line; the reference draws
+modelCatalogHeading as a column (gap 2px) with modelCatalogTitle (the Models
+title, 12px/500 label-secondary) ABOVE modelCatalogMeta (label-tertiary), so the
+title is back. The modelListHead toolbar was fetch-then-restore; the reference's
+own order is restore-then-fetch, and modelListHead is align-items flex-start with
+gap 12px, which both now hold. The addModelButton takes its measured metrics
+(28px, gap 4px not 6, .5px border-l3, align-self flex-start), and the fetch
+trigger now names settings.fetching ("Asking the provider" / 正在询问提供商) while a
+request is in flight, so a second press cannot start a second request — the busy
+flag is cleared on the answer, on a refusal, and when the provider it was asking
+about is deleted.
+
+Root cause of the raw keys in the earlier screenshot, since it was the bug the
+pane actually showed: **six live keys were used in crates/bsh/src but absent from
+both locale files**, and four more existed with drifted values. A missing
+rust-i18n key renders as the key itself, which is why settings.create and
+settings.modelsEmpty appeared as literal text. All six added and four corrected
+against the reference's own inline dictionary; the key-resolution test now covers
+eleven keys, and a python call-site audit counts the use of each.
+
+Honest gaps, not drawn: GPUI has no dashed border, so modelEmpty's
+"border:1px dashed border-l3" is a solid .5px l3 rule; no select primitive exists
+in gpui-kit, so the dropdown is built from the same Stateful<Div> rows the pane
+already uses rather than a host control (which costs the chevron's exact 12x12
+data-URI, replaced by the kit's IconName::ChevronDown at 12px); and the
+settings.models title string is free copy rather than a measured one, because the
+reference's title for that heading is not in the Models package dictionary.
+The green suite is 255 passing, fmt/clippy/doc clean, and
+the_catalogue_provider_chooser_is_a_select_of_ids presses the closed box, proves
+the list is closed, presses it again, proves all five ids are offered, picks one
+and proves both that the choice moved and that the list closed.
+
+Round 126 drove the add-model flow in the running app with `ocu` and found five
+defects that the test suite could not see, because each one only shows as a
+window that renders the wrong thing.
+
+**The capture recipe that works** (the one in this file needed three fixes).
+`get_app_state` captures the WINDOW through ScreenCaptureKit and downscales it
+so the width is at most 1280, so a 1280x820-point window gives 1 screenshot pixel
+per point while a fullscreen 1800x1130-point window gives 0.711. `click` with
+`click_method: "app_post"` takes those raw screenshot coordinates — NOT global
+screen coordinates, and NOT the window's backing pixels, and adding the window
+origin (measured at 160,160) lands every press 160px up and left, on the title
+bar. `app_post` on a GPUI view only ever paints the hover/press state: the pane
+lights the row under the pointer and no `on_click` fires. `sky_click` at the same
+coordinates does fire it, so that is the method to use for a GPUI window. An
+Accessibility action (`click` with `element_index`) also fires, but the dialog's
+controls are not in the tree — only the shell's chrome and the window buttons are
+— so the pane is still reached with `--settings=SECTION` and pressed by
+coordinate. Typing needs the field focused first; `ocu js` with
+`click` then `typeText` in one process is far steadier than two `ocu call`
+invocations, which intermittently typed into nothing. Launch the dev binary
+(`cargo build -p bsh` then `./target/debug/bsh --settings=models`), not the
+`.app`: LaunchServices drops `--args`, and a bundle-id launch also lets
+`ocu` resurrect the app through `open` with an inherited environment.
+
+The five defects, in the order the flow exposed them:
+
+1. **The add card's field labels were raw keys.** `editor_field` took a
+   `label: &'static str` and drew it verbatim while every caller passed a locale
+   key, so the card read `settings.provider` and `settings.apiKey`. It
+   translates now, which also fixed the custom route's four fields
+   (`settings.customRoute`, `settings.displayName`, `settings.customBaseUrl`,
+   `settings.apiMode`). A key argument has to be translated where it is drawn,
+   or the missing-`tr` is invisible in review: the call sites all look correct.
+2. **`settings.workspace.agent.permission` was not a key.** The General pane's
+   permission row named a dotted path that exists in neither locale, so the row
+   was titled with its own key while `settings.permission` ("Permission" / 权限)
+   sat unused in both files — the same shape as the earlier
+   `settings.modelOptions` bug. Grep the key, not the call site.
+3. **The editor's Add model button read fields the pane never drew.** It read
+   `new_row_id`/`new_row_name`, which only the add card's Custom route renders,
+   so in the provider editor it could only ever answer `settings.modelIdRequired`
+   about text nobody could type. The editor now owns `new_model_id`/
+   `new_model_name` (a model id typed for the provider already open is a
+   different fact from the custom route's, so sharing one engine carried text
+   between two forms), draws them in the measured 28px row above the control, and
+   clears them only on a successful add so a refusal keeps what was typed.
+4. **`reload_model_rows` read `state.settings` while every pane write lands in
+   `state.draft()`**, so rebuilding the rows echoed the copy the reader had not
+   applied and the model that was just added never appeared. This is the rule the
+   round history already states — a pane reads the draft — broken inside a
+   helper rather than at a call site.
+5. **A locale edit did not rebuild the crate.** `rust_i18n::i18n!` embeds
+   `locales/*.yml` at compile time and nothing declared them as inputs, so
+   `cargo build` reported "Finished" in under a second with the old strings
+   still baked in, and a correct translation kept rendering as its key.
+   `crates/bsh/build.rs` now emits `cargo:rerun-if-changed` for both files.
+   This is the one that made bugs 1 and 2 look like a stale binary.
+
+Evidence: the flow was driven end to end in the window — add card, select
+`nvidia` from the provider select, type a key, Create, Edit, type
+`z-ai/glm-5.3-flash`, Add model — and the pane then showed an editable model row
+with that id, the heading flipped from "Using the adapter defaults" to
+"Customized model catalog", the empty-state note withdrew, and the add fields
+cleared. `the_editor_add_model_row_draws_the_id_it_adds` pins it headlessly and
+was discrimination-checked twice: pointing the selector at a name that is not
+drawn fails it, and reverting the draft read fails its row count. Gates: fmt
+clean, clippy 0, `cargo test -p bsh` 256 passed, doc 0.
+
+Honest gaps: `app_post` producing hover without a click is unexplained (GPUI may
+drop a synthetic click whose window number the event lacks), and it is why the
+recipe insists on `sky_click`; the model row's own name field and chevron are
+drawn but this round did not drive them; and the measured 24x24 per-field help
+button from round 96 is still owed.
+
+Round 127 made settings actually reach the files that own them. The audit found
+five places where a value was written to the wrong copy, and the shape of all
+five is the same: a pane edits the DRAFT, but the write went to `settings` (the
+committed tree) or the save persisted `settings` while the value lived in the
+draft.
+
+Measured live, with a probe workspace so both files are readable: `HOME` a
+scratch home whose `settings.toml` names a workspace rooted at
+`/tmp/bsh-ws-probe`. Pick Read Only in General and the screen shows Read Only;
+the workspace file still said `workspace-write`, because the LANGUAGE pick beside
+it called `settings.save()` and stamped the committed copy of every other field.
+That is the bug the four axis check calls a silent loss: the reader is told
+"saved" and the file disagrees with the screen.
+
+1. **The preview actions persisted the committed tree.** `language_action`,
+   `theme_action` and `font_size_action` wrote `state.settings` and saved it;
+   `developer_tools_action` wrote the draft and then saved `settings`, so its own
+   toggle was the one field the write did not carry. All four edit the draft now
+   and let Save persist. `Shell::cancel_settings` puts the two previews back
+   (interface language, palette) from the committed tree, so a cancelled dialog
+   no longer keeps the language it was merely trying on.
+2. **Every render read the committed tree.** Twenty-two sites in composer, header,
+   meter, settings, shell, statusbar and transcript read
+   `state.settings.global.general.*`, so NO preview followed the draft - the font
+   size, the transcript view, the developer-tools gate. They read `state.draft()`
+   now, which is also what makes Cancel revert them correctly. Two of the
+   twenty-two were WRITES (the drag-committed content and sidebar widths) and take
+   `draft_mut()`.
+3. **The drag commits saved the committed tree.** `commit_chat_width` and
+   `commit_sidebar_width` wrote the draft then called `settings.save()`, so the
+   width a reader dragged never reached the file. Both go through
+   `commit_settings()`, which is the one path that moves a draft into the
+   document.
+4. **Creating a provider made the document uncommittable.** `select_provider`
+   wrote the provider half and left the model half empty, and the workspace file
+   refuses a half-made selection - so adding a provider failed the NEXT save with
+   "the selection \"deepseek/\" names only half a model", about a model the reader
+   had never been asked for. A provider with no models now leaves the selection
+   untouched (the pair is both or neither, and the previous working model is not
+   dropped); one with models moves both halves.
+5. **A refused save closed the dialog.** `commit_settings` cleared the overlay
+   before writing, so the refusal arrived in a notice with the pane already gone -
+   the one place the fix can be made. It closes only on success and hands the
+   draft back on failure.
+
+A sixth change is the guard that makes the rest legible: `save()` no longer
+silently skips the workspace document when the active workspace has no root. A
+blank document is still nothing to report, but a document with content and no
+root is an error the Save bar shows, because the only copy was the window.
+
+Evidence, live: with the probe layout, changing the Context window and pressing
+Save took the workspace file from `context_budget = 32768` to `64000` while the
+global file carried no budget at all; creating a provider and pressing Save put
+`[providers.deepseek]` (base URL, key, protocol) in the GLOBAL file while the
+workspace file kept `provider = ""` and no provider block. Both directions of the
+split are proven on disk, not only in a unit test.
+
+Tests: `a_save_writes_each_fact_only_to_its_own_file` (both paths and both
+directions of the split, read back from disk), `a_draft_edit_writes_nothing_until_
+it_is_committed`, `a_save_with_no_workspace_root_reports_instead_of_dropping`,
+`selecting_a_provider_never_half_makes_the_selection`,
+`a_refused_commit_keeps_the_dialog_open` and
+`cancelling_settings_restores_the_previewed_language`. Two of them were
+discrimination-checked by re-injecting the bug (dropping the workspace write; and
+removing the preview restore). Five older tests asserted against `settings` after
+driving a control and now read `draft()`, which is the rule this crate already
+states for pane tests. Gates: fmt clean, clippy 0, `cargo test -p bsh` 262
+passed, doc 0.
+
+Honest gaps: the save bar sits inside the scrolling options box, so in the
+General pane it is below the fold at the reference window size and neither
+synthetic wheels nor keyboard paging reach it through `ocu` - the live Save press
+was proven on the Context and Models panes instead. `developer_tools` is drafted
+rather than written through the controller as the reference does (round 124's
+measurement), chosen so one rule covers every preference; its inline error now
+belongs to the commit. And `~/.bos/bsh/settings.toml` is still the old flat
+format, so the app runs on defaults until it is rewritten - unchanged from the
+last round, and never written by these tests because every one redirects the
+save.
+
+Round 128 closed the two gaps round 127 reported, and the second one uncovered a
+third defect that the live check had been hiding.
+
+**The save bar is pinned.** It was the last child of the scrolling options box, so
+the dialog's ONE committing control scrolled away with the section. Measured in
+the harness: in General it laid out at **y=1214 in a 900-tall window** - off
+screen - while Models put it at 885. `the_save_bar_does_not_scroll_with_the_section`
+pins it by asserting the models and general panes place the bar within 40px of each
+other, which is true only when it is a sibling of the scroller; re-injecting the
+old layout fails it with exactly those two numbers (885 / 1214.5). That also
+retires the round-127 gap: the General pane's own Save is now reachable, and the
+live proof it could not give before was run - Permission -> Read Only and
+Language -> 中文, Save pressed at the pinned (985,757), after which the GLOBAL file
+held `lang = "zh"` and the WORKSPACE file held `permission = "read-only"`, with
+both files still on their old values before the press.
+
+**A provider is named by its name, never its endpoint.** `built_in` answers
+`(display name, base URL, protocol)`, and two sites read the SECOND element as
+the label: the Models card printed `https://integrate.api.nvidia.com/v1` where the
+provider's name belongs, and the provider editor opened its display-name field
+pre-filled with the endpoint. Both go through `provider_label(id, name)` now -
+the tree's name, else the shipped family's, else the id -
+and `a_provider_is_named_by_its_name_not_its_endpoint` asserts every shipped id
+produces a name with no `://` in it. The wrong element was visible in a round-126
+screenshot and read as a design deviation; it was an off-by-one in a tuple
+pattern, which is why the test checks the INVARIANT (a name is not a URL) rather
+than the expected strings alone.
+
+**The user's own configuration is in the new format.** `~/.bos/bsh/settings.toml`
+was the old flat file, which the tree refuses under `deny_unknown_fields`, so the
+app had been running on defaults and would have moved the file aside on the first
+Save. It was rewritten by GENERATING it from the real types (a temporary test that
+built the documents and asserted they reparse, then was removed) rather than
+hand-typed, so the schema cannot drift; the legacy file is kept at
+`settings.toml.legacy-2026-10-18`. Carried over: the local relay as
+`[providers.nvidia]` (base_url `http://127.0.0.1:11436/v1`, api_key, `api_mode =
+"chat"`) with its `z-ai/glm-5.3-flash` leaf, the workspace rooted at this repo
+(id `bos`) selecting that model, and the agent section (system prompt,
+temperature 0.7, permission workspace-write, budget 32768, steps 10, shell 300,
+cap 16384, memory on), plus `skills_dir`. Dropped because the redesigned schema
+has no such field: `require_approval` (the permission mode expresses it),
+`web_tools_enabled`, `active_provider`, `catalogs`, and the empty
+`memory_path`. The workspace half was written to `.bsh/settings/settings.toml`
+inside the workspace (which `.gitignore` already covers), the global half needed
+one `danger-full-access` write because it lives outside the session workspace.
+Verified live: the shell now starts on workspace "bos", the status bar reads
+`z-ai/glm-5.3-flash`, the Models card reads NVIDIA with its credential dot, and
+the editor opens on that model under "Customized model catalog".
+
+Gates: fmt clean, clippy 0, `cargo test -p bsh` 264 passed, doc 0.
+
+Honest gaps: `web_tools_enabled` had no home in the redesigned schema, so a
+preference the flat file carried is gone by design rather than by oversight, and
+nothing was written for `catalogs`; the Base URL is not shown on the collapsed
+provider card (it sits under "Customized settings"), so the endpoint was confirmed
+from the file and the editor's model row rather than by reading it off the card.
+
+Round 129 gave the two preferences round 128 had to report as homeless a real
+home, and made the workspace document travel with the checkout.
+
+**Web search is a setting now, not a dropped field.** The stack already carried
+the capability and nothing offered it: `react::llm::LlmTool::web_search` builds a
+HOSTED tool (the provider runs the search and returns results in its own stream),
+and the only place it was attached was a test. The chain is now four links, and
+each link exists because of what the previous one cannot know:
+
+- `AgentSection.web_tools_enabled` (workspace tier, default true) is the reader's
+  half, beside `bash_enabled` and `file_tools_enabled` - the same three switches
+  the flat file carried.
+- `Resolution` carries it and `Effective` exposes it. Two structs, not one: the
+  first attempt put the field on `Resolution` only, and the compiler said
+  `Effective` had no such field; `Effective` is built FROM a `Resolution`, so both
+  need it and the constructor reads `resolution.web_tools_enabled`.
+- `AgentConfig.web_search` is the agent's half, and `offers_web_search(enabled,
+  api_mode) == enabled && api_mode == "responses"` is the rule. The protocol is
+  part of it because a hosted tool is an object only the Responses API
+  understands: offering it to a chat-completions or anthropic endpoint would fail
+  every request rather than add a capability. The rule is a pure function with a
+  truth table test, so the decision is not a caller's to remember.
+- The Tools pane draws the row. It is NOT in the capability list below it,
+  because nothing local registers it - the provider runs it - so a switchless
+  tool would have been invisible. `the_tools_pane_switches_the_hosted_web_search`
+  presses it and asserts both the draft and the built agent follow.
+
+The bindings do not expose the knob, matching `parallel_tool_calls`: nbos, jsbos
+and the resilience example take `web_search: false`, which is what
+`AgentConfig::default()` says. Extending the Python/JS option structs is a
+separate change with its own docs and parity entries.
+
+**The workspace document travels with the checkout.** `.gitignore` ignored all of
+`.bsh/`, which contradicted the file's own documented purpose ("the file travels
+with the checkout, so a second machine that clones it inherits the same agent
+configuration without carrying anyone's credentials"). It is now `.bsh/*` with
+`!.bsh/settings/` re-included, so `git check-ignore` answers ignored for
+`sessions/` and `log/` and NOT for `settings/settings.toml`, which is the split
+that sentence claims.
+
+Also fixed while in the pane that gained the row: the Tools pane printed its hint
+TWICE - the pane header draws the section hint and the first row repeated the same
+key. The row is gone, so the sentence appears once. The same duplication shape
+exists in a few other sections (mcp, workspaces, archived) and is left for a
+round that touches them.
+
+Evidence, live: with a redirected home so the write is permitted, toggling Web
+search off and pressing Save put `web_tools_enabled = false` on line 13 of the
+workspace file and nothing in the global file. With the real home the same press
+was REFUSED - "cannot read the settings file: Operation not permitted" - which is
+this agent's sandbox rather than the product, and it incidentally re-proved the
+round-127 refusal path: the dialog stayed open with the draft intact.
+`~/.bos/bsh/settings.toml` still cannot be written from here for the same reason,
+so the installed workspace document gained the line by hand and was re-read by the
+app (the switch renders on, which is the round trip).
+
+Gates: fmt clean, clippy 0 across the workspace, `cargo test -p bsh` 266 passed,
+`cargo test -p agent` 190 passed, doc 0.
+
+Honest gaps: `require_approval`, `active_provider` and `catalogs` remain
+unmigrated rather than wired - the first two are expressed by the permission mode
+and the workspace selection, and `catalogs` was absorbed into the provider tree,
+so nothing was invented for them; and the hosted tool is only reachable on a
+Responses-protocol provider, which is why the row's description says so instead of
+silently doing nothing on a chat endpoint.
+
+Round 130 verified the three caveats round 129 reported, with the session's file
+sandbox lifted so the one that could only be reasoned about became measurable.
+
+1. **The four constructors.** `AgentConfig.web_search` broke every literal that
+   names all fields: the TOML bridge (`agent/config.rs`), both bindings
+   (`nbos`, `jsbos`) and `examples/with_resilience.rs`. All four now carry it, and
+   `cargo build --workspace` is the proof that no literal was missed - the other
+   sites use `..Default::default()` and need nothing. A brace-matching scan is NOT
+   a usable check here: `format!("{}/{}", ...)` inside a literal makes a naive
+   depth count report fields missing that are present, which is how the first
+   attempt "found" seven missing that did not exist.
+2. **The real-home save.** With `danger-full-access` the same Save that reported
+   "Operation not permitted" advanced BOTH real files (13:49:15 -> 13:51:46),
+   closed the dialog, and showed "Settings saved", and the composer's permission
+   chip followed the file (`read-only`, then `workspace-write` after restoring).
+   So the refusal was the agent's sandbox and never the product. One artefact
+   worth recording: a synthetic multi-click sequence (open the menu, pick, press
+   Save) can leave the dialog up while the write still lands, because a press that
+   arrives as a menu is closing is not the press the next step assumes. The clean
+   sequence (one Save press) behaves correctly, and
+   `a_successful_commit_closes_the_dialog` now pins the success half of
+   `commit_settings` headlessly, beside `a_refused_commit_keeps_the_dialog_open`.
+3. **The three homeless fields.** `require_approval` and `catalogs` appear nowhere
+   in the crate; `active_provider` exists only as `Settings::active_provider()`, a
+   getter derived from the workspace selection rather than a stored copy. The
+   substitute is real rather than a rename: `is_confined()` keeps the shell
+   validator and the files' root for every mode but full access, and
+   `allows_writes()` keeps the shell and the writer OUT OF THE REQUEST under Read
+   Only, so "no approval needed" is expressed as "the tool is not offered".
+
+Gates: fmt clean, clippy 0, `cargo test -p bsh` 267 passed, `cargo test -p agent`
+190 passed, doc 0. The live configuration was left as it was found: global file
+untouched after the round's writes (byte-identical to its backup), workspace
+document with `permission = "workspace-write"` and `web_tools_enabled = true`, and
+the legacy flat file still at `settings.toml.legacy-2026-10-18`.
+
+Round 131 made the whole on-disk configuration the current format, not only the
+two documents that had been rewritten. The audit found three things the earlier
+rounds had left behind.
+
+**Two superseded flat documents were sitting in the live settings directory.**
+`settings.toml.bak` and `settings.toml.legacy-2026-10-18` were both
+`schema_version = 1` flat files - the format the tree refuses. Nothing reads
+`*.bak`, but a directory whose contents disagree about their own format is a
+trap for the next reader and for the next round. Both moved to
+`~/.bos/bsh/archive/legacy-flat/` with `.toml.old` names, so the live directory
+holds exactly the documents the app reads: `settings.toml`, `sessions/`, and
+`log/`. Nothing was deleted.
+
+**All sixteen sessions were orphaned.** Every session document carried a
+`workspace` id that the registry no longer names - four different dead ids, and
+the old flat files' own registries pointed at `root = "/"` (that was the old
+format's bug). The sidebar therefore listed none of the history: the shell
+filters `in_workspace` by the registry id, so a session tagged with an id nobody
+registers is invisible while the file parses perfectly. All sixteen are re-tagged
+to the one live workspace (`bos`), which is what made them appear, with a copy of
+each file kept under `~/.bos/bsh/archive/sessions-before-retag/`. This is a
+migration the user asked for by name ("ensure all settings in new format"); the
+session document itself needed no schema change, only its workspace reference.
+
+**The `api_key` found in one session is not a schema leak.** A grep for the field
+matched three places, all inside tool OUTPUT - a `cat` of the old settings file, a
+source grep, a test's printed config - not a structured field of the session
+document. The session schema stores the provider and model as a reference and
+never a credential, which held. Redacting a verbatim quote inside conversation
+history would corrupt the transcript, so it was left alone and reported instead.
+
+Two surfaces deliberately untouched: `~/.bos/conf/config.toml` and
+`~/.bos/config/app.toml` belong to the BOS framework, not to bsh ("BSH does not
+read the ambient BOS config: the settings files are the whole truth for this
+shell"), and their own backup clutter is that system's business.
+
+Verified live: the app starts on the one workspace, the composer chip reads
+`Workspace Write` from the workspace document, the status bar names
+`z-ai/glm-5.3-flash` from the global one, and the sidebar lists the recovered
+history - which is the proof that every session file parses under the current
+schema, because the store drops the ones that do not, silently.
+
+No source changed this round: it is a data migration plus an audit.
+
+Round 132 fixed the three problems round 131 could only report, and the work
+turned up a fourth that has been quietly destroying the reader's configuration.
+
+**The superseded document no longer sits beside the live one.** `save()` used to
+rename a file it could not parse to `settings.toml.bak` IN PLACE, so an
+old-format document stayed in the live directory for good and every later reader
+had to work out which was which. It now goes to `archive/legacy-flat/` with the
+epoch in its name (`settings-flat-<unix>.toml.old`), which is both a record and
+impossible to mistake for a live file. `an_unreadable_document_is_archived_beside_the_tree`
+pins the live file, the absence of a `.bak`, and the archived name and content.
+
+**A session whose workspace nobody registers is re-homed, not hidden.** It loaded
+fine and then `in_workspace` filtered it out of every row: history on disk and
+unreachable, which is a worse failure than not loading, because nothing looks
+wrong. `Store::rehome_orphans(active)` attaches those sessions to the workspace in
+use - there is no other workspace to attribute them to - and deletes the
+quarantined copy so the id is not on disk twice. That last part needed a second
+fix: `read` did not dedupe by id, so the same session on disk twice was shown
+twice; it now keeps one per id, newest wins.
+
+**A configured credential never reaches a session file.** A transcript can quote
+the configuration - a tool that printed the settings file puts the key in the
+conversation - and the session document is documented to carry provider
+REFERENCES, never a credential. `Store` now takes the live keys
+(`Settings::secrets()`) and scrubs the exact configured values out of the
+serialized text at the one place a session is written, replacing them with `***`.
+Only the exact values, never a pattern, so ordinary prose is not mangled; keys
+shorter than six characters are skipped because they are not credentials and
+replacing them would corrupt text. The sixteen sessions already on disk were
+scrubbed with the same rule and a copy of each kept under
+`archive/sessions-before-scrub/`.
+
+**The fourth problem: a test build could write the REAL configuration.** While
+repairing the file it was overwritten three times with fixture values - a
+`providers.work` entry pointing at `https://work.example` and a workspace rooted
+at a DIFFERENT checkout, `~/.local/share/opencode/worktree/97f97e/feature-work`.
+Every test redirects its writes by setting `save_root` to its scratch store, and
+that redirect works here (`cargo test -p bsh` leaves the file byte-identical), so
+the writer was a test run in that second worktree: one `$HOME` is shared by every
+checkout on the machine. A forgotten redirect anywhere is therefore not a failed
+assertion, it is the reader's settings replaced by a fixture. `save()` now
+refuses outright when it is a test build with no `save_root`, which makes the
+class impossible in this build, and
+`a_test_build_never_writes_the_real_configuration` pins it. The other worktree
+still needs the same line before its test runs stop overwriting the file.
+
+Evidence: each of the three store/settings behaviours was re-injected and the test
+failed with its own message (a no-op re-home, an identity redact, a plain rename);
+`cargo test -p bsh` ran with the real file's md5 unchanged before and after.
+
+Gates: fmt clean, clippy 0, `cargo test -p bsh` 271 passed, `cargo test -p agent`
+190 passed, doc 0. The reader's configuration was restored from the backup taken
+in round 130 and verified intact afterwards (provider, relay base URL, key, model
+leaf and workspace all present).
+
+Two follow-ups on the same round, both learned by watching the file: the
+clobbering happened again DURING the gate run, with the same signature (a
+\`providers.work\` fixture and the feature-work worktree's root), which is the
+confirmation that it is that checkout and not this one - \`cargo test -p bsh\` here
+leaves the file byte-identical. And the sixteen re-tagged sessions were moved from
+the quarantine (\`~/.bos/bsh/sessions\`) into the workspace they now belong to
+(\`.bsh/sessions\`), because a session tagged \`bos\` is SAVED beside \`bos\` while its
+old copy sat in the quarantine: the id would have been on disk twice, which
+\`dedupe_by_id\` would mask rather than fix. \`.bsh/sessions\` is gitignored, so the
+history stays local while the settings document travels.
+
+Round 133 removed the legacy documents for good. The reader asked for the old
+format to be GONE, not archived, so the two \`settings-flat-*.toml.old\` records and
+the \`settings.toml.bak\` that a test run in the second checkout had left behind are
+deleted, and \`~/.bos/bsh/\` now holds exactly one settings document - the new format
+- beside \`sessions/\`, \`log/\` and the pre-migration session copies. \`archive_unreadable\`
+stays in the code, because it is not legacy SUPPORT: it is the one guard that stops a
+file this build cannot parse from being overwritten unseen, and it fires only when a
+load has already failed. Nothing in the crate reads or writes the flat format; a flat
+file simply fails to parse, which is what makes it the right thing to refuse.
+
+The repeated overwrites were confirmed as the second checkout's problem, with a
+timestamp: \`~/.bos/bsh/settings.toml\` became a default-value fixture (workspace rooted
+at \`.../worktree/97f97e/feature-work/crates/bsh\`, no providers) at 14:05, 14:07, 14:14
+and 14:15, each time while that tree's tests ran. This checkout's suite cannot do it -
+\`cargo test -p bsh\` leaves the file byte-identical - because of the round-132 guard.

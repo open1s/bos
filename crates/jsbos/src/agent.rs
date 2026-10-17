@@ -293,6 +293,7 @@ impl From<AgentConfig> for agent::AgentConfig {
       timeout_secs: value.timeout_secs as u64,
       max_steps: value.max_steps.unwrap_or(10) as usize,
       parallel_tool_calls: false,
+      web_search: false,
       api_mode: value.api_mode.unwrap_or_else(|| "chat".to_string()),
       reasoning_effort: value.reasoning_effort,
       circuit_breaker,

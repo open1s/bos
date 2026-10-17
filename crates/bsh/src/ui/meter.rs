@@ -30,7 +30,7 @@ impl Shell {
     pub(crate) fn context_meter(&self, cx: &mut Context<Self>) -> Option<Div> {
         let (used, window) = self.state.context_figures()?;
         let percent = self.state.context_percent()?;
-        let size = self.state.settings.content_font_size;
+        let size = self.state.draft().global.general.content_font_size;
         let lang = self.state.lang;
         let breakdown = self.state.context_breakdown();
         let open = self.state.meter_open;

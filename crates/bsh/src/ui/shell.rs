@@ -19,6 +19,9 @@ pub(crate) struct Shell {
     pub(crate) models_fetch_failed: bool,
     /// Whether the last fetch was asked for with no base URL.
     pub(crate) models_fetch_needs_base_url: bool,
+    /// Whether a fetch is still in flight, so the trigger names the ask
+    /// rather than repeating the request it is already running.
+    pub(crate) models_fetching: bool,
     /// The fetched model ids currently ticked in the picker.
     pub(crate) models_selected: std::collections::BTreeSet<String>,
     /// All shell state.
@@ -72,11 +75,48 @@ pub(crate) struct Shell {
     /// Set when the header action could not reach the settings file. The
     /// reference prints its own inline `openDocument.error` beside the button.
     pub(crate) config_open_failed: bool,
+
     /// Whether the Models pane's add-provider card is open. The reference
     /// swaps its dashed Add button for the card, so the two never show at once.
     pub(crate) models_add_open: bool,
-    /// Whether the Models editor's Customized settings fold is open.
+    /// Which route the open add card offers: a shipped provider from the
+    /// catalogue, or a hand-typed endpoint. The reference's segmented control.
+    pub(crate) models_add_route: ModelsAddRoute,
+    /// The provider id the add card is typed for.
+    pub(crate) add_route: Entity<InputState>,
+    /// The display name the add card is typed for; blank follows the id.
+    pub(crate) add_display: Entity<InputState>,
+    /// The base URL the add card is typed for.
+    pub(crate) add_base_url: Entity<InputState>,
+    /// The API key the add card is typed for.
+    pub(crate) add_key: Entity<InputState>,
+    /// The model leaves the open provider editor or add card is editing, with
+    /// one text engine per row so a keystroke repaints its own row.
+    pub(crate) model_rows: Vec<ModelRowEditor>,
+    /// A new model id row the add card is filling in.
+    pub(crate) new_row_id: Entity<InputState>,
+    /// The new model row's display name.
+    pub(crate) new_row_name: Entity<InputState>,
+    /// The model id the open provider editor is adding.
+    ///
+    /// The editor's own field, not the add card's: the custom route types a
+    /// model id for a provider that does not exist yet, and this one types a
+    /// model id for the provider already open. They are different facts, so a
+    /// shared engine would carry text from one form into the other and let
+    /// someone add a model they never typed here.
+    pub(crate) new_model_id: Entity<InputState>,
+    /// The display name the editor's new model row will take.
+    pub(crate) new_model_name: Entity<InputState>,
+    /// Whether the provider editor's Customized settings fold is open.
     pub(crate) models_advanced_open: bool,
+    /// The third-party provider the add card picked from the catalogue.
+    pub(crate) catalogue_choice: Option<String>,
+    /// Whether the catalogue's provider select has its options open.
+    ///
+    /// The reference's chooser is a `select`: one closed box naming the
+    /// provider id, and the list of the rest is drawn only while the reader
+    /// has it open, so a click anywhere else closes it again.
+    pub(crate) catalogue_open: bool,
     /// The transcript scroll position, so the turn rail can jump within it.
     pub(crate) transcript_scroll: ScrollHandle,
     /// The transcript content height as of the last frame. Following the tail
@@ -100,7 +140,7 @@ pub(crate) struct Shell {
     /// The rail's container rule and its card breadth are measured against it.
     pub(crate) conversation_w: Pixels,
     /// The chat content width a reader dragged out, or none while the column
-    /// follows the reference's clamp. Loaded from settings.content_width.
+    /// follows the reference's clamp. Loaded from settings.global.general.content_width.
     pub(crate) chat_user_w: Option<f32>,
     /// The width drag in flight, if any.
     pub(crate) chat_drag: Option<ChatDrag>,
@@ -108,7 +148,7 @@ pub(crate) struct Shell {
     /// of the bar's visibility rule.
     pub(crate) chat_hover: Option<HandleSide>,
     /// The sidebar width a reader dragged out, before it is committed.
-    /// Loaded from settings.sidebar_width.
+    /// Loaded from settings.global.general.sidebar_width.
     pub(crate) sidebar_user_w: Option<f32>,
     /// The sidebar resize in flight, if any.
     pub(crate) sidebar_drag: Option<SideDrag>,
@@ -132,6 +172,33 @@ pub(crate) struct Shell {
     pub(crate) settings_inputs: SettingsInputs,
     /// Live subscriptions (input events).
     _subs: Vec<Subscription>,
+}
+
+/// Which route the add-provider card offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ModelsAddRoute {
+    /// One of the shipped providers, taking its family endpoint.
+    Catalogue,
+    /// A hand-typed provider id and endpoint.
+    Custom,
+}
+
+/// One model row inside the open provider editor.
+///
+/// A row knows the nickname it is filed under in the tree, the leaf in effect
+/// and the two text engines the reference's inputs read, so a keystroke can
+/// repaint that row alone.
+pub(crate) struct ModelRowEditor {
+    /// The nickname this row is filed under in the provider's model map.
+    pub(crate) key: String,
+    /// The leaf in effect: model id, display name and declared input types.
+    pub(crate) entry: crate::settings::global::ModelEntry,
+    /// The model-id input.
+    pub(crate) id: Entity<InputState>,
+    /// The display-name input.
+    pub(crate) name: Entity<InputState>,
+    /// Whether this row's advanced part is open.
+    pub(crate) open: bool,
 }
 
 /// Which measured width handle a drag is working.
@@ -199,15 +266,16 @@ impl Shell {
         // Measured: the reference reads its stored content width
         // (dsh.conversation.contentWidth) on every width publish, so a window
         // reopens on the column the reader dragged.
-        let chat_user_w = state.settings.content_width;
-        let sidebar_user_w = state.settings.sidebar_width;
+        let chat_user_w = state.settings.global.general.content_width;
+        let sidebar_user_w = state.settings.global.general.sidebar_width;
         let viewport_w = window.viewport_size().width.as_f32();
         // The meter's tools bucket follows the tool array a request carries, so
         // it is seeded from the same registry the next turn will send: without
         // this the bucket reads zero until the first turn runs.
         state.set_tools_schema(crate::caps::build_agent(&state.settings).tools_schema_chars);
         // The tree order the sidebar last chose, from the settings file.
-        state.sort = crate::store::SessionSort::from_persisted(&state.settings.session_sort);
+        state.sort =
+            crate::store::SessionSort::from_persisted(&state.settings.global.general.session_sort);
         let lang = state.lang;
         // Measured: the hero editor draws its own placeholder, so the phase
         // the restore landed in picks the string.
@@ -334,6 +402,17 @@ impl Shell {
                 },
             ),
         ];
+        // One text engine per provider form field. They wake the pane through
+        // an `InputEvent::Change` subscription, so a disabled state an id already
+        // taken produces repaints as the reader types.
+        let add_route = cx.new(|cx| InputState::new(window, cx));
+        let add_display = cx.new(|cx| InputState::new(window, cx));
+        let add_base_url = cx.new(|cx| InputState::new(window, cx));
+        let add_key = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let new_row_id = cx.new(|cx| InputState::new(window, cx));
+        let new_row_name = cx.new(|cx| InputState::new(window, cx));
+        let new_model_id = cx.new(|cx| InputState::new(window, cx));
+        let new_model_name = cx.new(|cx| InputState::new(window, cx));
         let settings_inputs = SettingsInputs::new(window, cx);
         let mut shell = Self {
             state,
@@ -358,7 +437,19 @@ impl Shell {
             shortcuts_open: false,
             config_open_failed: false,
             models_add_open: false,
+            models_add_route: ModelsAddRoute::Catalogue,
+            add_route,
+            add_display,
+            add_base_url,
+            add_key,
+            model_rows: Vec::new(),
+            new_row_id,
+            new_row_name,
+            new_model_id,
+            new_model_name,
             models_advanced_open: false,
+            catalogue_choice: None,
+            catalogue_open: false,
             composer_value: String::new(),
             caps: Vec::new(),
             plugins: Vec::new(),
@@ -383,10 +474,11 @@ impl Shell {
             models_fetched: None,
             models_fetch_failed: false,
             models_fetch_needs_base_url: false,
+            models_fetching: false,
             models_selected: std::collections::BTreeSet::new(),
             _subs: subs,
         };
-        crate::theme::apply(&shell.state.settings.theme_mode, window, cx);
+        crate::theme::apply(&shell.state.settings.global.general.theme_mode, window, cx);
         // Follow a live host appearance switch, which is what makes the System
         // option mean anything: the copied palette tokens would otherwise go
         // stale the moment macOS changed.
@@ -420,7 +512,7 @@ impl Shell {
                 .await;
             if this
                 .update(cx, |this, cx| {
-                    if !this.state.settings.schedules.is_empty() {
+                    if !this.state.settings.global.schedules.is_empty() {
                         this.check_schedules(cx);
                     }
                 })
@@ -446,16 +538,23 @@ impl Shell {
     /// not a request. The HTTP call runs on the shell tokio runtime because
     /// the gpui executor has no reactor, and only the answer comes back to the
     /// view; a refusal is reported rather than painted as an empty list.
-    pub(crate) fn fetch_models(&mut self, cx: &mut Context<Self>) {
-        let endpoint = self.state.draft().base_url.trim().to_string();
+    pub(crate) fn fetch_models(&mut self, provider: &str, cx: &mut Context<Self>) {
+        let Some(node) = self.state.settings.global.providers.get(provider).cloned() else {
+            return;
+        };
+        let endpoint = node.base_url.trim().to_string();
         if endpoint.is_empty() {
             self.models_fetch_needs_base_url = true;
             cx.notify();
             return;
         }
-        let draft = self.state.draft();
-        let model = draft.model.trim().to_string();
-        let api_key = draft.api_key.clone();
+        let model = node
+            .models
+            .values()
+            .find(|leaf| !leaf.model.trim().is_empty())
+            .map(|leaf| leaf.model.trim().to_string())
+            .unwrap_or_default();
+        let api_key = node.api_key.clone();
         let (tx, rx) = async_channel::bounded(1);
         self.state.runner.rt().spawn(async move {
             let vendor = react::llm::vendor::OpenAiVendor::new(endpoint, model, api_key);
@@ -463,6 +562,7 @@ impl Shell {
         });
         self.models_fetch_failed = false;
         self.models_fetch_needs_base_url = false;
+        self.models_fetching = true;
         cx.spawn(async move |this, cx| {
             let outcome = rx.recv().await;
             let _ = this.update(cx, |this, cx| {
@@ -476,6 +576,9 @@ impl Shell {
                         this.models_fetch_failed = true;
                     }
                 }
+                // The ask is over whether it answered or refused, so the
+                // trigger goes back to naming the request.
+                this.models_fetching = false;
                 cx.notify();
             });
         })
@@ -493,19 +596,25 @@ impl Shell {
     ///
     /// The catalog itself refuses blanks and repeats, so adding twice is
     /// harmless; the picker closes because the reference dialog does.
-    pub(crate) fn add_selected_models(&mut self) {
-        let provider = self.state.draft().active_provider.clone();
+    pub(crate) fn add_selected_models(
+        &mut self,
+        provider: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ids: Vec<String> = self.models_selected.iter().cloned().collect();
         let draft = self.state.draft_mut();
         for id in ids {
-            let _ = draft.add_catalog_model(&provider, &id);
+            let _ = draft.global.add_model(provider, &id, &id, &id, "");
         }
         self.models_selected.clear();
         self.models_fetched = None;
+        self.reload_model_rows(provider, window, cx);
+        cx.notify();
     }
 
     pub(crate) fn appearance_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.settings.theme_mode == "system" {
+        if self.state.draft().global.general.theme_mode == "system" {
             crate::theme::apply("system", window, cx);
             cx.notify();
         }
@@ -520,7 +629,7 @@ impl Shell {
 
     /// Ask for files and mention them in the composer.
     pub(crate) fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let accepts = self.state.settings.active_accepts_image();
+        let accepts = self.state.settings.accepts_image();
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: true,
@@ -590,29 +699,14 @@ impl Shell {
                 let existing = this
                     .state
                     .settings
+                    .global
                     .workspaces
                     .iter()
                     .find(|w| w.root == root)
                     .map(|w| w.id.clone());
-                let id = match existing {
-                    Some(id) => id,
-                    None => {
-                        let id = uuid::Uuid::new_v4().to_string();
-                        this.state
-                            .settings
-                            .workspaces
-                            .push(crate::settings::Workspace {
-                                id: id.clone(),
-                                name,
-                                root,
-                                created_at: crate::state::now(),
-                                updated_at: crate::state::now(),
-                                ..Default::default()
-                            });
-                        id
-                    }
-                };
-                this.state.settings.active_workspace = id;
+                let id =
+                    existing.unwrap_or_else(|| this.state.settings.note_workspace(&name, &root));
+                this.state.settings.global.general.active_workspace = id;
                 let _ = this.state.settings.save();
                 cx.notify();
             })
@@ -641,8 +735,19 @@ impl Shell {
     }
 
     /// Close the settings dialog, discarding everything it edited.
+    ///
+    /// The draft is what holds the edits, so dropping it is most of the work.
+    /// Two preferences are also PREVIEWED while the dialog is open - the
+    /// interface language and the palette - and those live outside the draft,
+    /// so they are put back from the committed settings here. Without this a
+    /// cancelled dialog kept the language it had merely been trying on.
     pub(crate) fn cancel_settings(&mut self, cx: &mut Context<Self>) {
         self.state.cancel_settings();
+        let committed = &self.state.settings.global.general;
+        self.state.lang = crate::i18n::Lang::from_locale(&committed.lang);
+        let mode = committed.theme_mode.clone();
+        crate::theme::apply_here(&mode, cx);
+        self.developer_tools_failed = false;
         cx.notify();
     }
 
@@ -655,13 +760,20 @@ impl Shell {
             Ok(()) => {
                 self.caps.clear();
                 self.plugins.clear();
+                self.developer_tools_failed = false;
                 self.state
                     .notice(crate::i18n::tr(self.state.lang, "settings.saved").to_string());
             }
-            Err(error) => self.state.notice(format!(
-                "{} {error}",
-                crate::i18n::tr(self.state.lang, "settings.saveFailed")
-            )),
+            Err(error) => {
+                // The inline error beside the developer-tools row and the
+                // notice say the same thing, so a file that could not be
+                // written is visible where the reader was looking.
+                self.developer_tools_failed = true;
+                self.state.notice(format!(
+                    "{} {error}",
+                    crate::i18n::tr(self.state.lang, "settings.saveFailed")
+                ));
+            }
         }
         cx.notify();
     }
@@ -697,6 +809,14 @@ impl Shell {
         }
         let input = crate::state::turn_input(&text, &attachments);
         let display = crate::state::display_text(&text, &attachments);
+        // A name the trees no longer define is refused where the reader can see
+        // it, before a turn opens against a model nobody chose.
+        if let Some(key) = self.state.settings.refusal() {
+            let why = crate::i18n::tr(self.state.lang, key);
+            self.state.attachments = attachments;
+            self.state.notice(why);
+            return;
+        }
         let Some((id, transcript, budget)) = self.state.begin_turn(&display) else {
             self.state.attachments = attachments;
             return;
@@ -785,11 +905,12 @@ impl Shell {
     /// this tick.
     pub(crate) fn check_schedules(&mut self, cx: &mut Context<Self>) {
         let now = crate::settings::unix_now();
-        let due = self.state.settings.due_schedules(now);
+        let due = self.state.settings.global.due_schedules(now);
         for id in due {
             let Some(task) = self
                 .state
                 .settings
+                .global
                 .schedules
                 .iter()
                 .find(|entry| entry.id == id)
@@ -803,12 +924,12 @@ impl Shell {
             let Some((transcript, budget)) =
                 self.state.begin_turn_in(&task.session_id, &task.prompt)
             else {
-                self.state.settings.toggle_schedule(&id);
+                self.state.settings.global.toggle_schedule(&id);
                 continue;
             };
             let input = crate::state::turn_input(&task.prompt, &[]);
             self.spawn_turn(task.session_id.clone(), input, transcript, budget, cx);
-            self.state.settings.mark_schedule_ran(&id, now);
+            self.state.settings.global.mark_schedule_ran(&id, now);
         }
         cx.notify();
     }
@@ -928,8 +1049,11 @@ impl Shell {
             return;
         };
         if drag.moved {
-            self.state.settings.content_width = self.chat_user_w;
-            let _ = self.state.settings.save();
+            self.state.draft_mut().global.general.content_width = self.chat_user_w;
+            // The width was just written to the draft, so persisting `settings`
+            // would store the copy from before the drag. The commit is what
+            // moves the draft into the document and writes it.
+            let _ = self.state.commit_settings();
         }
         cx.notify();
     }
@@ -1075,8 +1199,10 @@ impl Shell {
             crate::theme::resolve_sidebar_width(Some(drag.base + (pointer_x - drag.origin_x)));
         if drag.moved {
             self.sidebar_user_w = Some(width);
-            self.state.settings.sidebar_width = self.sidebar_user_w;
-            let _ = self.state.settings.save();
+            self.state.draft_mut().global.general.sidebar_width = self.sidebar_user_w;
+            // Same as the content width: the value lives in the draft now, so
+            // only a commit writes it where the next launch reads it.
+            let _ = self.state.commit_settings();
         }
         cx.notify();
     }

@@ -81,6 +81,14 @@ pub struct AgentConfig {
     pub timeout_secs: u64,
     /// Maximum ReAct steps before the run is stopped.
     pub max_steps: usize,
+    /// Offer the model a hosted web-search tool.
+    ///
+    /// A HOSTED tool, not a local one: the provider runs the search and returns
+    /// the results in its own stream, so nothing here can execute it. Only the
+    /// Responses protocol carries hosted tools, which is why
+    /// \`prepare_context\` decides on this flag AND the protocol together - an
+    /// OpenAI-compatible chat endpoint would reject the object outright.
+    pub web_search: bool,
     /// Run one response's tool calls concurrently instead of one at a time.
     ///
     /// Off by default: a sequential batch keeps the hook and session order a
@@ -114,6 +122,7 @@ impl Default for AgentConfig {
             max_tokens: None,
             timeout_secs: 60,
             max_steps: 10,
+            web_search: false,
             parallel_tool_calls: false,
             api_mode: "chat".to_string(),
             reasoning_effort: None,

@@ -108,7 +108,7 @@ impl Shell {
     /// here: `request_permission` is the one entry point both controls call,
     /// and it is what keeps the confirmation from being a pane-only ritual.
     pub(crate) fn set_permission(&mut self, permission: &str, cx: &mut Context<Self>) {
-        self.state.draft_mut().permission = permission.to_string();
+        self.state.draft_mut().workspace.agent.permission = permission.to_string();
         cx.notify();
     }
 
@@ -118,7 +118,7 @@ impl Shell {
     /// `danger-full-access` to `RiskConfirmation` instead of writing it, so
     /// the gate cannot be skipped by choosing it from a different control.
     pub(crate) fn request_permission(&mut self, permission: &str, cx: &mut Context<Self>) {
-        if self.state.draft().permission == permission {
+        if self.state.draft().workspace.agent.permission == permission {
             return;
         }
         if permission == crate::caps::FULL_ACCESS {
@@ -177,7 +177,7 @@ impl Shell {
     /// The composer card under the conversation.
     pub(crate) fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // The chip names the mode the tools obey, not a fixed label.
-        let permission = self.state.draft().permission.clone();
+        let permission = self.state.draft().workspace.agent.permission.clone();
         let lang = self.state.lang;
         let streaming = self.state.any_streaming();
         let can_send = !self.composer_value.trim().is_empty();
@@ -185,8 +185,10 @@ impl Shell {
         // The menu offers the same list the Models pane draws: the active
         // provider's customized catalog.
         let models = {
-            let draft = self.state.draft();
-            draft.catalog(&draft.active_provider).to_vec()
+            let settings = self.state.draft();
+            settings
+                .catalog(settings.active_provider().to_string().as_str())
+                .to_vec()
         };
         let column = div().pb(px(4.0)).flex().flex_col().child({
             // Measured: radius-panel 28 over the input-major fill (white in light,
@@ -221,7 +223,7 @@ impl Shell {
                         .pt(px(0.0))
                         .min_h(px(theme::COMPOSER_INPUT_MIN_H))
                         .text_size(px(theme::body_size_at(
-                            self.state.settings.content_font_size,
+                            self.state.draft().global.general.content_font_size,
                         )))
                         .max_h(px(theme::COMPOSER_INPUT_MAX_H))
                         .overflow_y_scroll()
@@ -418,7 +420,7 @@ impl Shell {
                                     PopupMenuItem::new(model).checked(active).on_click(
                                         move |_, _window, cx| {
                                             pick.update(cx, |this, cx| {
-                                                this.catalog_select(&name);
+                                                this.state.select_model(&name);
                                                 cx.notify();
                                             });
                                         },

@@ -533,9 +533,10 @@ impl Shell {
     fn workspace_root(&self) -> Option<PathBuf> {
         let settings = &self.state.settings;
         settings
+            .global
             .workspaces
             .iter()
-            .find(|workspace| workspace.id == settings.active_workspace)
+            .find(|workspace| workspace.id == settings.global.general.active_workspace)
             .map(|workspace| PathBuf::from(&workspace.root))
     }
 
@@ -543,6 +544,7 @@ impl Shell {
     fn workspace_name(&self, id: &str) -> String {
         self.state
             .settings
+            .global
             .workspaces
             .iter()
             .find(|workspace| workspace.id == id)

@@ -97,7 +97,7 @@ impl Shell {
     /// in; only the highlight theme and the `is_dark` flag are named here so a
     /// dark window does not get light code colours.
     pub(crate) fn markdown_style(&self) -> TextViewStyle {
-        let content = self.state.settings.content_font_size;
+        let content = self.state.draft().global.general.content_font_size;
         let dark = theme::is_dark();
         let table = |weight: Option<FontWeight>| {
             let cell = StyleRefinement::default()
@@ -488,7 +488,7 @@ impl Shell {
                     ))
                     .child(txt(
                         goal.objective.clone(),
-                        theme::body_size_at(self.state.settings.content_font_size),
+                        theme::body_size_at(self.state.draft().global.general.content_font_size),
                         theme::text(),
                     ))
                     .into_any_element(),
@@ -509,7 +509,7 @@ impl Shell {
                     .child(glyph(mark, 12.0, theme::muted()))
                     .child(txt(
                         item.text.clone(),
-                        theme::body_size_at(self.state.settings.content_font_size),
+                        theme::body_size_at(self.state.draft().global.general.content_font_size),
                         theme::text(),
                     ))
                     .into_any_element(),
@@ -552,8 +552,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if message.role == Role::User {
-            let size = theme::body_size_at(self.state.settings.content_font_size);
-            let line = theme::bubble_line_at(self.state.settings.content_font_size);
+            let size = theme::body_size_at(self.state.draft().global.general.content_font_size);
+            let line = theme::bubble_line_at(self.state.draft().global.general.content_font_size);
             return div()
                 .w_full()
                 .flex()
@@ -600,7 +600,7 @@ impl Shell {
                             }
                             None => self.state.lang.tr("msg.running").to_string(),
                         },
-                        theme::body_size_at(self.state.settings.content_font_size),
+                        theme::body_size_at(self.state.draft().global.general.content_font_size),
                         theme::muted(),
                     )),
             );
@@ -610,10 +610,10 @@ impl Shell {
                     .on_link_click(open_link)
                     .style(self.markdown_style())
                     .line_height(px(theme::body_line_at(
-                        self.state.settings.content_font_size,
+                        self.state.draft().global.general.content_font_size,
                     )))
                     .text_size(px(theme::body_size_at(
-                        self.state.settings.content_font_size,
+                        self.state.draft().global.general.content_font_size,
                     )))
                     .text_color(rgb(theme::text())),
             );
@@ -657,7 +657,7 @@ impl Shell {
         folded: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let content = self.state.settings.content_font_size;
+        let content = self.state.draft().global.general.content_font_size;
         let row_h = theme::disclosure_row_at(content);
         let small = theme::small_size_at(content);
         let quiet = theme::faint();
@@ -939,7 +939,9 @@ impl Shell {
                     .child(
                         txt(
                             name,
-                            theme::small_size_at(self.state.settings.content_font_size),
+                            theme::small_size_at(
+                                self.state.draft().global.general.content_font_size,
+                            ),
                             theme::text(),
                         )
                         .font_weight(FontWeight::SEMIBOLD),
@@ -997,7 +999,7 @@ impl Shell {
             .justify_center()
             .child(txt(
                 self.state.lang.tr(key),
-                theme::body_size_at(self.state.settings.content_font_size),
+                theme::body_size_at(self.state.draft().global.general.content_font_size),
                 theme::muted(),
             ))
     }

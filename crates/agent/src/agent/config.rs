@@ -80,8 +80,9 @@ impl From<TomlAgentConfig> for AgentConfig {
             max_tokens: t.max_tokens,
             timeout_secs: t.timeout_secs,
             max_steps: t.max_steps.unwrap_or(10),
-            // A TOML agent config carries no switch for this yet; the host sets
-            // the field on the AgentConfig it builds directly.
+            // A TOML agent config carries no switch for these yet; the host sets
+            // the fields on the AgentConfig it builds directly.
+            web_search: false,
             parallel_tool_calls: false,
             api_mode: t.api_mode.unwrap_or_default(),
             reasoning_effort: t.reasoning_effort,

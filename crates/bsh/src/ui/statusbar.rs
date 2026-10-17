@@ -20,7 +20,7 @@ impl Shell {
     /// has values, and bsh models no per-step timings, so it stays that shape.
     /// The usage pill is the button over the token dialog.
     pub(crate) fn render_statusbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let size = self.state.settings.content_font_size;
+        let size = self.state.draft().global.general.content_font_size;
         let lang = self.state.lang;
         let (turns, steps) = self
             .state

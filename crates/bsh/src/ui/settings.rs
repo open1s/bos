@@ -11,7 +11,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
-use super::shell::Shell;
+use super::shell::{ModelRowEditor, ModelsAddRoute, Shell};
 use super::{hairline_all, hairline_bottom, icon, txt, DivExt, IconName};
 use crate::i18n::{tr, tr_args, Lang};
 use crate::settings::Settings;
@@ -29,7 +29,7 @@ pub(crate) const SECTIONS: [&str; 14] = [
     "settings.agent-loop",
     "settings.mcp",
     "settings.archived-sessions",
-    "settings.workspaces",
+    "settings.global.workspaces",
     "settings.context",
     "settings.agent-presets",
     "settings.plugins",
@@ -78,48 +78,49 @@ fn parse_capacity(text: &str) -> Option<usize> {
 }
 
 pub(crate) fn section_index(id: &str) -> Option<usize> {
-    SECTIONS
-        .iter()
-        .position(|key| key.trim_start_matches("settings.") == id)
+    SECTIONS.iter().position(|key| {
+        // A pane the rail does not carry is reached by its short id, so the
+        // global-level prefix is part of the id and not of the name: the
+        // workspaces pane is `settings.global.workspaces` in the file and
+        // `workspaces` to the cell that opens it.
+        let trimmed = key
+            .strip_prefix("settings.global.")
+            .or_else(|| key.strip_prefix("settings."))
+            .unwrap_or(key);
+        trimmed == id
+    })
 }
 
-/// The text fields the Models and Context sections edit.
+/// The text fields the panes edit.
+///
+/// The connection fields are not here any more: an endpoint belongs to a
+/// provider node in the tree, and the provider form carries its own fields on
+/// `Shell`, because one provider form is open at a time.
 pub(crate) struct SettingsInputs {
-    model: Entity<InputState>,
-    base_url: Entity<InputState>,
-    api_key: Entity<InputState>,
     system_prompt: Entity<InputState>,
     budget: Entity<InputState>,
     shell_timeout: Entity<InputState>,
     output_cap: Entity<InputState>,
     pub(crate) max_steps: Entity<InputState>,
     max_tokens: Entity<InputState>,
-    provider_name: Entity<InputState>,
 }
 
 impl SettingsInputs {
     /// Build the fields.
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Shell>) -> Self {
         Self {
-            model: cx.new(|cx| InputState::new(window, cx)),
-            base_url: cx.new(|cx| InputState::new(window, cx)),
-            api_key: cx.new(|cx| InputState::new(window, cx).masked(true)),
             system_prompt: cx.new(|cx| InputState::new(window, cx)),
             budget: cx.new(|cx| InputState::new(window, cx)),
             shell_timeout: cx.new(|cx| InputState::new(window, cx)),
             output_cap: cx.new(|cx| InputState::new(window, cx)),
             max_steps: cx.new(|cx| InputState::new(window, cx)),
             max_tokens: cx.new(|cx| InputState::new(window, cx)),
-            provider_name: cx.new(|cx| InputState::new(window, cx)),
         }
     }
 
     /// Load the fields from the settings the dialog opened on.
     pub(crate) fn sync(&self, settings: &Settings, window: &mut Window, cx: &mut Context<Shell>) {
         let effective = settings.effective();
-        set(&self.model, effective.model, window, cx);
-        set(&self.base_url, effective.base_url, window, cx);
-        set(&self.api_key, effective.api_key, window, cx);
         set(&self.system_prompt, effective.system_prompt, window, cx);
         set(
             &self.budget,
@@ -153,88 +154,130 @@ impl SettingsInputs {
 
     /// Write the fields back into the draft.
     pub(crate) fn read(&self, settings: &mut Settings, cx: &App) {
-        settings.model = self.model.read(cx).value().to_string();
-        settings.base_url = self.base_url.read(cx).value().to_string();
-        settings.api_key = self.api_key.read(cx).value().to_string();
-        settings.system_prompt = self.system_prompt.read(cx).value().to_string();
+        settings.workspace.agent.system_prompt = self.system_prompt.read(cx).value().to_string();
         let budget = self.budget.read(cx).value().trim().to_string();
         if let Some(parsed) = parse_capacity(&budget) {
-            settings.context_budget = parsed;
+            settings.workspace.agent.context_budget = parsed;
         }
         let timeout = self.shell_timeout.read(cx).value().trim().to_string();
         if let Ok(parsed) = timeout.parse::<u64>() {
-            settings.shell_timeout_secs = parsed.max(1);
+            settings.workspace.agent.shell_timeout_secs = parsed.max(1);
         }
         let cap = self.output_cap.read(cx).value().trim().to_string();
         if let Ok(parsed) = cap.parse::<usize>() {
-            settings.tool_output_cap = parsed.max(256);
+            settings.workspace.agent.tool_output_cap = parsed.max(256);
         }
         let steps = self.max_steps.read(cx).value().trim().to_string();
         if let Ok(parsed) = steps.parse::<usize>() {
-            settings.max_steps = parsed.max(1);
+            settings.workspace.agent.max_steps = parsed.max(1);
         }
         let tokens = self.max_tokens.read(cx).value().trim().to_string();
         if tokens.is_empty() {
-            settings.max_tokens = None;
+            settings.workspace.agent.max_tokens = None;
         } else if let Some(parsed) = parse_capacity(&tokens) {
-            settings.max_tokens = Some(parsed.min(u32::MAX as usize) as u32);
+            settings.workspace.agent.max_tokens = Some(parsed.min(u32::MAX as usize) as u32);
         }
     }
 }
 
-/// Replace one field's text.
-fn set(input: &Entity<InputState>, value: String, window: &mut Window, cx: &mut Context<Shell>) {
-    input.update(cx, |state, cx| state.set_value(value, window, cx));
+/// The name a provider is shown under: the name the tree carries, else the
+/// shipped family's own name, else its id.
+///
+/// Never the base URL. `built_in` answers `(name, base URL, protocol)`, and two
+/// sites here took its SECOND element as the label, so the Models card printed
+/// `https://integrate.api.nvidia.com/v1` where the provider's name belongs and
+/// the display-name field opened pre-filled with the endpoint.
+pub(crate) fn provider_label(id: &str, name: Option<&str>) -> String {
+    if let Some(named) = name.map(str::trim).filter(|named| !named.is_empty()) {
+        return named.to_string();
+    }
+    crate::settings::global::built_in(id)
+        .map(|(label, _, _)| label.to_string())
+        .unwrap_or_else(|| id.to_string())
 }
 
-/// Load a saved provider into the form: the draft carries the values the form
-/// saves, and the inputs are what the user sees.
+/// Load a provider into the open editor: the tree carries the values, and the
+/// text engines are what the reader sees.
+///
+/// The provider id is fixed, because it is the key the tree is filed under and
+/// the prefix the engine registers the vendor with; the display name is the
+/// part a reader may edit.
 pub(crate) fn load_provider_into_form(
     shell: &mut Shell,
-    profile: &crate::settings::Profile,
+    id: &str,
     window: &mut Window,
     cx: &mut Context<Shell>,
 ) {
-    set(
-        &shell.settings_inputs.provider_name,
-        profile.name.clone(),
-        window,
-        cx,
-    );
-    set(
-        &shell.settings_inputs.model,
-        profile.model.clone(),
-        window,
-        cx,
-    );
-    set(
-        &shell.settings_inputs.base_url,
-        profile.base_url.clone(),
-        window,
-        cx,
-    );
-    set(
-        &shell.settings_inputs.api_key,
-        profile.api_key.clone(),
-        window,
-        cx,
-    );
-    shell.state.begin_provider_edit(profile);
+    // The draft is the document the panes edit, so a provider seeded into
+    // it is the one the form opens, and the file it is saved to never has to
+    // be read back for a value the form already holds.
+    let Some(provider) = shell.state.draft().global.providers.get(id).cloned() else {
+        return;
+    };
+    let label = provider_label(id, provider.name.as_deref());
+    set_value(&shell.add_route, id.to_string(), window, cx);
+    set_value(&shell.add_display, label, window, cx);
+    set_value(&shell.add_base_url, provider.base_url.clone(), window, cx);
+    set_value(&shell.add_key, provider.api_key.clone(), window, cx);
+    // One editor per leaf, so the reference's per-row inputs are per-row
+    // engines rather than one shared field that collapses every row into one.
+    shell.model_rows = provider
+        .models
+        .iter()
+        .map(|(key, entry)| ModelRowEditor {
+            key: key.clone(),
+            entry: entry.clone(),
+            id: cx.new(|cx| {
+                let mut state = InputState::new(window, cx);
+                state.set_value(entry.model.clone(), window, cx);
+                state
+            }),
+            name: cx.new(|cx| {
+                let mut state = InputState::new(window, cx);
+                state.set_value(entry.name.clone().unwrap_or_default(), window, cx);
+                state
+            }),
+            open: false,
+        })
+        .collect();
+    set_value(&shell.new_row_id, String::new(), window, cx);
+    set_value(&shell.new_row_name, String::new(), window, cx);
+    set_value(&shell.new_model_id, String::new(), window, cx);
+    set_value(&shell.new_model_name, String::new(), window, cx);
+    shell.catalogue_choice = None;
+    shell.catalogue_open = false;
+    shell.state.begin_provider_edit(id);
+}
+
+/// Replace one text engine's value, without firing a change event.
+fn set_value(
+    input: &Entity<InputState>,
+    value: String,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) {
+    input.update(cx, |state, cx| state.set_value(value, window, cx));
+}
+/// The alias the pane uses for a text engine replacement.
+fn set(input: &Entity<InputState>, value: String, window: &mut Window, cx: &mut Context<Shell>) {
+    set_value(input, value, window, cx);
 }
 
 /// Switch the interface language.
 fn language_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
     let lang = if key == "zh" { Lang::Zh } else { Lang::En };
+    // The preview follows the click; the file follows Save. Writing the
+    // committed tree and saving it here would persist every OTHER field from
+    // the copy the reader has not applied yet, which is how a pending
+    // permission change got overwritten by a language pick.
     shell.state.lang = lang;
-    shell.state.settings.lang = lang.locale().to_string();
-    let _ = shell.state.settings.save();
+    shell.state.draft_mut().global.general.lang = lang.locale().to_string();
     cx.notify();
 }
 
 /// Switch the colour mode and remember it.
 fn theme_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
-    shell.state.settings.theme_mode = key.to_string();
-    let _ = shell.state.settings.save();
+    shell.state.draft_mut().global.general.theme_mode = key.to_string();
     crate::theme::apply_here(key, cx);
     cx.notify();
 }
@@ -244,16 +287,15 @@ fn theme_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
 /// The reference stepper accepts 10..22 px and moves the conversation text by
 /// the step, so the shell re-renders instead of only storing the number.
 fn font_size_action(shell: &mut Shell, delta: i32, cx: &mut Context<Shell>) {
-    let current = shell.state.settings.content_font_size as i32;
+    let current = shell.state.draft().global.general.content_font_size as i32;
     let next = (current + delta).clamp(
         crate::theme::CONTENT_MIN as i32,
         crate::theme::CONTENT_MAX as i32,
     ) as u32;
-    if next == shell.state.settings.content_font_size {
+    if next == shell.state.draft().global.general.content_font_size {
         return;
     }
-    shell.state.settings.content_font_size = next;
-    let _ = shell.state.settings.save();
+    shell.state.draft_mut().global.general.content_font_size = next;
     cx.notify();
 }
 
@@ -296,27 +338,26 @@ fn preference_action(
 /// draft, and reports `developerTools.error` inline when the write fails, so a
 /// refusal is visible on the row instead of looking like it worked.
 fn developer_tools_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
-    shell.state.draft_mut().developer_tools = on;
-    if shell.state.settings.save().is_err() {
-        shell.developer_tools_failed = true;
-    }
+    // Draft only. Saving here persisted the committed tree, so the toggle the
+    // reader had just flipped was the one field the write did NOT carry - the
+    // file kept its old value while the pane showed the new one.
+    shell.state.draft_mut().global.general.developer_tools = on;
+    shell.developer_tools_failed = false;
     cx.notify();
 }
 
-/// Choose the API protocol the agent speaks; automatic follows the model.
-fn api_mode_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
-    let mode = if key == "auto" {
-        String::new()
-    } else {
-        key.to_string()
-    };
-    shell.state.draft_mut().api_mode = mode;
+/// Offer or withdraw the hosted web-search tool.
+///
+/// Nothing local executes it - the provider runs the search - so the switch
+/// writes the setting and the engine decides whether the protocol can carry it.
+fn web_tools_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
+    shell.state.draft_mut().workspace.agent.web_tools_enabled = on;
     cx.notify();
 }
 
 /// Attach or detach the memory store.
 fn memory_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
-    shell.state.draft_mut().memory_enabled = on;
+    shell.state.draft_mut().workspace.agent.memory_enabled = on;
     cx.notify();
 }
 
@@ -328,22 +369,42 @@ fn memory_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
 /// decides completed-turn folding, step grouping, whether a live process step is
 /// shown and whether a settled reasoning block keeps its preview.
 fn transcript_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
-    preference_action(shell, |settings| &mut settings.transcript_view, key, cx);
+    preference_action(
+        shell,
+        |settings| &mut settings.global.general.transcript_view,
+        key,
+        cx,
+    );
 }
 
 /// Where a link in the transcript opens.
 fn link_opening_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
-    preference_action(shell, |settings| &mut settings.link_opening, key, cx);
+    preference_action(
+        shell,
+        |settings| &mut settings.global.general.link_opening,
+        key,
+        cx,
+    );
 }
 
 /// What Enter does while a turn streams.
 fn composer_enter_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
-    preference_action(shell, |settings| &mut settings.composer_enter, key, cx);
+    preference_action(
+        shell,
+        |settings| &mut settings.global.general.composer_enter,
+        key,
+        cx,
+    );
 }
 
 /// How much performance and usage detail the footer shows.
 fn performance_usage_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
-    preference_action(shell, |settings| &mut settings.performance_usage, key, cx);
+    preference_action(
+        shell,
+        |settings| &mut settings.global.general.performance_usage,
+        key,
+        cx,
+    );
 }
 
 /// The one reveal path the account pane's button and the header action share.
@@ -389,11 +450,13 @@ impl Field {
     fn default_text(self) -> String {
         let default = Settings::default();
         match self {
-            Field::ShellTimeout => default.shell_timeout_secs.to_string(),
-            Field::OutputCap => default.tool_output_cap.to_string(),
-            Field::MaxSteps => default.max_steps.to_string(),
-            Field::Budget => default.context_budget.to_string(),
+            Field::ShellTimeout => default.workspace.agent.shell_timeout_secs.to_string(),
+            Field::OutputCap => default.workspace.agent.tool_output_cap.to_string(),
+            Field::MaxSteps => default.workspace.agent.max_steps.to_string(),
+            Field::Budget => default.workspace.agent.context_budget.to_string(),
             Field::MaxTokens => default
+                .workspace
+                .agent
                 .max_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_default(),
@@ -632,9 +695,15 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .child(txt(tr(lang, hint), 12.0, theme::faint()).mb(px(12.0)))
-                    .children(content)
-                    .child(footer),
-            );
+                    .children(content),
+            )
+            // The save bar is pinned under the scrolling box, not carried in it.
+            // Carried in it, the dialog's ONE primary action scrolled away with
+            // the section: in General at the reference window size it laid out at
+            // y=1214 in a 900-tall window - off screen - so the reader had to
+            // scroll to find the only control that commits, and nothing reachable
+            // by keyboard could replace it.
+            .child(div().flex_none().px(px(24.0)).pb(px(24.0)).child(footer));
 
         // Measured (SettingsRoot.module.css): 800 wide and as tall as
         // min(800, viewport - 48) - the mask's own 24px inset on each side - on
@@ -727,7 +796,7 @@ impl Shell {
     /// hover - with the `px` unit beside it.
     fn font_size_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
-        let size = self.state.settings.content_font_size;
+        let size = self.state.draft().global.general.content_font_size;
         let arrows = div()
             .absolute()
             .right(px(8.0))
@@ -788,7 +857,7 @@ impl Shell {
     /// One chevron of the Font size stepper: the reference's own 17x12 chip at
     /// the measured radius, inert at either end of the range.
     fn font_step(&self, id: &'static str, delta: i32, cx: &mut Context<Self>) -> AnyElement {
-        let size = self.state.settings.content_font_size as i32;
+        let size = self.state.draft().global.general.content_font_size as i32;
         let at_end = (size + delta).clamp(
             crate::theme::CONTENT_MIN as i32,
             crate::theme::CONTENT_MAX as i32,
@@ -834,7 +903,7 @@ impl Shell {
     /// stronger border; the others keep the hairline and fill on hover.
     fn appearance_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
-        let current = self.state.settings.theme_mode.clone();
+        let current = self.state.draft().global.general.theme_mode.clone();
         let cubes = [
             ("light", IconName::Sun, "settings.modeLight"),
             ("dark", IconName::Moon, "settings.modeDark"),
@@ -1270,17 +1339,17 @@ impl Shell {
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let lang = self.state.lang;
         let draft = self.state.draft().clone();
-        let permission = draft.permission.clone();
+        let permission = draft.workspace.agent.permission.clone();
         let language = if self.state.lang == Lang::Zh {
             "zh"
         } else {
             "en"
         };
-        let transcript = draft.transcript_view.clone();
-        let links = draft.link_opening.clone();
-        let enter = draft.composer_enter.clone();
-        let performance = draft.performance_usage.clone();
-        let developer_tools = draft.developer_tools;
+        let transcript = draft.global.general.transcript_view.clone();
+        let links = draft.global.general.link_opening.clone();
+        let enter = draft.global.general.composer_enter.clone();
+        let performance = draft.global.general.performance_usage.clone();
+        let developer_tools = draft.global.general.developer_tools;
         let failed = self.developer_tools_failed;
         let mut rows = vec![
             self.select_row(
@@ -1488,12 +1557,8 @@ impl Shell {
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let draft = self.state.draft();
-        let active = draft.preset.clone();
-        let listed: Vec<String> = draft
-            .presets
-            .iter()
-            .map(|preset| preset.name.clone())
-            .collect();
+        let active = draft.global.default_preset.clone();
+        let listed: Vec<String> = draft.global.preset_ids();
         let mut rows: Vec<AnyElement> = vec![div()
             .debug_selector(|| "preset-default".to_string())
             .id(SharedString::from("preset-default"))
@@ -1549,255 +1614,206 @@ impl Shell {
     /// block shows its Add button, or the add card while that is open, never both.
     fn section_models(
         &self,
-        cx: &mut Context<Shell>,
+        cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        // Discovered profiles first, then saved ones; only the saved ones are
-        // bsh's own rows to remove, because the rest are rewritten from the BOS
-        // config on every load.
-        let listed: Vec<(crate::settings::Profile, bool)> = {
-            let draft = self.state.draft();
-            let mut listed: Vec<(crate::settings::Profile, bool)> = draft
-                .profiles
-                .iter()
-                .map(|profile| (profile.clone(), false))
-                .collect();
-            listed.extend(
-                draft
-                    .providers
-                    .iter()
-                    .map(|profile| (profile.clone(), true)),
-            );
-            listed
+        let lang = self.state.lang;
+        let cards: Vec<AnyElement> = self
+            .state
+            .draft()
+            .global
+            .providers
+            .iter()
+            .enumerate()
+            .map(|(index, (id, provider))| self.provider_card(id, provider, index, cx))
+            .collect();
+        let listed = if cards.is_empty() {
+            vec![self.model_empty_note(lang)]
+        } else {
+            cards
         };
-        let mut cards: Vec<AnyElement> = Vec::new();
-        for (index, (profile, removable)) in listed.iter().enumerate() {
-            cards.push(self.provider_card(profile, *removable, index, cx));
-        }
-        let rows: Vec<AnyElement> = vec![
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .mt(px(12.0))
-                .children(cards)
-                .into_any_element(),
-            self.add_provider_block(cx),
-        ];
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(listed.len() + 1);
+        rows.extend(listed);
+        rows.push(self.add_provider_block(cx));
         ("settings.models", "settings.modelsHint", rows)
     }
 
-    /// One provider card: the measured `rowCard` head, and the editor under it
-    /// while this provider is the one being edited.
+    /// The empty catalogue, drawn where the reference draws its `modelEmpty`.
+    fn model_empty_note(&self, lang: Lang) -> AnyElement {
+        hairline_all(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .py(px(12.0))
+                .px(px(14.0))
+                .rounded(px(16.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border_soft()))
+                .child(txt(lang.tr("settings.modelsEmpty"), 12.0, theme::faint())),
+        )
+        .into_any_element()
+    }
+
+    /// One provider card: the measured row head, and the editor under it while
+    /// this provider is the one being edited.
     fn provider_card(
         &self,
-        profile: &crate::settings::Profile,
-        removable: bool,
+        id: &str,
+        provider: &crate::settings::global::Provider,
         index: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let lang = self.state.lang;
-        let open = self.state.editing_provider.as_deref() == Some(profile.name.as_str());
-
-        // `rowIdentity`: the name, the hand-declared tag, the API-key dot.
-        // bsh keeps "which endpoint the agent is built against" here, behind a
-        // click on the name, because its composer chip picks a MODEL and not a
-        // provider. The reference has no such control on this page - its model
-        // chip owns the choice - so this is the one BSH-only affordance on the
-        // card, and it deliberately adds no chrome of its own.
-        let select_name = profile.name.clone();
+        let open = self.state.editing_provider.as_deref() == Some(id);
+        let name = provider_label(id, provider.name.as_deref());
         let mut identity = div()
-            .id(SharedString::from(format!("provider-{index}")))
-            .debug_selector(move || format!("provider-{index}"))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
             .min_w_0()
-            .cursor_pointer()
-            .child(txt(profile.name.clone(), 14.0, theme::text()).font_weight(FontWeight::MEDIUM));
-        if removable {
-            identity = identity.child(hairline_all(
-                div()
-                    .flex_none()
-                    .px(px(6.0))
-                    .py(px(1.0))
-                    .rounded(px(3.0))
-                    .border_color(rgb(theme::border()))
-                    .child(txt(tr(lang, "settings.customTag"), 11.0, theme::muted())),
-            ));
+            .child(txt(name.clone(), 14.0, theme::text()).font_weight(FontWeight::MEDIUM));
+        if provider.declared {
+            identity = identity.child(
+                hairline_all(
+                    div()
+                        .px(px(6.0))
+                        .py(px(1.0))
+                        .rounded(px(3.0))
+                        .border_color(rgb(theme::border()))
+                        .child(txt(lang.tr("settings.customTag"), 11.0, theme::muted())),
+                )
+                .into_any_element(),
+            );
         }
-        // The reference's dot is green only for a credential it confirmed
-        // present, and red only for a named reference it proved missing. bsh
-        // holds the key as a plain string and names no reference, so no state
-        // here could prove one missing and the missing dot is never drawn.
-        if !profile.api_key.trim().is_empty() {
+        if !provider.api_key.trim().is_empty() {
             identity = identity.child(
                 div()
-                    .debug_selector(move || format!("provider-key-{index}"))
-                    .flex_none()
+                    .debug_selector(|| format!("provider-key-{index}"))
                     .w(px(8.0))
                     .h(px(8.0))
                     .rounded_full()
-                    .bg(rgb(theme::success())),
+                    .bg(rgb(theme::success()))
+                    .into_any_element(),
             );
         }
-        identity = identity.on_click(cx.listener(move |this, _event, _window, cx| {
-            this.state.select_provider(&select_name);
-            cx.notify();
-        }));
-
-        // `rowActions`: 4px apart, pushed to the right edge.
-        let mut actions = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.0))
-            .ml_auto();
-        let edit_profile = profile.clone();
-        actions = actions.child(
-            div()
-                .id(SharedString::from(format!("provider-edit-{index}")))
-                .debug_selector(move || format!("provider-edit-{index}"))
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(28.0))
-                .px(px(10.0))
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::hover())))
-                .child(txt(tr(lang, "settings.editProvider"), 12.0, theme::text()))
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    if this.state.editing_provider.as_deref() == Some(edit_profile.name.as_str()) {
-                        this.state.editing_provider = None;
-                        this.state.provider_refusal = None;
-                    } else {
-                        this.models_add_open = false;
-                        this.models_advanced_open = false;
-                        load_provider_into_form(this, &edit_profile, window, cx);
-                    }
-                    cx.notify();
-                })),
-        );
-        if removable {
-            let name = profile.name.clone();
-            actions = actions.child(
-                div()
-                    .id(SharedString::from(format!("provider-remove-{index}")))
-                    .debug_selector(move || format!("provider-remove-{index}"))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(28.0))
-                    .px(px(10.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(txt(tr(lang, "settings.modelsRemove"), 12.0, theme::error()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.begin_provider_remove(&name);
-                        cx.notify();
-                    })),
-            );
-        }
-
-        let mut card = div().flex().flex_col().gap(px(12.0)).child(
+        let owned = id.to_string();
+        let head = identity.child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(10.0))
-                .child(identity)
-                .child(actions),
+                .gap(px(4.0))
+                .ml_auto()
+                .child(
+                    div()
+                        .id(format!("provider-edit-{index}"))
+                        .debug_selector(move || format!("provider-edit-{index}"))
+                        .cursor_pointer()
+                        .child(txt(lang.tr("settings.editProvider"), 12.0, theme::muted()))
+                        .on_click(cx.listener({
+                            let owned = owned.clone();
+                            move |this, _event, window, cx| {
+                                load_provider_into_form(this, &owned, window, cx);
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .id(format!("provider-remove-{index}"))
+                        .debug_selector(move || format!("provider-remove-{index}"))
+                        .cursor_pointer()
+                        .child(txt(lang.tr("settings.modelsRemove"), 12.0, theme::muted()))
+                        .on_click(cx.listener({
+                            let owned = owned.clone();
+                            move |this, _event, _window, cx| {
+                                this.state.begin_provider_remove(&owned);
+                                cx.notify();
+                            }
+                        })),
+                ),
         );
-        if open {
-            if let Some(key) = self.state.provider_refusal {
-                card = card.child(self.settings_note(key, true));
-            }
-            card = card.child(self.provider_editor(profile, cx));
-        }
-        hairline_all(
-            card.py(px(12.0))
+        let mut card = hairline_all(
+            div()
+                .id(SharedString::from(format!("provider-{index}")))
+                .debug_selector(move || format!("provider-{index}"))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .py(px(12.0))
                 .px(px(14.0))
                 .rounded(px(16.0))
                 .bg(rgb(theme::page()))
-                .border_color(rgb(theme::border_soft())),
-        )
-        .into_any_element()
+                .border_color(rgb(theme::border_soft()))
+                .child(head),
+        );
+        if open {
+            card = card.child(self.provider_editor(id, cx));
+        }
+        card.into_any_element()
     }
-
-    /// The editor a card opens: the reference's API-key field over its
-    /// Customized settings fold, with the Apply/Cancel pair under both.
-    fn provider_editor(
-        &self,
-        profile: &crate::settings::Profile,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// The provider editor: the measured card head and the model list under
+    /// it. One text engine per model row, so a refusal repaints its own row.
+    fn provider_editor(&self, id: &str, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
-        let inputs = &self.settings_inputs;
-        let mut body: Vec<AnyElement> = vec![self.editor_field(
+        let mut body: Vec<AnyElement> = Vec::with_capacity(10);
+        // The measured editor field order: the credential, then the fold that
+        // holds the endpoint, the protocol and the display name.
+        body.push(self.editor_field(
             "settings.apiKey",
-            self.editor_input(&inputs.api_key, "field-editor-api-key".to_string()),
-        )];
-
-        // The fold carries what the reference keeps behind it: the endpoint, the
-        // protocol, and the model catalog. Only the key shows above it.
-        let fold_open = self.models_advanced_open;
-        let mut fold = div()
+            self.editor_input(&self.add_key, "field-editor-api-key".to_string()),
+        ));
+        let open = self.models_advanced_open;
+        let fold = div()
+            .id("models-customized")
+            .debug_selector(|| "models-customized".to_string())
             .flex()
-            .flex_col()
+            .flex_row()
+            .items_center()
             .gap(px(6.0))
-            .pt(px(10.0))
-            .border_t_1()
-            .border_color(rgb(theme::border_soft()))
-            .child(
-                div()
-                    .id("models-customized")
-                    .debug_selector(|| "models-customized".to_string())
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .cursor_pointer()
-                    .child(if fold_open {
-                        icon(IconName::ChevronDown, 12.0, theme::muted())
-                    } else {
-                        icon(IconName::ChevronRight, 12.0, theme::muted())
-                    })
-                    .child(
-                        txt(tr(lang, "settings.customized"), 12.0, theme::muted())
-                            .font_weight(FontWeight::MEDIUM),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.models_advanced_open = !this.models_advanced_open;
-                        cx.notify();
-                    })),
-            );
-        if fold_open {
-            let mut inner: Vec<AnyElement> = vec![
-                self.editor_field(
-                    "settings.customBaseUrl",
-                    self.editor_input(&inputs.base_url, "field-editor-base-url".to_string()),
-                ),
-                self.editor_field("settings.apiMode", self.api_mode_choices(cx)),
-                txt(tr(lang, "settings.advancedHint"), 12.0, theme::faint()).into_any_element(),
-            ];
-            inner.extend(self.catalog_rows(cx));
-            inner.extend(self.models_picker_rows(cx));
-            fold = fold.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.0))
-                    .pt(px(12.0))
-                    .children(inner),
+            .cursor_pointer()
+            .child(if open {
+                icon(IconName::ChevronDown, 12.0, theme::muted())
+            } else {
+                icon(IconName::ChevronRight, 12.0, theme::muted())
+            })
+            .child(txt(lang.tr("settings.customized"), 12.0, theme::muted()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.models_advanced_open = !open;
+                cx.notify();
+            }))
+            .into_any_element();
+        body.push(fold);
+        if open {
+            body.push(self.editor_field(
+                "settings.customBaseUrl",
+                self.editor_input(&self.add_base_url, "field-editor-base-url".to_string()),
+            ));
+            body.push(self.editor_field(
+                "settings.displayName",
+                self.editor_input(&self.add_display, "field-editor-display".to_string()),
+            ));
+            body.push(self.editor_field("settings.apiMode", self.api_mode_choices(cx)));
+            body.push(
+                txt(lang.tr("settings.advancedHint"), 12.0, theme::faint()).into_any_element(),
             );
         }
-        body.push(fold.into_any_element());
-
-        let original = profile.name.clone();
+        body.extend(self.model_list_rows(id, cx));
+        // A refusal is drawn, not only computed: the backend already named what
+        // is wrong, and a pane that hides it leaves the reader guessing at why
+        // the apply did nothing.
+        if let Some(key) = self.state.provider_refusal {
+            body.push(
+                div()
+                    .debug_selector(|| "provider-refusal".to_string())
+                    .child(txt(lang.tr(key), 12.0, theme::error()))
+                    .into_any_element(),
+            );
+        }
+        let owned = id.to_string();
         let apply = div()
-            .id("models-apply")
+            .id(SharedString::from("models-apply"))
             .debug_selector(|| "models-apply".to_string())
             .flex()
             .items_center()
@@ -1807,26 +1823,16 @@ impl Shell {
             .rounded(px(8.0))
             .bg(rgb(theme::text()))
             .cursor_pointer()
-            .hover(|s| s.opacity(0.9))
-            .child(txt(tr(lang, "settings.apply"), 14.0, theme::page()))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                let typed = this
-                    .settings_inputs
-                    .provider_name
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .to_string();
-                this.settings_inputs.read(this.state.draft_mut(), cx);
-                let outcome = this.state.update_provider(&original, &typed);
-                this.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
-                if this.state.provider_refusal.is_none() {
-                    this.state.editing_provider = None;
+            .child(txt(lang.tr("settings.apply"), 14.0, theme::page()))
+            .on_click(cx.listener({
+                let owned = owned.clone();
+                move |this, _event, window, cx| {
+                    this.apply_provider_edit(&owned, window, cx);
                 }
-                cx.notify();
-            }));
+            }))
+            .into_any_element();
         let cancel = div()
-            .id("models-editor-cancel")
+            .id(SharedString::from("models-editor-cancel"))
             .debug_selector(|| "models-editor-cancel".to_string())
             .flex()
             .items_center()
@@ -1834,194 +1840,1028 @@ impl Shell {
             .h(px(36.0))
             .px(px(14.0))
             .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(theme::hover())))
-            .child(txt(tr(lang, "settings.cancel"), 14.0, theme::text()))
-            .on_click(cx.listener(|this, _event, _window, cx| {
+            .child(txt(lang.tr("settings.cancel"), 14.0, theme::text()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.state.editing_provider = None;
-                this.state.provider_refusal = None;
+                this.model_rows.clear();
+                this.models_advanced_open = false;
                 cx.notify();
-            }));
-        body.push(
+            }))
+            .into_any_element();
+        let actions = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(apply)
+            .child(cancel);
+        div()
+            .id(SharedString::from("provider-editor"))
+            .debug_selector(|| "provider-editor".to_string())
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .pt(px(12.0))
+                    .children(body),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+    /// Commit the editor: the connection it holds, then every model leaf.
+    ///
+    /// The rows are read on the click, not on a keystroke, so a half-typed
+    /// row never reaches the tree; and the provider id is not editable,
+    /// because it is the registry key the wire model carries.
+    fn apply_provider_edit(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let base_url = self.add_base_url.read(cx).value().trim().to_string();
+        let api_key = self.add_key.read(cx).value().trim().to_string();
+        let name = self.add_display.read(cx).value().trim().to_string();
+        if base_url.is_empty() {
+            self.state.provider_refusal =
+                Some(crate::settings::provider::ProviderRefusal::NeedsBaseUrl.key());
+            cx.notify();
+            return;
+        }
+        if let Some(refusal) = crate::settings::provider::base_url_refusal(&base_url) {
+            self.state.provider_refusal = Some(refusal.key());
+            cx.notify();
+            return;
+        }
+        let rows: Vec<(String, crate::settings::global::ModelEntry)> = self
+            .model_rows
+            .iter()
+            .map(|row| {
+                let display = row.name.read(cx).value().trim().to_string();
+                let mut leaf = row.entry.clone();
+                leaf.model = row.id.read(cx).value().trim().to_string();
+                leaf.name = (!display.is_empty()).then_some(display);
+                (row.key.clone(), leaf)
+            })
+            .collect();
+        self.state.provider_refusal = None;
+        for (key, leaf) in rows {
+            if let Err(refusal) = self.state.update_model(id, &key, &leaf) {
+                self.state.provider_refusal = Some(refusal.key());
+            }
+        }
+        let owned = id.to_string();
+        self.state
+            .set_provider_connection(&owned, &base_url, &api_key);
+        self.state.set_provider_name(&owned, &name);
+        self.state.editing_provider = None;
+        self.model_rows.clear();
+        self.models_advanced_open = false;
+        self.reload_model_rows(&owned, window, cx);
+    }
+    /// The model list: the measured head, one entry per leaf and the add row.
+    fn model_list_rows(&self, id: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let lang = self.state.lang;
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(self.model_rows.len() + 3);
+        let customized = !self.model_rows.is_empty();
+        // The head carries the inherited/customized meta and the reset link,
+        // which drops the whole catalog override in one press.
+        let owned = id.to_string();
+        let reset = div()
+            .id(SharedString::from("models-reset"))
+            .debug_selector(|| "models-reset".to_string())
+            .cursor_pointer()
+            .child(txt(lang.tr("settings.resetModels"), 12.0, theme::muted()))
+            .on_click(cx.listener({
+                let owned = owned.clone();
+                move |this, _event, _window, cx| {
+                    this.state.remove_provider(&owned);
+                    this.model_rows.clear();
+                    this.state.editing_provider = None;
+                    this.models_advanced_open = false;
+                    // A provider that is gone cannot be asked, so the
+                    // trigger stops naming an ask that will never land.
+                    this.models_fetching = false;
+                    cx.notify();
+                }
+            }))
+            .into_any_element();
+        // While the ask is in flight the trigger names the ask, so a
+        // second press does not start a second request.
+        let fetch_label = if self.models_fetching {
+            lang.tr("settings.fetching")
+        } else {
+            lang.tr("settings.models.fetchModels")
+        };
+        let fetch = div()
+            .id(SharedString::from("models-fetch"))
+            .debug_selector(|| "models-fetch".to_string())
+            .cursor_pointer()
+            .child(txt(fetch_label, 12.0, theme::muted()))
+            .on_click(cx.listener({
+                let owned = owned.clone();
+                move |this, _event, _window, cx| {
+                    this.fetch_models(&owned, cx);
+                }
+            }))
+            .into_any_element();
+        // The measured catalogue heading: the title above the meta line,
+        // in one column, with the link buttons parked at its top right.
+        let heading = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                txt(lang.tr("settings.models"), 12.0, theme::muted())
+                    .font_weight(FontWeight::MEDIUM),
+            )
+            .child(txt(
+                if customized {
+                    lang.tr("settings.modelsCustomized")
+                } else {
+                    lang.tr("settings.modelsInherited")
+                },
+                12.0,
+                theme::faint(),
+            ));
+        // Restore defaults leads the toolbar, and the fetch follows it, which is
+        // the order the reference's own catalog toolbar names.
+        let actions = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(reset)
+            .child(fetch);
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .justify_between()
+            .gap(px(12.0))
+            .child(heading)
+            .child(actions);
+        rows.push(head.into_any_element());
+        if !customized {
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .py(px(12.0))
+                    .rounded(px(16.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .child(txt(lang.tr("settings.modelsEmpty"), 12.0, theme::faint()))
+                    .into_any_element(),
+            );
+        }
+        for index in 0..self.model_rows.len() {
+            rows.push(self.model_row(id, index, cx));
+        }
+        rows.extend(self.fetch_rows(id, cx));
+        // The row the add control needs: the reference pairs its add button
+        // with the id being added, so the press has something to add. Without
+        // these fields the button could only ever report `settings.modelIdRequired`
+        // about a field the pane never drew.
+        //
+        // The editor's own engines, not the add card's: this form adds a model
+        // to the provider already open, which is a different fact from the one
+        // the custom route types for a provider that does not exist yet.
+        let new_id_selector = SharedString::from("model-new-id");
+        let new_name_selector = SharedString::from("model-new-name");
+        rows.push(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_end()
                 .gap(px(8.0))
-                .child(cancel)
-                .child(apply)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            Input::new(&self.new_model_id)
+                                .id(SharedString::from("model-new-id-field"))
+                                .appearance(false)
+                                .w_full()
+                                .h(px(28.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(theme::page()))
+                                .border_1()
+                                .border_color(rgb(theme::border()))
+                                .px(px(8.0)),
+                        )
+                        .debug_selector(move || new_id_selector.to_string()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            Input::new(&self.new_model_name)
+                                .id(SharedString::from("model-new-name-field"))
+                                .appearance(false)
+                                .w_full()
+                                .h(px(28.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(theme::page()))
+                                .border_1()
+                                .border_color(rgb(theme::border()))
+                                .px(px(8.0)),
+                        )
+                        .debug_selector(move || new_name_selector.to_string()),
+                )
                 .into_any_element(),
         );
-
-        div()
-            .debug_selector(|| "provider-editor".to_string())
-            .flex()
-            .flex_col()
-            .gap(px(14.0))
-            .px(px(16.0))
-            .py(px(14.0))
-            .rounded(px(16.0))
-            .bg(rgb(theme::new_session_fill()))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_baseline()
-                    .gap(px(8.0))
-                    .child(
-                        txt(profile.name.clone(), 14.0, theme::text())
-                            .font_weight(FontWeight::MEDIUM),
-                    )
-                    .child(txt(profile.model.clone(), 12.0, theme::faint())),
-            )
-            .children(body)
-            .into_any_element()
-    }
-
-    /// One editor field: the measured `field` - a 12px/500 label over its
-    /// control, 6px apart.
-    fn editor_field(&self, label: &'static str, control: AnyElement) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .min_w_0()
-            .child(
-                txt(tr(self.state.lang, label), 12.0, theme::muted())
-                    .font_weight(FontWeight::MEDIUM),
-            )
-            .child(control)
-            .into_any_element()
-    }
-
-    /// The measured 32px editor input on the layer-1 fill.
-    fn editor_input(&self, input: &Entity<InputState>, id: String) -> AnyElement {
-        let selector = id.clone();
-        hairline_all(
+        // The measured `addModelButton`: a 28px link-sized control on a
+        // `.5px` l3 rule, its own 4px gap and `align-self: flex-start`.
+        let add = hairline_all(
             div()
-                .id(SharedString::from(id))
-                .debug_selector(move || selector)
-                .h(px(32.0))
-                .rounded(px(8.0))
-                .px(px(10.0))
+                .id(SharedString::from("model-add"))
+                .debug_selector(|| "model-add".to_string())
                 .flex()
+                .flex_row()
                 .items_center()
+                .self_start()
+                .gap(px(4.0))
+                .h(px(28.0))
+                .px(px(10.0))
+                .rounded(px(4.0))
                 .bg(rgb(theme::page()))
                 .border_color(rgb(theme::border()))
-                .child(Input::new(input).appearance(false)),
-        )
-        .into_any_element()
+                .cursor_pointer()
+                .child(icon(IconName::Plus, 14.0, theme::text()))
+                .child(txt(lang.tr("settings.addModel"), 12.0, theme::text()))
+                .on_click(cx.listener({
+                    let owned = owned.clone();
+                    move |this, _event, window, cx| {
+                        let typed = this.new_model_id.read(cx).value().trim().to_string();
+                        let named = this.new_model_name.read(cx).value().trim().to_string();
+                        let outcome = this.state.add_model(&owned, &typed, &named, &typed, "");
+                        this.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
+                        // A row that landed leaves the fields empty, so the next
+                        // press adds a second model rather than re-adding this
+                        // one. A refusal keeps the text, because the reader has
+                        // to correct what they typed.
+                        if outcome.is_ok() {
+                            this.new_model_id.update(cx, |state, cx| {
+                                state.set_value(String::new(), window, cx);
+                            });
+                            this.new_model_name.update(cx, |state, cx| {
+                                state.set_value(String::new(), window, cx);
+                            });
+                        }
+                        this.reload_model_rows(&owned, window, cx);
+                    }
+                })),
+        );
+        rows.push(add.into_any_element());
+        rows
     }
 
-    /// The API-protocol chips, stacked the way the reference stacks them.
-    fn api_mode_choices(&self, cx: &mut Context<Self>) -> AnyElement {
-        let lang = self.state.lang;
-        let current = {
-            let draft = self.state.draft();
-            if draft.api_mode.is_empty() {
-                "auto".to_string()
-            } else {
-                draft.api_mode.clone()
-            }
+    /// Rebuild the per-row engines from the tree, so the pane never holds a
+    /// second copy of a leaf it is only echoing.
+    pub(crate) fn reload_model_rows(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The draft, not the saved tree: every write in this pane lands in the
+        // draft, so rebuilding the rows from `settings` re-echoes the copy the
+        // reader has not applied yet and drops the row they just added.
+        let provider = self.state.draft().global.providers.get(id).cloned();
+        let Some(provider) = provider else {
+            self.model_rows.clear();
+            cx.notify();
+            return;
         };
-        let options = [
-            ("auto", "settings.apiAuto"),
-            ("chat", "settings.apiChat"),
-            ("responses", "settings.apiResponses"),
-            ("anthropic", "settings.apiAnthropic"),
-        ];
-        let mut group = div().flex().flex_row().flex_wrap().gap(px(6.0));
-        for (key, label) in options {
-            let selected = key == current;
-            group = group.child(
-                div()
-                    .id(SharedString::from(format!("set-api-mode-{key}")))
-                    .debug_selector(move || format!("set-api-mode-{key}"))
-                    .px(px(10.0))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(rgb(if selected {
-                        theme::accent()
-                    } else {
-                        theme::border()
-                    }))
-                    .bg(rgb(if selected {
-                        theme::accent()
-                    } else {
-                        theme::page()
-                    }))
-                    .cursor_pointer()
-                    .hover(move |s| {
-                        s.bg(rgb(if selected {
-                            theme::accent()
-                        } else {
-                            theme::hover()
-                        }))
-                    })
-                    .child(txt(
-                        tr(lang, label),
-                        theme::CHIP_SIZE,
-                        if selected {
-                            theme::page()
-                        } else {
-                            theme::muted()
-                        },
-                    ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        api_mode_action(this, key, cx);
-                    })),
+        self.model_rows = provider
+            .models
+            .iter()
+            .map(|(key, entry)| ModelRowEditor {
+                key: key.clone(),
+                entry: entry.clone(),
+                id: cx.new(|cx| InputState::new(window, cx)),
+                name: cx.new(|cx| InputState::new(window, cx)),
+                open: false,
+            })
+            .collect();
+        for (row, (_, entry)) in self.model_rows.iter_mut().zip(provider.models.iter()) {
+            set_value(&row.id, entry.model.clone(), window, cx);
+            set_value(
+                &row.name,
+                entry.name.clone().unwrap_or_default(),
+                window,
+                cx,
             );
         }
-        group.into_any_element()
+        cx.notify();
     }
 
-    /// The add block: the Add button, or the open add card.
-    fn add_provider_block(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// One measured model row: the id and name inputs, the chevron and the
+    /// trash, with the declared input types under the row.
+    /// The endpoint model picker: what a successful fetch returned, which of
+    /// it is ticked, and the adopt control that turns the ticks into rows.
+    ///
+    /// A refusal is a sentence rather than an empty list, because an empty list
+    /// says the provider has nothing where a refused call says the ask never
+    /// landed. Nothing is held open between panes: closing the provider editor
+    /// drops the fetched list along with it.
+    fn fetch_rows(&self, id: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if self.models_fetch_needs_base_url {
+            rows.push(
+                txt(
+                    self.state.lang.tr("settings.models.fetchNeedsBaseUrl"),
+                    12.0,
+                    theme::error(),
+                )
+                .into_any_element(),
+            );
+            return rows;
+        }
+        if self.models_fetch_failed {
+            rows.push(
+                txt(
+                    self.state.lang.tr("settings.models.fetchEmpty"),
+                    12.0,
+                    theme::faint(),
+                )
+                .into_any_element(),
+            );
+            return rows;
+        }
+        let Some(fetched) = self.models_fetched.clone() else {
+            return rows;
+        };
         let lang = self.state.lang;
-        if !self.models_add_open {
-            return div()
+        // The search narrows what the provider returned, so a row's index is its
+        // position in the filtered list: the pane never renumbers a list a
+        // filter has already cut down.
+        let query = self.state.picker_query.trim().to_ascii_lowercase();
+        let shown: Vec<String> = fetched
+            .iter()
+            .filter(|model| query.is_empty() || model.to_ascii_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        let empty = shown.is_empty();
+        rows.push(
+            div()
                 .flex()
-                .child(hairline_all(
+                .flex_col()
+                .gap(px(6.0))
+                .p(px(10.0))
+                .rounded(px(12.0))
+                .bg(rgb(theme::page()))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .child(txt(
+                    lang.tr("settings.models.fetchTitle"),
+                    12.0,
+                    theme::text(),
+                ))
+                .children(shown.iter().enumerate().map(|(index, model)| {
+                    let ticked = self.models_selected.contains(model);
+                    let pick = model.clone();
                     div()
-                        .id("provider-add")
-                        .debug_selector(|| "provider-add".to_string())
+                        .id(SharedString::from(format!("fetch-{index}")))
+                        .debug_selector(|| format!("fetch-{index}"))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .h(px(28.0))
+                        .px(px(8.0))
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .child(icon(
+                            if ticked {
+                                IconName::Check
+                            } else {
+                                IconName::Plus
+                            },
+                            12.0,
+                            theme::text(),
+                        ))
+                        .child(txt(model.clone(), 12.0, theme::text()).flex_1())
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.toggle_fetched_model(&pick);
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                }))
+                .when(empty, |box_| {
+                    box_.child(
+                        div()
+                            .id(SharedString::from("fetch-empty"))
+                            .debug_selector(|| "fetch-empty".to_string())
+                            .child(
+                                txt(lang.tr("settings.models.fetchEmpty"), 12.0, theme::faint())
+                                    .into_any_element(),
+                            )
+                            .into_any_element(),
+                    )
+                })
+                .child({
+                    let owned = id.to_string();
+                    div()
+                        .id(SharedString::from("fetch-adopt"))
+                        .debug_selector(|| "fetch-adopt".to_string())
                         .flex()
                         .flex_row()
                         .items_center()
                         .justify_center()
                         .gap(px(6.0))
-                        .flex_1()
-                        .min_w(px(180.0))
-                        .h(px(44.0))
-                        .rounded(px(16.0))
+                        .h(px(28.0))
+                        .px(px(10.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(theme::accent()))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .child(txt(lang.tr("settings.addSelected"), 12.0, theme::page()))
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            this.add_selected_models(&owned, window, cx);
+                        }))
+                        .into_any_element()
+                })
+                .into_any_element(),
+        );
+        rows
+    }
+
+    fn model_row(&self, id: &str, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let Some(row) = self.model_rows.get(index) else {
+            return div().into_any_element();
+        };
+        let id_input = Input::new(&row.id)
+            .appearance(false)
+            .flex_1()
+            .h(px(32.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::page()))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .px(px(10.0));
+        let name_input = Input::new(&row.name)
+            .appearance(false)
+            .flex_1()
+            .h(px(32.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::page()))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .px(px(10.0));
+        let open = row.open;
+        let tip = lang.tr("settings.models.modelAdvanced");
+        let chevron = div()
+            .id(SharedString::from(format!("model-row-{index}")))
+            .debug_selector(move || format!("model-row-{index}"))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(28.0))
+            .h(px(28.0))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .child(if open {
+                icon(IconName::ChevronDown, 12.0, theme::faint())
+            } else {
+                icon(IconName::ChevronRight, 12.0, theme::faint())
+            })
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if let Some(row) = this.model_rows.get_mut(index) {
+                    row.open = !open;
+                }
+                cx.notify();
+            }))
+            .into_any_element();
+        let owned = id.to_string();
+        let key = row.key.clone();
+        let leaf = key.clone();
+        let trash = div()
+            .id(SharedString::from(format!("model-row-remove-{index}")))
+            .debug_selector(move || format!("model-row-remove-{index}"))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(28.0))
+            .h(px(28.0))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .child(icon(IconName::Trash, 14.0, theme::faint()))
+            .on_click(cx.listener({
+                let owned = owned.clone();
+                move |this, _event, window, cx| {
+                    this.state.remove_model(&owned, &key);
+                    this.reload_model_rows(&owned, window, cx);
+                }
+            }))
+            .into_any_element();
+        let entry = hairline_all(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .py(px(6.0))
+                .px(px(8.0))
+                .rounded(px(16.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border_soft()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(id_input)
+                        .child(name_input)
+                        .child(chevron)
+                        .child(trash),
+                )
+                .when(open, |row| {
+                    row.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .pt(px(6.0))
+                            .child(self.model_input_types(id, &leaf, index, cx)),
+                    )
+                }),
+        );
+        entry.into_any_element()
+    }
+
+    /// The declared input types of one model, as the reference's
+    /// `ModelInputTypes` checkbox pair: the last one standing cannot be turned
+    /// off, so a model never ends up with nothing to send.
+    fn model_input_types(
+        &self,
+        id: &str,
+        key: &str,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let draft = self.state.draft();
+        let declared = draft.global.input_types_of(id, key);
+        let owned = id.to_string();
+        let mut row = div().flex().flex_row().items_center().gap(px(16.0));
+        for entry in ["text", "image"] {
+            let id = owned.clone();
+            let key = key.to_string();
+            let kind = entry.to_string();
+            let checked = declared.iter().any(|entry| entry.as_str() == kind);
+            let locked =
+                declared.len() == 1 && declared.first().map(String::as_str) == Some(kind.as_str());
+            let image = kind == "image";
+            let tag = kind.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("model-input-{index}-{kind}")))
+                    .debug_selector(move || format!("model-input-{index}-{tag}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .cursor_pointer()
+                    .opacity(if locked { 0.4 } else { 1.0 })
+                    .child(if checked {
+                        icon(IconName::Check, 12.0, theme::text())
+                    } else {
+                        icon(IconName::Plus, 12.0, theme::faint())
+                    })
+                    .child(txt(
+                        if image {
+                            lang.tr("settings.inputImage")
+                        } else {
+                            lang.tr("settings.inputText")
+                        },
+                        12.0,
+                        theme::muted(),
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.toggle_model_input(&id, &key, &kind);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// The measured editor field: a label, and the control under it.
+    ///
+    /// The label argument is a locale KEY, not the copy: every caller names the
+    /// field it draws (`settings.apiKey`, `settings.customRoute`, ...), and
+    /// the pane is the one place that knows the current language. Translating
+    /// here is what makes those arguments keys; without it the key itself is
+    /// drawn, which is how the provider card showed `settings.provider`
+    /// instead of "Provider".
+    fn editor_field(&self, label: &'static str, control: AnyElement) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div().flex().items_center().gap(px(10.0)).child(
+                    txt(lang.tr(label), 12.0, theme::muted()).font_weight(FontWeight::MEDIUM),
+                ),
+            )
+            .child(control)
+            .into_any_element()
+    }
+
+    /// A bare text input: the measured input, without the kit's wrapper chrome.
+    fn editor_input(&self, input: &Entity<InputState>, id: String) -> AnyElement {
+        let selector = id.clone();
+        let field = Input::new(input)
+            .appearance(false)
+            .w_full()
+            .h(px(36.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::page()))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .px(px(12.0))
+            .into_any_element();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || selector.clone())
+            .w_full()
+            .child(field)
+            .into_any_element()
+    }
+
+    /// The measured protocol picker: three segments, the chosen one filled.
+    /// Changing the protocol leaves the typed address alone, the way the
+    /// reference does.
+    fn api_mode_choices(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let open = self.state.editing_provider.clone().unwrap_or_default();
+        let current = self.state.draft().global.family_protocol_of(&open);
+        let mut row = div().flex().flex_row().gap(px(4.0));
+        for protocol in crate::settings::provider::PROTOCOLS {
+            let owned = open.clone();
+            let mode = protocol.to_string();
+            let tag = mode.clone();
+            let chosen = current == tag;
+            let label = match mode.as_str() {
+                "responses" => lang.tr("settings.apiResponses"),
+                "anthropic" => lang.tr("settings.apiAnthropic"),
+                _ => lang.tr("settings.apiChat"),
+            };
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("api-mode-{mode}")))
+                    .debug_selector(move || format!("api-mode-{tag}"))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(36.0))
+                    .px(px(12.0))
+                    .rounded(px(8.0))
+                    .bg(if chosen {
+                        rgb(theme::text())
+                    } else {
+                        rgb(theme::page())
+                    })
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .cursor_pointer()
+                    .child(txt(
+                        label,
+                        14.0,
+                        if chosen { theme::page() } else { theme::text() },
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state
+                            .draft_mut()
+                            .global
+                            .set_family_protocol(&owned, &mode);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        row.into_any_element()
+    }
+    /// The dashed add button, and the card it swaps for once it is open.
+    pub(crate) fn add_provider_block(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        if !self.models_add_open {
+            return div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .id(SharedString::from("provider-add"))
+                        .debug_selector(|| "provider-add".to_string())
+                        .flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(6.0))
+                        .h(px(44.0))
+                        .min_w(px(180.0))
+                        .rounded(px(16.0))
+                        .border_1()
                         .border_color(rgb(theme::border()))
+                        .cursor_pointer()
                         .child(icon(IconName::Plus, 14.0, theme::text()))
-                        .child(txt(
-                            tr(lang, "settings.addModelProvider"),
-                            14.0,
-                            theme::text(),
-                        ))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.state.editing_provider = None;
-                            this.state.provider_refusal = None;
+                        .child(txt(lang.tr("settings.add"), 14.0, theme::text()))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            let addable = this.state.draft().global.addable_providers();
+                            this.models_add_route = if addable.is_empty() {
+                                ModelsAddRoute::Custom
+                            } else {
+                                ModelsAddRoute::Catalogue
+                            };
                             this.models_add_open = true;
-                            this.models_advanced_open = false;
                             cx.notify();
-                        })),
-                ))
+                        }))
+                        .into_any_element(),
+                )
                 .into_any_element();
         }
+        self.add_card(cx)
+    }
 
-        let inputs = &self.settings_inputs;
-        let original = self.state.editing_provider.clone().unwrap_or_default();
-        let create_label = tr(lang, "settings.createProvider");
+    /// The add card: the measured segmented control, then the panel the chosen
+    /// route owns.
+    fn add_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let route = self.models_add_route;
+        let mut modes = div().flex().flex_row().gap(px(4.0));
+        for (kind, label) in [
+            (ModelsAddRoute::Catalogue, lang.tr("settings.addCatalog")),
+            (ModelsAddRoute::Custom, lang.tr("settings.addCustom")),
+        ] {
+            let chosen = kind == route;
+            modes = modes.child(
+                div()
+                    .id(SharedString::from(format!("add-route-{kind:?}")))
+                    .debug_selector(move || format!("add-route-{kind:?}"))
+                    .flex()
+                    .items_center()
+                    .h(px(32.0))
+                    .px(px(12.0))
+                    .rounded(px(8.0))
+                    .bg(if chosen {
+                        rgb(theme::text())
+                    } else {
+                        rgb(theme::page())
+                    })
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .cursor_pointer()
+                    .child(txt(
+                        label,
+                        12.0,
+                        if chosen { theme::page() } else { theme::text() },
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.models_add_route = kind;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        // One line of purpose under the switch, the way the reference explains
+        // what each route is for.
+        let purpose = if route == ModelsAddRoute::Catalogue {
+            lang.tr("settings.addCatalogHint")
+        } else {
+            lang.tr("settings.addCustomHint")
+        };
+        let panel = div().flex().flex_col().gap(px(14.0)).pt(px(12.0));
+        let panel = match route {
+            ModelsAddRoute::Catalogue => panel.child(self.catalogue_pick(cx)),
+            ModelsAddRoute::Custom => panel.child(self.custom_panel(cx)),
+        };
+        let card = hairline_all(
+            div()
+                .id(SharedString::from("models-add-card"))
+                .debug_selector(|| "models-add-card".to_string())
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .py(px(14.0))
+                .px(px(16.0))
+                .rounded(px(16.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border_soft()))
+                .child(modes)
+                .child(txt(purpose, 12.0, theme::faint()))
+                .child(panel),
+        );
+        card.into_any_element()
+    }
+
+    /// The catalogue route: the reference's `Provider` label and its `select`,
+    /// then the key field and the create action.
+    ///
+    /// The reference's chooser is a `select.input.selectInput`, so what the
+    /// reader sees is one closed box naming the provider id beside a chevron,
+    /// and the rest of the catalogue is drawn only while it is open. The rows
+    /// this replaced claimed a place on screen the reference gives to the
+    /// editor, and they read as a set of choices to make rather than the one
+    /// value a select holds, which is what the provider id is.
+    fn catalogue_pick(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let addable = self.state.draft().global.addable_providers();
+        let chosen = self
+            .catalogue_choice
+            .clone()
+            .or_else(|| addable.first().cloned());
+        let Some(chosen) = chosen else {
+            return txt(lang.tr("settings.modelsEmpty"), 12.0, theme::faint()).into_any_element();
+        };
+        // The closed box: the provider id on the left, the chevron at the
+        // right, with the measured inner padding reserving the room for it.
+        let closed = hairline_all(
+            div()
+                .id(SharedString::from("catalogue-select"))
+                .debug_selector(|| "catalogue-select".to_string())
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .max_w(px(240.0))
+                .h(px(32.0))
+                .px(px(10.0))
+                .pr(px(32.0))
+                .rounded(px(8.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border()))
+                .cursor_pointer()
+                .child(txt(chosen.clone(), 14.0, theme::text()))
+                .child(icon(IconName::ChevronDown, 12.0, theme::faint()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.catalogue_open = !this.catalogue_open;
+                    cx.notify();
+                })),
+        );
+        let mut boxed = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(closed.into_any_element());
+        if self.catalogue_open {
+            // The open list: every provider id the file does not carry yet,
+            // the chosen one marked, and a pick that also closes again.
+            let mut options = hairline_all(
+                div()
+                    .flex()
+                    .flex_col()
+                    .py(px(4.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(theme::page()))
+                    .border_color(rgb(theme::border())),
+            );
+            for id in &addable {
+                let owned = id.clone();
+                let selected = *id == chosen;
+                options = options.child(
+                    div()
+                        .id(SharedString::from(format!("catalogue-option-{id}")))
+                        .debug_selector(move || format!("catalogue-option-{id}"))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h(px(28.0))
+                        .px(px(10.0))
+                        .bg(if selected {
+                            rgb(theme::hover())
+                        } else {
+                            rgb(theme::page())
+                        })
+                        .cursor_pointer()
+                        .child(txt(id.clone(), 14.0, theme::text()))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.catalogue_choice = Some(owned.clone());
+                            this.catalogue_open = false;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            boxed = boxed.child(options.into_any_element());
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(self.editor_field("settings.provider", boxed.into_any_element()))
+            .child(self.editor_field(
+                "settings.apiKey",
+                self.editor_input(&self.add_key, "add-key".to_string()),
+            ))
+            .child(self.add_actions(&chosen, cx))
+            .into_any_element()
+    }
+
+    /// The custom route: the measured field order, and the create button that
+    /// refuses to fire until every required field is filled.
+    fn custom_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let route = self.add_route.read(cx).value().trim().to_string();
+        let base_url = self.add_base_url.read(cx).value().trim().to_string();
+        let taken = self.state.draft().global.providers.contains_key(&route);
+        let address = crate::settings::provider::base_url_refusal(&base_url);
+        let ready = !route.is_empty()
+            && !base_url.is_empty()
+            && address.is_none()
+            && !taken
+            && !self.state.draft().global.providers.is_empty()
+            && !self.model_rows.is_empty();
+        let _ = ready;
+        let model_field = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(txt(lang.tr("settings.modelId"), 12.0, theme::muted()))
+            .child(
+                Input::new(&self.new_row_id)
+                    .id(SharedString::from("add-model-id"))
+                    .appearance(false)
+                    .flex_1()
+                    .h(px(36.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(theme::page()))
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .px(px(12.0)),
+            )
+            .child(
+                Input::new(&self.new_row_name)
+                    .id(SharedString::from("add-model-name"))
+                    .appearance(false)
+                    .flex_1()
+                    .h(px(36.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(theme::page()))
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .px(px(12.0)),
+            );
+        let mut column = div().flex().flex_col().gap(px(14.0));
+        column = column
+            .child(self.editor_field(
+                "settings.customRoute",
+                self.editor_input(&self.add_route, "add-route".to_string()),
+            ))
+            .child(self.editor_field(
+                "settings.displayName",
+                self.editor_input(&self.add_display, "add-display".to_string()),
+            ))
+            .child(self.editor_field(
+                "settings.customBaseUrl",
+                self.editor_input(&self.add_base_url, "add-base-url".to_string()),
+            ))
+            .child(self.editor_field("settings.apiMode", self.api_mode_choices(cx)))
+            .child(self.editor_field(
+                "settings.apiKey",
+                self.editor_input(&self.add_key, "add-key".to_string()),
+            ))
+            .child(model_field);
+        // The refusals the reference prints above the create button, in the
+        // order it checks them.
+        if route.is_empty() {
+            column = column.child(self.add_note(lang.tr("settings.providerIdRequired")));
+        } else if taken {
+            column = column.child(self.add_note(lang.tr("settings.providerIdTaken")));
+        }
+        if base_url.is_empty() {
+            column = column.child(self.add_note(lang.tr("settings.customNeedsBaseUrl")));
+        } else if let Some(refusal) = address {
+            column = column.child(self.add_note(lang.tr(refusal.key())));
+        }
+        column
+            .child(self.add_actions(&route, cx))
+            .into_any_element()
+    }
+
+    /// One line of refusal copy, the measured inline error style.
+    fn add_note(&self, copy: String) -> AnyElement {
+        txt(copy, 12.0, theme::error()).into_any_element()
+    }
+
+    /// The create and cancel buttons at the foot of the add card.
+    fn add_actions(&self, id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let owned = id.to_string();
         let create = div()
-            .id("models-create")
-            .debug_selector(|| "models-create".to_string())
+            .id(SharedString::from("add-create"))
+            .debug_selector(|| "add-create".to_string())
             .flex()
             .items_center()
             .justify_center()
@@ -2030,163 +2870,69 @@ impl Shell {
             .rounded(px(8.0))
             .bg(rgb(theme::text()))
             .cursor_pointer()
-            .hover(|s| s.opacity(0.9))
-            .child(txt(create_label, 14.0, theme::page()))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                let typed = this
-                    .settings_inputs
-                    .provider_name
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .to_string();
-                this.settings_inputs.read(this.state.draft_mut(), cx);
-                let outcome = if original.is_empty() {
-                    this.state.add_provider(&typed)
-                } else {
-                    this.state.update_provider(&original, &typed)
-                };
-                this.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
-                if this.state.provider_refusal.is_none() {
-                    this.state.editing_provider = None;
-                    this.models_add_open = false;
-                    this.models_advanced_open = false;
+            .child(txt(lang.tr("settings.create"), 14.0, theme::page()))
+            .on_click(cx.listener({
+                let owned = owned.clone();
+                move |this, _event, _window, cx| {
+                    this.create_provider(&owned, cx);
                 }
-                cx.notify();
-            }));
+            }))
+            .into_any_element();
         let cancel = div()
-            .id("models-add-cancel")
-            .debug_selector(|| "models-add-cancel".to_string())
+            .id(SharedString::from("add-cancel"))
+            .debug_selector(|| "add-cancel".to_string())
             .flex()
             .items_center()
             .justify_center()
             .h(px(36.0))
             .px(px(14.0))
             .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(theme::hover())))
-            .child(txt(tr(lang, "settings.cancel"), 14.0, theme::text()))
-            .on_click(cx.listener(|this, _event, _window, cx| {
+            .child(txt(lang.tr("settings.cancel"), 14.0, theme::text()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.models_add_open = false;
-                this.models_advanced_open = false;
-                this.state.editing_provider = None;
-                this.state.provider_refusal = None;
+                this.catalogue_choice = None;
+                this.catalogue_open = false;
                 cx.notify();
-            }));
-
-        let panel: Vec<AnyElement> = vec![
-            self.editor_field(
-                "settings.customRoute",
-                self.editor_input(&inputs.provider_name, "field-provider-id".to_string()),
-            ),
-            self.editor_field(
-                "settings.modelId",
-                self.editor_input(&inputs.model, "field-new-model".to_string()),
-            ),
-            self.editor_field(
-                "settings.customBaseUrl",
-                self.editor_input(&inputs.base_url, "field-new-base-url".to_string()),
-            ),
-            self.editor_field(
-                "settings.apiKey",
-                self.editor_input(&inputs.api_key, "field-new-api-key".to_string()),
-            ),
-            self.editor_field("settings.apiMode", self.api_mode_choices(cx)),
-            txt(tr(lang, "settings.customRouteHint"), 12.0, theme::faint()).into_any_element(),
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_end()
-                .gap(px(8.0))
-                .child(cancel)
-                .child(create)
-                .into_any_element(),
-        ];
-
+            }))
+            .into_any_element();
         div()
-            .debug_selector(|| "models-add-card".to_string())
-            .flex()
-            .flex_col()
-            .gap(px(14.0))
-            .px(px(16.0))
-            .py(px(14.0))
-            .rounded(px(16.0))
-            .bg(rgb(theme::new_session_fill()))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap(px(8.0))
-                    .child(self.models_mode_switch())
-                    .child(txt(
-                        tr(lang, "settings.addCustomHint"),
-                        12.0,
-                        theme::faint(),
-                    )),
-            )
-            .child(div().flex().flex_col().gap(px(14.0)).children(panel))
-            .into_any_element()
-    }
-
-    /// The reference's SegmentedControl: a 4px-padded track on the hover fill
-    /// whose selected segment is a raised layer-1 pill.
-    ///
-    /// The catalog mode is disabled because bsh composes no provider directory,
-    /// so it has nothing to list. `addCatalogExhausted` - "Every catalog
-    /// provider is already configured." - is literally true here, and the
-    /// reference puts a disabled mode's reason in its hover text.
-    fn models_mode_switch(&self) -> AnyElement {
-        let lang = self.state.lang;
-        let mut track = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(2.0))
-            .p(px(4.0))
-            .rounded(px(8.0))
-            .bg(rgb(theme::hover()));
-        let segments: [(&'static str, &'static str, bool); 2] = [
-            ("catalog", "settings.addCatalog", false),
-            ("custom", "settings.addCustom", true),
-        ];
-        for (id, label, selected) in segments {
-            let base = div()
-                .id(SharedString::from(format!("models-mode-{id}")))
-                .debug_selector(move || format!("models-mode-{id}"))
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(28.0))
-                .px(px(16.0))
-                .rounded(px(6.0));
-            let text = txt(
-                tr(lang, label),
-                theme::CHIP_SIZE,
-                if selected {
-                    theme::text()
-                } else {
-                    theme::muted()
-                },
-            );
-            let seg: AnyElement = if selected {
-                hairline_all(
-                    base.bg(rgb(theme::page()))
-                        .border_color(rgb(theme::border_soft())),
-                )
-                .child(text)
-                .into_any_element()
-            } else {
-                let reason = SharedString::from(tr(lang, "settings.addCatalogExhausted"));
-                base.opacity(0.4)
-                    .tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx))
-                    .child(text)
-                    .into_any_element()
-            };
-            track = track.child(seg);
+            .gap(px(8.0))
+            .child(create)
+            .child(cancel)
+            .into_any_element()
+    }
+
+    /// Commit the add card, on the route it is showing.
+    fn create_provider(&mut self, id: &str, cx: &mut Context<Self>) {
+        let route = self.models_add_route;
+        let key = self.add_key.read(cx).value().trim().to_string();
+        let base_url = self.add_base_url.read(cx).value().trim().to_string();
+        let named = self.add_display.read(cx).value().trim().to_string();
+        let typed = self.new_row_id.read(cx).value().trim().to_string();
+        let outcome = match route {
+            ModelsAddRoute::Catalogue => self.state.add_shipped_provider(id, &key),
+            ModelsAddRoute::Custom => self.state.add_custom_provider(
+                id,
+                &named,
+                &base_url,
+                &key,
+                &[crate::settings::global::ModelEntry::named(&typed)],
+            ),
+        };
+        self.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
+        if outcome.is_ok() {
+            self.state.select_provider(id);
+            self.models_add_open = false;
+            self.catalogue_choice = None;
+            self.catalogue_open = false;
         }
-        track.into_any_element()
+        cx.notify();
     }
 
     /// Tools and skills, with a switch each.
@@ -2194,7 +2940,40 @@ impl Shell {
         &mut self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let mut rows: Vec<AnyElement> = vec![self.settings_note("settings.toolsHint", false)];
+        let lang = self.state.lang;
+        let web = self.state.draft().workspace.agent.web_tools_enabled;
+        // The hosted web tool has no local registrar, so it cannot appear in the
+        // capability list below - the provider runs it. It is still a tool the
+        // reader can switch off, so it leads the pane as its own row.
+        // The section's hint is drawn under the title by the pane header, so it is
+        // NOT repeated as the first row: the sentence appeared twice, once above
+        // the list and once at the top of it.
+        let mut rows: Vec<AnyElement> = vec![hairline_bottom(
+            div()
+                .py(px(12.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(24.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap(px(4.0))
+                        .min_w_0()
+                        .pr(px(48.0))
+                        .child(txt(tr(lang, "settings.webToolsTitle"), 14.0, theme::text()))
+                        .child(txt(
+                            tr(lang, "settings.webToolsDescription"),
+                            12.0,
+                            theme::faint(),
+                        )),
+                )
+                .child(self.switch("settings-web-tools", web, true, web_tools_action, cx)),
+        )
+        .into_any_element()];
         if self.caps.is_empty() {
             rows.push(
                 txt(tr(self.state.lang, "settings.empty"), 13.0, theme::muted())
@@ -2209,11 +2988,19 @@ impl Shell {
             let off = if category == "skill" {
                 self.state
                     .draft()
-                    .disabled_skills
+                    .workspace
+                    .disabled
+                    .skills
                     .iter()
                     .any(|s| s == &name)
             } else {
-                self.state.draft().disabled_tools.iter().any(|t| t == &name)
+                self.state
+                    .draft()
+                    .workspace
+                    .disabled
+                    .tools
+                    .iter()
+                    .any(|t| t == &name)
             };
             let is_skill = category == "skill";
             rows.push(
@@ -2274,440 +3061,6 @@ impl Shell {
         ("settings.tools", "settings.toolsHint", rows)
     }
 
-    /// Select one catalog model as the active model, the row action.
-    pub(crate) fn catalog_select(&mut self, model: &str) {
-        self.state.draft_mut().model = model.to_string();
-    }
-
-    /// Add a typed model id to the active provider catalog.
-    ///
-    /// Refusals are ignored here on purpose: the pane derives its hint from
-    /// the draft, so a blank or a repeat is explained by the list it draws.
-    pub(crate) fn catalog_add(&mut self, typed: &str) {
-        let provider = self.state.draft().active_provider.clone();
-        let _ = self.state.draft_mut().add_catalog_model(&provider, typed);
-    }
-
-    /// Drop one model id from the active provider catalog.
-    pub(crate) fn catalog_remove(&mut self, model: &str) {
-        let provider = self.state.draft().active_provider.clone();
-        self.state
-            .draft_mut()
-            .remove_catalog_model(&provider, model);
-    }
-
-    /// Toggle one declared input type on a catalog row.
-    pub(crate) fn catalog_toggle_input(&mut self, model: &str, kind: &str, cx: &mut Context<Self>) {
-        let provider = self.state.draft().active_provider.clone();
-        self.state
-            .draft_mut()
-            .toggle_input_type(&provider, model, kind);
-        cx.notify();
-    }
-    /// The active provider customized model catalog.
-    ///
-    /// The reference keeps this list in its provider editor: one row per model
-    /// id the user added, each of which selects itself as the active model, a
-    /// delete control beside it, and an add row that takes whatever the Model ID
-    /// field holds. The hints are derived from the draft instead of remembered,
-    /// so a refusal is explained without the pane holding any state of its own.
-    /// The fetched-model picker: the reference Choose models to add flow.
-    ///
-    /// The list is what a real GET /models returned through the react vendor
-    /// seam, so the heading only appears once a fetch has delivered one. The
-    /// reference candidate search is drawn under its own measured wording
-    /// (fetchSearch), and it narrows what the select-all pair acts on, which is
-    /// what the reference does: its own button is disabled with no visible
-    /// candidate and toggles exactly the visible ones.
-    fn models_picker_rows(&self, cx: &mut Context<Shell>) -> Vec<AnyElement> {
-        let mut rows: Vec<AnyElement> = vec![div()
-            .debug_selector(|| "models-fetch".to_string())
-            .id(SharedString::from("models-fetch"))
-            .py(px(6.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .child(icon(IconName::ArrowUpDown, 12.0, theme::accent()))
-            .child(txt(
-                tr(self.state.lang, "settings.fetchModels"),
-                13.0,
-                theme::accent(),
-            ))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.fetch_models(cx);
-                cx.notify();
-            }))
-            .into_any_element()];
-        if self.models_fetch_needs_base_url {
-            rows.push(
-                txt(
-                    tr(self.state.lang, "settings.fetchNeedsBaseUrl"),
-                    12.0,
-                    theme::warn(),
-                )
-                .pb(px(6.0))
-                .into_any_element(),
-            );
-        }
-        if self.models_fetch_failed {
-            rows.push(
-                txt(
-                    tr(self.state.lang, "settings.fetchFailed"),
-                    12.0,
-                    theme::error(),
-                )
-                .pb(px(6.0))
-                .into_any_element(),
-            );
-        }
-        let Some(models) = self.models_fetched.clone() else {
-            return rows;
-        };
-        rows.push(
-            txt(
-                tr(self.state.lang, "settings.chooseModels"),
-                13.0,
-                theme::text(),
-            )
-            .pt(px(8.0))
-            .pb(px(4.0))
-            .into_any_element(),
-        );
-        let query = self.state.picker_query.clone();
-        let visible: Vec<String> = models
-            .iter()
-            .filter(|model| crate::state::matches(&query, model))
-            .cloned()
-            .collect();
-        if models.is_empty() {
-            rows.push(
-                txt(
-                    tr(self.state.lang, "settings.fetchEmpty"),
-                    12.0,
-                    theme::faint(),
-                )
-                .pb(px(6.0))
-                .into_any_element(),
-            );
-            return rows;
-        }
-        rows.push(
-            div()
-                .mb(px(6.0))
-                .px(px(8.0))
-                .py(px(4.0))
-                .rounded(px(6.0))
-                .bg(rgb(theme::new_session_fill()))
-                .border_1()
-                .border_color(rgb(theme::border_soft()))
-                .child(Input::new(&self.picker_search).appearance(false))
-                .into_any_element(),
-        );
-        let all = visible.clone();
-        let none = visible.clone();
-        rows.push(
-            div()
-                .pb(px(4.0))
-                .flex()
-                .flex_row()
-                .gap(px(10.0))
-                .child(
-                    txt(
-                        tr(self.state.lang, "settings.selectAll"),
-                        12.0,
-                        theme::accent(),
-                    )
-                    .debug_selector(|| "fetched-select-all".to_string())
-                    .id(SharedString::from("fetched-select-all"))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        for model in &all {
-                            this.models_selected.insert(model.clone());
-                        }
-                        cx.notify();
-                    })),
-                )
-                .child(
-                    txt(
-                        tr(self.state.lang, "settings.deselectAll"),
-                        12.0,
-                        theme::accent(),
-                    )
-                    .debug_selector(|| "fetched-deselect-all".to_string())
-                    .id(SharedString::from("fetched-deselect-all"))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        for model in &none {
-                            this.models_selected.remove(model);
-                        }
-                        cx.notify();
-                    })),
-                )
-                .into_any_element(),
-        );
-        if visible.is_empty() {
-            rows.push(
-                div()
-                    .debug_selector(|| String::from("fetched-none"))
-                    .child(
-                        txt(
-                            tr(self.state.lang, "settings.noMatchingModels"),
-                            12.0,
-                            theme::faint(),
-                        )
-                        .pb(px(6.0)),
-                    )
-                    .into_any_element(),
-            );
-            return rows;
-        }
-        for (index, model) in visible.iter().enumerate() {
-            let ticked = self.models_selected.contains(model);
-            let id = model.clone();
-            let label = model.clone();
-            rows.push(
-                div()
-                    .debug_selector(move || format!("fetched-{index}"))
-                    .id(SharedString::from(format!("fetched-{index}")))
-                    .py(px(5.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::hover())))
-                    .child(
-                        div()
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(rgb(if ticked {
-                                theme::accent()
-                            } else {
-                                theme::border()
-                            }))
-                            .bg(rgb(if ticked {
-                                theme::accent()
-                            } else {
-                                theme::page()
-                            }))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(if ticked {
-                                icon(IconName::Check, 11.0, theme::page()).into_any_element()
-                            } else {
-                                div().into_any_element()
-                            }),
-                    )
-                    .child(txt(label, 13.0, theme::text()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.toggle_fetched_model(&id);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-        }
-        rows.push(
-            div()
-                .debug_selector(|| "fetched-add".to_string())
-                .id(SharedString::from("fetched-add"))
-                .py(px(6.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .child(icon(IconName::Plus, 12.0, theme::accent()))
-                .child(txt(
-                    tr(self.state.lang, "settings.addSelected"),
-                    13.0,
-                    theme::accent(),
-                ))
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.add_selected_models();
-                    cx.notify();
-                }))
-                .into_any_element(),
-        );
-        rows
-    }
-
-    fn catalog_rows(&self, cx: &mut Context<Shell>) -> Vec<AnyElement> {
-        let draft = self.state.draft();
-        let models = draft.catalog(&draft.active_provider).to_vec();
-        let typed = self
-            .settings_inputs
-            .model
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let mut rows: Vec<AnyElement> = vec![
-            txt(
-                tr(self.state.lang, "settings.modelCatalog"),
-                13.0,
-                theme::text(),
-            )
-            .pt(px(10.0))
-            .pb(px(2.0))
-            .into_any_element(),
-            txt(
-                tr(self.state.lang, "settings.modelCatalogHint"),
-                12.0,
-                theme::faint(),
-            )
-            .pb(px(6.0))
-            .into_any_element(),
-        ];
-        if typed.is_empty() {
-            rows.push(
-                txt(
-                    tr(self.state.lang, "settings.modelIdRequired"),
-                    12.0,
-                    theme::warn(),
-                )
-                .pb(px(6.0))
-                .into_any_element(),
-            );
-        } else if models.iter().any(|model| model == &typed) {
-            rows.push(
-                txt(
-                    tr(self.state.lang, "settings.modelIdUnique"),
-                    12.0,
-                    theme::warn(),
-                )
-                .pb(px(6.0))
-                .into_any_element(),
-            );
-        }
-        for (index, model) in models.iter().enumerate() {
-            let selected = model == &draft.model;
-            let select_name = model.clone();
-            let remove_name = model.clone();
-            let text = model.clone();
-            rows.push(
-                div()
-                    .py(px(6.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .border_b_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .child(
-                        div()
-                            .debug_selector(move || format!("catalog-{index}"))
-                            .id(SharedString::from(format!("catalog-{index}")))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .flex_1()
-                            .px(px(6.0))
-                            .py(px(4.0))
-                            .rounded(px(5.0))
-                            .when(selected, |element| element.bg(rgb(theme::selected_row())))
-                            .child(txt(text, 13.0, theme::text()))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.catalog_select(&select_name);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(move || format!("catalog-remove-{index}"))
-                            .id(SharedString::from(format!("catalog-remove-{index}")))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .rounded(px(4.0))
-                            .child(icon(IconName::X, 12.0, theme::muted()))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.catalog_remove(&remove_name);
-                                cx.notify();
-                            })),
-                    )
-                    .into_any_element(),
-            );
-            let chip_model = model.clone();
-            let mut chips: Vec<AnyElement> = Vec::new();
-            for (kind, key, id) in [
-                ("text", "settings.inputText", "catalog-input-text"),
-                ("image", "settings.inputImage", "catalog-input-image"),
-            ] {
-                let on = draft.shows_input_type(&draft.active_provider, model, kind);
-                let kind = kind.to_string();
-                let clicked = chip_model.clone();
-                chips.push(
-                    div()
-                        .debug_selector(move || format!("{id}-{index}"))
-                        .id(SharedString::from(format!("{id}-{index}")))
-                        .px(px(8.0))
-                        .py(px(2.0))
-                        .rounded(px(5.0))
-                        .border_1()
-                        .border_color(rgb(if on { theme::accent() } else { theme::border() }))
-                        .when(on, |element| element.bg(rgb(theme::selected_row())))
-                        .child(txt(
-                            tr(self.state.lang, key),
-                            12.0,
-                            if on { theme::accent() } else { theme::muted() },
-                        ))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.catalog_toggle_input(&clicked, &kind, cx);
-                        }))
-                        .into_any_element(),
-                );
-            }
-            rows.push(
-                div()
-                    .pb(px(6.0))
-                    .pl(px(6.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(txt(
-                        tr(self.state.lang, "settings.inputTypes"),
-                        12.0,
-                        theme::faint(),
-                    ))
-                    .children(chips)
-                    .into_any_element(),
-            );
-        }
-        rows.push(
-            div()
-                .debug_selector(|| "catalog-add".to_string())
-                .id(SharedString::from("catalog-add"))
-                .py(px(6.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .child(icon(IconName::Plus, 12.0, theme::accent()))
-                .child(txt(
-                    tr(self.state.lang, "settings.addModel"),
-                    13.0,
-                    theme::accent(),
-                ))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    let typed = this
-                        .settings_inputs
-                        .model
-                        .read(cx)
-                        .value()
-                        .trim()
-                        .to_string();
-                    this.catalog_add(&typed);
-                    cx.notify();
-                }))
-                .into_any_element(),
-        );
-        rows
-    }
-
     /// Agent loop: the step ceiling one turn may reach.
     fn section_agent_loop(
         &self,
@@ -2722,7 +3075,7 @@ impl Shell {
                 cx,
             ),
             {
-                let on = self.state.draft().memory_enabled;
+                let on = self.state.draft().workspace.agent.memory_enabled;
                 // The reference's General pane has no memory row, so this one
                 // carries the title alone: there is no measured description to
                 // quote and inventing one would be our copy, not its.
@@ -2733,7 +3086,7 @@ impl Shell {
                 )
             },
             {
-                let on = self.state.draft().parallel_tool_calls;
+                let on = self.state.draft().workspace.agent.parallel_tool_calls;
                 div()
                     .debug_selector(|| "parallel-tool-calls".to_string())
                     .id(SharedString::from("parallel-tool-calls"))
@@ -2909,13 +3262,6 @@ impl Shell {
         ("settings.plugin-inventory", "settings.pluginListHint", rows)
     }
 
-    /// The reference own Built-in plugins pane.
-    ///
-    /// This is the plugin-level view: which plugins this deployment ships and
-    /// whether each is on. bsh contributes no plugin views at all, which the
-    /// reference answers with a sentence of its own, so that sentence is drawn
-    /// instead of an invented empty state. The switches themselves live in the
-    /// inventory pane, beside the tools each plugin contributed.
     /// The reference own Automation tasks page.
     ///
     /// The reference renders it as a sidebar PANEL whose id is `schedules`;
@@ -2932,8 +3278,9 @@ impl Shell {
         let filter = self.task_filter;
         let now = crate::settings::unix_now();
         let draft = self.state.draft();
-        let total = draft.schedules.len();
+        let total = draft.global.schedules.len();
         let tasks: Vec<(String, String, String, bool, String)> = draft
+            .global
             .schedules
             .iter()
             .filter(|task| crate::state::matches(&query, &task.name))
@@ -2948,7 +3295,9 @@ impl Shell {
                     task.name.clone(),
                     self.cadence_text(task.every_seconds),
                     task.enabled,
-                    draft
+                    self.state
+                        .draft()
+                        .global
                         .next_run(task, now)
                         .map(|at| self.countdown_text(at, now))
                         .unwrap_or_default(),
@@ -3230,11 +3579,13 @@ impl Shell {
             .trim()
             .parse()
             .unwrap_or(30);
-        let session = self.state.settings.active_session.clone();
-        let refusal =
-            self.state
-                .draft_mut()
-                .add_schedule(&name, &prompt, &session, minutes.max(1) * 60);
+        let session = self.state.draft().workspace.general.active_session.clone();
+        let refusal = self.state.draft_mut().global.add_schedule(
+            &name,
+            &prompt,
+            &session,
+            minutes.max(1) * 60,
+        );
         if let Err(refusal) = refusal {
             let key = match refusal {
                 crate::settings::ScheduleRefusal::Name => "task.invalidTitle",
@@ -3248,7 +3599,7 @@ impl Shell {
 
     /// Flip one task between enabled and inactive.
     pub(crate) fn task_toggle(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.state.draft_mut().toggle_schedule(id);
+        self.state.draft_mut().global.toggle_schedule(id);
         cx.notify();
     }
 
@@ -3264,7 +3615,7 @@ impl Shell {
     /// sentence rather than looking like it worked.
     pub(crate) fn task_confirm_delete(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.task_delete.take() {
-            let removed = self.state.draft_mut().remove_schedule(&id);
+            let removed = self.state.draft_mut().global.remove_schedule(&id);
             let key = if removed {
                 "task.deleted"
             } else {
@@ -3575,9 +3926,11 @@ impl Shell {
         let has_credential = self
             .state
             .draft()
+            .global
             .providers
-            .iter()
-            .any(|profile| profile.name == name && !profile.api_key.trim().is_empty());
+            .get(&name)
+            .map(|provider| !provider.api_key.trim().is_empty())
+            .unwrap_or(false);
         // The reference picks the description by whether a credential is
         // configured, and labels the confirm with the provider's own name.
         let title = crate::i18n::tr_with(lang, "settings.deleteTitle", &name);
@@ -3800,7 +4153,9 @@ impl Shell {
         if self
             .state
             .draft()
-            .disabled_plugins
+            .workspace
+            .disabled
+            .extentions
             .iter()
             .any(|plugin| plugin == name)
         {
@@ -3813,7 +4168,7 @@ impl Shell {
     /// MCP servers.
     fn section_mcp(&self) -> (&'static str, &'static str, Vec<AnyElement>) {
         let mut rows: Vec<AnyElement> = Vec::new();
-        let servers = &self.state.draft().mcp_servers;
+        let servers = &self.state.draft().global.mcp_servers;
         if servers.is_empty() {
             rows.push(
                 txt(
@@ -3907,10 +4262,11 @@ impl Shell {
         &mut self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let active = self.state.draft().active_workspace.clone();
+        let active = self.state.draft().global.general.active_workspace.clone();
         let workspaces: Vec<(String, String, String)> = self
             .state
             .draft()
+            .global
             .workspaces
             .iter()
             .map(|workspace| {
@@ -3963,7 +4319,7 @@ impl Shell {
                     },
                 ))
                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.state.draft_mut().active_workspace = pick.clone();
+                    this.state.draft_mut().global.general.active_workspace = pick.clone();
                     cx.notify();
                 }));
             rows.push(
@@ -3987,7 +4343,11 @@ impl Shell {
             );
         }
         rows.push(self.settings_note("settings.workspacesHint", false));
-        ("settings.workspaces", "settings.workspacesHint", rows)
+        (
+            "settings.global.workspaces",
+            "settings.workspacesHint",
+            rows,
+        )
     }
 
     /// Context: the send-side ceiling.
@@ -4044,6 +4404,44 @@ mod capacity_tests {
 mod label_tests {
     fn tr(locale: &str, key: &'static str) -> String {
         crate::i18n::tr(crate::i18n::Lang::from_locale(locale), key)
+    }
+
+    /// A provider is named by its own name, its shipped family, or its id — and
+    /// never by its endpoint.
+    ///
+    /// `built_in` answers `(name, base URL, protocol)`; two call sites read the
+    /// second element, so the Models card showed
+    /// `https://integrate.api.nvidia.com/v1` where the provider's name belongs.
+    #[test]
+    fn a_provider_is_named_by_its_name_not_its_endpoint() {
+        use crate::ui::settings::provider_label;
+        assert_eq!(
+            provider_label("nvidia", None),
+            "NVIDIA",
+            "a shipped family is named by the catalog's own label"
+        );
+        assert_eq!(
+            provider_label("nvidia", Some("My Relay")),
+            "My Relay",
+            "the name the tree carries wins"
+        );
+        assert_eq!(
+            provider_label("nvidia", Some("   ")),
+            "NVIDIA",
+            "a blank name is absence, not a name"
+        );
+        assert_eq!(
+            provider_label("my-relay", None),
+            "my-relay",
+            "an unknown id names itself"
+        );
+        for id in ["deepseek", "openai", "anthropic", "nvidia", "openrouter"] {
+            let label = provider_label(id, None);
+            assert!(
+                !label.contains("://"),
+                "{id} is named by a name, not by a URL (got {label})"
+            );
+        }
     }
 
     #[test]

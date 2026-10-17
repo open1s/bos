@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = AgentConfig {
         parallel_tool_calls: false,
+        web_search: false,
         name: "resilient-agent".to_string(),
         model,
         base_url: nvidia_cfg.base_url,

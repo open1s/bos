@@ -1,512 +1,64 @@
-//! Persisted harness settings and per-workspace overrides.
+//! Persisted harness settings: the files the shell reads and writes.
 //!
-//! Loaded from ~/.bos/bsh/settings.toml; when that file does not exist the
-//! model defaults are discovered from the BOS config (~/.bos/conf/config.toml).
+//! Two documents, each the truth for what it owns. The global file
+//! (`~/.bos/bsh/settings.toml`) holds everything that is the same whichever
+//! workspace is open: appearance, language, the provider tree, the preset and
+//! extension inventories, the workspace registry and the task list. One file per
+//! workspace (`<root>/.bsh/settings/settings.toml`) holds that workspace's own
+//! agent configuration, and one session file per session holds which model and
+//! preset that session last used.
+//!
+//! This module is the seam the panes edit. Nothing here is a projection, so a
+//! round trip through the UI cannot drop a field a pane does not draw: what a
+//! pane writes is what the file holds.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// A named alternate endpoint discovered from the BOS config.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct Profile {
-    /// Profile name as used in [llm.<name>].
-    pub(crate) name: String,
-    /// Model identifier.
-    pub(crate) model: String,
-    /// API base URL.
-    pub(crate) base_url: String,
-    /// API key.
-    pub(crate) api_key: String,
-}
+pub(crate) mod global;
+pub(crate) mod provider;
+pub(crate) mod resolve;
+pub(crate) mod workspace;
 
-/// One configured workspace.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct Workspace {
-    /// Stable id.
-    pub(crate) id: String,
-    /// Display name.
-    pub(crate) name: String,
-    /// Filesystem root the tools are confined to.
-    pub(crate) root: String,
-    /// Model override; empty inherits the global model.
-    pub(crate) model: String,
-    /// Base URL override.
-    pub(crate) base_url: String,
-    /// API key override.
-    pub(crate) api_key: String,
-    /// System prompt override.
-    pub(crate) system_prompt: String,
-    /// Temperature override; 0 inherits.
-    pub(crate) temperature: f32,
-    /// Reasoning effort override.
-    pub(crate) reasoning_effort: Option<String>,
-    /// Unix seconds created.
-    pub(crate) created_at: u64,
-    /// Unix seconds last changed.
-    pub(crate) updated_at: u64,
-}
+use global::GlobalSettings;
+use workspace::WorkspaceSettings;
 
-impl Default for Workspace {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            name: String::new(),
-            root: String::new(),
-            model: String::new(),
-            base_url: String::new(),
-            api_key: String::new(),
-            system_prompt: String::new(),
-            temperature: 0.0,
-            reasoning_effort: None,
-            created_at: 0,
-            updated_at: 0,
-        }
-    }
-}
+// The automation tasks, the clock they read and their refusals live on the
+// global document, because a task is a machine-level instruction that names
+// a session rather than belonging to one workspace.
+pub(crate) use self::global::{unix_now, Schedule, ScheduleRefusal};
 
-/// One provider's customized model catalog.
+/// The harness settings, held as the two documents they are stored in.
 ///
-/// The reference keeps this list inside its provider editor: the model ids a
-/// user added by hand, which is what the pane offers to switch the active model
-/// between. It is keyed by provider name, and an empty key is the plain
-/// endpoint rather than a named provider.
+/// The panes edit this structure directly: a pane that changes a provider edits
+/// [`GlobalSettings::providers`], and a pane that changes how one workspace
+/// behaves edits [`WorkspaceSettings::agent`]. Nothing here is a projection back
+/// out of these trees, so a round trip through the UI cannot drop a field a pane
+/// does not draw - what a pane writes is what the file holds.
+///
+/// The one computed value is [`Settings::effective`], which folds the two trees
+/// into the concrete numbers a build uses. That is a derivation, not a second
+/// storage.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ModelCatalog {
-    /// The provider the list belongs to; empty is the plain endpoint.
-    pub(crate) provider: String,
-    /// The model ids the user added, in the order they were added.
-    pub(crate) models: Vec<String>,
-    /// Declared input types per model id ("text", "image").
-    ///
-    /// Absent means undeclared, which bsh reads as permissive, so a catalog
-    /// written before this field keeps sending images.
-    #[serde(default)]
-    pub(crate) input_types: BTreeMap<String, Vec<String>>,
-}
-
-/// Why a model id was refused by a provider's catalog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CatalogError {
-    /// The typed id was blank.
-    Empty,
-    /// The catalog already holds the id.
-    Duplicate,
-}
-
-/// Why the provider form refused to add a provider.
-///
-/// The reference refuses an incomplete custom provider instead of filling the
-/// gaps in, so each variant maps to the sentence it draws.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderRefusal {
-    /// The display name was blank.
-    NameEmpty,
-    /// No base URL was entered.
-    NeedsBaseUrl,
-    /// No model id was entered.
-    NeedsModel,
-    /// A saved provider already carries the name.
-    IdTaken,
-}
-
-impl ProviderRefusal {
-    /// The locale key of the sentence this refusal draws.
-    pub(crate) fn key(self) -> &'static str {
-        match self {
-            ProviderRefusal::NameEmpty => "settings.providerNameEmpty",
-            ProviderRefusal::NeedsBaseUrl => "settings.providerNeedsBaseUrl",
-            ProviderRefusal::NeedsModel => "settings.providerNeedsModel",
-            ProviderRefusal::IdTaken => "settings.providerIdTaken",
-        }
-    }
-}
-
-/// One automation task: an instruction that runs in a session on a cadence.
-///
-/// The reference keeps a task beside the session it was created in and lists
-/// it on its Automation tasks panel, which is the `session_id` link. The
-/// cadence here is the "every N" family bsh supports, with
-/// `every_seconds == 0` meaning the one-shot `once` rule. The reference also
-/// offers daily, weekdays, weekly and cron rules, which need date and
-/// time-zone arithmetic bsh does not do yet, so they are not drawn.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Schedule {
-    /// Stable identifier, unique within the settings file.
-    pub(crate) id: String,
-    /// Task name, bounded by [`Settings::NAME_LIMIT`].
-    pub(crate) name: String,
-    /// The instruction the task sends to its session.
-    pub(crate) prompt: String,
-    /// The session the task runs in.
-    #[serde(default)]
-    pub(crate) session_id: String,
-    /// Seconds between runs; zero means the task runs once.
-    #[serde(default)]
-    pub(crate) every_seconds: u64,
-    /// Whether the task still triggers.
-    #[serde(default = "default_true")]
-    pub(crate) enabled: bool,
-    /// Unix seconds of the last run; zero when it has never run.
-    #[serde(default)]
-    pub(crate) last_run: u64,
-}
-
-/// A boolean that is on when unset, for task fields that default to enabled.
-fn default_true() -> bool {
-    true
-}
-
-/// Why a task could not be created, under the reference own refusals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScheduleRefusal {
-    /// The name is empty or longer than [`Settings::NAME_LIMIT`].
-    Name,
-    /// The instruction is empty.
-    Prompt,
-}
-
-impl Settings {
-    /// The longest task name the reference accepts.
-    pub(crate) const NAME_LIMIT: usize = 120;
-
-    /// Append an automation task, answering with its id.
-    pub(crate) fn add_schedule(
-        &mut self,
-        name: &str,
-        prompt: &str,
-        session_id: &str,
-        every_seconds: u64,
-    ) -> Result<String, ScheduleRefusal> {
-        let name = name.trim();
-        let prompt = prompt.trim();
-        if name.is_empty() || name.chars().count() > Self::NAME_LIMIT {
-            return Err(ScheduleRefusal::Name);
-        }
-        if prompt.is_empty() {
-            return Err(ScheduleRefusal::Prompt);
-        }
-        let id = format!("task-{}", unix_now());
-        self.schedules.push(Schedule {
-            id: id.clone(),
-            name: name.to_string(),
-            prompt: prompt.to_string(),
-            session_id: session_id.to_string(),
-            every_seconds,
-            enabled: true,
-            last_run: 0,
-        });
-        Ok(id)
-    }
-
-    /// Drop a task; false when no task carries the id.
-    pub(crate) fn remove_schedule(&mut self, id: &str) -> bool {
-        let before = self.schedules.len();
-        self.schedules.retain(|entry| entry.id != id);
-        before != self.schedules.len()
-    }
-
-    /// Flip a task between enabled and inactive; false when the id is unknown.
-    pub(crate) fn toggle_schedule(&mut self, id: &str) -> bool {
-        let Some(entry) = self.schedules.iter_mut().find(|entry| entry.id == id) else {
-            return false;
-        };
-        entry.enabled = !entry.enabled;
-        true
-    }
-
-    /// Whether a task triggers at `now`.
-    pub(crate) fn is_due(&self, schedule: &Schedule, now: u64) -> bool {
-        if !schedule.enabled {
-            return false;
-        }
-        if schedule.last_run == 0 {
-            return true;
-        }
-        schedule.every_seconds != 0
-            && now.saturating_sub(schedule.last_run) >= schedule.every_seconds
-    }
-
-    /// The tasks due at `now`, in file order.
-    pub(crate) fn due_schedules(&self, now: u64) -> Vec<String> {
-        self.schedules
-            .iter()
-            .filter(|entry| self.is_due(entry, now))
-            .map(|entry| entry.id.clone())
-            .collect()
-    }
-
-    /// When a task runs next: `now` while it is due, `None` when it is off or
-    /// its single run has already happened.
-    pub(crate) fn next_run(&self, schedule: &Schedule, now: u64) -> Option<u64> {
-        if !schedule.enabled {
-            return None;
-        }
-        if schedule.last_run == 0 {
-            return Some(now);
-        }
-        if schedule.every_seconds == 0 {
-            return None;
-        }
-        Some(schedule.last_run + schedule.every_seconds)
-    }
-
-    /// Record that a task ran at `now`. A one-shot task turns itself off, so a
-    /// restart does not run it a second time.
-    pub(crate) fn mark_schedule_ran(&mut self, id: &str, now: u64) {
-        if let Some(entry) = self.schedules.iter_mut().find(|entry| entry.id == id) {
-            entry.last_run = now;
-            if entry.every_seconds == 0 {
-                entry.enabled = false;
-            }
-        }
-    }
-}
-
-/// Unix seconds, or zero if the clock is before the epoch.
-pub(crate) fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
-}
-
-/// The persisted harness settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub(crate) struct Settings {
-    /// Format version.
-    pub(crate) schema_version: u32,
-    /// The palette mode: "light", "dark" or "system".
+    /// The global document: preferences, the provider tree, the preset and
+    /// extension inventories, and the workspace registry.
+    #[serde(default)]
+    pub(crate) global: GlobalSettings,
+    /// The active workspace's document: what it selects and how it configures
+    /// the agent here.
+    #[serde(default)]
+    pub(crate) workspace: WorkspaceSettings,
+    /// The directory the global document is written to.
     ///
-    /// The reference defaults to following the system preference.
-    #[serde(default = "default_theme_mode")]
-    pub(crate) theme_mode: String,
-    /// The chat content width a reader dragged out, or none while the column
-    /// follows the reference's own clamp. Measured: the reference keeps this as
-    /// dsh.conversation.contentWidth in its client store and resolves it
-    /// through resolveContentWidth; bsh's store is this file.
-    #[serde(default)]
-    pub(crate) content_width: Option<f32>,
-    /// The sidebar width a reader dragged out, or none while the column takes
-    /// the reference's own 280 default. Measured: setSidebar keeps
-    /// layoutInfo.sidebar in the client store, clamped to 264..420.
-    #[serde(default)]
-    pub(crate) sidebar_width: Option<f32>,
-    /// The conversation content size in px (the reference Font size setting).
-    #[serde(default = "default_content_font_size")]
-    pub(crate) content_font_size: u32,
-    /// How much of a turn the conversation renders: "compact", "standard",
-    /// "detailed" or "verbose" (the reference's Work details row).
-    #[serde(default = "default_transcript_view")]
-    pub(crate) transcript_view: String,
-    /// Where a link in a message opens: "sidebar" or "new-tab".
-    #[serde(default = "default_link_opening")]
-    pub(crate) link_opening: String,
-    /// What Enter does while a turn streams: "queue" or "steer".
-    #[serde(default = "default_composer_enter")]
-    pub(crate) composer_enter: String,
-    /// How much performance and usage detail to show: "compact" or "detailed".
-    #[serde(default = "default_performance_usage")]
-    pub(crate) performance_usage: String,
-    /// Show the coding view: the trajectory tab and the Agent preset switch.
-    #[serde(default = "default_developer_tools")]
-    pub(crate) developer_tools: bool,
-    /// The interface language: "en" or "zh".
-    #[serde(default = "default_lang")]
-    pub(crate) lang: String,
-    /// Default model identifier.
-    pub(crate) model: String,
-    /// Default API base URL.
-    pub(crate) base_url: String,
-    /// Default API key.
-    pub(crate) api_key: String,
-    /// Default system prompt.
-    pub(crate) system_prompt: String,
-    /// Default sampling temperature.
-    pub(crate) temperature: f32,
-    /// Reasoning effort for reasoning models.
-    pub(crate) reasoning_effort: Option<String>,
-    /// Optional completion cap.
-    pub(crate) max_tokens: Option<u32>,
-    /// ReAct steps one turn may take before the loop stops.
-    #[serde(default = "default_max_steps")]
-    pub(crate) max_steps: usize,
-    /// Register the shell tool.
-    pub(crate) bash_enabled: bool,
-    /// Register the filesystem tools.
-    pub(crate) file_tools_enabled: bool,
-    /// Register the web tools.
-    pub(crate) web_tools_enabled: bool,
-    /// Require approval before side-effecting tools run.
-    pub(crate) require_approval: bool,
-    /// The default permission mode for new sessions, the reference's own
-    /// trinary: "read-only", "workspace-write" or "danger-full-access".
-    #[serde(default = "default_permission")]
-    pub(crate) permission: String,
-    /// Where skill folders live.
-    pub(crate) skills_dir: String,
-    /// Send-side token ceiling; 0 disables compaction.
-    pub(crate) context_budget: usize,
-    /// Seconds one shell command may run before it is killed.
-    pub(crate) shell_timeout_secs: u64,
-    /// Bytes of one tool result kept before the rest is truncated.
-    pub(crate) tool_output_cap: usize,
-    /// Attach the file-backed memory store.
-    pub(crate) memory_enabled: bool,
-    /// Memory file; empty uses the shared default.
-    pub(crate) memory_path: String,
-    /// MCP server entries.
-    pub(crate) mcp_servers: Vec<serde_json::Value>,
-    /// Provider entries.
-    pub(crate) providers: Vec<Profile>,
-    /// Configured workspaces.
-    pub(crate) workspaces: Vec<Workspace>,
-    /// Active workspace id.
-    pub(crate) active_workspace: String,
-    /// Provider the models pane selected; empty uses the plain endpoint.
-    #[serde(default)]
-    pub(crate) active_provider: String,
-    /// Customized model catalogs, one per provider key.
-    #[serde(default)]
-    pub(crate) catalogs: Vec<ModelCatalog>,
-    /// Automation tasks: instructions that run in a session on a cadence.
-    #[serde(default)]
-    pub(crate) schedules: Vec<Schedule>,
-    /// The declarative presets found under the BSH directory.
-    #[serde(default)]
-    pub(crate) presets: Vec<agent::plugins::presets::Preset>,
-    /// Preset the agent-presets pane selected; empty uses no preset.
-    #[serde(default)]
-    pub(crate) preset: String,
-    /// Run one assistant turn's tool calls concurrently instead of one at a time.
-    #[serde(default)]
-    pub(crate) parallel_tool_calls: bool,
-
-    /// The session reopened at launch; empty starts on the welcome screen.
-    #[serde(default)]
-    pub(crate) active_session: String,
-    /// Tool names switched off by name.
-    pub(crate) disabled_tools: Vec<String>,
-    /// Skill names switched off by name.
-    pub(crate) disabled_skills: Vec<String>,
-    /// Plugin names switched off by name.
-    pub(crate) disabled_plugins: Vec<String>,
-    /// API protocol the agent speaks: empty follows the model, else chat, responses,
-    /// or anthropic (the Messages API).
-    #[serde(default)]
-    pub(crate) api_mode: String,
-    /// Workspace tree order the sidebar last chose; empty means the default.
-    #[serde(default)]
-    pub(crate) session_sort: String,
-    /// Endpoints discovered from the BOS config (never serialized).
+    /// This is a location, never a setting: serde skips it so the file never
+    /// claims to live somewhere else, and a test points it at its own scratch
+    /// directory. Without it a test that changes a preference writes the user's
+    /// real configuration, which is how a shell ends up confined to a
+    /// temporary directory a test made.
     #[serde(skip)]
-    pub(crate) profiles: Vec<Profile>,
-}
-
-fn default_lang() -> String {
-    "en".to_string()
-}
-
-fn default_theme_mode() -> String {
-    "system".to_string()
-}
-
-/// The reference stepper default, which is the baseline body size.
-fn default_content_font_size() -> u32 {
-    crate::theme::BODY_SIZE as u32
-}
-
-fn default_max_steps() -> usize {
-    10
-}
-
-/// The reference's own default permission mode for a new session.
-fn default_permission() -> String {
-    "workspace-write".to_string()
-}
-
-/// The desktop shell's measured Work details default, which is `dshDesktop`
-/// in the reference's `TranscriptViewPolicy` rather than the shared
-/// `DEFAULT_TRANSCRIPT_VIEW_MODE`.
-fn default_transcript_view() -> String {
-    DEFAULT_TRANSCRIPT_VIEW.to_string()
-}
-
-/// Where a message's links open; the reference's measured default.
-fn default_link_opening() -> String {
-    "sidebar".to_string()
-}
-
-/// What Enter does while a turn streams; the reference's measured default.
-fn default_composer_enter() -> String {
-    "queue".to_string()
-}
-
-/// How much performance and usage detail to show; the reference's default.
-fn default_performance_usage() -> String {
-    "detailed".to_string()
-}
-
-/// The reference's `DeveloperToolsSettingsFields` default, which is on.
-fn default_developer_tools() -> bool {
-    true
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            schema_version: 1,
-            theme_mode: "system".to_string(),
-            content_width: None,
-            sidebar_width: None,
-            content_font_size: 14,
-            transcript_view: default_transcript_view(),
-            link_opening: default_link_opening(),
-            composer_enter: default_composer_enter(),
-            performance_usage: default_performance_usage(),
-            developer_tools: default_developer_tools(),
-            lang: "en".to_string(),
-            model: "gpt-4o".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: String::new(),
-            system_prompt: "You are a helpful assistant.".to_string(),
-            temperature: 0.7,
-            reasoning_effort: None,
-            max_tokens: None,
-            max_steps: default_max_steps(),
-            bash_enabled: true,
-            file_tools_enabled: true,
-            web_tools_enabled: true,
-            require_approval: true,
-            permission: default_permission(),
-            skills_dir: "~/.bos/skills".to_string(),
-            context_budget: 32768,
-            shell_timeout_secs: 300,
-            tool_output_cap: 16 * 1024,
-            memory_enabled: true,
-            memory_path: String::new(),
-            mcp_servers: Vec::new(),
-            providers: Vec::new(),
-            workspaces: Vec::new(),
-            active_workspace: String::new(),
-            active_provider: String::new(),
-            catalogs: Vec::new(),
-            schedules: Vec::new(),
-            presets: Vec::new(),
-            preset: String::new(),
-            parallel_tool_calls: false,
-            active_session: String::new(),
-            disabled_tools: Vec::new(),
-            disabled_skills: Vec::new(),
-            disabled_plugins: Vec::new(),
-            api_mode: String::new(),
-            session_sort: String::new(),
-            profiles: Vec::new(),
-        }
-    }
+    pub(crate) save_root: Option<PathBuf>,
 }
 
 /// How a completed turn's process steps group, from the reference's own
@@ -596,6 +148,11 @@ pub(crate) struct Effective {
     pub(crate) name: String,
     /// Workspace root.
     pub(crate) root: String,
+    /// The provider id the model came from, which is the wire prefix the
+    /// engine registers the vendor under.
+    pub(crate) provider: String,
+    /// The model reference that resolved, or none while nothing is chosen.
+    pub(crate) model_ref: Option<global::ModelRef>,
     /// Model identifier.
     pub(crate) model: String,
     /// API base URL.
@@ -614,6 +171,8 @@ pub(crate) struct Effective {
     pub(crate) bash_enabled: bool,
     /// Register the filesystem tools.
     pub(crate) file_tools_enabled: bool,
+    /// Offer the model a hosted web-search tool.
+    pub(crate) web_tools_enabled: bool,
     /// The default permission mode for new sessions.
     pub(crate) permission: String,
     /// Skills directory.
@@ -634,6 +193,8 @@ pub(crate) struct Effective {
     pub(crate) disabled_tools: Vec<String>,
     /// Skill names switched off.
     pub(crate) disabled_skills: Vec<String>,
+    /// The plugin ids the preset mounts. The complete set, not a delta.
+    pub(crate) preset_plugins: Vec<String>,
 }
 
 /// The harness data directory.
@@ -641,36 +202,12 @@ pub(crate) fn dir() -> PathBuf {
     PathBuf::from(shellexpand::tilde("~/.bos/bsh").into_owned())
 }
 
-/// Load every preset a directory holds, skipping the files that do not parse.
-///
-/// The store drops unreadable session files silently for the same reason: a
-/// stray file in the directory must not take the pane down with it.
-pub(crate) fn presets_in(dir: &std::path::Path) -> Vec<agent::plugins::presets::Preset> {
-    let mut presets: Vec<agent::plugins::presets::Preset> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            matches!(
-                path.extension().and_then(|ext| ext.to_str()),
-                Some("json") | Some("toml")
-            )
-        })
-        .filter_map(|path| agent::plugins::presets::Preset::load(&path).ok())
-        .collect();
-    presets.sort_by(|a, b| a.name.cmp(&b.name));
-    presets
-}
-
-/// The presets under the BSH directory, which is where the pane reads them.
-pub(crate) fn discover_presets() -> Vec<agent::plugins::presets::Preset> {
-    presets_in(&dir().join("presets"))
-}
-
 /// The settings file path.
+///
+/// One definition, owned by the type that reads and writes it, so the path the
+/// settings model uses and the path the reveal action opens cannot drift apart.
 pub(crate) fn settings_path() -> PathBuf {
-    dir().join("settings.toml")
+    global::GlobalSettings::path()
 }
 
 /// The platform's file browser launcher.
@@ -696,388 +233,294 @@ pub(crate) fn reveal_config() -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// One config error as something a caller in the io world can carry.
+fn as_io(error: global::SettingsError) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
+
+/// Move a document this build cannot read out of the live directory.
+///
+/// The live directory holds exactly the documents the app reads, so a file it
+/// has just refused to parse must not keep living there under a name that looks
+/// like one of them. It used to be renamed to `settings.toml.bak` in place -
+/// an old-format document beside the live one for good, and every later reader
+/// had to work out which was which.
+///
+/// It goes to `archive/legacy-flat/` with the epoch in its name, because two
+/// runs on two days are two different records and neither should overwrite the
+/// other. Nothing is deleted: the archive is the one place a lost configuration
+/// can still be recovered from.
+fn archive_unreadable(path: &std::path::Path) {
+    let Some(parent) = path.parent() else {
+        let _ = std::fs::rename(path, path.with_extension("toml.old"));
+        return;
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let dir = parent.join("archive").join("legacy-flat");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::rename(path, dir.join(format!("settings-flat-{stamp}.toml.old")));
+}
+
+/// The root the global file's active workspace points at, empty while none does.
+fn active_root(global: &GlobalSettings) -> String {
+    global
+        .workspaces
+        .iter()
+        .find(|w| w.id == global.general.active_workspace)
+        .map(|w| w.root.clone())
+        .unwrap_or_default()
+}
+
 impl Settings {
-    /// Read the saved settings, discovering model defaults on first run.
+    /// Read the two documents, and do nothing else.
+    ///
+    /// The files are the truth. The global file carries the machine
+    /// preferences, the provider tree, the preset declarations, the extension
+    /// inventory, the workspace registry and the task list; one file per
+    /// workspace carries that workspace's own agent configuration. Both are read
+    /// whole, and this structure holds them whole, so what a pane writes is what
+    /// the file holds on the way back out.
+    ///
+    /// Nothing is written on the way in. A first run leaves the disk alone, so
+    /// asking what the configuration is can never destroy it.
     pub(crate) fn load() -> Self {
-        let path = settings_path();
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(mut parsed) = toml::from_str::<Settings>(&text) {
-                parsed.profiles = discover_profiles();
-                parsed.presets = discover_presets();
-                parsed.ensure_workspace();
-                return parsed;
-            }
-        }
-        let mut settings = Settings::discover();
-        settings.ensure_workspace();
-        let _ = settings.save();
-        settings
-    }
-
-    /// Build settings from the BOS config defaults.
-    pub(crate) fn discover() -> Self {
-        let profiles = discover_profiles();
-        let first = profiles.first().cloned();
-        let mut settings = Settings {
-            profiles,
-            presets: discover_presets(),
-            ..Settings::default()
-        };
-        if let Some(profile) = first {
-            settings.model = profile.model;
-            settings.base_url = profile.base_url;
-            settings.api_key = profile.api_key;
-        }
-        settings
-    }
-
-    /// Persist the settings.
-    pub(crate) fn save(&self) -> std::io::Result<()> {
-        let dir = dir();
-        std::fs::create_dir_all(&dir)?;
-        let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(settings_path(), text)
-    }
-
-    /// Guarantee at least one workspace and a valid active id.
-    pub(crate) fn ensure_workspace(&mut self) {
-        if self.workspaces.is_empty() {
-            let root = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
+        let global = GlobalSettings::load(&GlobalSettings::path()).unwrap_or_default();
+        let root = active_root(&global);
+        let workspace =
+            WorkspaceSettings::load(&WorkspaceSettings::path(std::path::Path::new(&root)))
                 .unwrap_or_default();
-            let name = PathBuf::from(&root)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "workspace".to_string());
-            let ws = Workspace {
-                id: uuid::Uuid::new_v4().to_string(),
-                name,
-                root,
-                created_at: crate::state::now(),
-                updated_at: crate::state::now(),
-                ..Default::default()
-            };
-            self.active_workspace = ws.id.clone();
-            self.workspaces.push(ws);
+        let mut read = Self {
+            global,
+            workspace,
+            // The settings were read from their own location, so that is where
+            // they are written back to.
+            save_root: None,
+        };
+        read.ensure_workspace();
+        read
+    }
+
+    /// Write both documents back, each whole.
+    ///
+    /// No round trip goes through a projection, so there is nothing to merge:
+    /// the whole tree is written and the whole tree comes back. A file that
+    /// exists but does not parse is moved aside rather than overwritten - that
+    /// is not a migration and does not try to read the old format; it is the one
+    /// guard that keeps a redesign from silently eating a configuration it
+    /// cannot read.
+    pub(crate) fn save(&self) -> std::io::Result<()> {
+        // A TEST BUILD MUST NEVER WRITE THE REAL CONFIGURATION.
+        //
+        // Every test redirects the write by setting save_root to its scratch
+        // store, and this is the belt behind that brace: one checkout's test run
+        // shares $HOME with every other checkout on the machine, so a single
+        // forgotten redirect does not merely fail a test - it overwrites the
+        // reader's actual settings with a fixture. That is not hypothetical: a
+        // test run in a second worktree wrote this file while it was being
+        // repaired, replacing the reader's provider with a "work.example"
+        // fixture. The guard costs one comparison and makes the class
+        // impossible in this build.
+        if cfg!(test) && self.save_root.is_none() {
+            return Err(std::io::Error::other(
+                "a test build has no save_root and must not write the real settings file",
+            ));
         }
-        if self.active_workspace.is_empty()
-            || !self
+        // The location is carried, not recomputed, so a redirected settings
+        // tree writes exactly where its reader looks.
+        let global_path = match &self.save_root {
+            Some(root) => root.join("settings.toml"),
+            None => GlobalSettings::path(),
+        };
+        if global_path.exists() && GlobalSettings::load(&global_path).is_err() {
+            archive_unreadable(&global_path);
+        }
+        let root = self.active_workspace_root();
+        let workspace = self.workspace.clone();
+        self.global.validate().map_err(as_io)?;
+        workspace.validate().map_err(as_io)?;
+        self.global.save(&global_path).map_err(as_io)?;
+        if root.is_empty() {
+            // Nothing to place is nothing to report. Something to place with no
+            // root is a loss the reader has to see: the dialog would otherwise
+            // say "saved" about a document that never landed anywhere, and the
+            // only copy of that workspace's configuration would be the window
+            // that just closed.
+            if workspace == WorkspaceSettings::default() {
+                return Ok(());
+            }
+            return Err(std::io::Error::other(
+                "the active workspace has no root, so its settings were not written",
+            ));
+        }
+        workspace
+            .save(&WorkspaceSettings::path(std::path::Path::new(&root)))
+            .map_err(as_io)?;
+        Ok(())
+    }
+
+    /// The provider credentials this configuration carries.
+    ///
+    /// Read by the session store, which must not write a credential into a
+    /// transcript. The tree is the only place a key is defined, so it is the
+    /// only place that can say which strings to scrub.
+    pub(crate) fn secrets(&self) -> Vec<String> {
+        self.global
+            .providers
+            .values()
+            .filter_map(|provider| {
+                let key = provider.api_key.trim();
+                (!key.is_empty()).then(|| key.to_string())
+            })
+            .collect()
+    }
+
+    /// The root of the workspace the registry says is active.
+    pub(crate) fn active_workspace_root(&self) -> String {
+        active_root(&self.global)
+    }
+
+    /// Make sure the registry names a workspace it actually carries.
+    ///
+    /// A fresh install has no registry at all, so the first save names the
+    /// working directory rather than writing a file nobody can point at.
+    pub(crate) fn ensure_workspace(&mut self) {
+        if !self.global.general.active_workspace.is_empty()
+            && self
+                .global
                 .workspaces
                 .iter()
-                .any(|w| w.id == self.active_workspace)
+                .any(|w| w.id == self.global.general.active_workspace)
         {
-            self.active_workspace = self.workspaces[0].id.clone();
+            return;
+        }
+        if self.global.workspaces.is_empty() {
+            // A fresh install has nothing to point at, and a shell with no
+            // workspace record has no root to confine its tools to and no
+            // session it can create. The directory the shell was launched from
+            // is the one fact that needs no settings file, so it is named here
+            // rather than left for a save nobody has triggered yet.
+            let root = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let name = root
+                .rsplit('/')
+                .next()
+                .filter(|leaf| !leaf.is_empty())
+                .unwrap_or(&root)
+                .to_string();
+            let id = self.note_workspace(&name, &root);
+            self.global.general.active_workspace = id;
+            return;
+        }
+        if let Some(first) = self.global.workspaces.first() {
+            self.global.general.active_workspace = first.id.clone();
         }
     }
 
-    /// The active workspace.
-    pub(crate) fn active_workspace(&self) -> Option<&Workspace> {
-        self.workspaces
+    /// The workspace record in effect, from the registry.
+    pub(crate) fn active_workspace(&self) -> Option<&global::WorkspaceRef> {
+        self.global
+            .workspaces
             .iter()
-            .find(|w| w.id == self.active_workspace)
-            .or_else(|| self.workspaces.first())
+            .find(|w| w.id == self.global.general.active_workspace)
     }
 
-    /// The preset the agent-presets pane selected, if it is still on disk.
-    pub(crate) fn active_preset(&self) -> Option<&agent::plugins::presets::Preset> {
-        if self.preset.is_empty() {
-            return None;
-        }
-        self.presets
-            .iter()
-            .find(|preset| preset.name == self.preset)
-    }
-
-    /// The model ids one provider's catalog holds, in insertion order.
-    pub(crate) fn catalog(&self, provider: &str) -> &[String] {
-        self.catalogs
-            .iter()
-            .find(|entry| entry.provider == provider)
-            .map(|entry| entry.models.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Add a model id to one provider's catalog.
+    /// Why a turn cannot be sent in this workspace, or none while it can.
     ///
-    /// A blank and a repeat are both refused rather than quietly stored, because
-    /// the pane explains the refusal; the catalog is created on first use.
-    /// Add one provider, or say why it cannot be added.
-    ///
-    /// A refused call leaves the settings exactly as they were: the reference
-    /// never silently replaces a provider that is already saved.
-    /// Update the provider behind `original` from the current fields, or say
-    /// why it cannot be updated.
-    ///
-    /// An edit may rename the provider, but never onto another saved one; the
-    /// reference refuses that with the same sentence it refuses a duplicate on.
-    pub(crate) fn update_provider(
-        &mut self,
-        original: &str,
-        name: &str,
-    ) -> Result<(), ProviderRefusal> {
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            return Err(ProviderRefusal::NameEmpty);
-        }
-        if self.base_url.trim().is_empty() {
-            return Err(ProviderRefusal::NeedsBaseUrl);
-        }
-        if self.model.trim().is_empty() {
-            return Err(ProviderRefusal::NeedsModel);
-        }
-        if name != original && self.providers.iter().any(|saved| saved.name == name) {
-            return Err(ProviderRefusal::IdTaken);
-        }
-        let Some(index) = self
-            .providers
+    /// The refusal is the seam that keeps a stale name honest: a workspace whose
+    /// model or preset the trees no longer define is reported rather than
+    /// quietly falling back to some other definition, because the reader who
+    /// chose that name is the one who can correct it.
+    pub(crate) fn refusal(&self) -> Option<&'static str> {
+        let entry = self
+            .global
+            .workspaces
             .iter()
-            .position(|saved| saved.name == original)
-        else {
-            return self.add_provider(&name);
-        };
-        let model = self.model.clone();
-        let base_url = self.base_url.clone();
-        let api_key = self.api_key.clone();
-        let entry = &mut self.providers[index];
-        entry.name = name.clone();
-        entry.model = model;
-        entry.base_url = base_url;
-        entry.api_key = api_key;
-        self.active_provider = name;
-        Ok(())
+            .find(|w| w.id == self.global.general.active_workspace);
+        let resolution = resolve::resolve(
+            &self.global,
+            &self.workspace,
+            entry,
+            &resolve::SessionChoice::default(),
+        );
+        resolution.refusal().map(|refusal| match refusal {
+            resolve::Refusal::NoModel => "composer.noModels",
+            resolve::Refusal::UnknownModel(_) => "composer.modelUnavailable",
+            resolve::Refusal::UnknownPreset(_) => "composer.presetUnavailable",
+        })
     }
 
-    pub(crate) fn add_provider(&mut self, name: &str) -> Result<(), ProviderRefusal> {
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            return Err(ProviderRefusal::NameEmpty);
-        }
-        if self.base_url.trim().is_empty() {
-            return Err(ProviderRefusal::NeedsBaseUrl);
-        }
-        if self.model.trim().is_empty() {
-            return Err(ProviderRefusal::NeedsModel);
-        }
-        if self.providers.iter().any(|saved| saved.name == name) {
-            return Err(ProviderRefusal::IdTaken);
-        }
-        self.providers.push(Profile {
-            name: name.clone(),
-            model: self.model.clone(),
-            base_url: self.base_url.clone(),
-            api_key: self.api_key.clone(),
-        });
-        self.active_provider = name;
-        Ok(())
-    }
-
-    pub(crate) fn add_catalog_model(
-        &mut self,
-        provider: &str,
-        model: &str,
-    ) -> Result<(), CatalogError> {
-        let model = model.trim();
-        if model.is_empty() {
-            return Err(CatalogError::Empty);
-        }
-        let index = match self
-            .catalogs
-            .iter()
-            .position(|entry| entry.provider == provider)
-        {
-            Some(index) => index,
-            None => {
-                self.catalogs.push(ModelCatalog {
-                    provider: provider.to_string(),
-                    models: Vec::new(),
-                    input_types: BTreeMap::new(),
-                });
-                self.catalogs.len() - 1
-            }
-        };
-        let entry = &mut self.catalogs[index];
-        if entry.models.iter().any(|existing| existing == model) {
-            return Err(CatalogError::Duplicate);
-        }
-        entry.models.push(model.to_string());
-        Ok(())
-    }
-
-    /// Drop a model id from one provider's catalog, dropping an emptied catalog.
-    pub(crate) fn remove_catalog_model(&mut self, provider: &str, model: &str) {
-        if let Some(entry) = self
-            .catalogs
-            .iter_mut()
-            .find(|entry| entry.provider == provider)
-        {
-            entry.models.retain(|existing| existing != model);
-            entry.input_types.remove(model);
-        }
-        self.catalogs.retain(|entry| !entry.models.is_empty());
-    }
-
-    /// The input types declared for one catalog model, empty when undeclared.
-    pub(crate) fn input_types_for(&self, provider: &str, model: &str) -> &[String] {
-        self.catalogs
-            .iter()
-            .find(|entry| entry.provider == provider)
-            .and_then(|entry| entry.input_types.get(model))
-            .map(|types| types.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Whether one catalog model shows an input type as declared.
+    /// Fold the two documents into the concrete values a build uses.
     ///
-    /// Undeclared reads as both, because bsh sends either until the user says
-    /// otherwise; that keeps the chips lit on a catalog that predates them.
-    pub(crate) fn shows_input_type(&self, provider: &str, model: &str, kind: &str) -> bool {
-        match self.input_types_for(provider, model) {
-            [] => true,
-            declared => declared.iter().any(|entry| entry == kind),
-        }
-    }
-
-    /// Whether one catalog model accepts image input.
-    ///
-    /// Undeclared is permissive: bsh only refuses an image the user explicitly
-    /// said the model cannot take.
-    pub(crate) fn accepts_image(&self, provider: &str, model: &str) -> bool {
-        self.shows_input_type(provider, model, "image")
-    }
-
-    /// Whether the active model of the active provider accepts image input.
-    pub(crate) fn active_accepts_image(&self) -> bool {
-        if self.active_provider.is_empty() {
-            return true;
-        }
-        self.accepts_image(&self.active_provider, &self.model)
-    }
-
-    /// Toggle one input type declared on a catalog model.
-    ///
-    /// The first toggle materializes the declaration: a model that declares
-    /// nothing shows both chips lit, and turning one off records the other.
-    /// Text is never dropped, because a model that takes no text cannot answer.
-    pub(crate) fn toggle_input_type(&mut self, provider: &str, model: &str, kind: &str) {
-        if !self.catalogs.iter().any(|entry| entry.provider == provider) {
-            self.catalogs.push(ModelCatalog {
-                provider: provider.to_string(),
-                models: Vec::new(),
-                input_types: BTreeMap::new(),
-            });
-        }
-        let declared: Vec<String> = match self.input_types_for(provider, model) {
-            [] => vec!["text".to_string(), "image".to_string()],
-            current => current.to_vec(),
-        };
-        let mut next: Vec<String> = declared
-            .iter()
-            .filter(|entry| *entry != kind)
-            .cloned()
-            .collect();
-        if next.len() == declared.len() {
-            next.push(kind.to_string());
-        }
-        if !next.iter().any(|entry| entry == "text") {
-            next.insert(0, "text".to_string());
-        }
-        if let Some(entry) = self
-            .catalogs
-            .iter_mut()
-            .find(|entry| entry.provider == provider)
-        {
-            entry.input_types.insert(model.to_string(), next);
-        }
-    }
-    /// The provider the models pane selected, looked up across both lists.
-    ///
-    /// Saved providers are searched first, then the profiles discovered from
-    /// the BOS config, so a saved entry wins over a discovered one of the same
-    /// name. An empty selection is no selection.
-    pub(crate) fn active_profile(&self) -> Option<&Profile> {
-        if self.active_provider.is_empty() {
-            return None;
-        }
-        self.providers
-            .iter()
-            .chain(self.profiles.iter())
-            .find(|profile| profile.name == self.active_provider)
-    }
-
-    /// Resolve the effective values for the active workspace.
+    /// This is a derivation, never a second storage: every field is read from
+    /// the trees, so a value one pane wrote is the value every pane and the
+    /// agent both see.
     pub(crate) fn effective(&self) -> Effective {
-        let mut eff = Effective {
-            name: String::new(),
-            root: String::new(),
-            model: self.model.clone(),
-            base_url: self.base_url.clone(),
-            api_key: self.api_key.clone(),
-            system_prompt: self.system_prompt.clone(),
-            temperature: self.temperature,
-            reasoning_effort: self.reasoning_effort.clone(),
-            max_tokens: self.max_tokens,
-            max_steps: self.max_steps,
-            parallel_tool_calls: self.parallel_tool_calls,
-            api_mode: self.api_mode.clone(),
-            bash_enabled: self.bash_enabled,
-            file_tools_enabled: self.file_tools_enabled,
-            permission: self.permission.clone(),
-            skills_dir: self.skills_dir.clone(),
-            context_budget: self.context_budget,
-            shell_timeout_secs: self.shell_timeout_secs,
-            tool_output_cap: self.tool_output_cap,
-            memory_enabled: self.memory_enabled,
-            transcript_view: TranscriptPolicy::resolve(&self.transcript_view),
-            performance_usage: self.performance_usage.clone(),
-            disabled_tools: self.disabled_tools.clone(),
-            disabled_skills: self.disabled_skills.clone(),
-        };
-        if let Some(profile) = self.active_profile() {
-            eff.model = profile.model.clone();
-            eff.base_url = profile.base_url.clone();
-            eff.api_key = profile.api_key.clone();
+        let entry = self
+            .global
+            .workspaces
+            .iter()
+            .find(|w| w.id == self.global.general.active_workspace);
+        let resolution = resolve::resolve(
+            &self.global,
+            &self.workspace,
+            entry,
+            &resolve::SessionChoice::default(),
+        );
+        let connection = resolution.model.connection();
+        let provider_id = resolution
+            .model
+            .reference()
+            .map(|named| named.provider.clone())
+            .unwrap_or_default();
+        let general = &self.global.general;
+        Effective {
+            provider: provider_id,
+            model_ref: resolution.model.reference().cloned(),
+            max_steps: resolution.max_steps,
+            parallel_tool_calls: resolution.parallel_tool_calls,
+            api_mode: connection
+                .and_then(|c| c.api_mode.clone())
+                .unwrap_or_default(),
+            name: resolution.name,
+            root: resolution.root,
+            model: connection.map(|c| c.model.clone()).unwrap_or_default(),
+            base_url: connection.map(|c| c.base_url.clone()).unwrap_or_default(),
+            api_key: connection.map(|c| c.api_key.clone()).unwrap_or_default(),
+            system_prompt: resolution.system_prompt,
+            temperature: resolution.temperature.unwrap_or(0.7),
+            reasoning_effort: resolution.reasoning_effort,
+            max_tokens: resolution.max_tokens,
+            bash_enabled: resolution.bash_enabled,
+            file_tools_enabled: resolution.file_tools_enabled,
+            web_tools_enabled: resolution.web_tools_enabled,
+            permission: resolution.permission,
+            skills_dir: resolution.skills_dir.to_string_lossy().to_string(),
+            context_budget: resolution.context_budget,
+            shell_timeout_secs: resolution.shell_timeout_secs,
+            tool_output_cap: resolution.tool_output_cap,
+            memory_enabled: resolution.memory_enabled,
+            transcript_view: resolution.transcript_view,
+            performance_usage: general.performance_usage.clone(),
+            disabled_tools: resolution.disabled_tools,
+            disabled_skills: resolution.disabled_skills,
+            preset_plugins: resolution.plugins,
         }
-        if let Some(preset) = self.active_preset() {
-            if let Some(model) = &preset.model {
-                eff.model = model.clone();
-            }
-            if let Some(prompt) = &preset.system_prompt {
-                eff.system_prompt = prompt.clone();
-            }
-            if let Some(steps) = preset.max_steps {
-                eff.max_steps = steps as usize;
-            }
-        }
-        if let Some(ws) = self.active_workspace() {
-            eff.name = ws.name.clone();
-            if !ws.root.is_empty() {
-                eff.root = ws.root.clone();
-            }
-            if !ws.model.is_empty() {
-                eff.model = ws.model.clone();
-            }
-            if !ws.base_url.is_empty() {
-                eff.base_url = ws.base_url.clone();
-            }
-            if !ws.api_key.is_empty() {
-                eff.api_key = ws.api_key.clone();
-            }
-            if !ws.system_prompt.is_empty() {
-                eff.system_prompt = ws.system_prompt.clone();
-            }
-            if ws.temperature > 0.0 {
-                eff.temperature = ws.temperature;
-            }
-            if ws.reasoning_effort.is_some() {
-                eff.reasoning_effort = ws.reasoning_effort.clone();
-            }
-        }
-        eff
     }
 
     /// The memory file in effect.
     pub(crate) fn memory_file(&self) -> PathBuf {
-        let raw = self.memory_path.trim();
+        let raw = self
+            .workspace
+            .agent
+            .memory_path
+            .as_deref()
+            .unwrap_or("")
+            .trim();
         let path = if raw.is_empty() {
             dir().join("memory.jsonl")
         } else {
@@ -1085,500 +528,774 @@ impl Settings {
         };
         path
     }
-}
 
-/// Read the [llm.<name>] profiles from the discovered BOS config.
-fn discover_profiles() -> Vec<Profile> {
-    let mut profiles = Vec::new();
-    let mut loader = config::ConfigLoader::new().discover();
-    let Ok(value) = loader.load_sync() else {
-        return profiles;
-    };
-    if let Some(gm) = value.get("global_model") {
-        let model = gm
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let base_url = gm
-            .get("base_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let api_key = gm
-            .get("api_key")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !model.is_empty() {
-            profiles.push(Profile {
-                name: "global".to_string(),
-                model,
-                base_url,
-                api_key,
-            });
-        }
+    /// The provider the active workspace chose, empty while it chose none.
+    pub(crate) fn active_provider(&self) -> &str {
+        self.workspace.general.provider.trim()
     }
-    if let Some(llm) = value.get("llm").and_then(|v| v.as_object()) {
-        for (name, entry) in llm {
-            let model = entry.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            if model.is_empty() {
-                continue;
-            }
-            profiles.push(Profile {
-                name: name.clone(),
-                model: model.to_string(),
-                base_url: entry
-                    .get("base_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                api_key: entry
-                    .get("api_key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            });
-        }
+
+    /// The model nicknames one provider carries, for the menu and the pane.
+    pub(crate) fn catalog(&self, provider: &str) -> Vec<String> {
+        self.global.models_of(provider).keys().cloned().collect()
     }
-    profiles
+
+    /// Whether the model in effect accepts an image attachment.
+    ///
+    /// An undeclared model is permissive; only a model that names its input
+    /// types has something to answer.
+    pub(crate) fn accepts_image(&self) -> bool {
+        let Some(named) = self.effective().model_ref else {
+            return false;
+        };
+        self.global.accepts_image(&named.provider, &named.model)
+    }
+
+    /// Register the workspace the shell is running from, if it is new.
+    pub(crate) fn note_workspace(&mut self, name: &str, root: &str) -> String {
+        if let Some(id) = self
+            .global
+            .workspaces
+            .iter()
+            .find(|w| w.root == root)
+            .map(|w| w.id.clone())
+        {
+            return id;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        self.global.workspaces.push(global::WorkspaceRef {
+            id: id.clone(),
+            name: name.to_string(),
+            root: root.to_string(),
+            created_at: unix_now(),
+            updated_at: unix_now(),
+        });
+        id
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::global::{GlobalSettings, ModelEntry};
+    use super::workspace::WorkspaceSettings;
+    use super::Settings;
+
+    /// The reference font-size default and the appearance default, both on the
+    /// global tier because neither is a workspace fact.
     #[test]
-    fn the_content_font_size_defaults_to_the_reference_step() {
-        let settings = super::Settings::default();
-        assert_eq!(
-            settings.content_font_size, 14,
-            "the reference stepper default"
-        );
-        assert_eq!(
-            settings.theme_mode, "system",
-            "the reference default preference"
-        );
-        assert_eq!(super::default_content_font_size(), 14);
-        assert_eq!(super::default_theme_mode(), "system");
+    fn the_reference_chrome_defaults_survive() {
+        let settings = Settings::default();
+        assert_eq!(settings.global.general.content_font_size, 14);
+        assert_eq!(settings.global.general.theme_mode, "system");
+        assert_eq!(settings.global.general.lang, "en");
+        assert_eq!(settings.global.general.transcript_view, "standard");
     }
 
+    /// A fresh install ships no endpoint, so the first run asks for one rather
+    /// than pretending a provider is configured.
     #[test]
-    fn input_types_are_undeclared_until_the_pane_says_otherwise() {
-        let mut settings = super::Settings {
-            active_provider: "p".to_string(),
-            model: "m".to_string(),
-            ..super::Settings::default()
-        };
-        assert!(settings.active_accepts_image(), "undeclared is permissive");
-        settings.toggle_input_type("p", "m", "image");
+    fn a_fresh_install_ships_nothing() {
+        let settings = Settings::default();
         assert!(
-            !settings.active_accepts_image(),
-            "turning Image off refuses images"
+            settings.global.providers.is_empty(),
+            "no provider is seeded"
         );
-        assert_eq!(settings.input_types_for("p", "m"), ["text".to_string()]);
+        assert!(
+            settings.global.presets.is_empty(),
+            "no preset is seeded from a retired directory"
+        );
+        assert!(
+            settings.workspace.general.provider.trim().is_empty(),
+            "no workspace names a provider"
+        );
+        assert!(
+            settings.workspace.general.model.trim().is_empty(),
+            "no workspace names a model"
+        );
     }
 
+    /// A name the trees no longer define is reported, never substituted:
+    /// the workspace that names it is the one that can correct it.
     #[test]
-    fn an_image_can_be_turned_off_and_back_on() {
-        let mut settings = super::Settings::default();
-        settings.toggle_input_type("p", "m", "image");
-        assert!(!settings.accepts_image("p", "m"));
-        settings.toggle_input_type("p", "m", "image");
-        assert!(settings.accepts_image("p", "m"));
+    fn a_stale_name_is_refused_rather_than_substituted() {
+        // A fresh install has no workspace yet, so naming one is what makes the
+        // rest of the test about a workspace rather than about emptiness.
+        let mut settings = Settings::default();
+        let id = settings.note_workspace("scratch", "/tmp");
+        settings.global.general.active_workspace = id;
         assert_eq!(
-            settings.input_types_for("p", "m"),
-            ["text".to_string(), "image".to_string()]
+            settings.refusal(),
+            Some("composer.noModels"),
+            "a workspace that names no model asks for one"
+        );
+
+        // A model nickname that no provider tree defines.
+        settings.workspace.general.provider = "work".to_string();
+        settings.workspace.general.model = "ghost".to_string();
+        assert_eq!(
+            settings.refusal(),
+            Some("composer.modelUnavailable"),
+            "a name the tree dropped is not silently swapped for another"
+        );
+
+        // The very same nickname, now defined, resolves.
+        let mut global = settings.global.clone();
+        global.add_provider("work", "", "https://work.example/v1", "k", &[]);
+        let _ = global.add_model("work", "ghost", "", "gpt-4o", "");
+        settings.global = global;
+        assert_eq!(settings.refusal(), None, "a resolved name is not refused");
+
+        // A preset nothing defines is the harder stop: it decides what the
+        // model sees, so a missing mount cannot be answered by a guess.
+        // The user's default is the name a session that names none carries.
+        settings.global.default_preset = "missing-preset".to_string();
+        assert_eq!(
+            settings.refusal(),
+            Some("composer.presetUnavailable"),
+            "a preset the tree cannot build is refused outright"
         );
     }
 
+    /// A provider node owns its endpoint, and a model leaf keys the nickname
+    /// to the full API id the wire speaks.
+    #[test]
+    fn a_provider_node_owns_the_endpoint_and_the_model_ids() {
+        let mut settings = GlobalSettings::default();
+        settings.add_provider("work", "", "https://work.example/v1", "k", &[]);
+        let _ = settings.add_model("work", "fast", "Fast one", "gpt-4o-mini", "chat");
+        let _ = settings.add_model("work", "brilliant", "", "o3", "responses");
+        let node = settings.providers.get("work").expect("seeded");
+        assert_eq!(node.base_url, "https://work.example/v1");
+        assert_eq!(node.api_key, "k");
+        assert_eq!(
+            node.models.get("fast").expect("nickname").model,
+            "gpt-4o-mini",
+            "the nickname keys the leaf, and the field is the API id"
+        );
+        assert_eq!(
+            node.models.get("brilliant").expect("nickname").model,
+            "o3",
+            "a blank nickname falls back to the model id"
+        );
+        assert_eq!(
+            node.models
+                .get("brilliant")
+                .and_then(|leaf| leaf.name.as_deref()),
+            None,
+            "an untyped display name is None, not an empty string"
+        );
+        assert_eq!(node.models.get("fast").expect("lm").model, "gpt-4o-mini");
+        assert_eq!(
+            settings.protocol("work", "fast"),
+            "chat",
+            "the leaf carries the protocol it was added with"
+        );
+    }
+
+    /// The provider id is the registry key, so it is what the wire model
+    /// carries: a rename moves the display, never the prefix.
+    #[test]
+    fn the_provider_id_stays_the_registry_key() {
+        let mut settings = GlobalSettings::default();
+        settings.add_custom_provider(
+            "relay",
+            "",
+            "https://relay.example/v1",
+            "",
+            &[ModelEntry::named("m")],
+        );
+        settings.set_provider_name("relay", "Relay");
+        let node = settings.providers.get("relay").expect("seeded");
+        assert_eq!(node.name.as_deref(), Some("Relay"));
+        assert!(
+            node.models.keys().any(|key| key == "m"),
+            "the model leaf is keyed by the id it carries"
+        );
+        assert!(settings.providers.contains_key("relay"), "the key is fixed");
+    }
+
+    /// Input types are undeclared until the pane says otherwise, so a model
+    /// that never declared them takes everything.
+    #[test]
+    fn an_undeclared_model_takes_everything() {
+        let mut settings = GlobalSettings::default();
+        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        let _ = settings.add_model("p", "m", "", "m", "");
+        assert!(settings.accepts_image("p", "m"), "undeclared is permissive");
+        assert_eq!(settings.input_types_of("p", "m"), ["text", "image"]);
+    }
+
+    /// Turning image off refuses it, and the text leaf can never be turned off,
+    /// because a model that takes no text has nothing to send.
     #[test]
     fn text_never_leaves_the_declared_input_types() {
-        let mut settings = super::Settings::default();
-        settings.toggle_input_type("p", "m", "text");
-        assert!(settings.shows_input_type("p", "m", "text"));
-        assert!(settings.accepts_image("p", "m"));
+        let mut settings = GlobalSettings::default();
+        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        let _ = settings.add_model("p", "m", "", "m", "");
+        settings.set_input_type("p", "m", "image");
+        assert!(
+            !settings.accepts_image("p", "m"),
+            "turning image off refuses it"
+        );
+        settings.set_input_type("p", "m", "image");
+        assert!(
+            settings.accepts_image("p", "m"),
+            "turning it back on restores it"
+        );
+        assert_eq!(settings.input_types_of("p", "m"), ["text", "image"]);
+        settings.set_input_type("p", "m", "text");
+        assert!(
+            settings.shows_input_type("p", "m", "text"),
+            "text stays standing"
+        );
+        assert!(settings.accepts_image("p", "m"), "and image is untouched");
     }
 
+    /// A declaration survives a file round trip, because the tree is the
+    /// document rather than a view the pane rebuilds from.
     #[test]
     fn a_declared_input_type_survives_a_reload() {
-        let mut settings = super::Settings::default();
-        settings.toggle_input_type("p", "m", "image");
-        settings.toggle_input_type("p", "m", "image");
-        let text = serde_json::to_string(&settings).expect("serialize");
-        let back: super::Settings = serde_json::from_str(&text).expect("deserialize");
-        assert!(back.accepts_image("p", "m"));
+        let mut settings = Settings {
+            global: {
+                let mut global = GlobalSettings::default();
+                global.add_provider("p", "", "https://p.example/v1", "", &[]);
+                let _ = global.add_model("p", "m", "", "m", "");
+                global
+            },
+            ..Settings::default()
+        };
+        settings.global.set_input_type("p", "m", "image");
+        let text = toml::to_string(&settings.global).expect("serialize");
+        let back = GlobalSettings::from_toml(&text).expect("deserialize");
+        assert!(
+            !back.accepts_image("p", "m"),
+            "the declaration came back too"
+        );
     }
 
+    /// Dropping the model drops its declaration, so a re-added leaf starts
+    /// permissive rather than inheriting a stale answer.
     #[test]
-    fn dropping_a_catalog_model_drops_its_declaration() {
-        let mut settings = super::Settings::default();
-        settings.add_catalog_model("p", "m").expect("add");
-        settings.toggle_input_type("p", "m", "image");
+    fn dropping_a_model_drops_its_declaration() {
+        let mut settings = GlobalSettings::default();
+        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        let _ = settings.add_model("p", "m", "", "m", "");
+        settings.set_input_type("p", "m", "image");
         assert!(!settings.accepts_image("p", "m"));
-        settings.remove_catalog_model("p", "m");
+        settings.remove_model("p", "m");
+        let _ = settings.add_model("p", "m", "", "m", "");
         assert!(settings.accepts_image("p", "m"), "gone means undeclared");
     }
-    use super::{presets_in, Profile, Settings};
 
-    /// A preset with a name, a model, a prompt and a step ceiling.
-    fn preset(name: &str) -> agent::plugins::presets::Preset {
-        agent::plugins::presets::Preset {
-            name: name.to_string(),
-            tools: vec!["bash".to_string()],
-            model: Some(format!("{name}-model")),
-            system_prompt: Some(format!("{name} prompt")),
-            max_steps: Some(21),
-        }
-    }
-
-    /// A selected preset names the agent, and a stale name falls back to the
-    /// fields rather than blanking them.
+    /// A repeated model id under a different key is refused, so two leaves
+    /// cannot answer the same wire model on one provider.
     #[test]
-    fn a_preset_supplies_the_model_prompt_and_ceiling() {
-        let settings = Settings {
-            model: "plain".to_string(),
-            max_steps: 4,
-            presets: vec![preset("careful")],
-            preset: "careful".to_string(),
-            ..Settings::default()
-        };
-        let eff = settings.effective();
-        assert_eq!(eff.model, "careful-model");
-        assert_eq!(eff.system_prompt, "careful prompt");
-        assert_eq!(eff.max_steps, 21);
-
-        let stale = Settings {
-            preset: "gone".to_string(),
-            ..settings
-        };
-        let eff = stale.effective();
-        assert_eq!(eff.model, "plain");
-        assert_eq!(eff.max_steps, 4);
-    }
-
-    /// The directory loader reads what parses, in name order, and skips the rest.
-    #[test]
-    fn the_preset_loader_reads_the_directory() {
-        let dir = std::path::PathBuf::from("target/bsh-preset-dir");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        std::fs::write(
-            dir.join("careful.json"),
-            r#"{"name":"careful","tools":["bash"],"model":"m","max_steps":3}"#,
-        )
-        .expect("write");
-        std::fs::write(dir.join("broken.json"), "{ not json").expect("write");
-        std::fs::write(dir.join("ignored.txt"), "hello").expect("write");
-
-        let found = presets_in(&dir);
-        assert_eq!(found.len(), 1, "only the parseable preset is read");
-        assert_eq!(found[0].name, "careful");
-        assert_eq!(found[0].max_steps, Some(3));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A selected provider is the endpoint tier, and a stale name falls back to
-    /// the plain fields rather than blanking the endpoint.
-    #[test]
-    fn effective_prefers_the_active_provider() {
-        let settings = Settings {
-            model: "plain".to_string(),
-            base_url: "https://plain".to_string(),
-            api_key: "plain-key".to_string(),
-            providers: vec![Profile {
-                name: "work".to_string(),
-                model: "work-model".to_string(),
-                base_url: "https://work".to_string(),
-                api_key: "work-key".to_string(),
-            }],
-            active_provider: "work".to_string(),
-            ..Settings::default()
-        };
-        let eff = settings.effective();
-        assert_eq!(eff.model, "work-model");
-        assert_eq!(eff.base_url, "https://work");
-        assert_eq!(eff.api_key, "work-key");
-
-        let stale = Settings {
-            active_provider: "gone".to_string(),
-            ..settings
-        };
-        let eff = stale.effective();
-        assert_eq!(eff.base_url, "https://plain");
-        assert_eq!(eff.api_key, "plain-key");
-    }
-
-    /// The provider form refuses what the reference refuses, and a refusal never
-    /// touches a provider that is already saved.
-    #[test]
-    fn the_provider_form_refuses_and_never_replaces() {
-        let mut settings = super::Settings {
-            base_url: String::new(),
-            model: String::new(),
-            ..super::Settings::default()
-        };
-        assert_eq!(
-            settings.add_provider("  "),
-            Err(super::ProviderRefusal::NameEmpty)
-        );
-        assert_eq!(
-            settings.add_provider("work"),
-            Err(super::ProviderRefusal::NeedsBaseUrl)
-        );
-        settings.base_url = "https://api.example/v1".to_string();
-        assert_eq!(
-            settings.add_provider("work"),
-            Err(super::ProviderRefusal::NeedsModel)
-        );
-        settings.model = "deepseek-chat".to_string();
-        assert_eq!(settings.add_provider("work"), Ok(()));
-        assert_eq!(settings.providers.len(), 1);
-        assert_eq!(settings.active_provider, "work");
-
-        settings.base_url = "https://elsewhere.example/v1".to_string();
-        assert_eq!(
-            settings.add_provider("work"),
-            Err(super::ProviderRefusal::IdTaken),
-            "a saved provider is never replaced"
-        );
-        assert_eq!(
-            settings.providers[0].base_url, "https://api.example/v1",
-            "and the refusal left it untouched"
+    fn a_model_id_appears_once_on_a_provider() {
+        let mut settings = GlobalSettings::default();
+        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_model("p", "m", "", "same", "").expect("first");
+        let repeat = settings.add_model("p", "n", "", "same", "");
+        assert!(
+            repeat.is_err(),
+            "a second key repeating the id is a duplicate"
         );
     }
 
-    /// Each refusal draws the reference own sentence, so the mapping is pinned.
+    /// Re-adding an id under the key it already has merges rather than
+    /// duplicating, so a rename of the nickname is not a refusal.
     #[test]
-    fn every_refusal_names_the_sentence_it_draws() {
-        let pairs = [
-            (
-                super::ProviderRefusal::NameEmpty,
-                "settings.providerNameEmpty",
-            ),
-            (
-                super::ProviderRefusal::NeedsBaseUrl,
-                "settings.providerNeedsBaseUrl",
-            ),
-            (
-                super::ProviderRefusal::NeedsModel,
-                "settings.providerNeedsModel",
-            ),
-            (super::ProviderRefusal::IdTaken, "settings.providerIdTaken"),
-        ];
-        for (refusal, key) in pairs {
-            assert_eq!(refusal.key(), key);
-        }
-    }
-
-    /// An edit changes the provider in place and may rename it, but never onto
-    /// another saved provider.
-    #[test]
-    fn editing_a_provider_updates_it_in_place() {
-        let mut settings = super::Settings {
-            base_url: "https://api.example/v1".to_string(),
-            model: "deepseek-chat".to_string(),
-            ..super::Settings::default()
-        };
-        assert_eq!(settings.add_provider("work"), Ok(()));
-        assert_eq!(settings.add_provider("spare"), Ok(()));
-
-        settings.base_url = "https://elsewhere.example/v1".to_string();
+    fn re_adding_an_id_under_its_own_key_merges() {
+        let mut settings = GlobalSettings::default();
+        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_model("p", "m", "", "same", "").expect("first");
+        settings.add_model("p", "m", "", "same", "").expect("merge");
+        assert_eq!(settings.model_ids("p").len(), 1, "one leaf, not two");
         assert_eq!(
-            settings.update_provider("work", "spare"),
-            Err(super::ProviderRefusal::IdTaken)
-        );
-        assert_eq!(settings.providers.len(), 2, "a refused edit adds nothing");
-        assert_eq!(settings.providers[0].name, "work", "and renames nothing");
-
-        assert_eq!(settings.update_provider("work", "  home  "), Ok(()));
-        assert_eq!(settings.providers.len(), 2, "an edit never duplicates");
-        assert_eq!(settings.providers[0].name, "home");
-        assert_eq!(
-            settings.providers[0].base_url,
-            "https://elsewhere.example/v1"
-        );
-        assert_eq!(settings.active_provider, "home");
-
-        settings.base_url = String::new();
-        assert_eq!(
-            settings.update_provider("home", "home"),
-            Err(super::ProviderRefusal::NeedsBaseUrl)
-        );
-        assert_eq!(
-            settings.providers[0].base_url, "https://elsewhere.example/v1",
-            "the refused edit left the provider alone"
+            settings.model_ids("p").iter().next().map(String::as_str),
+            Some("same")
         );
     }
 
-    /// The catalog refuses a blank id and a repeat, keeps insertion order, and
-    /// drops an emptied list, because the pane derives its hints from exactly
-    /// these answers.
+    /// A blank model id is refused, because a leaf with no id has nothing for
+    /// the wire to speak.
     #[test]
-    fn the_model_catalog_refuses_blanks_and_repeats() {
-        let mut settings = Settings::default();
-        assert!(settings.catalog("work").is_empty());
-        assert_eq!(
-            settings.add_catalog_model("work", "   "),
-            Err(super::CatalogError::Empty)
+    fn a_blank_model_id_is_refused() {
+        let mut settings = GlobalSettings::default();
+        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        let outcome = settings.add_model("p", "m", "", "   ", "");
+        assert!(outcome.is_err(), "a whitespace id is not a model");
+    }
+
+    /// A typed but blank display name is refused, so a half-rename is visible
+    /// rather than silently dropped.
+    #[test]
+    fn a_typed_but_blank_display_name_is_refused() {
+        let mut settings = GlobalSettings::default();
+        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        let outcome = settings.add_model("p", "m", "  ", "m", "");
+        assert!(
+            outcome.is_err(),
+            "a typed blank name is a refusal, not a None"
+        );
+    }
+
+    /// The endpoint is validated on add, so an unspeakable address never
+    /// reaches the file.
+    #[test]
+    fn an_unspeakable_endpoint_is_refused() {
+        let mut settings = GlobalSettings::default();
+        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        let outcome = settings.add_model("p", "m", "", "m", "");
+        assert!(outcome.is_ok(), "a good address is accepted");
+        let malformed = super::provider::base_url_refusal("not an endpoint");
+        assert!(malformed.is_some(), "a malformed address is refused");
+    }
+
+    /// The ids the tree does not carry yet are the catalogue the add card
+    /// offers; an id already taken is not offered again.
+    #[test]
+    fn only_the_unconfigured_families_are_offered() {
+        let mut settings = GlobalSettings::default();
+        assert!(
+            settings.addable_providers().len() >= 2,
+            "a fresh tree offers families"
+        );
+        settings.add_provider("deepseek", "", "https://api.deepseek.com", "", &[]);
+        let offered = settings.addable_providers();
+        assert!(
+            !offered.iter().any(|id| id == "deepseek"),
+            "taken is not offered"
         );
         assert!(
-            settings.catalog("work").is_empty(),
-            "a blank id stores nothing"
+            offered.iter().any(|id| id == "openai"),
+            "the rest still are"
         );
-        assert_eq!(settings.add_catalog_model("work", "gpt-4o"), Ok(()));
-        assert_eq!(
-            settings.add_catalog_model("work", "gpt-4o"),
-            Err(super::CatalogError::Duplicate)
-        );
-        assert_eq!(settings.add_catalog_model("work", "o3"), Ok(()));
-        assert_eq!(
-            settings.catalog("work"),
-            ["gpt-4o".to_string(), "o3".to_string()],
-            "insertion order is the user order"
-        );
-        assert!(settings.catalog("personal").is_empty());
-        assert_eq!(settings.add_catalog_model("personal", "llama"), Ok(()));
-        assert_eq!(
-            settings.catalog("work").len(),
-            2,
-            "catalogs are per provider"
-        );
-        settings.remove_catalog_model("work", "gpt-4o");
-        assert_eq!(settings.catalog("work"), ["o3".to_string()]);
-        settings.remove_catalog_model("work", "o3");
+    }
+
+    /// The workspace names a provider and a nickname, and the reference the
+    /// resolver reads is that pair rather than a bare model string.
+    #[test]
+    fn the_workspace_records_a_reference_not_a_model_string() {
+        let mut settings = Settings::default();
+        settings
+            .global
+            .add_provider("p", "", "https://p.example/v1", "k", &[]);
+        let _ = settings
+            .global
+            .add_model("p", "fast", "", "gpt-4o-mini", "");
+        settings.workspace.general.provider = "p".to_string();
+        settings.workspace.general.model = "fast".to_string();
+        let reference = settings.workspace.general.model_ref().expect("resolved");
+        assert_eq!(reference.provider, "p");
+        assert_eq!(reference.model, "fast");
+        let effective = settings.effective();
+        assert_eq!(effective.provider, "p");
+        assert_eq!(effective.model, "gpt-4o-mini");
+    }
+
+    /// A session reference the tree cannot resolve refuses to send rather
+    /// than falling back to a model the reader never asked for.
+    #[test]
+    fn an_unresolvable_reference_is_reported_not_faked() {
+        let settings = Settings::default();
         assert!(
-            !settings
-                .catalogs
-                .iter()
-                .any(|entry| entry.provider == "work"),
-            "an emptied catalog is dropped rather than kept as a husk"
+            settings.effective().model_ref.is_none(),
+            "no provider means no reference"
         );
     }
 
+    /// The active image answer follows the workspace's own choice.
     #[test]
-    fn a_new_task_is_due_once_and_then_waits_for_its_interval() {
+    fn the_active_image_answer_follows_the_workspace_choice() {
         let mut settings = Settings::default();
-        let id = settings
-            .add_schedule("Digest", "Summarize the inbox.", "s1", 60)
-            .expect("a named task with an instruction is accepted");
-        let task = settings.schedules[0].clone();
-        assert!(settings.is_due(&task, 1_000), "a fresh task is due at once");
-        settings.mark_schedule_ran(&id, 1_000);
-        let task = settings.schedules[0].clone();
+        settings
+            .global
+            .add_provider("p", "", "https://p.example/v1", "", &[]);
+        let _ = settings.global.add_model("p", "m", "", "m", "");
+        settings.workspace.general.provider = "p".to_string();
+        settings.workspace.general.model = "m".to_string();
+        assert!(settings.accepts_image(), "undeclared is permissive");
+        settings.global.set_input_type("p", "m", "image");
         assert!(
-            !settings.is_due(&task, 1_059),
-            "the interval has not elapsed"
+            !settings.accepts_image(),
+            "the declaration reached the active answer"
         );
-        assert!(settings.is_due(&task, 1_060), "the interval has elapsed");
-        assert_eq!(settings.next_run(&task, 1_060), Some(1_060));
     }
 
+    /// The catalog a pane lists is the nicknames one provider carries, so the
+    /// menu and the row cannot drift.
     #[test]
-    fn a_one_shot_task_runs_once_and_turns_itself_off() {
+    fn the_catalog_is_the_provider_s_nicknames() {
         let mut settings = Settings::default();
-        let id = settings
-            .add_schedule("Ping", "Say hello.", "s1", 0)
-            .expect("a single run needs no interval");
-        let task = settings.schedules[0].clone();
-        assert!(settings.is_due(&task, 10));
-        settings.mark_schedule_ran(&id, 10);
-        let task = settings.schedules[0].clone();
-        assert!(!task.enabled, "a single run has happened");
-        assert!(!settings.is_due(&task, 10_000));
-        assert_eq!(settings.next_run(&task, 10_000), None);
+        settings
+            .global
+            .add_provider("p", "", "https://p.example/v1", "", &[]);
+        let _ = settings.global.add_model("p", "fast", "", "a", "");
+        let _ = settings.global.add_model("p", "slow", "", "b", "");
+        assert_eq!(
+            settings.catalog("p"),
+            vec!["fast".to_string(), "slow".to_string()]
+        );
     }
 
+    /// A task is registered against the file, and the cadence it carries is
+    /// what the shell scheduler reads.
     #[test]
-    fn an_inactive_task_never_triggers() {
-        let mut settings = Settings::default();
+    fn a_task_is_registered_and_runs_on_its_cadence() {
+        let mut settings = GlobalSettings::default();
         let id = settings
-            .add_schedule("Watch", "Check the queue.", "s1", 30)
-            .expect("the task is valid before it is switched off");
+            .add_schedule("Nightly digest", "summarize the day", "session-1", 60)
+            .expect("a schedule");
+        assert_eq!(settings.schedules.len(), 1);
+        let task = settings.schedules[0].clone();
+        assert_eq!(task.prompt, "summarize the day");
+        assert_eq!(task.every_seconds, 60);
+
+        // A task that never ran is due whenever it is asked.
+        assert!(settings.is_due(&task, 0));
+        assert!(settings.is_due(&task, 60));
+
+        // Once it has run, the cadence holds.
+        // A zero stamp would read as never ran, so the clock starts at one.
+        settings.mark_schedule_ran(&id, 1);
+        assert!(!settings.is_due(&settings.schedules[0], 60));
+        assert!(settings.is_due(&settings.schedules[0], 61));
+        assert_eq!(settings.next_run(&settings.schedules[0], 30), Some(61));
+
+        // A repeated name on another session is a second task, not a clash.
+        assert!(settings
+            .add_schedule("Nightly digest", "x", "s-2", 1)
+            .is_ok());
+        assert_eq!(settings.schedules.len(), 2);
         assert!(settings.toggle_schedule(&id));
-        let task = settings.schedules[0].clone();
-        assert!(!settings.is_due(&task, 10_000));
-        assert_eq!(settings.next_run(&task, 10_000), None);
-        assert!(settings.toggle_schedule(&id), "it can be switched back on");
-        let task = settings.schedules[0].clone();
-        assert!(settings.is_due(&task, 10_000));
-    }
-
-    #[test]
-    fn a_task_needs_a_name_and_an_instruction() {
-        let mut settings = Settings::default();
-        assert_eq!(
-            settings.add_schedule("  ", "Do it.", "s1", 60),
-            Err(super::ScheduleRefusal::Name)
-        );
-        let long = "n".repeat(Settings::NAME_LIMIT + 1);
-        assert_eq!(
-            settings.add_schedule(&long, "Do it.", "s1", 60),
-            Err(super::ScheduleRefusal::Name)
-        );
-        assert_eq!(
-            settings.add_schedule("Named", "   ", "s1", 60),
-            Err(super::ScheduleRefusal::Prompt)
-        );
-        assert!(settings.schedules.is_empty(), "a refused task is not kept");
-    }
-
-    #[test]
-    fn the_work_details_modes_are_the_references_own_table() {
-        use super::{StepGrouping, TranscriptPolicy};
-        let compact = TranscriptPolicy::resolve("compact");
-        assert!(compact.fold_completed_turns);
-        assert_eq!(compact.step_grouping, StepGrouping::Collapsed);
-        assert!(!compact.live_process_detail);
-        assert!(!compact.settled_reasoning_preview);
-
-        let standard = TranscriptPolicy::resolve("standard");
-        assert!(standard.fold_completed_turns);
-        assert_eq!(standard.step_grouping, StepGrouping::Collapsed);
-        assert!(standard.live_process_detail);
-        assert!(standard.settled_reasoning_preview);
-
-        let detailed = TranscriptPolicy::resolve("detailed");
-        assert!(detailed.fold_completed_turns);
-        assert_eq!(detailed.step_grouping, StepGrouping::History);
-        assert!(detailed.live_process_detail);
-        assert!(detailed.settled_reasoning_preview);
-
-        let verbose = TranscriptPolicy::resolve("verbose");
-        assert!(!verbose.fold_completed_turns);
-        assert_eq!(verbose.step_grouping, StepGrouping::None);
-        assert!(!verbose.live_process_detail);
-        assert!(verbose.settled_reasoning_preview);
-    }
-
-    #[test]
-    fn a_legacy_work_details_value_reads_as_detailed() {
-        let detailed = super::TranscriptPolicy::resolve("detailed");
-        for legacy in ["normal", "expanded"] {
-            assert_eq!(
-                super::TranscriptPolicy::resolve(legacy),
-                detailed,
-                "{legacy} is a saved value of the two-mode generation"
-            );
-        }
-        assert_eq!(
-            super::TranscriptPolicy::resolve("standard"),
-            super::TranscriptPolicy::resolve("not-a-mode"),
-            "an unknown mode falls back to the desktop default"
-        );
-        assert_eq!(super::DEFAULT_TRANSCRIPT_VIEW, "standard");
-        assert_eq!(super::default_transcript_view(), "standard");
-    }
-
-    #[test]
-    fn dropping_a_task_takes_it_out_of_the_file() {
-        let mut settings = Settings::default();
-        let id = settings
-            .add_schedule("Digest", "Summarize.", "s1", 60)
-            .expect("the task is valid");
+        assert!(!settings.is_due(&settings.schedules[0], 10_000));
         assert!(settings.remove_schedule(&id));
-        assert!(
-            !settings.remove_schedule(&id),
-            "a second drop finds nothing"
-        );
+        assert!(!settings.remove_schedule(&id));
         assert!(settings.schedules.is_empty());
+    }
+
+    /// A task with no name or no instruction is refused by the same spelling
+    /// the reference uses, so the pane can show a reason.
+    #[test]
+    fn an_empty_task_is_refused() {
+        let mut settings = GlobalSettings::default();
+        assert!(settings.add_schedule("", "prompt", "s", 60).is_err());
+        assert!(settings.add_schedule("name", "   ", "s", 60).is_err());
+    }
+
+    /// Presets are declared in the file, so the retired preset directory has
+    /// nothing left to read.
+    #[test]
+    fn presets_live_in_the_settings_file() {
+        let mut settings = Settings::default();
+        settings.global.presets.insert(
+            "tight".to_string(),
+            super::global::Preset {
+                name: Some("Tight".to_string()),
+                plugins: vec!["shell".to_string()],
+                description: None,
+                order: None,
+            },
+        );
+        assert!(settings.global.preset_ids().contains(&"tight".to_string()));
+        assert!(settings.global.preset("tight").is_some());
+        assert!(
+            settings.global.preset("standard").is_some(),
+            "the shipped two stay available"
+        );
+    }
+
+    /// The workspace registry records each root once, so reopening a folder
+    /// returns the workspace it already has.
+    #[test]
+    fn a_workspace_root_registers_once() {
+        let mut settings = Settings::default();
+        let first = settings.note_workspace("first", "/tmp/one");
+        let second = settings.note_workspace("renamed", "/tmp/one");
+        assert_eq!(first, second, "the root identifies the workspace");
+        assert_eq!(settings.global.workspaces.len(), 1);
+        let other = settings.note_workspace("second", "/tmp/two");
+        assert_ne!(other, first, "a different root is a different workspace");
+    }
+
+    /// The global file and the workspace file are separate documents, so a
+    /// workspace switch does not rewrite the global one.
+    #[test]
+    fn the_two_level_files_are_separate_documents() {
+        let global = GlobalSettings::default().to_toml().expect("global");
+        assert!(
+            !global.contains("[providers."),
+            "an empty tree writes no provider"
+        );
+        let workspace = super::workspace::WorkspaceSettings::default()
+            .to_toml()
+            .expect("ws");
+        assert!(
+            workspace.trim().lines().count() > 0,
+            "the workspace writes its own file"
+        );
+    }
+
+    /// A test build refuses to write the real configuration.
+    ///
+    /// The scratch store redirects every save, and this is the guard behind that
+    /// redirect: one checkout's test run shares $HOME with every other checkout,
+    /// so a forgotten redirect overwrites the reader's settings with a fixture.
+    /// A second worktree did exactly that to this file while it was being
+    /// repaired.
+    #[cfg(test)]
+    #[test]
+    fn a_test_build_never_writes_the_real_configuration() {
+        let bare = Settings::default();
+        assert!(bare.save_root.is_none(), "the premise: no redirect is set");
+        let refused = bare.save();
+        assert!(
+            refused.is_err(),
+            "a test build with no save_root must refuse, not write the user's file"
+        );
+    }
+
+    /// An unreadable document leaves the live directory for the archive.
+    ///
+    /// It used to be renamed to `settings.toml.bak` in place, so an old-format
+    /// file sat beside the live one for good and every later reader had to work
+    /// out which was which.
+    #[test]
+    fn an_unreadable_document_is_archived_beside_the_tree() {
+        let base = std::env::temp_dir().join(format!("bsh-archive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let settings = Settings {
+            save_root: Some(base.clone()),
+            ..Settings::default()
+        };
+        // A file this build cannot read, which is what the old flat format is.
+        let old = base.join("settings.toml");
+        std::fs::write(&old, "schema_version = 1\ntheme_mode = \"light\"\n")
+            .expect("the old document");
+        settings.save().expect("the save");
+
+        // The live document is the one this build wrote...
+        let live = std::fs::read_to_string(&old).expect("the live document");
+        assert!(
+            live.contains("[general]"),
+            "the live file is the new format the app reads"
+        );
+        assert!(
+            !base.join("settings.toml.bak").exists(),
+            "nothing is left beside the live file under a settings-like name"
+        );
+        // ...and the old one is in the archive, named so it cannot be mistaken
+        // for a live document, with its content intact.
+        let archived = std::fs::read_dir(base.join("archive").join("legacy-flat"))
+            .expect("the archive")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(archived.len(), 1, "one record, got {archived:?}");
+        let name = archived[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            name.starts_with("settings-flat-") && name.ends_with(".toml.old"),
+            "the archived name cannot be read as a live document, got {name}"
+        );
+        let kept = std::fs::read_to_string(&archived[0]).expect("the archived content");
+        assert!(
+            kept.contains("theme_mode"),
+            "the refused document is kept whole, not eaten"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A save puts each fact in the file that owns it, at the path that file is
+    /// documented to live at.
+    ///
+    /// This is the assertion the split is worth: the global document carries the
+    /// machine preference and the registry, one workspace document carries that
+    /// workspace's selection and agent configuration, and neither leaks into the
+    /// other. A save that wrote one file and skipped the other would still leave
+    /// every pane green, so the paths and both directions of the split are read
+    /// back from disk here.
+    #[test]
+    fn a_save_writes_each_fact_only_to_its_own_file() {
+        let base = std::env::temp_dir().join(format!("bsh-two-level-{}", std::process::id()));
+        let root = base.join("workspace");
+        let home = base.join("home");
+        std::fs::create_dir_all(&root).expect("the workspace root");
+        // The redirected location is what a test and a scratch store use, so the
+        // global file is never the developer's own.
+        let mut settings = Settings {
+            save_root: Some(home.clone()),
+            ..Settings::default()
+        };
+        let id = settings.note_workspace("probe", &root.to_string_lossy());
+        settings.global.general.active_workspace = id.clone();
+        // One fact that belongs to the machine...
+        settings.global.general.lang = "zh".to_string();
+        // ...and three that belong to this workspace.
+        settings.workspace.agent.permission = crate::caps::READ_ONLY.to_string();
+        settings.workspace.general.provider = "work".to_string();
+        settings.workspace.general.model = "m".to_string();
+        settings.save().expect("the save reaches both files");
+
+        // The global document, at the documented path.
+        let global_path = home.join("settings.toml");
+        assert!(global_path.exists(), "the global file is written");
+        let global = GlobalSettings::load(&global_path).expect("the global file parses");
+        assert_eq!(global.general.lang, "zh", "the machine preference landed");
+        assert!(
+            global.workspaces.iter().any(|workspace| workspace.id == id),
+            "the registry landed"
+        );
+
+        // The workspace document, under the workspace it configures.
+        let workspace_path = WorkspaceSettings::path(&root);
+        assert_eq!(
+            workspace_path,
+            root.join(".bsh").join("settings").join("settings.toml"),
+            "the workspace file lives under the workspace"
+        );
+        assert!(workspace_path.exists(), "the workspace file is written");
+        let workspace = WorkspaceSettings::load(&workspace_path).expect("the workspace parses");
+        assert_eq!(
+            workspace.agent.permission,
+            crate::caps::READ_ONLY,
+            "the agent configuration landed"
+        );
+        assert_eq!(workspace.general.model, "m", "the selection landed");
+
+        // The split, in both directions: neither file carries the other's facts.
+        let global_text = std::fs::read_to_string(&global_path).expect("global text");
+        assert!(
+            !global_text.contains("permission"),
+            "the workspace's agent configuration stays out of the global file"
+        );
+        let workspace_text = std::fs::read_to_string(&workspace_path).expect("workspace text");
+        assert!(
+            !workspace_text.contains("lang"),
+            "the machine preference stays out of the workspace file"
+        );
+        assert!(
+            !workspace_text.contains("workspaces"),
+            "the registry stays out of the workspace file"
+        );
+
+        // Reading the two files back is what a relaunch does, and it finds the
+        // same facts — so the split survives the round trip, not only the write.
+        let read_back = Settings {
+            global: GlobalSettings::load(&global_path).expect("global back"),
+            workspace: WorkspaceSettings::load(&workspace_path).expect("workspace back"),
+            save_root: None,
+        };
+        assert_eq!(read_back.global.general.lang, "zh");
+        assert_eq!(read_back.workspace.agent.permission, crate::caps::READ_ONLY);
+        assert_eq!(read_back.active_workspace_root(), root.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pane edit lives in the draft until it is committed.
+    ///
+    /// The actions that preview a preference (language, palette, font size, the
+    /// coding-view switch) used to write the COMMITTED tree and save it, so a
+    /// language pick persisted every other field from the copy the reader had
+    /// not applied yet - a pending permission change was overwritten by it. The
+    /// contract this pins is the one the crate already states: a pane edits the
+    /// draft and Save is the only writer.
+    #[test]
+    fn a_draft_edit_writes_nothing_until_it_is_committed() {
+        let base = std::env::temp_dir().join(format!("bsh-draft-{}", std::process::id()));
+        let root = base.join("workspace");
+        let home = base.join("home");
+        std::fs::create_dir_all(&root).expect("the workspace root");
+
+        let mut settings = Settings {
+            save_root: Some(home.clone()),
+            ..Settings::default()
+        };
+        let id = settings.note_workspace("probe", &root.to_string_lossy());
+        settings.global.general.active_workspace = id;
+        settings.save().expect("the baseline");
+
+        let global_path = home.join("settings.toml");
+        let workspace_path = WorkspaceSettings::path(&root);
+        let global_before = std::fs::read_to_string(&global_path).expect("global baseline");
+        let workspace_before =
+            std::fs::read_to_string(&workspace_path).expect("workspace baseline");
+
+        // What a pane does: the draft moves, nothing is written.
+        let mut draft = settings.clone();
+        draft.global.general.lang = "zh".to_string();
+        draft.workspace.agent.permission = crate::caps::READ_ONLY.to_string();
+        assert_eq!(
+            std::fs::read_to_string(&global_path).expect("global unchanged"),
+            global_before,
+            "editing the draft must not touch the global file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&workspace_path).expect("workspace unchanged"),
+            workspace_before,
+            "editing the draft must not touch the workspace file"
+        );
+
+        // What Save does: the draft becomes the document, and both files take
+        // exactly the facts they own.
+        settings = draft;
+        settings.save().expect("the commit");
+        let global = GlobalSettings::load(&global_path).expect("global after");
+        assert_eq!(global.general.lang, "zh", "the language is committed");
+        let workspace = WorkspaceSettings::load(&workspace_path).expect("workspace after");
+        assert_eq!(
+            workspace.agent.permission,
+            crate::caps::READ_ONLY,
+            "the permission the reader picked survives a language change beside it"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A workspace document with nowhere to go is reported, not dropped.
+    ///
+    /// The only copy of that configuration is the window holding it, so a silent
+    /// skip would lose it while telling the reader the save succeeded.
+    #[test]
+    fn a_save_with_no_workspace_root_reports_instead_of_dropping() {
+        let base = std::env::temp_dir().join(format!("bsh-no-root-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("scratch");
+        let mut settings = Settings {
+            save_root: Some(base.clone()),
+            ..Settings::default()
+        };
+        // Nothing is registered, so there is no root to place a document under.
+        settings.global.workspaces.clear();
+        settings.global.general.active_workspace = String::new();
+        settings.workspace.agent.permission = crate::caps::READ_ONLY.to_string();
+        let refused = settings.save();
+        assert!(
+            refused.is_err(),
+            "a workspace fact with no root is a failure, not a silent skip"
+        );
+        assert!(
+            base.join("settings.toml").exists(),
+            "the global file is still written before the refusal"
+        );
+
+        // A workspace document with nothing in it has nothing to lose, so an
+        // empty one is not a failure.
+        let mut empty = Settings {
+            save_root: Some(base.clone()),
+            ..Settings::default()
+        };
+        empty.global.workspaces.clear();
+        empty.global.general.active_workspace = String::new();
+        assert!(
+            empty.save().is_ok(),
+            "an empty workspace document has nothing to place"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -73,9 +73,17 @@ pub(crate) struct BuiltAgent {
 /// Build the agent for the active workspace.
 pub(crate) fn build_agent(settings: &Settings) -> BuiltAgent {
     let eff = settings.effective();
+    // The wire form is `<provider>/<model>`: the engine registers one vendor
+    // per provider id and resolves the prefix out of this string, so the id the
+    // Models pane shows is the id the engine dispatches on.
+    let model = if eff.provider.is_empty() {
+        eff.model.clone()
+    } else {
+        format!("{}/{}", eff.provider, eff.model)
+    };
     let mut config = AgentConfig {
         name: "bsh".to_string(),
-        model: eff.model.clone(),
+        model,
         base_url: eff.base_url.clone(),
         api_key: eff.api_key.clone(),
         system_prompt: eff.system_prompt.clone(),
@@ -87,27 +95,33 @@ pub(crate) fn build_agent(settings: &Settings) -> BuiltAgent {
         parallel_tool_calls: eff.parallel_tool_calls,
         ..AgentConfig::default()
     };
-    // The framework fills per-model defaults from the BOS config - the API
-    // protocol among them. An explicit protocol in the settings wins, because it
-    // is the choice the user just made in the pane.
-    agent::agent::config::apply_model_defaults(&mut config);
-    if !eff.api_mode.is_empty() {
-        config.api_mode = eff.api_mode.clone();
-    }
+    // BSH does not read the ambient BOS config: the settings files are the
+    // whole truth for this shell. The model's declared protocol arrives through
+    // the settings instead, so the pane and the wire agree by construction.
+    config.api_mode = eff.api_mode.clone();
+    // The hosted web-search tool. The engine still requires the Responses
+    // protocol before it offers the tool, because a chat or anthropic endpoint
+    // would reject the object; the setting decides whether the reader wants it.
+    config.web_search = eff.web_tools_enabled;
 
     let mut agent = Agent::from_config(config);
     let root = workspace_root(&eff);
-    // A preset names the tools it wants, so anything it leaves out is off; the
-    // tool-level switch still subtracts from whatever the preset allows.
-    let preset_tools = settings.active_preset().map(|preset| preset.tools.clone());
-    let off = |name: &str| {
-        if let Some(allowed) = &preset_tools {
-            if !allowed.iter().any(|tool| tool == name) {
+    // A preset names the BUNDLES it wants, not their tools: the shipped
+    // presets say `shell`, `files` and `plan`, while the bundle that carries the
+    // shell is named `shell` and its own tool `bash`. Comparing a tool name
+    // against a bundle name would switch every tool off, which is exactly the
+    // wrong-model symptom of an agent that answers with no tools at all. So the
+    // preset answers by bundle, and the tool-level switch answers by tool.
+    let preset_bundles = (!eff.preset_plugins.is_empty()).then(|| eff.preset_plugins.clone());
+    let off_bundle = |name: &str| {
+        if let Some(allowed) = &preset_bundles {
+            if !allowed.iter().any(|bundle| bundle == name) {
                 return true;
             }
         }
-        eff.disabled_tools.iter().any(|d| d == name)
+        false
     };
+    let off_tool = |name: &str| eff.disabled_tools.iter().any(|d| d == name);
     let mut bundles: Vec<plugins::Bundle> = Vec::new();
 
     // The permission mode is the reference's own trinary, and each arm lands on
@@ -123,7 +137,7 @@ pub(crate) fn build_agent(settings: &Settings) -> BuiltAgent {
     let confined = is_confined(&eff.permission);
     let writes = allows_writes(&eff.permission);
 
-    if eff.bash_enabled && writes && !off("bash") {
+    if eff.bash_enabled && writes && !off_bundle("shell") && !off_tool("bash") {
         let config = agent::tools::bash::BashToolConfig {
             workspace_root: if confined {
                 root.as_ref().map(|r| r.to_string_lossy().to_string())
@@ -136,30 +150,30 @@ pub(crate) fn build_agent(settings: &Settings) -> BuiltAgent {
         let tool: Arc<dyn agent::tools::Tool> = Arc::new(BashTool::new("bash").with_config(config));
         bundles.push(plugins::Bundle::new("shell", vec![tool]));
     }
-    if eff.file_tools_enabled {
+    if eff.file_tools_enabled && !off_bundle("files") {
         let files_root = if confined { root.clone() } else { None };
         let mut files: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
-        if !off("read_file") {
+        if !off_tool("read_file") {
             files.push(Arc::new(read_file_tool(root.clone())));
         }
-        if writes && !off("write_file") {
+        if writes && !off_tool("write_file") {
             files.push(Arc::new(write_file_tool(files_root.clone())));
         }
-        if !off("list_dir") {
+        if !off_tool("list_dir") {
             files.push(Arc::new(list_dir_tool(root.clone())));
         }
         if !files.is_empty() {
             bundles.push(plugins::Bundle::new("files", files));
         }
     }
-    if !off("update_plan") {
+    if !off_bundle("plan") && !off_tool("update_plan") {
         let tool: Arc<dyn agent::tools::Tool> = Arc::new(PlanTool::new(agent.plan()));
         bundles.push(plugins::Bundle::new("plan", vec![tool]));
     }
 
     // The registry is the source of the agent's tools: install the bundles,
     // then hand every tool they contributed to the agent.
-    let (registry, plugins) = plugins::install(bundles, &settings.disabled_plugins);
+    let (registry, plugins) = plugins::install(bundles, &settings.workspace.disabled.extentions);
     for name in registry.tool_names() {
         if let Some(tool) = registry.tool(&name) {
             agent.add_tool(tool);
@@ -394,23 +408,22 @@ fn open_memory(settings: &Settings) -> Option<Arc<dyn MemoryStore>> {
 #[cfg(test)]
 mod tests {
     use super::{allows_writes, build_agent, is_confined, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE};
+    use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::Settings;
 
-    /// The meter's tools figure is the serialized request array: nonzero for a
+    /// A bare tree, which is what a fresh install carries.
+    fn bare() -> Settings {
+        Settings::default()
+    }
+
+    /// The meter tools figure is the serialized request array: nonzero for a
     /// built-in tool set, and strictly smaller once a tool is switched off.
     #[test]
     fn the_tool_schema_length_follows_the_registered_tools() {
-        let full = Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            ..Settings::default()
-        };
-        let all = build_agent(&full).tools_schema_chars;
-        let no_bash = Settings {
-            bash_enabled: false,
-            ..full.clone()
-        };
-        let fewer = build_agent(&no_bash).tools_schema_chars;
+        let all = build_agent(&bare()).tools_schema_chars;
+        let mut settings = bare();
+        settings.workspace.agent.bash_enabled = false;
+        let fewer = build_agent(&settings).tools_schema_chars;
         assert!(all > 0, "a built agent carries tool definitions");
         assert!(
             fewer > 0 && fewer < all,
@@ -418,41 +431,59 @@ mod tests {
         );
     }
 
+    /// The web-tools switch reaches the agent config, and the hosted tool only
+    /// appears when the protocol can carry it.
+    ///
+    /// The setting is the reader's half of the decision; the engine holds the
+    /// other half, so this pins that the value arrives and that a chat-protocol
+    /// provider is not handed a hosted tool it would reject.
+    #[test]
+    fn the_web_tools_switch_reaches_the_agent() {
+        let mut settings = bare();
+        assert!(
+            settings.workspace.agent.web_tools_enabled,
+            "the shipped default offers web search"
+        );
+        assert!(
+            build_agent(&settings).agent.config().web_search,
+            "the setting reaches the agent config"
+        );
+
+        settings.workspace.agent.web_tools_enabled = false;
+        assert!(
+            !build_agent(&settings).agent.config().web_search,
+            "switching it off withdraws the tool"
+        );
+    }
+
     /// A settings selection of a provider is the endpoint the agent is built
     /// against, so what the models pane lists really reaches the agent.
     #[test]
     fn a_selected_provider_is_the_endpoint() {
-        let settings = Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            providers: vec![crate::settings::Profile {
-                name: "work".to_string(),
-                model: "work-model".to_string(),
-                base_url: "https://work.example".to_string(),
-                api_key: "work-key".to_string(),
-            }],
-            active_provider: "work".to_string(),
-            ..Settings::default()
-        };
+        let mut settings = bare();
+        settings.global.add_provider(
+            "work",
+            "Work",
+            "https://work.example",
+            "work-key",
+            &[ModelEntry::named("work-model")],
+        );
+        settings.workspace.general.provider = "work".to_string();
+        settings.workspace.general.model = "work-model".to_string();
         let built = build_agent(&settings);
         let config = built.agent.config();
-        assert_eq!(config.model, "work-model");
+        // The wire form is the prefix the engine registers a vendor on.
+        assert_eq!(config.model, "work/work-model");
         assert_eq!(config.base_url, "https://work.example");
     }
 
     /// The agent-loop switch reaches the agent config, not just the file.
     #[test]
     fn the_parallel_switch_reaches_the_agent_config() {
-        let off = Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            ..Settings::default()
-        };
+        let off = bare();
         assert!(!build_agent(&off).agent.config().parallel_tool_calls);
-        let on = Settings {
-            parallel_tool_calls: true,
-            ..off
-        };
+        let mut on = bare();
+        on.workspace.agent.parallel_tool_calls = true;
         assert!(build_agent(&on).agent.config().parallel_tool_calls);
     }
 
@@ -461,18 +492,16 @@ mod tests {
     /// label.
     #[test]
     fn the_api_protocol_reaches_the_agent_config() {
-        let settings = Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            api_mode: "responses".to_string(),
-            ..Settings::default()
-        };
+        let mut settings = bare();
+        settings
+            .global
+            .add_provider("p", "", "https://p.example", "", &[ModelEntry::named("m")]);
+        settings.workspace.general.provider = "p".to_string();
+        settings.workspace.general.model = "m".to_string();
+        settings.global.set_family_protocol("p", "responses");
         assert_eq!(build_agent(&settings).agent.config().api_mode, "responses");
-        let chat = Settings {
-            api_mode: "chat".to_string(),
-            ..settings
-        };
-        assert_eq!(build_agent(&chat).agent.config().api_mode, "chat");
+        settings.global.set_family_protocol("p", "chat");
+        assert_eq!(build_agent(&settings).agent.config().api_mode, "chat");
     }
 
     /// The Max output tokens row reaches the agent config. Two explicit values
@@ -481,40 +510,31 @@ mod tests {
     /// which leaves the provider own default in charge.
     #[test]
     fn the_output_cap_reaches_the_agent_config() {
-        let capped = Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            max_tokens: Some(4096),
-            ..Settings::default()
-        };
+        let mut capped = bare();
+        capped.workspace.agent.max_tokens = Some(4096);
         assert_eq!(build_agent(&capped).agent.config().max_tokens, Some(4096));
-        let smaller = Settings {
-            max_tokens: Some(2048),
-            ..capped
-        };
+        let mut smaller = bare();
+        smaller.workspace.agent.max_tokens = Some(2048);
         assert_eq!(build_agent(&smaller).agent.config().max_tokens, Some(2048));
     }
-    /// A selected preset narrows the tools the agent is built with and names the
-    /// endpoint, so the agent-presets pane changes the agent rather than a label.
+
+    /// A selected preset narrows the tools the agent is built with, so the
+    /// agent-presets pane changes the agent rather than a label.
     #[test]
     fn a_preset_narrows_the_tools() {
-        let narrow = Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            presets: vec![agent::plugins::presets::Preset {
-                name: "shell-only".to_string(),
-                tools: vec!["bash".to_string()],
-                model: Some("preset-model".to_string()),
-                system_prompt: None,
-                max_steps: Some(3),
-            }],
-            preset: "shell-only".to_string(),
-            ..Settings::default()
-        };
-
+        let mut narrow = bare();
+        narrow.global.presets.insert(
+            "shell-only".to_string(),
+            Preset {
+                name: Some("shell-only".to_string()),
+                plugins: vec!["shell".to_string()],
+                description: None,
+                order: None,
+            },
+        );
+        narrow.global.default_preset = "shell-only".to_string();
         let built = build_agent(&narrow);
-        assert_eq!(built.agent.config().model, "preset-model");
-        assert_eq!(built.agent.config().max_steps, 3);
+        assert_eq!(built.agent.config().max_steps, 10);
         let mut carrying: Vec<String> = built
             .plugins
             .iter()
@@ -535,17 +555,13 @@ mod tests {
         assert!(shell.tools.iter().any(|tool| tool == "bash"));
     }
 
-    /// The registry is the source of the agent's tools, and a disabled tool is
+    /// The registry is the source of the agent tools, and a disabled tool is
     /// filtered out before its bundle is installed.
     #[test]
     fn plugins_carry_the_filtered_tools() {
-        let settings = Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            disabled_tools: vec!["read_file".to_string()],
-            max_steps: 17,
-            ..Settings::default()
-        };
+        let mut settings = bare();
+        settings.workspace.disabled.tools = vec!["read_file".to_string()];
+        settings.workspace.agent.max_steps = 17;
         let built = build_agent(&settings);
         let names = |plugin: &str| {
             let mut tools = built
@@ -575,22 +591,15 @@ mod tests {
     /// filter cannot pass by dropping every tool.
     #[test]
     fn a_disabled_plugin_contributes_no_tools() {
-        let on = build_agent(&Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            ..Settings::default()
-        });
+        let on = build_agent(&bare());
         assert!(on
             .plugins
             .iter()
             .any(|plugin| plugin.enabled && plugin.tools.iter().any(|tool| tool == "bash")));
 
-        let off = build_agent(&Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            disabled_plugins: vec!["shell".to_string()],
-            ..Settings::default()
-        });
+        let mut off_tree = bare();
+        off_tree.workspace.disabled.extentions = vec!["shell".to_string()];
+        let off = build_agent(&off_tree);
         let shell = off
             .plugins
             .iter()
@@ -604,19 +613,13 @@ mod tests {
     }
 
     /// Read Only is not a label: the side-effecting tools never reach the
-    /// request, so the registry is smaller than the confined build's and holds
+    /// request, so the registry is smaller than the confined build and holds
     /// neither the shell nor the file writer.
     #[test]
     fn read_only_withholds_the_side_effecting_tools() {
-        let confined = Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            ..Settings::default()
-        };
-        let read_only = Settings {
-            permission: READ_ONLY.to_string(),
-            ..confined.clone()
-        };
+        let confined = bare();
+        let mut read_only = bare();
+        read_only.workspace.agent.permission = READ_ONLY.to_string();
 
         let names = |settings: &Settings| {
             let built = build_agent(settings);
@@ -650,9 +653,9 @@ mod tests {
         );
     }
 
-    /// Full access is the mode that releases the confinement, and the shell's
-    /// own config is where it lands: `workspace_root: None` is what leaves
-    /// `BashTool`'s validator unset and drops its two guards.
+    /// Full access is the mode that releases the confinement, and the shell
+    /// own config is where it lands: an unset workspace root is what leaves
+    /// the shell tool validator unset and drops its two guards.
     #[test]
     fn full_access_releases_the_workspace_confinement() {
         assert!(is_confined(WORKSPACE_WRITE));
@@ -670,12 +673,8 @@ mod tests {
     /// A zero step ceiling cannot run a loop, so it is floored at one.
     #[test]
     fn a_zero_step_ceiling_is_floored() {
-        let settings = Settings {
-            skills_dir: String::new(),
-            memory_enabled: false,
-            max_steps: 0,
-            ..Settings::default()
-        };
+        let mut settings = bare();
+        settings.workspace.agent.max_steps = 0;
         assert_eq!(build_agent(&settings).agent.config().max_steps, 1);
     }
 }
