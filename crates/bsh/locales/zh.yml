@@ -497,3 +497,4 @@
 "right.files.opaque": "此文件无法在此处编辑。"
 "right.files.notePlaceholder": "为此文件添加批注"
 "right.files.noteAdd": "添加批注"
+"right.terminal.placeholder": "输入命令"

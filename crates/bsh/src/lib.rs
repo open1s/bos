@@ -21,6 +21,7 @@ pub(crate) mod runner;
 pub(crate) mod settings;
 pub(crate) mod state;
 pub(crate) mod store;
+pub(crate) mod terminal;
 pub(crate) mod theme;
 pub(crate) mod ui;
 

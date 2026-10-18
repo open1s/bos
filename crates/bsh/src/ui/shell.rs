@@ -156,6 +156,9 @@ pub(crate) struct Shell {
     pub(crate) right: super::right_panel::RightPanel,
     /// The workspace browser's place in the tree.
     pub(crate) files: super::right_panel::FilesPane,
+    /// The terminal's command line. Enter gates the command through regorus
+    /// before it is echoed and (once the PTY is wired) run.
+    pub(crate) terminal_input: Entity<InputState>,
     /// The viewport width as of the last frame, which is what the reference's
     /// sidebar auto-collapse measures.
     pub(crate) viewport_w: f32,
@@ -306,6 +309,14 @@ impl Shell {
                 .auto_grow(1, crate::theme::QUEUE_EDITOR_MAX_ROWS)
                 .submit_on_enter(true)
         });
+        let terminal_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.terminal.placeholder"))
+        });
+        let files_note = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "right.files.notePlaceholder"))
+        });
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "side.search"))
         });
@@ -361,6 +372,19 @@ impl Shell {
                     InputEvent::Change => cx.notify(),
                     InputEvent::PressEnter { shift: false, .. } => this.save_queue_edit(cx),
                     _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &terminal_input,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                        this.run_terminal_command(window, cx);
+                    }
                 },
             ),
             cx.subscribe_in(
@@ -426,10 +450,6 @@ impl Shell {
             InputState::new(window, cx)
                 .placeholder(crate::i18n::tr(state.lang, "right.files.renamePlaceholder"))
         });
-        let files_note = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(crate::i18n::tr(state.lang, "right.files.notePlaceholder"))
-        });
         let mut shell = Self {
             state,
             composer,
@@ -489,6 +509,7 @@ impl Shell {
             sidebar_drag: None,
             right: super::right_panel::RightPanel::default(),
             files: super::right_panel::FilesPane::new(files_new, files_rename, files_note),
+            terminal_input,
             models_fetched: None,
             models_fetch_failed: false,
             models_fetch_needs_base_url: false,

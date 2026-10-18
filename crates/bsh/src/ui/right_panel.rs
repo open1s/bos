@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::Focusable;
 use gpui_kit::*;
 
 use super::shell::{Shell, SideDrag};
@@ -104,6 +105,8 @@ pub(crate) struct RightPanel {
     pub(crate) user_w: Option<f32>,
     /// The resize in flight, if any.
     pub(crate) drag: Option<SideDrag>,
+    /// The managed terminal, spawned when the Terminal tab is first opened.
+    pub(crate) terminal: Option<crate::terminal::Terminal>,
 }
 
 /// The workspace browser's place in the tree, and the files open beside it.
@@ -491,7 +494,8 @@ impl Shell {
         match self.right.tab {
             None => body.child(self.right_start(cx)),
             Some(RightTab::Files) => body.child(self.files_pane(cx)),
-            Some(RightTab::Terminal) | Some(RightTab::Browser) => {
+            Some(RightTab::Terminal) => body.child(self.terminal_pane(cx)),
+            Some(RightTab::Browser) => {
                 body.child(self.right_pane_placeholder(self.right.tab.expect("Some arm")))
             }
         }
@@ -519,6 +523,85 @@ impl Shell {
                 txt(lang.tr("right.notBuilt"), theme::CHIP_SIZE, theme::faint())
                     .text_align(TextAlign::Center),
             )
+    }
+
+    /// The managed terminal's surface: the scrollback, the input line, and the
+    /// gate that decides whether a command runs.
+    ///
+    /// The terminal is focusable and captures keystrokes the way a shell does:
+    /// printable characters go to the input line, Backspace deletes, and
+    /// Enter gates the command through regorus before it reaches the shell.
+    /// Until the PTY is wired the accepted command is echoed to the screen,
+    /// which is enough to prove the gate end to end.
+    fn terminal_pane(&self, _cx: &mut Context<Self>) -> AnyElement {
+        let Some(terminal) = self.right.terminal.as_ref() else {
+            return self
+                .right_pane_placeholder(RightTab::Terminal)
+                .into_any_element();
+        };
+        let screen = terminal.screen.clone();
+        let cwd = terminal.cwd.clone();
+        // The screen is a scrollback of lines plus the input line; the pane
+        // renders both and captures keystrokes into the input.
+        div()
+            .debug_selector(|| String::from("terminal-pane"))
+            .id("terminal-pane")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .px(px(theme::RIGHT_PAD))
+            .py(px(8.0))
+            .cursor_text()
+            .child(
+                // The scrollback: every line the screen holds, in order.
+                div()
+                    .debug_selector(|| String::from("terminal-scroll"))
+                    .id("terminal-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .children(screen.lines.iter().map(|line| {
+                        div()
+                            .debug_selector(|| format!("terminal-line-{}", line))
+                            .w_full()
+                            .child(txt(line, theme::BODY_SIZE, theme::text()))
+                    })),
+            )
+            .child(
+                // The command line: the prompt and the field the reader types
+                // into. Enter is handled by the input's own subscription.
+                div()
+                    .debug_selector(|| String::from("terminal-input"))
+                    .id("terminal-input")
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        txt(
+                            format!("{} $ ", cwd.display()),
+                            theme::BODY_SIZE,
+                            theme::faint(),
+                        )
+                        .font_weight(FontWeight::BOLD),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.terminal_input)
+                                .appearance(false)
+                                .h(px(24.0)),
+                        ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The Start screen: the panel's headline over its three cards.
@@ -1514,6 +1597,43 @@ impl Shell {
         if tab == RightTab::Files && self.files.roots.is_empty() && self.files.tabs.is_empty() {
             self.refresh_files(cx);
         }
+        if tab == RightTab::Terminal && self.right.terminal.is_none() {
+            let cwd = self.state.workspace_root().unwrap_or_default();
+            self.right.terminal = Some(crate::terminal::Terminal::new(cwd));
+        }
+        cx.notify();
+    }
+
+    /// Run the terminal command the reader typed.
+    ///
+    /// The command passes the regorus gate first: an allowed command is echoed
+    /// to the screen as `cwd $ command` (the PTY will produce its own output
+    /// once wired), and a refused one is refused in place, so the reader sees
+    /// exactly what the policy did with their line.
+    pub(crate) fn run_terminal_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let command = self
+            .terminal_input
+            .read(cx)
+            .value()
+            .to_string()
+            .trim()
+            .to_string();
+        if command.is_empty() {
+            return;
+        }
+        let Some(terminal) = self.right.terminal.as_mut() else {
+            return;
+        };
+        let cwd = terminal.cwd.clone();
+        let allowed = terminal.allows(&command);
+        let screen = &mut terminal.screen;
+        screen.push_line(format!("{} $ {}", cwd.display(), command));
+        if !allowed {
+            screen.push_line(String::from("refused by policy"));
+        }
+        self.terminal_input.update(cx, |state, cx| {
+            state.set_value(String::new(), window, cx);
+        });
         cx.notify();
     }
 

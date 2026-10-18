@@ -37,6 +37,9 @@ uuid = { workspace = true }
 shellexpand = { workspace = true }
 rust-i18n = "4.2.4"
 dirs = "7.0.0"
+portable-pty = { workspace = true }
+regorus = { workspace = true }
+vte = { workspace = true }
 
 [dev-dependencies]
 # The same package the kit aliases as gpui, with GPUI test hooks enabled: the

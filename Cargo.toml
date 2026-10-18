@@ -40,6 +40,9 @@ notify = "8"
 async-channel = "2.5"
 shellexpand = "3.1"
 bus = { path = "crates/bus" }
+portable-pty = "0.8"
+regorus = "0.11"
+vte = "0.13"
 
 [workspace.package]
 version = "3.0.2"

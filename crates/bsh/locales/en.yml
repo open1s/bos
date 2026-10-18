@@ -500,3 +500,4 @@
 "right.files.opaque": "This file cannot be edited here."
 "right.files.notePlaceholder": "Add a note to this file"
 "right.files.noteAdd": "Add note"
+"right.terminal.placeholder": "Type a command"

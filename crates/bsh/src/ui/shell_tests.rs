@@ -6624,3 +6624,145 @@ fn a_note_pins_to_the_file_and_survives_a_reload(cx: &mut TestAppContext) {
     .expect("the note is written to the workspace's sidecar");
     assert!(sidecar.contains("remember to mention the bus"));
 }
+
+/// The terminal pane opens with a screen and a command line, and a command
+/// the gate allows is echoed to the screen the way a shell would show it.
+#[gpui::test]
+fn the_terminal_pane_echoes_a_gated_command(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-terminal");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // Opening the Terminal tab spawns the terminal and shows its surface.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("terminal-pane").is_some(),
+        "the terminal surface renders"
+    );
+    assert!(
+        cx.debug_bounds("terminal-input").is_some(),
+        "and the command line renders"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.terminal.is_some()),
+        "opening the tab spawns the terminal"
+    );
+
+    // Type a command and press Enter. The default gate allows everything, so
+    // the command is echoed to the screen as `cwd $ command`.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.terminal_input.update(cx, |input, cx| {
+                input.set_value("ls -la", window, cx);
+            });
+            this.run_terminal_command(window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let lines = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.screen.lines.clone())
+            .unwrap_or_default()
+    });
+    assert!(
+        lines.iter().any(|line| line.ends_with("$ ls -la")),
+        "the allowed command is echoed to the screen: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("refused")),
+        "and the gate does not refuse it"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).terminal_input.read(cx).value().to_string()),
+        "",
+        "and the command line clears after Enter"
+    );
+}
+
+/// A command the gate refuses is shown as refused, not echoed as run.
+#[gpui::test]
+fn the_terminal_pane_shows_a_refused_command(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-terminal-deny");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Terminal, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A denied input flips the gate, which is how a policy says no. The
+    // engine holds the policy; the test drives the input the policy reads.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.terminal_input.update(cx, |input, cx| {
+                input.set_value("rm -rf /", window, cx);
+            });
+        });
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            let Some(terminal) = this.right.terminal.as_mut() else {
+                return;
+            };
+            let policy = r#"
+                package terminal
+
+                allow := false if {
+                    input.command != "ls"
+                }
+            "#;
+            terminal
+                .gate
+                .load_policy("deny.rego", policy)
+                .expect("the deny policy is valid Rego");
+        });
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.run_terminal_command(window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let lines = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.screen.lines.clone())
+            .unwrap_or_default()
+    });
+    assert!(
+        lines.iter().any(|line| line.ends_with("$ rm -rf /")),
+        "the refused command is still echoed: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("refused by policy")),
+        "and the refusal is on the screen"
+    );
+}
