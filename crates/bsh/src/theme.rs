@@ -290,9 +290,6 @@ pub(crate) const METER_STROKE: f32 = 2.0;
 pub(crate) const METER_PAD_X: f32 = 8.0;
 pub(crate) const METER_PAD_Y: f32 = 1.0;
 pub(crate) const METER_GAP: f32 = 6.0;
-/// The trigger sits 4px under the composer card, which is what the reference's
-/// `dock` adds before the meter's own row.
-pub(crate) const METER_TOP_GAP: f32 = 4.0;
 pub(crate) const METER_PANEL_W: f32 = 264.0;
 pub(crate) const METER_PANEL_PAD: f32 = 12.0;
 pub(crate) const METER_PANEL_GAP: f32 = 8.0;
@@ -326,8 +323,33 @@ pub(crate) const HERO_HEADLINE_LINE: f32 = 32.0;
 pub(crate) const HERO_HEADLINE_GAP: f32 = 10.0;
 /// The title group's gap.
 pub(crate) const HERO_TITLE_GAP: f32 = 7.0;
-/// The brand mark's width.
-pub(crate) const HERO_MARK: f32 = 34.0;
+/// The status-dot column every session row leads with.
+///
+/// The live rows put their streaming dot here and archived rows a same-width
+/// spacer, so both kinds start their title at the same x. A row that skipped the
+/// column (the archived list did) reads as a different rank of thing, which is
+/// not what "archived" means - it is the same session, put away.
+pub(crate) const TREE_ROW_LEAD: f32 = 6.0;
+
+/// The gap the workspace tree keeps below its last row.
+///
+/// A scroller whose content ends exactly on the pinned floor's divider renders the
+/// last row FLUSH against that line, which reads as the row being sliced by the
+/// pinned element. The reference leaves the list a little air at the bottom; this
+/// is that air.
+pub(crate) const TREE_BOTTOM_INSET: f32 = 32.0;
+
+/// The brand mark's BOX: the row height the reference measures (32).
+///
+/// The mantis-shrimp emblem is square and carries its own padding, so drawing it
+/// at 32 left it looking smaller than the reference's wide fish glyph. The box
+/// keeps the measured row and the emblem is drawn larger inside it, centred - a
+/// child that overflows its box adds no layout height, which is what lets the
+/// artwork take the optical size without moving the headline.
+pub(crate) const HERO_MARK: f32 = 32.0;
+
+/// The size the emblem itself is drawn at inside [`HERO_MARK`].
+pub(crate) const HERO_MARK_DRAWN: f32 = 40.0;
 /// The preview badge's size.
 pub(crate) const HERO_BADGE_SIZE: f32 = 12.0;
 /// The preview badge's line height.
@@ -658,29 +680,82 @@ pub(crate) const FILES_HEADER_H: f32 = 38.0;
 /// Measured: the column is `clamp(680px, conversation-column * 0.64, 920px)`
 /// where the conversation column is the viewport less the sidebar; 680 is its
 /// floor, the width bsh draws before a frame has been measured. The live width
+/// How far a step row sits in from the message it belongs to, and how tall its
+/// expanded body may get before it clips.
+///
+/// The trace nests: a message's steps hang off a rail one step in, and their
+/// bodies hang one more. 18 is that step at the secondary size.
+/// How close to the transcript's top a reader gets before the window above it
+/// is paged in. A screen's worth of distance, so the rows are there before the
+/// eye arrives.
+/// Windows of messages a paged session keeps resident.
+///
+/// Four is a screen or two in each direction around the reader: enough that
+/// scrolling back finds what they just passed, far short of a whole chat.
+pub(crate) const WINDOWS_KEPT: usize = 4;
+
+pub(crate) const PAGE_TRIGGER: f32 = 400.0;
+
+pub(crate) const TOOL_INDENT: f32 = 18.0;
+/// The ceiling on an expanded step body, so one long output cannot own the
+/// transcript.
+pub(crate) const TOOL_BODY_MAX: f32 = 220.0;
+
 /// is `chat_width_at`.
 pub(crate) const CHAT_W: f32 = 680.0;
-/// The cap of that clamp, measured 920px.
-pub(crate) const CHAT_MAX_W: f32 = 920.0;
-/// The conversation column's measured share of the chat width, `.64`.
-pub(crate) const CHAT_SHARE: f32 = 0.64;
+/// The empty band the column keeps on each side of the transcript.
+///
+/// The reference has no such constant - its clamp leaves whatever .64 and a
+/// 920 cap imply, which on a wide window is a quarter of the page each side.
+/// A fixed 32 per side is what a reader needs to see that the transcript
+/// ENDS, and the drag handles still move the edge.
+pub(crate) const CHAT_GUTTER: f32 = 32.0;
+/// The conversation column's share of the chat width.
+///
+/// The reference takes .64; .9 gives the transcript nearly the whole column,
+/// because the empty band either side was the first thing a wide window
+/// showed and it read as a layout fault rather than as whitespace.
+pub(crate) const CHAT_SHARE: f32 = 0.9;
 
-/// The reference's own chat content width, straight from its sheet:
-/// `--dsh-chat-content-width: var(--dsh-chat-user-width, clamp(680px,
-/// calc(var(--dsh-conversation-column-width, 0px) * .64), 920px))`, with the
-/// composer card at `calc(that + 32px)` ([COMPOSER_WIDEN]). A column that has
-/// not been measured yet is zero, which lands on the floor - the width bsh drew
-/// before this was live.
+/// How much of the left band the transcript keeps, measured against the band
+/// the right side still holds.
+///
+/// The chat is not centred any more: the right edge stays where the turn rail
+/// and the composer expect it, and the left edge moves out to 40% of the band,
+/// because the empty strip beside the text was the widest thing on a wide
+/// window and only the LEFT side can give without moving the composer.
+pub(crate) const CHAT_LEFT_SHARE: f32 = 0.4;
+
+/// The left inset the transcript keeps for a column and a chat width.
+pub(crate) fn chat_left_inset(column: f32, chat: f32) -> f32 {
+    // Rounded to a whole pixel: the handle parks 24 outside this edge, and a
+    // fractional inset painted as a snapped pad put the strip 1.2px off it.
+    (((column - chat) / 2.0).max(0.0) * CHAT_LEFT_SHARE).round()
+}
+
+/// How far the token readout sits left of centre, as a share of the half-width
+/// of the column it lives in.
 pub(crate) fn chat_width_at(conversation_w: f32) -> f32 {
-    (conversation_w * CHAT_SHARE).clamp(CHAT_W, CHAT_MAX_W)
+    // The share fills the column; the gutter is the only ceiling, so a wide
+    // window cannot leave the bands the reference clamp leaves.
+    let ceiling = (conversation_w - 2.0 * CHAT_GUTTER).max(CHAT_W);
+    let ideal = (conversation_w * CHAT_SHARE).clamp(CHAT_W, ceiling);
+    // A column of zero is not a narrow column, it is a frame that has not been
+    // measured yet, and that keeps the floor it has always had.
+    if conversation_w <= 0.0 {
+        return ideal;
+    }
+    // Otherwise the floor exists so the chat is READABLE, not so it overflows
+    // the column it sits in. An open right panel takes a laptop's column below
+    // 680, and the floor then hung the composer and the hero over the panel's
+    // edge - clipped, half their text unreadable. The composer card is this
+    // width plus the measured widen, so the cap leaves that much room.
+    ideal.min((conversation_w - COMPOSER_WIDEN).max(0.0))
 }
 
 /// The floor a DRAGGED content width takes, measured 640. The clamp's own floor
 /// is 680, so a drag may pull the column 40px narrower than the default.
 pub(crate) const CONTENT_MIN_DRAG: f32 = 640.0;
-/// The room the reference reserves at each edge for the width handles and
-/// their safe zones, measured 176: a dragged width never exceeds column - 176.
-pub(crate) const CONTENT_EDGE_BUDGET: f32 = 176.0;
 /// The width handle's own box, measured min(10px, (column - content) / 2 - 48).
 pub(crate) const HANDLE_STRIP_W: f32 = 10.0;
 /// The measured clearance between the content column's edge and its handle.
@@ -693,7 +768,11 @@ pub(crate) const HANDLE_OFFSET: f32 = 24.0;
 /// preference wins over the clamp, and with none the column is
 /// [chat_width_at].
 pub(crate) fn resolve_content_width(column: f32, preference: Option<f32>) -> f32 {
-    let max = (column - CONTENT_EDGE_BUDGET).max(CONTENT_MIN_DRAG);
+    // The drag tops out at the same gutter the default width keeps, so the two
+    // rules cannot disagree: a default that the drag bound would then shorten
+    // made the first pointer move pull the column IN, which is what a 176 budget
+    // beside a .9 share did.
+    let max = (column - 2.0 * CHAT_GUTTER).max(CONTENT_MIN_DRAG);
     match preference {
         Some(preference) => preference.clamp(CONTENT_MIN_DRAG, max),
         None => chat_width_at(column),
@@ -718,6 +797,20 @@ pub(crate) fn scrollbar_bar() -> u32 {
     }
 }
 
+/// The wash behind an added line of a step's patch.
+///
+/// A diff tint has to stay legible over the page in both palettes, so it is the
+/// success tone at low alpha rather than a hard fill.
+pub(crate) fn diff_add() -> u32 {
+    let rgb = success() & 0x00FF_FFFF;
+    (rgb << 8) | 0x24
+}
+
+/// The wash behind a removed line of a step's patch.
+pub(crate) fn diff_del() -> u32 {
+    let rgb = error() & 0x00FF_FFFF;
+    (rgb << 8) | 0x24
+}
 /// The measured bar: a 2px column, 72 tall, whose solid 16px band sits
 /// between two 28px fades - the reference's transparent calc(y - 36px) ->
 /// scrollbar-bg-l1 calc(y - 8px) -> scrollbar-bg-l1 calc(y + 8px) ->
@@ -730,6 +823,14 @@ pub(crate) const HANDLE_BAR_BAND: f32 = 16.0;
 pub(crate) const ROW_H: f32 = 44.0;
 /// The transcript side inset.
 pub(crate) const INSET: f32 = 64.0;
+
+/// The code face.
+///
+/// Measured from the reference's own stack (`toolCallNameTypeface`):
+/// `Menlo, Consolas, Liberation Mono, PingFang SC, Microsoft YaHei`, exposed as
+/// `--ds-font-family-code`. A tool call and its result are written in it, the
+/// way the reference renders those rows.
+pub(crate) const CODE_FONT: &str = "Menlo";
 /// Copy the active kit theme into the token accessors.
 pub(crate) fn sync(cx: &App) {
     let t = cx.theme();

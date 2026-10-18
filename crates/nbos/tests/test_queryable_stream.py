@@ -80,3 +80,63 @@ class TestQueryableStream:
         assert collected[0] == "step:0"
         assert collected[1] == "step:1"
         assert collected[2] == "step:2"
+
+    @pytest.mark.asyncio
+    async def test_stream_overflow_reports_the_buffer_limit(self):
+        """A handler that overfills the reply buffer must not deadlock.
+
+        The bus buffers 32 replies and drains them only after the handler
+        returns, so blocking on capacity (the old behaviour) parked the Tokio
+        worker while holding the GIL and hung the whole interpreter.
+        """
+        overflow_errors: list[str] = []
+
+        def flooding_handler(text: str, sender: StreamSender):
+            for i in range(40):
+                try:
+                    sender.send(f"step:{i}")
+                except RuntimeError as exc:
+                    overflow_errors.append(str(exc))
+                    return
+
+        bus = await Bus.create(BusConfig())
+        queryable = await Queryable.create(bus, "test/stream-overflow")
+        await queryable.run_stream(flooding_handler)
+
+        await asyncio.sleep(0.1)
+
+        query = await Query.create(bus, "test/stream-overflow")
+        stream_iter = await query.stream_text("go")
+
+        async def drain() -> list[str]:
+            return [chunk async for chunk in stream_iter]
+
+        collected = await asyncio.wait_for(drain(), timeout=10)
+
+        assert len(overflow_errors) == 1, overflow_errors
+        assert "stream reply buffer is full" in overflow_errors[0]
+        assert 0 < len(collected) <= 32
+
+    @pytest.mark.asyncio
+    async def test_stream_handler_exception_reaches_the_caller(self):
+        """An exception raised by the handler must surface, not truncate silently."""
+        def failing_handler(text: str, sender: StreamSender):
+            raise ValueError("handler exploded")
+
+        bus = await Bus.create(BusConfig())
+        queryable = await Queryable.create(bus, "test/stream-failing")
+        await queryable.run_stream(failing_handler)
+
+        await asyncio.sleep(0.1)
+
+        query = await Query.create(bus, "test/stream-failing")
+        stream_iter = await query.stream_text("boom")
+
+        async def drain() -> list[str]:
+            return [chunk async for chunk in stream_iter]
+
+        # The failure must reach the caller instead of ending the stream with
+        # no replies. The bus reports it as a generic reply error, so only the
+        # exception type is asserted here.
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(drain(), timeout=10)

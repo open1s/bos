@@ -423,3 +423,34 @@ async fn chat_hosted_tools_serialized_as_function_tools() {
     assert_eq!(fn_tool["function"]["name"], json!("web_search"));
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn chat_stream_preserves_a_split_multibyte_character() {
+    let payload = format!("data: {}\n\ndata: [DONE]\n\n", chat_chunk("你好"));
+    let bytes = payload.into_bytes();
+    let char_start = bytes
+        .windows("你".len())
+        .position(|window| window == "你".as_bytes())
+        .expect("the payload contains the character");
+    // Split one byte into the three-byte character, the way a transport chunk
+    // boundary can fall.
+    let split = char_start + 1;
+    let chunks = vec![bytes[..split].to_vec(), bytes[split..].to_vec()];
+
+    let server =
+        MockLlmServer::start(move |_req: &CapturedRequest| MockReply::RawChunks(chunks.clone()))
+            .await;
+    let vendor = OpenAiVendor::new(server.url(), "gpt-4".into(), "sk-mock".into());
+
+    let mut session = LlmSession::new();
+    session.push(LlmMessage::user("hello"));
+    let mut context = LlmContext::default();
+    let stream = vendor
+        .stream_complete(None, LlmRequest::new("gpt-4"), &mut session, &mut context)
+        .await
+        .expect("chat stream");
+
+    let tokens = collect_tokens(stream).await;
+    assert_text_then_done(&tokens, &["你好"], false);
+    server.shutdown().await;
+}

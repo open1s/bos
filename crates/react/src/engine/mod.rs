@@ -604,6 +604,7 @@ skill_dir: {}
         let stream = stream! {
             let mut loaded_skills: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
             let mut request = request;
+            let mut steps = 0usize;
 
             context.add_tool(load_skill_tool());
 
@@ -612,6 +613,16 @@ skill_dir: {}
                     yield Err(ReactError::HookAbort("Execution stopped by user".to_string()));
                     break;
                 }
+
+                // The streaming loop drives the same ReAct steps as
+                // `react_loop`, so it must honour the same `max_steps` bound.
+                // Without it a model that keeps requesting tools would grow
+                // the session without limit.
+                if steps >= self.max_steps {
+                    yield Ok(StreamToken::Done);
+                    break;
+                }
+                steps += 1;
 
                 match self.react_app
                     .before_llm_call(&mut request, session, context)
@@ -811,16 +822,11 @@ skill_dir: {}
         self.token_counter.usage()
     }
 
-    /// Lifetime prompt and completion totals across every LLM call this
-    /// engine has made.
-    ///
-    /// Unlike [`ReActEngine::token_usage`], these accumulate across runs
-    /// that share a cached engine; take a difference between snapshots for
-    /// a per-run value.
     /// Lifetime count of prompt tokens the provider served from its cache.
     ///
-    /// Take a difference between snapshots for a per-run value, the way
-    /// cumulative_token_usage is used.
+    /// Zero for a provider that never reports the cache breakdown. Take a
+    /// difference between snapshots for a per-run value, the way
+    /// [`ReActEngine::cumulative_token_usage`] is used.
     pub fn cumulative_cached_tokens(&self) -> u64 {
         self.token_counter.lifetime_cached_tokens()
     }

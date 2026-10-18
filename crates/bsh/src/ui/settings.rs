@@ -12,15 +12,16 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::shell::{ModelRowEditor, ModelsAddRoute, Shell};
-use super::{hairline_all, hairline_bottom, icon, txt, DivExt, IconName};
+use super::{hairline_all, hairline_bottom, hairline_top, icon, txt, DivExt, IconName};
 use crate::i18n::{tr, tr_args, Lang};
 use crate::settings::Settings;
 use crate::theme;
 
 /// The rail, in display order; the index is the section number narrowest the
 /// state stores. Public within the crate so the command line can deep-link.
-pub(crate) const SECTIONS: [&str; 14] = [
+pub(crate) const SECTIONS: [&str; 15] = [
     "settings.account",
+    "settings.vault",
     "settings.general",
     "settings.models",
     "settings.tools",
@@ -36,29 +37,21 @@ pub(crate) const SECTIONS: [&str; 14] = [
     "settings.automation",
 ];
 
-/// The rail's cells, measured from the reference.
+/// The rail's cells: the reference's five, plus the Vault.
 ///
 /// DSH registers five `settings.section`s and sorts them by `order`: account
 /// (-10), general (0), models (10), plugins (15, "Built-in plugins") and
-/// agent-presets (20). Everything else this crate's `SECTIONS` carries is a
-/// card, a tab or a sidebar panel in the reference, so it is not a rail cell
-/// here either. See `docs/ui-mirror/reference/dsh-settings-rail.md`.
-pub(crate) const NAV: [&str; 5] = ["account", "general", "models", "plugins", "agent-presets"];
-
-/// The panes the Built-in plugins section hosts, in the reference's own order:
-/// the inventory tab first (`settings.plugins.tab`, order 10), then the plugin
-/// packages' cards (Shell 10, Agent loop 20), then the panes DSH reaches from
-/// its sidebar rather than from a settings cell.
-pub(crate) const VIEWS: [&str; 9] = [
-    "plugin-inventory",
-    "shell",
-    "agent-loop",
-    "tools",
-    "mcp",
-    "archived-sessions",
-    "workspaces",
-    "context",
-    "automation",
+/// agent-presets (20). The Vault is a BSH addition and sits after Account, the
+/// surface it is administered from. Everything else this crate's `SECTIONS`
+/// carries is a card, a tab or a sidebar panel in the reference, so it is not a
+/// rail cell here either. See `docs/ui-mirror/reference/dsh-settings-rail.md`.
+pub(crate) const NAV: [&str; 6] = [
+    "account",
+    "vault",
+    "general",
+    "models",
+    "plugins",
+    "agent-presets",
 ];
 
 /// Resolve a section id (the part after `settings.`) to its rail index.
@@ -180,6 +173,51 @@ impl SettingsInputs {
     }
 }
 
+/// The Vault pane's text fields.
+///
+/// The passphrase and the entry value are masked; the confirm field exists so a
+/// create is typed twice, because a vault sealed under a typo has no recovery.
+pub(crate) struct VaultInputs {
+    /// The admin passphrase, masked.
+    pub(crate) passphrase: Entity<InputState>,
+    /// The second copy a create asks for, masked.
+    pub(crate) confirm: Entity<InputState>,
+    /// The name of the entry being added.
+    pub(crate) name: Entity<InputState>,
+    /// The value of the entry being added, masked.
+    pub(crate) value: Entity<InputState>,
+}
+
+impl VaultInputs {
+    /// Build the fields, with the pane's own placeholders.
+    pub(crate) fn new(window: &mut Window, lang: Lang, cx: &mut Context<Shell>) -> Self {
+        let passphrase = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder(tr(lang, "settings.vaultPassphrasePlaceholder"))
+        });
+        let confirm = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder(tr(lang, "settings.vaultConfirmPlaceholder"))
+        });
+        let name = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(tr(lang, "settings.vaultNamePlaceholder"))
+        });
+        let value = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder(tr(lang, "settings.vaultValuePlaceholder"))
+        });
+        Self {
+            passphrase,
+            confirm,
+            name,
+            value,
+        }
+    }
+}
+
 /// The name a provider is shown under: the name the tree carries, else the
 /// shipped family's own name, else its id.
 ///
@@ -194,6 +232,17 @@ pub(crate) fn provider_label(id: &str, name: Option<&str>) -> String {
     crate::settings::global::built_in(id)
         .map(|(label, _, _)| label.to_string())
         .unwrap_or_else(|| id.to_string())
+}
+
+/// The label of the provider's API-key source control.
+///
+/// A chosen entry names itself, so the row states where the credential comes
+/// from; with no choice the control is the affordance that opens the vault.
+pub(crate) fn vault_source_label(lang: Lang, entry: Option<&str>) -> String {
+    match entry.map(str::trim).filter(|entry| !entry.is_empty()) {
+        Some(entry) => tr_args(lang, "settings.vaultSource", &[("name", entry.to_string())]),
+        None => tr(lang, "settings.vaultChoose"),
+    }
 }
 
 /// Load a provider into the open editor: the tree carries the values, and the
@@ -218,7 +267,6 @@ pub(crate) fn load_provider_into_form(
     set_value(&shell.add_route, id.to_string(), window, cx);
     set_value(&shell.add_display, label, window, cx);
     set_value(&shell.add_base_url, provider.base_url.clone(), window, cx);
-    set_value(&shell.add_key, provider.api_key.clone(), window, cx);
     // One editor per leaf, so the reference's per-row inputs are per-row
     // engines rather than one shared field that collapses every row into one.
     shell.model_rows = provider
@@ -525,7 +573,14 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if self.caps.is_empty() {
-            let built = crate::caps::build_agent(self.state.draft());
+            // The dialog previews the WORKSPACE configuration it is editing, so
+            // it resolves without a session choice: the pane's job is to show
+            // what the draft would build for a session that inherits.
+            let built = crate::caps::build_agent(
+                self.state.draft(),
+                &self.state.vault,
+                &crate::settings::resolve::SessionChoice::default(),
+            );
             self.caps = crate::caps::capabilities(&built.agent);
             self.plugins = built.plugins;
             // The dialog's build already knows the tool array, so the meter's
@@ -594,18 +649,19 @@ impl Shell {
 
         let (title, hint, content) = match section {
             0 => self.section_account(),
-            1 => self.section_general(cx),
-            2 => self.section_models(cx),
-            3 => self.section_tools(cx),
-            4 => self.section_plugins(cx),
-            5 => self.section_shell(cx),
-            6 => self.section_agent_loop(cx),
-            7 => self.section_mcp(),
-            8 => self.section_archived(cx),
-            9 => self.section_workspaces(cx),
-            10 => self.section_context(cx),
-            11 => self.section_agent_presets(cx),
-            12 => self.section_builtin_plugins(cx),
+            1 => self.section_vault(cx),
+            2 => self.section_general(cx),
+            3 => self.section_models(cx),
+            4 => self.section_tools(cx),
+            5 => self.section_plugins(cx),
+            6 => self.section_shell(cx),
+            7 => self.section_agent_loop(cx),
+            8 => self.section_mcp(),
+            9 => self.section_archived(cx),
+            10 => self.section_workspaces(cx),
+            11 => self.section_context(cx),
+            12 => self.section_agent_presets(cx),
+            13 => self.section_builtin_plugins(cx),
             _ => self.section_automation(cx),
         };
 
@@ -1686,7 +1742,13 @@ impl Shell {
                 .into_any_element(),
             );
         }
-        if !provider.api_key.trim().is_empty() {
+        // The dot answers "is a credential configured", which now means a
+        // vault source: a named entry, or the conventional entry a migration
+        // filed. A locked vault is not a missing key, so a named choice counts
+        // regardless of the lock state.
+        let in_vault = self.state.vault.contains(&crate::vault::provider_key(id))
+            || provider.api_key_vault.is_some();
+        if in_vault {
             identity = identity.child(
                 div()
                     .debug_selector(|| format!("provider-key-{index}"))
@@ -1760,10 +1822,7 @@ impl Shell {
         let mut body: Vec<AnyElement> = Vec::with_capacity(10);
         // The measured editor field order: the credential, then the fold that
         // holds the endpoint, the protocol and the display name.
-        body.push(self.editor_field(
-            "settings.apiKey",
-            self.editor_input(&self.add_key, "field-editor-api-key".to_string()),
-        ));
+        body.push(self.provider_api_key_field(id, cx));
         let open = self.models_advanced_open;
         let fold = div()
             .id("models-customized")
@@ -1875,6 +1934,273 @@ impl Shell {
             .child(actions)
             .into_any_element()
     }
+    /// The API key row, including the vault chooser that names the source.
+    ///
+    /// The plaintext field is the source whenever it is non-empty, matching the
+    /// resolver's order. When the vault is unlocked the row offers its entries;
+    /// a chosen entry `disables` the plaintext field and names itself, while a
+    /// locked vault keeps the field editable, names any saved choice, and hints
+    /// that unlocking would offer the menu.
+    fn provider_api_key_field(&self, id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let selected = self
+            .state
+            .draft()
+            .global
+            .providers
+            .get(id)
+            .and_then(|provider| provider.api_key_vault.as_deref())
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string);
+        let unlocked = self.state.vault.is_app_available();
+        // No plaintext field exists: the vault entry is the only source. The
+        // app access key keeps the chooser available even while the Vault pane
+        // is locked; without that key the row explains how to grant access.
+        let mut column = div().flex().flex_col().gap(px(6.0));
+        if unlocked {
+            column = column.child(self.provider_vault_chooser(id, selected.as_deref(), cx));
+        } else {
+            if selected.is_some() {
+                column = column.child(
+                    div()
+                        .debug_selector(|| "provider-vault-source-locked".to_string())
+                        .child(txt(
+                            vault_source_label(lang, selected.as_deref()),
+                            12.0,
+                            theme::faint(),
+                        )),
+                );
+            }
+            let hint = if self.state.vault.exists() {
+                "settings.vaultUnlockToChoose"
+            } else {
+                "settings.vaultCreateToChoose"
+            };
+            column = column.child(
+                div()
+                    .debug_selector(|| "provider-vault-hint".to_string())
+                    .child(txt(lang.tr(hint), 12.0, theme::faint())),
+            );
+        }
+        if unlocked && selected.is_some() {
+            column = column.child(
+                div()
+                    .debug_selector(|| "provider-vault-note".to_string())
+                    .child(txt(
+                        lang.tr("settings.vaultKeyFromVault"),
+                        12.0,
+                        theme::faint(),
+                    )),
+            );
+        }
+        self.editor_field("settings.apiKey", column.into_any_element())
+    }
+
+    /// The vault source control: one button naming the current source, opening
+    /// the unlocked vault's entry ids and a Clear row.
+    fn provider_vault_chooser(
+        &self,
+        id: &str,
+        selected: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let source = selected.map(str::to_string);
+        let entries: Vec<String> = self
+            .state
+            .vault
+            .entries()
+            .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+            .unwrap_or_default();
+        let shell = cx.entity();
+        let provider = id.to_string();
+        let label = vault_source_label(lang, selected);
+        let debug = if selected.is_some() {
+            "provider-vault-source"
+        } else {
+            "provider-vault-choose"
+        };
+        div()
+            .debug_selector(move || debug.to_string())
+            .child(
+                Button::new("provider-api-key-vault")
+                    .ghost()
+                    .h(px(32.0))
+                    .px(px(10.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(theme::selected_row()))
+                    .cursor_pointer()
+                    .label(label)
+                    .icon(IconName::ChevronDown)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let mut menu = menu.min_w(px(260.0));
+                        if entries.is_empty() && source.is_none() {
+                            return menu.item(
+                                PopupMenuItem::new(lang.tr("settings.vaultNoEntries"))
+                                    .disabled(true),
+                            );
+                        }
+                        for entry in entries.iter() {
+                            let picked = entry.clone();
+                            let provider = provider.clone();
+                            let pick = shell.clone();
+                            let active = source.as_deref() == Some(entry.as_str());
+                            menu = menu.item(
+                                PopupMenuItem::new(entry.clone()).checked(active).on_click(
+                                    move |_, window, cx| {
+                                        pick.update(cx, |this, cx| {
+                                            this.choose_provider_vault_key(
+                                                &provider,
+                                                Some(&picked),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                ),
+                            );
+                        }
+                        if source.is_some() {
+                            let provider = provider.clone();
+                            let pick = shell.clone();
+                            menu = menu.item(PopupMenuItem::separator()).item(
+                                PopupMenuItem::new(lang.tr("settings.vaultClear")).on_click(
+                                    move |_, window, cx| {
+                                        pick.update(cx, |this, cx| {
+                                            this.choose_provider_vault_key(
+                                                &provider, None, window, cx,
+                                            );
+                                        });
+                                    },
+                                ),
+                            );
+                        }
+                        menu
+                    }),
+            )
+            .into_any_element()
+    }
+    /// The add card's API key row, with the same vault chooser as the editor.
+    ///
+    /// The provider this card creates does not exist yet, so the choice is
+    /// pending on the shell until Create lands it on the new provider. The
+    /// chooser is offered only while the vault is unlocked, exactly as in the
+    /// editor; with the vault unlocked a chosen entry disables the plaintext
+    /// field, while a locked vault keeps it editable.
+    fn add_api_key_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let selected = self
+            .add_key_vault
+            .as_deref()
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string);
+        let unlocked = self.state.vault.is_app_available();
+        // Same rule as the editor: app access keeps the chooser available even
+        // while the admin view is locked.
+        let mut column = div().flex().flex_col().gap(px(6.0));
+        if unlocked {
+            column = column.child(self.add_vault_chooser(selected.as_deref(), cx));
+        } else {
+            if selected.is_some() {
+                column = column.child(
+                    div()
+                        .debug_selector(|| "add-vault-source-locked".to_string())
+                        .child(txt(
+                            vault_source_label(lang, selected.as_deref()),
+                            12.0,
+                            theme::faint(),
+                        )),
+                );
+            }
+            let hint = if self.state.vault.exists() {
+                "settings.vaultUnlockToChoose"
+            } else {
+                "settings.vaultCreateToChoose"
+            };
+            column = column.child(
+                div()
+                    .debug_selector(|| "add-vault-hint".to_string())
+                    .child(txt(lang.tr(hint), 12.0, theme::faint())),
+            );
+        }
+        if unlocked && selected.is_some() {
+            column = column.child(div().debug_selector(|| "add-vault-note".to_string()).child(
+                txt(lang.tr("settings.vaultKeyFromVault"), 12.0, theme::faint()),
+            ));
+        }
+        self.editor_field("settings.apiKey", column.into_any_element())
+    }
+
+    /// The add card's vault source control, matching the editor's chooser.
+    fn add_vault_chooser(&self, selected: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let source = selected.map(str::to_string);
+        let entries: Vec<String> = self
+            .state
+            .vault
+            .entries()
+            .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+            .unwrap_or_default();
+        let shell = cx.entity();
+        let label = vault_source_label(lang, selected);
+        let debug = if selected.is_some() {
+            "add-vault-source"
+        } else {
+            "add-vault-choose"
+        };
+        div()
+            .debug_selector(move || debug.to_string())
+            .child(
+                Button::new("add-api-key-vault")
+                    .ghost()
+                    .h(px(32.0))
+                    .px(px(10.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(theme::selected_row()))
+                    .cursor_pointer()
+                    .label(label)
+                    .icon(IconName::ChevronDown)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let mut menu = menu.min_w(px(260.0));
+                        if entries.is_empty() && source.is_none() {
+                            return menu.item(
+                                PopupMenuItem::new(lang.tr("settings.vaultNoEntries"))
+                                    .disabled(true),
+                            );
+                        }
+                        for entry in entries.iter() {
+                            let picked = entry.clone();
+                            let pick = shell.clone();
+                            let active = source.as_deref() == Some(entry.as_str());
+                            menu = menu.item(
+                                PopupMenuItem::new(entry.clone()).checked(active).on_click(
+                                    move |_, window, cx| {
+                                        pick.update(cx, |this, cx| {
+                                            this.choose_add_vault_key(Some(&picked), window, cx);
+                                        });
+                                    },
+                                ),
+                            );
+                        }
+                        if source.is_some() {
+                            let pick = shell.clone();
+                            menu = menu.item(PopupMenuItem::separator()).item(
+                                PopupMenuItem::new(lang.tr("settings.vaultClear")).on_click(
+                                    move |_, window, cx| {
+                                        pick.update(cx, |this, cx| {
+                                            this.choose_add_vault_key(None, window, cx);
+                                        });
+                                    },
+                                ),
+                            );
+                        }
+                        menu
+                    }),
+            )
+            .into_any_element()
+    }
     /// Commit the editor: the connection it holds, then every model leaf.
     ///
     /// The rows are read on the click, not on a keystroke, so a half-typed
@@ -1882,7 +2208,6 @@ impl Shell {
     /// because it is the registry key the wire model carries.
     fn apply_provider_edit(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let base_url = self.add_base_url.read(cx).value().trim().to_string();
-        let api_key = self.add_key.read(cx).value().trim().to_string();
         let name = self.add_display.read(cx).value().trim().to_string();
         if base_url.is_empty() {
             self.state.provider_refusal =
@@ -1913,8 +2238,7 @@ impl Shell {
             }
         }
         let owned = id.to_string();
-        self.state
-            .set_provider_connection(&owned, &base_url, &api_key);
+        self.state.set_provider_connection(&owned, &base_url);
         self.state.set_provider_name(&owned, &name);
         self.state.editing_provider = None;
         self.model_rows.clear();
@@ -2586,6 +2910,7 @@ impl Shell {
                                 ModelsAddRoute::Catalogue
                             };
                             this.models_add_open = true;
+                            this.add_key_vault = None;
                             cx.notify();
                         }))
                         .into_any_element(),
@@ -2761,10 +3086,7 @@ impl Shell {
             .flex_col()
             .gap(px(12.0))
             .child(self.editor_field("settings.provider", boxed.into_any_element()))
-            .child(self.editor_field(
-                "settings.apiKey",
-                self.editor_input(&self.add_key, "add-key".to_string()),
-            ))
+            .child(self.add_api_key_field(cx))
             .child(self.add_actions(&chosen, cx))
             .into_any_element()
     }
@@ -2828,10 +3150,7 @@ impl Shell {
                 self.editor_input(&self.add_base_url, "add-base-url".to_string()),
             ))
             .child(self.editor_field("settings.apiMode", self.api_mode_choices(cx)))
-            .child(self.editor_field(
-                "settings.apiKey",
-                self.editor_input(&self.add_key, "add-key".to_string()),
-            ))
+            .child(self.add_api_key_field(cx))
             .child(model_field);
         // The refusals the reference prints above the create button, in the
         // order it checks them.
@@ -2895,6 +3214,7 @@ impl Shell {
                 this.models_add_open = false;
                 this.catalogue_choice = None;
                 this.catalogue_open = false;
+                this.add_key_vault = None;
                 cx.notify();
             }))
             .into_any_element();
@@ -2909,28 +3229,33 @@ impl Shell {
     }
 
     /// Commit the add card, on the route it is showing.
-    fn create_provider(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn create_provider(&mut self, id: &str, cx: &mut Context<Self>) {
         let route = self.models_add_route;
-        let key = self.add_key.read(cx).value().trim().to_string();
         let base_url = self.add_base_url.read(cx).value().trim().to_string();
         let named = self.add_display.read(cx).value().trim().to_string();
         let typed = self.new_row_id.read(cx).value().trim().to_string();
+        let vault_entry = self.add_key_vault.clone();
         let outcome = match route {
-            ModelsAddRoute::Catalogue => self.state.add_shipped_provider(id, &key),
+            ModelsAddRoute::Catalogue => self.state.add_shipped_provider(id),
             ModelsAddRoute::Custom => self.state.add_custom_provider(
                 id,
                 &named,
                 &base_url,
-                &key,
                 &[crate::settings::global::ModelEntry::named(&typed)],
             ),
         };
         self.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
         if outcome.is_ok() {
-            self.state.select_provider(id);
+            if let Some(entry) = vault_entry.as_deref() {
+                self.state.set_provider_api_key_vault(id, Some(entry));
+            }
+            // Adding a provider no longer selects it for anything: a model is
+            // chosen per chat from the composer, and the workspace document
+            // holds no selection. The card closes on its own write.
             self.models_add_open = false;
             self.catalogue_choice = None;
             self.catalogue_open = false;
+            self.add_key_vault = None;
         }
         cx.notify();
     }
@@ -3579,7 +3904,9 @@ impl Shell {
             .trim()
             .parse()
             .unwrap_or(30);
-        let session = self.state.draft().workspace.general.active_session.clone();
+        // A task runs in the session on screen, which is a runtime fact; the
+        // settings draft carries no session identity.
+        let session = self.state.active_id.clone().unwrap_or_default();
         let refusal = self.state.draft_mut().global.add_schedule(
             &name,
             &prompt,
@@ -3923,14 +4250,19 @@ impl Shell {
     pub(crate) fn render_provider_delete(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let name = self.state.removing_provider.clone().unwrap_or_default();
-        let has_credential = self
-            .state
-            .draft()
-            .global
-            .providers
-            .get(&name)
-            .map(|provider| !provider.api_key.trim().is_empty())
-            .unwrap_or(false);
+        let has_credential =
+            self.state
+                .draft()
+                .global
+                .providers
+                .get(&name)
+                .is_some_and(|provider| {
+                    provider.api_key_vault.is_some()
+                        || self
+                            .state
+                            .vault
+                            .contains(&crate::vault::provider_key(&name))
+                });
         // The reference picks the description by whether a credential is
         // configured, and labels the confirm with the provider's own name.
         let title = crate::i18n::tr_with(lang, "settings.deleteTitle", &name);
@@ -4069,88 +4401,317 @@ impl Shell {
             }))
             .into_any_element()
     }
+    /// The Built-in plugins pane's Plugin list, in the reference's own shape.
+    ///
+    /// Measured from `dsh-client-ui-plugins`: a tab strip (Plugin list / MCP /
+    /// Plugin Market), a full-width search field, then two collapsible groups -
+    /// the SESSION plugins an agent preset composes, and the GLOBAL plugins the
+    /// system and every session share - drawn as cards two per row, each with a
+    /// name, a description and a state.
     fn section_builtin_plugins(
         &self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let mut rows: Vec<AnyElement> = Vec::new();
-        if self.plugins.is_empty() {
-            rows.push(
-                txt(tr(self.state.lang, "settings.empty"), 13.0, theme::muted()).into_any_element(),
-            );
-        }
-        for (index, plugin) in self.plugins.iter().enumerate() {
-            let name = plugin.name.clone();
-            let status = self.plugin_status_key(&plugin.name);
-            rows.push(
-                div()
-                    .debug_selector(move || format!("builtin-plugin-{index}"))
-                    .id(SharedString::from(format!("builtin-plugin-{index}")))
-                    .py(px(7.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .border_b_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .child(txt(name, 13.0, theme::text()).flex_1())
-                    .child(txt(tr(self.state.lang, status), 12.0, theme::muted()))
-                    .into_any_element(),
-            );
-        }
+        let lang = self.state.lang;
+        let mut rows: Vec<AnyElement> = vec![self.plugin_tabs(cx)];
         rows.push(
-            txt(
-                tr(self.state.lang, "settings.pluginViews"),
-                13.0,
-                theme::text(),
+            div()
+                .mb(px(10.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .h(px(34.0))
+                .px(px(10.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(rgb(theme::border()))
+                .child(icon(IconName::Search, 14.0, theme::faint()))
+                .child(Input::new(&self.plugin_search).appearance(false))
+                .into_any_element(),
+        );
+
+        // ---- Session plugins: what the active preset composes. ----
+        let draft = self.state.draft();
+        let preset_id = draft.global.default_preset.clone();
+        let preset_label = if preset_id.is_empty() {
+            tr(lang, "settings.presetDefault")
+        } else {
+            preset_id.clone()
+        };
+        let composed: Vec<String> = draft
+            .global
+            .preset(&preset_id)
+            .map(|preset| preset.plugins)
+            .unwrap_or_default();
+        let preset_ids = draft.global.preset_ids();
+        let session_open = self.plugins_session_open;
+        let global_open = self.plugins_global_open;
+
+        rows.push(
+            self.plugin_group_header(
+                "plugins-session",
+                tr(lang, "settings.pluginsSession"),
+                self.preset_pill(preset_label, preset_ids, cx),
+                !session_open,
+                true,
+                cx,
             )
-            .pt(px(12.0))
-            .pb(px(2.0))
             .into_any_element(),
         );
-        for id in VIEWS {
-            rows.push(self.builtin_view_row(id, cx));
+        if session_open {
+            rows.push(
+                txt(
+                    tr(lang, "settings.pluginsSessionHint"),
+                    12.0,
+                    theme::faint(),
+                )
+                .pb(px(8.0))
+                .into_any_element(),
+            );
+            if composed.is_empty() {
+                rows.push(
+                    txt(tr(lang, "settings.pluginsEmpty"), 12.0, theme::faint())
+                        .pb(px(10.0))
+                        .into_any_element(),
+                );
+            }
+            for pair in composed.chunks(2) {
+                let mut row = div().flex().flex_row().gap(px(8.0)).pb(px(8.0));
+                for name in pair {
+                    let tools = self.plugin_tools(name);
+                    row = row.child(self.plugin_card(
+                        format!("plugins-composed-{name}"),
+                        name.clone(),
+                        tools,
+                        None,
+                        None,
+                        cx,
+                    ));
+                }
+                if pair.len() == 1 {
+                    row = row.child(div().flex_1());
+                }
+                rows.push(row.into_any_element());
+            }
         }
+
+        // ---- Global plugins: the installed inventory. ----
+        rows.push(
+            self.plugin_group_header(
+                "plugins-global",
+                tr(lang, "settings.pluginsGlobal"),
+                div().into_any_element(),
+                !global_open,
+                false,
+                cx,
+            )
+            .into_any_element(),
+        );
+        if global_open {
+            rows.push(
+                txt(tr(lang, "settings.pluginsGlobalHint"), 12.0, theme::faint())
+                    .pb(px(8.0))
+                    .into_any_element(),
+            );
+            let query = self.state.plugin_query.clone();
+            let listed: Vec<(usize, String, bool)> = self
+                .plugins
+                .iter()
+                .enumerate()
+                .filter(|(_, plugin)| crate::state::matches(&query, &plugin.name))
+                .map(|(index, plugin)| {
+                    (
+                        index,
+                        plugin.name.clone(),
+                        self.plugin_enabled(&plugin.name),
+                    )
+                })
+                .collect();
+            if listed.is_empty() {
+                rows.push(
+                    txt(tr(lang, "settings.noMatchingPlugins"), 12.0, theme::faint())
+                        .pb(px(10.0))
+                        .into_any_element(),
+                );
+            }
+            for pair in listed.chunks(2) {
+                let mut row = div().flex().flex_row().gap(px(8.0)).pb(px(8.0));
+                for (index, name, enabled) in pair {
+                    let tools = self.plugin_tools(name);
+                    row = row.child(self.plugin_card(
+                        format!("builtin-plugin-{index}"),
+                        name.clone(),
+                        tools,
+                        Some(*enabled),
+                        Some(name.clone()),
+                        cx,
+                    ));
+                }
+                if pair.len() == 1 {
+                    row = row.child(div().flex_1());
+                }
+                rows.push(row.into_any_element());
+            }
+        }
+
         ("settings.plugins", "settings.builtinPluginsHint", rows)
     }
 
-    /// One row of the Built-in plugins pane's view list: a real control that
-    /// moves the dialog to the pane it names, labelled with that pane's own
-    /// title key, so the list cannot drift from the panes it opens.
-    fn builtin_view_row(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
-        let index = section_index(id).unwrap_or(0);
+    /// The tools one plugin contributes, as the card's description.
+    fn plugin_tools(&self, name: &str) -> String {
+        self.plugins
+            .iter()
+            .find(|plugin| plugin.name == name)
+            .map(|plugin| plugin.tools.join(", "))
+            .filter(|tools| !tools.is_empty())
+            .unwrap_or_else(|| tr(self.state.lang, "settings.pluginsNoTools"))
+    }
+
+    /// The tab strip the Plugin list view opens with.
+    ///
+    /// "MCP" is a real tab - it moves the dialog to that pane. "Plugin Market"
+    /// is drawn DISABLED: this deployment ships no market, and a tab that looks
+    /// pressable but does nothing is what the standing rule forbids.
+    fn plugin_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
+        let active = div()
+            .pb(px(8.0))
+            .border_b_2()
+            .border_color(rgb(theme::text()))
+            .child(txt(tr(lang, "settings.pluginsTabs"), 13.0, theme::text()));
+        let mcp_index = section_index("mcp");
         div()
-            .id(SharedString::from(format!("builtin-view-{id}")))
-            .debug_selector(move || format!("builtin-view-{id}"))
-            .py(px(8.0))
+            .debug_selector(|| String::from("plugins-tabs"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(18.0))
+            .mb(px(10.0))
+            .border_b_1()
+            .border_color(rgb(theme::border_soft()))
+            .child(active)
+            .child(
+                div()
+                    .id("plugins-tab-mcp")
+                    .debug_selector(|| String::from("plugins-tab-mcp"))
+                    .pb(px(8.0))
+                    .cursor_pointer()
+                    .child(txt(
+                        tr(lang, "settings.pluginsTabMcp"),
+                        13.0,
+                        theme::muted(),
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        if let Some(index) = mcp_index {
+                            this.state.settings_section = index;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                div()
+                    .debug_selector(|| String::from("plugins-tab-market"))
+                    .pb(px(8.0))
+                    .child(txt(
+                        tr(lang, "settings.pluginsTabMarket"),
+                        13.0,
+                        theme::faint(),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// One collapsible group header: a chevron, the title and a trailing control.
+    fn plugin_group_header(
+        &self,
+        id: &'static str,
+        title: String,
+        trailing: AnyElement,
+        folded: bool,
+        session: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_string())
+            .h(px(32.0))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.0))
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::hover())))
-            .border_b_1()
-            .border_color(rgb(theme::border_soft()))
+            .child(icon(
+                if folded {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                },
+                14.0,
+                theme::muted(),
+            ))
             .child(
-                txt(tr(lang, SECTIONS[index]), 13.0, theme::text())
-                    .flex_1()
-                    .min_w_0(),
+                txt(title, 14.0, theme::text())
+                    .font_weight(FontWeight::MEDIUM)
+                    .flex_1(),
             )
+            .child(trailing)
             .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.state.settings_section = index;
+                if session {
+                    this.plugins_session_open = !this.plugins_session_open;
+                } else {
+                    this.plugins_global_open = !this.plugins_global_open;
+                }
                 cx.notify();
             }))
+    }
+
+    /// The Session plugins header's trailing control: the active preset.
+    ///
+    /// It writes the DRAFT, the same value the agent-presets pane writes, so Save
+    /// is the one door either control's change goes through.
+    fn preset_pill(&self, label: String, ids: Vec<String>, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let shell = cx.entity();
+        Button::new("plugins-preset")
+            .ghost()
+            .compact()
+            .h(px(28.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::new_session_fill()))
+            .label(label)
+            .icon(IconName::ChevronDown)
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                let mut menu = menu;
+                for id in ids.iter() {
+                    let pick = id.clone();
+                    let text = if id.is_empty() {
+                        tr(lang, "settings.presetDefault")
+                    } else {
+                        id.clone()
+                    };
+                    let pick_shell = shell.clone();
+                    menu = menu.item(PopupMenuItem::new(text).on_click(
+                        move |_event, _window, cx| {
+                            let picked = pick.clone();
+                            pick_shell.update(cx, |this, cx| {
+                                this.state.select_preset(&picked);
+                                cx.notify();
+                            });
+                        },
+                    ));
+                }
+                menu
+            })
             .into_any_element()
     }
 
-    /// The locale key for one plugin switch in the draft.
+    /// Whether the DRAFT leaves a plugin installed.
     ///
-    /// The pane reads the draft rather than the installed inventory, so a
-    /// plugin switched off elsewhere shows as off here with no state of its
-    /// own to keep in sync.
-    pub(crate) fn plugin_status_key(&self, name: &str) -> &'static str {
-        if self
+    /// The pane reads this rather than the installed inventory, so a plugin
+    /// switched off reads off here with no second state to keep in sync.
+    pub(crate) fn plugin_enabled(&self, name: &str) -> bool {
+        !self
             .state
             .draft()
             .workspace
@@ -4158,13 +4719,74 @@ impl Shell {
             .extentions
             .iter()
             .any(|plugin| plugin == name)
-        {
-            "settings.pluginDisabled"
-        } else {
-            "settings.pluginEnabled"
-        }
     }
 
+    /// One plugin card: an optional switch, the name, the description and a
+    /// chevron - the reference's `.card` inside the pane's own grid.
+    fn plugin_card(
+        &self,
+        id: String,
+        name: String,
+        description: String,
+        enabled: Option<bool>,
+        toggle: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selector = id.clone();
+        let mut head = div().flex().flex_row().items_center().gap(px(8.0));
+        if let Some(on) = enabled {
+            head = head.child(
+                div()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .flex_none()
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(rgb(if on {
+                        theme::accent()
+                    } else {
+                        theme::border_strong()
+                    }))
+                    .bg(rgb(if on { theme::accent() } else { theme::page() }))
+                    .when(on, |boxed| {
+                        boxed.child(icon(IconName::Check, 10.0, theme::page()))
+                    }),
+            );
+        }
+        head = head
+            .child(txt(name, 13.0, theme::text()).flex_1().min_w_0())
+            .child(icon(IconName::ChevronDown, 12.0, theme::faint()));
+        let mut card = div()
+            .id(SharedString::from(id))
+            .debug_selector(move || selector.clone())
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .p(px(10.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .bg(rgb(theme::page()))
+            .child(head)
+            .child(
+                txt(description, 12.0, theme::muted())
+                    .line_height(px(17.0))
+                    .max_h(px(38.0))
+                    .overflow_hidden(),
+            );
+        if let Some(plugin) = toggle {
+            card = card
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())));
+            card = card.on_click(cx.listener(move |this, _event, _window, cx| {
+                this.state.toggle_plugin_off(&plugin);
+                cx.notify();
+            }));
+        }
+        card.into_any_element()
+    }
     /// MCP servers.
     fn section_mcp(&self) -> (&'static str, &'static str, Vec<AnyElement>) {
         let mut rows: Vec<AnyElement> = Vec::new();
@@ -4371,6 +4993,756 @@ impl Shell {
         ];
         ("settings.context", "settings.contextHint", rows)
     }
+
+    /// Vault: the admin-key store, locked or unlocked.
+    ///
+    /// The locked state explains what the file is and asks for the one secret
+    /// that opens it; a create asks twice, because a vault sealed under a typo
+    /// has no recovery. The unlocked state lists names and dates, reveals one
+    /// value inline on press, deletes with a confirmation and adds a row.
+    fn section_vault(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (&'static str, &'static str, Vec<AnyElement>) {
+        let lang = self.state.lang;
+        let exists = self.state.vault.exists();
+        let unlocked = self.state.vault.is_unlocked();
+        let app_access = self.state.vault.is_app_available();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if unlocked {
+            rows.extend(self.vault_unlocked_rows(cx));
+        } else {
+            rows.push(self.settings_note("settings.vaultExplain", false));
+            if self.vault_busy {
+                rows.push(self.settings_note("settings.vaultBusy", false));
+            } else if exists {
+                rows.push(self.editor_field(
+                    "settings.vaultPassphrase",
+                    self.editor_input(
+                        &self.vault_inputs.passphrase,
+                        "vault-passphrase".to_string(),
+                    ),
+                ));
+                rows.push(self.vault_button(
+                    "vault-unlock",
+                    "settings.vaultUnlock",
+                    true,
+                    Shell::vault_unlock,
+                    cx,
+                ));
+                rows.push(self.settings_note(
+                    if app_access {
+                        "settings.vaultAdminLockedHint"
+                    } else {
+                        "settings.vaultLockedHint"
+                    },
+                    false,
+                ));
+            } else {
+                rows.push(self.editor_field(
+                    "settings.vaultPassphrase",
+                    self.editor_input(
+                        &self.vault_inputs.passphrase,
+                        "vault-passphrase".to_string(),
+                    ),
+                ));
+                rows.push(self.editor_field(
+                    "settings.vaultConfirm",
+                    self.editor_input(&self.vault_inputs.confirm, "vault-confirm".to_string()),
+                ));
+                rows.push(self.vault_strength_note(cx));
+                rows.push(self.vault_button(
+                    "vault-create",
+                    "settings.vaultCreate",
+                    true,
+                    Shell::vault_create,
+                    cx,
+                ));
+                rows.push(self.settings_note("settings.vaultCreateHint", true));
+            }
+        }
+        // The refusal leads the pane: a wrong passphrase or an unreadable file
+        // is the first thing the reader must see, not a line past the list.
+        if let Some(key) = self.vault_error {
+            rows.insert(
+                0,
+                div()
+                    .debug_selector(|| "vault-error".to_string())
+                    .pb(px(10.0))
+                    .child(txt(tr(lang, key), 12.0, theme::error()))
+                    .into_any_element(),
+            );
+        }
+        ("settings.vault", "settings.vaultHint", rows)
+    }
+
+    /// The strength note under a create's two passphrase fields.
+    ///
+    /// It is a note, not a gate: the only hard rule is the confirmation match,
+    /// because refusing a passphrase the reader chose is a policy this shell is
+    /// not entitled to make. The note still tells them what a good one is.
+    fn vault_strength_note(&self, cx: &mut Context<Self>) -> AnyElement {
+        let passphrase = self.vault_inputs.passphrase.read(cx).value().to_string();
+        let length = passphrase.chars().count();
+        let (key, colour) = if length < 12 {
+            ("settings.vaultStrengthShort", theme::warn())
+        } else if length < 20 {
+            ("settings.vaultStrengthFair", theme::muted())
+        } else {
+            ("settings.vaultStrengthStrong", theme::success())
+        };
+        txt(tr(self.state.lang, key), 12.0, colour).into_any_element()
+    }
+
+    /// A masked control button of the Vault pane.
+    fn vault_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        primary: bool,
+        action: fn(&mut Shell, &mut Window, &mut Context<Shell>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .h(px(32.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .border_1()
+            .border_color(rgb(if primary {
+                theme::accent()
+            } else {
+                theme::border()
+            }))
+            .bg(rgb(if primary {
+                theme::accent()
+            } else {
+                theme::page()
+            }))
+            .hover(|style| style.opacity(0.9))
+            .child(txt(
+                tr(self.state.lang, label),
+                13.0,
+                if primary {
+                    theme::page()
+                } else {
+                    theme::text()
+                },
+            ))
+            .on_click(cx.listener(move |this, _event, window, cx| action(this, window, cx)))
+            .into_any_element()
+    }
+
+    /// The unlocked state's status line and its Lock now control.
+    fn vault_status_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let count = self
+            .state
+            .vault
+            .entries()
+            .map(|rows| rows.len())
+            .unwrap_or(0);
+        hairline_bottom(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .pb(px(10.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(icon(IconName::Lock, 14.0, theme::success()))
+                .child(txt(
+                    tr(self.state.lang, "settings.vaultUnlocked"),
+                    13.0,
+                    theme::text(),
+                ))
+                .child(txt(
+                    tr_args(
+                        self.state.lang,
+                        "settings.vaultEntryCount",
+                        &[("count", count.to_string())],
+                    ),
+                    12.0,
+                    theme::faint(),
+                ))
+                .child(div().flex_1())
+                .child(self.vault_button(
+                    "vault-lock",
+                    "settings.vaultLock",
+                    false,
+                    Shell::vault_lock,
+                    cx,
+                )),
+        )
+        .into_any_element()
+    }
+
+    /// The unlocked state: the entry list and the add row.
+    fn vault_unlocked_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let lang = self.state.lang;
+        let entries = self.state.vault.entries().unwrap_or_default();
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(entries.len() + 3);
+        rows.push(self.vault_status_row(cx));
+        rows.push(
+            div()
+                .pt(px(14.0))
+                .pb(px(4.0))
+                .child(txt(
+                    tr_args(
+                        lang,
+                        "settings.vaultEntries",
+                        &[("count", entries.len().to_string())],
+                    ),
+                    12.0,
+                    theme::muted(),
+                ))
+                .into_any_element(),
+        );
+        if entries.is_empty() {
+            rows.push(self.settings_note("settings.vaultEmpty", false));
+        }
+        for entry in entries {
+            rows.push(self.vault_entry_row(&entry.name, entry.created, cx));
+        }
+        rows.push(self.vault_add_block(cx));
+        rows
+    }
+
+    /// One entry: its name and date, a masked or revealed value, and its
+    /// controls.
+    ///
+    /// The value is resolved only for the row the reader revealed, so an
+    /// ordinary repaint does not copy every secret out of the vault.
+    fn vault_entry_row(&self, name: &str, created: u64, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let revealed = self.vault_revealed.as_deref() == Some(name);
+        let owned = name.to_string();
+        let owned_copy = name.to_string();
+        let owned_delete = name.to_string();
+        let reveal_label = if revealed {
+            "settings.vaultHide"
+        } else {
+            "settings.vaultReveal"
+        };
+        let controls = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .id(SharedString::from(format!("vault-reveal-{name}")))
+                    .debug_selector({
+                        let selector = format!("vault-reveal-{name}");
+                        move || selector.clone()
+                    })
+                    .cursor_pointer()
+                    .child(txt(tr(lang, reveal_label), 12.0, theme::muted()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.vault_revealed = if this.vault_revealed.as_deref() == Some(&owned) {
+                            None
+                        } else {
+                            Some(owned.clone())
+                        };
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("vault-copy-{name}")))
+                    .debug_selector({
+                        let selector = format!("vault-copy-{name}");
+                        move || selector.clone()
+                    })
+                    .cursor_pointer()
+                    .child(txt(tr(lang, "settings.vaultCopy"), 12.0, theme::muted()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.vault_copy(&owned_copy, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("vault-delete-{name}")))
+                    .debug_selector({
+                        let selector = format!("vault-delete-{name}");
+                        move || selector.clone()
+                    })
+                    .cursor_pointer()
+                    .child(txt(tr(lang, "settings.vaultDelete"), 12.0, theme::error()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.vault_confirm_delete = Some(owned_delete.clone());
+                        cx.notify();
+                    })),
+            );
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                txt(name.to_string(), 13.0, theme::text())
+                    .font_family("monospace")
+                    .flex_1()
+                    .min_w_0(),
+            )
+            .child(txt(
+                tr_args(
+                    lang,
+                    "settings.vaultCreated",
+                    &[("when", vault_stamp(created))],
+                ),
+                11.0,
+                theme::faint(),
+            ))
+            .child(controls);
+        let mut row = div().flex().flex_col().gap(px(8.0)).py(px(10.0));
+        if revealed {
+            let value = self
+                .state
+                .vault
+                .resolve(name)
+                .map(|secret| secret.as_str().to_string())
+                .unwrap_or_default();
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(rgb(theme::border()))
+                            .bg(rgb(theme::page()))
+                            .child(
+                                txt(value, 12.0, theme::text())
+                                    .font_family("monospace")
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("vault-reveal-copy-{name}")))
+                            .debug_selector({
+                                let selector = format!("vault-reveal-copy-{name}");
+                                move || selector.clone()
+                            })
+                            .cursor_pointer()
+                            .child(icon(IconName::Copy, 14.0, theme::muted()))
+                            .on_click(cx.listener({
+                                let copied = name.to_string();
+                                move |this, _event, _window, cx| {
+                                    this.vault_copy(&copied, cx);
+                                }
+                            })),
+                    ),
+            );
+        } else {
+            row = row.child(txt("••••••••", 12.0, theme::faint()).font_family("monospace"));
+        }
+        hairline_bottom(row.border_color(rgb(theme::border_soft())).child(head)).into_any_element()
+    }
+
+    /// The add-entry block under the list.
+    fn vault_add_block(&self, cx: &mut Context<Self>) -> AnyElement {
+        hairline_top(
+            div()
+                .mt(px(6.0))
+                .pt(px(14.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(
+                    txt(
+                        tr(self.state.lang, "settings.vaultAddTitle"),
+                        13.0,
+                        theme::text(),
+                    )
+                    .font_weight(FontWeight::MEDIUM),
+                )
+                .child(self.editor_field(
+                    "settings.vaultName",
+                    self.editor_input(&self.vault_inputs.name, "vault-entry-name".to_string()),
+                ))
+                .child(self.editor_field(
+                    "settings.vaultValue",
+                    self.editor_input(&self.vault_inputs.value, "vault-entry-value".to_string()),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(self.vault_button(
+                            "vault-add",
+                            "settings.vaultAdd",
+                            true,
+                            Shell::vault_add,
+                            cx,
+                        ))
+                        .child(txt(
+                            tr(self.state.lang, "settings.vaultNameHint"),
+                            12.0,
+                            theme::faint(),
+                        )),
+                ),
+        )
+        .into_any_element()
+    }
+
+    /// Create the vault from the two passphrase fields.
+    fn vault_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_busy {
+            return;
+        }
+        let passphrase = zeroize::Zeroizing::new(
+            self.vault_inputs
+                .passphrase
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+        );
+        let confirm = zeroize::Zeroizing::new(
+            self.vault_inputs
+                .confirm
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+        );
+        if passphrase.is_empty() {
+            self.vault_error = Some("settings.vaultPassphraseRequired");
+            cx.notify();
+            return;
+        }
+        if *passphrase != *confirm {
+            self.vault_error = Some("settings.vaultMismatch");
+            cx.notify();
+            return;
+        }
+        self.run_vault_op(move |vault| vault.create(&passphrase), window, cx);
+    }
+
+    /// Unlock the vault with the passphrase field.
+    fn vault_unlock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_busy {
+            return;
+        }
+        let passphrase = zeroize::Zeroizing::new(
+            self.vault_inputs
+                .passphrase
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+        );
+        if passphrase.is_empty() {
+            self.vault_error = Some("settings.vaultPassphraseRequired");
+            cx.notify();
+            return;
+        }
+        self.run_vault_op(move |vault| vault.unlock(&passphrase), window, cx);
+    }
+
+    /// Drop the derived key and every decrypted value.
+    fn vault_lock(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.vault.is_unlocked() {
+            return;
+        }
+        self.state.vault.lock();
+        self.vault_revealed = None;
+        self.vault_error = None;
+        self.state
+            .notice(tr(self.state.lang, "settings.vaultLockedNotice").to_string());
+        cx.notify();
+    }
+
+    /// Write the add row's entry to the vault.
+    fn vault_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.vault_inputs.name.read(cx).value().trim().to_string();
+        let value = zeroize::Zeroizing::new(self.vault_inputs.value.read(cx).value().to_string());
+        if name.is_empty() || value.is_empty() {
+            self.vault_error = Some("settings.vaultEntryRequired");
+            cx.notify();
+            return;
+        }
+        match self.state.vault.put(&name, &value) {
+            Ok(()) => {
+                self.vault_error = None;
+                self.vault_inputs
+                    .name
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.vault_inputs
+                    .value
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.state
+                    .notice(tr(self.state.lang, "settings.vaultAdded").to_string());
+            }
+            Err(error) => {
+                self.vault_error = Some(error.locale_key());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Copy one entry's value to the clipboard.
+    ///
+    /// get, not resolve, so a locked or absent entry says why instead of the
+    /// copied notice over an empty pasteboard.
+    fn vault_copy(&mut self, name: &str, cx: &mut Context<Self>) {
+        match self.state.vault.get(name) {
+            Ok(secret) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(secret.as_str().to_string()));
+                self.state
+                    .notice(tr(self.state.lang, "settings.vaultCopied").to_string());
+                self.vault_error = None;
+            }
+            Err(error) => {
+                self.vault_error = Some(error.locale_key());
+                let why = tr(self.state.lang, error.locale_key());
+                self.state.notice(why);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Remove the entry the confirmation names.
+    fn vault_delete(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.vault_confirm_delete.clone() else {
+            return;
+        };
+        self.vault_confirm_delete = None;
+        match self.state.vault.remove(&name) {
+            Ok(removed) => {
+                if self.vault_revealed.as_deref() == Some(&name) {
+                    self.vault_revealed = None;
+                }
+                self.vault_error = None;
+                if removed {
+                    self.state
+                        .notice(tr(self.state.lang, "settings.vaultRemoved").to_string());
+                }
+            }
+            Err(error) => self.vault_error = Some(error.locale_key()),
+        }
+        cx.notify();
+    }
+
+    /// Run a key derivation off the view thread.
+    ///
+    /// Argon2 at 64 MiB / 3 passes is deliberately expensive, so an unlock or a
+    /// create moves the vault to the shell's runtime, derives there, and hands
+    /// it back. The pane says why it is waiting rather than freezing.
+    fn run_vault_op(
+        &mut self,
+        op: impl FnOnce(&mut crate::vault::Vault) -> Result<(), crate::vault::VaultError>
+            + Send
+            + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut vault = std::mem::replace(&mut self.state.vault, crate::vault::Vault::disabled());
+        let (tx, rx) = async_channel::bounded(1);
+        self.state.runner.rt().spawn(async move {
+            let outcome = op(&mut vault);
+            let _ = tx.send((vault, outcome)).await;
+        });
+        self.vault_busy = true;
+        self.vault_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = rx.recv().await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.vault_busy = false;
+                match outcome {
+                    Ok((vault, Ok(()))) => {
+                        this.state.vault = vault;
+                        this.vault_error = None;
+                        for input in [&this.vault_inputs.passphrase, &this.vault_inputs.confirm] {
+                            input.update(cx, |state, cx| state.set_value("", window, cx));
+                        }
+                    }
+                    Ok((vault, Err(error))) => {
+                        this.state.vault = vault;
+                        this.vault_error = Some(error.locale_key());
+                    }
+                    // The task went away without answering; the vault is locked
+                    // rather than half-open, and the pane can try again.
+                    Err(_) => this.vault_error = Some("settings.vaultIo"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Choose the vault entry a provider reads its API key from.
+    ///
+    /// The id goes into the DRAFT and never the value; the settings tree holds
+    /// only the id, and the secret stays in the vault.
+    pub(crate) fn choose_provider_vault_key(
+        &mut self,
+        id: &str,
+        entry: Option<&str>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.set_provider_api_key_vault(id, entry);
+        cx.notify();
+    }
+
+    /// Choose the vault entry the add card will land on its new provider.
+    ///
+    /// The provider does not exist until Create, so the choice is pending on
+    /// the shell rather than written to the draft. Clear drops it again.
+    pub(crate) fn choose_add_vault_key(
+        &mut self,
+        entry: Option<&str>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_key_vault = entry
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        cx.notify();
+    }
+
+    /// The vault delete confirmation, drawn over the settings panel.
+    pub(crate) fn render_vault_delete(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let name = self.vault_confirm_delete.clone().unwrap_or_default();
+        let confirm = div()
+            .id("vault-delete-confirm")
+            .debug_selector(|| String::from("vault-delete-confirm"))
+            .px(px(16.0))
+            .h(px(30.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .bg(rgb(theme::accent()))
+            .hover(|style| style.opacity(0.9))
+            .child(txt(
+                tr(lang, "settings.vaultDeleteConfirm"),
+                13.0,
+                theme::page(),
+            ))
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.vault_delete(window, cx);
+            }));
+        let cancel = div()
+            .id("vault-delete-cancel")
+            .debug_selector(|| String::from("vault-delete-cancel"))
+            .px(px(16.0))
+            .h(px(30.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(tr(lang, "settings.cancel"), 13.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.vault_confirm_delete = None;
+                cx.notify();
+            }));
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(rgba(0x0F1115CC))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .debug_selector(|| String::from("vault-delete-dialog"))
+                    .w(px(460.0))
+                    .p(px(18.0))
+                    .rounded(px(12.0))
+                    .bg(rgb(theme::page()))
+                    .border_1()
+                    .border_color(rgb(theme::border_strong()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(txt(
+                        crate::i18n::tr_with(lang, "settings.vaultDeleteTitle", &name),
+                        15.0,
+                        theme::text(),
+                    ))
+                    .child(txt(
+                        tr(lang, "settings.vaultDeleteDescription"),
+                        12.5,
+                        theme::muted(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(cancel)
+                            .child(confirm),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+/// Format a unix timestamp as 'YYYY-MM-DD HH:MM UTC'.
+///
+/// The vault stores plain unix seconds and the pane shows a readable date; the
+/// civil-date arithmetic is Howard Hinnant's days-from-civil inverse, so one
+/// label does not pull a calendar crate into the shell.
+fn vault_stamp(created: u64) -> String {
+    let seconds = created as i64;
+    let days = seconds.div_euclid(86_400);
+    let of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        of_day / 3_600,
+        (of_day % 3_600) / 60
+    )
+}
+
+/// The calendar date a count of days since 1970-01-01 names.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (
+        if month <= 2 { year + 1 } else { year },
+        month as u32,
+        day as u32,
+    )
 }
 
 #[cfg(test)]
@@ -4395,6 +5767,14 @@ mod capacity_tests {
         assert_eq!(parse_capacity(""), None);
         assert_eq!(parse_capacity("many"), None);
         assert_eq!(parse_capacity("K"), None);
+    }
+
+    /// A stored unix timestamp reads as the civil date the row shows.
+    #[test]
+    fn a_vault_timestamp_reads_as_a_date() {
+        assert_eq!(super::vault_stamp(0), "1970-01-01 00:00 UTC");
+        assert_eq!(super::vault_stamp(1_700_000_000), "2023-11-14 22:13 UTC");
+        assert_eq!(super::vault_stamp(951_782_400), "2000-02-29 00:00 UTC");
     }
 }
 
@@ -4455,5 +5835,21 @@ mod label_tests {
         assert_eq!(tr("zh", "settings.budget"), "上下文窗口");
         assert_eq!(tr("zh", "settings.apiAuto"), "提供商默认");
         assert_eq!(tr("zh", "settings.apiChat"), "OpenAI Chat Completions");
+    }
+
+    /// The source control's label names the chosen vault entry, and is the
+    /// affordance when nothing is chosen.
+    #[test]
+    fn the_vault_source_label_names_the_entry() {
+        use crate::i18n::Lang;
+        use crate::ui::settings::vault_source_label;
+        assert_eq!(
+            vault_source_label(Lang::En, Some("keys/work")),
+            "vault: keys/work"
+        );
+        assert_eq!(vault_source_label(Lang::En, None), "Choose from vault");
+        let zh = vault_source_label(Lang::Zh, Some("keys/work"));
+        assert!(zh.contains("keys/work"), "the id survives translation");
+        assert_ne!(zh, "Choose from vault", "the value is translated");
     }
 }

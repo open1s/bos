@@ -174,9 +174,6 @@ pub(crate) enum SettingsError {
     EmptyExtention,
     /// Two extension entries carried the same id.
     DuplicateExtention(String),
-    /// A workspace named a provider without a model, or a model without a
-    /// provider.
-    HalfMadeSelection(String),
 }
 
 impl std::fmt::Display for SettingsError {
@@ -189,9 +186,6 @@ impl std::fmt::Display for SettingsError {
             Self::EmptyExtention => write!(f, "an extension entry carries no id"),
             Self::DuplicateExtention(id) => {
                 write!(f, "the extension {id:?} is installed twice")
-            }
-            Self::HalfMadeSelection(id) => {
-                write!(f, "the selection {id:?} names only half a model")
             }
         }
     }
@@ -269,7 +263,12 @@ fn default_preset() -> String {
     "standard".to_string()
 }
 
-/// Machine preferences. None of these follow a workspace.
+/// Machine preferences and window state.
+///
+/// None of these is workspace configuration: they are the machine's own
+/// choices plus what was last on screen (`active_workspace`,
+/// `active_session`), which several concurrent sessions make a view fact
+/// rather than a workspace setting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -302,6 +301,13 @@ pub(crate) struct General {
     pub(crate) session_sort: String,
     /// The workspace that was open; empty while none is registered.
     pub(crate) active_workspace: String,
+    /// The session last on screen; empty while none has been selected.
+    ///
+    /// A window/layout fact, not a workspace setting: several sessions in one
+    /// workspace may run at the same time, and which one is being READ is the
+    /// window's state. It therefore rides here with the other machine
+    /// preferences, and the workspace document carries no session identity.
+    pub(crate) active_session: String,
 }
 
 impl Default for General {
@@ -319,6 +325,7 @@ impl Default for General {
             developer_tools: true,
             session_sort: String::new(),
             active_workspace: String::new(),
+            active_session: String::new(),
         }
     }
 }
@@ -331,7 +338,8 @@ fn is_false(value: &bool) -> bool {
 /// One provider: one connection, and the models reached through it.
 ///
 /// The connection lives here rather than on each model so that a gateway is
-/// declared once. Two models on one gateway share its base URL and API key.
+/// declared once. Two models on one gateway share its base URL and the vault
+/// entry named here.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Provider {
@@ -340,8 +348,22 @@ pub(crate) struct Provider {
     pub(crate) name: Option<String>,
     /// The API base URL.
     pub(crate) base_url: String,
-    /// The API key.
-    pub(crate) api_key: String,
+    /// The vault entry id this provider reads its API key from.
+    ///
+    /// The secret itself never lives in this file. When no id is named the
+    /// provider falls back to the conventional `provider:<id>:api_key` entry,
+    /// which is where the old migration filed a moved key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) api_key_vault: Option<String>,
+    /// A plaintext key from a settings document written before the vault became
+    /// the only credential source.
+    ///
+    /// Accepted so an old file still parses, never written back, and never used
+    /// to authenticate: a credential comes from `api_key_vault` or the
+    /// conventional vault entry. It survives in memory only long enough for the
+    /// session store to scrub it from transcripts.
+    #[serde(rename = "api_key", default, skip_serializing)]
+    pub(crate) legacy_api_key: Option<String>,
     /// Whether the user declared this connection by hand instead of picking
     /// the provider from the shipped catalog. Written only when true.
     #[serde(skip_serializing_if = "is_false")]
@@ -640,7 +662,7 @@ lang = "zh"
 
 [providers.nvidia]
 base_url = "http://127.0.0.1:11436/v1"
-api_key  = "sk-local"
+api_key_vault = "keys/nvidia"
 
 [providers.nvidia."glm-5.3-flash"]
 model = "nvidia/z-ai/glm-5.3-flash"
@@ -665,7 +687,27 @@ root = "/tmp/bsh"
         let provider = settings.providers.get("nvidia").expect("the provider");
         assert_eq!(provider.models.len(), 2, "two models, one connection");
         assert_eq!(provider.base_url, "http://127.0.0.1:11436/v1");
-        assert_eq!(provider.api_key, "sk-local");
+        assert_eq!(provider.api_key_vault.as_deref(), Some("keys/nvidia"));
+    }
+
+    /// A document written before the vault landed still parses, but its
+    /// plaintext key is never written back and never becomes the credential.
+    #[test]
+    fn a_legacy_plaintext_key_is_read_then_dropped() {
+        let text =
+            "[providers.legacy]\nbase_url = \"https://legacy.example\"\napi_key = \"sk-legacy\"\n";
+        let settings = GlobalSettings::from_toml(text).expect("the old document parses");
+        let provider = settings.providers.get("legacy").expect("the provider");
+        assert_eq!(provider.legacy_api_key.as_deref(), Some("sk-legacy"));
+        assert_eq!(provider.api_key_vault, None);
+        let rendered = settings.to_toml().expect("renders");
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key =")),
+            "the plaintext field is not written back: {rendered}"
+        );
+        assert!(!rendered.contains("sk-legacy"));
     }
 
     #[test]
@@ -818,7 +860,7 @@ active_workspace = "w1"
 
 [providers.nvidia]
 base_url = "https://integrate.api.nvidia.com/v1"
-api_key = "nvapi-x"
+api_key_vault = "keys/nvidia"
 
   [providers.nvidia."glm-5.3-flash"]
   model = "zai-org/glm-5.3-flash"

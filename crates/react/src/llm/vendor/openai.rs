@@ -109,15 +109,10 @@ fn serialize_content(content: &Content) -> serde_json::Value {
     }
 
     match content {
-        Content::Text(s) => {
-            if let Ok(parts) = serde_json::from_str::<Vec<ContentPart>>(s) {
-                serde_json::Value::Array(parts.iter().map(serialize_part).collect())
-            } else if let Ok(part) = serde_json::from_str::<ContentPart>(s) {
-                serde_json::Value::Array(vec![serialize_part(&part)])
-            } else {
-                serde_json::Value::String(s.clone())
-            }
-        }
+        Content::Text(s) => match crate::llm::types::parse_content_parts(s) {
+            Some(parts) => serde_json::Value::Array(parts.iter().map(serialize_part).collect()),
+            None => serde_json::Value::String(s.clone()),
+        },
         Content::Parts(parts) => {
             serde_json::Value::Array(parts.iter().map(serialize_part).collect())
         }
@@ -141,12 +136,7 @@ struct FunctionCallJson {
 impl OpenAiVendor {
     /// Create a vendor with an explicit endpoint, model, and key.
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
-        let client = Arc::new(
-            Client::builder()
-                // .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("Failed to create HTTP client"),
-        );
+        let client = Arc::new(crate::llm::vendor::build_http_client());
 
         Self {
             client,
@@ -444,11 +434,13 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let url = format!("{}/chat/completions", endpoint);
 
-        info!(
-            "Req: {}",
-            serde_json::to_string(&openai_req)
-                .unwrap_or_else(|_| "Failed to serialize request".into())
-        );
+        if log::log_enabled!(log::Level::Info) {
+            info!(
+                "Req: {}",
+                serde_json::to_string(&openai_req)
+                    .unwrap_or_else(|_| "Failed to serialize request".into())
+            );
+        }
 
         let t1 = std::time::Instant::now();
         let response = client
@@ -484,10 +476,13 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let resp = LlmResponse::OpenAI(body);
 
-        info!(
-            "Resp: {}",
-            serde_json::to_string(&resp).unwrap_or_else(|_| "Failed to serialize response".into())
-        );
+        if log::log_enabled!(log::Level::Info) {
+            info!(
+                "Resp: {}",
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|_| "Failed to serialize response".into())
+            );
+        }
 
         context.notify_response(&resp);
         Ok(resp)
@@ -533,11 +528,13 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let url = format!("{}/chat/completions", endpoint);
 
-        info!(
-            "Req: {}",
-            serde_json::to_string(&openai_req)
-                .unwrap_or_else(|_| "Failed to serialize request".into())
-        );
+        if log::log_enabled!(log::Level::Info) {
+            info!(
+                "Req: {}",
+                serde_json::to_string(&openai_req)
+                    .unwrap_or_else(|_| "Failed to serialize request".into())
+            );
+        }
 
         let response = client
             .post(&url)
@@ -568,11 +565,17 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             let mut byte_stream = response.bytes_stream();
             let mut extractor = OpenAIExtractor::new(JsonExtractor::default());
             let mut acc = StreamToolCallAccumulator::new();
+            // A transport chunk may split a multi-byte character; keep the
+            // incomplete tail and decode it with the next chunk.
+            let mut utf8_tail: Vec<u8> = Vec::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes).to_string();
+                        utf8_tail.extend_from_slice(&bytes);
+                        let valid = crate::utils::complete_utf8_prefix(&utf8_tail);
+                        let text = String::from_utf8_lossy(&utf8_tail[..valid]).into_owned();
+                        utf8_tail.drain(..valid);
 
                         if let Some(chats) = extractor.push(&text) {
                             for chat in chats {
@@ -607,11 +610,11 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                             let args_delta = call
                                                 .function
                                                 .as_ref()
-                                                .and_then(|f| f.arguments.clone())
+                                                .and_then(|f| f.arguments.as_deref())
                                                 .unwrap_or_default();
 
                                             if let Some((n, args_val, id)) =
-                                                acc.push_delta(index, id, name, &args_delta)
+                                                acc.push_delta(index, id, name, args_delta)
                                             {
                                                 on_chunk.as_ref().inspect(|cb| cb(&n));
                                                 let _ = tx

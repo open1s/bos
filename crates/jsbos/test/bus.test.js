@@ -98,3 +98,25 @@ test.serial('subscriber yields null when nothing arrives before the timeout', as
   const sub = await bus.createSubscriber(topic('empty'))
   t.is(await sub.recvWithTimeoutMs(150), null)
 })
+
+// A handler that returns a promise used to be stringified into
+// "[object Promise]" instead of being awaited.
+test.serial('callable and queryable handlers may be async', async (t) => {
+  const bus = await newBus(t)
+
+  const rpcName = topic('async-rpc')
+  const callable = await bus.createCallable(rpcName)
+  // Handlers are invoked error-first, like every other ThreadsafeFunction.
+  await callable.run(async (_err, payload) => `echo:${payload}`)
+  // Give Zenoh a moment to route the new queryable/callable.
+  await sleep(200)
+  const caller = await bus.createCaller(rpcName)
+  t.is(await caller.callText('hi'), 'echo:hi')
+
+  const queryName = topic('async-query')
+  const queryable = await bus.createQueryable(queryName)
+  await queryable.run(async (_err, payload) => payload.toUpperCase())
+  await sleep(200)
+  const query = await bus.createQuery(queryName)
+  t.is(await query.queryText('hey'), 'HEY')
+})

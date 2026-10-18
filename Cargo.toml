@@ -18,7 +18,9 @@ resolver = "2"
 tokio = { version = "1.52", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-toml = "1.1.8+spec-1.1.0"
+# Cargo ignores semver build metadata, so `+spec-1.1.0` only produced a
+# manifest warning on every build.
+toml = "1.1.8"
 serde_yaml = "0.9"
 dashmap = "6.2.1"
 anyhow = "1.0.104"
@@ -40,9 +42,17 @@ notify = "8"
 async-channel = "2.5"
 shellexpand = "3.1"
 bus = { path = "crates/bus" }
-portable-pty = "0.8"
-regorus = "0.11"
-vte = "0.13"
+portable-pty = "0.9.0"
+regorus = "0.13.0"
+vte = "0.15.0"
+unicode-width = "0.2"
+# The admin-key vault: a memory-hard KDF, an XChaCha20-Poly1305 AEAD, and the
+# zeroizing wrappers that keep a derived key and its plaintext out of ordinary
+# allocations once they are dropped.
+argon2 = "0.6.0"
+chacha20poly1305 = "0.11.0"
+zeroize = "1.9.1"
+rand = "0.10.3"
 
 [workspace.package]
 version = "3.0.2"
@@ -56,3 +66,23 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# A key-derivation function is the one dependency whose debug build a reader
+# feels: Argon2 at the vault's documented 64 MiB / 3 passes is benchmarked in
+# release, not at opt-level 0. Compiling just the KDF, its Blake2 core and the
+# AEAD optimised keeps the unlock press responsive and the security tests quick,
+# without changing a single crypto parameter.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+
+[profile.dev.package.chacha20]
+opt-level = 3
+
+[profile.dev.package.poly1305]
+opt-level = 3

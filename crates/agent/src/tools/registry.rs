@@ -171,6 +171,11 @@ impl ToolRegistry {
     }
 
     /// Execute a tool by name, validating arguments against its schema.
+    ///
+    /// Async tools are driven to completion on a dedicated thread with its own
+    /// current-thread runtime, because this entry point is synchronous while
+    /// the tool's future may await I/O. Their arguments are validated before
+    /// dispatch, exactly like a synchronous tool's.
     pub fn execute(
         &self,
         name: &str,
@@ -178,22 +183,33 @@ impl ToolRegistry {
     ) -> Result<serde_json::Value, ToolError> {
         // First try async tools via suffix matching
         if let Some(tool) = self.find_async_tool(name) {
-            let tool = tool.clone();
-            let args = args.clone();
+            let registry_name = tool.name().to_string();
+            let schema =
+                if let Some(cached) = self.schema_cache.get(&registry_name).map(|r| r.clone()) {
+                    cached
+                } else {
+                    let schema = tool.json_schema();
+                    self.schema_cache.insert(registry_name, schema.clone());
+                    schema
+                };
+            super::validate_args(&schema, args)?;
 
+            let args = args.clone();
             let (tx, rx) = std::sync::mpsc::channel();
 
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .expect("Failed to create runtime");
-                let result = rt.block_on(tool.run(&args));
+                let result = match tokio::runtime::Builder::new_current_thread().build() {
+                    Ok(rt) => rt.block_on(tool.run(&args)),
+                    Err(e) => Err(ToolError::Failed(format!(
+                        "Failed to create tool runtime: {e}"
+                    ))),
+                };
                 let _ = tx.send(result);
             });
 
             return rx
                 .recv()
-                .map_err(|e| ToolError::Failed(format!("Channel error: {}", e)))?;
+                .map_err(|e| ToolError::Failed(format!("Async tool thread failed: {e}")))?;
         }
 
         let tool = self
@@ -243,6 +259,47 @@ mod mcp_projection_tests {
         async fn run(&self, _input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
             Ok(serde_json::json!({}))
         }
+    }
+
+    struct StrictAsync;
+
+    #[async_trait]
+    impl AsyncTool for StrictAsync {
+        fn name(&self) -> &str {
+            "strict_exec"
+        }
+        fn description(&self) -> String {
+            "requires a value".to_string()
+        }
+        fn json_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "value": { "type": "string" } },
+                "required": ["value"]
+            })
+        }
+        async fn run(&self, _input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            Ok(serde_json::json!({ "ran": true }))
+        }
+    }
+
+    #[test]
+    fn async_tool_arguments_are_validated_before_dispatch() {
+        let mut registry = ToolRegistry::new();
+        registry.register_async(Arc::new(StrictAsync)).unwrap();
+
+        let error = registry
+            .execute("strict_exec", &serde_json::json!({}))
+            .expect_err("missing required argument");
+        assert!(
+            matches!(error, ToolError::SchemaMismatch { .. }),
+            "{error:?}"
+        );
+
+        let value = registry
+            .execute("strict_exec", &serde_json::json!({"value": "x"}))
+            .expect("valid call runs");
+        assert_eq!(value["ran"], true);
     }
 
     fn registry(name: &str, mcp: bool) -> ToolRegistry {

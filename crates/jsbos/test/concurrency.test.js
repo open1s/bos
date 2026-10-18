@@ -71,3 +71,43 @@ test.serial('read-only getters stay responsive while a run is in flight', async 
   agent.stop()
   await running
 })
+
+test.serial('session setters and stop never park the event loop on a run', async (t) => {
+  const { server, requestSeen, port } = await slowLlmServer(1500)
+  t.teardown(() => server.close())
+
+  const agent = await Agent.create({
+    name: 'concurrency-stop',
+    model: 'test',
+    baseUrl: 'http://127.0.0.1:' + port + '/v1',
+    apiKey: 'test-key',
+    systemPrompt: 'You are a test.',
+    temperature: 0.0,
+    timeoutSecs: 30,
+  })
+  t.teardown(() => agent.close())
+
+  const running = agent.react('hello').catch((err) => String(err))
+  await Promise.race([
+    requestSeen,
+    sleep(5000).then(() => {
+      throw new Error('agent never reached the mock LLM endpoint')
+    }),
+  ])
+
+  // A write path must refuse instead of blocking the JavaScript thread (the
+  // run holds the agent for the whole call, so blocking here used to deadlock
+  // as soon as a tool needed the event loop).
+  const started = Date.now()
+  t.throws(() => agent.clearSession(), { message: /running/ })
+
+  // stop({ clearSession: true }) must return immediately and apply the clear
+  // once the run ends.
+  const stopResult = agent.stop({ clearSession: true })
+  const elapsed = Date.now() - started
+  t.true(elapsed < 1000, 'stop blocked for ' + elapsed + 'ms while a run was in flight')
+  t.true(stopResult.stopped)
+
+  await running
+  t.deepEqual(agent.getMessages(), [])
+})

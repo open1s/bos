@@ -1,12 +1,12 @@
-//! The resolution layer: one workspace's concrete values.
+//! The resolution layer: one session's concrete values.
 //!
-//! Three levels fold into one answer, and the precedence is the design's own.
-//! The session names a model, the workspace names a default, the global file
-//! defines what those names mean, and the framework supplies what nobody set.
-//!
-//! Nothing is ever silently substituted. A name that no longer resolves comes
-//! back as a missing definition for the view to report, because a quiet
-//! fallback would send a turn on an endpoint the reader never chose.
+//! The SESSION names the model, and the global file defines what a name means.
+//! There is no workspace-level model: the selection is per chat, so two chats
+//! in one workspace can run different models. Nothing is ever silently
+//! substituted - a name that no longer resolves comes back as a missing
+//! definition for the view to report, and a session that names nothing is
+//! unchosen - because a quiet fallback would send a turn on an endpoint the
+//! reader never chose.
 
 use std::path::PathBuf;
 
@@ -19,22 +19,13 @@ use super::{dir, TranscriptPolicy};
 /// The skill folder used when neither level names one.
 const FRAMEWORK_SKILLS_DIR: &str = "~/.bos/skills";
 
-/// Which level named the model in effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Source {
-    /// The session carries its own choice, which beats the workspace's.
-    Session,
-    /// The workspace's own default.
-    Workspace,
-}
-
 /// The connection and model facts one request needs.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Connection {
     /// The API base URL, owned by the provider rather than by the model.
     pub(crate) base_url: String,
-    /// The API key, owned by the provider.
-    pub(crate) api_key: String,
+    /// The vault entry the provider named, if any.
+    pub(crate) api_key_vault: Option<String>,
     /// The full API model id, not the nickname the reader sees.
     pub(crate) model: String,
     /// The wire protocol, or none to follow the model.
@@ -74,19 +65,15 @@ pub(crate) struct SessionChoice {
 pub(crate) enum ModelChoice {
     /// A name resolved against the provider tree.
     Found {
-        /// Which level named it.
-        source: Source,
         /// The name that resolved.
         reference: ModelRef,
         /// The connection it resolved to.
         connection: Connection,
     },
-    /// Nothing names a model.
+    /// This session names no model.
     Unchosen,
     /// A name that no longer resolves. Never replaced by another.
     Missing {
-        /// Which level named it.
-        source: Source,
         /// The name that did not resolve.
         reference: ModelRef,
     },
@@ -203,7 +190,7 @@ pub(crate) fn resolve(
     entry: Option<&WorkspaceRef>,
     session: &SessionChoice,
 ) -> Resolution {
-    let model = choose_model(global, workspace, session.model.as_ref());
+    let model = choose_model(global, session.model.as_ref());
 
     // The session's own preset wins; one that names none takes the user's
     // default, which is the reference's selectedDefault over its deployment
@@ -303,29 +290,21 @@ impl Resolution {
     }
 }
 
-/// Pick the model: the session's own choice, else the workspace's, else none.
-fn choose_model(
-    global: &GlobalSettings,
-    workspace: &WorkspaceSettings,
-    session_model: Option<&ModelRef>,
-) -> ModelChoice {
-    let chosen = match session_model {
-        Some(reference) => Some((Source::Session, reference.clone())),
-        None => workspace
-            .general
-            .model_ref()
-            .map(|reference| (Source::Workspace, reference)),
-    };
-    let Some((source, reference)) = chosen else {
+/// Pick the model: the session's own choice, else none.
+///
+/// There is no workspace-level default any more. An older settings file may
+/// still carry one; it is migrated onto the open session at launch, so this
+/// function never reads it.
+fn choose_model(global: &GlobalSettings, session_model: Option<&ModelRef>) -> ModelChoice {
+    let Some(reference) = session_model.cloned() else {
         return ModelChoice::Unchosen;
     };
     match global.lookup(&reference) {
         Some((provider, leaf)) => ModelChoice::Found {
-            source,
             reference: reference.clone(),
             connection: Connection {
                 base_url: provider.base_url.clone(),
-                api_key: provider.api_key.clone(),
+                api_key_vault: provider.api_key_vault.clone(),
                 model: leaf.model.clone(),
                 // A leaf that names no protocol speaks its family's, so
                 // the protocol the pane set on the provider node reaches the
@@ -337,7 +316,7 @@ fn choose_model(
                 input_types: leaf.input_types.clone(),
             },
         },
-        None => ModelChoice::Missing { source, reference },
+        None => ModelChoice::Missing { reference },
     }
 }
 
@@ -411,6 +390,9 @@ name = "bsh"
 root = "/tmp/bsh"
 "#;
 
+    /// A workspace file as an older build wrote it: the model pair is legacy
+    /// INPUT now, so this fixture doubles as the "an old file still parses"
+    /// case. The pair must not become a fallback.
     const WORKSPACE: &str = r#"
 [general]
 provider = "nvidia"
@@ -441,58 +423,63 @@ mcp_servers = [
         g.workspaces.first().cloned().expect("the registry entry")
     }
 
+    /// The choice one session carries into resolution.
+    fn choice(provider: &str, model: &str) -> SessionChoice {
+        SessionChoice {
+            model: Some(ModelRef {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            }),
+            preset: None,
+        }
+    }
+
     fn bare() -> Resolution {
         resolve(
             &global(),
             &workspace(),
             Some(&entry()),
-            &SessionChoice::default(),
+            &choice("nvidia", "glm"),
         )
     }
 
     #[test]
-    fn the_workspace_default_is_used_when_the_session_names_none() {
-        let r = bare();
-        let ModelChoice::Found {
-            source, connection, ..
-        } = &r.model
-        else {
-            panic!("the workspace fixture selects a model that resolves");
-        };
-        assert_eq!(*source, Source::Workspace);
+    fn a_legacy_workspace_pair_is_not_a_fallback() {
+        // The fixture still carries provider/model under [general], which an
+        // older build wrote. They parse, and they select NOTHING.
+        let r = resolve(
+            &global(),
+            &workspace(),
+            Some(&entry()),
+            &SessionChoice::default(),
+        );
         assert_eq!(
-            connection.model, "nvidia/z-ai/glm-5.3-flash",
+            r.model,
+            ModelChoice::Unchosen,
+            "the retired workspace selection must not choose a model"
+        );
+        assert_eq!(r.model.refusal(), Some(Refusal::NoModel));
+    }
+
+    #[test]
+    fn the_sessions_choice_resolves_against_the_global_tree() {
+        let r = resolve(
+            &global(),
+            &workspace(),
+            Some(&entry()),
+            &choice("nvidia", "kimi"),
+        );
+        let ModelChoice::Found { connection, .. } = &r.model else {
+            panic!("the session's choice resolves");
+        };
+        assert_eq!(
+            connection.model, "nvidia/moonshotai/kimi-k3",
             "the connection carries the API id, not the nickname"
         );
         assert_eq!(
             connection.base_url, "http://127.0.0.1:11436/v1",
             "the connection comes from the provider, not the leaf"
         );
-    }
-
-    #[test]
-    fn the_sessions_own_choice_beats_the_workspace_default() {
-        let chosen = ModelRef {
-            provider: "nvidia".to_string(),
-            model: "kimi".to_string(),
-        };
-        let r = resolve(
-            &global(),
-            &workspace(),
-            Some(&entry()),
-            &SessionChoice {
-                model: Some(chosen.clone()),
-                preset: None,
-            },
-        );
-        let ModelChoice::Found {
-            source, connection, ..
-        } = &r.model
-        else {
-            panic!("the session's choice resolves");
-        };
-        assert_eq!(*source, Source::Session);
-        assert_eq!(connection.model, "nvidia/moonshotai/kimi-k3");
     }
 
     #[test]
@@ -522,7 +509,6 @@ mcp_servers = [
         assert_eq!(
             r.model,
             ModelChoice::Missing {
-                source: Source::Session,
                 reference: chosen.clone(),
             },
             "the reader is told what it wanted, not quietly given something else"
@@ -555,7 +541,7 @@ mcp_servers = [
             &global(),
             &overridden,
             Some(&entry()),
-            &SessionChoice::default(),
+            &choice("nvidia", "glm"),
         );
         assert_eq!(
             r.reasoning_effort.as_deref(),

@@ -100,10 +100,10 @@ impl WorkspaceValidator {
         let normalized = Self::normalize_path(&full_path)?;
         let workspace_normalized = Self::normalize_path(&self.workspace_root)?;
 
-        let normalized_str = normalized.to_string_lossy().to_lowercase();
-        let workspace_str = workspace_normalized.to_string_lossy().to_lowercase();
-
-        if !normalized_str.starts_with(&workspace_str) {
+        // Compare path components, not string prefixes: `/tmp/ws-evil` shares
+        // the string prefix `/tmp/ws` but is not inside the workspace. Both
+        // sides are canonical, so one components comparison settles it.
+        if !normalized.starts_with(&workspace_normalized) {
             return Err(SecurityError::OutsideWorkspace(format!(
                 "Path {} is outside workspace {}",
                 path,
@@ -170,6 +170,37 @@ mod tests {
 
         let result = validator.validate_path("/etc/passwd");
         assert!(matches!(result, Err(SecurityError::OutsideWorkspace(_))));
+    }
+
+    /// A symlinked directory must not turn a same-prefix sibling into an
+    /// "inside workspace" path.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cannot_escape_through_a_shorter_workspace_prefix() {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("bos-workspace-validator-{}", std::process::id()));
+        let workspace = base.join("ws");
+        let sibling = base.join("ws-evil");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("secret.txt"), "secret").unwrap();
+        symlink(&sibling, workspace.join("link")).unwrap();
+
+        let validator = WorkspaceValidator::new(workspace.clone());
+        let error = validator
+            .validate_path("link/secret.txt")
+            .expect_err("a path resolving outside the workspace is refused");
+        assert!(
+            matches!(error, SecurityError::OutsideWorkspace(_)),
+            "{error:?}"
+        );
+
+        std::fs::write(workspace.join("inside.txt"), "ok").unwrap();
+        assert!(validator.validate_path("inside.txt").is_ok());
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

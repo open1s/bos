@@ -7,6 +7,8 @@
 use flexi_logger::{Cleanup, Criterion, DeferredNow, FileSpec, Logger, Naming};
 use log::Record;
 use std::{
+    cell::RefCell,
+    fmt,
     io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -39,32 +41,62 @@ pub fn short_format(
     )
 }
 
+thread_local! {
+    /// Reused so the stdout formatter does not allocate a fresh String for
+    /// every log record.
+    static MESSAGE_BUFFER: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
 fn pretty_stdout(w: &mut dyn Write, now: &mut DeferredNow, record: &Record) -> std::io::Result<()> {
     let ts = now.now().format("%H:%M:%S%.3f");
     let level = record.level();
     let file = record.file().unwrap_or("unknown");
     let line = record.line().unwrap_or(0);
 
-    writeln!(
-        w,
-        "🕒 {} │ {:<5} │ {}:{}\n{}",
-        ts,
-        level,
-        file,
-        line,
-        pretty_msg(&record.args().to_string())
+    writeln!(w, "🕒 {} │ {:<5} │ {}:{}", ts, level, file, line)?;
+    write_pretty_message(w, record.args())
+}
+
+/// Cheap prefix check that keeps most ordinary log lines out of the JSON
+/// parser; only values that could begin valid JSON are attempted.
+fn looks_like_json(message: &str) -> bool {
+    matches!(
+        message.trim_start().as_bytes().first(),
+        Some(b'{' | b'[' | b'"' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n')
     )
 }
 
-fn pretty_msg(msg: &str) -> String {
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(msg) {
-        return format!(
-            "{}\n{}",
-            "📦 JSON:",
-            serde_json::to_string_pretty(&json).unwrap()
-        );
-    }
-    msg.to_string()
+fn write_pretty_message(w: &mut dyn Write, args: &fmt::Arguments<'_>) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+
+    MESSAGE_BUFFER
+        .try_with(|cell| {
+            let Ok(mut buffer) = cell.try_borrow_mut() else {
+                // Recursive logging: format directly instead of panicking on a
+                // re-entrant borrow of the shared buffer.
+                return write!(w, "{}", args);
+            };
+            buffer.clear();
+            // Do not retain a huge buffer for the life of the thread just
+            // because one unusually large record was logged.
+            if buffer.capacity() > 64 * 1024 {
+                buffer.shrink_to(4096);
+            }
+            // Writing to a String cannot fail.
+            let _ = write!(buffer, "{}", args);
+
+            let trimmed = buffer.trim_start();
+            if looks_like_json(trimmed) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+                        // flexi_logger appends the record's trailing newline.
+                        return write!(w, "📦 JSON:\n{}", pretty);
+                    }
+                }
+            }
+            write!(w, "{}", buffer)
+        })
+        .unwrap_or_else(|_| write!(w, "{}", args))
 }
 
 /// The default log directory: `~/.bos/log`. `None` when no home directory
@@ -77,7 +109,8 @@ pub fn default_log_dir() -> Option<PathBuf> {
 ///
 /// Writes rotating files under [`default_log_dir`] with the basename `bos`
 /// and mirrors them to stdout. The level comes from `RUST_LOG`, then
-/// `BOS_LOG`, then the `logging.level` config key, defaulting to `error`.
+/// `BOS_LOG`, then the `logging.level` config key, defaulting to `error`;
+/// an unrecognized level falls back to `info`.
 /// Returns early if the log directory cannot be created; a failure to
 /// install the logger is printed to stderr.
 pub fn auto_init_tracing() {
@@ -130,8 +163,14 @@ pub fn auto_init_tracing_in(log_dir: impl AsRef<Path>, basename: &str) {
     );
 
     let file_spec = FileSpec::default().directory(logdir).basename(basename);
-    let logger = Logger::try_with_str(level)
-        .unwrap()
+    let logger = match Logger::try_with_str(level) {
+        Ok(logger) => logger,
+        Err(e) => {
+            eprintln!("logging: invalid level filter: {}", e);
+            return;
+        }
+    };
+    let logger = logger
         .log_to_file(file_spec)
         .rotate(
             Criterion::Size(10_000_000), // 10 MB
@@ -223,5 +262,50 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pretty_stdout_keeps_plain_messages_intact() {
+        let mut out = Vec::new();
+        let mut now = flexi_logger::DeferredNow::new();
+        let record = log::Record::builder()
+            .args(format_args!("plain message"))
+            .level(log::Level::Info)
+            .target("ui")
+            .file(Some("src/lib.rs"))
+            .line(Some(1))
+            .build();
+
+        crate::pretty_stdout(&mut out, &mut now, &record).expect("formatting");
+
+        let text = String::from_utf8(out).expect("formatter output is utf-8");
+        assert!(text.contains("plain message"), "{text}");
+        assert!(!text.contains("📦 JSON"), "{text}");
+        assert_eq!(
+            text.matches('\n').count(),
+            1,
+            "exactly one metadata/message separator: {text:?}"
+        );
+        assert!(
+            text.ends_with("plain message"),
+            "the logger appends the trailing newline: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_pretty_stdout_pretty_prints_json() {
+        let mut out = Vec::new();
+        let mut now = flexi_logger::DeferredNow::new();
+        let record = log::Record::builder()
+            .args(format_args!("{{\"a\":1,\"b\":[true,null]}}"))
+            .level(log::Level::Info)
+            .target("ui")
+            .build();
+
+        crate::pretty_stdout(&mut out, &mut now, &record).expect("formatting");
+
+        let text = String::from_utf8(out).expect("formatter output is utf-8");
+        assert!(text.contains("📦 JSON:"), "{text}");
+        assert!(text.contains("\"a\": 1"), "{text}");
     }
 }

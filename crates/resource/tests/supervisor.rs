@@ -232,3 +232,62 @@ async fn list_reports_restart_count() {
         .await
         .unwrap();
 }
+/// A failure part-way through `Open` must not leave earlier children running:
+/// the supervisor tears down whatever it already spawned.
+#[tokio::test]
+async fn failed_open_tears_down_started_children() {
+    let mgr = Arc::new(ResourceManager::new(test_policy()));
+    mgr.register(Box::new(ProcManager::new(mgr.clone())), "admin".into())
+        .await
+        .unwrap();
+
+    let started = ChildSpec {
+        args: vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()],
+        env: vec![],
+    };
+    let missing = ChildSpec {
+        args: vec!["bos-no-such-binary-for-tests".into()],
+        env: vec![],
+    };
+    let supervisor = Supervisor::new(
+        "partial",
+        mgr.clone(),
+        vec![started, missing],
+        SupPolicy::default(),
+    );
+    let sup_uri = supervisor.meta().uri.clone();
+    mgr.register(Box::new(supervisor), "admin".into())
+        .await
+        .unwrap();
+
+    let client = ResourceClient::new("admin", Some(mgr.clone()), None);
+    let result = client.invoke(&sup_uri, ResourceAction::Open).await;
+    assert!(result.is_err(), "second child cannot spawn");
+
+    // The proc manager still knows the first child, but the supervisor must
+    // have deregistered (and killed) it as part of the failed Open.
+    let entries = match client
+        .invoke("proc://", ResourceAction::List { pattern: None })
+        .await
+        .unwrap()
+    {
+        ResourceOutput::Listed { entries } => entries,
+        other => panic!("expected listed procs, got {other:?}"),
+    };
+    let uri = entries
+        .iter()
+        .find(|entry| entry.contains("sleep 60"))
+        .expect("first child was spawned")
+        .split_whitespace()
+        .next()
+        .expect("entry starts with its URI")
+        .to_string();
+    assert!(
+        uri.starts_with("proc://"),
+        "entry carries a proc URI: {uri}"
+    );
+    assert!(
+        !mgr.contains(&uri).await,
+        "partially-started child {uri} must be deregistered"
+    );
+}

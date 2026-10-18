@@ -2,8 +2,8 @@ schema_version = 0
 
 [general]
 provider = "nvidia"
-model = "z-ai/glm-5.3-flash"
-active_session = "c2d1f1ab-1701-4fc8-9040-b54a54229fdf"
+model = "stepfun-ai/step-5-preview"
+active_session = "9adbe5a7-7419-487b-8327-159aa99327bd"
 
 [agent]
 system_prompt = "You are a helpful assistant."

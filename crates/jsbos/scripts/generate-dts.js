@@ -32,7 +32,6 @@ try {
   const program = ts.createProgram([join(rootDir, 'index.js')], options)
   const diagnostics = ts.getPreEmitDiagnostics(program)
   if (diagnostics.length > 0) {
-    const host = ts.createCompilerHost(options)
     const formatHost = {
       getCanonicalFileName: (p) => p,
       getCurrentDirectory: ts.sys.getCurrentDirectory,
@@ -40,10 +39,19 @@ try {
     }
     console.warn(ts.formatDiagnosticsWithColorAndContext(diagnostics, formatHost))
   }
+  // A type error in index.js would still emit a declaration file, but one
+  // that no longer matches the public API. Fail the build instead of
+  // publishing types that lie about the wrapper.
+  const errors = diagnostics.filter((d) => d.category === ts.DiagnosticCategory.Error)
+  if (errors.length > 0) {
+    console.error(`tsc reported ${errors.length} error(s) in index.js; refusing to emit index.d.ts`)
+    process.exit(1)
+  }
   program.emit()
   indexDts = readFileSync(join(tmpOutDir, 'index.d.ts'), 'utf8')
-} catch {
-  console.warn('tsc failed to generate index.d.ts')
+} catch (error) {
+  // Surface the cause: the previous `catch {}` left a bare "tsc failed" line.
+  console.error('tsc failed to generate index.d.ts:', error)
   process.exit(1)
 }
 

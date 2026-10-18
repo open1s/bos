@@ -17,9 +17,13 @@ use serde::{Deserialize, Serialize};
 /// to the `n`th line, counted from one the way an editor numbers lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Note {
-    /// The line the note is pinned to, or none for the file as a whole.
+    /// The first line the note is pinned to, or none for the file as a whole.
     #[serde(default)]
     pub(crate) line: Option<usize>,
+    /// The LAST line, when the note covers a range (the reference's `lines 12-18`).
+    /// Absent on single-line notes and on records written before ranges existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) to: Option<usize>,
     /// What the note says.
     pub(crate) text: String,
 }
@@ -27,9 +31,10 @@ pub(crate) struct Note {
 impl Note {
     /// The anchor the note is labelled with: a line number, or the whole file.
     pub(crate) fn anchor(&self) -> String {
-        match self.line {
-            Some(line) => format!("L{line}"),
-            None => String::from("·"),
+        match (self.line, self.to) {
+            (Some(from), Some(to)) if to > from => format!("L{from}-{to}"),
+            (Some(line), _) => format!("L{line}"),
+            (None, _) => String::from("·"),
         }
     }
 }
@@ -80,6 +85,23 @@ impl Notes {
     }
 
     /// Remove the `index`th note from a file; a bad index is a no-op.
+    /// Move a file's notes with it.
+    ///
+    /// A rename the reader made in the tree must not orphan the remarks pinned
+    /// to the old path: notes are keyed by that path, so the key moves with it.
+    pub(crate) fn rename(&mut self, from: &Path, to: &Path) {
+        let from = from.to_string_lossy().to_string();
+        let to = to.to_string_lossy().to_string();
+        if let Some(notes) = self.0.remove(&from) {
+            self.0.insert(to, notes);
+        }
+    }
+
+    /// Drop a file's notes, for when the file they described is gone.
+    pub(crate) fn forget(&mut self, rel: &Path) {
+        self.0.remove(&rel.to_string_lossy().to_string());
+    }
+
     pub(crate) fn remove(&mut self, rel: &Path, index: usize) {
         let key = rel.to_string_lossy().to_string();
         if let Some(notes) = self.0.get_mut(&key) {
@@ -97,6 +119,20 @@ impl Notes {
     pub(crate) fn has_notes(&self, rel: &Path) -> bool {
         !self.on(rel).is_empty()
     }
+}
+
+/// The byte offset a one-based line starts at, the anchor a note points to.
+pub(crate) fn line_start_offset(text: &str, line: usize) -> usize {
+    let mut number = 1;
+    for (offset, ch) in text.char_indices() {
+        if number == line {
+            return offset;
+        }
+        if ch == '\n' {
+            number += 1;
+        }
+    }
+    text.len()
 }
 
 /// Turn a buffer's byte offset into a one-based line number, the anchor a note
@@ -137,6 +173,7 @@ mod tests {
             Note {
                 line: Some(3),
                 text: String::from("watch this"),
+                to: None,
             },
         );
         notes.save(&root).unwrap();
@@ -145,7 +182,8 @@ mod tests {
             loaded.on(Path::new("src/lib.rs")),
             [Note {
                 line: Some(3),
-                text: String::from("watch this")
+                text: String::from("watch this"),
+                to: None,
             }]
         );
         assert_eq!(
@@ -170,6 +208,7 @@ mod tests {
             Note {
                 line: None,
                 text: String::from("first"),
+                to: None,
             },
         );
         notes.add(
@@ -177,6 +216,7 @@ mod tests {
             Note {
                 line: None,
                 text: String::from("second"),
+                to: None,
             },
         );
         notes.remove(rel, 0);
@@ -192,10 +232,12 @@ mod tests {
         let whole = Note {
             line: None,
             text: String::new(),
+            to: None,
         };
         let pinned = Note {
             line: Some(12),
             text: String::new(),
+            to: None,
         };
         assert_eq!(whole.anchor(), "·");
         assert_eq!(pinned.anchor(), "L12");

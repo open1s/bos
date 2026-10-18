@@ -1343,3 +1343,911 @@ timestamp: \`~/.bos/bsh/settings.toml\` became a default-value fixture (workspac
 at \`.../worktree/97f97e/feature-work/crates/bsh\`, no providers) at 14:05, 14:07, 14:14
 and 14:15, each time while that tree's tests ran. This checkout's suite cannot do it -
 \`cargo test -p bsh\` leaves the file byte-identical - because of the round-132 guard.
+
+Round 134 reviewed the merged right panel and fixed seven defects in it, all
+found by reading the pane rather than by a failing test - the suite was green
+before the round and the compiler had nothing to say.
+
+**A rename could not be made.** `files_rename_row` was a CHILD of
+`files_new_row`, which only renders after a double-click on the tree's blank
+space, so pressing the pencil armed `renaming` and drew nothing: no field, no
+confirm control, no way to type. The row renders on its own condition now, and
+`begin_rename` focuses the field the press asked for.
+
+**The header's maximise control closed the panel.** `right_panel_control`'s
+handler folded the column for BOTH controls, so the glyph promised a width the
+press threw away, and the bar carried two controls doing one thing. Maximise is
+real now (`RightPanel::maximized`, the glyph flips to Minimize, the width becomes
+the window less the sidebar), and a hand drag gives the maximised column up.
+
+**A click on the seam discarded the dragged width.** `commit_right_panel_width`
+cleared `user_w` whenever the drag had not moved, so touching the handle reset a
+size the reader had chosen. The sidebar's seam has always kept it; this one does
+too, and `drag_right_panel_width` only stores a width once the drag is real.
+
+**Row and tab element ids were keyed by file NAME.** Two branches can hold the
+same name - the state fields already use a rel for exactly that reason - so the
+rows shared an element id, a hover group and their action ids. Ids and the group
+key on the path now; the DEBUG selector stays name-based because that is the
+address the click tests use.
+
+**Two refusals were hardcoded English.** "That path leaves the workspace." and the
+terminal's "refused by policy" came from string literals; they are
+`right.files.outside` and `right.terminal.refused` in both dictionaries now.
+
+**Notes orphaned onto a path nothing pointed at.** Notes are keyed by the
+workspace-relative path, so a rename left them under the old key and a delete left
+them forever. `Notes::rename` and `Notes::forget` move and drop them, called from
+`rename_file` and `delete_file`.
+
+**The centre column never learned the panel existed.** `render` computed
+`conversation_w = viewport - sidebar`, so with a 480px panel open on a 1280
+window the chat width, the width handles and the rail's own container query all
+believed in 1640px of space that the layout had given away. It subtracts the
+panel now.
+
+That measurement exposed the layout bug the capture showed: the chat width's
+680px FLOOR then overflowed the 520px column, hanging the composer and the hero
+over the panel's edge with their text clipped. `theme::chat_width_at` caps the
+result at the column less the composer's own widen - the floor exists so the chat
+is readable, not so it overflows - while a column of zero still means "not
+measured yet" and keeps the floor. A maximised panel leaves a zero column, which
+is what maximising a side panel means.
+
+**And switching workspaces left the old workspace's files on screen.** Every path
+in the pane is relative, so after a switch an open tab's rel resolved into the NEW
+workspace's file and a save would have written there. `refile_workspace` drops
+the tabs, the tree and the expanded branches, then re-lists the workspace in use;
+the hero's workspace picker calls it.
+
+Verified by five new tests, each re-injected and watched to fail with its own
+message (rename row hidden, maximise closing, seam clearing, `chat_width_at`
+uncapped, refile a no-op), and by two captures of the running app: the panel open
+on Files with the rename row drawn over the tree and the composer wrapping inside
+the narrow column, then the same panel maximised across the whole centre.
+
+Trap worth keeping: `shutil.copy2` preserves the source's mtime, so restoring a
+file that way leaves cargo believing its binary is newer and the next `cargo test`
+runs the OLD build. Five tests "failed" against a fix that was already correct
+until the files were touched. When a restore is involved, touch the files (or
+`cargo clean -p`) before believing a red suite.
+Round 135 closed the three gaps round 134 reported rather than fixed.
+
+**The two dead locale keys are gone.** `right.files.up` and `right.files.save`
+named a browser's up-one-level and a save button that the tree and cmd-s
+replaced; nothing read either, so they are deleted from both dictionaries
+instead of being parked. A key is vocabulary for a control that exists.
+
+**The panel's seam carries the reveal bar.** The 2x72 bar the content handles
+draw is now ONE definition (`ui::handle_bar`), used by the chat handles and by
+the panel's strip: 2px wide, 72 tall, a solid 16px band between two 28px fades
+of `scrollbar_bar`, at opacity 0 until the pointer is on the seam (or a drag
+holds it). `Shell::right_hover` is set by the strip's own move, which stops
+propagation, and cleared by the column's move - the same pair the chat handles
+use, and the reason the clear cannot win the same dispatch.
+
+**The terminal runs a real shell.** The module documented a `portable_pty` child
+it never had; it now opens one per command and reads the child's output on a
+thread into a shared scrollback, so what the pane shows is the shell's own
+output rather than an echo. Two things had to be measured rather than assumed:
+the reader's `$SHELL` cannot be silenced (fish reprints its prompt and echoes
+the command regardless), and an INTERACTIVE zsh cannot either - zsh's ZLE
+re-enables echo and redraws its line editor, which filled the screen with `%`
+fragments and a second copy of every command. So a command runs non-interactively
+under `zsh -f` (or `bash --norc`), the pane writes its own `cwd $ command` line,
+and the trade-off is stated where it belongs: a `cd` does not outlive its
+command, because there is no session to outlive. The gate still decides: a
+refused command is never written to a pty at all.
+
+Wiring traps worth keeping: the pane polls a line VERSION and copies the
+scrollback only when it moved (a quiet terminal costs one integer compare per
+120ms tick, not a lock per frame); `Terminal::send` kills the previous child
+before starting the next, so one command cannot outlive its successor; and the
+probe that opened the panel for a capture must anchor on a line INSIDE
+`Shell::new` - `rfind` found a later `shell` in an unrelated `this.update`
+closure, the build succeeded, and the capture showed no panel at all.
+
+Verified by two captures of the running app (the terminal showing `$ echo
+from-the-pty; ls | head -3` followed by `from-the-pty`, `AGENTS.md`,
+`ARCHITECTURE.md`, `CHANGELOG.md` - the shell's output, not an echo) and by
+tests that were re-injected and watched to fail: `send` not writing,
+`strip_ansi` as the identity, and the seam move setting hover false.
+Round 136 pinned the sidebar's account row. The column was brand, new session,
+panels, tree, a `flex_1` spacer and then the row - but the TREE had no scroll
+and no `min_h`, so a long session list made the column taller than the window:
+the spacer collapsed to nothing and the row was pushed below the viewport. The
+row was also missing `flex_none`, so under pressure it SHRANK (44 measured as
+33).
+
+The tree is now the column's only flexible region (`flex_1`, `min_h(0)`,
+`overflow_y_scroll`, with its own `id` because a scroller must be stateful), the
+spacer is gone, and the account row is `flex_none` with a debug selector. The
+measured evidence is the test's: with forty sessions seeded, the row's bounds
+were `y=2129, 33 tall` in a 1080-tall window before the fix and sit at the
+bottom, 44 tall, after it - `the_account_row_stays_pinned_under_a_long_session_list`,
+which was re-injected and watched to fail with exactly that geometry.
+Round 137 completed the session menu. bsh offered two operations (Pin, Archive)
+while the reference offers five: Pin session, Rename, Fork session, Archive
+session, Copy Session ID. The three missing ones are real now, with the
+reference's wording, icons and accelerators.
+
+**Rename** edits the title in place, on the row, the way the reference's ⌥⌘G
+does - a shared `InputState` moved from row to row, one field at a time, Enter
+commits. `AppState::rename_session` retitles without touching `updated_at`, so a
+rename does not reorder the list under the reader's hand.
+
+**Fork session** copies the transcript into a new session (fresh id, its own
+file, pin/archive reset) and opens it. It forks the whole transcript, which is
+what bsh can honestly do: no per-message branch point is kept yet.
+
+**Copy Session ID** puts the id on the clipboard, which is what a bug report
+needs.
+
+**The accelerators are bound, not decoration.** `actions!(bsh_session, ...)`
+with `bind_global_actions` binding alt-cmd-g / alt-cmd-f / shift-cmd-a, handled
+by `on_action` on the shell frame so they work from wherever focus sits inside
+it. The kit's `PopupMenuItem` has no shortcut slot, so each row is an
+`element` with [icon] [label] [spacer] [keys]; `simulate_keystrokes("alt-cmd-g")`
+in a test proves the hint is true.
+
+Two live-only traps, both found by looking at the running app rather than at the
+green suite: (1) the field opened from the menu item and vanished in the same
+frame, because the menu's close handed focus back and our `InputEvent::Blur`
+handler cancelled the rename - the fix is to commit on Enter and NOT cancel on
+blur (a rename is cleared by committing it or by opening another session), and to
+focus the field through `window.defer` so the menu's own close lands first;
+(2) the row's action overlay is only hit-testable while the row is hovered, so a
+scripted click has to hover the row in the same `ocu call --calls` sequence
+before pressing the `...`, and the menu's y follows the row it opened on.
+
+Verified: the five rows captured in the running app (icons, labels, ⌥⌘G / ⌥⌘F /
+⇧⌘A) and the inline field captured open on the active row; five new tests, four
+re-injected and watched to fail (rename a no-op, fork returning the same id, the
+clipboard write dropped, the alt-cmd-g binding removed, a menu row removed).
+Round 138 added the hero workspace menu's "+ Add workspace..." row, the
+reference's own door to a new root. bsh had an add path already - the sidebar's
+small plus - but the hero chip's menu listed workspaces and stopped.
+
+`Shell::add_workspace` was split so the dialog half and the registration half are
+separable: `adopt_workspace(path)` registers the directory (or selects it when it
+is already registered), makes it active, saves, and refiles the files pane - the
+last part matters because every path in that pane is relative, so a new root
+rebases the open tabs onto another workspace's files. The hero's row and the
+sidebar's button now land in the same function, and a test can drive the half
+that needs no native dialog.
+
+Measured against the reference: the list ends with a separator and then
+"+ Add workspace..." (ellipsis included, because it opens a picker), matching the
+row drawn in the reference's own menu; the wording is shared with the sidebar
+(`side.addWorkspace`).
+
+Traps: `debug_bounds` takes `&'static str`, so a test that needs a row keyed by a
+generated id has to seed a fixed one (the session menu's test does); a scroller
+or menu item that is only hit-testable while its row is hovered needs the hover
+press in the same `ocu call --calls` sequence as the press that follows it; and
+the focus field of an inline rename must not be cancelled on blur, or the menu
+that opened it takes the field down with it.
+
+Honest note on my own automation: a stray click landed in the composer and a
+keystroke typed into an inline rename field that was still open, retitling one
+session "New chata". The title was restored from the session file before the
+round ended; the lesson is that a rename field which survives blur keeps taking
+keys, so a scripted pass should close it before pressing anywhere else.
+Round 139 fixed model switching and added the Effort row the reference carries.
+
+**Switching did not switch.** `AppState::select_model` wrote the settings
+DIALOG's draft and nothing else, while `caps::build_agent` - the one function
+the turn is built from - reads the committed tree. So the chip's label moved and
+the next request still used the old model, and nothing was saved either. The
+choice lands in the committed workspace document now (the model is a workspace
+fact), keeps any open draft in step, and is saved: the chip, the status bar and
+the built agent all read it, and a relaunch keeps it.
+
+**The Effort row exists.** The reference's model menu is two root cells - Model
+and Effort - and bsh drew only Model, although `reasoning_effort` already reached
+`AgentConfig` from the workspace tree. The row is a submenu of five levels
+(Default, Off, Low, Medium, High) with the current one marked, and its label
+carries the value (`Effort · High`) because a kit submenu item can only draw its
+label. `AppState::set_reasoning_effort` writes the workspace tree and saves;
+`caps::build_agent` maps the literal `off` to an ABSENT effort field rather than
+sending the string, which is what the reference means by "Off turns reasoning off
+and needs no value". `None` is not Off: it hands the decision back to the model's
+own declared effort.
+
+Measured from the reference's own package (`dsh-client-ui-settings-models`): effort
+is a per-MODEL capability (`reasoningEfforts`, level plus API value) and there is
+deliberately no provider-scoped control. bsh's tree declares one effort per model,
+so this row is workspace-scoped - the honest limit, reported rather than hidden.
+
+Verified live: the menu draws `Model >` and `Effort · Default >`; picking
+stepfun-ai/step-5-preview moved the chip AND the status bar and wrote
+`model = "stepfun-ai/step-5-preview"`; picking High drew the `high` suffix on the
+trigger and wrote `reasoning_effort = "high"`. Both tests were re-injected and
+watched to fail (draft-only selection, the `off` filter removed).
+Round 140 replaced the product's artwork and its line. The hero and the sidebar
+brand row now draw the mantis-shrimp emblem, and the headline reads
+"See Beyond. Stay True." / "洞察未见，忠于所托" where the reference's own
+"Into the Unknown" stood.
+
+The source sheet is 2048px RGB with a near-white background, so it cannot be
+embedded as-is: 3 MB in the binary, and a white tile behind the emblem on every
+dark theme. `assets/bsh-mark.png` is the cut-out - the background flood-filled
+from the border with a 22/255 tolerance, alpha feathered 0.8px, trimmed to the
+subject, squared and scaled to 128 (30 KB). The asset test pins all of it: PNG
+signature, IHDR 128x128, colour type 6 (RGBA, which is what makes the white
+paper disappear), and a 64 KB ceiling so the sheet cannot creep back in.
+
+Two measured-chrome traps. The reference's mark is 34 WIDE over a 32-tall
+headline row; the emblem is square, so 34 set a 34-tall row and
+`the_hero_takes_the_measured_chrome` failed on the line box (42px against the
+measured 32). The row keeps its 32 as a BOX and the emblem is drawn at 40 inside
+it, centred: a child that overflows a fixed box adds no layout height, so the
+artwork takes its optical size without moving anything. And the sidebar's brand
+box went 20 -> 24 for the same padding reason.
+
+The old canvas path (`ui/fish.rs`) went with the mark - the hero was its only
+caller and clippy's dead_code would have found it anyway - as did the unused
+`assets::logo()`; the `.icns`/`.ico`/`.svg` files stay as bundle material,
+because the Dock icon is a tile design and swapping it for a bare transparent
+emblem would look worse, not better. That remains the one place the old glyph
+still lives.
+
+Round 141 gave the workspace row the two controls the reference puts on it: a
+circled plus that opens a chat IN that workspace, and an ellipsis whose menu is
+Rename (pencil) and Delete workspace (trash, error colour). The bookkeeping
+behind them exposed a real bug in the same family as round 138's: the Store
+keeps its own `roots` map because it needs one to know where a session file
+lives, and that map was built once at open. A workspace added later had no root
+to name, so a chat created in it would be SAVED INTO THE QUARANTINE DIRECTORY,
+and a deleted workspace's chats kept reading as owned, so the orphan sweep moved
+nothing and the rows vanished while their files sat in a directory no row
+pointed at. `Store::set_roots` rebuilds the map from the registry, and
+`AppState::adopt_workspace`/`sync_store_roots` keep it in step on add and
+delete - the registry is the truth and the map is a cache of it.
+
+Delete REHOMES rather than destroys: the registry row goes and its chats move to
+the workspace that becomes active, because a list row leaving must not take a
+transcript with it. The rename is the display name alone - id and root stay,
+which the test asserts field by field - and a blank name is refused with the
+field left open rather than silently discarded.
+Round 142 gave the session menu the destructive cell it was missing. Archive was
+the only way out of the list, and archive KEEPS the transcript - there was no
+action that removes a chat, which is what "delete" means to a reader.
+
+`Store::remove(id)` drops the row and its file in one call: removing the row
+alone would let the chat reappear on the next launch, because the store loads
+whatever is on disk. The file is computed from `dir_for` BEFORE the row is
+removed, and a file that cannot be unlinked still drops the row - the reader
+asked for it to be gone. `AppState::delete_session` then clears the plan and,
+when the deleted chat was the selected one, moves the selection to the next row
+in the list (or to none), because deleting the chat the shell is showing must
+not leave it pointing at nothing. `Shell::delete_session` also puts away a
+rename field on that row first, so it cannot commit into a chat that is gone.
+
+The menu cell follows the workspace menu's design: `PopupMenuItem::element` with
+the label and glyph in `theme::error()` - the kit's own item paints its label
+from the theme and takes no tint - behind a separator, so archive and delete are
+not one muscle-memory apart. Selector `session-menu-delete`.
+
+Verified live: the menu draws 置顶会话 / 重命名 / 分叉会话 / 归档会话 / 复制会话 ID,
+then a rule, then 删除会话 in red. The test pins all three halves of the delete
+(row gone, FILE gone - searched recursively under the scratch root, since an
+unregistered workspace's sessions live in quarantine - and the shell moved to the
+sibling), and it was re-injected twice to fail: dropping the unlink fails "and so
+is its file", dropping the reselection fails the selection assert.
+Round 143 made the workspace tree a real scroller. It already had
+`overflow_y_scroll()`, so the WHEEL worked (the kit's overflow scroller takes it),
+but nothing could address the offset: no handle, no focus, no keys, so a long list
+was reachable only by the wheel and no test could prove any of it.
+
+`Shell` now carries `side_scroll` (a `ScrollHandle` the tree tracks) and
+`side_focus`. The tree takes focus on mouse-down and maps Up/Down to one row,
+PageUp/PageDown to a page LESS one row of context, and Home/End to the ends
+through the pure `tree_key_delta(key, page)`. `scroll_tree_by` clamps between
+`-max_offset` and zero - GPUI stores a scrolled-down offset as a NEGATIVE y, and
+getting that sign wrong jumps the list to its end on the first arrow press.
+
+The header had to move. `工作区` and its search/sort/add controls were the tree's
+FIRST CHILD, so scrolling pushed the section title off the top and left the list
+looking like it had no name. They are now a sibling above the scroller
+(`workspace_tree_header`), which is what the reference's own sidebar does.
+
+Evidence: the harness dispatches a real `ScrollWheelEvent` (the app-level
+`simulate_scroll` is not on a window view, so the test goes through
+`window.dispatch_event`) and the offset moves; the key path is pinned through
+`scroll_tree_by` (row, page, End clamp); and live, Down x3 and End scroll the real
+30-row list while 工作区 stays put. Both halves were re-injected: dropping
+`track_scroll` leaves `max_offset` at 0 (the test fails on its premise), and a
+no-op `set_offset` fails the Home/End asserts. The ocu `scroll` tool is not a
+wheel - it drives an AX element and does nothing here - so the wheel evidence is
+the dispatched event, not a screenshot.
+Round 144 closed the last thing the scroll exposed: at max offset the tree's
+content ended exactly on the account row's divider, so the last row sat FLUSH on
+that hairline and read as sliced by the pinned element (`the last one still hide
+by pinned element`). Measured live with a temporary probe: tree viewport 332..776,
+max 225, deepest content row 1001 - i.e. at offset -225 the last row's bottom was
+the tree's bottom exactly. Nothing was overlapping; the LIST simply had no air
+under it.
+
+The fix is a floor gap: `theme::TREE_BOTTOM_INSET` (20) is appended as the tree's
+last child, so the content is 20px taller than its rows and the final row stops
+20 above the divider. 8 was tried first and still read as crowded once the row
+hovered; the user asked for 20, which is what ships.
+
+The regression test pins both halves of the geometry: the scroller's bottom never
+passes the account row's top, and the last row's bottom keeps at least
+`TREE_BOTTOM_INSET` of air above the tree's bottom. It uses a fixed id on the
+last row (`debug_bounds` takes `&'static str` only). Re-injected by deleting the
+spacer: `row ends at 1036px, floor at 1036px (gap 0)`.
+
+Trap worth keeping: the live `End` can clamp against a max from the frame before
+the content settled (a probe showed off=-267 while max read 225), so a screenshot
+taken right after the key shows less gap than the steady state - press it again,
+or read the geometry, before believing the picture.
+Round 145 made deletion undoable: a bin for chats and workspaces.
+
+Before this, `delete_session` unlinked the session file and `delete_workspace`
+dropped the registry row - a misclick was final. Both now PARK what they remove
+first, as one JSON envelope per item under the settings root:
+
+```text
+~/.bos/bsh/trash/session-<unix>-<id>.json
+~/.bos/bsh/trash/workspace-<unix>-<id>.json
+```
+
+The envelope carries the payload ITSELF (the whole `Session`, or the
+`WorkspaceRef`), not a pointer to a file, so restoring cannot depend on a
+workspace that moved or a file somebody edited in between. The parking write
+comes BEFORE the removal: if it fails the delete does not happen, because losing
+the copy is worse than refusing the delete. A chat whose workspace no longer
+exists comes back into the workspace in use.
+
+The panel is one overlay from the account row's bin control: sessions and
+workspaces as sections, newest first, each row carrying the workspace it came from,
+how long ago, Restore, and Delete permanently. An unreadable envelope is skipped
+rather than fatal, so one bad file cannot hide the bin.
+
+`Settings::trash_dir` derives from `save_root`, so a scratch configuration gets a
+scratch bin - and a TEST build that reaches it without a root PANICS rather than
+writing the reader's bin. That guard was added after a stray envelope appeared in
+the real bin during a sweep and then vanished (a restore consumed it); with the
+guard in place the whole suite passes, so no test can be the source now, and the
+one live deletion I performed for evidence was restored.
+
+Evidence: four tests (park+restore a chat; purge it; park+restore a workspace; the
+bin follows the settings root), each re-injection-checked - dropping the parking
+call fails `and one item is in the bin`. Live: deleting a chat removed the row,
+the bin listed it (`新会话 · bos · 6s`), Restore put it back with its id, title and
+workspace on disk, and the bin emptied.
+Round 146 gave the archived rows the same menu the live ones have.
+
+The archived list offered only the restore arrow, so a chat in the archive could
+not be renamed, forked, copied or deleted until it came back. Its row now reveals
+the same hover ellipsis, wired to the same `session_menu::session_items`.
+
+One cell had to change. `session_items` takes `archived` and, on an archived row,
+swaps the archive cell for `icon Undo` + "Unarchive session" in the SAME slot - a
+chat already in the archive cannot be archived again, and a menu that offers it
+would be a control that does nothing. The cell carries no accelerator: none is
+bound to unarchiving, and a hint is only drawn when pressing those keys does the
+same thing.
+
+Both call sites (the sidebar row and the header's More actions) pass the flag from
+`Session.archived_at`, through the new `AppState::is_archived`.
+
+Evidence: a click test seeds an archived chat, hovers its row, opens the ellipsis
+and asserts the menu carries pin / rename / fork / copy / delete AND unarchive,
+and does NOT carry archive. Re-injected by ignoring the flag (`if false`): it
+fails on "and the archive cell offers the way back". Live: the archived row shows
+↩, the time and the ellipsis; its menu reads Pin session / Rename ⌥⌘G / Fork
+session ⌥⌘F / **Unarchive session** / Copy Session ID / (rule) / Delete session.
+Round 147 indented the archived rows like the live ones.
+
+The archived list skipped the status-dot column the live rows lead with, so its
+titles started 14px to the left of every other session title (measured: 24 against
+38). An archived chat is the SAME session put away, not a different rank of thing,
+so it now leads with an empty column of the same width -
+`theme::TREE_ROW_LEAD` (6) plus the row's own 8px gap, shared by both kinds - and
+the two cannot drift apart again.
+
+The regression test renders one live and one archived session (fixed ids, so the
+title selectors are literals), reads both titles with `debug_bounds` and asserts
+the same left edge. Re-injected by deleting the spacer: 24 against 38, which is
+exactly the 6 + 8 the archived row was missing. The titles carry
+`session-title-{id}` / `archived-title-{id}` selectors for this.
+Round 148 made the centre column scroll with the wheel, smoothly, on both tabs.
+
+Two defects sat behind the report. The first was the real blocker: while
+`following_tail` held, `render` re-pinned the transcript to the newest message
+EVERY frame, and only a rail jump cleared the flag - so a wheel could not scroll
+the chat up at all. The wheel now releases the pin (that is the whole first half,
+and the test fails on it when removed).
+
+The second is the feel: the kit's scroller applies a wheel delta in one step, so a
+mouse notch cuts instead of scrolling. `ui/smooth.rs` holds the mechanism - a
+TARGET offset and a fraction-per-frame walk towards it (EASE 0.28, ~8 frames,
+~130ms, SETTLED 0.5) - with the amount of motion and the clamp as pure functions a
+test can pin.
+
+The kit's own jump had to be taken back. Its listener runs before this shell's, so
+by the time `wheel_chat` sees the event the offset has already moved by the whole
+delta; the handler reads how far it jumped, sets the offset back to the settled
+one, and aims the easing at `settled + jumped`. Without that take-back the motion
+doubled (400px for a 160px notch, measured).
+
+Trajectory gained the same treatment, which also gave it a tracked handle
+(`traj_scroll`) it did not have: its wheel worked but nothing could address it.
+
+Traps this round cost: a `#[cfg(test)] mod tests` with `use super::*` in a file
+that imports gpui anywhere puts gpui's `test` attribute macro in scope, and rustc
+dies with `recursion limit reached while expanding #[test]` (SIGBUS on this
+toolchain, which looks like anything but a name clash) - import the items by name.
+And `state.tab = Tab::Trajectory` set BEFORE `build_for_test` is lost: `assemble`
+settles the tab, so a trajectory test has to switch it after the shell exists.
+Round 149 made the centre column's scroll FAST, on the two axes the feedback named.
+
+Time: `smooth::EASE` 0.28 -> **0.6** (eight frames to three, ~50ms) and `SETTLED`
+0.5 -> 0.25. 0.28 was chosen for a readable ramp and read as sluggish; the ramp is
+now short enough that the wheel answers the hand while still being motion rather
+than a cut.
+
+Distance: a mouse wheel sends whole LINES - one coarse detent - where a trackpad
+sends precise pixels. At 1:1 a long transcript took dozens of notches to cross, so
+`MOUSE_GAIN` (2.0) is applied to the line delta only; a trackpad's pixel delta still
+goes through untouched, because its hardware already carries momentum and gaining
+it would fight that.
+
+`wheel_delta` is now a thin wrapper over the pure `wheel_pixels(delta, line_height)`
+so both halves are pinned: a notch must travel further than its raw pixels, and a
+precise delta must come through at exactly its own value. Re-injected by dropping
+the gain - it fails with `and further than its raw pixels: -60`.
+Round 150 rebuilt the Built-in plugins pane in the reference's own shape.
+
+Measured from `dsh-client-ui-plugins`: a tab strip (Plugin list / MCP / Plugin
+Market), a full-width search field with a leading magnifier, then two collapsible
+groups - SESSION plugins (what the active agent preset composes, with the preset
+as the header's trailing control) and GLOBAL plugins (the installed inventory,
+"Shared by the system and every session") - drawn as cards TWO PER ROW, each with
+a switch, a name, a description and a chevron. The pane header already carried the
+reference's "Open configuration file" action (`settings-open-config`).
+
+Wording comes from the reference's own dictionary: "Session plugins", "Composed
+per session by agent presets", "Global plugins", "Shared by the system and every
+session", "Search plugins", and the three tab names.
+
+Honest mapping: bsh has no plugin DESCRIPTIONS and no market. A card's description
+is the tools the plugin contributes (`bash`, `list_dir, read_file, write_file`),
+which is the truth this deployment has rather than invented prose; and the
+"Plugin Market" tab is drawn DISABLED, because shipping no market means a tab that
+would only look pressable. The "MCP" tab is real and moves the dialog to that
+pane (verified live). The session group reads the preset from `GlobalSettings::
+preset`, so a user-declared preset replaces the shipped `standard` list exactly as
+the agent build does.
+
+`plugin_enabled` reads the DRAFT, so a plugin switched off anywhere reads off in
+the card's switch with no second state - the test pins that by toggling "shell"
+and watching the switch follow.
+
+Traps: a settings helper that takes `cx` cannot build a menu with `cx.listener`
+inside the `'static` menu builder (borrowed data escapes) - clone the entity and
+`update` it in the handler; and `Div` vs `Stateful<Div>` is decided by `.id()`, so
+a header helper that sets one returns the latter.
+Round 152 removed the Built-in plugins pane's view list, and with it the sidebar
+rows that had already gone: the pane is now exactly the reference's Plugin list -
+tabs, search, Session plugins, Global plugins.
+
+`VIEWS`, `builtin_view_row` and the `settings.pluginViews` key went with the block,
+so nothing but the five rail cells names a pane in the settings chrome. Consequence
+worth knowing: nine panes in `SECTIONS` (shell, agent-loop, tools, mcp,
+archived-sessions, global.workspaces, context, automation, plugin-inventory) now have
+no in-app entry - only the command line's `--settings=SECTION` deep link. MCP is the
+one exception, because the Plugin list's own tab reaches it (`plugins-tab-mcp`,
+click-tested).
+
+The screenshot that prompted the round also showed `settings.global.workspaces`
+rendering as a raw key. That was REAL: the key was missing from both locale files,
+so the Workspaces pane title and its row printed the key. Added as
+"Workspaces" / 工作区 beside the other settings section titles.
+
+Traps: cutting a span that ends at `}` after a searched marker swallowed the old
+test's tail and left a stray `"` / `);` / `}` in the file - fix by deleting the
+residual lines by INDEX after asserting each one's content, not by another search;
+and two tests named the removed list (`the_builtin_plugins_pane_hosts_the_reference_views`
+pressed `builtin-view-shell`), so the pane's shape tests and the key list had to move
+with the code.
+Round 154 answered "左右两边的空白太多了" twice: `CHAT_SHARE` .64 -> .8 -> **.9** and
+the fixed 920 cap became a **32px gutter per side**, so the transcript takes the
+column rather than a measured band the reference never questioned.
+
+Measured at the harness window (1280 wide, 280 sidebar, 1000 column): the band was
+160 each side at the reference clamp, 100 at .8, and is 50 at .9 - half of the
+previous round, which is what the feedback asked for. At 1640 the band is 82.
+
+The two width rules had to agree. A .9 share with the reference's 176 drag budget
+meant the DEFAULT (1476 at 1640) exceeded the widest a drag could store (1464), so
+the first pointer move pulled the column IN and the drag test caught it as
+`left: 1464, right: 1556`. `resolve_content_width` now bounds a stored preference by
+the same gutter the default keeps, `column - 2 * CHAT_GUTTER`, with the reference's
+640 floor still underneath; `CONTENT_EDGE_BUDGET` went with the old rule and clippy
+`dead_code` found it.
+
+The handle strip survives: it is `min(10, band / 2 - 48)`, which is 10 while the
+band is 164 and 2 at 100 - a drag to the gutter eventually leaves no strip, which is
+the reference's own behaviour at its bound.
+Round 155 answered "左边的再减少为现在的40%" with an ASYMMETRIC column: the right
+band is unchanged (the turn rail and the composer are laid out against it) and the
+left one is `CHAT_LEFT_SHARE` 0.4 of it, rounded to a whole pixel.
+
+Measured at the harness window: the transcript's left inset went 100 -> 40, so the
+text starts 60px further left while the composer keeps the width and centre it had -
+which is what "不要影响下面的输入框" asked for. The cost, stated rather than hidden:
+the composer is now the widest thing in the column, hanging 46px left of the message
+text, because chat + 32 centred no longer matches the transcript's left edge.
+
+Two things had to move with it. The LEFT handle derives from the inset now
+(`left: inset - 24 - strip`) instead of the symmetric `right: 50% + content / 2 + 24`,
+and the strip's clearance is asserted within one pixel because the painted padding
+snaps to a device pixel after the handle's own exact origin. And `chat_left_inset`
+rounds: a fractional inset put the 24px clearance 1.2px off, which the handle test
+caught as `measured 22.799988`.
+Round 156 moved the token readout off centre: the context meter and the stat
+pills now take `meter_shift(chat) = chat / 2 * METER_SHIFT_SHARE` to the left, so
+the ring lands at roughly 30% of the composer card - the point the reader drew an
+arrow to - instead of the card's middle.
+
+Both boxes are laid out centred as before and then offset with
+`.relative().left(px(-shift))`, because a `relative` offset paints without moving
+the flex box: the composer keeps its measured width and the pills keep their own
+row, and the offset simply carries both. The status row uses the chat width and the
+meter the composer width, so the two offsets are the same number and the pair reads
+as one block.
+
+0.7 of the half-width was tried first, exactly as asked, and it put the readout's
+LEFT EDGE 20px from the column's edge - clipping risk on a narrower window and past
+the point the arrow named. 0.4 is the share that lands the centre on that point; the
+share is one constant and the report says which number is which.
+Round 157 gave the chat the trace shape: each tool call is a STEP row - a
+chevron, the KIND the step is (Bash, Read, Write, List, Plan, Skill, Step), a `·`
+and a one-line summary - nested one rail in from the message it belongs to, with
+its arguments and output in labelled IN / OUT blocks when opened.
+
+The kind is a locale key per tool family (`tool.kind.*`), not the registry name,
+so two providers' differently-named file writers read as one kind. The summary is
+`tool_summary(args)`: the first well-known field's value (command, path,
+file_path, query, code, instruction, prompt), else the first quoted VALUE (a span
+followed by `:` is a key and is skipped), else the raw arguments - whitespace
+collapsed and clipped at 96 characters, because the body holds the whole text.
+
+The fold direction was inverted and this round fixed it: `liveProcessDetail`
+governed SETTLED turns, so every completed turn opened every body - a wall of
+arguments where the reference shows one summary line per step. It now governs the
+RUNNING turn, and a settled turn folds its process (`folded` true -> closed), which
+is what makes a long trace scannable. The screenshot that prompted the round is
+exactly that state.
+
+Traps: `debug_bounds` takes `&'static str`, so a dynamically built selector cannot
+be passed - use a literal and seed a known message count ([user, assistant] means
+the tool is on message 1); and `state_with_turns(label, 1)` is the cheapest way to
+get that fixed shape.
+Round 158 closed the four gaps the step rows had. Each is real code, not a
+stretch of the same row:
+
+1. CODE HIGHLIGHTING. `code_lang(name, args)` names the language a body is -
+   bash for a command step, and for a file step the extension of the path it
+   wrote or patched - and the body renders through the kit's markdown fence, so
+   it is highlighted and carries the fence's own language chip. A step with no
+   code claims none and stays plain text.
+2. COPY. Every IN/OUT block has a copy control on its header row,
+   `cx.write_to_clipboard(ClipboardItem::new_string(..))`.
+3. SIZE BADGE. `format_bytes(tool_bytes(tool))` - the payload the step moved
+   (its output once finished, its arguments while it runs), 812 B / 7.2 KB, the
+   reference's own shape. It is a size OF THE EVENT, not of a file on disk: bsh
+   keeps no handle, and a disk read would be a second source of truth.
+4. PATCH. A write or an edit renders as `-` / `+` lines with the success/error
+   wash (`theme::diff_add` / `diff_del`), from the arguments the model sent -
+   the SHAPE of the change, not a disk diff, because no before-image is stored.
+
+Two follow-ups fell out of looking at it: the OUT body unwraps the shell
+tool's `{stdout, stderr}` envelope (`output_body`), so a reader sees the text
+rather than `\n` escapes; and a command step's IN body shows the command itself
+rather than the JSON around it.
+
+Traps: `json_field` flattens escapes for summaries, which is wrong for a patch -
+`json_field_exact` keeps `\n` as a newline, and the two cannot share a reader;
+and an empty object is not a summary, so `meaningful` suppresses the `{}` that
+was sitting beside every row whose arguments carried nothing (`{}` and `[]`
+both).
+Round 159 put the transcript on disk as a paged Parquet log (`history.rs`) and
+made the session document metadata.
+
+SHAPE: one append-only segment per save - msg-000.parquet, traj-000.parquet -
+written in row groups of PAGE (128) rows. A save costs O(new rows), not
+O(history); a page read decodes ONE row group (`with_row_groups`), not the file;
+decoded pages sit in an LRU capped at CACHE_PAGES (8), so a scroll holds a few
+pages of text rather than the transcript.
+
+WIRING: `Session` keeps a WINDOW (2 pages = 256) of its transcript plus
+`loaded_from`, the global index of messages[0]. `Store::save` writes the rows the
+log is missing and clears the document's messages; `Store::read` hydrates the
+tail window from the log; `Store::load_older` prepends the window before it, and
+`Shell::page_older_at_the_top` calls it when the transcript's offset comes within
+PAGE_TRIGGER (400px) of the top, anchoring the reader on the row they were
+looking at so the view does not jump.
+
+SECURITY, caught by an existing test: the document used to be the only door the
+secret scrubber guarded, and moving the transcript to Parquet would have written
+a quoted credential into the log unredacted. `save_history` now maps every
+message through `redact_message` (text, reasoning, error, tool args and outputs)
+and the redaction test asserts against the LOG rather than the JSON.
+
+Compatibility: a JSON document that still embeds its transcript keeps working -
+on its next save the log is rebuilt from it (`History::rewrite`) and the document
+drops the messages.
+
+Evidence: `a_session_pages_its_transcript_from_the_parquet_log` (600 rows -> 256
+in memory, loaded_from 344, one load_older -> 512/88, page to the start, then
+zero), plus the module's own six: round trip, a page read decoding exactly PAGE
+rows, the cache ceiling, append costing one segment, a window crossing a page
+boundary, and the trajectory written beside the messages.
+Round 160 closed the gaps the paged backend opened - three of them were DATA LOSS
+paths, which is what the wiring round could not have known until the log became
+the only transcript.
+
+1. TRUNCATION (retry / edit / a cut). `truncate_from` mutates the in-memory
+   window, so `save_history` saw a log that did not line up and rewrote it FROM
+   THE WINDOW - silently deleting every page above it. The rewrite now reads the
+   prefix back (`History::prefix`) and rewrites prefix + window.
+2. FORK. A fork cloned the session, which holds only a window, so the copy was a
+   shortened chat. `Store::copy_history` copies the source's whole segment set
+   into the fork's directory before the fork's first save.
+3. RESTORE FROM THE BIN. The log never moves while a chat sits in the bin (the
+   two-digit id keys both), so a restore has to re-attach it: `Store::rehydrate`
+   loads the tail window after the document comes back. `purge_trashed` now
+   removes the log too, so a purged chat leaves nothing behind.
+   A save also has a safety net: an EMPTY in-memory transcript over a NON-empty
+   log is not a truncation and never rewrites - that is the shape a list-only
+   read or a restore has, and treating it as a cut is how a transcript vanishes.
+
+4. TRAJECTORY PAGING. The trace tab now reads tool rows from `traj-*.parquet`
+   (`Store::trajectory_page`), one page at a time: the first page loads when the
+   tab is opened, another when the trace is scrolled to its top, and the rows are
+   per session (a switch starts the paging over). A session with no log yet still
+   draws the rows it holds in memory, which is how the JSON-era chats render.
+
+Evidence: `a_truncation_keeps_the_pages_above_the_window` (400 rows -> a window of
+256 -> cut in half -> the log keeps 360 pages and still starts at row 0) and
+`a_fork_copies_the_log` (300 rows -> the copy reads every page).
+Round 161 made the turn rail's last mark clickable, and fixed a paging design
+error the earlier rounds hid.
+
+THE RAIL. Measured before changing anything: with sixty turns the last tick laid
+out at y=913-923 while the transcript area ended at 977 and the frame was 420
+tall - i.e. the marks were painted BELOW the frame that hit-tests them, so the
+bottom of the column was a dead strip with a sliver of a mark in it. `.max_h`
+never capped a flex child, so the track grew past the frame. The track now takes
+an explicit `.h(frame_h)` with `flex_none()`, where frame_h is the
+min(marks + inset, TURN_RAIL_MAX_H) the preview maths already assumed, and the
+rail is tail-biased: while the transcript follows the tail, an overflowing rail
+scrolls to its bottom so the NEWEST mark - the one a reader presses to come back
+- is the one in view.
+
+THE SIGN TRAP: `ScrollHandle::max_offset()` is a MAGNITUDE (positive) while
+`offset()` runs from zero DOWN to -max. The first guard compared them with one
+sign and never scrolled; the test caught it as `max 192` where the assertion
+expected `max < 0`.
+
+THE PAGING FIX. `loaded_from` was answering two different questions - where the
+window in memory starts, and how far back the log has been read. Trimming moved
+it forward while paging moved it back, so a caller doing both oscillated forever
+(a test binary hung 26 minutes and had to be killed), and once trimming pushed it
+to zero paging stopped although the log still held every page above. `Session`
+now carries `paged_from` - the paging floor, monotonic toward zero - and
+`load_older` reads from THAT, while `trim_front` moves only `loaded_from`.
+
+THE BIN. A session's Parquet pages now move with its envelope (`Envelope.log`,
+`trash::park_log`), so a parked chat is whole: restore moves the pages back
+beside the document and re-hydrates the window; purge removes them with the
+envelope. The log is addressed through `Store::dir_for_id`, the session's own
+directory, not a bare root.
+
+Evidence: `the_last_turn_tick_is_reachable` (sixty turns overflow, the rail rests
+at its bottom, and the last tick's laid-out position shifted by the scroll falls
+inside the frame), `trimming_bounds_the_window` (an exhaustive page-up holds four
+windows, the floor reaches Some(0), the log keeps every row), and
+`the_bin_carries_the_transcript_pages` (pages leave the workspace, the bin reads
+all 400, a purge leaves nothing).
+Round 162 finished the rail's last mark. Round 161 made it visible; this one
+makes pressing it DO something.
+
+The symptom survived because the newest mark had no action: the click handler
+only ever RELEASED the tail pin (`following_tail = false` then jump). Pressed at
+the live end - which is where a reader is when they reach for the last mark - the
+jump lands where they already are, so the control looked dead. The newest mark now
+re-engages the tail: `following_tail = true` plus `scroll_to_bottom`, i.e. it is
+the way back to the live end from anywhere, and the way to start following again
+while already there. Every other mark still leaves the pin off.
+
+The handler became `Shell::jump_to_turn(child, newest)`, called by the mark's
+click, because a 28px overlay does not take a synthetic click reliably - the
+crate's own rule for a hard-to-hit control is to drive its method and assert it is
+on screen, and the test does both.
+
+Diagnosed, not guessed: a test proved clicks DO reach the rail (pressing the first
+mark moves the transcript), so the mark was never dead - it was invisible in
+round 161 and inert in this one.
+
+Evidence: `the_newest_mark_reengages_the_tail` (leave the tail, press the newest
+mark's own method, assert the pin is back and the offset is at -max, with the mark's
+box asserted inside the frame), `the_rail_marks_receive_the_click` (a press on the
+first mark moves the transcript), `the_last_turn_tick_is_reachable` (sixty turns,
+the rail rests at its bottom, the last mark is inside the frame).
+Round 163: the rail's ACTIVE mark, and an honest report on the hover preview.
+
+FIXED AND PROVEN. `visible_turn` picked the last turn whose top sat at or above
+the viewport's, which at the tail is always the turn ABOVE the newest one - the
+newest turn begins below the top because nothing follows it. The newest mark was
+therefore permanently dim while the chat had already ended, which is the
+screenshot the user sent (highlight one above the end). It now returns the newest
+turn whenever the reader is at the live end (tail pin on, or offset at -max), and
+the old rule everywhere else.
+
+Also proven: hovering the NEWEST mark opens the preview card exactly like any
+other mark, and the card's top clamp keeps it inside the frame -
+`the_rail_preview_opens_on_hover` now hovers turn 2 of 3 and asserts the card's
+width and its containment.
+
+NOT FIXED, AND LEFT AS A REPRODUCTION. With an OVERFLOWING rail (more marks than
+the 420px frame) the card does not draw at all - not for the newest mark and not
+for a middle one - while `rail_hover` is set, so the state is right and the card
+is what is missing from the drawn frame. That is the user's case (a long chat).
+`an_overflowing_rail_draws_the_hover_preview` is `#[ignore]`d and documents it, so
+the next round starts from the reproduction rather than a guess. Candidate causes
+to check first: the tail-bias scroll runs every frame while following the tail and
+may be moving the mark out from under the pointer between the hover and the card's
+build; and the card is a child of a 28px-wide frame inside an absolute rail, which
+is worth measuring rather than assuming.
+Round 164 found and closed the rail's real bug: an ORDINAL was compared with a
+MESSAGE INDEX. That single mismatch caused three symptoms the last four rounds
+chased separately.
+
+The mark loop is `turns.iter().enumerate().map(|(turn, index)| ...)`: `turn` is the
+mark's ORDINAL (0..n-1, the selector id and the hover payload), `index` is the
+turn's MESSAGE index (0, 2, 4, ... 118, the scroll child). `rail_hover` stores the
+ordinal, and three readers treated it as a message index:
+
+1. The preview searched `turns.iter().position(|item| *item == turn)`, which only
+   matches when ordinal == message index - i.e. mark 0. Every odd ordinal, and
+   therefore the NEWEST mark (n-1 is odd for even n), drew no card at all. That is
+   'hover the last one, nothing; the others have a card'.
+2. `is_last = turns.last() == Some(turn)` compared a message index with an ordinal,
+   so the newest mark never took the tail-re-engaging branch - clicking it ran the
+   ordinary jump, which at the tail is a no-op.
+3. The card's centre used the ordinal anyway, so the cards that did appear were
+   correctly placed, which hid the mismatch.
+
+Everything is ordinal now: `preview` reads `turns.get(ordinal)` for the message
+index the texts need, the centre uses the ordinal, and `is_last` is
+`turn == turns.len() - 1`.
+
+Two probes made this cheap and are the reusable lesson: printing
+`turns.first()/last()/len()` beside `rail_hover` showed `last=Some(118) n=60`
+against `hover=Some(59)`, which named the bug in one run; and the earlier
+'overflow' reproduction was itself wrong - 30 turns is 312px, which FITS the 420px
+frame, so it tested nothing. Overflow needs 42+ turns.
+
+Evidence: `an_overflowing_rail_draws_the_hover_preview` (60 turns, hover a middle
+mark 50 AND the newest 59, both must draw the card), `the_rail_preview_opens_on_hover`
+(3 turns, the newest mark previews at 300px and stays inside the frame),
+`the_newest_mark_reengages_the_tail`, `the_rail_highlights_the_newest_mark_at_the_tail`.
+Round 165 built the Trajectory tab the reference actually draws. The old pane
+rendered the goal card, the plan list and the chat's tool rows - the transcript
+again, one tab over - while the reference has its own view: a measure toolbar, a
+three-lane strip, a typed event log, and a detail panel.
+
+New module crates/bsh/src/ui/trajectory.rs. `events(shell)` flattens the session
+into typed lines (USER / ASSISTANT / TOOL, each with title, outcome, raw payload,
+source and ms), `matches` is the search filter, and the view draws the measured
+chrome: a segmented [Duration | Turns | Calls] over a search field, three lanes
+(Input / Model / Tools), rows with a kind dot, a chip, a one-line title and the
+outcome line, and a 470px detail panel with Summary / Preview / Raw / Source tabs
+over Source / Status / Duration fields.
+
+THE MEASURE IS LIVE. The segmented control re-weights the lanes rather than only
+highlighting itself: duration sums each turn's tool ms, calls counts its calls,
+turns gives equal shares. `the_trajectory_measure_redraws_the_lanes` proves both
+directions on a session whose turn 1 has one 9s call and turn 2 has three 10ms
+calls - by duration turn 1 is widest, by call count turn 2 is.
+
+TRAPS. `txt` WRAPS, so a 28px row became a tower of text until the title and the
+outcome carried `.text_ellipsis().whitespace_nowrap()` (the seam queue_dock and
+composer already use); a shell heredoc containing `\u{2192}` and backticks in doc
+comments silently did not apply - tools.edit on an exact anchor is the reliable
+path, and grep must confirm the edit landed; and `overflow_y_scroll` needs an
+`.id(..)`, so the detail body carries one.
+
+Wired into the existing machinery rather than beside it: the log rides
+`Shell::traj_scroll` with the same eased `traj_wheel`, so
+`the_trajectory_scrolls_with_the_wheel` still passes, and the search field is a
+real InputState whose Change event sets `traj_query`.
+
+HONEST GAPS, stated in the module doc: the SUBTOOL and CONTEXT chips the reference
+draws have no producer here (nested calls and injected time-context messages are
+their harness's), the lanes are step densities because no event carries a start
+time, and the reference's per-row indent tree is absent because this model has no
+nesting.
+
+Evidence: `the_trajectory_draws_its_log_and_opens_the_detail_panel` (the tab
+renders log rows, no panel until a line is pressed, pressing opens it, the Raw tab
+selects, close drops it) and the measure test above. 367 passing, fmt/clippy
+clean.
+Round 166 closed two of the trajectory's three stated deviations, and left one
+because the data does not exist.
+
+TIME AXIS. The timeline could only be a step density because no event had a
+start time - only a duration. `ToolEvent` now carries `at` (epoch ms, serde
+default so old records parse) and `AgentEvent::ToolCall` stamps it from
+`state::now_ms()`; a message takes the instant of the first call it made, carried
+across turns. With timestamps the lanes are a real gantt: a shared domain from the
+earliest start to the latest end, a transparent spacer for each wait and a bar
+sized by the call, both in ms. A log recorded before the field existed has no
+positions, so the lanes fall back to one segment per turn rather than inventing
+an axis - which is what the current sessions show.
+
+TURN RAILS. Measured from the table sheet
+(`tr[data-turn-start=true] td:before`: 2px, border-l1, translateY(-50%)) the
+first line of each turn now carries a 2px top rule, so the log reads in turns
+the way the reference's does. The flag is computed before the rows are built - a
+closure capturing a running `previous` does not outlive `.children`.
+
+STILL OPEN, with the reason: SUBTOOL and CONTEXT chips have no producer (nested
+calls and injected time-context messages are the reference harness's), the
+earlierHistory affordance at the track's left (28px gradient) is not drawn, and
+the kind slot does not yet take the reference's 44px zh width because bsh sizes
+the tag to its own text.
+
+Trap: adding a field to ToolEvent means every fixture literal in shell_tests.rs,
+history.rs and model.rs needs it; a regex over `ToolEvent {(...)}` misses bodies
+holding braces inside strings, so a brace-matching scan that skips string
+literals is the reliable edit - and it must not double-insert on literals that
+already carry the field.
+Round 167 supported SUBTOOL, and CONTEXT and ERROR with it - the trajectory now
+draws every kind the reference draws that this model can produce.
+
+SUBTOOL has NO stored parent, and it does not need one: a call is nested when its
+start falls INSIDE another call's interval. `at` (added in round 166) and `ms` are
+the two facts every record already carries, so `events()` derives the depth while
+it reads and old logs need no migration. A subtool row sits one 18px rail in from
+its parent, drawn as a MARGIN rather than padding - padding moves the content
+inside the row's box, so the row still starts on the same edge and a bounds test
+cannot see the indent.
+
+CONTEXT got its producer too: the session's `goal` is context the agent is handed,
+and it was being dropped from the log entirely. ERROR likewise - `ChatMessage.error`
+was invisible in Trajectory, so a failed turn now has its own row in state-error.
+Both use the same measured 19px / 10px / 650 tag in the 76px (44px zh) slot.
+
+Evidence: `a_call_inside_another_becomes_a_subtool` seeds an outer call running
+1_000..6_000 with an inner call starting at 2_000 and a later call at 7_000, then
+asserts the kinds are [Tool, Subtool, Tool] AND that the subtool row's origin x is
+more than 10px right of its parent's. Trap in that test: the tool rows are not the
+first three events - the turn's messages come first - so the indices have to be read
+from the log rather than assumed.
+Round 168 put the trajectory on the reference's own type: families as well as
+sizes.
+
+FAMILY. A tool or subtool row is written in CODE, not in the UI face: measured
+`tr[data-kind=tool] .contentText` (and `[data-kind=subtool] .resultPreview`) take
+`--ds-font-family-code` at 12px, and `toolCallNameTypeface` names the stack -
+Menlo, Consolas, Liberation Mono, PingFang SC, Microsoft YaHei. `theme::CODE_FONT`
+records Menlo and the row's text and outcome both use it; every other kind stays in
+the UI face, which is the distinction the reference draws.
+
+SIZES, as measured: table base `--dsw-font-xxs-12` (rows 12, already), detail tabs
+and the panel header `--dsw-font-xs-13` (were 12), kind tag 10 (unchanged). The
+token definitions live outside the extracted corpus, so `xxs-12` = 12 and `xs-13` =
+13 come from the class names alone - worth confirming against a live capture if the
+reference ever changes them.
+
+Not drawn: the reference's column header row (th, 12 at weight 500) because this
+list has no columns, and 8px/10px mono tabular turn labels on the rail, which the
+kind-slot design does not have a place for.

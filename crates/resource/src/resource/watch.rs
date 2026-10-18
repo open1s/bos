@@ -1,9 +1,10 @@
 //! Filesystem watch (change notifications) for `file://` and `folder://`.
 //!
 //! Uses `notify`'s `RecommendedWatcher`. Events are bridged into the async
-//! world via an unbounded Tokio channel (`send` never blocks, so the watcher
-//! callback is safe to call from a sync thread), then re-exposed as a stream
-//! of [`ResourceEvent`].
+//! world via a small *bounded* Tokio channel (`try_send` never blocks, so the
+//! watcher callback is safe to call from a sync thread), then re-exposed as a
+//! stream of [`ResourceEvent`]. A subscriber that falls far behind loses
+//! events rather than growing the channel without bound.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -14,20 +15,24 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::action::ResourceEvent;
 use crate::error::{ResourceError, Result};
 
+/// Depth of the filesystem-event queue. Large enough to absorb a burst while
+/// a subscriber is scheduled, small enough that a stalled subscriber cannot
+/// grow memory without limit.
+const WATCH_QUEUE: usize = 1024;
+
+/// Hand an event to the subscriber queue without blocking the notify thread.
+/// A full queue means the subscriber is behind; the event is dropped.
+fn offer_event(tx: &tokio::sync::mpsc::Sender<notify::Result<Event>>, ev: notify::Result<Event>) {
+    let _ = tx.try_send(ev);
+}
+
 /// Start watching `path` and return a stream of resource events. The watcher
 /// is dropped when the stream is dropped, ending notification.
 pub fn watch(path: &Path) -> Result<Pin<Box<dyn Stream<Item = ResourceEvent> + Send>>> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<notify::Result<Event>>();
-    let mut watcher = RecommendedWatcher::new(
-        move |ev| {
-            // Channel is unbounded; send never blocks or panics on a closed
-            // receiver — it just fails, which is fine when the subscriber is
-            // gone (the watcher thread exits shortly after).
-            let _ = tx.send(ev);
-        },
-        notify::Config::default(),
-    )
-    .map_err(|e| ResourceError::Io(std::io::Error::other(e)))?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<notify::Result<Event>>(WATCH_QUEUE);
+    let mut watcher =
+        RecommendedWatcher::new(move |ev| offer_event(&tx, ev), notify::Config::default())
+            .map_err(|e| ResourceError::Io(std::io::Error::other(e)))?;
     watcher
         .watch(path, RecursiveMode::Recursive)
         .map_err(|e| ResourceError::Io(std::io::Error::other(e)))?;
@@ -69,4 +74,24 @@ pub fn watch(path: &Path) -> Result<Pin<Box<dyn Stream<Item = ResourceEvent> + S
 /// watched it (no FS mutation).
 pub fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn event_queue_is_bounded_and_drops_when_full() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        offer_event(&tx, Ok(Event::default()));
+        // The second offer must not block or grow the queue.
+        offer_event(&tx, Ok(Event::default()));
+
+        assert!(rx.recv().await.is_some(), "first event is delivered");
+        assert!(
+            rx.try_recv().is_err(),
+            "excess event is dropped instead of buffered forever"
+        );
+    }
 }

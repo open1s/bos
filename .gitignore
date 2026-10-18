@@ -117,3 +117,7 @@ $RECYCLE.BIN/
 
 # Generated: the shipped reference bundle corpus (regenerate with the extract-asar.py recipe)
 docs/ui-mirror/reference/pkgs/
+
+# The bsh app's runtime sidecar (sessions, annotations); its settings stay tracked.
+crates/bsh/.bsh/*
+!crates/bsh/.bsh/settings/

@@ -167,7 +167,13 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                     .stream_complete(persona.clone(), req, session, context)
                     .await
             } else {
-                Ok::<TokenStream, LlmError>(Box::pin(futures::stream::empty()))
+                // An unknown vendor is a refusal, not an empty completion:
+                // returning an empty stream would look like a finished answer
+                // and would skip the fallbacks registered below.
+                Err(LlmError::Other(format!(
+                    "Unknown vendor: {}",
+                    request.model
+                )))
             }
         };
         match primary {
@@ -204,5 +210,76 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
     }
     fn provider_name(&self) -> &'static str {
         "llm-router"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct StubClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmClient<(), ()> for StubClient {
+        async fn complete(
+            &self,
+            _persona: Option<String>,
+            _req: LlmRequest,
+            _session: &mut (),
+            _context: &mut (),
+        ) -> LlmResponseResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(LlmError::Other("stub complete".to_string()))
+        }
+
+        async fn stream_complete(
+            &self,
+            _persona: Option<String>,
+            _req: LlmRequest,
+            _session: &mut (),
+            _context: &mut (),
+        ) -> Result<TokenStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_vendor_stream_is_an_error_not_an_empty_answer() {
+        let router = LlmRouter::<(), ()>::new();
+        let result = router
+            .stream_complete(None, LlmRequest::new("missing/model"), &mut (), &mut ())
+            .await;
+        match result {
+            Err(LlmError::Other(message)) => {
+                assert!(message.contains("Unknown vendor"), "got: {message}");
+            }
+            _ => panic!("an unknown vendor must refuse, not return an empty stream"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_vendor_stream_still_reaches_a_registered_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = LlmRouter::<(), ()>::new();
+        router.register_fallback(
+            "fallback-model".to_string(),
+            Box::new(StubClient {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let result = router
+            .stream_complete(None, LlmRequest::new("missing/model"), &mut (), &mut ())
+            .await;
+        assert!(
+            result.is_ok(),
+            "the fallback must be tried when the primary vendor is unknown"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

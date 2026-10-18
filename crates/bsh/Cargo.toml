@@ -16,6 +16,8 @@ name = "bsh"
 path = "src/main.rs"
 
 [dependencies]
+arrow =  { version = "60.0.0"}
+parquet = { version = "60.0.0", features = ["arrow"] }
 # One UI dependency: gpui-kit re-exports gpui, gpui-base, gpui-component and the
 # default assets, and pins the matching GPUI release.
 gpui-kit = "=0.7.3"
@@ -40,6 +42,15 @@ dirs = "7.0.0"
 portable-pty = { workspace = true }
 regorus = { workspace = true }
 vte = { workspace = true }
+unicode-width = { workspace = true }
+
+# The Vault's cryptography. The admin key is derived with Argon2id, the file is
+# sealed with XChaCha20-Poly1305, and every key and plaintext buffer is held in
+# a zeroizing wrapper.
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 # The same package the kit aliases as gpui, with GPUI test hooks enabled: the

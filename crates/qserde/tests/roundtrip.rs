@@ -88,6 +88,28 @@ fn expressive_aliases_stay_small() {
     assert_eq!(restored, state);
 }
 
+/// Validation must reject truncated archives instead of indexing past the
+/// buffer: every strict prefix of a valid archive is malformed.
+#[test]
+fn truncated_archives_are_rejected_not_panicked() {
+    let state = SessionState {
+        id: 5,
+        name: "truncated".to_string(),
+        tags: vec!["a".to_string(), "b".to_string()],
+    };
+    let bytes = state.serialize().expect("serialize should succeed");
+
+    assert!(from_bytes::<SessionState>(&[]).is_err());
+    for cut in 0..bytes.len() {
+        let result = from_bytes::<SessionState>(&bytes[..cut]);
+        assert!(
+            result.is_err(),
+            "archive truncated to {cut} of {} bytes must be rejected",
+            bytes.len()
+        );
+    }
+}
+
 #[test]
 fn typed_snapshot_flow() {
     let state = SessionState {

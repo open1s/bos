@@ -71,6 +71,14 @@ pub(crate) fn tr_args(lang: Lang, key: &'static str, args: &[(&str, String)]) ->
 mod tests {
     use super::*;
 
+    /// The hero's line is the brand's own, not the reference's placeholder:
+    /// "See Beyond. Stay True." and its Chinese counterpart.
+    #[test]
+    fn the_hero_headline_is_the_brand_line() {
+        assert_eq!(tr(Lang::En, "hero.headline"), "See Beyond. Stay True.");
+        assert_eq!(tr(Lang::Zh, "hero.headline"), "洞察未见，忠于所托");
+    }
+
     #[test]
     fn both_locales_resolve_the_same_keys() {
         let en = tr(Lang::En, "side.newSession");
@@ -97,6 +105,12 @@ mod tests {
             "message.turnUsage.input",
             "message.turnUsage.cacheRead",
             "message.turnUsage.output",
+            // The terminal's policy surfaces: the refused input, the output
+            // marker, the compact blocked count and the policy parse error.
+            "right.terminal.inputRefused",
+            "right.terminal.outputBlocked",
+            "right.terminal.policyBlocked",
+            "right.terminal.policyError",
         ] {
             assert_ne!(tr(Lang::En, key), key, "{key} missing from en");
             assert_ne!(tr(Lang::Zh, key), key, "{key} missing from zh");
@@ -200,5 +214,99 @@ mod tests {
             assert_ne!(tr(Lang::En, key), key, "{key} missing from en");
             assert_ne!(tr(Lang::Zh, key), key, "{key} missing from zh");
         }
+    }
+
+    /// The Vault pane's whole vocabulary resolves in both locales, including the
+    /// dynamic refusal keys the backend hands it.
+    #[test]
+    fn vault_pane_keys_resolve_in_both_locales() {
+        for key in [
+            "settings.vault",
+            "settings.vaultHint",
+            "settings.vaultExplain",
+            "settings.vaultBusy",
+            "settings.vaultPassphrase",
+            "settings.vaultPassphrasePlaceholder",
+            "settings.vaultConfirm",
+            "settings.vaultConfirmPlaceholder",
+            "settings.vaultUnlock",
+            "settings.vaultCreate",
+            "settings.vaultCreateHint",
+            "settings.vaultLockedHint",
+            "settings.vaultAdminLockedHint",
+            "settings.vaultStrengthShort",
+            "settings.vaultStrengthFair",
+            "settings.vaultStrengthStrong",
+            "settings.vaultUnlocked",
+            "settings.vaultEntryCount",
+            "settings.vaultEntries",
+            "settings.vaultEmpty",
+            "settings.vaultCreated",
+            "settings.vaultReveal",
+            "settings.vaultHide",
+            "settings.vaultCopy",
+            "settings.vaultCopied",
+            "settings.vaultDelete",
+            "settings.vaultDeleteTitle",
+            "settings.vaultDeleteDescription",
+            "settings.vaultDeleteConfirm",
+            "settings.vaultAddTitle",
+            "settings.vaultName",
+            "settings.vaultValue",
+            "settings.vaultAdd",
+            "settings.vaultNameHint",
+            "settings.vaultNamePlaceholder",
+            "settings.vaultValuePlaceholder",
+            "settings.vaultPassphraseRequired",
+            "settings.vaultMismatch",
+            "settings.vaultNoVault",
+            "settings.vaultLockedError",
+            "settings.vaultWrongKey",
+            "settings.vaultIo",
+            "settings.vaultCorrupt",
+            "settings.vaultEntryRequired",
+            "settings.vaultEntryMissing",
+            "settings.vaultLock",
+            "settings.vaultLockedNotice",
+            "settings.vaultAdded",
+            "settings.vaultRemoved",
+        ] {
+            assert_ne!(tr(Lang::En, key), key, "{key} missing from en");
+            assert_ne!(tr(Lang::Zh, key), key, "{key} missing from zh");
+        }
+        assert_eq!(
+            tr(Lang::En, "settings.vaultEntryCount").replace("{count}", "2"),
+            "2 entries",
+            "the entry count is the pane's own template"
+        );
+    }
+
+    /// The provider's vault chooser vocabulary resolves in both locales,
+    /// including the two templates that carry an entry id.
+    #[test]
+    fn vault_choice_keys_resolve_in_both_locales() {
+        for key in [
+            "settings.vaultChoose",
+            "settings.vaultSource",
+            "settings.vaultClear",
+            "settings.vaultNoEntries",
+            "settings.vaultUnlockToChoose",
+            "settings.vaultCreateToChoose",
+            "settings.vaultKeyFromVault",
+            "settings.vaultNamedEntryMissing",
+        ] {
+            assert_ne!(tr(Lang::En, key), key, "{key} missing from en");
+            assert_ne!(tr(Lang::Zh, key), key, "{key} missing from zh");
+        }
+        assert_eq!(
+            tr(Lang::En, "settings.vaultSource").replace("{name}", "provider:work:api_key"),
+            "vault: provider:work:api_key",
+            "the source control names the chosen entry"
+        );
+        assert_eq!(
+            tr(Lang::En, "settings.vaultNamedEntryMissing").replace("{name}", "lost-entry"),
+            "The vault holds no entry named lost-entry.",
+            "a named miss names the id"
+        );
     }
 }

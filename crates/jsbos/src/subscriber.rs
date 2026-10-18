@@ -58,12 +58,9 @@ impl Subscriber {
   #[napi]
   /// Receive the next message, waiting up to `timeout_ms`.
   pub async fn recv_with_timeout_ms(&self, timeout_ms: i64) -> Result<Option<String>> {
+    let timeout = crate::millis_from_js("timeout_ms", timeout_ms)?;
     let mut guard = self.inner.lock().await;
-    Ok(
-      guard
-        .recv_with_timeout(std::time::Duration::from_millis(timeout_ms as u64))
-        .await,
-    )
+    Ok(guard.recv_with_timeout(timeout).await)
   }
 
   #[napi]
@@ -72,10 +69,9 @@ impl Subscriber {
     &self,
     timeout_ms: i64,
   ) -> Result<Option<serde_json::Value>> {
+    let timeout = crate::millis_from_js("timeout_ms", timeout_ms)?;
     let mut guard = self.inner.lock().await;
-    let msg = guard
-      .recv_with_timeout(std::time::Duration::from_millis(timeout_ms as u64))
-      .await;
+    let msg = guard.recv_with_timeout(timeout).await;
     match msg {
       Some(s) => {
         let value: serde_json::Value = serde_json::from_str(&s)

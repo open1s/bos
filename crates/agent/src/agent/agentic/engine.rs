@@ -1,5 +1,50 @@
 use super::*;
 
+/// Owns the session history for one run and puts it back when the run ends.
+///
+/// Both [`Agent::react`] and [`Agent::stream`] take the message log out of the
+/// agent so the engine can drive it without holding the session lock. A
+/// caller can drop the future or the stream before the generator reaches its
+/// cleanup (a host that stops reading at `Done` does exactly that), so the
+/// history is restored from `Drop` as well: cancellation must not silently
+/// erase the transcript.
+struct SessionRestore<'a> {
+    agent: &'a Agent,
+    session: Option<AgentSession>,
+}
+
+impl<'a> SessionRestore<'a> {
+    fn new(agent: &'a Agent, messages: Vec<LlmMessage>) -> Self {
+        let mut session = AgentSession::new();
+        session.restore_messages(messages);
+        Self {
+            agent,
+            session: Some(session),
+        }
+    }
+
+    fn session_mut(&mut self) -> &mut AgentSession {
+        self.session
+            .as_mut()
+            .expect("session is present until restore runs")
+    }
+
+    /// Move the current messages back into the agent's session.
+    fn restore(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            let messages = session.take_messages();
+            let mut target = self.agent.session.lock().unwrap();
+            target.restore_messages(messages);
+        }
+    }
+}
+
+impl Drop for SessionRestore<'_> {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 /// Whether the hosted web-search tool is offered on this request.
 ///
 /// Both halves are required. The switch says the reader wants it; the protocol
@@ -260,8 +305,7 @@ impl Agent {
             let mut session = self.session.lock().unwrap();
             session.take_messages()
         };
-        let mut agent_session = AgentSession::new();
-        agent_session.restore_messages(messages);
+        let mut session_restore = SessionRestore::new(self, messages);
         let system_prompt = self.system_prompt_for(&task_content).await;
         let prompt_text = task_content.as_text().unwrap_or_default().to_string();
 
@@ -286,16 +330,13 @@ impl Agent {
             .react(
                 Some(system_prompt),
                 request,
-                &mut agent_session,
+                session_restore.session_mut(),
                 &mut *context.as_mut().unwrap(),
             )
             .await;
         let engine_time = engine_start.elapsed();
 
-        {
-            let mut session = self.session.lock().unwrap();
-            session.restore_messages(agent_session.take_messages());
-        }
+        session_restore.restore();
 
         match result {
             Ok(answer) => {
@@ -429,12 +470,12 @@ impl Agent {
             let mut session = self.session.lock().unwrap();
             session.take_messages()
         };
-        let mut agent_session = AgentSession::new();
-        agent_session.restore_messages(messages);
+        let session_restore = SessionRestore::new(self, messages);
 
         let stream = async_stream::stream! {
             let mut engine = engine;
             let mut context = context;
+            let mut session_restore = session_restore;
             let mut reply = String::new();
 
             // Reset the per-stream readings first: a run that aborts early
@@ -466,24 +507,37 @@ impl Agent {
                 ..Default::default()
             };
 
+            // The terminal token is held back until the run's bookkeeping has
+            // finished: a host that stops reading at `Done` must still get the
+            // remembered exchange, the metrics, the hooks, and a cached engine.
+            let mut terminal_token: Option<StreamToken> = None;
             {
-                let react_stream = engine.react_stream(Some(system_prompt), request, &mut agent_session, &mut context);
+                let react_stream =
+                    engine.react_stream(Some(system_prompt), request, session_restore.session_mut(), &mut context);
                 futures::pin_mut!(react_stream);
-                let plugins = self.plugins.clone();
+                let plugin_list = self.plugins.plugins();
                 let hooks = self.hooks.clone();
                 let agent_name = self.config.name.clone();
 
                 while let Some(item) = react_stream.next().await {
                     match item {
+                        Ok(token) if matches!(token, StreamToken::Done | StreamToken::Stopped) => {
+                            terminal_token = Some(token);
+                            break;
+                        }
                         Ok(token) => {
-                            let final_token = if plugins.has_plugins() {
-                                let wrapped = StreamTokenWrapper::new(&token);
-                                match plugins.on_stream_token(wrapped).await {
+                            // Snapshot the plugins once per stream and move the
+                            // token into the wrapper: this runs for every chunk.
+                            let final_token = if plugin_list.is_empty() {
+                                token
+                            } else {
+                                let wrapped = StreamTokenWrapper::from_token(token);
+                                match PluginRegistry::on_stream_token_with(&plugin_list, wrapped)
+                                    .await
+                                {
                                     Some(modified) => modified.into_token(),
                                     None => continue,
                                 }
-                            } else {
-                                token
                             };
                             if let StreamToken::Text(text) = &final_token {
                                 reply.push_str(text);
@@ -512,10 +566,7 @@ impl Agent {
             // aborted stream returns from inside the loop above.
             self.remember_exchange(&prompt_text, &reply).await;
 
-            {
-                let mut session = self.session.lock().unwrap();
-                session.restore_messages(agent_session.take_messages());
-            }
+            session_restore.restore();
 
             {
                 let cumulative = engine.cumulative_token_usage();
@@ -553,6 +604,10 @@ impl Agent {
             {
                 let mut cache = self.context_cache.lock().unwrap();
                 *cache = Some(context);
+            }
+
+            if let Some(token) = terminal_token {
+                yield Ok(token);
             }
         };
 

@@ -151,7 +151,8 @@ impl PyBus {
         let bus = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let mut guard = bus.lock().await;
+            // `Session::publish` takes `&self`, so the guard is not mutated.
+            let guard = bus.lock().await;
             guard
                 .publish(&topic, &payload)
                 .await
@@ -171,7 +172,7 @@ impl PyBus {
         let bus = self.inner.clone();
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
-            let mut guard = bus.lock().await;
+            let guard = bus.lock().await;
             guard
                 .publish(&topic, &json_str)
                 .await

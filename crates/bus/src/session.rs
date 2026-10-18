@@ -9,7 +9,8 @@ use rkyv::ser::Serializer;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::ops::Deref;
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use zenoh::Config;
 
@@ -18,7 +19,7 @@ use zenoh::Config;
 /// An open Zenoh session plus the background tasks the bus spawned.
 pub struct Bus {
     session: Arc<Session>,
-    handles: Arc<tokio::sync::Mutex<Vec<JoinHandle<Result<(), String>>>>>,
+    handles: Arc<Mutex<Vec<JoinHandle<Result<(), String>>>>>,
 }
 
 impl Bus {
@@ -26,7 +27,7 @@ impl Bus {
     pub fn new(session: Arc<Session>) -> Self {
         Self {
             session,
-            handles: Arc::new(tokio::sync::Mutex::new(vec![])),
+            handles: Arc::new(Mutex::new(vec![])),
         }
     }
 
@@ -35,12 +36,25 @@ impl Bus {
         self.session.clone()
     }
 
-    fn abort_handles(&mut self) {
-        if let Ok(mut handles) = self.handles.try_lock() {
-            for handle in handles.drain(..) {
-                handle.abort();
-            }
+    fn abort_handles(&self) {
+        // The critical section only drains a Vec; no I/O happens while the
+        // lock is held, so a blocking std mutex is appropriate here and lets
+        // Drop abort deterministically.
+        let mut handles = match self.handles.lock() {
+            Ok(handles) => handles,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for handle in handles.drain(..) {
+            handle.abort();
         }
+    }
+
+    fn push_handle(&self, handle: JoinHandle<Result<(), String>>) {
+        let mut handles = match self.handles.lock() {
+            Ok(handles) => handles,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        handles.push(handle);
     }
 
     /// Close the bus, aborting all running tasks and releasing resources.
@@ -50,18 +64,23 @@ impl Bus {
         let _ = self.session.close().await;
     }
 
-    ///load from config
+    /// Open a bus from config.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Zenoh cannot open a session with the resulting configuration
+    /// (for example when a listen endpoint is already bound).
     pub async fn from(config: BusConfig) -> Self {
         let zenoh_config: Config = config.into();
         let session = zenoh::open(zenoh_config).await.unwrap();
         Self {
             session: Arc::new(session),
-            handles: Arc::new(tokio::sync::Mutex::new(vec![])),
+            handles: Arc::new(Mutex::new(vec![])),
         }
     }
 
     /// Subscribe to `topic`, calling `handler` for every decoded message.
-    pub async fn subscribe<T, F>(&mut self, topic: &str, mut handler: F)
+    pub async fn subscribe<T, F>(&self, topic: &str, mut handler: F)
     where
         F: FnMut(T) + Send + 'static,
         T: Archive + Send + 'static,
@@ -80,11 +99,11 @@ impl Bus {
             }
             Ok(())
         });
-        self.handles.lock().await.push(handle);
+        self.push_handle(handle);
     }
 
     /// Publish one rkyv-encoded value to `topic`.
-    pub async fn publish<T>(&mut self, topic: &str, payload: &T) -> Result<(), ZenohError>
+    pub async fn publish<T>(&self, topic: &str, payload: &T) -> Result<(), ZenohError>
     where
         T: Archive,
         for<'a> T: Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
@@ -101,7 +120,13 @@ impl Bus {
 
 impl Drop for Bus {
     fn drop(&mut self) {
-        self.abort_handles();
+        // The handles are shared by every clone of this bus. Only the last
+        // owner may abort them: dropping a temporary clone (such as the
+        // bus.clone().into() pattern used to obtain a session) must not
+        // cancel subscriptions another owner still relies on.
+        if Arc::strong_count(&self.handles) == 1 {
+            self.abort_handles();
+        }
     }
 }
 
@@ -132,7 +157,9 @@ pub struct BusConfig {
     pub connect: Option<Vec<String>>,
     /// Endpoints to listen on.
     pub listen: Option<Vec<String>>,
-    /// Peer id override.
+    /// Zenoh id override, emitted as id in the generated configuration.
+    ///
+    /// When set, the value must be a valid Zenoh id (at most 16 bytes).
     pub peer: Option<Option<String>>,
 }
 
@@ -148,31 +175,57 @@ impl BusConfig {
     }
 }
 
-impl From<BusConfig> for zenoh::config::Config {
-    fn from(value: BusConfig) -> Config {
-        let mut json = if value.mode == "router" {
-            r#"{"mode": "router""#.to_string()
+impl BusConfig {
+    /// Render this configuration as the JSON5 document handed to Zenoh.
+    fn to_zenoh_json(&self) -> String {
+        // Pass the mode through so valid Zenoh modes other than peer/router
+        // (for example client) are not silently rewritten.
+        let mode = if self.mode.is_empty() {
+            "peer"
         } else {
-            r#"{"mode": "peer""#.to_string()
+            self.mode.as_str()
         };
+        let mut json = format!(
+            r#"{{"mode": {}"#,
+            serde_json::to_string(mode).expect("a string always serializes")
+        );
 
-        if let Some(listen) = &value.listen {
+        if let Some(listen) = &self.listen {
             json.push_str(&format!(
                 r#", "listen": {{"endpoints": {}}}"#,
-                serde_json::to_string(listen).unwrap()
+                serde_json::to_string(listen).expect("a list of strings always serializes")
             ));
         }
 
-        if let Some(connect) = &value.connect {
+        if let Some(connect) = &self.connect {
             json.push_str(&format!(
                 r#", "connect": {{"endpoints": {}}}"#,
-                serde_json::to_string(connect).unwrap()
+                serde_json::to_string(connect).expect("a list of strings always serializes")
             ));
+        }
+
+        if let Some(Some(peer)) = &self.peer {
+            // Only emit a syntactically valid Zenoh id: an invalid value would
+            // make Zenoh reject the whole document and silently discard the
+            // listen/connect endpoints as well.
+            if zenoh::config::ZenohId::from_str(peer).is_ok() {
+                json.push_str(&format!(
+                    r#", "id": {}"#,
+                    serde_json::to_string(peer).expect("a string always serializes")
+                ));
+            }
         }
 
         json.push('}');
+        json
+    }
+}
 
-        zenoh::config::Config::from_json5(&json).unwrap_or_default()
+impl From<BusConfig> for zenoh::config::Config {
+    fn from(value: BusConfig) -> Config {
+        // A configuration Zenoh rejects falls back to the Zenoh defaults; the
+        // generated document is exercised by the unit tests below.
+        zenoh::config::Config::from_json5(&value.to_zenoh_json()).unwrap_or_default()
     }
 }
 
@@ -184,5 +237,65 @@ impl Default for BusConfig {
             listen: None,
             peer: None,
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_json(value: BusConfig) -> serde_json::Value {
+        let rendered = value.to_zenoh_json();
+        let config = zenoh::config::Config::from_json5(&rendered)
+            .unwrap_or_else(|e| panic!("generated config rejected by zenoh: {e}\n{rendered}"));
+        serde_json::to_value(&config).expect("zenoh config serializes")
+    }
+
+    #[test]
+    fn test_mode_is_passed_through() {
+        let json = config_json(BusConfig::new("client"));
+        assert_eq!(json.get("mode").and_then(|m| m.as_str()), Some("client"));
+    }
+
+    #[test]
+    fn test_empty_mode_falls_back_to_peer() {
+        let json = config_json(BusConfig::new(""));
+        assert_eq!(json.get("mode").and_then(|m| m.as_str()), Some("peer"));
+    }
+
+    #[test]
+    fn test_peer_id_becomes_zenoh_id() {
+        let config = BusConfig {
+            peer: Some(Some("abc".to_string())),
+            ..BusConfig::default()
+        };
+        let json = config_json(config);
+        let expected =
+            serde_json::to_value(zenoh::config::ZenohId::from_str("abc").expect("valid zenoh id"))
+                .expect("id serializes");
+        assert_eq!(json.get("id"), Some(&expected));
+    }
+
+    #[test]
+    fn test_unset_peer_leaves_id_unset() {
+        let json = config_json(BusConfig::default());
+        assert!(json.get("id").is_some_and(|id| id.is_null()));
+    }
+
+    #[test]
+    fn test_invalid_peer_id_is_ignored_without_dropping_endpoints() {
+        let config = BusConfig {
+            peer: Some(Some("not a zenoh id".to_string())),
+            listen: Some(vec!["tcp/127.0.0.1:0".to_string()]),
+            ..BusConfig::default()
+        };
+        let json = config_json(config);
+        assert!(
+            json.get("id").is_some_and(|id| id.is_null()),
+            "invalid ids are not emitted: {json}"
+        );
+        assert!(
+            json.to_string().contains("tcp/127.0.0.1:0"),
+            "valid endpoints survive an invalid peer id: {json}"
+        );
     }
 }

@@ -153,12 +153,18 @@ pub(crate) struct Effective {
     pub(crate) provider: String,
     /// The model reference that resolved, or none while nothing is chosen.
     pub(crate) model_ref: Option<global::ModelRef>,
-    /// Model identifier.
+    /// Model identifier, as the API is called with it.
     pub(crate) model: String,
+    /// The name the chip and its menu show for the resolved choice.
+    ///
+    /// The leaf's display name when it declares one, else the nickname the
+    /// menu rows carry, so the label and the checked row never describe two
+    /// different things. Empty while nothing is chosen.
+    pub(crate) model_name: String,
     /// API base URL.
     pub(crate) base_url: String,
-    /// API key.
-    pub(crate) api_key: String,
+    /// The vault entry the provider named, if any.
+    pub(crate) api_key_vault: Option<String>,
     /// System prompt.
     pub(crate) system_prompt: String,
     /// Sampling temperature.
@@ -299,8 +305,25 @@ impl Settings {
             // they are written back to.
             save_root: None,
         };
+        read.adopt_legacy_session();
         read.ensure_workspace();
         read
+    }
+
+    /// Bring a retired workspace `active_session` into the machine preference.
+    ///
+    /// Which session is on screen is a window fact - several sessions in one
+    /// workspace can run at once - so it lives on the global document now. An
+    /// older workspace file still names one; this carries that answer over
+    /// once, and never lets it overwrite a session the reader has since opened.
+    fn adopt_legacy_session(&mut self) {
+        if !self.global.general.active_session.trim().is_empty() {
+            return;
+        }
+        let legacy = self.workspace.general.legacy_active_session.trim();
+        if !legacy.is_empty() {
+            self.global.general.active_session = legacy.to_string();
+        }
     }
 
     /// Write both documents back, each whole.
@@ -312,35 +335,10 @@ impl Settings {
     /// guard that keeps a redesign from silently eating a configuration it
     /// cannot read.
     pub(crate) fn save(&self) -> std::io::Result<()> {
-        // A TEST BUILD MUST NEVER WRITE THE REAL CONFIGURATION.
-        //
-        // Every test redirects the write by setting save_root to its scratch
-        // store, and this is the belt behind that brace: one checkout's test run
-        // shares $HOME with every other checkout on the machine, so a single
-        // forgotten redirect does not merely fail a test - it overwrites the
-        // reader's actual settings with a fixture. That is not hypothetical: a
-        // test run in a second worktree wrote this file while it was being
-        // repaired, replacing the reader's provider with a "work.example"
-        // fixture. The guard costs one comparison and makes the class
-        // impossible in this build.
-        if cfg!(test) && self.save_root.is_none() {
-            return Err(std::io::Error::other(
-                "a test build has no save_root and must not write the real settings file",
-            ));
-        }
-        // The location is carried, not recomputed, so a redirected settings
-        // tree writes exactly where its reader looks.
-        let global_path = match &self.save_root {
-            Some(root) => root.join("settings.toml"),
-            None => GlobalSettings::path(),
-        };
-        if global_path.exists() && GlobalSettings::load(&global_path).is_err() {
-            archive_unreadable(&global_path);
-        }
+        let global_path = self.writable_global_path()?;
         let root = self.active_workspace_root();
         let workspace = self.workspace.clone();
         self.global.validate().map_err(as_io)?;
-        workspace.validate().map_err(as_io)?;
         self.global.save(&global_path).map_err(as_io)?;
         if root.is_empty() {
             // Nothing to place is nothing to report. Something to place with no
@@ -361,17 +359,64 @@ impl Settings {
         Ok(())
     }
 
-    /// The provider credentials this configuration carries.
+    /// Write the machine preferences alone.
     ///
-    /// Read by the session store, which must not write a credential into a
-    /// transcript. The tree is the only place a key is defined, so it is the
-    /// only place that can say which strings to scrub.
+    /// Selecting a session changes a WINDOW fact - which chat is on screen - and
+    /// the workspace document no longer carries session identity, so there is no
+    /// reason to rewrite that file every time the reader switches chats.
+    pub(crate) fn save_global(&self) -> std::io::Result<()> {
+        let global_path = self.writable_global_path()?;
+        self.global.validate().map_err(as_io)?;
+        self.global.save(&global_path).map_err(as_io)
+    }
+
+    /// The path a machine preference is written to, after the write guards.
+    ///
+    /// Every global write goes through here, so the test guard and the
+    /// unreadable-file archive cannot be forgotten by one of the writers.
+    fn writable_global_path(&self) -> std::io::Result<PathBuf> {
+        // A TEST BUILD MUST NEVER WRITE THE REAL CONFIGURATION.
+        //
+        // Every test redirects the write by setting save_root to its scratch
+        // store, and this is the belt behind that brace: one checkout's test run
+        // shares $HOME with every other checkout on the machine, so a single
+        // forgotten redirect does not merely fail a test - it overwrites the
+        // reader's actual settings with a fixture. That is not hypothetical: a
+        // test run in a second worktree wrote this file while it was being
+        // repaired, replacing the reader's provider with a "work.example"
+        // fixture. The guard costs one comparison and makes the class
+        // impossible in this build.
+        if cfg!(test) && self.save_root.is_none() {
+            return Err(std::io::Error::other(
+                "a test build has no save_root and must not write the real settings file",
+            ));
+        }
+        // The location is carried, not recomputed, so a redirected settings
+        // tree writes exactly where its reader looks.
+        let path = match &self.save_root {
+            Some(root) => root.join("settings.toml"),
+            None => GlobalSettings::path(),
+        };
+        if path.exists() && GlobalSettings::load(&path).is_err() {
+            archive_unreadable(&path);
+        }
+        Ok(path)
+    }
+
+    /// Plaintext provider keys an older settings document still carries.
+    ///
+    /// The tree no longer stores a credential; vault entries are the only
+    /// source. A legacy `api_key` is kept in memory just long enough for the
+    /// session store to scrub it from transcripts, and is never serialized or
+    /// used to authenticate.
     pub(crate) fn secrets(&self) -> Vec<String> {
         self.global
             .providers
             .values()
             .filter_map(|provider| {
-                let key = provider.api_key.trim();
+                // Only a legacy plaintext key remains readable here; it is
+                // scrubbed from transcripts but never used to authenticate.
+                let key = provider.legacy_api_key.as_deref()?.trim();
                 (!key.is_empty()).then(|| key.to_string())
             })
             .collect()
@@ -429,26 +474,27 @@ impl Settings {
             .find(|w| w.id == self.global.general.active_workspace)
     }
 
-    /// Why a turn cannot be sent in this workspace, or none while it can.
+    /// Why a turn cannot be sent for one session's own choice, or none while
+    /// it can.
     ///
-    /// The refusal is the seam that keeps a stale name honest: a workspace whose
-    /// model or preset the trees no longer define is reported rather than
-    /// quietly falling back to some other definition, because the reader who
-    /// chose that name is the one who can correct it.
-    pub(crate) fn refusal(&self) -> Option<&'static str> {
+    /// The refusal is the seam that keeps a stale name honest: a model or
+    /// preset the trees no longer define is reported rather than quietly
+    /// falling back to some other definition, because the reader who chose
+    /// that name is the one who can correct it.
+    ///
+    /// The resolution is the one the build uses - the session's pair against
+    /// the global tree - so the send gate and the agent can never disagree
+    /// about whether a turn has an endpoint. A session that names nothing is
+    /// refused with the composer's "choose a model" copy.
+    pub(crate) fn refusal_for(&self, session: &resolve::SessionChoice) -> Option<&'static str> {
         let entry = self
             .global
             .workspaces
             .iter()
             .find(|w| w.id == self.global.general.active_workspace);
-        let resolution = resolve::resolve(
-            &self.global,
-            &self.workspace,
-            entry,
-            &resolve::SessionChoice::default(),
-        );
+        let resolution = resolve::resolve(&self.global, &self.workspace, entry, session);
         resolution.refusal().map(|refusal| match refusal {
-            resolve::Refusal::NoModel => "composer.noModels",
+            resolve::Refusal::NoModel => "composer.chooseModel",
             resolve::Refusal::UnknownModel(_) => "composer.modelUnavailable",
             resolve::Refusal::UnknownPreset(_) => "composer.presetUnavailable",
         })
@@ -459,18 +505,61 @@ impl Settings {
     /// This is a derivation, never a second storage: every field is read from
     /// the trees, so a value one pane wrote is the value every pane and the
     /// agent both see.
+    /// The recycle bin's directory.
+    ///
+    /// Beside the settings file, derived from `save_root` rather than recomputed from
+    /// `$HOME`, so a scratch configuration gets a scratch bin and a test can never
+    /// empty the reader's.
+    pub(crate) fn trash_dir(&self) -> PathBuf {
+        match &self.save_root {
+            Some(root) => root.join("trash"),
+            // A test build never gets a path it could write the reader's bin from:
+            // the guard finds the state that lost its root instead of quietly
+            // emptying somebody's recycle bin.
+            None if cfg!(test) => panic!("a test reached the real recycle bin"),
+            None => crate::settings::dir().join("trash"),
+        }
+    }
+
+    /// The admin-key vault's file.
+    ///
+    /// Beside the settings document, derived from 'save_root' rather than
+    /// recomputed from '$HOME', so a scratch configuration gets a scratch vault
+    /// and a test can never open the reader's. This is the one place the path is
+    /// defined; 'Vault' is constructed from it.
+    pub(crate) fn vault_path(&self) -> PathBuf {
+        // A vault written before the file was hidden is renamed once, so a
+        // reader who already stored secrets does not silently get an empty one.
+        let current = match &self.save_root {
+            Some(root) => root.join(".vault.bin"),
+            None if cfg!(test) => panic!("a test reached the real vault"),
+            None => crate::settings::dir().join(".vault.bin"),
+        };
+        if !current.exists() {
+            let legacy = current.with_file_name("vault.bin");
+            if legacy.is_file() {
+                let _ = std::fs::rename(&legacy, &current);
+            }
+        }
+        current
+    }
+
     pub(crate) fn effective(&self) -> Effective {
+        self.effective_for(&resolve::SessionChoice::default())
+    }
+
+    /// Fold the two documents with one session's own model choice folded in.
+    ///
+    /// The session names the model and the global tree defines what the name
+    /// means. There is no workspace-level default: a session that names
+    /// nothing has no model rather than inheriting someone else's.
+    pub(crate) fn effective_for(&self, session: &resolve::SessionChoice) -> Effective {
         let entry = self
             .global
             .workspaces
             .iter()
             .find(|w| w.id == self.global.general.active_workspace);
-        let resolution = resolve::resolve(
-            &self.global,
-            &self.workspace,
-            entry,
-            &resolve::SessionChoice::default(),
-        );
+        let resolution = resolve::resolve(&self.global, &self.workspace, entry, session);
         let connection = resolution.model.connection();
         let provider_id = resolution
             .model
@@ -478,9 +567,15 @@ impl Settings {
             .map(|named| named.provider.clone())
             .unwrap_or_default();
         let general = &self.global.general;
+        let model_name = resolution
+            .model
+            .reference()
+            .map(|reference| self.model_display_name(reference))
+            .unwrap_or_default();
         Effective {
             provider: provider_id,
             model_ref: resolution.model.reference().cloned(),
+            model_name,
             max_steps: resolution.max_steps,
             parallel_tool_calls: resolution.parallel_tool_calls,
             api_mode: connection
@@ -490,7 +585,7 @@ impl Settings {
             root: resolution.root,
             model: connection.map(|c| c.model.clone()).unwrap_or_default(),
             base_url: connection.map(|c| c.base_url.clone()).unwrap_or_default(),
-            api_key: connection.map(|c| c.api_key.clone()).unwrap_or_default(),
+            api_key_vault: connection.and_then(|c| c.api_key_vault.clone()),
             system_prompt: resolution.system_prompt,
             temperature: resolution.temperature.unwrap_or(0.7),
             reasoning_effort: resolution.reasoning_effort,
@@ -529,22 +624,51 @@ impl Settings {
         path
     }
 
-    /// The provider the active workspace chose, empty while it chose none.
-    pub(crate) fn active_provider(&self) -> &str {
-        self.workspace.general.provider.trim()
-    }
-
     /// The model nicknames one provider carries, for the menu and the pane.
     pub(crate) fn catalog(&self, provider: &str) -> Vec<String> {
         self.global.models_of(provider).keys().cloned().collect()
     }
 
-    /// Whether the model in effect accepts an image attachment.
+    /// Every provider that carries models, with its catalogue, for the menu.
+    ///
+    /// Grouping by provider id keeps the rows unambiguous when two providers
+    /// carry a model of the same name. `active` is the provider the choice in
+    /// effect names; it leads the list so the common case is one row away. The
+    /// model is session state now, so the caller passes the provider in rather
+    /// than the workspace carrying a selection.
+    pub(crate) fn catalogs_by_provider(&self, active: &str) -> Vec<(String, Vec<String>)> {
+        let mut groups: Vec<(String, Vec<String>)> = self
+            .global
+            .providers
+            .keys()
+            .map(|provider| (provider.clone(), self.catalog(provider)))
+            .filter(|(_, models)| !models.is_empty())
+            .collect();
+        groups.sort_by_key(|(provider, _)| provider != active);
+        groups
+    }
+
+    /// The name a resolved choice is shown under, in the chip and its menu.
+    ///
+    /// A leaf that declares a display name owns what the reader sees; one that
+    /// declares none is named by its nickname. The nickname is the key the
+    /// menu rows carry, so the label and the checked row describe the same
+    /// thing - the API model id is a different fact and stays on the wire.
+    pub(crate) fn model_display_name(&self, reference: &global::ModelRef) -> String {
+        self.global
+            .lookup(reference)
+            .and_then(|(_, leaf)| leaf.name.clone())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| reference.model.clone())
+    }
+
+    /// Whether one session's model accepts an image attachment.
     ///
     /// An undeclared model is permissive; only a model that names its input
-    /// types has something to answer.
-    pub(crate) fn accepts_image(&self) -> bool {
-        let Some(named) = self.effective().model_ref else {
+    /// types has something to answer. A session with no model accepts none.
+    pub(crate) fn accepts_image_for(&self, session: &resolve::SessionChoice) -> bool {
+        let Some(named) = self.effective_for(session).model_ref else {
             return false;
         };
         self.global.accepts_image(&named.provider, &named.model)
@@ -575,7 +699,7 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::global::{GlobalSettings, ModelEntry};
+    use super::global::{self, GlobalSettings, ModelEntry};
     use super::workspace::WorkspaceSettings;
     use super::Settings;
 
@@ -604,54 +728,88 @@ mod tests {
             "no preset is seeded from a retired directory"
         );
         assert!(
-            settings.workspace.general.provider.trim().is_empty(),
-            "no workspace names a provider"
-        );
-        assert!(
-            settings.workspace.general.model.trim().is_empty(),
-            "no workspace names a model"
+            settings.workspace.general.legacy_pair().is_none(),
+            "no workspace holds a model selection: it lives on the session"
         );
     }
 
-    /// A name the trees no longer define is reported, never substituted:
-    /// the workspace that names it is the one that can correct it.
+    /// A name the trees no longer define is reported, never substituted: the
+    /// session that names it is the one that can correct it.
     #[test]
     fn a_stale_name_is_refused_rather_than_substituted() {
-        // A fresh install has no workspace yet, so naming one is what makes the
-        // rest of the test about a workspace rather than about emptiness.
         let mut settings = Settings::default();
         let id = settings.note_workspace("scratch", "/tmp");
         settings.global.general.active_workspace = id;
+        let choice = |provider: &str, model: &str| crate::settings::resolve::SessionChoice {
+            model: Some(global::ModelRef {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            }),
+            preset: None,
+        };
         assert_eq!(
-            settings.refusal(),
-            Some("composer.noModels"),
-            "a workspace that names no model asks for one"
+            settings.refusal_for(&crate::settings::resolve::SessionChoice::default()),
+            Some("composer.chooseModel"),
+            "a chat that names no model asks for one"
         );
 
         // A model nickname that no provider tree defines.
-        settings.workspace.general.provider = "work".to_string();
-        settings.workspace.general.model = "ghost".to_string();
+        let ghost = choice("work", "ghost");
         assert_eq!(
-            settings.refusal(),
+            settings.refusal_for(&ghost),
             Some("composer.modelUnavailable"),
             "a name the tree dropped is not silently swapped for another"
         );
 
         // The very same nickname, now defined, resolves.
         let mut global = settings.global.clone();
-        global.add_provider("work", "", "https://work.example/v1", "k", &[]);
+        global.add_provider("work", "", "https://work.example/v1", &[]);
         let _ = global.add_model("work", "ghost", "", "gpt-4o", "");
         settings.global = global;
-        assert_eq!(settings.refusal(), None, "a resolved name is not refused");
+        assert_eq!(
+            settings.refusal_for(&ghost),
+            None,
+            "a resolved name is not refused"
+        );
 
         // A preset nothing defines is the harder stop: it decides what the
         // model sees, so a missing mount cannot be answered by a guess.
-        // The user's default is the name a session that names none carries.
         settings.global.default_preset = "missing-preset".to_string();
         assert_eq!(
-            settings.refusal(),
+            settings.refusal_for(&ghost),
             Some("composer.presetUnavailable"),
             "a preset the tree cannot build is refused outright"
+        );
+    }
+
+    /// A session that names a model is sendable; one that names none is not,
+    /// and the composer reads the "choose a model" copy.
+    #[test]
+    fn a_session_choice_is_the_only_way_to_name_a_model() {
+        let mut settings = Settings::default();
+        let id = settings.note_workspace("scratch", "/tmp");
+        settings.global.general.active_workspace = id;
+        settings
+            .global
+            .add_provider("work", "", "https://work.example/v1", &[]);
+        let _ = settings.global.add_model("work", "fast", "", "fast-id", "");
+        assert_eq!(
+            settings.refusal_for(&crate::settings::resolve::SessionChoice::default()),
+            Some("composer.chooseModel"),
+            "with no session choice there is no model, even when one is defined"
+        );
+
+        let choice = crate::settings::resolve::SessionChoice {
+            model: Some(global::ModelRef {
+                provider: "work".to_string(),
+                model: "fast".to_string(),
+            }),
+            preset: None,
+        };
+        assert_eq!(
+            settings.refusal_for(&choice),
+            None,
+            "the session's own pair is enough to send"
         );
     }
 
@@ -660,12 +818,12 @@ mod tests {
     #[test]
     fn a_provider_node_owns_the_endpoint_and_the_model_ids() {
         let mut settings = GlobalSettings::default();
-        settings.add_provider("work", "", "https://work.example/v1", "k", &[]);
+        settings.add_provider("work", "", "https://work.example/v1", &[]);
         let _ = settings.add_model("work", "fast", "Fast one", "gpt-4o-mini", "chat");
         let _ = settings.add_model("work", "brilliant", "", "o3", "responses");
         let node = settings.providers.get("work").expect("seeded");
         assert_eq!(node.base_url, "https://work.example/v1");
-        assert_eq!(node.api_key, "k");
+        assert_eq!(node.api_key_vault, None);
         assert_eq!(
             node.models.get("fast").expect("nickname").model,
             "gpt-4o-mini",
@@ -700,7 +858,6 @@ mod tests {
             "relay",
             "",
             "https://relay.example/v1",
-            "",
             &[ModelEntry::named("m")],
         );
         settings.set_provider_name("relay", "Relay");
@@ -718,7 +875,7 @@ mod tests {
     #[test]
     fn an_undeclared_model_takes_everything() {
         let mut settings = GlobalSettings::default();
-        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_provider("p", "", "https://p.example/v1", &[]);
         let _ = settings.add_model("p", "m", "", "m", "");
         assert!(settings.accepts_image("p", "m"), "undeclared is permissive");
         assert_eq!(settings.input_types_of("p", "m"), ["text", "image"]);
@@ -729,7 +886,7 @@ mod tests {
     #[test]
     fn text_never_leaves_the_declared_input_types() {
         let mut settings = GlobalSettings::default();
-        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_provider("p", "", "https://p.example/v1", &[]);
         let _ = settings.add_model("p", "m", "", "m", "");
         settings.set_input_type("p", "m", "image");
         assert!(
@@ -757,7 +914,7 @@ mod tests {
         let mut settings = Settings {
             global: {
                 let mut global = GlobalSettings::default();
-                global.add_provider("p", "", "https://p.example/v1", "", &[]);
+                global.add_provider("p", "", "https://p.example/v1", &[]);
                 let _ = global.add_model("p", "m", "", "m", "");
                 global
             },
@@ -777,7 +934,7 @@ mod tests {
     #[test]
     fn dropping_a_model_drops_its_declaration() {
         let mut settings = GlobalSettings::default();
-        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_provider("p", "", "https://p.example/v1", &[]);
         let _ = settings.add_model("p", "m", "", "m", "");
         settings.set_input_type("p", "m", "image");
         assert!(!settings.accepts_image("p", "m"));
@@ -791,7 +948,7 @@ mod tests {
     #[test]
     fn a_model_id_appears_once_on_a_provider() {
         let mut settings = GlobalSettings::default();
-        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_provider("p", "", "https://p.example/v1", &[]);
         settings.add_model("p", "m", "", "same", "").expect("first");
         let repeat = settings.add_model("p", "n", "", "same", "");
         assert!(
@@ -805,7 +962,7 @@ mod tests {
     #[test]
     fn re_adding_an_id_under_its_own_key_merges() {
         let mut settings = GlobalSettings::default();
-        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_provider("p", "", "https://p.example/v1", &[]);
         settings.add_model("p", "m", "", "same", "").expect("first");
         settings.add_model("p", "m", "", "same", "").expect("merge");
         assert_eq!(settings.model_ids("p").len(), 1, "one leaf, not two");
@@ -820,7 +977,7 @@ mod tests {
     #[test]
     fn a_blank_model_id_is_refused() {
         let mut settings = GlobalSettings::default();
-        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_provider("p", "", "https://p.example/v1", &[]);
         let outcome = settings.add_model("p", "m", "", "   ", "");
         assert!(outcome.is_err(), "a whitespace id is not a model");
     }
@@ -830,7 +987,7 @@ mod tests {
     #[test]
     fn a_typed_but_blank_display_name_is_refused() {
         let mut settings = GlobalSettings::default();
-        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_provider("p", "", "https://p.example/v1", &[]);
         let outcome = settings.add_model("p", "m", "  ", "m", "");
         assert!(
             outcome.is_err(),
@@ -843,7 +1000,7 @@ mod tests {
     #[test]
     fn an_unspeakable_endpoint_is_refused() {
         let mut settings = GlobalSettings::default();
-        settings.add_provider("p", "", "https://p.example/v1", "", &[]);
+        settings.add_provider("p", "", "https://p.example/v1", &[]);
         let outcome = settings.add_model("p", "m", "", "m", "");
         assert!(outcome.is_ok(), "a good address is accepted");
         let malformed = super::provider::base_url_refusal("not an endpoint");
@@ -859,7 +1016,7 @@ mod tests {
             settings.addable_providers().len() >= 2,
             "a fresh tree offers families"
         );
-        settings.add_provider("deepseek", "", "https://api.deepseek.com", "", &[]);
+        settings.add_provider("deepseek", "", "https://api.deepseek.com", &[]);
         let offered = settings.addable_providers();
         assert!(
             !offered.iter().any(|id| id == "deepseek"),
@@ -871,25 +1028,35 @@ mod tests {
         );
     }
 
-    /// The workspace names a provider and a nickname, and the reference the
-    /// resolver reads is that pair rather than a bare model string.
+    /// A session records a nickname the global tree defines, and the effective
+    /// connection carries that leaf's API id rather than the nickname.
     #[test]
-    fn the_workspace_records_a_reference_not_a_model_string() {
+    fn a_session_records_a_reference_not_a_model_string() {
         let mut settings = Settings::default();
         settings
             .global
-            .add_provider("p", "", "https://p.example/v1", "k", &[]);
+            .add_provider("p", "", "https://p.example/v1", &[]);
         let _ = settings
             .global
             .add_model("p", "fast", "", "gpt-4o-mini", "");
-        settings.workspace.general.provider = "p".to_string();
-        settings.workspace.general.model = "fast".to_string();
-        let reference = settings.workspace.general.model_ref().expect("resolved");
-        assert_eq!(reference.provider, "p");
-        assert_eq!(reference.model, "fast");
-        let effective = settings.effective();
+        let choice = crate::settings::resolve::SessionChoice {
+            model: Some(global::ModelRef {
+                provider: "p".to_string(),
+                model: "fast".to_string(),
+            }),
+            preset: None,
+        };
+        let effective = settings.effective_for(&choice);
         assert_eq!(effective.provider, "p");
         assert_eq!(effective.model, "gpt-4o-mini");
+        assert_eq!(
+            effective.model_name, "fast",
+            "the chip names the nickname when the leaf declares no display name"
+        );
+        assert!(
+            settings.effective().model_ref.is_none(),
+            "without a session choice there is no reference at all"
+        );
     }
 
     /// A session reference the tree cannot resolve refuses to send rather
@@ -903,21 +1070,33 @@ mod tests {
         );
     }
 
-    /// The active image answer follows the workspace's own choice.
+    /// The image answer follows the SESSION's choice.
     #[test]
-    fn the_active_image_answer_follows_the_workspace_choice() {
+    fn the_image_answer_follows_the_session_choice() {
         let mut settings = Settings::default();
         settings
             .global
-            .add_provider("p", "", "https://p.example/v1", "", &[]);
+            .add_provider("p", "", "https://p.example/v1", &[]);
         let _ = settings.global.add_model("p", "m", "", "m", "");
-        settings.workspace.general.provider = "p".to_string();
-        settings.workspace.general.model = "m".to_string();
-        assert!(settings.accepts_image(), "undeclared is permissive");
+        let choice = crate::settings::resolve::SessionChoice {
+            model: Some(global::ModelRef {
+                provider: "p".to_string(),
+                model: "m".to_string(),
+            }),
+            preset: None,
+        };
+        assert!(
+            settings.accepts_image_for(&choice),
+            "undeclared is permissive"
+        );
         settings.global.set_input_type("p", "m", "image");
         assert!(
-            !settings.accepts_image(),
-            "the declaration reached the active answer"
+            !settings.accepts_image_for(&choice),
+            "the declaration reached the session's answer"
+        );
+        assert!(
+            !settings.accepts_image_for(&crate::settings::resolve::SessionChoice::default()),
+            "a chat with no model accepts no image"
         );
     }
 
@@ -928,7 +1107,7 @@ mod tests {
         let mut settings = Settings::default();
         settings
             .global
-            .add_provider("p", "", "https://p.example/v1", "", &[]);
+            .add_provider("p", "", "https://p.example/v1", &[]);
         let _ = settings.global.add_model("p", "fast", "", "a", "");
         let _ = settings.global.add_model("p", "slow", "", "b", "");
         assert_eq!(
@@ -1135,10 +1314,10 @@ mod tests {
         settings.global.general.active_workspace = id.clone();
         // One fact that belongs to the machine...
         settings.global.general.lang = "zh".to_string();
-        // ...and three that belong to this workspace.
+        // ...one more that is also a machine preference (which session was on
+        // screen), and one that belongs to this workspace.
+        settings.global.general.active_session = "s1".to_string();
         settings.workspace.agent.permission = crate::caps::READ_ONLY.to_string();
-        settings.workspace.general.provider = "work".to_string();
-        settings.workspace.general.model = "m".to_string();
         settings.save().expect("the save reaches both files");
 
         // The global document, at the documented path.
@@ -1146,6 +1325,10 @@ mod tests {
         assert!(global_path.exists(), "the global file is written");
         let global = GlobalSettings::load(&global_path).expect("the global file parses");
         assert_eq!(global.general.lang, "zh", "the machine preference landed");
+        assert_eq!(
+            global.general.active_session, "s1",
+            "the session on screen is a machine preference"
+        );
         assert!(
             global.workspaces.iter().any(|workspace| workspace.id == id),
             "the registry landed"
@@ -1165,7 +1348,10 @@ mod tests {
             crate::caps::READ_ONLY,
             "the agent configuration landed"
         );
-        assert_eq!(workspace.general.model, "m", "the selection landed");
+        assert_eq!(
+            workspace.general.legacy_active_session, "",
+            "the workspace document carries no session identity"
+        );
 
         // The split, in both directions: neither file carries the other's facts.
         let global_text = std::fs::read_to_string(&global_path).expect("global text");
@@ -1182,6 +1368,13 @@ mod tests {
             !workspace_text.contains("workspaces"),
             "the registry stays out of the workspace file"
         );
+        assert!(
+            !workspace_text.contains("provider =")
+                && !workspace_text.contains("model =")
+                && !workspace_text.contains("active_session"),
+            "neither a model nor a session identity reaches the workspace \
+             document: {workspace_text}"
+        );
 
         // Reading the two files back is what a relaunch does, and it finds the
         // same facts — so the split survives the round trip, not only the write.
@@ -1195,6 +1388,59 @@ mod tests {
         assert_eq!(read_back.active_workspace_root(), root.to_string_lossy());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Recording which session is on screen rewrites the MACHINE preference and
+    /// leaves the workspace document byte-identical.
+    #[test]
+    fn recording_the_open_session_leaves_the_workspace_file_alone() {
+        let base = std::env::temp_dir().join(format!("bsh-open-session-{}", std::process::id()));
+        let root = base.join("workspace");
+        let home = base.join("home");
+        std::fs::create_dir_all(&root).expect("the workspace root");
+        let mut settings = Settings {
+            save_root: Some(home.clone()),
+            ..Settings::default()
+        };
+        let id = settings.note_workspace("probe", &root.to_string_lossy());
+        settings.global.general.active_workspace = id;
+        settings.save().expect("the baseline");
+        let workspace_path = WorkspaceSettings::path(&root);
+        let before = std::fs::read_to_string(&workspace_path).expect("the baseline document");
+
+        // What selecting a chat does.
+        settings.global.general.active_session = "s9".to_string();
+        settings.save_global().expect("the preference write");
+
+        let global = GlobalSettings::load(&home.join("settings.toml")).expect("the global file");
+        assert_eq!(global.general.active_session, "s9");
+        let after = std::fs::read_to_string(&workspace_path).expect("the workspace document");
+        assert_eq!(
+            before, after,
+            "switching chats must not rewrite the workspace a chat happens to live in"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A workspace file written before this move named the session itself. It is
+    /// carried into the machine preference once, and never over a newer choice.
+    #[test]
+    fn a_legacy_workspace_session_becomes_the_machine_preference_once() {
+        let mut settings = Settings::default();
+        settings.workspace.general.legacy_active_session = "old-chat".to_string();
+        settings.adopt_legacy_session();
+        assert_eq!(
+            settings.global.general.active_session, "old-chat",
+            "the old file's answer is adopted, so a relaunch opens the same chat"
+        );
+
+        settings.global.general.active_session = "newer-chat".to_string();
+        settings.workspace.general.legacy_active_session = "old-chat".to_string();
+        settings.adopt_legacy_session();
+        assert_eq!(
+            settings.global.general.active_session, "newer-chat",
+            "a preference already recorded is never overwritten by the retired field"
+        );
     }
 
     /// A pane edit lives in the draft until it is committed.

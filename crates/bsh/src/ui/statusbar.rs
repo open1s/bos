@@ -34,6 +34,11 @@ impl Shell {
             .items_center()
             .justify_center()
             .gap(px(theme::STAT_GAP));
+        // The context reading leads the row: it is the one figure that answers
+        // "how full is the prompt", which is what a reader looks for first.
+        if let Some(meter) = self.context_meter(cx) {
+            row = row.child(meter);
+        }
         // The reference draws the counts pill only once a step has landed.
         if steps > 0 {
             row = row.child(self.stat_time_pill(size, turns, steps, lang));
@@ -41,9 +46,8 @@ impl Shell {
         if let Some(summary) = self.state.stat_summary() {
             row = row.child(self.stat_usage_pill(size, summary, lang, cx));
         }
-        if let Some(model) = self.state.status_model() {
-            row = row.child(self.stat_text(size, model));
-        }
+        // The model name is not repeated here: the composer's own chip already
+        // names it, and this row belongs to the figures about the turn.
         if let Some(notice) = &self.state.notice {
             row = row.child(txt(
                 notice.clone(),

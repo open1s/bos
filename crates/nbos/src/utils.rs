@@ -92,7 +92,22 @@ pub fn parse_merge_strategy(
     }
 }
 
+/// Deepest Python nesting accepted when converting to JSON.
+///
+/// A cyclic Python container would otherwise recurse until the Rust stack
+/// overflows, which aborts the interpreter.
+const MAX_JSON_DEPTH: usize = 64;
+
 pub fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    py_to_json_at(value, 0)
+}
+
+fn py_to_json_at(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<serde_json::Value> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(PyValueError::new_err(format!(
+            "Python value is nested more than {MAX_JSON_DEPTH} levels deep (or is cyclic)"
+        )));
+    }
     if value.is_none() {
         return Ok(serde_json::Value::Null);
     }
@@ -118,21 +133,21 @@ pub fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         let mut map = serde_json::Map::new();
         for (k, v) in dict {
             let key = k.extract::<String>()?;
-            map.insert(key, py_to_json(&v)?);
+            map.insert(key, py_to_json_at(&v, depth + 1)?);
         }
         return Ok(serde_json::Value::Object(map));
     }
     if let Ok(list) = value.cast::<PyList>() {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
-            out.push(py_to_json(&item)?);
+            out.push(py_to_json_at(&item, depth + 1)?);
         }
         return Ok(serde_json::Value::Array(out));
     }
     if let Ok(tuple) = value.cast::<PyTuple>() {
         let mut out = Vec::with_capacity(tuple.len());
         for item in tuple.iter() {
-            out.push(py_to_json(&item)?);
+            out.push(py_to_json_at(&item, depth + 1)?);
         }
         return Ok(serde_json::Value::Array(out));
     }

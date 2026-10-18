@@ -186,10 +186,18 @@ impl Shell {
                 if hero {
                     middle.justify_center().child(self.hero_group(cx))
                 } else {
+                    // The transcript is not centred: its right edge keeps the
+                    // band the turn rail and the composer were laid out with,
+                    // and its left edge takes only CHAT_LEFT_SHARE of the band,
+                    // so the text starts where the eye expects it instead of
+                    // behind a wide empty margin.
+                    let band = ((self.conversation_w.as_f32() - self.chat_w()) / 2.0).max(0.0);
                     middle
                         .child(
                             div()
-                                .w(px(self.chat_w()))
+                                .w_full()
+                                .pl(px(self.chat_left_inset()))
+                                .pr(px(band))
                                 .min_h_0()
                                 .flex_1()
                                 .flex()
@@ -243,6 +251,9 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .items_center()
+                    // No leftward shift: it existed to align a SEPARATE meter row
+                    // with the pills. The meter now leads the row, so the shift
+                    // pushed it under the sidebar's edge and clipped it.
                     .child(div().w(px(self.chat_w())).child(self.render_statusbar(cx))),
             )
     }
@@ -365,6 +376,7 @@ impl Shell {
                     .session(&id)
                     .map(|session| session.pinned)
                     .unwrap_or(false);
+                let archived = self.state.is_archived(&id);
                 let streaming = self.state.is_streaming(&id);
                 let lang = self.state.lang;
                 let more_shell = cx.entity();
@@ -380,6 +392,7 @@ impl Shell {
                             for item in crate::ui::session_menu::session_items(
                                 &id,
                                 pinned,
+                                archived,
                                 streaming,
                                 lang,
                                 &more_shell,
@@ -438,56 +451,18 @@ impl Shell {
     fn chat_handle(&self, side: HandleSide, cx: &mut Context<Self>) -> impl IntoElement {
         let offset =
             self.conversation_w.as_f32() / 2.0 + self.chat_w() / 2.0 + crate::theme::HANDLE_OFFSET;
-        // The measured bar: 2 wide, 72 tall, its solid 16px band between two
-        // 28px fades, centred in the strip - which is the CSS default pointer-y
-        // of 50% and puts it the measured 4px in from the inner edge.
-        let colour = theme::scrollbar_bar();
-        let faded = colour & 0xFFFFFF00;
-        let fade = |from: u32, to: u32| {
-            linear_gradient(
-                180.0,
-                linear_color_stop(rgba(from), 0.0),
-                linear_color_stop(rgba(to), 1.0),
-            )
-        };
-        let bar = div()
-            .debug_selector(move || {
-                match side {
-                    HandleSide::Left => "chat-handle-bar-left",
-                    HandleSide::Right => "chat-handle-bar-right",
-                }
-                .to_string()
-            })
-            .w(px(crate::theme::HANDLE_BAR_W))
-            .h(px(crate::theme::HANDLE_BAR_H))
-            .flex()
-            .flex_col()
-            .rounded(px(crate::theme::HANDLE_BAR_W))
-            .opacity(
-                if self.chat_drag.is_some() || self.chat_hover == Some(side) {
-                    1.0
-                } else {
-                    0.0
-                },
-            )
-            .child(
-                div()
-                    .w_full()
-                    .h(px(crate::theme::HANDLE_BAR_FADE))
-                    .bg(fade(faded, colour)),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .h(px(crate::theme::HANDLE_BAR_BAND))
-                    .bg(rgba(colour)),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .h(px(crate::theme::HANDLE_BAR_FADE))
-                    .bg(fade(colour, faded)),
-            );
+        // The measured bar, from the one shared definition every seam uses.
+        let bar = super::handle_bar(
+            match side {
+                HandleSide::Left => "chat-handle-bar-left",
+                HandleSide::Right => "chat-handle-bar-right",
+            },
+            if self.chat_drag.is_some() || self.chat_hover == Some(side) {
+                1.0
+            } else {
+                0.0
+            },
+        );
         let id = match side {
             HandleSide::Left => "chat-handle-left",
             HandleSide::Right => "chat-handle-right",
@@ -521,7 +496,13 @@ impl Shell {
             )
             .child(bar);
         match side {
-            HandleSide::Left => handle.right(px(offset)),
+            // The transcript is not centred, so each handle parks outside ITS
+            // own edge: the left one follows the narrowed inset rather than the
+            // symmetric offset the right one still uses.
+            HandleSide::Left => handle.left(px((self.chat_left_inset()
+                - crate::theme::HANDLE_OFFSET
+                - self.handle_w())
+            .max(0.0))),
             HandleSide::Right => handle.left(px(offset)),
         }
     }
@@ -903,7 +884,13 @@ impl Shell {
                     .line_height(px(16.0)),
                 )
                 .on_click(cx.listener(move |this, _event, _window, cx| {
+                    // The trace tab reads its rows from the Parquet log, so the
+                    // first page is scheduled when the tab is opened - not on
+                    // every frame, and not for a tab nobody is looking at.
                     this.state.tab = this_tab;
+                    if this_tab == Tab::Trajectory && this.trace_pages == 0 {
+                        this.request_trace_page(cx);
+                    }
                     cx.notify();
                 }))
         };

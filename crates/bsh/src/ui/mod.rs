@@ -5,11 +5,14 @@
 
 mod command_menu;
 pub(crate) mod composer;
-mod fish;
 pub(crate) mod header;
 pub(crate) mod hero;
 pub(crate) mod meter;
+pub(crate) mod paging;
 mod session_menu;
+pub(crate) mod smooth;
+pub(crate) mod trash;
+pub(crate) mod workspace_menu;
 
 pub(crate) mod queue_dock;
 pub(crate) mod right_panel;
@@ -20,6 +23,7 @@ mod shell_tests;
 pub(crate) mod sidebar;
 pub(crate) mod statusbar;
 pub(crate) mod todo_panel;
+pub(crate) mod trajectory;
 pub(crate) mod transcript;
 
 use gpui_kit::*;
@@ -96,6 +100,50 @@ pub(crate) fn hairline_all<E: Styled>(mut element: E) -> E {
     element
 }
 
+/// The measured reveal bar a width handle shows while the pointer is on it.
+///
+/// One definition for every seam in the shell: a 2px column, 72 tall, whose
+/// solid 16px band sits between two 28px fades of the same colour - the
+/// reference's `linear-gradient(transparent 0, scrollbar-bg-l1 8px,
+/// scrollbar-bg-l1 8px, transparent)` written as three stacked layers, because
+/// gpui-pre's `Background` carries exactly two stops.
+pub(crate) fn handle_bar(debug: &'static str, opacity: f32) -> Div {
+    let colour = crate::theme::scrollbar_bar();
+    let faded = colour & 0xFFFFFF00;
+    let fade = |from: u32, to: u32| {
+        linear_gradient(
+            180.0,
+            linear_color_stop(rgba(from), 0.0),
+            linear_color_stop(rgba(to), 1.0),
+        )
+    };
+    div()
+        .debug_selector(move || debug.to_string())
+        .w(px(crate::theme::HANDLE_BAR_W))
+        .h(px(crate::theme::HANDLE_BAR_H))
+        .flex()
+        .flex_col()
+        .rounded(px(crate::theme::HANDLE_BAR_W))
+        .opacity(opacity)
+        .child(
+            div()
+                .w_full()
+                .h(px(crate::theme::HANDLE_BAR_FADE))
+                .bg(fade(faded, colour)),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(crate::theme::HANDLE_BAR_BAND))
+                .bg(rgba(colour)),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(crate::theme::HANDLE_BAR_FADE))
+                .bg(fade(colour, faded)),
+        )
+}
 /// A `.5px` border on the left only; see [`hairline_bottom`].
 pub(crate) fn hairline_left<E: Styled>(mut element: E) -> E {
     element.style().border_widths.left = Some(px(0.5).into());
@@ -152,7 +200,15 @@ impl Startup {
 /// focused editor through the files body. Tests bind it too, since they never
 /// walk [`run`].
 pub(crate) fn bind_global_actions(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-s", right_panel::SaveFile, None)]);
+    cx.bind_keys([
+        KeyBinding::new("cmd-s", right_panel::SaveFile, None),
+        // The session menu's accelerators. The menu shows these keys, so they
+        // have to do the same thing the row does - a hint that presses nothing
+        // is a lying control.
+        KeyBinding::new("alt-cmd-g", session_menu::RenameSession, None),
+        KeyBinding::new("alt-cmd-f", session_menu::ForkSession, None),
+        KeyBinding::new("shift-cmd-a", session_menu::ArchiveSession, None),
+    ]);
 }
 
 pub(crate) fn run(startup: Startup) {

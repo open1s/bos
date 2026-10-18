@@ -1,5 +1,9 @@
-# Use extension-module to avoid linking Python statically
-[build]
+# Python extension modules must not link libpython: pyo3 resolves the Python
+# symbols from the interpreter that loads the module. Only macOS needs the
+# `-undefined,dynamic_lookup` linker flag for that; GNU ld and MSVC reject it,
+# so it must stay scoped to macOS instead of applying to every workspace build
+# (which would break the Linux and Windows binding builds).
+[target.'cfg(target_os = "macos")']
 rustflags = ["-C", "link-args=-Wl,-undefined,dynamic_lookup"]
 
 [env]

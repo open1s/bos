@@ -138,7 +138,19 @@ impl TomlAgentBuilder {
     /// Construct the agent and register every configured tool.
     pub async fn build(self, _session: Option<Arc<ZenohSession>>) -> Result<Agent, AgentError> {
         let mut config: AgentConfig = self.config.clone().into();
-        apply_model_defaults(&mut config);
+        // `apply_model_defaults` discovers and reads the home config from disk.
+        // Keep that off an async runtime thread when one is present; callers
+        // driving `build` from a plain executor keep the inline path.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            config = tokio::task::spawn_blocking(move || {
+                apply_model_defaults(&mut config);
+                config
+            })
+            .await
+            .map_err(|e| AgentError::Config(format!("config read task failed: {e}")))?;
+        } else {
+            apply_model_defaults(&mut config);
+        }
 
         // DeepSeek natively supports the Responses API; default to it unless
         // the config explicitly selects chat.
@@ -284,6 +296,32 @@ mod tests {
 
         assert_eq!(config.api_mode, "chat");
         assert_eq!(config.reasoning_effort, None);
+    }
+
+    const BUILT_TOML: &str = "\nname = \"built\"\nmodel = \"mock/test-model\"\nbase_url = \"http://127.0.0.1:9/v1\"\napi_key = \"\"\nmax_steps = 3\n";
+
+    #[tokio::test]
+    async fn build_loads_defaults_off_the_runtime_thread() {
+        let agent = TomlAgentBuilder::from_toml(BUILT_TOML)
+            .expect("valid toml")
+            .build(None)
+            .await
+            .expect("build succeeds");
+        assert_eq!(agent.config().name, "built");
+        assert_eq!(agent.config().max_steps, 3);
+    }
+
+    /// Build must not require a Tokio runtime: hosts may drive it from a
+    /// plain executor, where spawn_blocking is unavailable.
+    #[test]
+    fn build_works_without_a_tokio_runtime() {
+        let agent = futures::executor::block_on(
+            TomlAgentBuilder::from_toml(BUILT_TOML)
+                .expect("valid toml")
+                .build(None),
+        )
+        .expect("build succeeds");
+        assert_eq!(agent.config().name, "built");
     }
 
     #[test]

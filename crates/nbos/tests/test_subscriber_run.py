@@ -3,8 +3,6 @@
 Test Subscriber.run() with Python callback
 """
 import asyncio
-import sys
-sys.path.insert(0, '/Users/gaosg/Projects/bos/crates/pybos')
 
 from nbos import Bus, BusConfig, Publisher, Subscriber
 

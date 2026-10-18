@@ -1,35 +1,9 @@
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use std::sync::Arc;
 
-fn call_string_handler(
-  handler: &ThreadsafeFunction<String, napi::Unknown<'static>>,
-  input: String,
-) -> std::result::Result<String, String> {
-  let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<String, String>>();
-  let tx_clone = tx.clone();
-
-  handler.call_with_return_value(
-    Ok(input),
-    ThreadsafeFunctionCallMode::NonBlocking,
-    move |result: std::result::Result<napi::Unknown<'_>, napi::Error>, _env| -> Result<()> {
-      match result {
-        Ok(value) => {
-          let string_value = value.coerce_to_string()?.into_utf8()?.as_str()?.to_string();
-          let _ = tx_clone.send(Ok(string_value));
-        }
-        Err(e) => {
-          let _ = tx_clone.send(Err(e.to_string()));
-        }
-      }
-      Ok(())
-    },
-  );
-
-  rx.recv()
-    .unwrap_or_else(|_| Err("handler channel closed".to_string()))
-}
+use crate::call_js_string_handler;
 
 #[napi]
 /// Issues request/response calls over the bus.
@@ -91,7 +65,7 @@ impl Callable {
     &self,
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
   ) -> Result<()> {
-    let mut guard = self.handler.lock().unwrap();
+    let mut guard = crate::lock_recover(&self.handler);
     *guard = Some(Arc::new(handler));
     Ok(())
   }
@@ -117,12 +91,16 @@ impl Callable {
       .as_mut()
       .ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "Callable not available"))?;
 
-    if let Some(tsfn) = self.handler.lock().unwrap().take() {
+    if let Some(tsfn) = crate::lock_recover(&self.handler).take() {
       let tsfn = Arc::new(tsfn);
       callable
         .set_handler(move |input: String| {
           let tsfn_clone = tsfn.clone();
-          async move { call_string_handler(&tsfn_clone, input).map_err(bus::ZenohError::Query) }
+          async move {
+            call_js_string_handler(&tsfn_clone, input)
+              .await
+              .map_err(bus::ZenohError::Query)
+          }
         })
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
     }
@@ -145,7 +123,7 @@ impl Callable {
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
   ) -> Result<()> {
     {
-      let mut guard = self.handler.lock().unwrap();
+      let mut guard = crate::lock_recover(&self.handler);
       *guard = Some(Arc::new(handler));
     }
     self.start().await

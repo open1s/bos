@@ -349,11 +349,23 @@ impl ResourceHandler for Supervisor {
                             g.children[idx].pid = Some(pid);
                         }
                         Err(e) => {
-                            self.state
-                                .lock()
-                                .await
-                                .running
-                                .store(false, Ordering::SeqCst);
+                            // Tear down the children that did start: a
+                            // partially-started group must not leak processes
+                            // or `proc://` registrations.
+                            let (uris, owner) = {
+                                let mut g = self.state.lock().await;
+                                g.running.store(false, Ordering::SeqCst);
+                                let uris = g
+                                    .children
+                                    .iter_mut()
+                                    .filter_map(|c| {
+                                        c.finished = true;
+                                        c.pid.take().map(|pid| format!("proc://{pid}"))
+                                    })
+                                    .collect::<Vec<_>>();
+                                (uris, owner.clone())
+                            };
+                            kill_children(&self.mgr, &owner, uris).await;
                             return Err(e);
                         }
                     }

@@ -1,7 +1,6 @@
 use crate::bus::PyBus;
 use crate::utils::{json_to_py, py_to_json, to_py_runtime_error};
 use agent::agent::agentic::LlmProvider;
-use agent::agent::hooks::HookEvent;
 use agent::{
     Agent, AgentCallableServer, AgentConfig, AgentRpcClient, CircuitBreakerConfig, LlmMessage,
     RateLimiterConfig, StreamToken,
@@ -125,7 +124,7 @@ impl PyLlmMessage {
             LlmMessage::User { content } => {
                 let dict = PyDict::new(py);
                 dict.set_item("role", "user")?;
-                let _ = dict.set_item("content", content_to_py(py, content)?);
+                dict.set_item("content", content_to_py(py, content)?)?;
                 Ok(dict.into_any())
             }
             LlmMessage::Assistant { content } => {
@@ -290,16 +289,21 @@ impl PyPythonTool {
         schema: String,
         callback: Py<PyAny>,
         cancel_callback: Option<Py<PyAny>>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let _ = parameters;
-        Self {
+        // A tool registered with a malformed schema would silently reach the
+        // model with no parameters, so refuse it at construction time.
+        let schema = serde_json::from_str(&schema).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid tool schema JSON: {e}"))
+        })?;
+        Ok(Self {
             name,
             description,
-            schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
+            schema,
             cancelable: false,
             callback,
             cancel_callback,
-        }
+        })
     }
 
     fn cancelable(&mut self) {
@@ -1263,8 +1267,9 @@ impl PyAgent {
         let tool_name = py_tool.name().to_string();
         let tool_description = py_tool.description().to_string();
         let tool_schema = py_tool.schema_json();
-        let tool_schema: serde_json::Value =
-            serde_json::from_str(&tool_schema).unwrap_or(serde_json::Value::Null);
+        let tool_schema: serde_json::Value = serde_json::from_str(&tool_schema).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid tool schema JSON: {e}"))
+        })?;
         drop(py_tool);
 
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
@@ -1472,7 +1477,8 @@ impl PyAgent {
         let messages = guard.session().messages().to_vec();
         let py_list = pyo3::types::PyList::empty(py);
         for msg in messages {
-            let wrapper = PyLlmMessage { inner: msg.clone() };
+            // `msg` is already owned; cloning it again copied every message body.
+            let wrapper = PyLlmMessage { inner: msg };
             py_list.append(wrapper.to_py(py)?)?;
         }
         Ok(py_list.into_any())
@@ -1618,21 +1624,13 @@ impl PyAgent {
                 pyo3::exceptions::PyValueError::new_err("event must be a HookEvent or string")
             })?;
 
-        let hook_event = match event_str.as_str() {
-            "BeforeToolCall" => HookEvent::BeforeToolCall,
-            "AfterToolCall" => HookEvent::AfterToolCall,
-            "BeforeLlmCall" => HookEvent::BeforeLlmCall,
-            "AfterLlmCall" => HookEvent::AfterLlmCall,
-            "OnMessage" => HookEvent::OnMessage,
-            "OnComplete" => HookEvent::OnComplete,
-            "OnError" => HookEvent::OnError,
-            _ => HookEvent::OnMessage,
-        };
+        let hook_event = crate::hooks::parse_hook_event(&event_str)?;
 
-        {
-            let mut agent = self.inner.lock().unwrap();
-            agent.add_hook(hook_event, std::sync::Arc::new(hook));
-        }
+        let mut agent = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        agent.add_hook(hook_event, std::sync::Arc::new(hook));
 
         Ok(())
     }
@@ -1645,7 +1643,10 @@ impl PyAgent {
             },
         )?;
 
-        self.inner.lock().unwrap().add_plugin(plugin_arc);
+        self.inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?
+            .add_plugin(plugin_arc);
         Ok(())
     }
 }

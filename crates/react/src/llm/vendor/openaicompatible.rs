@@ -264,6 +264,49 @@ pub fn sse_has_done_signal(text: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct StreamToolCallAccumulator {
     pending: HashMap<u32, PendingToolCall>,
+    /// Incremental bracket/string state per pending call, so a fragment is
+    /// only parsed once the accumulated JSON can plausibly be complete.
+    scans: HashMap<u32, JsonScanState>,
+}
+
+/// Minimal JSON lexer state for the "is this value complete yet?" test.
+///
+/// Parsing the whole accumulated buffer on every fragment is quadratic for a
+/// large streamed argument (for example a file body split into many SSE
+/// chunks). Tracking depth and string/escape state costs one pass over the
+/// new fragment and lets the old parse attempts on partial JSON disappear.
+#[derive(Debug, Default)]
+struct JsonScanState {
+    depth: usize,
+    in_string: bool,
+    escape: bool,
+}
+
+impl JsonScanState {
+    fn feed(&mut self, fragment: &str) {
+        for byte in fragment.bytes() {
+            if self.in_string {
+                if self.escape {
+                    self.escape = false;
+                } else if byte == b'\\' {
+                    self.escape = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => self.depth = self.depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.depth == 0 && !self.in_string
+    }
 }
 
 /// A single pending (incomplete) streaming tool call.
@@ -283,6 +326,7 @@ impl StreamToolCallAccumulator {
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            scans: HashMap::new(),
         }
     }
 
@@ -297,6 +341,12 @@ impl StreamToolCallAccumulator {
         name: Option<String>,
         args_delta: &str,
     ) -> Option<(String, serde_json::Value, Option<String>)> {
+        let may_be_complete = {
+            let scan = self.scans.entry(index).or_default();
+            scan.feed(args_delta);
+            scan.is_complete()
+        };
+
         let entry = self
             .pending
             .entry(index)
@@ -313,11 +363,14 @@ impl StreamToolCallAccumulator {
         }
         entry.arguments.push_str(args_delta);
 
-        if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&entry.arguments) {
-            if let (Some(n), Some(i)) = (entry.name.as_ref(), entry.id.as_ref()) {
-                let result = (n.clone(), args_val, Some(i.clone()));
-                self.pending.remove(&index);
-                return Some(result);
+        if may_be_complete {
+            if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&entry.arguments) {
+                if let (Some(n), Some(i)) = (entry.name.as_ref(), entry.id.as_ref()) {
+                    let result = (n.clone(), args_val, Some(i.clone()));
+                    self.pending.remove(&index);
+                    self.scans.remove(&index);
+                    return Some(result);
+                }
             }
         }
         None
@@ -326,6 +379,7 @@ impl StreamToolCallAccumulator {
     /// Drain all pending tool calls (finish_reason or stream end).
     /// Incomplete arguments fall back to `{}`.
     pub fn drain(&mut self) -> Vec<(String, serde_json::Value, Option<String>)> {
+        self.scans.clear();
         let mut results = Vec::new();
         for (_, entry) in self.pending.drain() {
             let name = entry.name.unwrap_or_default();
@@ -514,5 +568,25 @@ mod tests {
                 .and_then(|d| d.cached_tokens),
             Some(16)
         );
+    }
+
+    #[test]
+    fn accumulator_does_not_emit_while_a_brace_is_inside_a_string() {
+        let mut acc = StreamToolCallAccumulator::new();
+        assert!(
+            acc.push_delta(
+                0,
+                Some("call_1".into()),
+                Some("echo".into()),
+                r#"{"text":"a}"#
+            )
+            .is_none(),
+            "a }} inside a JSON string does not close the object"
+        );
+        let (name, args, _) = acc
+            .push_delta(0, None, None, r#"b"}"#)
+            .expect("the real closing brace completes the object");
+        assert_eq!(name, "echo");
+        assert_eq!(args, serde_json::json!({"text": "a}b"}));
     }
 }

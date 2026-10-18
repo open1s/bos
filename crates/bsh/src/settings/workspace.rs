@@ -21,7 +21,7 @@ use super::global::{ModelRef, SettingsError};
 pub(crate) struct WorkspaceSettings {
     /// Format version; each file versions independently.
     pub(crate) schema_version: u32,
-    /// The workspace's own selection: which model, preset and session.
+    /// The workspace's own facts: the session it last had open.
     pub(crate) general: WorkspaceGeneral,
     /// How the agent is configured here.
     pub(crate) agent: AgentSection,
@@ -29,31 +29,51 @@ pub(crate) struct WorkspaceSettings {
     pub(crate) disabled: Disabled,
 }
 
-/// The workspace's selection out of the global definitions.
+/// The workspace's own facts.
 ///
-/// Each of these names something the global file defines, in the same way:
-/// definitions live globally and the workspace records which one it uses.
+/// Neither a model nor a session identity belongs here: a model is chosen per
+/// session, and which session is on screen is the window's state (several
+/// sessions can run at once). What stays here is the workspace's agent
+/// configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceGeneral {
-    /// The provider id this workspace uses by default.
-    pub(crate) provider: String,
-    /// The model nickname under that provider.
-    pub(crate) model: String,
-    /// The session last open in this workspace.
-    pub(crate) active_session: String,
+    /// A provider id an older build wrote here, when the model was a workspace
+    /// setting rather than a session one.
+    ///
+    /// Deserialize-only, the same shape as `Provider::legacy_api_key`: a file
+    /// that still carries it parses, it is read once to seed the session that
+    /// was open, and nothing ever writes it again.
+    #[serde(default, rename = "provider", skip_serializing)]
+    pub(crate) legacy_provider: String,
+    /// The model nickname that accompanied [`Self::legacy_provider`].
+    #[serde(default, rename = "model", skip_serializing)]
+    pub(crate) legacy_model: String,
+    /// The session last open in this workspace, as an older build recorded it.
+    ///
+    /// Deserialize-only like the model pair above. Which session is on screen
+    /// is a WINDOW fact - several sessions can run at once - so it lives on
+    /// the global preferences now, and this field only carries an old file's
+    /// answer into that preference once.
+    #[serde(default, rename = "active_session", skip_serializing)]
+    pub(crate) legacy_active_session: String,
 }
 
 impl WorkspaceGeneral {
-    /// The model this workspace selects, or none while it selects none.
-    pub(crate) fn model_ref(&self) -> Option<ModelRef> {
-        if self.provider.is_empty() || self.model.is_empty() {
+    /// The pair an older file wrote, when it wrote both halves.
+    ///
+    /// A half-made pair is no selection: it could not resolve, so it is not
+    /// migrated onto a session that would then report an unknown name.
+    pub(crate) fn legacy_pair(&self) -> Option<ModelRef> {
+        let provider = self.legacy_provider.trim();
+        let model = self.legacy_model.trim();
+        if provider.is_empty() || model.is_empty() {
             return None;
         }
         Some(ModelRef {
-            provider: self.provider.clone(),
-            model: self.model.clone(),
+            provider: provider.to_string(),
+            model: model.to_string(),
         })
     }
 }
@@ -150,10 +170,7 @@ pub(crate) struct Disabled {
 impl WorkspaceSettings {
     /// Parse the workspace settings from TOML text.
     pub(crate) fn from_toml(text: &str) -> Result<Self, SettingsError> {
-        let settings: Self =
-            toml::from_str(text).map_err(|e| SettingsError::Parse(e.to_string()))?;
-        settings.validate()?;
-        Ok(settings)
+        toml::from_str(text).map_err(|e| SettingsError::Parse(e.to_string()))
     }
 
     /// A workspace's settings file, under the workspace it configures.
@@ -187,23 +204,6 @@ impl WorkspaceSettings {
     pub(crate) fn to_toml(&self) -> Result<String, SettingsError> {
         toml::to_string_pretty(self).map_err(|e| SettingsError::Parse(e.to_string()))
     }
-
-    /// Refuse a file whose selection is half made.
-    ///
-    /// A provider with no model, or a model with no provider, is a selection
-    /// that cannot resolve; it is refused rather than treated as "none", so a
-    /// typo never silently starts a session on the wrong endpoint.
-    pub(crate) fn validate(&self) -> Result<(), SettingsError> {
-        let provider = self.general.provider.trim().is_empty();
-        let model = self.general.model.trim().is_empty();
-        if provider != model {
-            return Err(SettingsError::HalfMadeSelection(format!(
-                "{}/{}",
-                self.general.provider, self.general.model
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -216,6 +216,7 @@ schema_version = 1
 [general]
 provider = "nvidia"
 model = "glm-5.3-flash"
+active_session = "chat-1"
 
 [agent]
 temperature = 0.0
@@ -250,37 +251,60 @@ extentions = ["plan"]
         );
     }
 
+    /// The pair an older file wrote is READ - it is the one fact a migration
+    /// needs - but nothing ever writes it again.
     #[test]
-    fn the_workspace_names_a_model_it_does_not_define() {
+    fn a_legacy_selection_is_read_but_never_written() {
         let settings = WorkspaceSettings::from_toml(WORKED).expect("parses");
-        let reference = settings.general.model_ref().expect("a selection");
+        let reference = settings.general.legacy_pair().expect("the old pair");
         assert_eq!(reference.provider, "nvidia");
         assert_eq!(reference.model, "glm-5.3-flash");
+        assert_eq!(
+            settings.general.legacy_active_session, "chat-1",
+            "the session it remembered is read too"
+        );
+
+        let text = settings.to_toml().expect("renders");
+        assert!(
+            !text.contains("provider ="),
+            "a workspace no longer names a provider: {text}"
+        );
+        assert!(
+            !text.contains("model ="),
+            "a workspace no longer names a model: {text}"
+        );
+        assert!(
+            !text.contains("active_session ="),
+            "a workspace no longer names the session on screen: {text}"
+        );
     }
 
+    /// A half-made legacy pair could not resolve, so it is not migrated.
     #[test]
-    fn a_half_made_selection_is_refused() {
+    fn a_half_made_legacy_selection_is_not_a_choice() {
         let text = "[general]\nprovider = \"nvidia\"\n";
-        assert_eq!(
-            WorkspaceSettings::from_toml(text),
-            Err(SettingsError::HalfMadeSelection("nvidia/".to_string())),
-            "a provider without a model cannot resolve"
-        );
+        let settings = WorkspaceSettings::from_toml(text).expect("an old file still parses");
+        assert_eq!(settings.general.legacy_pair(), None);
     }
 
     #[test]
     fn no_selection_at_all_is_legal() {
         let settings = WorkspaceSettings::from_toml("").expect("a fresh workspace parses");
-        assert_eq!(settings.general.model_ref(), None);
+        assert_eq!(settings.general.legacy_pair(), None);
         assert_eq!(
             settings.agent.permission, "workspace-write",
             "the confinement default survives an empty file"
         );
     }
 
+    /// The written document no longer carries the pair, so what comes back is
+    /// the file WITHOUT the legacy input: a second save is the same document.
     #[test]
-    fn the_workspace_file_round_trips() {
-        let settings = WorkspaceSettings::from_toml(WORKED).expect("parses");
+    fn the_workspace_file_round_trips_without_the_legacy_pair() {
+        let mut settings = WorkspaceSettings::from_toml(WORKED).expect("parses");
+        settings.general.legacy_provider.clear();
+        settings.general.legacy_model.clear();
+        settings.general.legacy_active_session.clear();
         let text = settings.to_toml().expect("renders");
         assert_eq!(
             WorkspaceSettings::from_toml(&text).expect("re-parses"),
@@ -311,7 +335,10 @@ extentions = ["plan"]
         let path = scratch("absent").join("settings.toml");
         let loaded = WorkspaceSettings::load(&path).expect("absence is not an error");
         assert_eq!(loaded, WorkspaceSettings::default());
-        assert!(loaded.general.provider.is_empty(), "it selects nothing");
+        assert!(
+            loaded.general.legacy_provider.is_empty(),
+            "it selects nothing"
+        );
         assert!(!path.exists(), "reading must not create the file it read");
     }
 
@@ -323,8 +350,17 @@ extentions = ["plan"]
         assert!(path.exists(), "save must create its directory");
         let reloaded = WorkspaceSettings::load(&path).expect("loads");
         assert_eq!(
-            reloaded, original,
-            "a save/load round trip must not lose a field"
+            reloaded.agent, original.agent,
+            "a save/load round trip must not lose an agent field"
+        );
+        assert_eq!(
+            reloaded.general.legacy_pair(),
+            None,
+            "the legacy pair is not written, so it does not come back"
+        );
+        assert_eq!(
+            reloaded.general.legacy_active_session, "",
+            "and neither does the retired session id"
         );
     }
 
@@ -334,6 +370,8 @@ extentions = ["plan"]
         let text = original.to_toml().expect("renders");
         let reparsed =
             WorkspaceSettings::from_toml(&text).expect("its own output must be valid input");
-        assert_eq!(reparsed, original);
+        assert_eq!(reparsed.agent, original.agent);
+        assert_eq!(reparsed.disabled, original.disabled);
+        assert_eq!(reparsed.general.legacy_pair(), None);
     }
 }

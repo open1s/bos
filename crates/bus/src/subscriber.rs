@@ -50,7 +50,12 @@ where
         Ok(self)
     }
 
-    /// Receive the next message (returns None if subscriber not initialized)
+    /// Receive the next message.
+    ///
+    /// Returns None when the subscriber is not initialized, when the
+    /// subscription is closed, or when a payload does not decode as T. Payload
+    /// integrity is the sender's responsibility: the bytes are not
+    /// archive-validated before decoding.
     pub async fn recv(&mut self) -> Option<T> {
         let subscriber = self.subscriber.as_mut()?;
 

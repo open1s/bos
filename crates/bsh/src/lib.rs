@@ -13,6 +13,7 @@ pub(crate) mod assets;
 pub(crate) mod caps;
 mod editors;
 pub(crate) mod files;
+pub(crate) mod history;
 pub(crate) mod i18n;
 pub(crate) mod model;
 pub(crate) mod notes;
@@ -23,7 +24,9 @@ pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod terminal;
 pub(crate) mod theme;
+pub(crate) mod trash;
 pub(crate) mod ui;
+pub(crate) mod vault;
 
 /// Launch the BOS Harness desktop window. Blocks until the window closes.
 pub fn run() {

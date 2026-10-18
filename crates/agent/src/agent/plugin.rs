@@ -108,6 +108,27 @@ pub enum StreamTokenWrapper {
 }
 
 impl StreamTokenWrapper {
+    /// Wrap an owned [`StreamToken`](react::llm::StreamToken), moving its
+    /// buffers instead of copying them.
+    ///
+    /// Streaming runs this once per token, so the move matters: the borrowed
+    /// [`StreamTokenWrapper::new`] has to clone the text.
+    pub fn from_token(token: react::llm::StreamToken) -> Self {
+        match token {
+            react::llm::StreamToken::Text(s) => StreamTokenWrapper::Text(s),
+            react::llm::StreamToken::ToolCall { name, args, id } => {
+                StreamTokenWrapper::ToolCall { name, args, id }
+            }
+            react::llm::StreamToken::ToolResult { name, output, ms } => {
+                StreamTokenWrapper::ToolResult { name, output, ms }
+            }
+            react::llm::StreamToken::ReasoningContent(s) => StreamTokenWrapper::ReasoningContent(s),
+            react::llm::StreamToken::Usage(u) => StreamTokenWrapper::Usage(u),
+            react::llm::StreamToken::Done => StreamTokenWrapper::Done,
+            react::llm::StreamToken::Stopped => StreamTokenWrapper::Stopped,
+        }
+    }
+
     /// Wrap a borrowed [`StreamToken`](react::llm::StreamToken).
     pub fn new(token: &react::llm::StreamToken) -> Self {
         match token {
@@ -392,17 +413,106 @@ impl PluginRegistry {
     }
 
     /// Run all plugins' on_stream_token in order.
-    pub async fn on_stream_token(
-        &self,
+    pub async fn on_stream_token(&self, token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
+        let plugins = self.plugins();
+        Self::on_stream_token_with(&plugins, token).await
+    }
+
+    /// Run `on_stream_token` over a list the caller snapshotted.
+    ///
+    /// A stream token arrives per chunk; cloning the plugin vector for each
+    /// one would allocate on the streaming hot path, so the stream snapshots
+    /// the list once and calls this instead.
+    pub(crate) async fn on_stream_token_with(
+        plugins: &[Arc<dyn AgentPlugin>],
         mut token: StreamTokenWrapper,
     ) -> Option<StreamTokenWrapper> {
-        let plugins = self.plugins();
-        for plugin in &plugins {
+        for plugin in plugins {
             match plugin.on_stream_token(token).await {
-                Some(r) => token = r,
+                Some(next) => token = next,
                 None => return None,
             }
         }
         Some(token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct Upper;
+
+    #[async_trait]
+    impl AgentPlugin for Upper {
+        fn name(&self) -> &str {
+            "upper"
+        }
+
+        async fn on_stream_token(&self, token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
+            match token {
+                StreamTokenWrapper::Text(text) => {
+                    Some(StreamTokenWrapper::Text(text.to_uppercase()))
+                }
+                other => Some(other),
+            }
+        }
+    }
+
+    struct Veto;
+
+    #[async_trait]
+    impl AgentPlugin for Veto {
+        fn name(&self) -> &str {
+            "veto"
+        }
+
+        async fn on_stream_token(&self, _token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
+            None
+        }
+    }
+
+    #[test]
+    fn an_owned_token_round_trips_through_the_wrapper() {
+        let token = react::llm::StreamToken::ToolCall {
+            name: "read_file".into(),
+            args: serde_json::json!({ "path": "a.txt" }),
+            id: Some("call-1".into()),
+        };
+        match StreamTokenWrapper::from_token(token).into_token() {
+            react::llm::StreamToken::ToolCall { name, args, id } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(args, serde_json::json!({ "path": "a.txt" }));
+                assert_eq!(id.as_deref(), Some("call-1"));
+            }
+            other => panic!("wrong token: {other:?}"),
+        }
+
+        match StreamTokenWrapper::from_token(react::llm::StreamToken::Text("hello".into()))
+            .into_token()
+        {
+            react::llm::StreamToken::Text(text) => assert_eq!(text, "hello"),
+            other => panic!("wrong token: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshotted_plugin_list_applies_in_order() {
+        let plugins: Vec<Arc<dyn AgentPlugin>> = vec![Arc::new(Upper), Arc::new(Upper)];
+        let wrapped = StreamTokenWrapper::from_token(react::llm::StreamToken::Text("hi".into()));
+        let result = PluginRegistry::on_stream_token_with(&plugins, wrapped)
+            .await
+            .expect("no plugin vetoed");
+        assert!(matches!(result, StreamTokenWrapper::Text(text) if text == "HI"));
+    }
+
+    #[tokio::test]
+    async fn a_snapshotted_plugin_list_honours_a_veto() {
+        let plugins: Vec<Arc<dyn AgentPlugin>> = vec![Arc::new(Upper), Arc::new(Veto)];
+        let wrapped = StreamTokenWrapper::from_token(react::llm::StreamToken::Text("hi".into()));
+        assert!(PluginRegistry::on_stream_token_with(&plugins, wrapped)
+            .await
+            .is_none());
     }
 }

@@ -115,14 +115,17 @@ fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             .into();
     }
 
-    let has_rkyv_attr = item_has_rkyv_attr(&item);
+    let has_crate_attr = item_has_rkyv_crate_attr(&item);
     let crate_path = args
         .crate_path
         .unwrap_or_else(|| syn::parse_quote!(::qserde));
     let rkyv_path = args
         .rkyv_path
         .unwrap_or_else(|| syn::parse_quote!(#crate_path::rkyv));
-    let maybe_rkyv_attr = if has_rkyv_attr {
+    // Only suppress the injected path when the user already pinned one. Other
+    // rkyv arguments (derive, compare, archive_bounds, ...) still need the
+    // generated impls to resolve rkyv through qserde.
+    let maybe_rkyv_attr = if has_crate_attr {
         quote! {}
     } else {
         quote! {
@@ -142,7 +145,12 @@ fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
-fn item_has_rkyv_attr(item: &Item) -> bool {
+/// Whether the item already pins rkyv's crate path in a crate argument.
+///
+/// Other rkyv arguments (derive, compare, archive_bounds, ...) must not
+/// suppress the crate path injected by this macro, otherwise a downstream crate
+/// that only depends on qserde fails to resolve the bare rkyv path.
+fn item_has_rkyv_crate_attr(item: &Item) -> bool {
     let attrs: &[Attribute] = match item {
         Item::Struct(item) => &item.attrs,
         Item::Enum(item) => &item.attrs,
@@ -150,5 +158,17 @@ fn item_has_rkyv_attr(item: &Item) -> bool {
         _ => return false,
     };
 
-    attrs.iter().any(|attr| attr.path().is_ident("rkyv"))
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("rkyv"))
+        .any(|attr| match &attr.meta {
+            syn::Meta::List(list) => list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, Token![,]>::parse_terminated,
+                )
+                .map(|metas| metas.iter().any(|meta| meta.path().is_ident("crate")))
+                // Let rkyv's derive report a malformed attribute.
+                .unwrap_or(true),
+            _ => false,
+        })
 }

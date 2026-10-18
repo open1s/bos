@@ -15,6 +15,30 @@ use crate::runner::{AgentEvent, Runner};
 use crate::settings::Settings;
 use crate::store::Store;
 
+/// Wall-clock milliseconds since the Unix epoch, for the trajectory timeline.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record when a turn's first visible output arrived, once.
+fn note_first_output(message: &mut ChatMessage, at: u64) {
+    message.timing_mut().first_output.get_or_insert(at);
+}
+
+/// Close a turn's measured span, when it has a start and no end yet.
+fn settle_ms(message: &mut ChatMessage, at: u64) {
+    let Some(start) = message.timing().and_then(|timing| timing.start) else {
+        return;
+    };
+    if message.timing().and_then(|timing| timing.ms).is_some() {
+        return;
+    }
+    message.timing_mut().ms = Some(at.saturating_sub(start));
+}
+
 /// Wall-clock seconds since the Unix epoch.
 pub(crate) fn now() -> u64 {
     SystemTime::now()
@@ -170,6 +194,11 @@ pub(crate) struct AppState {
     pub(crate) settings_section: usize,
     /// The settings being edited; None when the dialog is closed.
     pub(crate) draft: Option<Settings>,
+    /// The admin-key vault. It reopens at launch from the app-access sidecar
+    /// when that file exists, so provider entries resolve without the admin
+    /// passphrase while the Vault pane stays locked; a missing or stale sidecar
+    /// leaves the app without access until the vault is unlocked once.
+    pub(crate) vault: crate::vault::Vault,
     /// Whether the sidebar is folded away. This is the reference's stored
     /// layoutInfo.sidebar === 0 sentinel, which only governs a wide viewport.
     pub(crate) sidebar_collapsed: bool,
@@ -243,6 +272,9 @@ impl AppState {
             expanded_tools: BTreeSet::new(),
             settings_section: 0,
             draft: None,
+            // The path is settled after the scratch redirect below, because a
+            // scratch store is a scratch home.
+            vault: crate::vault::Vault::disabled(),
             sidebar_collapsed: false,
             narrow_expanded: false,
             turn_started: None,
@@ -257,7 +289,20 @@ impl AppState {
         // configuration.
         if state.store.is_scratch() {
             state.settings.save_root = Some(state.store.root().to_path_buf());
+            // A scratch home is a scratch WORKSPACE too. The first workspace a
+            // test registers comes from the process's cwd - the crate directory
+            // - and the workspace document follows the registry, so a save wrote
+            // a `.bsh/settings/settings.toml` into the checkout a reader owns.
+            // Both documents land in the scratch tree now.
+            let scratch = state.store.root().to_string_lossy().to_string();
+            for workspace in &mut state.settings.global.workspaces {
+                workspace.root = scratch.clone();
+            }
         }
+        // The vault lives beside the document this state writes, which is the
+        // scratch store for a test and the bsh data directory for the app. It
+        // starts LOCKED, whether or not the file exists.
+        state.vault = crate::vault::Vault::new(state.settings.vault_path());
         state.ensure_active();
         state
     }
@@ -280,6 +325,9 @@ impl AppState {
         if self.active_id.is_none() {
             self.new_session();
         }
+        if let Some(id) = self.active_id.clone() {
+            self.store.rehydrate(&id);
+        }
     }
 
     /// The selected session.
@@ -287,6 +335,69 @@ impl AppState {
         self.active_id
             .as_ref()
             .and_then(|id| self.store.session(id))
+    }
+
+    /// What one session contributes to model resolution.
+    ///
+    /// A session carries its own (provider, nickname) pair, so two chats in the
+    /// same workspace can run on different models. The pair is a reference into
+    /// the global tree and never a copy of the endpoint. It is the ONLY model
+    /// selection: a session that names none has no model and is refused at send
+    /// rather than inheriting one from somewhere else.
+    pub(crate) fn session_choice(&self, id: &str) -> crate::settings::resolve::SessionChoice {
+        self.store
+            .session(id)
+            .map(Session::choice)
+            .unwrap_or_default()
+    }
+
+    /// The values a build in the given session uses.
+    ///
+    /// The session's own choice, resolved against the global tree - one order,
+    /// read by the chip, the menu, the send gate and the agent.
+    pub(crate) fn effective_in(&self, id: &str) -> crate::settings::Effective {
+        self.settings.effective_for(&self.session_choice(id))
+    }
+
+    /// The values a build for the session on screen uses.
+    ///
+    /// No session at all reads as no choice, which is also what a session that
+    /// never chose gets: an unchosen model, never a silent fallback.
+    pub(crate) fn effective(&self) -> crate::settings::Effective {
+        match self.active_id.as_deref() {
+            Some(id) => self.effective_in(id),
+            None => self.settings.effective(),
+        }
+    }
+
+    /// Move a legacy workspace model pair onto the session that is open.
+    ///
+    /// Settings written before the choice became session-scoped carried the
+    /// pair under the workspace's `[general]`. That document is deserialize-
+    /// only now: this reads the pair ONCE, gives it to the session on screen,
+    /// saves that session, and clears the in-memory copy so no later session
+    /// can pick it up. A session that already chose keeps its own choice.
+    ///
+    /// Returns whether a session took the pair.
+    pub(crate) fn adopt_legacy_model(&mut self) -> bool {
+        let pair = self.settings.workspace.general.legacy_pair();
+        // Consumed either way: the pair describes the session that was open
+        // when the file was written, and that decision is made once.
+        self.settings.workspace.general.legacy_provider.clear();
+        self.settings.workspace.general.legacy_model.clear();
+        let (Some(pair), Some(id)) = (pair, self.active_id.clone()) else {
+            return false;
+        };
+        let Some(session) = self.store.session_mut(&id) else {
+            return false;
+        };
+        if session.provider.is_some() || session.model.is_some() {
+            return false;
+        }
+        session.provider = Some(pair.provider);
+        session.model = Some(pair.model);
+        self.save_session(&id);
+        true
     }
 
     /// Whether the reference draws its hero for the active conversation.
@@ -324,12 +435,17 @@ impl AppState {
         Some(id)
     }
 
-    /// Select a session by id.
     /// Reopen the session the user was last in, else the newest one here.
+    ///
+    /// The remembered id is a machine preference, so it can name a chat in a
+    /// workspace the reader has since left: the restore only accepts it while it
+    /// still belongs to the active workspace. Otherwise the newest visible chat
+    /// here wins. Several sessions may be running; this only decides which one
+    /// the window shows at launch.
     pub(crate) fn restore_session(&mut self) {
         let remembered = self
             .settings
-            .workspace
+            .global
             .general
             .active_session
             .trim()
@@ -340,18 +456,21 @@ impl AppState {
             .into_iter()
             .map(|session| session.id.clone())
             .collect();
-        if !remembered.is_empty()
-            && !archived.contains(&remembered)
-            && self.store.session(&remembered).is_some()
-        {
-            self.select(&remembered);
-            return;
-        }
         let workspace = self
             .settings
             .active_workspace()
             .map(|record| record.id.clone())
             .unwrap_or_default();
+        if !remembered.is_empty()
+            && !archived.contains(&remembered)
+            && self
+                .store
+                .session(&remembered)
+                .is_some_and(|session| session.workspace == workspace)
+        {
+            self.select(&remembered);
+            return;
+        }
         let newest = self
             .store
             .in_workspace(&workspace)
@@ -364,12 +483,18 @@ impl AppState {
         }
     }
 
+    /// Show a session in the window.
+    ///
+    /// This is a view change, not a runtime one: another session's turn keeps
+    /// streaming, and the remembered id is a machine preference, so only the
+    /// global document is rewritten.
     pub(crate) fn select(&mut self, id: &str) {
         if self.store.session(id).is_some() {
+            self.store.rehydrate(id);
             self.active_id = Some(id.to_string());
             self.tab = Tab::Chat;
-            self.settings.workspace.general.active_session = id.to_string();
-            let _ = self.settings.save();
+            self.settings.global.general.active_session = id.to_string();
+            let _ = self.settings.save_global();
         }
     }
 
@@ -389,6 +514,394 @@ impl AppState {
         let _ = self.settings.save();
     }
 
+    /// Re-read the workspace registry into the store's root map.
+    ///
+    /// Called after the registry changes: adding a workspace, deleting one. The
+    /// settings tree is the truth; the store's map only says where the files go.
+    fn sync_store_roots(&mut self) {
+        let pairs: Vec<(String, String)> = self
+            .settings
+            .global
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.id.clone(), workspace.root.clone()))
+            .collect();
+        self.store.set_roots(&pairs);
+    }
+
+    /// Register a directory as a workspace, keeping the store in step.
+    pub(crate) fn adopt_workspace(&mut self, name: &str, root: &str) -> String {
+        let id = self.settings.note_workspace(name, root);
+        self.sync_store_roots();
+        id
+    }
+
+    /// Retitle a workspace.
+    ///
+    /// A rename is the display name alone: the id is the key every session is
+    /// tagged with and the root stays where it is, so nothing moves and no
+    /// transcript is touched.
+    pub(crate) fn rename_workspace(&mut self, id: &str, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Some(record) = self
+            .settings
+            .global
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == id)
+        else {
+            return false;
+        };
+        if record.name == name {
+            return true;
+        }
+        record.name = name.to_string();
+        let _ = self.settings.save();
+        true
+    }
+
+    /// Delete a workspace from the list.
+    ///
+    /// The registry entry goes, and its sessions are REHOMED onto the workspace
+    /// that becomes active rather than deleted: a row leaving a list must not
+    /// take a transcript with it. Deleting the last one leaves none, which the
+    /// sidebar and the hero both handle as "no workspace".
+    pub(crate) fn delete_workspace(&mut self, id: &str) -> bool {
+        // Park the record first, for the same reason a chat is parked first: a
+        // delete nobody can undo is a delete nobody dares to use.
+        let Some(record) = self
+            .settings
+            .global
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .cloned()
+        else {
+            return false;
+        };
+        if self
+            .stash(
+                crate::trash::Kind::Workspace,
+                &record.name,
+                &record.id,
+                &record,
+            )
+            .is_none()
+        {
+            return false;
+        }
+        let before = self.settings.global.workspaces.len();
+        self.settings
+            .global
+            .workspaces
+            .retain(|workspace| workspace.id != id);
+        if self.settings.global.workspaces.len() == before {
+            return false;
+        }
+        let next = if self.settings.global.general.active_workspace == id {
+            self.settings
+                .global
+                .workspaces
+                .first()
+                .map(|workspace| workspace.id.clone())
+                .unwrap_or_default()
+        } else {
+            self.settings.global.general.active_workspace.clone()
+        };
+        self.settings.global.general.active_workspace = next.clone();
+        // The store's copy of the registry is a CACHE, so it is re-read here:
+        // without it the deleted workspace's chats still read as owned and the
+        // orphan sweep below moves nothing.
+        self.sync_store_roots();
+        if !next.is_empty() {
+            // The deleted workspace's sessions are unregistered now, which is
+            // exactly the orphan case the store already knows how to move.
+            self.store.rehome_orphans(&next);
+        }
+        let _ = self.settings.save();
+        true
+    }
+
+    /// Create a chat in the named workspace and select it.
+    ///
+    /// Different from [`AppState::set_workspace`]: that one MOVES the chat under
+    /// the editor, because the hero's picker reassigns the blank session it
+    /// sits under. This one leaves every existing chat where it is.
+    pub(crate) fn new_session_in(&mut self, workspace: &str) -> Option<String> {
+        self.settings.global.general.active_workspace = workspace.to_string();
+        self.new_session()
+    }
+
+    /// Retitle a session.
+    ///
+    /// A rename is a title and nothing else: the transcript, the workspace and
+    /// the model reference stay put, and `updated_at` does not move - renaming a
+    /// conversation must not reorder the reader's list under their hand.
+    pub(crate) fn rename_session(&mut self, id: &str, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            return;
+        }
+        if let Some(session) = self.store.session_mut(id) {
+            session.title = title.to_string();
+        }
+        self.save_session(id);
+        self.store.sort();
+    }
+
+    /// Delete a chat, parking it in the recycle bin first.
+    ///
+    /// The parking write comes BEFORE the removal: if the envelope cannot be
+    /// written the delete does not happen, because losing the copy is worse than
+    /// refusing the delete. The selection then moves to the next chat in the list,
+    /// or to none when that was the last one.
+    pub(crate) fn delete_session(&mut self, id: &str) -> bool {
+        let Some(session) = self.store.session(id).cloned() else {
+            return false;
+        };
+        if self
+            .stash(
+                crate::trash::Kind::Session,
+                &session.title,
+                &session.workspace,
+                &session,
+            )
+            .is_none()
+        {
+            return false;
+        }
+        if !self.store.remove(id) {
+            return false;
+        }
+        self.plans.remove(id);
+        if self.active_id.as_deref() == Some(id) {
+            let next = self
+                .store
+                .sessions
+                .first()
+                .map(|session| session.id.clone());
+            self.active_id = next.clone();
+            self.settings.global.general.active_session = next.unwrap_or_default();
+            let _ = self.settings.save_global();
+        }
+        true
+    }
+
+    /// Write one item's envelope into the bin.
+    fn stash<T: serde::Serialize>(
+        &self,
+        kind: crate::trash::Kind,
+        name: &str,
+        workspace: &str,
+        payload: &T,
+    ) -> Option<std::path::PathBuf> {
+        let payload = serde_json::to_value(payload).ok()?;
+        let workspace_name = self
+            .settings
+            .global
+            .workspaces
+            .iter()
+            .find(|record| record.id == workspace)
+            .map(|record| record.name.clone())
+            .unwrap_or_else(|| workspace.to_string());
+        // The id keys both the envelope and the log beside it, so a restore can
+        // find the pages without trusting a path recorded earlier.
+        let id = payload
+            .get("id")
+            .and_then(|id| id.as_str())
+            .unwrap_or("item")
+            .to_string();
+        let envelope = crate::trash::Envelope {
+            kind: kind.key().to_string(),
+            deleted_at: now(),
+            workspace: workspace.to_string(),
+            workspace_name,
+            name: name.to_string(),
+            // A chat's transcript lives in Parquet pages beside its document, so
+            // the park carries them: the bin holds the whole chat, and restoring
+            // does not depend on a directory a purge or a moved workspace could
+            // take away.
+            log: match kind {
+                crate::trash::Kind::Session => format!("log-{id}"),
+                crate::trash::Kind::Workspace => String::new(),
+            },
+            payload,
+        };
+        let dir = self.settings.trash_dir();
+        if kind == crate::trash::Kind::Session {
+            let from = crate::history::History::dir_for(&self.store.dir_for_id(&id), &id);
+            let _ = crate::trash::park_log(&dir, &from, &envelope);
+        }
+        crate::trash::stash(&dir, &envelope).ok()
+    }
+
+    /// Everything in the bin, newest first.
+    pub(crate) fn trash(&self) -> Vec<crate::trash::Entry> {
+        crate::trash::entries(&self.settings.trash_dir())
+    }
+
+    /// Put a parked item back.
+    ///
+    /// A chat whose workspace no longer exists lands in the workspace in use - the
+    /// alternative is restoring it onto a root nobody has, which is the orphan case
+    /// the store already refuses to draw.
+    pub(crate) fn restore_trashed(&mut self, path: &std::path::Path) -> bool {
+        let Some(entry) = crate::trash::entries(&self.settings.trash_dir())
+            .into_iter()
+            .find(|entry| entry.path == path)
+        else {
+            return false;
+        };
+        match entry.kind() {
+            Some(crate::trash::Kind::Session) => {
+                let Ok(mut session) =
+                    serde_json::from_value::<crate::model::Session>(entry.envelope.payload.clone())
+                else {
+                    return false;
+                };
+                let known = self
+                    .settings
+                    .global
+                    .workspaces
+                    .iter()
+                    .any(|record| record.id == session.workspace);
+                if !known {
+                    session.workspace = self.settings.global.general.active_workspace.clone();
+                }
+                let restored = session.id.clone();
+                if self.store.save(&session).is_err() {
+                    return false;
+                }
+                self.store.insert(session);
+                // The park moved the Parquet pages into the bin, so a restore
+                // moves them back before the window is read: a chat comes out of
+                // the bin whole, whatever happened to its workspace meanwhile.
+                if !entry.envelope.log.is_empty() {
+                    let parked = crate::trash::log_dir(&self.settings.trash_dir(), &entry.envelope);
+                    let into = crate::history::History::dir_for(
+                        &self.store.dir_for_id(&restored),
+                        &restored,
+                    );
+                    let _ =
+                        std::fs::create_dir_all(into.parent().unwrap_or(std::path::Path::new(".")));
+                    let _ = std::fs::remove_dir_all(&into);
+                    let _ = std::fs::rename(&parked, &into);
+                }
+                self.store.rehydrate(&restored);
+                self.store.sort();
+            }
+            Some(crate::trash::Kind::Workspace) => {
+                let Ok(record) = serde_json::from_value::<crate::settings::global::WorkspaceRef>(
+                    entry.envelope.payload.clone(),
+                ) else {
+                    return false;
+                };
+                if !self
+                    .settings
+                    .global
+                    .workspaces
+                    .iter()
+                    .any(|existing| existing.id == record.id)
+                {
+                    self.settings.global.workspaces.push(record);
+                }
+                self.sync_store_roots();
+                let _ = self.settings.save();
+            }
+            None => return false,
+        }
+        crate::trash::purge(path);
+        true
+    }
+
+    /// Delete a parked item for good.
+    /// Remove the bsh state folder inside a workspace root.
+    ///
+    /// Only that one directory: a purge removes bsh own state (annotations, the
+    /// terminal policy, the trace index) and never the workspace files. An empty
+    /// or unknown root removes nothing.
+    fn remove_workspace_state(root: &std::path::Path) {
+        if root.as_os_str().is_empty() {
+            return;
+        }
+        let state = root.join(".bsh");
+        if state.is_dir() {
+            let _ = std::fs::remove_dir_all(state);
+        }
+    }
+
+    pub(crate) fn purge_trashed(&mut self, path: &std::path::Path) -> bool {
+        // A parked session's Parquet log outlives its document: the bin holds the
+        // document, the pages never moved. Purging has to take them too, or every
+        // deleted chat leaves its transcript behind on disk.
+        if let Some(entry) = crate::trash::entries(&self.settings.trash_dir())
+            .into_iter()
+            .find(|entry| entry.path == path)
+        {
+            if entry.kind() == Some(crate::trash::Kind::Session) {
+                if let Ok(session) =
+                    serde_json::from_value::<crate::model::Session>(entry.envelope.payload.clone())
+                {
+                    // The log lives under the session's WORKSPACE directory, not
+                    // the store root. The old path named `root/history/<id>`, a
+                    // directory that never existed, so every purge left the
+                    // transcript and the trajectory behind on disk.
+                    let session_dir = self.store.dir_for_workspace(&session.workspace);
+                    let dir = crate::history::History::dir_for(&session_dir, &session.id);
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+            // Removing a workspace also removes the state bsh wrote into it: its
+            // `.bsh` folder carries the annotations, the terminal policy and the
+            // trace index for that root. The folder itself is never touched - only
+            // the one directory bsh owns inside it.
+            if entry.kind() == Some(crate::trash::Kind::Workspace) {
+                if let Ok(workspace) = serde_json::from_value::<crate::settings::global::WorkspaceRef>(
+                    entry.envelope.payload.clone(),
+                ) {
+                    Self::remove_workspace_state(std::path::Path::new(&workspace.root));
+                }
+            }
+        }
+        crate::trash::purge(path)
+    }
+    /// Branch a session: a copy of its transcript as a new conversation.
+    ///
+    /// The reference forks at the current point, which is the whole transcript
+    /// here - bsh keeps no per-message branch point yet. The copy is a NEW
+    /// session (its own id, its own file), laid out as a sibling: pin and
+    /// archive do not follow it, because those are decisions about the original.
+    pub(crate) fn fork_session(&mut self, id: &str) -> Option<String> {
+        let mut forked = self.store.session(id)?.clone();
+        forked.id = uuid::Uuid::new_v4().to_string();
+        forked.created_at = now();
+        forked.updated_at = forked.created_at;
+        forked.pinned = false;
+        forked.archived_at = None;
+        let forked_id = forked.id.clone();
+        // The copy carries the whole log, not just the window in memory.
+        self.store.copy_history(id, &forked_id);
+        let _ = self.store.save(&forked);
+        self.store.insert(forked);
+        self.store.sort();
+        Some(forked_id)
+    }
+
+    /// Whether a chat is in the archive.
+    pub(crate) fn is_archived(&self, id: &str) -> bool {
+        self.store
+            .session(id)
+            .map(|session| session.archived_at.is_some())
+            .unwrap_or(false)
+    }
+
+    /// A session's title, for the rename field to start from.
+    pub(crate) fn session_title(&self, id: &str) -> Option<String> {
+        self.store.session(id).map(|session| session.title.clone())
+    }
     /// Fold or unfold a workspace's session list.
     pub(crate) fn toggle_collapse(&mut self, workspace: &str) {
         if !self.collapsed.remove(workspace) {
@@ -404,10 +917,12 @@ impl AppState {
     /// its folder has gone; a panel over none says so rather than opening on a
     /// directory it cannot read.
     pub(crate) fn workspace_root(&self) -> Option<std::path::PathBuf> {
-        self.settings
+        let settings = &self.settings;
+        settings
+            .global
             .workspaces
             .iter()
-            .find(|workspace| workspace.id == self.settings.active_workspace)
+            .find(|workspace| workspace.id == settings.global.general.active_workspace)
             .map(|workspace| std::path::PathBuf::from(&workspace.root))
             .filter(|root| root.is_dir())
     }
@@ -485,11 +1000,14 @@ impl AppState {
     pub(crate) fn stop(&mut self, id: &str) {
         self.runner.stop(id);
         self.streams.remove(id);
+        let stopped = now_ms();
         if let Some(session) = self.store.session_mut(id) {
             if let Some(message) = session.messages.last_mut() {
                 if message.text.is_empty() && message.error.is_none() {
                     message.text = "…".to_string();
                 }
+                // A stop is terminal too: the turn's measured span ends here.
+                settle_ms(message, stopped);
             }
             session.updated_at = now();
         }
@@ -523,6 +1041,7 @@ impl AppState {
     /// A session that switched models reports the model the newest turn ran
     /// against; a session with no usage yet falls back to what the next turn
     /// will be sent to, so the field is never blank while a model is set.
+    #[cfg(test)]
     pub(crate) fn status_model(&self) -> Option<String> {
         let from_turn = self
             .active_session()
@@ -532,7 +1051,7 @@ impl AppState {
             .map(|usage| usage.model.clone())
             .filter(|model| !model.is_empty());
         from_turn.or_else(|| {
-            let configured = self.settings.effective().model;
+            let configured = self.effective().model;
             (!configured.is_empty()).then_some(configured)
         })
     }
@@ -597,6 +1116,10 @@ impl AppState {
     ) -> Option<(Vec<ChatMessage>, usize)> {
         let budget = self.settings.effective().context_budget;
         let id = session_id.to_string();
+        // One clock for the turn: the trajectory places the user row at the
+        // submission and the assistant row at the same instant, so the input
+        // lane measures the wait for the reply and the model lane the reply.
+        let opened = now_ms();
         let transcript;
         {
             let session = self.store.session_mut(&id)?;
@@ -606,6 +1129,9 @@ impl AppState {
             }
             session.messages.push(ChatMessage::user(prompt.to_string()));
             session.messages.push(ChatMessage::assistant());
+            for message in session.messages.iter_mut().rev().take(2) {
+                message.timing_mut().start = Some(opened);
+            }
             session.updated_at = now();
         }
         self.streams.insert(id, now());
@@ -721,9 +1247,14 @@ impl AppState {
             ));
         }
         let terminal = matches!(event, AgentEvent::Done | AgentEvent::Error(_));
+        // One clock for the event: it stamps a call's start, the turn's first
+        // output, and - on the terminal event - the turn's settled span.
+        let at = now_ms();
         // Read before the session borrow: the usage that lands belongs to the
-        // model the turn was sent to, which is what the status bar names.
-        let model = self.settings.effective().model;
+        // model the turn was sent to, which is what the status bar names. The
+        // session is resolved by id, because a turn may finish in a session the
+        // reader is not looking at.
+        let model = self.effective_in(id).model;
         {
             let Some(session) = self.store.session_mut(id) else {
                 return;
@@ -732,11 +1263,13 @@ impl AppState {
                 AgentEvent::Text(text) => {
                     if let Some(message) = session.messages.last_mut() {
                         message.text.push_str(&text);
+                        note_first_output(message, at);
                     }
                 }
                 AgentEvent::Reasoning(text) => {
                     if let Some(message) = session.messages.last_mut() {
                         message.reasoning.push_str(&text);
+                        note_first_output(message, at);
                     }
                 }
                 AgentEvent::ToolCall { name, args } => {
@@ -746,7 +1279,9 @@ impl AppState {
                             args,
                             output: None,
                             ms: None,
+                            at: Some(at),
                         });
+                        note_first_output(message, at);
                     }
                 }
                 AgentEvent::ToolResult { name, output, ms } => {
@@ -785,6 +1320,9 @@ impl AppState {
             }
             if terminal {
                 session.updated_at = now();
+                if let Some(message) = session.messages.last_mut() {
+                    settle_ms(message, at);
+                }
             }
         }
         if terminal {
@@ -871,6 +1409,41 @@ impl AppState {
     }
 
     /// Whether a tool row is open.
+    /// The window of older chat rows waiting to be read, if the log has one.
+    ///
+    /// Building this is index-only; the rows are decoded by the shell on the
+    /// background executor, so the render path never touches the files.
+    pub(crate) fn begin_older_read(&self) -> Option<crate::store::OlderRead> {
+        let id = self.active_id.as_deref()?;
+        self.store.older_read(id, crate::store::WINDOW)
+    }
+
+    /// Apply one decoded window above the loaded chat and bound the window.
+    ///
+    /// Returns how many rows arrived; zero means the page was stale or empty.
+    pub(crate) fn finish_older_read(
+        &mut self,
+        page: crate::store::OlderPage,
+        keep_windows: usize,
+    ) -> usize {
+        let id = page.session.clone();
+        let added = self.store.apply_older(page);
+        if added > 0 {
+            self.store
+                .trim_front(&id, crate::store::WINDOW * keep_windows);
+        }
+        added
+    }
+
+    /// The trajectory page waiting to be read, if the log has one.
+    pub(crate) fn begin_trace_page(
+        &self,
+        id: &str,
+        page: usize,
+    ) -> Option<crate::store::TraceRead> {
+        self.store.trace_read(id, page)
+    }
+
     pub(crate) fn tool_open(&self, message: usize, tool: usize) -> bool {
         self.expanded_tools.contains(&format!("{message}:{tool}"))
     }
@@ -961,44 +1534,77 @@ impl AppState {
         }
     }
 
-    /// Make one provider the endpoint the agent is built against.
+    /// Make one model the ACTIVE SESSION's choice.
     ///
-    /// The workspace records which of the global providers it uses; it never
-    /// carries a second copy of the endpoint, so changing it here cannot drop
-    /// the credential.
-    pub(crate) fn select_provider(&mut self, name: &str) {
-        // The two halves move together. The workspace file refuses a selection
-        // that names a provider and no model, so writing the provider alone left
-        // the document uncommittable: creating a fresh provider made the NEXT
-        // save fail with "names only half a model", about a model the reader had
-        // never been asked for.
-        //
-        // A provider with no models yet leaves no selection at all, which is a
-        // state the file accepts and the composer already explains.
-        let first = self
-            .draft()
-            .global
-            .providers
-            .get(name)
-            .and_then(|provider| provider.models.keys().next().cloned());
-        // A provider with no models cannot be selected at all: the pair must be
-        // both or neither, so there is nothing to point the other half at. The
-        // selection is left where it was rather than emptied, so creating a
-        // provider does not silently drop the model the reader was using.
-        if let Some(model) = first {
-            let draft = self.draft_mut();
-            draft.workspace.general.provider = name.to_string();
-            draft.workspace.general.model = model;
+    /// Session-scoped on purpose: the pair is stored on the session document,
+    /// so a model chosen in one chat leaves every sibling alone and leaves
+    /// `settings.workspace` untouched. A new session is not given a copy of
+    /// this choice: it starts with no model and asks for one.
+    ///
+    /// A (provider, nickname) pair is stored whole or not at all. A half-made
+    /// pair would resolve to nothing, so a blank half is refused here rather
+    /// than written and reported later as an unknown name.
+    pub(crate) fn select_model_from(&mut self, provider: &str, nickname: &str) {
+        let (provider, nickname) = (provider.trim(), nickname.trim());
+        if provider.is_empty() || nickname.is_empty() {
+            return;
+        }
+        let Some(id) = self.active_id.clone() else {
+            return;
+        };
+        if let Some(session) = self.store.session_mut(&id) {
+            session.provider = Some(provider.to_string());
+            session.model = Some(nickname.to_string());
+        }
+        // Saved like any other session mutation. `updated_at` deliberately does
+        // not move: choosing a model is metadata, and a choice must not reorder
+        // the reader's list under their hand.
+        self.save_session(&id);
+    }
+
+    /// Choose the active session's model by nickname under the provider it
+    /// already names, or the first provider that carries the nickname.
+    ///
+    /// The composer always passes the pair explicitly, so this is a test
+    /// convenience: it looks in the saved tree AND the draft the settings pane
+    /// edits, because a pane test seeds a provider in the draft.
+    #[cfg(test)]
+    pub(crate) fn select_model(&mut self, nickname: &str) {
+        let chosen = self
+            .effective()
+            .model_ref
+            .map(|reference| reference.provider);
+        let find =
+            |providers: &std::collections::BTreeMap<String, crate::settings::global::Provider>| {
+                providers
+                    .iter()
+                    .find(|(_, provider)| provider.models.contains_key(nickname))
+                    .map(|(id, _)| id.clone())
+            };
+        let provider = chosen
+            .or_else(|| find(&self.settings.global.providers))
+            .or_else(|| find(&self.draft().global.providers));
+        if let Some(provider) = provider {
+            self.select_model_from(&provider, nickname);
         }
     }
 
-    /// Make one model the workspace's active choice, by nickname.
+    /// Set the reasoning effort the composer's menu offers.
     ///
-    /// The reference's model menu writes the same reference the workspace
-    /// resolves against: a provider id and the nickname it is filed under,
-    /// never a bare model string, so a rename does not orphan the choice.
-    pub(crate) fn select_model(&mut self, nickname: &str) {
-        self.draft_mut().workspace.general.model = nickname.to_string();
+    /// `None` hands the choice back to the model's own declared effort; the
+    /// literal `off` asks for NO effort on the wire (the reference's "Off turns
+    /// reasoning off and needs no value"), which `caps::build_agent` maps to an
+    /// absent field rather than the string.
+    pub(crate) fn set_reasoning_effort(&mut self, level: Option<&str>) {
+        let value = level
+            .map(str::trim)
+            .filter(|level| !level.is_empty())
+            .map(str::to_string);
+        self.settings.workspace.agent.reasoning_effort = value.clone();
+        if let Some(draft) = self.draft.as_mut() {
+            draft.workspace.agent.reasoning_effort = value;
+        }
+        let _ = self.settings.save();
     }
     /// Save a provider into the global tree, or say why it cannot be saved.
     ///
@@ -1009,7 +1615,6 @@ impl AppState {
         id: &str,
         name: &str,
         base_url: &str,
-        api_key: &str,
         models: &[crate::settings::global::ModelEntry],
     ) -> Result<(), crate::settings::provider::ProviderRefusal> {
         if id.trim().is_empty() {
@@ -1029,7 +1634,7 @@ impl AppState {
         }
         self.draft_mut()
             .global
-            .add_custom_provider(id, name, base_url, api_key, models);
+            .add_custom_provider(id, name, base_url, models);
         Ok(())
     }
 
@@ -1041,7 +1646,6 @@ impl AppState {
     pub(crate) fn add_shipped_provider(
         &mut self,
         id: &str,
-        api_key: &str,
     ) -> Result<(), crate::settings::provider::ProviderRefusal> {
         if self.draft_mut().global.providers.contains_key(id) {
             return Err(crate::settings::provider::ProviderRefusal::IdTaken);
@@ -1049,9 +1653,7 @@ impl AppState {
         let Some((_, base_url, _)) = crate::settings::global::built_in(id) else {
             return Err(crate::settings::provider::ProviderRefusal::NeedsModel);
         };
-        self.draft_mut()
-            .global
-            .add_provider(id, "", base_url, api_key, &[]);
+        self.draft_mut().global.add_provider(id, "", base_url, &[]);
         Ok(())
     }
 
@@ -1062,10 +1664,16 @@ impl AppState {
     }
     /// Edit the connection and the model leaves of a provider already in the
     /// tree.
-    pub(crate) fn set_provider_connection(&mut self, id: &str, base_url: &str, api_key: &str) {
-        self.draft_mut()
-            .global
-            .set_connection(id, base_url, api_key);
+    pub(crate) fn set_provider_connection(&mut self, id: &str, base_url: &str) {
+        self.draft_mut().global.set_connection(id, base_url);
+    }
+
+    /// Name the vault entry a provider reads its API key from.
+    ///
+    /// This writes the DRAFT like every other provider field, so the choice is
+    /// committed by the dialog's own Save and dropped by its Cancel.
+    pub(crate) fn set_provider_api_key_vault(&mut self, id: &str, entry: Option<&str>) {
+        self.draft_mut().global.set_api_key_vault(id, entry);
     }
 
     /// Rename a provider. The id is the wire prefix and never changes; the
@@ -1112,13 +1720,13 @@ impl AppState {
         self.removing_provider = None;
     }
 
-    /// Drop a provider from the global tree, clearing the selection when the
-    /// workspace had chosen it.
+    /// Drop a provider from the global tree.
+    ///
+    /// Sessions that chose a model under it keep the reference and report it as
+    /// unavailable at send, rather than being quietly repointed at another
+    /// provider: the reader who chose it is the one who can correct it.
     pub(crate) fn remove_provider(&mut self, name: &str) {
-        let draft = self.draft_mut();
-        if draft.global.remove_provider(name) && draft.workspace.general.provider == name {
-            draft.workspace.general.provider.clear();
-        }
+        self.draft_mut().global.remove_provider(name);
         self.removing_provider = None;
     }
 
@@ -1498,19 +2106,17 @@ mod tests {
             "local",
             "Local",
             "https://local.example/v1",
-            "key",
             &[
                 crate::settings::global::ModelEntry::named("first-model"),
                 crate::settings::global::ModelEntry::named("second-model"),
             ],
         );
         state.settings.global = global;
-        state.settings.workspace.general.provider = "local".to_string();
-        state.settings.workspace.general.model = "first-model".to_string();
+        state.select_model_from("local", "first-model");
         assert_eq!(
             state.status_model().as_deref(),
             Some("first-model"),
-            "with no turn yet the configured model is the honest answer"
+            "with no turn yet the session's chosen model is the honest answer"
         );
 
         let (id, _, _) = state.begin_turn("hello").expect("a turn");
@@ -1524,7 +2130,7 @@ mod tests {
         );
         assert_eq!(state.status_model().as_deref(), Some("first-model"));
 
-        state.settings.workspace.general.model = "second-model".to_string();
+        state.select_model_from("local", "second-model");
         state.apply_event(
             &id,
             super::AgentEvent::Usage {
@@ -1543,11 +2149,63 @@ mod tests {
     /// A session with no model anywhere names none, rather than an empty chip.
     #[test]
     fn the_status_model_is_absent_when_nothing_names_one() {
-        let mut state = super::AppState::with_store(crate::store::Store::open_at(
+        let state = super::AppState::with_store(crate::store::Store::open_at(
             "target/bsh-status-empty".into(),
         ));
-        state.settings.workspace.general.model = String::new();
+        // Nothing was chosen in this session, so there is no configured model.
         assert_eq!(state.status_model(), None);
+    }
+
+    /// A turn stamps both of its rows, notes the first output, and closes its
+    /// span on the terminal event - which is what the trajectory reads.
+    #[test]
+    fn a_turn_records_its_measured_span() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join("bsh-turn-timing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let id = state.active_id.clone().expect("a session");
+        state.begin_turn_in(&id, "hello").expect("a turn opens");
+
+        // Back-date the turn so the measured span is a known, positive number
+        // rather than whatever the two calls happened to land on.
+        let opened = super::now_ms().saturating_sub(400);
+        if let Some(session) = state.store.session_mut(&id) {
+            for message in session.messages.iter_mut().rev().take(2) {
+                message.timing_mut().start = Some(opened);
+            }
+        }
+        state.apply_event(&id, super::AgentEvent::Text("hi".to_string()));
+        state.apply_event(&id, super::AgentEvent::Done);
+
+        let session = state.store.session(&id).expect("the session");
+        let (user, assistant) = (&session.messages[0], &session.messages[1]);
+        assert_eq!(
+            user.timing().and_then(|timing| timing.start),
+            Some(opened),
+            "the submission is stamped on the user row"
+        );
+        assert_eq!(
+            assistant.timing().and_then(|timing| timing.start),
+            Some(opened),
+            "and on the reply row, so both measure from the turn's opening"
+        );
+        let first = assistant
+            .timing()
+            .and_then(|timing| timing.first_output)
+            .expect("the first output is noted");
+        assert!(first >= opened, "it lands after the turn opened");
+        let ms = assistant
+            .timing()
+            .and_then(|timing| timing.ms)
+            .expect("the terminal event closes the span");
+        assert!(ms >= 400, "the span covers the back-dated clock: {ms}");
+        assert_eq!(
+            user.timing().and_then(|timing| timing.ms),
+            None,
+            "the user row keeps no span of its own; the view derives its wait"
+        );
     }
 
     #[test]
@@ -1599,5 +2257,226 @@ mod tests {
             crate::i18n::tr(zh, "row.newChat")
         );
         assert_eq!(crate::model::Session::title_from("hello", zh), "hello");
+    }
+
+    /// Register the provider the model tests choose from.
+    fn seed_models(state: &mut super::AppState) {
+        state.settings.global.add_custom_provider(
+            "p",
+            "P",
+            "https://p.example/v1",
+            &[
+                crate::settings::global::ModelEntry::named("alpha"),
+                crate::settings::global::ModelEntry::named("beta"),
+                crate::settings::global::ModelEntry::named("gamma"),
+            ],
+        );
+    }
+
+    /// A state over a scratch directory that can be reopened, with the provider
+    /// registered. No session carries a model until one chooses.
+    fn state_with_models(label: &str) -> super::AppState {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-models-{label}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        seed_models(&mut state);
+        state
+    }
+
+    /// Two chats in ONE workspace choose different models, and the choice is a
+    /// session document fact: reopening the store finds both.
+    #[test]
+    fn two_sessions_in_one_workspace_keep_their_own_models() {
+        let mut state = state_with_models("two");
+        let first = state.active_id.clone().expect("the first session");
+        let second = state.new_session().expect("the second session");
+        assert!(
+            state.effective_in(&first).model_ref.is_none(),
+            "a new session starts with no model"
+        );
+        assert!(
+            state.effective_in(&second).model_ref.is_none(),
+            "and so does a second one: the choice is not copied eagerly"
+        );
+
+        state.select(&first);
+        state.select_model_from("p", "beta");
+        state.select(&second);
+        state.select_model_from("p", "gamma");
+
+        // Switching sessions switches what the chip and the next turn see.
+        let chip = |state: &super::AppState| {
+            crate::ui::composer::model_label(&state.effective().model_name, crate::i18n::Lang::En)
+        };
+        assert_eq!(state.effective().model, "gamma");
+        assert_eq!(
+            chip(&state),
+            "gamma",
+            "the chip names the active session's model"
+        );
+        state.select(&first);
+        assert_eq!(state.effective().model, "beta");
+        assert_eq!(chip(&state), "beta", "and switching chats moves it");
+        state.select(&second);
+        assert_eq!(state.effective().model, "gamma");
+
+        // The same two ids read back from disk.
+        let dir = state.store.root().to_path_buf();
+        let mut reopened = super::AppState::with_store(crate::store::Store::open_at(dir));
+        seed_models(&mut reopened);
+        assert_eq!(reopened.effective_in(&first).model, "beta");
+        assert_eq!(reopened.effective_in(&second).model, "gamma");
+    }
+
+    /// Several chats in one workspace can be streaming at once; which one the
+    /// window shows is a view choice, and it is the only thing recorded.
+    #[test]
+    fn sessions_run_concurrently_while_the_window_shows_one() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join("bsh-concurrent-sessions");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let first = state.active_id.clone().expect("the first session");
+        let second = state.new_session().expect("the second session");
+        state.begin_turn_in(&first, "one").expect("turn one");
+        state.begin_turn_in(&second, "two").expect("turn two");
+        assert!(
+            state.is_streaming(&first) && state.is_streaming(&second),
+            "two turns run at the same time"
+        );
+
+        state.select(&first);
+
+        assert!(
+            state.is_streaming(&second),
+            "showing a chat must not stop the turn running in another one"
+        );
+        assert_eq!(state.background_jobs().len(), 1, "the other one is a job");
+        assert_eq!(
+            state.settings.global.general.active_session, first,
+            "the preference follows the view, not the stream"
+        );
+        assert!(
+            state
+                .settings
+                .workspace
+                .general
+                .legacy_active_session
+                .is_empty(),
+            "the workspace document holds no session identity"
+        );
+        // The view preference is persisted, in the machine document only.
+        let root = state.settings.save_root.clone().expect("a scratch root");
+        let global = std::fs::read_to_string(root.join("settings.toml"))
+            .expect("the global settings document");
+        assert!(
+            global.contains(&format!("active_session = \"{first}\"")),
+            "the visible session is remembered across a relaunch: {global}"
+        );
+        assert!(
+            !root.join(".bsh/settings/settings.toml").exists(),
+            "selecting a chat does not write a workspace document at all"
+        );
+    }
+
+    /// A chat that never chose has NO model: the chip falls back to its own
+    /// "Select model" copy and the send gate refuses it.
+    #[test]
+    fn a_session_without_a_choice_has_no_model_and_is_refused() {
+        let mut state = state_with_models("unchosen");
+        let chosen = state.active_id.clone().expect("the chosen session");
+        state.select_model_from("p", "beta");
+        let unchosen = state.new_session().expect("the unchosen session");
+        assert_eq!(state.effective_in(&chosen).model, "beta");
+        assert!(
+            state.effective_in(&unchosen).model_ref.is_none(),
+            "the sibling never inherits its neighbour's model"
+        );
+        assert!(state.effective_in(&unchosen).model.is_empty());
+        assert!(
+            state.effective_in(&unchosen).model_name.is_empty(),
+            "there is no name for the chip to show"
+        );
+        assert_eq!(
+            crate::ui::composer::model_label(
+                &state.effective_in(&unchosen).model_name,
+                crate::i18n::Lang::En,
+            ),
+            crate::i18n::tr(crate::i18n::Lang::En, "composer.selectModel"),
+            "so the chip shows the reference's own select-model copy"
+        );
+        assert_eq!(
+            state.settings.refusal_for(&state.session_choice(&unchosen)),
+            Some("composer.chooseModel"),
+            "the send gate asks for a model before opening a turn"
+        );
+    }
+
+    /// Choosing a model writes the ACTIVE session and nothing else.
+    #[test]
+    fn choosing_a_model_touches_only_its_session() {
+        let mut state = state_with_models("isolated");
+        let first = state.active_id.clone().expect("the first session");
+        let second = state.new_session().expect("the second session");
+        state.select(&first);
+        let workspace_before = state.settings.workspace.clone();
+        let sibling_before = state
+            .store
+            .session(&second)
+            .map(|session| (session.provider.clone(), session.model.clone()));
+
+        state.select_model_from("p", "beta");
+
+        assert_eq!(
+            state.settings.workspace, workspace_before,
+            "the workspace document is untouched"
+        );
+        let sibling_after = state
+            .store
+            .session(&second)
+            .map(|session| (session.provider.clone(), session.model.clone()));
+        assert_eq!(
+            sibling_before, sibling_after,
+            "the sibling session is untouched"
+        );
+        let chosen = state.store.session(&first).expect("the chosen session");
+        assert_eq!(chosen.provider.as_deref(), Some("p"));
+        assert_eq!(chosen.model.as_deref(), Some("beta"));
+    }
+
+    /// A workspace file written before the model was session-scoped still names
+    /// one. It is handed to the open session ONCE, and never to a later one.
+    #[test]
+    fn a_legacy_workspace_pair_seeds_the_open_session_once() {
+        let mut state = state_with_models("legacy");
+        let first = state.active_id.clone().expect("the open session");
+        state.settings.workspace.general.legacy_provider = "p".to_string();
+        state.settings.workspace.general.legacy_model = "beta".to_string();
+        assert!(state.adopt_legacy_model(), "the old pair is adopted");
+        assert_eq!(state.effective_in(&first).model, "beta");
+        assert!(
+            state.settings.workspace.general.legacy_pair().is_none(),
+            "the pair is consumed, so it cannot be read twice"
+        );
+
+        let second = state.new_session().expect("a later session");
+        assert!(
+            !state.adopt_legacy_model(),
+            "there is nothing left to adopt"
+        );
+        assert!(
+            state.effective_in(&second).model_ref.is_none(),
+            "a later session does not pick the retired pair up"
+        );
+
+        // A session that already chose is never overwritten.
+        state.select(&first);
+        state.settings.workspace.general.legacy_provider = "p".to_string();
+        state.settings.workspace.general.legacy_model = "gamma".to_string();
+        assert!(!state.adopt_legacy_model(), "an existing choice wins");
+        assert_eq!(state.effective_in(&first).model, "beta");
     }
 }

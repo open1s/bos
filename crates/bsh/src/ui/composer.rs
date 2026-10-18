@@ -44,10 +44,19 @@ const CHIP_CHEVRON: f32 = 14.0;
 struct ModelChipData {
     label: String,
     effort: Option<String>,
+    /// The level the Effort row shows, or `Default` when the model decides.
+    effort_level: Option<String>,
     current: String,
-    models: Vec<String>,
+    groups: Vec<(String, Vec<String>)>,
     streaming: bool,
 }
+
+/// The effort levels the model menu offers, in the reference's own shape: a
+/// "default" that hands the decision back to the model, then Off, then rising
+/// levels. `None` is that default; `off` is a level of its own, because the
+/// reference separates "Off turns reasoning off" from "the model decides".
+pub(crate) const EFFORT_LEVELS: [Option<&str>; 5] =
+    [None, Some("off"), Some("low"), Some("medium"), Some("high")];
 
 /// Ask for files and mention them in the composer.
 /// The permission modes the chip's menu offers, in the reference's own order.
@@ -150,6 +159,28 @@ pub(crate) fn effort_suffix(effort: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The Effort row's own label: "Effort" with the current level after it, so the
+/// root menu answers "what is it set to" without opening the submenu.
+pub(crate) fn effort_row_label(lang: crate::i18n::Lang, level: Option<&str>) -> String {
+    format!(
+        "{} · {}",
+        lang.tr("composer.menuEffort"),
+        effort_level_label(lang, level)
+    )
+}
+
+/// One effort level's wording. `None` is the model's own decision, which the
+/// reference separates from the explicit Off.
+pub(crate) fn effort_level_label(lang: crate::i18n::Lang, level: Option<&str>) -> String {
+    match level {
+        None => lang.tr("composer.effortDefault"),
+        Some("off") => lang.tr("composer.effortOff"),
+        Some("low") => lang.tr("composer.effortLow"),
+        Some("medium") => lang.tr("composer.effortMedium"),
+        Some("high") => lang.tr("composer.effortHigh"),
+        Some(other) => other.to_string(),
+    }
+}
 /// The models the model chip's menu offers - the active provider's catalog, the
 /// same list the Models pane draws - each marked when it is the active model.
 pub(crate) fn model_choices(models: &[String], current: &str) -> Vec<(String, bool)> {
@@ -181,15 +212,26 @@ impl Shell {
         let lang = self.state.lang;
         let streaming = self.state.any_streaming();
         let can_send = !self.composer_value.trim().is_empty();
-        let model = self.state.settings.effective().model;
-        // The menu offers the same list the Models pane draws: the active
-        // provider's customized catalog.
-        let models = {
-            let settings = self.state.draft();
-            settings
-                .catalog(settings.active_provider().to_string().as_str())
-                .to_vec()
-        };
+        // One resolution per frame: `effective()` clones a whole resolved
+        // workspace, and the chip asks three separate facts of it. The
+        // resolution is the ACTIVE SESSION's choice, which is what the menu
+        // checks and what the next turn builds; a chat that chose nothing shows
+        // the reference's own "Select model" fallback.
+        let effective = self.state.effective();
+        let label = effective.model_name;
+        // The menu rows are nicknames, so the checked row compares against the
+        // nickname rather than the API id the wire carries.
+        let current = effective
+            .model_ref
+            .as_ref()
+            .map(|reference| reference.model.clone())
+            .unwrap_or_default();
+        let effort = effort_suffix(effective.reasoning_effort.as_deref());
+        // The menu offers the same list the Models pane draws, grouped by
+        // provider, with the provider the choice in effect names leading. The
+        // draft is the tree the pane edits, so a provider added but not yet
+        // saved is still offered.
+        let groups = self.state.draft().catalogs_by_provider(&effective.provider);
         let column = div().pb(px(4.0)).flex().flex_col().child({
             // Measured: radius-panel 28 over the input-major fill (white in light,
             // the same as the page) lifted by `elevation-soft` - a stroke plus two
@@ -247,12 +289,13 @@ impl Shell {
                         .child(div().flex_1())
                         .child(self.model_chip(
                             ModelChipData {
-                                label: model_label(&model, lang),
-                                effort: effort_suffix(
-                                    self.state.settings.effective().reasoning_effort.as_deref(),
-                                ),
-                                current: model.clone(),
-                                models: models.clone(),
+                                label: model_label(&label, lang),
+                                effort: effort.clone(),
+                                effort_level: effort,
+                                current,
+                                // Moved, not cloned: the menu owns the list,
+                                // and the chip does not read it again.
+                                groups,
                                 streaming,
                             },
                             lang,
@@ -266,18 +309,10 @@ impl Shell {
                 .when_some(self.command_menu(cx), |card, menu| card.child(menu));
             hairline_all(card).border_color(rgb(theme::border_soft()))
         });
-        // Measured: the meter belongs under the card, centred in the composer's
-        // own box, and the reference draws nothing until a prompt size exists.
-        column.when_some(self.context_meter(cx), |column, meter| {
-            column.child(
-                div()
-                    .pt(px(theme::METER_TOP_GAP))
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .child(meter),
-            )
-        })
+        // The context meter moved into the status row, at its left end, so the
+        // reading sits with the other figures about the same turn instead of on
+        // a line of its own under the card.
+        column
     }
 
     /// The reference's `.add`: a fully round 28x28 `+` on the specific
@@ -339,8 +374,9 @@ impl Shell {
         let ModelChipData {
             label,
             effort,
+            effort_level,
             current,
-            models,
+            groups,
             streaming,
         } = data;
         let shell = cx.entity();
@@ -388,9 +424,13 @@ impl Shell {
                 chip.dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, window, cx| {
                     // The kit's builder is \`Fn\`, so every capture is cloned into
                     // the submenu's own closure.
-                    let models = models.clone();
+                    let groups = groups.clone();
                     let current = current.clone();
                     let shell = shell.clone();
+                    // The Effort submenu is a second closure inside an `Fn`
+                    // builder, so it needs its own copies of both captures.
+                    let effort_shell = shell.clone();
+                    let effort_row = effort_level.clone();
                     menu.submenu(
                         lang.tr("composer.menuModel"),
                         window,
@@ -399,7 +439,7 @@ impl Shell {
                             // The measured \`.menu\` box: \`min-width:min(240px,
                             // 100vw - 32px)\`, \`max-width:min(420px, 100vw - 32px)\`.
                             let submenu = submenu.min_w(px(240.0)).max_w(px(420.0));
-                            if models.is_empty() {
+                            if groups.is_empty() {
                                 let text = lang.tr("composer.noModels");
                                 return submenu.item(PopupMenuItem::element(
                                     move |_window, _cx| {
@@ -413,18 +453,55 @@ impl Shell {
                                 ));
                             }
                             let mut submenu = submenu;
-                            for (model, active) in model_choices(&models, &current) {
-                                let pick = shell.clone();
-                                let name = model.clone();
+                            for (provider, models) in groups.iter() {
+                                let heading = provider.clone();
+                                submenu =
+                                    submenu.item(PopupMenuItem::element(move |_window, _cx| {
+                                        txt(heading.clone(), 11.0, theme::faint())
+                                            .px(px(8.0))
+                                            .py(px(6.0))
+                                            .into_any_element()
+                                    }));
+                                for (model, active) in model_choices(models, &current) {
+                                    let pick = shell.clone();
+                                    let name = model.clone();
+                                    let owner = provider.clone();
+                                    submenu = submenu.item(
+                                        PopupMenuItem::new(model).checked(active).on_click(
+                                            move |_, _window, cx| {
+                                                pick.update(cx, |this, cx| {
+                                                    this.state.select_model_from(&owner, &name);
+                                                    cx.notify();
+                                                });
+                                            },
+                                        ),
+                                    );
+                                }
+                            }
+                            submenu
+                        },
+                    )
+                    // The reference's second root cell: the reasoning level, with
+                    // the current one named on the row itself because a kit submenu
+                    // item carries only its label.
+                    .submenu(
+                        effort_row_label(lang, effort_level.as_deref()),
+                        window,
+                        cx,
+                        move |submenu, _window, _cx| {
+                            let mut submenu = submenu.min_w(px(200.0));
+                            for level in EFFORT_LEVELS {
+                                let pick = effort_shell.clone();
+                                let active = effort_row.as_deref() == level;
                                 submenu = submenu.item(
-                                    PopupMenuItem::new(model).checked(active).on_click(
-                                        move |_, _window, cx| {
+                                    PopupMenuItem::new(effort_level_label(lang, level))
+                                        .checked(active)
+                                        .on_click(move |_, _window, cx| {
                                             pick.update(cx, |this, cx| {
-                                                this.state.select_model(&name);
+                                                this.state.set_reasoning_effort(level);
                                                 cx.notify();
                                             });
-                                        },
-                                    ),
+                                        }),
                                 );
                             }
                             submenu

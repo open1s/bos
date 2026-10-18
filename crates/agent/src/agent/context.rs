@@ -243,12 +243,80 @@ impl AgentSession {
 /// provider rejects the request. It is a heuristic for [`ContextBudget`],
 /// not a billing-grade count.
 pub fn estimate_tokens(text: &str) -> usize {
-    let ascii = text.chars().filter(|c| c.is_ascii()).count();
-    let other = text.chars().count().saturating_sub(ascii);
+    let mut ascii = 0usize;
+    let mut other = 0usize;
+    for c in text.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            other += 1;
+        }
+    }
     if ascii + other == 0 {
         0
     } else {
         ascii.div_ceil(4) + other
+    }
+}
+
+/// Character counts backing a token estimate without materializing the text.
+#[derive(Default)]
+struct CharCounts {
+    ascii: usize,
+    other: usize,
+}
+
+impl CharCounts {
+    fn add(&mut self, text: &str) {
+        for c in text.chars() {
+            if c.is_ascii() {
+                self.ascii += 1;
+            } else {
+                self.other += 1;
+            }
+        }
+    }
+
+    fn tokens(&self) -> usize {
+        if self.ascii + self.other == 0 {
+            0
+        } else {
+            self.ascii.div_ceil(4) + self.other
+        }
+    }
+}
+
+impl std::fmt::Write for CharCounts {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.add(s);
+        Ok(())
+    }
+}
+
+/// Token estimate for a [`Content`] without joining its text parts.
+///
+/// [`content_to_summary_string`] joins text parts with a single space; this
+/// mirrors that join by counting one extra ASCII separator per boundary, so
+/// the estimate is identical without allocating the joined string.
+fn estimate_content_tokens(content: &Content) -> usize {
+    match content {
+        Content::Text(text) => estimate_tokens(text),
+        Content::Parts(parts) => {
+            let mut counts = CharCounts::default();
+            let mut texts = 0usize;
+            for part in parts {
+                if let ContentPart::Text { text } = part {
+                    counts.add(text);
+                    texts += 1;
+                }
+            }
+            if texts == 0 {
+                return 0;
+            }
+            // The separators `content_to_summary_string` inserts between parts.
+            counts.ascii += texts - 1;
+            counts.tokens()
+        }
     }
 }
 
@@ -305,15 +373,23 @@ impl ContextBudget {
             .messages()
             .iter()
             .map(|msg| {
+                // Estimate over borrowed text: this runs on every turn, and a
+                // history full of tool results must not be copied just to be
+                // measured.
                 let body = match msg {
-                    Message::System { content } => content.clone(),
-                    Message::User { content } => content_to_summary_string(content),
-                    Message::Assistant { content } => content.clone(),
-                    Message::AssistantToolCall { name, args, .. } => format!("{name} {args}"),
-                    Message::ToolResult { content, .. } => content.clone(),
+                    Message::System { content } => estimate_tokens(content),
+                    Message::User { content } => estimate_content_tokens(content),
+                    Message::Assistant { content } => estimate_tokens(content),
+                    Message::AssistantToolCall { name, args, .. } => {
+                        let mut counts = CharCounts::default();
+                        let _ =
+                            std::fmt::Write::write_fmt(&mut counts, format_args!("{name} {args}"));
+                        counts.tokens()
+                    }
+                    Message::ToolResult { content, .. } => estimate_tokens(content),
                 };
                 // +4 per message covers role framing and message delimiters.
-                estimate_tokens(&body) + 4
+                body + 4
             })
             .sum()
     }
@@ -597,6 +673,11 @@ impl ReActApp for AgentReActApp {
                     *args = modified.args;
                 }
             }
+            // Serializing the arguments is only worth it when a hook reads
+            // them; tool calls happen on every step of the ReAct loop.
+            if !hooks.has_hooks(&crate::agent::hooks::HookEvent::BeforeToolCall) {
+                return react::runtime::HookDecision::Continue;
+            }
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("tool_name", &tool_name);
             ctx.set("call_id", &call_id);
@@ -621,7 +702,6 @@ impl ReActApp for AgentReActApp {
         let tool_name = tool_name.to_string();
         let call_id = call_id.to_string();
         let plugins = self.plugins.clone();
-        let result_text = result.as_ref().map(|v| v.to_string()).unwrap_or_default();
         async move {
             if plugins.has_plugins() {
                 let tool_result = match &*result {
@@ -643,6 +723,12 @@ impl ReActApp for AgentReActApp {
                     }
                 }
             }
+            if !hooks.has_hooks(&crate::agent::hooks::HookEvent::AfterToolCall) {
+                return react::runtime::HookDecision::Continue;
+            }
+            // Tool results can be large; only render them into the hook
+            // context when a hook is actually registered.
+            let result_text = result.as_ref().map(|v| v.to_string()).unwrap_or_default();
             let mut ctx = crate::agent::hooks::HookContext::new(&agent_name);
             ctx.set("tool_name", &tool_name);
             ctx.set("call_id", &call_id);
@@ -825,6 +911,42 @@ mod budget_tests {
             passes += 1;
             assert!(passes < 10, "compaction failed to converge");
         }
+    }
+
+    /// The allocation-free part estimate must equal the joined-text one.
+    ///
+    /// [`estimate_session`](ContextBudget::estimate_session) runs on every turn,
+    /// so it counts text parts in place instead of building the joined string;
+    /// this pins the two accountings together.
+    #[test]
+    fn parts_estimate_equals_the_joined_text_without_joining() {
+        let mut session = AgentSession::new();
+        session.add_user_content(Content::parts(vec![
+            ContentPart::Text { text: "ab".into() },
+            ContentPart::Text {
+                text: "c你好".into(),
+            },
+        ]));
+        assert_eq!(
+            ContextBudget::default().estimate_session(&session),
+            estimate_tokens("ab c你好") + 4
+        );
+    }
+
+    /// A rendered tool call is measured through `fmt`, never a built String.
+    #[test]
+    fn tool_call_estimate_matches_its_rendered_form() {
+        let args = serde_json::json!({"path": "a.txt"});
+        let mut session = AgentSession::new();
+        session.push(Message::AssistantToolCall {
+            tool_call_id: "call-1".into(),
+            name: "read_file".into(),
+            args: args.clone(),
+        });
+        assert_eq!(
+            ContextBudget::default().estimate_session(&session),
+            estimate_tokens(&format!("read_file {args}")) + 4
+        );
     }
 
     #[test]

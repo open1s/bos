@@ -377,7 +377,6 @@ impl GlobalSettings {
         id: &str,
         name: &str,
         base_url: &str,
-        api_key: &str,
         models: &[ModelEntry],
     ) {
         let id = id.trim();
@@ -389,7 +388,8 @@ impl GlobalSettings {
             Provider {
                 name: display_name(name, id),
                 base_url: base_url.trim().to_string(),
-                api_key: api_key.to_string(),
+                api_key_vault: None,
+                legacy_api_key: None,
                 declared: false,
                 api_mode: Some(family_protocol(id).to_string()),
                 models: BTreeMap::new(),
@@ -406,7 +406,6 @@ impl GlobalSettings {
         id: &str,
         name: &str,
         base_url: &str,
-        api_key: &str,
         models: &[ModelEntry],
     ) {
         let id = id.trim();
@@ -418,7 +417,8 @@ impl GlobalSettings {
             Provider {
                 name: display_name(name, id),
                 base_url: base_url.trim().to_string(),
-                api_key: api_key.to_string(),
+                api_key_vault: None,
+                legacy_api_key: None,
                 declared: true,
                 api_mode: None,
                 models: BTreeMap::new(),
@@ -435,10 +435,23 @@ impl GlobalSettings {
     }
 
     /// Point a provider at another connection.
-    pub(crate) fn set_connection(&mut self, id: &str, base_url: &str, api_key: &str) {
+    pub(crate) fn set_connection(&mut self, id: &str, base_url: &str) {
         if let Some(provider) = self.providers.get_mut(id) {
             provider.base_url = base_url.trim().to_string();
-            provider.api_key = api_key.to_string();
+        }
+    }
+
+    /// Name the vault entry a provider reads its API key from.
+    ///
+    /// An empty id clears the choice rather than writing `Some("")`, so the
+    /// provider falls back to the conventional `provider:<id>:api_key` entry.
+    pub(crate) fn set_api_key_vault(&mut self, id: &str, entry: Option<&str>) {
+        let entry = entry
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        if let Some(provider) = self.providers.get_mut(id) {
+            provider.api_key_vault = entry;
         }
     }
 
@@ -653,7 +666,6 @@ mod tests {
             "nvidia",
             "NVIDIA",
             "https://integrate.api.nvidia.com/v1",
-            "key",
             &[ModelEntry::named("nvidia/moonshotai/kimi-k3")],
         );
         global
@@ -664,7 +676,7 @@ mod tests {
         let global = with_model();
         let provider = global.providers.get("nvidia").expect("the provider");
         assert_eq!(provider.base_url, "https://integrate.api.nvidia.com/v1");
-        assert_eq!(provider.api_key, "key");
+        assert_eq!(provider.api_key_vault, None);
         assert_eq!(provider.name.as_deref(), Some("NVIDIA"));
         assert_eq!(
             global.model_refs("nvidia"),
@@ -704,7 +716,7 @@ mod tests {
     #[test]
     fn a_custom_provider_speaks_chat_and_keeps_its_name() {
         let mut global = GlobalSettings::default();
-        global.add_custom_provider("gateway", "Gateway", "https://gw.example/v1", "", &[]);
+        global.add_custom_provider("gateway", "Gateway", "https://gw.example/v1", &[]);
         let provider = global.providers.get("gateway").expect("the provider");
         assert_eq!(provider.name.as_deref(), Some("Gateway"));
         assert!(provider.declared);
@@ -715,7 +727,7 @@ mod tests {
     #[test]
     fn a_second_model_on_one_gateway_reuses_the_connection() {
         let mut global = GlobalSettings::default();
-        global.add_custom_provider("gw", "gw", "https://gw.example/v1", "k", &[]);
+        global.add_custom_provider("gw", "gw", "https://gw.example/v1", &[]);
         global
             .add_model("gw", "fast", "", "org/fast", "responses")
             .expect("the first model");
@@ -872,7 +884,6 @@ mod tests {
             "deepseek",
             "DeepSeek",
             "https://api.deepseek.com",
-            "",
             &[ModelEntry::named("deepseek-chat")],
         );
         assert_eq!(global.family_protocol_of("deepseek"), "responses");
@@ -921,7 +932,7 @@ mod tests {
     #[test]
     fn the_connections_carrying_a_model_are_listed() {
         let mut global = with_model();
-        global.add_custom_provider("direct", "direct", "https://example.com/v1", "", &[]);
+        global.add_custom_provider("direct", "direct", "https://example.com/v1", &[]);
         global
             .add_model("direct", "glm", "", "nvidia/moonshotai/kimi-k3", "chat")
             .expect("the same id elsewhere");

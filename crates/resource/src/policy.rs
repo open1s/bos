@@ -6,9 +6,21 @@
 
 use regorus::Engine;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
 
 use crate::error::{ResourceError, Result};
+
+thread_local! {
+    /// Per-thread cache of the parsed Rego module.
+    ///
+    /// [regorus::Engine] is `Rc`-backed and therefore neither `Send` nor
+    /// `Sync`, so it cannot be stored in [`SharedPolicy`]. A thread-local
+    /// keeps one parsed engine per worker thread and rebuilds it only when the
+    /// policy source changes; parsing the module on every authorization call
+    /// dominated dispatch latency.
+    static REGO_ENGINE: RefCell<Option<(String, Engine)>> = const { RefCell::new(None) };
+}
 
 /// Policy document containing Rego policy and optional legacy rules.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -125,41 +137,52 @@ impl PolicyDoc {
     }
 
     fn authorize_rego(rego: &str, agent: &str, uri: &str, action: &str) -> Result<()> {
-        let mut engine = Engine::new();
-        engine
-            .add_policy("policy.rego".to_string(), rego.to_string())
-            .map_err(|e| ResourceError::Codec(format!("rego parse error: {e}")))?;
+        REGO_ENGINE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let stale = match slot.as_ref() {
+                Some((cached, _)) => cached != rego,
+                None => true,
+            };
+            if stale {
+                let mut engine = Engine::new();
+                engine
+                    .add_policy("policy.rego".to_string(), rego.to_string())
+                    .map_err(|e| ResourceError::Codec(format!("rego parse error: {e}")))?;
+                *slot = Some((rego.to_string(), engine));
+            }
+            let engine = &mut slot.as_mut().expect("engine was just cached").1;
 
-        // Prepare input
-        let input = serde_json::json!({
-            "agent": agent,
-            "uri": uri,
-            "action": action
-        });
-        engine.set_input(input.into());
+            // Prepare input
+            let input = serde_json::json!({
+                "agent": agent,
+                "uri": uri,
+                "action": action
+            });
+            engine.set_input(input.into());
 
-        // Query allow
-        let results = engine
-            .eval_query("data.policy.allow".to_string(), false)
-            .map_err(|e| ResourceError::Codec(format!("rego eval error: {e}")))?;
+            // Query allow
+            let results = engine
+                .eval_query("data.policy.allow".to_string(), false)
+                .map_err(|e| ResourceError::Codec(format!("rego eval error: {e}")))?;
 
-        // regorus returns QueryResults with a `result` field containing Vec<QueryResult>
-        // Each QueryResult has expressions with the query result value
-        let allowed = results.result.iter().any(|qr| {
-            qr.expressions
-                .iter()
-                .any(|expr| expr.value.as_bool().copied().unwrap_or(false))
-        });
+            // regorus returns QueryResults with a `result` field containing Vec<QueryResult>
+            // Each QueryResult has expressions with the query result value
+            let allowed = results.result.iter().any(|qr| {
+                qr.expressions
+                    .iter()
+                    .any(|expr| expr.value.as_bool().copied().unwrap_or(false))
+            });
 
-        if allowed {
-            Ok(())
-        } else {
-            Err(ResourceError::PolicyDenied {
-                agent: agent.to_string(),
-                uri: uri.to_string(),
-                action: action.to_string(),
-            })
-        }
+            if allowed {
+                Ok(())
+            } else {
+                Err(ResourceError::PolicyDenied {
+                    agent: agent.to_string(),
+                    uri: uri.to_string(),
+                    action: action.to_string(),
+                })
+            }
+        })
     }
 }
 
@@ -519,6 +542,34 @@ mod tests {
         assert!(policy1.authorize("alice", "file:///test", "read").is_ok());
         assert!(policy2.authorize("bob", "file:///test", "read").is_ok());
         assert!(policy1.authorize("david", "file:///test", "read").is_err()); // not in allow list
+    }
+
+    #[test]
+    fn rego_engine_cache_tracks_policy_updates() {
+        fn doc(rego: &str) -> PolicyDoc {
+            PolicyDoc {
+                admins: vec!["admin".into()],
+                rego: Some(rego.into()),
+                rules: vec![],
+            }
+        }
+
+        let allow = doc("package policy\nallow if { true }");
+        let deny = doc("package policy\nallow if { false }");
+        let policy = SharedPolicy::new(allow.clone());
+
+        // Repeated evaluations reuse the parsed engine but still see the input.
+        for _ in 0..3 {
+            assert!(policy.authorize("alice", "file:///x", "read").is_ok());
+            assert!(policy.authorize("bob", "file:///x", "read").is_ok());
+        }
+
+        // A hot-reloaded policy must invalidate the cached engine.
+        policy.update(deny);
+        assert!(policy.authorize("alice", "file:///x", "read").is_err());
+
+        policy.update(allow);
+        assert!(policy.authorize("alice", "file:///x", "read").is_ok());
     }
 
     /// Every example policy in `examples/policies/*.rego` must remain valid and

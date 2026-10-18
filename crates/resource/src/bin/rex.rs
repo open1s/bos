@@ -298,26 +298,30 @@ async fn assemble(cli: &Cli) -> Result<Arc<ResourceClient>, String> {
 
             // If --ca not provided, auto-discover the server's CA from the bus.
             let ca_bytes = match cli.ca.as_deref() {
-                Some(ca_path) => std::fs::read(ca_path).map_err(|e| format!("read ca: {e}"))?,
+                Some(ca_path) => tokio::fs::read(ca_path)
+                    .await
+                    .map_err(|e| format!("read ca: {e}"))?,
                 None => {
                     d!("--ca not provided, discovering server CA from bus");
                     let bus_cfg = load_bus_config_from_discovery().unwrap_or_default();
-                    let mut bus = Bus::from(bus_cfg).await;
+                    let bus = Bus::from(bus_cfg).await;
                     let topic = format!("{DISCOVERY_TOPIC}/**");
-                    let (tx, rx) = std::sync::mpsc::channel::<String>();
+                    // Async channel: the subscription callback runs on the bus
+                    // runtime, so waiting for it must never block this worker.
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                     let server_name = cli.server.clone();
                     let target_addr = addr.clone();
                     bus.subscribe(&topic, move |ann: NodeAnnounce| {
-                        if ann.quic_addr == target_addr || ann.server_name == server_name {
-                            if !ann.ca_cert.is_empty() {
-                                let _ = tx.send(ann.ca_cert.clone());
-                            }
+                        if (ann.quic_addr == target_addr || ann.server_name == server_name)
+                            && !ann.ca_cert.is_empty()
+                        {
+                            let _ = tx.send(ann.ca_cert.clone());
                         }
                     })
                     .await;
                     // Wait for server CA — peer re-announces every 5s.
-                    match rx.recv_timeout(std::time::Duration::from_secs(8)) {
-                        Ok(ca_pem) => {
+                    match tokio::time::timeout(std::time::Duration::from_secs(8), rx.recv()).await {
+                        Ok(Some(ca_pem)) => {
                             d!("discovered server CA for {}", cli.server);
                             ca_pem.into_bytes()
                         }
@@ -330,8 +334,12 @@ async fn assemble(cli: &Cli) -> Result<Arc<ResourceClient>, String> {
                 }
             };
 
-            let cert_bytes = std::fs::read(cert).map_err(|e| format!("read cert: {e}"))?;
-            let key_bytes = std::fs::read(key).map_err(|e| format!("read key: {e}"))?;
+            let cert_bytes = tokio::fs::read(cert)
+                .await
+                .map_err(|e| format!("read cert: {e}"))?;
+            let key_bytes = tokio::fs::read(key)
+                .await
+                .map_err(|e| format!("read key: {e}"))?;
             let t =
                 build_quic_from_bytes(sock, &cli.server, &ca_bytes, &cert_bytes, &key_bytes, None)?;
             Some(Arc::new(t))
@@ -506,10 +514,7 @@ fn load_bus_config_from_discovery() -> Result<BusConfig, String> {
 fn apply_config(cli: &mut Cli, cfg: &RexFileConfig) {
     // Priority: CLI > flat keys > nested [node_section].
     if cli.node.is_none() {
-        cli.node = cfg
-            .node
-            .clone()
-            .or_else(|| cfg.node_cfg.bind.as_ref().map(|b| b.clone()));
+        cli.node = cfg.node.clone().or_else(|| cfg.node_cfg.bind.clone());
     }
     if cli.server == "server" {
         if let Some(s) = cfg.server.as_ref().or(cfg.node_cfg.server.as_ref()) {
@@ -532,6 +537,9 @@ fn apply_config(cli: &mut Cli, cfg: &RexFileConfig) {
 
 /// Run a resource node: build a permissive manager, register the hosted
 /// resources, then bind and serve QUIC with mutual TLS until interrupted.
+// CLI wiring passes each flag explicitly; grouping them into a struct would
+// only move the argument list.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     bind: &str,
     register: &[String],
@@ -540,14 +548,14 @@ async fn serve(
     key_path: &str,
     policy_path: Option<&str>,
     node_id: Option<&str>,
-    _server_name: &str,
     shared_secret: Option<&str>,
 ) -> Result<(), String> {
     // Load policy from file. Rego files (`.rego`) are used directly; otherwise
     // treated as a JSON `PolicyDoc` (JSON with optional `rego` field).
     let policy_doc = if let Some(path) = policy_path {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("read policy file {path}: {e}"))?;
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| format!("read policy file {path}: {e}"))?;
         if path.ends_with(".rego") {
             // Raw Rego source → wrap in PolicyDoc.
             d!("loaded Rego policy from {path}");
@@ -640,9 +648,15 @@ async fn serve(
     };
 
     // Load server identity + CA for client verification.
-    let ca = std::fs::read(&effective_ca).map_err(|e| format!("read ca: {e}"))?;
-    let cert_bytes = std::fs::read(&effective_cert).map_err(|e| format!("read cert: {e}"))?;
-    let key_bytes = std::fs::read(&effective_key).map_err(|e| format!("read key: {e}"))?;
+    let ca = tokio::fs::read(&effective_ca)
+        .await
+        .map_err(|e| format!("read ca: {e}"))?;
+    let cert_bytes = tokio::fs::read(&effective_cert)
+        .await
+        .map_err(|e| format!("read cert: {e}"))?;
+    let key_bytes = tokio::fs::read(&effective_key)
+        .await
+        .map_err(|e| format!("read key: {e}"))?;
     let cert: CertificateDer<'static> = rustls_pemfile::certs(&mut &cert_bytes[..])
         .next()
         .ok_or("server cert PEM contained no certificate")?
@@ -665,11 +679,13 @@ async fn serve(
     if let Some(nid) = node_id {
         let bus_cfg = load_bus_config_from_discovery().unwrap_or_default();
         d!("connecting to bus for discovery (node_id={nid})");
-        let mut bus = Bus::from(bus_cfg).await;
+        let bus = Bus::from(bus_cfg).await;
 
         // Briefly subscribe to collect any already-running peer CAs.
         let topic = format!("{DISCOVERY_TOPIC}/**");
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        // Async channel: waiting for peer announcements must yield the worker
+        // instead of blocking it (the bus delivers on the same runtime).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let my_nid = nid.to_string();
         let collect_secret = shared_secret.map(|s| s.to_string());
         bus.subscribe(&topic, move |ann: NodeAnnounce| {
@@ -690,17 +706,13 @@ async fn serve(
         // at least that long to catch a re-announcement.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
         loop {
-            match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-                Ok(ca) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(ca)) => {
                     d!("collected peer CA ({} bytes)", ca.len());
                     peer_ca_pems.push(ca);
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    break;
-                }
+                Ok(None) | Err(_) => break,
             }
         }
         d!("collected {} peer CAs from bus", peer_ca_pems.len());
@@ -881,7 +893,7 @@ async fn serve(
         // Periodic re-announce so late-joining peers discover us. Load is
         // refreshed (uptime + live resource/proc counts) on each tick.
         let re_topic = discovery_topic(nid);
-        let mut re_bus = bus.clone();
+        let re_bus = bus.clone();
         let mut re_announce = announce.clone();
         let re_secret = shared_secret.map(|s| s.to_string());
         let re_mgr = mgr_for_discovery.clone();
@@ -917,13 +929,17 @@ async fn serve(
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                let mut ls = cleanup_ls.write().await;
-                let stale: Vec<String> = ls
-                    .iter()
-                    .filter(|(_, ts)| now.duration_since(**ts).as_secs() > PEER_LOST_SECS)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for peer_id in &stale {
+                // Collect under the lock, then drop it before any I/O:
+                // deregister/remove are awaits, and holding the `last_seen`
+                // write guard across them stalls every announcement handler.
+                let stale: Vec<(String, Instant)> = {
+                    let ls = cleanup_ls.read().await;
+                    ls.iter()
+                        .filter(|(_, ts)| now.duration_since(**ts).as_secs() > PEER_LOST_SECS)
+                        .map(|(id, ts)| (id.clone(), *ts))
+                        .collect()
+                };
+                for (peer_id, _) in &stale {
                     let uri = format!("vnode://{peer_id}");
                     if cleanup_mgr.contains(&uri).await {
                         if let Err(e) = cleanup_mgr.deregister(&uri).await {
@@ -933,7 +949,16 @@ async fn serve(
                         }
                     }
                     cleanup_net.remove(peer_id).await; // evict pooled transport
-                    ls.remove(peer_id);
+                }
+                if !stale.is_empty() {
+                    let mut ls = cleanup_ls.write().await;
+                    for (peer_id, seen) in &stale {
+                        // A peer may have re-announced while we were evicting;
+                        // keep the fresh timestamp so it is tracked again.
+                        if ls.get(peer_id).is_some_and(|ts| ts == seen) {
+                            ls.remove(peer_id);
+                        }
+                    }
                 }
             }
         });
@@ -1043,7 +1068,6 @@ async fn main() {
                 key,
                 policy.as_deref(),
                 Some(effective_node_id),
-                &cli.server,
                 shared_secret,
             )
             .await
@@ -1143,17 +1167,15 @@ async fn run(cmd: &Cmd, explorer: Explorer, no_color: bool) -> resource::Result<
                         };
                         if depth == 0 {
                             println!(
-                                "{icon} {} ({}, {})",
+                                "{icon} {} ({colored_kind}, {:?})",
                                 c("1", &info.uri),
-                                colored_kind,
-                                format!("{:?}", info.state)
+                                info.state
                             );
                         } else {
                             println!(
-                                "{indent}{prefix}{icon} {} ({}, {})",
+                                "{indent}{prefix}{icon} {} ({colored_kind}, {:?})",
                                 c("1", &info.uri),
-                                colored_kind,
-                                format!("{:?}", info.state)
+                                info.state
                             );
                         }
                     }

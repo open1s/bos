@@ -695,8 +695,12 @@ impl Agent {
         self.context_cache.lock().unwrap().take();
     }
 
-    /// Signal the agent to stop the current execution.
-    /// Returns true if there was a running execution to stop.
+    /// Discard the cached ReAct engine, signalling it to stop.
+    ///
+    /// A run in progress holds the engine out of the cache, so this does not
+    /// interrupt one: it drops the idle engine, and the next run rebuilds it.
+    /// Drop the stream returned by [`Agent::stream`] to cancel a streaming
+    /// run; [`Agent::react`] has no cancellation handle.
     pub fn stop(&self) {
         let cached_engine = {
             let mut cache = self.engine_cache.lock().unwrap();

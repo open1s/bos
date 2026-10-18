@@ -176,6 +176,23 @@ impl HookRegistry {
         self.get_hooks(event)
     }
 
+    /// Whether at least one hook is registered for `event`.
+    ///
+    /// Per-step call sites use this to skip building an event context (which
+    /// may serialize tool arguments or results) when nothing would read it.
+    /// A poisoned registry reports `false` instead of panicking, matching
+    /// [`HookRegistry::trigger`]'s no-hook path.
+    pub fn has_hooks(&self, event: &HookEvent) -> bool {
+        self.hooks
+            .lock()
+            .map(|hooks| {
+                hooks
+                    .get(event)
+                    .is_some_and(|registered| !registered.is_empty())
+            })
+            .unwrap_or(false)
+    }
+
     /// Trigger all hooks for an event and aggregate decisions
     pub async fn trigger(&self, event: HookEvent, context: HookContext) -> HookDecision {
         let hooks = self.get_hooks(&event);

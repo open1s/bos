@@ -26,18 +26,38 @@ impl PyStreamSender {
 
 #[pymethods]
 impl PyStreamSender {
+    /// Push one reply chunk back to the caller.
+    ///
+    /// The bus buffers a fixed number of replies and only drains them after the
+    /// handler returns, so this never waits for capacity: waiting here would
+    /// hold the GIL on a parked Tokio worker and deadlock the query.
     fn send(&self, chunk: String) -> PyResult<()> {
         if let Some(tx) = &self.inner {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async { tx.send(Ok(chunk)).await })
-            })
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            match tx.try_send(Ok(chunk)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "stream reply buffer is full: the bus buffers 32 replies and drains them \
+                         only after the handler returns, so a handler cannot send more than 32 \
+                         chunks",
+                    ));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "stream receiver is closed",
+                    ));
+                }
+            }
         }
         Ok(())
     }
 
-    fn close(&self) {
-        // Drop the sender to signal stream end
+    /// Stop using this sender; later `send` calls are ignored.
+    ///
+    /// The reply stream itself ends when the handler returns, because the bus
+    /// drains buffered replies only then.
+    fn close(&mut self) {
+        self.inner = None;
     }
 }
 
@@ -335,9 +355,13 @@ impl PyQueryable {
             >| {
                 let handler = handler.clone();
                 async move {
+                    // Keep a sender for reporting handler failures: an exception
+                    // raised by the Python handler must reach the caller as a
+                    // stream error instead of silently truncating the replies.
+                    let error_tx = tx.clone();
                     let tx_wrapper = PyStreamSender::new(tx);
 
-                    let _ = Python::attach(|py| {
+                    let result = Python::attach(|py| {
                         let py_arg = input
                             .into_py_any(py)
                             .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
@@ -348,6 +372,12 @@ impl PyQueryable {
                             .map_err(|e| bus::ZenohError::Query(e.to_string()))?;
                         Ok::<_, bus::ZenohError>(())
                     });
+
+                    if let Err(e) = result {
+                        // A full buffer means the handler already hit the reply
+                        // cap; dropping the error is the only non-blocking option.
+                        let _ = error_tx.try_send(Err(e));
+                    }
                 }
             };
 

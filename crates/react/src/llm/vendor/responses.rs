@@ -370,15 +370,10 @@ fn serialize_content_part(part: &ContentPart) -> Option<ResponsesContentPart> {
 
 fn serialize_input_content(content: &Content) -> Vec<ResponsesContentPart> {
     match content {
-        Content::Text(s) => {
-            if let Ok(parts) = serde_json::from_str::<Vec<ContentPart>>(s) {
-                parts.iter().filter_map(serialize_content_part).collect()
-            } else if let Ok(part) = serde_json::from_str::<ContentPart>(s) {
-                serialize_content_part(&part).into_iter().collect()
-            } else {
-                vec![ResponsesContentPart::InputText { text: s.clone() }]
-            }
-        }
+        Content::Text(s) => match crate::llm::types::parse_content_parts(s) {
+            Some(parts) => parts.iter().filter_map(serialize_content_part).collect(),
+            None => vec![ResponsesContentPart::InputText { text: s.clone() }],
+        },
         Content::Parts(parts) => parts.iter().filter_map(serialize_content_part).collect(),
     }
 }
@@ -874,11 +869,13 @@ impl ResponsesTransport {
 
         let url = format!("{}/responses", self.endpoint);
 
-        info!(
-            "Req: {}",
-            serde_json::to_string(&responses_req)
-                .unwrap_or_else(|_| "Failed to serialize request".into())
-        );
+        if log::log_enabled!(log::Level::Info) {
+            info!(
+                "Req: {}",
+                serde_json::to_string(&responses_req)
+                    .unwrap_or_else(|_| "Failed to serialize request".into())
+            );
+        }
 
         let response = self
             .client
@@ -961,10 +958,19 @@ impl ResponsesTransport {
             let mut byte_stream = response.bytes_stream();
             let mut extractor = ResponsesExtractor::new(JsonExtractor::default());
             let mut func_calls = ResponsesFunctionCallAccumulator::new();
+            // A transport chunk may split a multi-byte character; keep the
+            // incomplete tail and decode it with the next chunk.
+            let mut utf8_tail: Vec<u8> = Vec::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let text = match chunk_result {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                    Ok(bytes) => {
+                        utf8_tail.extend_from_slice(&bytes);
+                        let valid = crate::utils::complete_utf8_prefix(&utf8_tail);
+                        let text = String::from_utf8_lossy(&utf8_tail[..valid]).into_owned();
+                        utf8_tail.drain(..valid);
+                        text
+                    }
                     Err(e) => {
                         let err = LlmError::Other(format!("Stream error: {}", e));
                         let _ = tx.send(Err(err)).await;

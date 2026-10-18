@@ -69,7 +69,6 @@ impl ToolRunManager {
             let bus = bus.clone();
             tokio::spawn(async move {
                 let payload = serde_json::to_string(&event).unwrap_or_default();
-                let mut bus = bus;
                 let _ = bus.publish(&topic, &payload).await;
             });
         }

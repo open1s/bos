@@ -57,6 +57,7 @@ performance_usage = "detailed" # compact | detailed
 developer_tools = true
 session_sort = ""
 active_workspace = "<id>"      # registry-level pointer
+active_session = "<id>"        # the session last on screen (window state)
 
 [providers.<id>]               # <id> is concrete: nvidia, openrouter, openai.
 base_url = "https://…"         # One node per provider — a duplicate id is a
@@ -133,11 +134,6 @@ starts at byte 16 and the file data begins at `8 + u32[4]`)
 ```toml
 schema_version = 1
 
-[general]
-provider = "<id>"              # reference into the global provider tree
-model = "<nickname>"           # this workspace's default model
-active_session = "<id>"        # the session last open HERE
-
 [agent]
 system_prompt = "…"
 temperature = 0.3              # ABSENT means inherit. 0.0 is a real value.
@@ -162,8 +158,15 @@ skills = []
 extentions = []                # subtracts from the global installed inventory
 ```
 
-`[general]` appears in both files deliberately — machine prefs in one, the agent's
-own selection in the other. They are different structs.
+The file is AGENT CONFIGURATION ONLY. It carries no model and no session
+identity: a model is a per-session choice, and which session is on screen is
+a window fact (several sessions in one workspace can run at once). Both used
+to sit under `[general]` and are still accepted as deserialize-only legacy
+input (`#[serde(rename = "...", skip_serializing)]`, the same shape as
+`Provider::api_key`) so a file written by an older build parses: the model
+pair is read once and given to the session that is open, and the remembered
+session id is read once into the machine preference `active_session`. A
+saved file carries none of the three lines.
 
 ## Session — `<root>/.bsh/sessions/<id>.json`
 
@@ -178,16 +181,28 @@ own selection in the other. They are different structs.
 }
 ```
 
-`provider`, `model` and `agent_preset` are **null** when the session names
-none - the reference's own schema is `z.union([z.string(), z.null()])` - and a null
-field is not a sentinel: it means "take the level below". A half-made reference (a
-provider with no model) counts as null rather than being sent on to fail as an
-unknown name.
+`provider` and `model` are the session's EXPLICIT choice, written when the
+composer picks a model in THIS chat; `agent_preset` is the same for the preset.
+They are **null** when the session names none, and null does not mean "take the
+level below" - there is no level below. A session with no choice has no model:
+the chip shows *Select model* and the send gate refuses with
+`composer.chooseModel` instead of sending to an endpoint nobody chose. A
+half-made reference (a provider with no model) counts as null rather than being
+sent on to fail as an unknown name. A new session is never given a copy of
+another session's choice.
 
 The session stores a **reference**, never `base_url` or `api_key`. A session
 whose reference no longer resolves is **unresolvable**: it shows the model it
 wanted and refuses to send until a model is picked. It never falls back
 silently — sending to a gateway nobody chose is worse than asking.
+
+**Which session is on screen** is a machine preference, not workspace state:
+`global.general.active_session`. Several chats in one workspace may be
+streaming at once, so selecting one only changes what the window shows (and
+writes the global document). A launch accepts the remembered id only while it
+still belongs to the active workspace; otherwise the newest visible chat there
+is opened. An older workspace file's `active_session` is migrated into this
+preference once, and never overwrites one the reader has since recorded.
 
 ## File rules
 
@@ -215,8 +230,10 @@ shell ended up confined to a temporary directory a test had made.
 
 ## Resolution
 
-**Model:** `session.provider/model` → `workspace general.provider/model` →
-**refuse and say so**. There is no global term: there is no default model.
+**Model:** `session.provider/model` → **refuse and say so**. There is no
+workspace and no global term: there is no default model. A legacy workspace pair
+is migrated onto the open session at launch, once, which is an upgrade step and
+not a resolution level.
 
 **Preset:** `session.agent_preset` → `default_preset` → none. The preset is a
 **session** fact, not a workspace one, because it decides the tool schemas and
@@ -236,13 +253,14 @@ order survives and a collision is replaced in place.
 **Implemented in `src/settings/resolve.rs`**, which returns *data* and never
 wording, so the view owns the copy:
 
-- `ModelChoice` is three-valued - `Found { source, reference, connection }`,
-  `Unchosen`, `Missing { source, reference }`. `source` records whether the
-  session or the workspace named it, so a pane can say which. `refusal()` turns
-  the two bad states into `NoModel` / `UnknownModel` for the composer.
+- `ModelChoice` is three-valued - `Found { reference, connection }`, `Unchosen`,
+  `Missing { reference }`. `refusal()` turns the two bad states into `NoModel` /
+  `UnknownModel` for the composer.
 - `Resolution::refusal()` checks the preset **first** — a mount that cannot be
   built is a harder stop than a model that cannot be reached — and
-  `Settings::refusal()` maps the three variants onto the composer's own keys.
+  `Settings::refusal_for()` maps the three variants onto the composer's own
+  keys (`composer.chooseModel`, `composer.modelUnavailable`,
+  `composer.presetUnavailable`).
   The resolution layer returns *data*, never wording.
 - The preset supplies exactly one thing: `plugins`, the complete mounted set.
   It carries no model, no system prompt and no step cap, so it cannot collide
@@ -274,8 +292,8 @@ one screen. `<root>/.bsh/settings/settings.toml` is written when a workspace is
 added — before that there is no agent, so there is nothing to configure.
 
 A turn a fresh install cannot answer is **refused, not faked**:
-`Settings::refusal()` folds the resolution and hands the view a key
-(`composer.noModels` / `composer.modelUnavailable` /
+`Settings::refusal_for()` folds the resolution and hands the view a key
+(`composer.chooseModel` / `composer.modelUnavailable` /
 `composer.presetUnavailable`), and `Shell::send` shows it as a notice instead of
 opening a turn against a model nobody chose.
 
@@ -315,7 +333,7 @@ struct ModelEntry { model: String,
 
 struct WorkspaceSettings {
     schema_version: u32,
-    general: WorkspaceGeneral,          // provider, model, active_preset, active_session
+    general: WorkspaceGeneral,          // LEGACY-ONLY: provider/model/active_session input
     agent: AgentSection,                // prompt, temperature: Option, permission, budgets
     disabled: Disabled,                 // tools, skills, extensions
 }

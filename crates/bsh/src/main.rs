@@ -10,7 +10,7 @@ fn main() {
         .any(|arg| arg == "--help" || arg == "-h")
     {
         println!(
-            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]]\n\n  --settings  open the settings dialog on launch\n  SECTION     the rail's five cells - account | general | models | plugins\n              | agent-presets - or a hosted view: plugin-inventory | shell\n              | agent-loop | tools | mcp | archived-sessions | presentation\n              | workspaces | context | automation (default: account)"
+            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]]\n\n  --settings  open the settings dialog on launch\n  SECTION     the rail's six cells - account | vault | general | models |\n              plugins | agent-presets - or a hosted view: plugin-inventory |\n              shell | agent-loop | tools | mcp | archived-sessions |\n              presentation | workspaces | context | automation (default: account)"
         );
         return;
     }

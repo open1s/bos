@@ -36,7 +36,7 @@ impl Query {
         Ok(self)
     }
 
-    /// Send a query with string payload
+    /// Send a query and decode the first reply.
     pub async fn query<Q, R>(&self, payload: &Q) -> Result<R, ZenohError>
     where
         Q: Archive,
@@ -49,22 +49,13 @@ impl Query {
             .encode(payload)
             .map_err(|e| ZenohError::Serialization(e.to_string()))?;
 
-        let results = self.query_internal_bytes(&bytes, None).await?;
-
-        if results.is_empty() {
-            return Err(ZenohError::Query(
-                "No replies received — query may have timed out or no callable is listening"
-                    .to_string(),
-            ));
-        }
-
-        let result: R = codec
-            .decode(results[0].as_slice())
-            .map_err(|e| ZenohError::Serialization(e.to_string()))?;
-        Ok(result)
+        let first = self.query_first_payload(&bytes, None).await?;
+        codec
+            .decode(first.as_slice())
+            .map_err(|e| ZenohError::Serialization(e.to_string()))
     }
 
-    /// Send a query with string payload and timeout
+    /// Send a query with a timeout and decode the first reply.
     pub async fn query_with_timeout<Q, R>(
         &self,
         payload: &Q,
@@ -81,11 +72,10 @@ impl Query {
             .encode(payload)
             .map_err(|e| ZenohError::Serialization(e.to_string()))?;
 
-        let results = self.query_internal_bytes(&bytes, Some(timeout)).await?;
-        let result: R = codec
-            .decode(results[0].as_slice())
-            .map_err(|e| ZenohError::Serialization(e.to_string()))?;
-        Ok(result)
+        let first = self.query_first_payload(&bytes, Some(timeout)).await?;
+        codec
+            .decode(first.as_slice())
+            .map_err(|e| ZenohError::Serialization(e.to_string()))
     }
 
     /// Send a query and process responses with a callback
@@ -119,7 +109,9 @@ impl Query {
                     .map_err(|e| ZenohError::Serialization(e.to_string()))?;
                 match handler(result) {
                     Ok(result) => results.push(result),
-                    Err(e) => return Err(ZenohError::Serialization(e.to_string())),
+                    Err(e) => {
+                        return Err(ZenohError::Query(format!("Handler error: {e:#}")));
+                    }
                 }
             }
         }
@@ -156,11 +148,15 @@ impl Query {
         Ok(rx)
     }
 
-    async fn query_internal_bytes(
+    /// Send a query and return the payload of the first successful reply.
+    ///
+    /// The reply stream is dropped as soon as the first reply arrives, so a
+    /// broadcast query does not accumulate every reply in memory.
+    async fn query_first_payload(
         &self,
         payload: &[u8],
         timeout: Option<std::time::Duration>,
-    ) -> Result<Vec<Vec<u8>>, ZenohError> {
+    ) -> Result<Vec<u8>, ZenohError> {
         let session = self.session.as_ref().ok_or(ZenohError::NotConnected)?;
 
         let replies = match timeout {
@@ -174,14 +170,26 @@ impl Query {
             None => session.get(&self.topic).payload(payload).await?,
         };
 
-        let mut results = Vec::new();
+        let mut last_error = None;
         while let Ok(reply) = replies.recv_async().await {
-            if let Ok(sample) = reply.result() {
-                results.push(sample.payload().to_bytes().to_vec());
+            match reply.result() {
+                Ok(sample) => return Ok(sample.payload().to_bytes().into_owned()),
+                Err(e) => {
+                    // The reply payload carries the callable's error message;
+                    // prefer it over Zenoh's opaque "N-byte payload" summary.
+                    last_error = Some(match e.payload().try_to_string() {
+                        Ok(text) => text.into_owned(),
+                        Err(_) => e.to_string(),
+                    });
+                }
             }
         }
 
-        Ok(results)
+        Err(ZenohError::Query(match last_error {
+            Some(e) => format!("No successful reply received: {e}"),
+            None => "No replies received — query may have timed out or no callable is listening"
+                .to_string(),
+        }))
     }
 
     /// Get the topic

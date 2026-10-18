@@ -38,7 +38,8 @@ impl McpClient {
       .initialize()
       .await
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-    Ok(serde_json::to_value(caps).unwrap_or(serde_json::Value::Null))
+    serde_json::to_value(caps)
+      .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
   }
 
   #[napi]

@@ -95,10 +95,32 @@ impl ConfigLoader {
       .inner
       .lock()
       .map_err(|_| napi::Error::new(napi::Status::GenericFailure, "lock poisoned"))?;
-    // reload is async in Rust, but for JS we use tokio runtime to block_on
-    let value = tokio::runtime::Handle::current()
-      .block_on(guard.reload())
+    // `ConfigLoader::reload` is async only for API symmetry: it clears the
+    // cache and then runs the same blocking loaders `load_sync` uses. Call
+    // those directly instead of reaching for a Tokio runtime, which does not
+    // exist on the JavaScript thread (`Handle::current()` panics there) and
+    // cannot be blocked on from inside one.
+    guard.reset();
+    let value = guard
+      .load_sync()
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
     Ok(value.to_string())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::ConfigLoader;
+
+  #[test]
+  fn reload_sync_refreshes_inline_sources_without_a_tokio_runtime() {
+    let loader = ConfigLoader::new().unwrap();
+    loader
+      .add_inline(serde_json::json!({ "reloaded": true }))
+      .unwrap();
+
+    let out = loader.reload_sync().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["reloaded"], serde_json::json!(true));
   }
 }

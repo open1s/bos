@@ -11,7 +11,6 @@ use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::*;
 
-use super::fish::fish;
 use super::shell::Shell;
 use super::{hairline_all, icon, txt, DivExt, IconName};
 use crate::theme;
@@ -58,7 +57,24 @@ impl Shell {
                             .items_center()
                             .justify_center()
                             .gap(px(theme::HERO_HEADLINE_GAP))
-                            .child(fish(theme::HERO_MARK, theme::text()))
+                            // The measured box stays [`theme::HERO_MARK`] so the
+                            // headline keeps its line box; the emblem is drawn
+                            // larger inside it and centred, which costs no layout
+                            // height because a child does not push a fixed box.
+                            .child(
+                                div()
+                                    .w(px(theme::HERO_MARK))
+                                    .h(px(theme::HERO_MARK))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        img(crate::assets::mark())
+                                            .w(px(theme::HERO_MARK_DRAWN))
+                                            .h(px(theme::HERO_MARK_DRAWN)),
+                                    ),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -166,11 +182,36 @@ impl Shell {
                             let id = id.clone();
                             pick.update(cx, |this, cx| {
                                 this.state.set_workspace(&id);
+                                // The file pane's paths are relative, so the
+                                // switch rebases them onto another workspace.
+                                this.refile_workspace(cx);
                                 cx.notify();
                             });
                         },
                     ));
                 }
+                // The reference closes the list with a separator and the door to
+                // a new root; without it the only way to add one was the
+                // sidebar's small plus.
+                let add = shell.clone();
+                let add_label = lang.tr("side.addWorkspace");
+                menu = menu.item(PopupMenuItem::separator()).item(
+                    PopupMenuItem::element(move |_window, _cx| {
+                        div()
+                            .debug_selector(|| String::from("hero-add-workspace"))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(9.0))
+                            .w_full()
+                            .child(icon(IconName::Plus, 14.0, theme::muted()).flex_none())
+                            .child(txt(add_label.clone(), 13.0, theme::text()).flex_1())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let add = add.clone();
+                        add.update(cx, |this, cx| this.add_workspace(window, cx));
+                    }),
+                );
                 menu
             });
         Some(

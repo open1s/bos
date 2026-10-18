@@ -107,7 +107,7 @@ impl AgentHook for JSHook {
                   .and_then(|s| s.into_utf8())
                   .and_then(|u| u.as_str().map(|s| s.to_string()))
                   .unwrap_or_else(|e| format!("error:{}", e));
-                if let Some(tx) = tx.lock().unwrap().take() {
+                if let Some(tx) = crate::lock_recover(&tx).take() {
                   let _ = tx.send(decision);
                 }
                 Ok(())

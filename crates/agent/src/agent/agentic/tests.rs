@@ -978,6 +978,62 @@ async fn auto_remember_records_streamed_exchange() {
     assert!(items[0].content.contains(&text), "reply captured verbatim");
 }
 
+/// A stream that is never polled must not take the transcript with it.
+#[test]
+fn dropping_an_unpolled_stream_keeps_the_session_history() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    agent
+        .session_mut()
+        .push(react::llm::LlmMessage::user_text("earlier"));
+
+    let stream = agent.stream("next");
+    drop(stream);
+
+    let state = agent.session_state();
+    assert_eq!(state.message_log.len(), 1, "the earlier turn survives");
+}
+
+/// Chat UIs commonly stop at `Done` and drop the stream; the session and the
+/// exchange must still be restored rather than lost with the generator.
+#[tokio::test]
+async fn stopping_at_done_keeps_the_session_history() {
+    use futures::StreamExt;
+
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let memory = crate::memory::InMemoryMemory::new();
+    agent = agent.with_memory(Arc::new(memory));
+    agent.set_auto_remember(true);
+    agent
+        .session_mut()
+        .push(react::llm::LlmMessage::user_text("earlier"));
+
+    {
+        let mut stream = agent.stream("next");
+        while let Some(item) = stream.next().await {
+            if matches!(item, Ok(StreamToken::Done)) {
+                break;
+            }
+        }
+    }
+
+    let state = agent.session_state();
+    assert!(
+        state.message_log.len() > 1,
+        "the run's messages are restored, not discarded: {}",
+        state.message_log.len()
+    );
+    let items = agent
+        .memory()
+        .expect("memory attached")
+        .search("next", 5)
+        .await;
+    assert_eq!(
+        items.len(),
+        1,
+        "the exchange is recorded before Done is handed out: {items:?}"
+    );
+}
+
 // ============================================================================
 // Working-plan (update_plan) Tests
 

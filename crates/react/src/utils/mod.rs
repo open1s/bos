@@ -52,6 +52,38 @@ impl Span {
 /// A span produced by a streaming extractor.
 pub type StreamSpan = Span;
 
+/// The length of `bytes` that ends on a complete UTF-8 code point.
+///
+/// Transport chunks can split a multi-byte character. Decoding the whole
+/// chunk with `from_utf8_lossy` would turn the two halves into replacement
+/// characters, so callers decode this prefix now and keep the tail for the
+/// next chunk.
+pub(crate) fn complete_utf8_prefix(bytes: &[u8]) -> usize {
+    let mut start = bytes.len();
+    for _ in 0..4 {
+        if start == 0 {
+            break;
+        }
+        start -= 1;
+        let byte = bytes[start];
+        if byte & 0b1100_0000 != 0b1000_0000 {
+            let expected = match byte {
+                0x00..=0x7f => 1,
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf7 => 4,
+                // An invalid lead byte cannot be completed by later chunks.
+                _ => 1,
+            };
+            if bytes.len() - start < expected {
+                return start;
+            }
+            break;
+        }
+    }
+    bytes.len()
+}
+
 #[derive(Debug, Default)]
 /// A growable byte buffer with absolute offsets.
 pub struct Arena {
@@ -256,8 +288,13 @@ impl StreamExtractor for XmlExtractor {
     type Item<'a> = StreamSpan;
     fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>> {
         if self.stack.is_empty() && !self.arena.is_empty() {
-            self.arena.compact(self.arena.len());
-            self.scan = 0;
+            // Usually every byte was consumed, but a truncated tag is left
+            // unscanned at the buffer edge; keep that prefix for the rescan.
+            let discard = self.scan.min(self.arena.len());
+            if discard > 0 {
+                self.arena.compact(discard);
+            }
+            self.scan = self.scan.saturating_sub(discard);
         } else if !self.stack.is_empty() {
             let min_pos = self.stack.iter().map(|(_, p)| *p).min().unwrap_or(0);
             if min_pos > 0 {
@@ -298,11 +335,20 @@ impl StreamExtractor for XmlExtractor {
             if b == b'<' {
                 let next = buf.get(i + 1).copied();
                 if next == Some(b'/') {
-                    // Closing tag
+                    // Closing tag. Its '>' can land in the next transport
+                    // chunk; ending the span at the buffer edge would point
+                    // past the arena and panic in extract(), so defer the tag
+                    // and rescan it from '<' once more bytes arrive.
                     let name_start = i + 2;
                     let name_end = find_tag_end(buf, name_start);
+                    let terminator_from = name_end.min(buf.len());
+                    let Some(gt_offset) =
+                        buf[terminator_from..].iter().position(|&byte| byte == b'>')
+                    else {
+                        break;
+                    };
+                    let tag_end = terminator_from + gt_offset + 1;
                     if let Some(name) = get_tag_name(buf, name_start, name_end) {
-                        let tag_end = name_end + 1;
                         if let Some(idx) = self.stack.iter().position(|(n, _)| n == &name) {
                             let (_, open_pos) = self.stack[idx];
                             self.stack.remove(idx);
@@ -331,6 +377,11 @@ impl StreamExtractor for XmlExtractor {
                     if let Some(name) = get_tag_name(buf, name_start, name_end) {
                         let is_void = name_end < buf.len() && buf[name_end] == b'/';
                         if is_void {
+                            // `<name/` without its '>' yet ends past the
+                            // buffer; defer it to the next chunk instead.
+                            if name_end + 1 >= buf.len() {
+                                break;
+                            }
                             let end = name_end + 2;
                             let level = self.stack.len() + 1;
                             let parent_idx = self.stack.len();
@@ -616,6 +667,46 @@ fn json_nested_partia_with_plain_text() {
     let s1 = std::str::from_utf8(ex.extract(&spans[0])).unwrap();
 
     assert_eq!(s1, r#"{"b":1}"#);
+}
+
+#[test]
+fn utf8_prefix_holds_back_a_split_code_point() {
+    let chinese = "你好".as_bytes();
+    assert_eq!(complete_utf8_prefix(chinese), chinese.len());
+    assert_eq!(complete_utf8_prefix(&chinese[..5]), 3);
+    assert_eq!(complete_utf8_prefix(&chinese[..4]), 3);
+    assert_eq!(complete_utf8_prefix(&chinese[..3]), 3);
+    assert_eq!(complete_utf8_prefix(b"abc"), 3);
+    assert_eq!(complete_utf8_prefix(b""), 0);
+}
+
+#[test]
+fn xml_truncated_closing_tag_is_deferred_instead_of_overrunning() {
+    let mut ex = XmlExtractor::default();
+    assert!(ex.push("<root>").unwrap().is_empty());
+    let spans = ex.push("</root").unwrap();
+    assert!(
+        spans.is_empty(),
+        "a closing tag split before '>' must emit nothing"
+    );
+
+    let spans = ex.push(">").unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        ex.extract_str(&spans[0]),
+        Some("<root></root>"),
+        "the deferred frame is rescanned once the '>' arrives"
+    );
+}
+
+#[test]
+fn xml_truncated_self_closing_tag_keeps_its_prefix() {
+    let mut ex = XmlExtractor::default();
+    assert!(ex.push("text<item/").unwrap().is_empty());
+
+    let spans = ex.push(">").unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(ex.extract_str(&spans[0]), Some("<item/>"));
 }
 
 #[test]

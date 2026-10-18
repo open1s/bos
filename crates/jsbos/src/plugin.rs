@@ -392,7 +392,7 @@ impl JSPlugin {
                       serde_json::from_str(&s).ok()
                     }
                   });
-                if let Some(tx) = tx.lock().unwrap().take() {
+                if let Some(tx) = crate::lock_recover(&tx).take() {
                   let _ = tx.send(json_val);
                 }
                 Ok(())

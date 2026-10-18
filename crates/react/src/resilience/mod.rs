@@ -327,7 +327,8 @@ impl RateLimiter {
                 break;
             }
 
-            let backoff = self.config.retry_backoff * (1u32 << attempt).min(6);
+            let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX).min(6);
+            let backoff = self.config.retry_backoff * factor;
             let wait_time = self
                 .reset_at()
                 .map(|reset| reset.saturating_duration_since(Instant::now()))
@@ -520,7 +521,8 @@ impl ReActResilience {
                         max_retries + 1
                     );
                     if attempt < max_retries {
-                        let duration = base_backoff * (1 << attempt).min(6);
+                        let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX).min(6);
+                        let duration = base_backoff * factor;
                         self.notify_retry_wait(duration);
                         log::info!("[Resilience] Retrying in {:?}", duration);
                         tokio::time::sleep(duration).await;
@@ -547,7 +549,8 @@ impl ReActResilience {
                         return Err(ResilienceError::CircuitOpen);
                     }
                     Err(ResilienceError::RateLimited) => {
-                        let duration = base_backoff * (1 << attempt).min(6);
+                        let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX).min(6);
+                        let duration = base_backoff * factor;
                         self.notify_retry_wait(duration);
                         tokio::time::sleep(duration).await;
                         continue;
@@ -566,7 +569,8 @@ impl ReActResilience {
             };
 
             if is_transient && attempt < max_retries {
-                let duration = base_backoff * (1 << attempt).min(6);
+                let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX).min(6);
+                let duration = base_backoff * factor;
                 self.notify_retry_wait(duration);
                 tokio::time::sleep(duration).await;
                 continue;

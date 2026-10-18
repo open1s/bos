@@ -102,9 +102,13 @@ impl AnthropicSseDecoder {
     pub fn push(&mut self, chunk: &str) -> Vec<Value> {
         self.buf.push_str(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.find("\n\n") {
-            let frame: String = self.buf.drain(..pos + 2).collect();
-            for line in frame.lines() {
+        let mut consumed = 0;
+        // Scan each complete frame in place and drain the consumed prefix
+        // once: draining per frame re-copies the rest of the buffer for every
+        // frame, which is quadratic when a chunk arrives with many frames.
+        while let Some(relative) = self.buf[consumed..].find("\n\n") {
+            let end = consumed + relative;
+            for line in self.buf[consumed..end].lines() {
                 let Some(rest) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -116,6 +120,10 @@ impl AnthropicSseDecoder {
                     out.push(value);
                 }
             }
+            consumed = end + 2;
+        }
+        if consumed > 0 {
+            self.buf.drain(..consumed);
         }
         out
     }
@@ -211,7 +219,7 @@ impl AnthropicVendor {
     /// The Messages endpoint URL.
     ///
     /// An endpoint that already ends in /v1 is respected, so both
-    /// https://api.anthropic.com and https://api.anthropic.com/v1 work.
+    /// <https://api.anthropic.com> and <https://api.anthropic.com/v1> work.
     pub fn messages_url(&self) -> String {
         let base = self.endpoint.trim_end_matches('/');
         if base.ends_with("/v1") {
@@ -415,7 +423,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             "usage": {
                 "prompt_tokens": usage_in,
                 "completion_tokens": usage_out,
-                "total_tokens": usage_in + usage_out,
+                "total_tokens": usage_in.saturating_add(usage_out),
             },
         });
         let parsed: ChatCompletionResponse =
@@ -445,10 +453,12 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
 
         let body = self.build_request(&persona, &request, session, context);
         let url = self.messages_url();
-        info!(
-            "anthropic request: {}",
-            serde_json::to_string(&body).unwrap_or_default()
-        );
+        if log::log_enabled!(log::Level::Info) {
+            info!(
+                "anthropic request: {}",
+                serde_json::to_string(&body).unwrap_or_default()
+            );
+        }
 
         let response = self
             .client
@@ -483,6 +493,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             let mut blocks = AnthropicBlockAccumulator::default();
             let mut input_tokens = 0u32;
             let mut output_tokens = 0u32;
+            // A transport chunk may split a multi-byte character; keep the
+            // incomplete tail and decode it with the next chunk.
+            let mut utf8_tail: Vec<u8> = Vec::new();
 
             while let Some(chunk) = bytes.next().await {
                 let chunk = match chunk {
@@ -495,7 +508,11 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                     }
                 };
 
-                for frame in decoder.push(&String::from_utf8_lossy(&chunk)) {
+                utf8_tail.extend_from_slice(&chunk);
+                let valid = crate::utils::complete_utf8_prefix(&utf8_tail);
+                let text = String::from_utf8_lossy(&utf8_tail[..valid]).into_owned();
+                utf8_tail.drain(..valid);
+                for frame in decoder.push(&text) {
                     let kind = frame.get("type").and_then(Value::as_str).unwrap_or("");
                     match kind {
                         "message_start" => {
@@ -503,7 +520,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                 .pointer("/message/usage/input_tokens")
                                 .and_then(Value::as_u64)
                             {
-                                input_tokens = n as u32;
+                                input_tokens = u32::try_from(n).unwrap_or(u32::MAX);
                             }
                         }
                         "content_block_start" => {
@@ -577,7 +594,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                 .pointer("/usage/output_tokens")
                                 .and_then(Value::as_u64)
                             {
-                                output_tokens = n as u32;
+                                output_tokens = u32::try_from(n).unwrap_or(u32::MAX);
                             }
                         }
                         "message_stop" => {
@@ -585,7 +602,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                 .send(Ok(StreamToken::Usage(Usage {
                                     prompt_tokens: input_tokens,
                                     completion_tokens: output_tokens,
-                                    total_tokens: input_tokens + output_tokens,
+                                    total_tokens: input_tokens.saturating_add(output_tokens),
                                     prompt_tokens_details: None,
                                 })))
                                 .await;
@@ -665,7 +682,7 @@ impl AnthropicVendorBuilder {
     pub fn build(self) -> Result<AnthropicVendor, VendorBuilderError> {
         let api_key = self.api_key.ok_or(VendorBuilderError::MissingApiKey)?;
         Ok(AnthropicVendor::new(
-            Arc::new(Client::new()),
+            Arc::new(crate::llm::vendor::build_http_client()),
             self.endpoint,
             self.model,
             api_key,
@@ -720,6 +737,21 @@ mod tests {
             with_v1.messages_url(),
             "https://api.anthropic.com/v1/messages"
         );
+    }
+
+    #[test]
+    fn the_decoder_reads_coalesced_frames_and_keeps_a_partial_one() {
+        let mut decoder = AnthropicSseDecoder::default();
+        let frames = decoder.push(
+            "data: {\"type\":\"one\"}\n\ndata: {\"type\":\"two\"}\n\ndata: {\"type\":\"three\"}",
+        );
+        assert_eq!(frames.len(), 2, "only terminated frames are emitted");
+        assert_eq!(frames[0]["type"], json!("one"));
+        assert_eq!(frames[1]["type"], json!("two"));
+
+        let frames = decoder.push("\n\n");
+        assert_eq!(frames.len(), 1, "the buffered frame completes");
+        assert_eq!(frames[0]["type"], json!("three"));
     }
 
     #[test]

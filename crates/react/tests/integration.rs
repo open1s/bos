@@ -290,3 +290,86 @@ async fn test_react_stream_yields_tool_result() {
     assert!(saw_call, "tool call observed");
     assert!(saw_result, "tool result observed");
 }
+
+/// A stream client that never stops asking for a tool, so the only thing that
+/// can finish the loop is the engine's own step bound.
+struct LoopingStreamLlm {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LlmClient<LlmSession, LlmContext> for LoopingStreamLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> LlmResponseResult {
+        Ok(make_text_response("Final Answer: loop".to_string(), true))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _request: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> Result<TokenStream, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let tokens: Vec<Result<react::llm::StreamToken, LlmError>> = vec![
+            Ok(react::llm::StreamToken::Text("again\n".into())),
+            Ok(react::llm::StreamToken::ToolCall {
+                name: "calculator".into(),
+                args: serde_json::json!({ "expression": "1+1" }),
+                id: Some("call_loop".into()),
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(tokens)))
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn provider_name(&self) -> &'static str {
+        "looping-stream"
+    }
+}
+
+#[tokio::test]
+async fn react_stream_honours_max_steps() {
+    use futures::StreamExt;
+    use react::llm::StreamToken;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
+        .llm(Box::new(LoopingStreamLlm {
+            calls: Arc::clone(&calls),
+        }))
+        .with_tool(ToolVariant::Sync(Box::new(TestCalculator)))
+        .max_steps(2)
+        .build()
+        .unwrap();
+
+    let mut session = LlmSession::default();
+    let mut context = LlmContext::default();
+    let mut request = LlmRequest::new("test");
+    request.input = react::llm::Content::text("loop forever?");
+
+    let stream = engine.react_stream(None, request, &mut session, &mut context);
+    futures::pin_mut!(stream);
+
+    let mut done = false;
+    while let Some(item) = stream.next().await {
+        if let StreamToken::Done = item.expect("stream item") {
+            done = true;
+        }
+    }
+
+    assert!(done, "the bounded stream still terminates with Done");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "max_steps bounds the number of LLM calls in streaming mode"
+    );
+}

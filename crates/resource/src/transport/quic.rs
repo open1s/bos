@@ -45,6 +45,26 @@ const STREAM_THRESHOLD: usize = 64 * 1024;
 /// or hostile `len` field triggering a multi-gigabyte allocation.
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
+/// Upper bound on a buffered streaming body (a `ReadOk`/`RecvOk` sent after a
+/// `Streaming` header). Every built-in handler caps a single response below
+/// this, so a larger declared length is a malformed or hostile peer, not data.
+const MAX_STREAM_BODY: usize = 64 * 1024 * 1024;
+
+/// Validate the length a peer declared for a following streaming body before
+/// allocating it. A missing or absurd length is a protocol error.
+fn streaming_body_len(total: Option<u64>) -> Result<usize> {
+    let total = total
+        .ok_or_else(|| ResourceError::Transport("streaming response missing length".to_string()))?;
+    let len = usize::try_from(total)
+        .map_err(|_| ResourceError::Transport(format!("streaming body too large: {total}")))?;
+    if len > MAX_STREAM_BODY {
+        return Err(ResourceError::Transport(format!(
+            "streaming body too large: {len} bytes (max {MAX_STREAM_BODY})"
+        )));
+    }
+    Ok(len)
+}
+
 /// If `out` is a data-bearing output (ReadOk/RecvOk) and its body is above the
 /// streaming threshold, return `(kind, bytes)` so the caller can stream it.
 fn streaming_payload(out: &ResourceOutput) -> Option<(u8, &Vec<u8>)> {
@@ -114,12 +134,20 @@ async fn write_frame<S>(stream: &mut S, tag: u8, payload: &[u8]) -> Result<()>
 where
     S: AsyncWriteExt + Unpin,
 {
-    let mut buf = Vec::with_capacity(payload.len() + 5);
-    buf.push(tag);
-    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    buf.extend_from_slice(payload);
+    // Write the five-byte header separately so a data-plane chunk is not
+    // copied into a temporary frame buffer on every send.
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        ResourceError::Transport(format!("frame too large: {} bytes", payload.len()))
+    })?;
+    let mut header = [0u8; 5];
+    header[0] = tag;
+    header[1..].copy_from_slice(&len.to_le_bytes());
     stream
-        .write_all(&buf)
+        .write_all(&header)
+        .await
+        .map_err(|e| ResourceError::Transport(e.to_string()))?;
+    stream
+        .write_all(payload)
         .await
         .map_err(|e| ResourceError::Transport(e.to_string()))
 }
@@ -274,14 +302,10 @@ impl Transport for QuicTransport {
         debug!("QUIC invoke response: uri={} tag={}", uri, tag);
         // Large bodies arrive as raw bytes following the header frame.
         if let ResourceOutput::Streaming { kind, total } = out {
-            let len = total.ok_or_else(|| {
-                ResourceError::Transport("streaming response missing length".to_string())
-            })? as usize;
+            let len = streaming_body_len(total)?;
             debug!(
                 "QUIC streaming response: uri={} kind={} len={}",
-                uri,
-                kind,
-                total.unwrap_or(0)
+                uri, kind, len
             );
             let mut buf = vec![0u8; len];
             stream
@@ -932,6 +956,12 @@ fn parse_uri_events(payload: &[u8]) -> Result<(String, Vec<String>)> {
     }
     let n = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
+    // Each event needs at least a 4-byte length prefix. Checking the count
+    // against the remaining bytes keeps a hostile `n` from pre-allocating
+    // gigabytes before the loop reads its first element.
+    if n > (payload.len() - pos) / 4 {
+        return Err(ResourceError::Transport("bad sub event count".into()));
+    }
     let mut events = Vec::with_capacity(n);
     for _ in 0..n {
         if payload.len() < pos + 4 {
@@ -946,4 +976,65 @@ fn parse_uri_events(payload: &[u8]) -> Result<(String, Vec<String>)> {
         pos += elen;
     }
     Ok((uri, events))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn events_payload(uri: &str, count: u32, events: &[&str]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(uri.len() as u32).to_le_bytes());
+        payload.extend_from_slice(uri.as_bytes());
+        payload.extend_from_slice(&count.to_le_bytes());
+        for event in events {
+            payload.extend_from_slice(&(event.len() as u32).to_le_bytes());
+            payload.extend_from_slice(event.as_bytes());
+        }
+        payload
+    }
+
+    #[test]
+    fn parse_uri_events_roundtrips() {
+        let payload = events_payload("file:///tmp/x", 2, &["create", "modify"]);
+        let (uri, events) = parse_uri_events(&payload).expect("valid payload");
+        assert_eq!(uri, "file:///tmp/x");
+        assert_eq!(events, vec!["create".to_string(), "modify".to_string()]);
+    }
+
+    #[test]
+    fn parse_uri_events_rejects_hostile_count_before_allocating() {
+        // A four-byte frame cannot contain four billion events; the parser
+        // must reject the count instead of pre-allocating for it.
+        let payload = events_payload("mem://x", u32::MAX, &[]);
+        assert!(parse_uri_events(&payload).is_err());
+    }
+
+    #[test]
+    fn streaming_body_len_is_bounded() {
+        assert_eq!(streaming_body_len(Some(0)).expect("empty body"), 0);
+        assert_eq!(streaming_body_len(Some(1024)).expect("small body"), 1024);
+        assert!(streaming_body_len(None).is_err());
+        assert!(streaming_body_len(Some((MAX_STREAM_BODY as u64) + 1)).is_err());
+        assert!(streaming_body_len(Some(u64::MAX)).is_err());
+    }
+
+    #[tokio::test]
+    async fn frames_roundtrip_through_a_stream() {
+        let (mut sender, mut receiver) = tokio::io::duplex(1024);
+        write_frame(&mut sender, TAG_INVOKE, b"hello")
+            .await
+            .expect("write");
+        drop(sender);
+        let (tag, payload) = read_frame(&mut receiver).await.expect("read");
+        assert_eq!(tag, TAG_INVOKE);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn parse_uri_action_validates_uri_length() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&100u32.to_le_bytes());
+        payload.extend_from_slice(b"short");
+        assert!(parse_uri_action(&payload).is_err());
+    }
 }

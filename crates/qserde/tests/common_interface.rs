@@ -190,19 +190,18 @@ fn test_archived_generic() {
 // ============================================================================
 
 #[test]
-#[should_panic(expected = "buffer")]
 fn test_deserialize_invalid_data() {
     let invalid_bytes = vec![0xFF, 0xFF, 0xFF, 0xFF];
 
-    let _result: User = User::deserialize(&invalid_bytes).unwrap();
+    // Malformed input must be rejected, never reinterpreted as an archive.
+    assert!(User::deserialize(&invalid_bytes).is_err());
 }
 
 #[test]
-#[should_panic(expected = "buffer")]
 fn test_deserialize_empty_bytes() {
     let empty_bytes = vec![];
 
-    let _result: User = User::deserialize(&empty_bytes).unwrap();
+    assert!(User::deserialize(&empty_bytes).is_err());
 }
 
 // ============================================================================

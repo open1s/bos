@@ -32,8 +32,15 @@ impl Shell {
         let percent = self.state.context_percent()?;
         let size = self.state.draft().global.general.content_font_size;
         let lang = self.state.lang;
-        let breakdown = self.state.context_breakdown();
         let open = self.state.meter_open;
+        // The breakdown prices every model-visible message, so it is read only
+        // while the panel that draws it is up: pricing the whole transcript for
+        // a panel nobody opened was a per-frame walk of the conversation.
+        let breakdown = if open {
+            self.state.context_breakdown()
+        } else {
+            None
+        };
         let trigger = self.meter_trigger(size, percent, open, cx);
         Some(
             div()
@@ -251,16 +258,18 @@ impl Shell {
             .child(bar)
             .child(rows);
         let panel = hairline_all(panel).border_color(rgb(theme::border_soft()));
-        // The wrapper spans the trigger, so the fixed-width panel centres on it.
+        // The wrapper spans the trigger. The panel hangs from the trigger's LEFT
+        // edge, not centred on it: the trigger now leads the status row, so a
+        // centred 264px panel ran off the column's left edge and lost its first
+        // characters ("system prompt" was drawn "ystem prompt").
         div()
             .absolute()
             .bottom(px(theme::stat_line_at(size)
                 + theme::METER_PAD_Y * 2.0
                 + theme::METER_PANEL_GAP))
             .left(px(0.0))
-            .right(px(0.0))
             .flex()
-            .justify_center()
+            .justify_start()
             .child(panel)
     }
 

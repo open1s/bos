@@ -20,7 +20,8 @@
 #![warn(missing_docs)]
 
 use rkyv::{
-    api::high::HighDeserializer,
+    api::high::{HighDeserializer, HighValidator},
+    bytecheck::CheckBytes,
     rancor::{Error as RkyvError, Fallible, Strategy},
     ser::{allocator::ArenaHandle, sharing::Share, Serializer},
     util::AlignedVec,
@@ -114,7 +115,8 @@ where
 /// Rebuild a value from rkyv bytes.
 pub trait Deserialize: RkyvArchive + Sized
 where
-    Self::Archived: rkyv::Deserialize<Self, DeserializeStrategy>,
+    Self::Archived: rkyv::Deserialize<Self, DeserializeStrategy>
+        + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
 {
     /// Deserialize from rkyv bytes.
     #[inline]
@@ -138,7 +140,8 @@ where
 impl<T> Deserialize for T
 where
     T: RkyvArchive + Sized,
-    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
+    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>
+        + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
 {
 }
 
@@ -148,14 +151,16 @@ pub trait DeserializeExt {
     fn load<T>(&self) -> Result<T>
     where
         T: RkyvArchive,
-        T::Archived: rkyv::Deserialize<T, DeserializeStrategy>;
+        T::Archived: rkyv::Deserialize<T, DeserializeStrategy>
+            + for<'a> CheckBytes<HighValidator<'a, RkyvError>>;
 
     /// Alias of [`DeserializeExt::load`].
     #[inline]
     fn decode<T>(&self) -> Result<T>
     where
         T: RkyvArchive,
-        T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
+        T::Archived: rkyv::Deserialize<T, DeserializeStrategy>
+            + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
     {
         self.load()
     }
@@ -169,7 +174,8 @@ where
     fn load<T>(&self) -> Result<T>
     where
         T: RkyvArchive,
-        T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
+        T::Archived: rkyv::Deserialize<T, DeserializeStrategy>
+            + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
     {
         from_bytes(self.as_ref())
     }
@@ -232,7 +238,8 @@ where
 impl<T> Archived<T>
 where
     T: RkyvArchive,
-    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
+    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>
+        + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
 {
     #[inline]
     /// Rebuild the value from the stored bytes.
@@ -280,12 +287,17 @@ where
 }
 
 /// Deserialize a `T` from rkyv bytes.
+///
+/// The bytes are validated before any archived data is accessed, so malformed,
+/// truncated, or hostile input is rejected with [`Error::Deserialize`] instead
+/// of being interpreted as an archive.
 pub fn from_bytes<T>(bytes: &[u8]) -> Result<T>
 where
     T: RkyvArchive,
-    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
+    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>
+        + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
 {
-    unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(bytes) }.map_err(Error::Deserialize)
+    rkyv::from_bytes::<T, RkyvError>(bytes).map_err(Error::Deserialize)
 }
 
 #[inline]
@@ -303,7 +315,8 @@ where
 pub fn load<T>(bytes: &[u8]) -> Result<T>
 where
     T: RkyvArchive,
-    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
+    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>
+        + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
 {
     from_bytes(bytes)
 }
@@ -323,7 +336,8 @@ where
 pub fn decode<T>(bytes: &[u8]) -> Result<T>
 where
     T: RkyvArchive,
-    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>,
+    T::Archived: rkyv::Deserialize<T, DeserializeStrategy>
+        + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
 {
     from_bytes(bytes)
 }

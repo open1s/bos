@@ -19,13 +19,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::input::{
+    Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
+};
 use gpui_kit::Focusable;
 use gpui_kit::*;
 
 use super::shell::{Shell, SideDrag};
-use super::{hairline_left, icon, txt, DivExt, IconName};
+use super::{hairline_left, handle_bar, icon, txt, DivExt, IconName};
 use crate::files::{self, Kind};
+use crate::terminal::KeyOutcome;
 use crate::theme;
 
 // Save the file the panel is showing, bound to cmd-s.
@@ -58,13 +61,268 @@ fn io_msg(error: &std::io::Error) -> String {
     error.to_string()
 }
 
+/// The terminal pane's measured geometry for one frame.
+///
+/// The prepaint pass records it, the terminal clock hands its grid to the PTY,
+/// and the mouse handlers turn a pointer position into the cell under it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TerminalFrame {
+    /// The grid's top-left corner on the window, in logical pixels.
+    pub(crate) origin: Point<Pixels>,
+    /// One cell's width.
+    pub(crate) cell_w: Pixels,
+    /// One cell's height.
+    pub(crate) cell_h: Pixels,
+    /// The grid this frame measured.
+    pub(crate) cols: u16,
+    /// The rows this frame measured.
+    pub(crate) rows: u16,
+    /// The size the grid was measured at.
+    pub(crate) font_size: f32,
+}
+
+/// The bytes a keystroke sends to a real terminal.
+///
+/// Printable characters go as their UTF-8, Enter as a carriage return (which
+/// is what a terminal's line discipline expects), and the editing and arrow
+/// keys as the CSI sequences xterm defines. A cmd chord is deliberately not
+/// translated: on macOS it belongs to the application, not to the shell.
+fn terminal_key_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    if keystroke.modifiers.platform {
+        return None;
+    }
+    let control = keystroke.modifiers.control;
+    let alt = keystroke.modifiers.alt;
+    let key = keystroke.key.as_str();
+    if control && key == "space" {
+        return Some(vec![0x00]);
+    }
+    let mut bytes: Vec<u8> = match key {
+        "enter" => b"\r".to_vec(),
+        "backspace" => vec![0x7f],
+        "tab" => b"\t".to_vec(),
+        "escape" => vec![0x1b],
+        "up" => b"\x1b[A".to_vec(),
+        "down" => b"\x1b[B".to_vec(),
+        "right" => b"\x1b[C".to_vec(),
+        "left" => b"\x1b[D".to_vec(),
+        "home" => b"\x1b[H".to_vec(),
+        "end" => b"\x1b[F".to_vec(),
+        "pageup" => b"\x1b[5~".to_vec(),
+        "pagedown" => b"\x1b[6~".to_vec(),
+        "insert" => b"\x1b[2~".to_vec(),
+        "delete" => b"\x1b[3~".to_vec(),
+        _ => {
+            if control {
+                let upper = key.to_ascii_uppercase();
+                let first = upper.as_bytes().first().copied()?;
+                let byte = if upper.len() == 1 && first.is_ascii_uppercase() {
+                    first & 0x1f
+                } else {
+                    match upper.as_str() {
+                        "@" => 0x00,
+                        "2" => 0x00,
+                        "3" => 0x1b,
+                        "4" => 0x1c,
+                        "5" => 0x1d,
+                        "6" => 0x1e,
+                        "7" => 0x1f,
+                        "/" => 0x1f,
+                        _ => return None,
+                    }
+                };
+                vec![byte]
+            } else {
+                let text = keystroke.key_char.as_deref().unwrap_or(key);
+                let mut chars = text.chars();
+                let ch = chars.next()?;
+                if chars.next().is_some() {
+                    return None;
+                }
+                let mut buffer = [0u8; 4];
+                ch.encode_utf8(&mut buffer).as_bytes().to_vec()
+            }
+        }
+    };
+    if alt && key != "escape" {
+        bytes.insert(0, 0x1b);
+    }
+    Some(bytes)
+}
+
+/// Whether a keystroke asks for the terminal's selection on the clipboard.
+///
+/// Both spellings a terminal user reaches for work: Cmd-C on macOS and
+/// Ctrl-Shift-C where Control is the modifier that owns the clipboard.
+fn terminal_copy_shortcut(keystroke: &Keystroke) -> bool {
+    let key = keystroke.key.as_str();
+    (keystroke.modifiers.platform && key == "c")
+        || (keystroke.modifiers.control && keystroke.modifiers.shift && key == "c")
+}
+
+/// Paint one snapshot of the terminal grid into the pane's bounds.
+///
+/// Each row is shaped as one line with a run per style span, so the cursor's
+/// inverse cell and every coloured span cost one shape call for the row rather
+/// than one per cell. The block cursor is a plain cell in the grid - painted,
+/// not blinked - so no clock owns it.
+fn paint_terminal_grid(
+    bounds: Bounds<Pixels>,
+    frame: &TerminalFrame,
+    snapshot: &crate::terminal::Snapshot,
+    selection: Option<crate::terminal::Selection>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.paint_quad(fill(bounds, rgb(theme::page())));
+    let default_fg: Hsla = rgb(theme::text()).into();
+    let default_bg: Hsla = rgb(theme::page()).into();
+    let selected_bg: Hsla = rgb(theme::selected_row()).into();
+    // The four faces a run can be shaped in, built once per paint: a grid is
+    // mostly monochrome text, but a single styled cell used to rebuild the Font
+    // (and its family string) for every run it opened.
+    let fonts = grid_fonts();
+    for (row_index, cells) in snapshot.rows.iter().enumerate() {
+        let document_row = snapshot.first_row + row_index as u64;
+        let mut text = String::with_capacity(cells.len());
+        let mut runs: Vec<TextRun> = Vec::new();
+        let mut style: Option<(Hsla, Hsla, bool, bool, bool, bool)> = None;
+        for (col, cell) in cells.iter().take(snapshot.cols).enumerate() {
+            // The trailing half of a double-width glyph is covered by that
+            // glyph's own advance; it must never paint a second character.
+            if cell.is_continuation() {
+                continue;
+            }
+            let mut fg = terminal_color(cell.fg, default_fg);
+            let mut bg = terminal_color(cell.bg, default_bg);
+            if cell.inverse() {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            if snapshot.cursor == Some((row_index, col)) {
+                fg = default_bg;
+                bg = default_fg;
+            } else if selection.is_some_and(|selection| selection.contains(document_row, col)) {
+                bg = selected_bg;
+            }
+            if cell.dim() {
+                fg.a *= 0.6;
+            }
+            cell.push_text(&mut text);
+            let len = cell.text_len();
+            let key = (
+                fg,
+                bg,
+                cell.bold(),
+                cell.italic(),
+                cell.underline(),
+                cell.strike(),
+            );
+            if style == Some(key) {
+                if let Some(run) = runs.last_mut() {
+                    run.len += len;
+                }
+            } else {
+                let font = fonts[(cell.bold() as usize) | ((cell.italic() as usize) << 1)].clone();
+                runs.push(TextRun {
+                    len,
+                    font,
+                    color: fg,
+                    background_color: Some(bg),
+                    underline: cell.underline().then_some(UnderlineStyle {
+                        color: Some(fg),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    strikethrough: cell.strike().then_some(StrikethroughStyle {
+                        color: Some(fg),
+                        thickness: px(1.0),
+                    }),
+                });
+                style = Some(key);
+            }
+        }
+        if text.is_empty() {
+            continue;
+        }
+        let origin = point(
+            bounds.origin.x,
+            bounds.origin.y + frame.cell_h * row_index as f32,
+        );
+        let line = window
+            .text_system()
+            .shape_line(text.into(), px(frame.font_size), &runs, None);
+        let _ = line.paint_background(origin, frame.cell_h, TextAlign::Left, None, window, cx);
+        let _ = line.paint(origin, frame.cell_h, TextAlign::Left, None, window, cx);
+    }
+}
+
+/// The four monospace faces a grid run can carry, indexed by
+/// `bold | italic << 1`.
+///
+/// Measured once per paint rather than once per run: a Font owns its family
+/// string, and a line of tinted text opens a run per style change.
+fn grid_fonts() -> [Font; 4] {
+    let face = |weight: FontWeight, style: FontStyle| Font {
+        family: "monospace".into(),
+        weight,
+        style,
+        ..Default::default()
+    };
+    [
+        face(FontWeight::NORMAL, FontStyle::Normal),
+        face(FontWeight::BOLD, FontStyle::Normal),
+        face(FontWeight::NORMAL, FontStyle::Italic),
+        face(FontWeight::BOLD, FontStyle::Italic),
+    ]
+}
+
+/// Resolve a cell colour against the theme's default for that slot.
+fn terminal_color(color: crate::terminal::Color, fallback: Hsla) -> Hsla {
+    use crate::terminal::Color;
+    match color {
+        Color::Default => fallback,
+        Color::Indexed(index) => rgb(indexed_color(index)).into(),
+        Color::Rgb(red, green, blue) => {
+            let hex = ((red as u32) << 16) | ((green as u32) << 8) | blue as u32;
+            rgb(hex).into()
+        }
+    }
+}
+
+/// The xterm 256-colour palette as 0xRRGGBB.
+///
+/// The first sixteen are xterm's own ANSI values, 16..=231 are the 6x6x6 cube
+/// and 232..=255 the grey ramp. A shell's default colours come from the theme
+/// instead, so this table is only what a program asked for by number.
+fn indexed_color(index: u8) -> u32 {
+    const ANSI: [u32; 16] = [
+        0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5, 0x7f7f7f,
+        0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
+    ];
+    match index {
+        0..=15 => ANSI[index as usize],
+        16..=231 => {
+            let value = (index - 16) as u32;
+            let steps = [0u32, 95, 135, 175, 215, 255];
+            let red = steps[(value / 36) as usize];
+            let green = steps[((value % 36) / 6) as usize];
+            let blue = steps[(value % 6) as usize];
+            (red << 16) | (green << 8) | blue
+        }
+        _ => {
+            let grey = 8 + (index - 232) as u32 * 10;
+            (grey << 16) | (grey << 8) | grey
+        }
+    }
+}
+
 /// Which pane the right panel is showing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RightTab {
     /// The workspace file browser and editor.
     Files,
-    /// The managed terminal. Not built yet; the chip exists so the frame is
-    /// the one the later panes land in.
+    /// The managed terminal: a real interactive shell on a persistent PTY,
+    /// drawn from its own cell grid.
     Terminal,
     /// The builtin browser. Not built yet; see [`RightTab::Terminal`].
     Browser,
@@ -103,10 +361,17 @@ pub(crate) struct RightPanel {
     pub(crate) tab: Option<RightTab>,
     /// The width a reader dragged out, before it is committed.
     pub(crate) user_w: Option<f32>,
+    /// Whether the panel has taken the whole column, which is what its header's
+    /// maximise control does.
+    pub(crate) maximized: bool,
     /// The resize in flight, if any.
     pub(crate) drag: Option<SideDrag>,
     /// The managed terminal, spawned when the Terminal tab is first opened.
     pub(crate) terminal: Option<crate::terminal::Terminal>,
+    /// The terminal's text selection, in the grid's document coordinates.
+    pub(crate) terminal_selection: Option<crate::terminal::Selection>,
+    /// The cell a terminal press started on, while a drag is in flight.
+    pub(crate) terminal_anchor: Option<(u64, usize)>,
 }
 
 /// The workspace browser's place in the tree, and the files open beside it.
@@ -166,8 +431,10 @@ pub(crate) struct FilesPane {
     pub(crate) notes: crate::notes::Notes,
     /// Whether the notes drawer is showing over the document.
     pub(crate) notes_open: bool,
+    /// Whether the inline comment card is up over the document.
+    pub(crate) comment_open: bool,
     /// The note being typed into the drawer's field.
-    pub(crate) note_text: Entity<InputState>,
+    pub(crate) note_text: Entity<TextareaState>,
 }
 
 /// One file open in the editor area, as the tab strip carries it.
@@ -201,7 +468,7 @@ impl FilesPane {
     pub(crate) fn new(
         new_name: Entity<InputState>,
         rename_name: Entity<InputState>,
-        note_text: Entity<InputState>,
+        note_text: Entity<TextareaState>,
     ) -> Self {
         Self {
             roots: Vec::new(),
@@ -219,6 +486,7 @@ impl FilesPane {
             last_blank_press: None,
             notes: crate::notes::Notes::default(),
             notes_open: false,
+            comment_open: false,
             note_text,
         }
     }
@@ -262,13 +530,20 @@ impl Shell {
                 .w(px(width))
                 .h_full()
                 .flex_shrink_0()
+                // Moving anywhere else in the column puts the bar away; the
+                // handle's own move stops propagation, so the two never fight.
+                .on_mouse_move(cx.listener(|this, _event: &MouseMoveEvent, _window, cx| {
+                    this.hover_right_seam(false, cx);
+                }))
                 .child(hairline_left(column).border_color(rgb(theme::border_soft())))
                 .child(self.render_right_panel_handle(cx)),
         )
     }
 
     /// The reference's DragHandle for the panel: an 8px col-resize strip
-    /// straddling the seam, drawn only while the column is up.
+    /// straddling the seam, drawn only while the column is up, carrying the
+    /// same reveal bar the content column's handles do: invisible until the
+    /// pointer is on the seam (or a drag holds it), then the measured 2x72.
     fn render_right_panel_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("right-panel-handle")
@@ -279,6 +554,9 @@ impl Shell {
             .bottom(px(0.0))
             .left(px(-crate::theme::SIDEBAR_HANDLE_W / 2.0))
             .w(px(crate::theme::SIDEBAR_HANDLE_W))
+            .flex()
+            .items_center()
+            .justify_center()
             .cursor(CursorStyle::ResizeLeftRight)
             .on_mouse_down(
                 MouseButton::Left,
@@ -286,12 +564,26 @@ impl Shell {
                     this.begin_right_panel_drag(event.position.x.as_f32(), cx);
                 }),
             )
+            // The bar follows the pointer; stopping the move here is what keeps
+            // the column's own move from clearing it in the same dispatch.
+            .on_mouse_move(cx.listener(|this, _event: &MouseMoveEvent, _window, cx| {
+                this.hover_right_seam(true, cx);
+                cx.stop_propagation();
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
                     this.commit_right_panel_width(event.position.x.as_f32(), cx);
                 }),
             )
+            .child(handle_bar(
+                "right-panel-bar",
+                if self.right.drag.is_some() || self.right_hover {
+                    1.0
+                } else {
+                    0.0
+                },
+            ))
     }
 
     /// The panel's bar: the Start screen's title, or the tab strip and the
@@ -318,7 +610,15 @@ impl Shell {
                     .font_weight(FontWeight::MEDIUM),
                 )
                 .child(div().flex_1())
-                .child(self.right_panel_control("right-maximize", IconName::Maximize2, cx))
+                .child(self.right_panel_control(
+                    "right-maximize",
+                    if self.right.maximized {
+                        IconName::Minimize2
+                    } else {
+                        IconName::Maximize2
+                    },
+                    cx,
+                ))
                 .child(self.right_panel_close(cx)),
             Some(tab) => {
                 let mut row = bar.child(self.right_tab_chip(tab, cx));
@@ -352,7 +652,18 @@ impl Shell {
                         })),
                 )
                 .child(div().flex_1())
-                .child(self.right_panel_control("right-maximize", IconName::Maximize2, cx))
+                // No strip control for the review drawer: the + that follows a
+                // selection is its door now, so the strip carries only the panel's
+                // own tabs and controls.
+                .child(self.right_panel_control(
+                    "right-maximize",
+                    if self.right.maximized {
+                        IconName::Minimize2
+                    } else {
+                        IconName::Maximize2
+                    },
+                    cx,
+                ))
                 // The rightmost control is the reference's own collapse
                 // control; a second panel-toggle before it would be the same
                 // action wearing two glyphs.
@@ -446,11 +757,11 @@ impl Shell {
             .hover(|s| s.bg(rgb(theme::hover())))
             .child(icon(mark, 14.0, theme::muted()))
             .on_click(cx.listener(move |this, _event, _window, cx| {
-                // Neither control has a second meaning yet: the panel toggle
-                // folds the column and the maximiser says so, so a reader who
-                // presses one sees the column move rather than a no-op.
-                this.right.open = false;
-                this.right.tab = None;
+                // The glyph is the contract: Maximise takes the column, Minimise
+                // gives it back, and neither one closes the panel - the
+                // collapse control beside this one does that. Both used to fold
+                // the panel, so the maximise icon was lying.
+                this.right.maximized = !this.right.maximized;
                 cx.notify();
             }))
     }
@@ -525,83 +836,319 @@ impl Shell {
             )
     }
 
-    /// The managed terminal's surface: the scrollback, the input line, and the
-    /// gate that decides whether a command runs.
+    /// The managed terminal's surface: one full-bleed cell grid painted from
+    /// the shell's own screen.
     ///
-    /// The terminal is focusable and captures keystrokes the way a shell does:
-    /// printable characters go to the input line, Backspace deletes, and
-    /// Enter gates the command through regorus before it reaches the shell.
-    /// Until the PTY is wired the accepted command is echoed to the screen,
-    /// which is enough to prove the gate end to end.
-    fn terminal_pane(&self, _cx: &mut Context<Self>) -> AnyElement {
-        let Some(terminal) = self.right.terminal.as_ref() else {
+    /// The shell is an interactive process on a persistent PTY, so its prompt,
+    /// its colours, its line editor and its history are the ones on screen:
+    /// bsh draws no prompt of its own and has no separate input line. Typing is
+    /// captured by this pane and written to the PTY as raw bytes, and the
+    /// parser above turns the shell's answer into the cells painted here.
+    ///
+    /// The pane's cell metrics are measured at prepaint time into
+    /// terminal_frame, so the terminal clock can resize the PTY from what the
+    /// pane actually occupies rather than from a constant, and the pointer
+    /// handlers can turn a drag position into the cell under it.
+    fn terminal_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.right.terminal.is_none() {
             return self
                 .right_pane_placeholder(RightTab::Terminal)
                 .into_any_element();
-        };
-        let screen = terminal.screen.clone();
-        let cwd = terminal.cwd.clone();
-        // The screen is a scrollback of lines plus the input line; the pane
-        // renders both and captures keystrokes into the input.
-        div()
+        }
+        let snapshot = std::rc::Rc::clone(&self.terminal_snapshot);
+        let measured = std::rc::Rc::clone(&self.terminal_frame);
+        let font_size = theme::BODY_SIZE - 1.0;
+        let selection = self.right.terminal_selection;
+        let mut pane = div()
             .debug_selector(|| String::from("terminal-pane"))
             .id("terminal-pane")
             .flex_1()
             .min_h_0()
             .w_full()
+            .h_full()
+            .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .px(px(theme::RIGHT_PAD))
-            .py(px(8.0))
+            .bg(rgb(theme::page()))
             .cursor_text()
-            .child(
-                // The scrollback: every line the screen holds, in order.
-                div()
-                    .debug_selector(|| String::from("terminal-scroll"))
-                    .id("terminal-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .children(screen.lines.iter().map(|line| {
-                        div()
-                            .debug_selector(|| format!("terminal-line-{}", line))
-                            .w_full()
-                            .child(txt(line, theme::BODY_SIZE, theme::text()))
-                    })),
+            .track_focus(&self.terminal_focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                this.terminal_key(event, cx);
+            }))
+            // A press clears the old selection and arms a new drag; the move
+            // handler grows it while the button is held, and the release keeps
+            // whatever was selected. A click alone therefore selects nothing.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.terminal_focus, cx);
+                    this.terminal_press(event.position, cx);
+                }),
             )
-            .child(
-                // The command line: the prompt and the field the reader types
-                // into. Enter is handled by the input's own subscription.
-                div()
-                    .debug_selector(|| String::from("terminal-input"))
-                    .id("terminal-input")
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        txt(
-                            format!("{} $ ", cwd.display()),
-                            theme::BODY_SIZE,
-                            theme::faint(),
-                        )
-                        .font_weight(FontWeight::BOLD),
-                    )
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Input::new(&self.terminal_input)
-                                .appearance(false)
-                                .h(px(24.0)),
-                        ),
-                    ),
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if event.pressed_button == Some(MouseButton::Left) {
+                    this.terminal_drag(event.position, cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    this.terminal_release(cx);
+                }),
             )
-            .into_any_element()
+            // The wheel browses the retained scrollback; the pane stays at the
+            // bottom until the reader scrolls away from it.
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                this.terminal_wheel(event, cx);
+            }));
+        if let Some((text, is_error)) = self.terminal_status_text() {
+            pane = pane.child(
+                div()
+                    .debug_selector(|| String::from("terminal-status"))
+                    .id("terminal-status")
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .bg(rgb(theme::page()))
+                    .child(txt(
+                        text,
+                        theme::CHIP_SIZE,
+                        if is_error {
+                            theme::error()
+                        } else {
+                            theme::faint()
+                        },
+                    )),
+            );
+        }
+        pane.child(
+            canvas(
+                move |bounds, window, _cx| {
+                    let font = Font {
+                        family: "monospace".into(),
+                        ..Default::default()
+                    };
+                    let font_id = window.text_system().resolve_font(&font);
+                    let mut cell_w = window
+                        .text_system()
+                        .layout_width(font_id, px(font_size), 'M');
+                    if cell_w <= px(0.0) {
+                        cell_w = px(font_size * 0.6);
+                    }
+                    let cell_h = px(font_size * 1.4);
+                    let cols = ((bounds.size.width / cell_w).floor() as i32).clamp(1, 500) as u16;
+                    let rows = ((bounds.size.height / cell_h).floor() as i32).clamp(1, 300) as u16;
+                    let frame = TerminalFrame {
+                        origin: bounds.origin,
+                        cell_w,
+                        cell_h,
+                        cols,
+                        rows,
+                        font_size,
+                    };
+                    measured.set(Some(frame));
+                    frame
+                },
+                move |bounds, frame, window, cx| {
+                    paint_terminal_grid(bounds, &frame, &snapshot, selection, window, cx);
+                },
+            )
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full(),
+        )
+        .into_any_element()
+    }
+
+    /// One keystroke to the shell.
+    ///
+    /// Every key is translated to the bytes a real terminal sends: printable
+    /// characters as their UTF-8, Enter as a carriage return, the arrows and
+    /// the editing block as their CSI sequences, and control chords as C0. A
+    /// cmd chord is left alone so the shell does not swallow app shortcuts.
+    pub(crate) fn terminal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        // Copy takes the chord only while there is a selection: with none it
+        // falls through to the shell, so Cmd-C still means what it always did.
+        if terminal_copy_shortcut(&event.keystroke) && self.terminal_copy(cx) {
+            cx.stop_propagation();
+            return;
+        }
+        let Some(bytes) = terminal_key_bytes(&event.keystroke) else {
+            crate::terminal::trace_key(&event.keystroke.key, None);
+            return;
+        };
+        crate::terminal::trace_key(&event.keystroke.key, Some(&bytes));
+        let Some(terminal) = self.right.terminal.as_mut() else {
+            return;
+        };
+        match terminal.send_key(&bytes) {
+            KeyOutcome::Sent => cx.stop_propagation(),
+            KeyOutcome::Refused => {
+                // The status line names the refusal, so the pane has to redraw.
+                cx.notify();
+                cx.stop_propagation();
+            }
+            // No shell to write to: the status line already says why.
+            KeyOutcome::Closed => {}
+        }
+    }
+
+    /// The cell a window position names, in the grid's document row and column.
+    fn terminal_cell(&self, position: Point<Pixels>) -> Option<(u64, usize)> {
+        let frame = self.terminal_frame.get()?;
+        let snapshot = &self.terminal_snapshot;
+        if snapshot.rows.is_empty() || snapshot.cols == 0 {
+            return None;
+        }
+        let x = position.x - frame.origin.x;
+        let y = position.y - frame.origin.y;
+        if x < px(0.0) || y < px(0.0) {
+            return None;
+        }
+        let col = (x / frame.cell_w).floor() as usize;
+        let row = (y / frame.cell_h).floor() as usize;
+        if col >= snapshot.cols || row >= snapshot.rows.len() {
+            return None;
+        }
+        Some((snapshot.first_row + row as u64, col))
+    }
+
+    /// A press clears the old selection and arms a new drag.
+    pub(crate) fn terminal_press(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.right.terminal_selection = None;
+        self.right.terminal_anchor = self.terminal_cell(position);
+        cx.notify();
+    }
+
+    /// A move with the button held grows the selection from the press.
+    pub(crate) fn terminal_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(anchor) = self.right.terminal_anchor else {
+            return;
+        };
+        let Some(head) = self.terminal_cell(position) else {
+            return;
+        };
+        let selection = (head != anchor).then(|| crate::terminal::Selection::new(anchor, head));
+        if self.right.terminal_selection != selection {
+            self.right.terminal_selection = selection;
+            cx.notify();
+        }
+    }
+
+    /// A release keeps whatever the drag selected; a click alone leaves none.
+    pub(crate) fn terminal_release(&mut self, cx: &mut Context<Self>) {
+        self.right.terminal_anchor = None;
+        cx.notify();
+    }
+
+    /// The selected text, when a selection covers any.
+    pub(crate) fn terminal_selection_text(&self) -> Option<String> {
+        let selection = self.right.terminal_selection?;
+        let terminal = self.right.terminal.as_ref()?;
+        let text = terminal.selection_text(&selection);
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Put the selection on the clipboard; whether there was text to copy.
+    pub(crate) fn terminal_copy(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.terminal_selection_text() else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    /// The wheel over the pane: one cell per line of scroll, browsing the
+    /// retained scrollback and returning towards the bottom on the way back.
+    pub(crate) fn terminal_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let cell_h = self
+            .terminal_frame
+            .get()
+            .map(|frame| frame.cell_h)
+            .unwrap_or(px(17.0));
+        let pixels = event.delta.pixel_delta(cell_h);
+        let lines = (f32::from(pixels.y) / f32::from(cell_h)).round() as i32;
+        if lines == 0 {
+            return;
+        }
+        let moved = match self.right.terminal.as_mut() {
+            Some(terminal) => terminal.scroll_view(lines),
+            None => false,
+        };
+        if moved {
+            self.sync_terminal(cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// What the pane says when there is no shell to draw.
+    ///
+    /// A refused start reports the policy's own copy, and a shell that failed
+    /// or exited reports the runtime reason beside it. Both are errors: a
+    /// terminal that cannot take a command is not a blank terminal.
+    pub(crate) fn terminal_status_text(&self) -> Option<(String, bool)> {
+        let terminal = self.right.terminal.as_ref()?;
+        let lang = self.state.lang;
+        if terminal.refused {
+            let mut text = lang.tr("right.terminal.refused");
+            if let Some(reason) = terminal.failure.as_ref() {
+                text.push_str(": ");
+                text.push_str(reason);
+            }
+            return Some((text, true));
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(error) = terminal.policy_error() {
+            parts.push(format!(
+                "{}: {error}",
+                lang.tr("right.terminal.policyError")
+            ));
+        }
+        if let Some(refusal) = terminal.last_refusal() {
+            let mut text = format!(
+                "{}: {}",
+                lang.tr("right.terminal.inputRefused"),
+                refusal.line
+            );
+            if let Some(reason) = refusal.reason.as_ref() {
+                text.push_str(": ");
+                text.push_str(reason);
+            }
+            parts.push(text);
+        }
+        // The audit's compact face: a count, and only once something was
+        // actually refused or redacted. No other chrome is added for a policy.
+        let blocked = terminal.blocked_decisions();
+        if blocked > 0 {
+            parts.push(crate::i18n::tr_args(
+                lang,
+                "right.terminal.policyBlocked",
+                &[("count", blocked.to_string())],
+            ));
+        }
+        if !terminal.is_running() {
+            let mut text = lang.tr("right.terminal.notRunning");
+            if let Some(reason) = terminal.failure.as_ref() {
+                text.push_str(": ");
+                text.push_str(reason);
+            }
+            // A dead pane must say how to come back: Enter starts a new shell
+            // (see Terminal::restart). Without this the pane looked hung after
+            // `exit`, because nothing on screen named the way out.
+            if !terminal.refused {
+                text.push_str(" \u{b7} ");
+                text.push_str(&lang.tr("right.terminal.restartHint"));
+            }
+            parts.insert(0, text);
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some((parts.join(" \u{b7} "), true))
     }
 
     /// The Start screen: the panel's headline over its three cards.
@@ -714,8 +1261,13 @@ impl Shell {
                     .font_family("monospace")
                     .flex_none(),
             )
-            .on_click(cx.listener(move |this, _event, _window, cx| {
+            .on_click(cx.listener(move |this, _event, window, cx| {
                 this.open_right_tab(tab, cx);
+                // A terminal is a text surface: opening it puts the cursor
+                // where the reader's next keystroke will land.
+                if tab == RightTab::Terminal {
+                    window.focus(&this.terminal_focus, cx);
+                }
             }))
     }
 
@@ -747,6 +1299,15 @@ impl Shell {
                 .when(
                     self.files.active_tab().is_none() && self.files.new_file_open,
                     |pane| pane.child(self.files_new_row(cx)),
+                )
+                // A rename is its own row rather than a tenant of the create
+                // row: arming one from a tree row has to show the field whether
+                // or not the create field happens to be open. It used to be
+                // nested inside it, so the pencil set a flag nothing drew and a
+                // rename could not be typed at all.
+                .when(
+                    self.files.active_tab().is_none() && self.files.renaming.is_some(),
+                    |pane| pane.child(self.files_rename_row(cx)),
                 )
                 // The save-failure line stays on both surfaces: feedback is
                 // not chrome, and it only renders when something went wrong.
@@ -896,8 +1457,6 @@ impl Shell {
     /// both mutations share one place to type.
     fn files_new_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.state.lang;
-        let renaming = self.files.renaming.clone();
-        let shown = renaming.is_some();
         div()
             .debug_selector(|| String::from("files-manage"))
             .w_full()
@@ -952,7 +1511,6 @@ impl Shell {
                             })),
                     ),
             )
-            .when(shown, |strip| strip.child(self.files_rename_row(cx)))
     }
 
     /// The rename row, which only exists while a row is being renamed.
@@ -1129,8 +1687,19 @@ impl Shell {
         let rel_rename = rel.to_path_buf();
         let rel_delete = rel.to_path_buf();
         let rel_toggle = rel.to_path_buf();
-        let group = SharedString::from(format!("file-{name}"));
-        let row_id = SharedString::from(format!("file-row-{name}"));
+        // Element ids and the hover group key on the whole path: two branches
+        // can hold a file of the same name, and a duplicated id shares one
+        // element state between them - the hover fill and both action groups
+        // would light up together. The debug selector stays name-based, which
+        // is what the click tests address.
+        let rel_key = rel.to_string_lossy().to_string();
+        let group = SharedString::from(format!("file-{rel_key}"));
+        let row_id = SharedString::from(format!("file-row-{rel_key}"));
+        // The debug selector stays name-based: it is a test address, not
+        // element state, and the click tests name their row by file name.
+        let debug_id = SharedString::from(format!("file-row-{name}"));
+        let rename_id = SharedString::from(format!("rename-{rel_key}"));
+        let delete_id = SharedString::from(format!("delete-{rel_key}"));
         let row_group = group.clone();
         let size = row.size;
         let deleting = self.files.deleting.as_deref() == Some(rel);
@@ -1139,7 +1708,7 @@ impl Shell {
         let glyph = file_glyph(row);
         let shell = cx.entity();
         div()
-            .debug_selector(|| row_id.to_string())
+            .debug_selector(|| debug_id.to_string())
             .id(row_id)
             .group(group)
             .w_full()
@@ -1195,7 +1764,7 @@ impl Shell {
                     .gap(px(2.0))
                     .child(
                         div()
-                            .id(SharedString::from(format!("rename-{}", row.name)))
+                            .id(rename_id)
                             .debug_selector(|| format!("rename-{}", row.name))
                             .px(px(4.0))
                             .rounded(px(4.0))
@@ -1217,7 +1786,7 @@ impl Shell {
                     )
                     .child(
                         div()
-                            .id(SharedString::from(format!("delete-{}", row.name)))
+                            .id(delete_id)
                             .debug_selector(|| format!("delete-{}", row.name))
                             .px(px(4.0))
                             .rounded(px(4.0))
@@ -1333,40 +1902,306 @@ impl Shell {
             }))
     }
 
-    /// The drawer's toggle, parked at the document's top right and revealed on
-    /// hover, which keeps the surface clean without burying the feature.
-    fn notes_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("files-notes-toggle")
-            .debug_selector(|| String::from("files-notes-toggle"))
-            .group("files-notes")
-            .absolute()
-            .top(px(4.0))
-            .right(px(4.0))
-            .w(px(26.0))
-            .h(px(26.0))
-            .rounded(px(theme::RADIUS_SM))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .opacity(0.0)
-            .group_hover("files-notes", |s| s.opacity(1.0))
-            .hover(|s| s.bg(rgb(theme::hover())))
-            .child(icon(
-                IconName::MessageSquare,
-                14.0,
-                if self.files.notes_open {
-                    theme::text()
-                } else {
-                    theme::muted()
-                },
-            ))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.toggle_notes(cx);
-            }))
+    /// Raise the review card for the current selection.
+    pub(crate) fn open_comment_card(&mut self, cx: &mut Context<Self>) {
+        self.files.comment_open = true;
+        self.files.notes_open = true;
+        cx.notify();
     }
 
+    /// Every pinned comment, drawn at the line it is anchored to.
+    ///
+    /// The reference interleaves these into the code so the text below shifts
+    /// down; a kit `Editor` paints one block and offers no seam between two
+    /// lines, so bsh puts each card at its anchor's own pixels instead. Same
+    /// place, same caption, same menu - the code simply does not move.
+    fn notes_inline(&self, rel: &Path, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(editor) = self.files.active_tab().and_then(|tab| tab.editor.clone()) else {
+            return Vec::new();
+        };
+        // Every anchor is measured against the same buffer, so the buffer is
+        // read ONCE: reading it inside the loop cloned the whole file per note
+        // per frame. The read is also scoped, because `cx.listener` below needs
+        // the context mutably.
+        let tops: Vec<(usize, f32)> = {
+            let state = editor.read(cx);
+            let text = state.value();
+            self.files
+                .notes
+                .on(rel)
+                .iter()
+                .enumerate()
+                .filter_map(|(index, note)| {
+                    let line = note.line?;
+                    let start = crate::notes::line_start_offset(text.as_ref(), line);
+                    let bounds = state.range_to_bounds(&(start..start))?;
+                    Some((
+                        index,
+                        f32::from(bounds.origin.y) + f32::from(bounds.size.height) + 6.0,
+                    ))
+                })
+                .collect()
+        };
+        let mut out = Vec::with_capacity(tops.len());
+        for (index, top) in tops {
+            let note = &self.files.notes.on(rel)[index];
+            let anchor = note.anchor();
+            let body = note.text.clone();
+            let del_rel = rel.to_path_buf();
+            out.push(
+                div()
+                    .id(SharedString::from(format!("note-inline-{index}")))
+                    .debug_selector(move || format!("note-inline-{index}"))
+                    .absolute()
+                    .top(px(top))
+                    .left(px(theme::RIGHT_PAD + 24.0))
+                    .right(px(16.0))
+                    .max_w(px(520.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .bg(rgb(theme::page()))
+                    .shadow_lg()
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(txt(body, 12.0, theme::text()).line_height(px(18.0)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(txt(anchor, 11.0, theme::faint()))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("note-delete-{index}")))
+                                    .debug_selector(move || format!("note-delete-{index}"))
+                                    .w(px(20.0))
+                                    .h(px(20.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(theme::hover())))
+                                    .child(icon(IconName::X, 11.0, theme::faint()))
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.delete_note(&del_rel, index, cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
+    /// The inline review card, shaped like the reference's: a titled box over the
+    /// document holding one growing field, the anchor it will carry, and Cancel /
+    /// Comment. Writing a note is a mode the card makes obvious; the strip's
+    /// Comments control is its door.
+    /// The little + that follows a line selection, and the press that opens the
+    /// comment card: the reference puts the affordance where the reader's hand
+    /// already is, instead of asking them to find a toolbar first.
+    fn comment_plus(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let editor = self.files.active_tab()?.editor.clone()?;
+        let state = editor.read(cx);
+        let range = state.selected_range();
+        if range.start >= range.end {
+            return None;
+        }
+        let bounds = state.range_to_bounds(&range)?;
+        let top = f32::from(bounds.origin.y) + f32::from(bounds.size.height) - 9.0;
+        let left = (f32::from(bounds.origin.x) - 26.0).max(4.0);
+        Some(
+            div()
+                .debug_selector(|| String::from("files-comment-plus"))
+                .id("files-comment-plus")
+                .absolute()
+                .top(px(top))
+                .left(px(left))
+                .w(px(20.0))
+                .h(px(20.0))
+                .rounded_full()
+                .bg(rgb(theme::accent()))
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.85))
+                .child(icon(IconName::Plus, 12.0, theme::page()))
+                // KNOWN GAP: a press on this does not route while the editor holds
+                // the pointer - it takes the mouse-down for its own selection, and
+                // neither a click handler nor a mouse-down one on this sibling
+                // wins. The action below is what the button calls, and it is
+                // verified; making the button itself reachable needs an overlay
+                // layer, not another handler here.
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.open_comment_card(cx);
+                }))
+                .into_any_element(),
+        )
+    }
+    fn comment_card(&self, rel: &Path, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = self.state.lang;
+        let lines = self
+            .files
+            .active_tab()
+            .and_then(|tab| tab.editor.clone())
+            .map(|editor| {
+                let state = editor.read(cx);
+                let range = state.selected_range();
+                let text = state.value();
+                (
+                    crate::notes::line_at_offset(text.as_ref(), range.start),
+                    crate::notes::line_at_offset(text.as_ref(), range.end),
+                )
+            });
+        let anchor = match lines {
+            Some((from, end)) if end > from => lang
+                .tr("right.files.commentLines")
+                .replace("{from}", &from.to_string())
+                .replace("{to}", &end.to_string()),
+            Some((from, _)) => lang
+                .tr("right.files.commentLine")
+                .replace("{line}", &from.to_string()),
+            None => lang.tr("right.files.commentFile"),
+        };
+
+        // The card hangs directly under the lines being commented, the way the
+        // reference puts it: `range_to_bounds` gives the selection's own box
+        // inside the editor, so the card starts one gap below its bottom edge.
+        // No clamp - clamping is what put it back at the pane's top, far from the
+        // lines the reader had just picked.
+        let selection_bottom = self
+            .files
+            .active_tab()
+            .and_then(|tab| tab.editor.clone())
+            .and_then(|editor| {
+                let state = editor.read(cx);
+                state.range_to_bounds(&state.selected_range())
+            })
+            .map(|bounds| f32::from(bounds.origin.y) + f32::from(bounds.size.height) + 8.0);
+        let send_rel = rel.to_path_buf();
+        let can_send = !self.files.note_text.read(cx).value().trim().is_empty();
+        div()
+            .debug_selector(|| String::from("files-comment-card"))
+            .absolute()
+            // Over the document's text area, so it must take the pointer ahead of
+            // the editor: without this the focused input ate every press and the
+            // card's own buttons never fired.
+            .occlude()
+            // Beside the lines when the editor can say where they are, and at the
+            // top otherwise (a tab with no editor, or before the first layout).
+            .when_some(selection_bottom, |card, top| card.top(px(top)))
+            .when(selection_bottom.is_none(), |card| card.top(px(20.0)))
+            // Left and right bounds instead of a fixed width: a 460px card anchored
+            // at the panel's left edge ran past the window, which put its buttons
+            // off screen - the probe put Comment at x=1850 in a 1640 window.
+            .left(px(theme::RIGHT_PAD + 24.0))
+            .right(px(16.0))
+            .flex()
+            .items_start()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(460.0))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .bg(rgb(theme::page()))
+                    .shadow_lg()
+                    .p(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        txt(lang.tr("right.files.commentTitle"), 13.0, theme::text())
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| String::from("files-comment-field"))
+                            .h(px(76.0))
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(theme::RADIUS_SM))
+                            .border_1()
+                            .border_color(rgb(theme::border()))
+                            .child(Textarea::new(&self.files.note_text).appearance(false)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(txt(anchor, 12.0, theme::faint()))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("files-comment-cancel")
+                                    .debug_selector(|| String::from("files-comment-cancel"))
+                                    .px(px(10.0))
+                                    .h(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(theme::hover())))
+                                    .child(txt(
+                                        lang.tr("right.files.commentCancel"),
+                                        12.0,
+                                        theme::text(),
+                                    ))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.files.comment_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("files-comment-add")
+                                    .debug_selector(|| String::from("files-comment-add"))
+                                    .px(px(12.0))
+                                    .h(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .cursor_pointer()
+                                    .bg(rgb(if can_send {
+                                        theme::accent()
+                                    } else {
+                                        theme::border()
+                                    }))
+                                    .child(txt(
+                                        lang.tr("right.files.commentAction"),
+                                        12.0,
+                                        theme::page(),
+                                    ))
+                                    .on_click(cx.listener(move |this, _event, window, cx| {
+                                        // Comment SENDS the review: the note is
+                                        // pinned and the whole set goes to the model
+                                        // as a prompt, queued when a turn is already
+                                        // running - what the composer's own send
+                                        // does, so nothing is sent twice or lost.
+                                        this.pin_note(window, cx);
+                                        this.send_review_to_chat(&send_rel, window, cx);
+                                        this.send(window, cx);
+                                        this.files.comment_open = false;
+                                        this.files.notes_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+    /// The drawer's toggle: a labelled control in the panel's tab strip.
     /// The notes drawer: what the reader pinned to the open file, plus the
     /// field that pins another.
     fn files_notes(&self, rel: &Path, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1398,10 +2233,9 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .child(
-                                Input::new(&self.files.note_text)
-                                    .id("files-note-field")
+                                Textarea::new(&self.files.note_text)
                                     .appearance(false)
-                                    .h(px(28.0)),
+                                    .h(px(56.0)),
                             ),
                     )
                     .child(
@@ -1429,9 +2263,41 @@ impl Shell {
                                 .font_weight(FontWeight::MEDIUM),
                             )
                             .on_click(cx.listener(|this, _event, window, cx| {
-                                this.add_note(window, cx);
+                                this.pin_note(window, cx);
                             })),
-                    ),
+                    )
+                    // The review goes to the model: the notes a reader wrote are a
+                    // prompt they should not have to retype. Only offered when
+                    // there is something to send.
+                    .when(!notes.is_empty(), |row| {
+                        let send_rel = rel.to_path_buf();
+                        row.child(
+                            div()
+                                .id("files-note-send")
+                                .debug_selector(|| String::from("files-note-send"))
+                                .h(px(28.0))
+                                .px(px(10.0))
+                                .rounded(px(theme::RADIUS_SM))
+                                .bg(rgb(theme::accent()))
+                                .cursor_pointer()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(icon(IconName::ArrowUp, 13.0, theme::page()))
+                                .child(
+                                    txt(
+                                        lang.tr("right.files.noteSend"),
+                                        theme::CHIP_SIZE,
+                                        theme::page(),
+                                    )
+                                    .font_weight(FontWeight::MEDIUM),
+                                )
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    this.send_review_to_chat(&send_rel, window, cx);
+                                })),
+                        )
+                    }),
             )
             .children(notes.iter().enumerate().map(|(index, note)| {
                 let anchor = note.anchor();
@@ -1515,10 +2381,6 @@ impl Shell {
             .when(self.files.notes_open, |editor| {
                 editor.child(self.files_notes(&rel, cx))
             })
-            // The drawer's own toggle, revealed on hover at the document's top
-            // right, the way a row's actions reveal - the surface stays clean
-            // until the reader asks for it.
-            .child(self.notes_toggle(cx))
             .child(match (&open.editor, open.kind) {
                 (Some(editor), _) => div()
                     .debug_selector(|| String::from("files-editor-body"))
@@ -1527,27 +2389,65 @@ impl Shell {
                     .w_full()
                     .child(
                         div()
+                            .debug_selector(|| String::from("files-editor-frame"))
+                            .id("files-editor-frame")
                             .size_full()
+                            .flex_1()
+                            .min_h_0()
                             .px(px(theme::RIGHT_PAD))
                             .py(px(6.0))
                             .border_1()
                             .border_color(rgb(theme::border_soft()))
-                            .child(Editor::new(editor)),
+                            // The kit editor draws its own bordered surface and
+                            // sizes it to the content, so a SHORT file was a short
+                            // box with the rest of the pane empty. Stretching it is
+                            // what makes the pane read as a document.
+                            .child(
+                                div()
+                                    .debug_selector(|| String::from("files-editor-fill"))
+                                    // The frame around this is a plain block, so a
+                                    // flex child here had nothing to grow in and
+                                    // collapsed to the editor's own content height
+                                    // (58px for a three-line file). A full height
+                                    // is the fact, not a flex share.
+                                    .h_full()
+                                    .min_h_0()
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .child(Editor::new(editor).h_full().w_full()),
+                            ),
                     ),
-                (None, Kind::Image) => div()
-                    .debug_selector(|| String::from("files-image"))
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    .child(
-                        img(files::resolve(root, &rel).unwrap_or_default())
-                            .max_w(relative(1.0))
-                            .max_h(relative(1.0)),
-                    ),
+                (None, Kind::Image) => {
+                    let mut pane = div()
+                        .debug_selector(|| String::from("files-image"))
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .overflow_hidden();
+                    match files::resolve(root, &rel) {
+                        Some(path) => {
+                            pane = pane.child(img(path).max_w(relative(1.0)).max_h(relative(1.0)));
+                        }
+                        // The tab's path must resolve inside the root; if it no
+                        // longer does, say so rather than handing the image pane
+                        // an empty path it silently draws nothing for.
+                        None => {
+                            pane = pane.child(
+                                txt(
+                                    lang.tr("right.files.outside"),
+                                    theme::CHIP_SIZE,
+                                    theme::faint(),
+                                )
+                                .debug_selector(|| String::from("files-image-outside")),
+                            );
+                        }
+                    }
+                    pane
+                }
                 (None, _) => div()
                     .flex_1()
                     .min_h_0()
@@ -1569,6 +2469,14 @@ impl Shell {
                         .line_height(px(18.0)),
                     ),
             })
+            // The + that follows a selection, and the review card under it. Both
+            // come LAST so they paint over the document: added before the editor
+            // they were drawn UNDER it, and the editor swallowed their presses.
+            .children(self.notes_inline(&rel, cx))
+            .children(self.comment_plus(cx))
+            .when(self.files.comment_open, |editor| {
+                editor.child(self.comment_card(&rel, cx))
+            })
     }
 }
 
@@ -1580,9 +2488,31 @@ impl Shell {
         cx.notify();
     }
 
+    /// Reveal or hide the seam's bar.
+    ///
+    /// The pointer moving onto the strip turns it on, and the column's own move
+    /// turns it off again - the same pair the content column's handles use.
+    pub(crate) fn hover_right_seam(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.right_hover != on {
+            self.right_hover = on;
+            cx.notify();
+        }
+    }
+
     /// The right panel column width for this frame, resolved from the reader's
     /// dragged preference against the viewport, the same way the sidebar's is.
     pub(crate) fn right_panel_w(&self) -> f32 {
+        if self.right.maximized {
+            // Every pixel the sidebar is not using: the maximised panel is the
+            // reader saying "this is the thing I am working in", and the header
+            // still carries the control that gives the space back.
+            let taken = if self.sidebar_folded() {
+                0.0
+            } else {
+                self.sidebar_w()
+            };
+            return (self.viewport_w - taken).max(theme::RIGHT_PANEL_MIN);
+        }
         theme::right_panel_width_at(self.viewport_w, self.right.user_w)
     }
 
@@ -1599,41 +2529,51 @@ impl Shell {
         }
         if tab == RightTab::Terminal && self.right.terminal.is_none() {
             let cwd = self.state.workspace_root().unwrap_or_default();
-            self.right.terminal = Some(crate::terminal::Terminal::new(cwd));
+            self.right.terminal = Some(crate::terminal::Terminal::new(cwd, self.state.lang));
         }
+        // A shell that already printed its first output would otherwise wait for
+        // the next tick, so take the copy the spawn produced right away.
+        self.sync_terminal(cx);
         cx.notify();
     }
 
-    /// Run the terminal command the reader typed.
+    /// Re-read the workspace policy when the file on disk changed.
     ///
-    /// The command passes the regorus gate first: an allowed command is echoed
-    /// to the screen as `cwd $ command` (the PTY will produce its own output
-    /// once wired), and a refused one is refused in place, so the reader sees
-    /// exactly what the policy did with their line.
-    pub(crate) fn run_terminal_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let command = self
-            .terminal_input
-            .read(cx)
-            .value()
-            .to_string()
-            .trim()
-            .to_string();
-        if command.is_empty() {
-            return;
+    /// Rides the terminal clock, which is one stat per tick and no work at all
+    /// when the stamp is unchanged: a policy edit takes effect without a
+    /// restart, and a broken edit keeps the last good policy instead of
+    /// wedging the pane.
+    pub(crate) fn refresh_terminal_policy(&mut self, cx: &mut Context<Self>) {
+        let refreshed = match self.right.terminal.as_mut() {
+            Some(terminal) => terminal.refresh_policy(),
+            None => false,
+        };
+        if refreshed {
+            cx.notify();
         }
-        let Some(terminal) = self.right.terminal.as_mut() else {
+    }
+
+    /// Apply the pane's measured size and copy the terminal's screen.
+    ///
+    /// Both jobs ride the terminal clock rather than the paint phase: the PTY
+    /// resize and the screen copy are state changes, and the window must not be
+    /// mutated while it is painting. The pane's prepaint stores the cell grid
+    /// it measured, so this is where a panel resize reaches the shell.
+    pub(crate) fn sync_terminal(&mut self, cx: &mut Context<Self>) {
+        if let Some(frame) = self.terminal_frame.get() {
+            if let Some(terminal) = self.right.terminal.as_mut() {
+                terminal.resize(frame.cols, frame.rows);
+            }
+        }
+        let Some(terminal) = self.right.terminal.as_ref() else {
             return;
         };
-        let cwd = terminal.cwd.clone();
-        let allowed = terminal.allows(&command);
-        let screen = &mut terminal.screen;
-        screen.push_line(format!("{} $ {}", cwd.display(), command));
-        if !allowed {
-            screen.push_line(String::from("refused by policy"));
+        let version = terminal.version();
+        if version == self.terminal_version {
+            return;
         }
-        self.terminal_input.update(cx, |state, cx| {
-            state.set_value(String::new(), window, cx);
-        });
+        self.terminal_version = version;
+        self.terminal_snapshot = std::rc::Rc::new(terminal.snapshot());
         cx.notify();
     }
 
@@ -1648,7 +2588,7 @@ impl Shell {
     }
 
     /// Track the strip's move, clamped to the panel's own contract range.
-    pub(crate) fn drag_right_panel_width(&mut self, pointer_x: f32, _cx: &mut Context<Self>) {
+    pub(crate) fn drag_right_panel_width(&mut self, pointer_x: f32, cx: &mut Context<Self>) {
         let Some(drag) = self.right.drag.as_mut() else {
             return;
         };
@@ -1657,21 +2597,61 @@ impl Shell {
             drag.moved = true;
         }
         // The strip sits on the panel's left edge, so dragging left widens it.
-        let width = drag.base - delta;
-        self.right.user_w = Some(
-            width
-                .round()
-                .clamp(theme::RIGHT_PANEL_MIN, theme::RIGHT_PANEL_MAX),
-        );
+        if !drag.moved {
+            return;
+        }
+        // Resizing by hand is the reader asking for a width, so it also gives up
+        // the maximised column rather than fighting it.
+        self.right.maximized = false;
+        let width = (drag.base - delta)
+            .round()
+            .clamp(theme::RIGHT_PANEL_MIN, theme::RIGHT_PANEL_MAX);
+        let width = Some(width);
+        // The width is read into the column's layout this frame, so a move must
+        // repaint: the sidebar's own drag notifies for exactly this reason, and
+        // without it the panel only followed the pointer when something else
+        // happened to schedule a frame.
+        if self.right.user_w != width {
+            self.right.user_w = width;
+            cx.notify();
+        }
     }
 
     /// Release the strip: the width stands, unless it was a click.
     pub(crate) fn commit_right_panel_width(&mut self, _pointer_x: f32, cx: &mut Context<Self>) {
-        if let Some(drag) = self.right.drag.take() {
-            if !drag.moved {
-                self.right.user_w = None;
-            }
+        // A press that never moved is a click on the seam, not a resize: it must
+        // leave the width the reader dragged out alone. It used to clear the
+        // preference, so touching the handle threw the width away - the
+        // sidebar's own seam has always kept it.
+        self.right.drag = None;
+        cx.notify();
+    }
+
+    /// Drop the file pane's view of the workspace it was showing.
+    ///
+    /// Every path in the pane is relative, so a switch changes what each one
+    /// MEANS: an open tab is a buffer whose rel would now resolve into another
+    /// workspace's file, and saving it would write there. So the tabs go, the
+    /// cached tree goes with them, and the pane re-lists whatever workspace is
+    /// active now.
+    pub(crate) fn refile_workspace(&mut self, cx: &mut Context<Self>) {
+        self.files.tabs.clear();
+        self.files.active = None;
+        self.files.expanded.clear();
+        self.files.children.clear();
+        self.files.roots.clear();
+        self.files.error = None;
+        self.files.renaming = None;
+        self.files.deleting = None;
+        self.files.new_file_open = false;
+        self.files.notes_open = false;
+        self.files.last_blank_press = None;
+        if self.right.tab == Some(RightTab::Files) {
+            // This also reloads the notes, which travel with the workspace.
+            self.refresh_files(cx);
+            return;
         }
+        self.files.notes = crate::notes::Notes::default();
         cx.notify();
     }
 
@@ -1774,6 +2754,45 @@ impl Shell {
     /// format decides the body: a text file lands in a highlighted editor, an
     /// image lands in an image pane, and anything else says it cannot be shown
     /// rather than dropping bytes into a buffer.
+    /// Send a file's review notes to the composer as a prompt.
+    ///
+    /// A note is already anchored to a line, so the prompt says which line and
+    /// what the reader wants changed; the reader edits it before sending rather
+    /// than the app sending on its own.
+    pub(crate) fn send_review_to_chat(
+        &mut self,
+        rel: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let notes = self.files.notes.on(rel);
+        if notes.is_empty() {
+            return;
+        }
+        let mut prompt = format!("Review of {}:\n", rel.display());
+        for note in notes {
+            // `line` is already one-based (it comes from the editor's own
+            // numbering), so it is printed as-is; a range prints as a range.
+            match (note.line, note.to) {
+                (Some(from), Some(to)) if to > from => {
+                    prompt.push_str(&format!("- lines {from}-{to}: {}\n", note.text));
+                }
+                (Some(line), _) => {
+                    prompt.push_str(&format!("- line {line}: {}\n", note.text));
+                }
+                (None, _) => {
+                    prompt.push_str(&format!("- {}\n", note.text));
+                }
+            }
+        }
+        prompt.push('\n');
+        self.composer
+            .update(cx, |state, cx| state.set_value(prompt.clone(), window, cx));
+        self.composer_value = prompt;
+        self.files.notes_open = false;
+        self.files.comment_open = false;
+        cx.notify();
+    }
     pub(crate) fn open_file(&mut self, rel: &Path, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.files.tab_index(rel) {
             self.files.active = Some(index);
@@ -1787,7 +2806,7 @@ impl Shell {
             return;
         };
         let Some(path) = files::resolve(&root, rel) else {
-            self.files.error = Some(String::from("That path leaves the workspace."));
+            self.files.error = Some(self.state.lang.tr("right.files.outside"));
             cx.notify();
             return;
         };
@@ -1932,18 +2951,12 @@ impl Shell {
         cx.notify();
     }
 
-    /// Show or hide the notes drawer over the document.
-    pub(crate) fn toggle_notes(&mut self, cx: &mut Context<Self>) {
-        self.files.notes_open = !self.files.notes_open;
-        cx.notify();
-    }
-
     /// Pin a note to the document the panel is showing.
     ///
     /// The note anchors to the editor's own cursor line, so a reader can place
     /// a remark exactly where they are looking; a tab with no editor (an
     /// image, or a file that will not open) takes a whole-file note instead.
-    pub(crate) fn add_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn pin_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self
             .files
             .note_text
@@ -1958,21 +2971,27 @@ impl Shell {
         let Some(rel) = self.files.active_tab().map(|tab| tab.rel.clone()) else {
             return;
         };
-        let line = self
+        // The SELECTION is the anchor: a note about three lines says three lines,
+        // the way the reference's card reports them.
+        let (line, to) = self
             .files
             .active_tab()
             .and_then(|tab| tab.editor.clone())
             .map(|editor| {
                 let state = editor.read(cx);
-                let offset = state.cursor();
-                crate::notes::line_at_offset(state.value().as_ref(), offset)
-            });
+                let range = state.selected_range();
+                let text = state.value();
+                let from = crate::notes::line_at_offset(text.as_ref(), range.start);
+                let end = crate::notes::line_at_offset(text.as_ref(), range.end);
+                (Some(from), (end > from).then_some(end))
+            })
+            .unwrap_or((None, None));
         let Some(root) = self.state.workspace_root() else {
             return;
         };
         self.files
             .notes
-            .add(&rel, crate::notes::Note { line, text });
+            .add(&rel, crate::notes::Note { line, to, text });
         if let Err(error) = self.files.notes.save(&root) {
             self.files.error = Some(io_msg(&error));
         }
@@ -2066,6 +3085,12 @@ impl Shell {
         match files::delete(&root, rel) {
             Ok(()) => {
                 self.files.deleting = None;
+                // The remarks described a file that is gone, so they go with it
+                // rather than resurfacing if a second file takes the name.
+                self.files.notes.forget(rel);
+                if let Err(error) = self.files.notes.save(&root) {
+                    self.files.error = Some(io_msg(&error));
+                }
                 // Walk backwards so an index the removal shifts never skips a
                 // tab over the same file.
                 let mut index = self.files.tabs.len();
@@ -2094,7 +3119,11 @@ impl Shell {
             .unwrap_or_default();
         self.files.rename_name.update(cx, |state, cx| {
             state.set_value(name, window, cx);
+            // The reader pressed the pencil, so they mean to type: focus the
+            // field and select nothing, the way the create field opens.
+            state.focus_handle(cx).focus(window, cx);
         });
+        self.files.deleting = None;
         cx.notify();
     }
 
@@ -2133,6 +3162,11 @@ impl Shell {
                 // not lose their buffer to a rename they made in the tree.
                 if let Some(tab) = self.files.tabs.iter_mut().find(|tab| tab.rel == from_rel) {
                     tab.rel = to_rel.clone();
+                }
+                // Notes are keyed by the path, so they move with the file.
+                self.files.notes.rename(&from_rel, &to_rel);
+                if let Err(error) = self.files.notes.save(&root) {
+                    self.files.error = Some(io_msg(&error));
                 }
                 self.refresh_branch(from_rel.parent().unwrap_or(Path::new("")), cx);
                 if to_rel.parent() != from_rel.parent() {
@@ -2203,4 +3237,81 @@ fn size_label(size: u64, dir: bool) -> String {
         return format!("{size} {}", UNITS[unit]);
     }
     format!("{value:.1} {}", UNITS[unit])
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{FontStyle, FontWeight, Keystroke, Modifiers};
+
+    use super::{grid_fonts, terminal_key_bytes};
+
+    fn key(key: &str, key_char: Option<&str>) -> Keystroke {
+        Keystroke {
+            key: key.to_string(),
+            key_char: key_char.map(str::to_string),
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn enter_sends_a_carriage_return() {
+        assert_eq!(terminal_key_bytes(&key("enter", None)), Some(vec![b'\r']));
+    }
+
+    #[test]
+    fn printable_keys_send_their_utf8() {
+        assert_eq!(
+            terminal_key_bytes(&key("a", Some("a"))),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            terminal_key_bytes(&key("s", Some("ß"))),
+            Some("ß".as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn arrows_send_their_csi_sequences() {
+        assert_eq!(
+            terminal_key_bytes(&key("up", None)),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            terminal_key_bytes(&key("left", None)),
+            Some(b"\x1b[D".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_control_chord_sends_its_c0_byte() {
+        let mut chord = key("c", Some("c"));
+        chord.modifiers.control = true;
+        assert_eq!(terminal_key_bytes(&chord), Some(vec![0x03]));
+    }
+
+    /// The painter picks a run's face with `bold | italic << 1`, so the table's
+    /// order is part of the contract: a wrong index draws bold text upright or
+    /// italic text roman, which no other assertion would catch.
+    #[test]
+    fn grid_fonts_index_by_bold_and_italic() {
+        let fonts = grid_fonts();
+        assert_eq!(fonts[0].weight, FontWeight::NORMAL);
+        assert_eq!(fonts[0].style, FontStyle::Normal);
+        assert_eq!(fonts[1].weight, FontWeight::BOLD);
+        assert_eq!(fonts[1].style, FontStyle::Normal);
+        assert_eq!(fonts[2].weight, FontWeight::NORMAL);
+        assert_eq!(fonts[2].style, FontStyle::Italic);
+        assert_eq!(fonts[3].weight, FontWeight::BOLD);
+        assert_eq!(fonts[3].style, FontStyle::Italic);
+        for font in fonts {
+            assert_eq!(&*font.family, "monospace");
+        }
+    }
+
+    #[test]
+    fn cmd_chords_are_left_to_the_application() {
+        let mut chord = key("p", Some("p"));
+        chord.modifiers.platform = true;
+        assert_eq!(terminal_key_bytes(&chord), None);
+    }
 }

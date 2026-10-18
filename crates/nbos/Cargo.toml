@@ -24,6 +24,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 pyo3 = { version = "0.29", features = ["extension-module", "serde"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
-async-trait = "0.1"
+async-trait = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }

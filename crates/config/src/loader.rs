@@ -128,7 +128,9 @@ impl ConfigLoader {
         for dir in &dirs {
             let expanded = shellexpand::tilde(dir);
             let path = Path::new(expanded.as_ref());
-            if path.exists() && path.is_dir() {
+            // is_dir() is false for a missing path, so no separate exists()
+            // probe (and no extra syscall) is needed.
+            if path.is_dir() {
                 debug!("discovered config directory: {}", expanded);
                 self.sources
                     .push(ConfigSource::Directory(expanded.into_owned()));
@@ -248,6 +250,7 @@ impl ConfigLoader {
         &mut self,
         metadata: &mut ConfigMetadata,
     ) -> ConfigResult<serde_json::Value> {
+        let mut last_error = None;
         for source in &self.sources {
             match self.load_source_sync(source, metadata) {
                 Ok(v) => {
@@ -257,13 +260,11 @@ impl ConfigLoader {
                 }
                 Err(e) => {
                     debug!("failed to load config source: {:#}, trying next", e);
-                    continue;
+                    last_error = Some(e);
                 }
             }
         }
-        Err(ConfigError::LoadError(anyhow::anyhow!(
-            "all config sources failed to load"
-        )))
+        Err(Self::all_sources_failed(last_error))
     }
 
     fn load_override_sync(
@@ -272,6 +273,7 @@ impl ConfigLoader {
     ) -> ConfigResult<serde_json::Value> {
         let mut final_value = serde_json::Value::Object(serde_json::Map::new());
         let mut has_value = false;
+        let mut last_error = None;
 
         for source in &self.sources {
             match self.load_source_sync(source, metadata) {
@@ -281,15 +283,13 @@ impl ConfigLoader {
                 }
                 Err(e) => {
                     debug!("failed to load config source: {:#}, trying next", e);
-                    continue;
+                    last_error = Some(e);
                 }
             }
         }
 
         if !has_value {
-            return Err(ConfigError::LoadError(anyhow::anyhow!(
-                "all config sources failed to load"
-            )));
+            return Err(Self::all_sources_failed(last_error));
         }
 
         self.cached_config = Some(final_value.clone());
@@ -303,6 +303,7 @@ impl ConfigLoader {
     ) -> ConfigResult<serde_json::Value> {
         let mut final_value = serde_json::Value::Object(serde_json::Map::new());
         let mut has_value = false;
+        let mut last_error = None;
 
         for source in &self.sources {
             match self.load_source_sync(source, metadata) {
@@ -312,15 +313,13 @@ impl ConfigLoader {
                 }
                 Err(e) => {
                     debug!("failed to load config source: {:#}, skipping", e);
-                    continue;
+                    last_error = Some(e);
                 }
             }
         }
 
         if !has_value {
-            return Err(ConfigError::LoadError(anyhow::anyhow!(
-                "all config sources failed to load"
-            )));
+            return Err(Self::all_sources_failed(last_error));
         }
 
         self.cached_config = Some(final_value.clone());
@@ -334,6 +333,7 @@ impl ConfigLoader {
     ) -> ConfigResult<serde_json::Value> {
         let mut final_value = serde_json::Value::Object(serde_json::Map::new());
         let mut has_value = false;
+        let mut last_error = None;
 
         for source in &self.sources {
             match self.load_source_sync(source, metadata) {
@@ -343,15 +343,13 @@ impl ConfigLoader {
                 }
                 Err(e) => {
                     debug!("failed to load config source: {:#}, skipping", e);
-                    continue;
+                    last_error = Some(e);
                 }
             }
         }
 
         if !has_value {
-            return Err(ConfigError::LoadError(anyhow::anyhow!(
-                "all config sources failed to load"
-            )));
+            return Err(Self::all_sources_failed(last_error));
         }
 
         self.cached_config = Some(final_value.clone());
@@ -394,15 +392,14 @@ impl ConfigLoader {
 
         let path_obj = Path::new(path);
 
-        if !path_obj.exists() {
-            return Err(ConfigError::NotFound(path.to_string()));
-        }
-
         let format = ConfigFormat::from_path(path)
             .ok_or_else(|| ConfigError::UnsupportedFormat(path.to_string()))?;
 
         let content = match fs::read_to_string(path_obj) {
             Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ConfigError::NotFound(path.to_string()));
+            }
             Err(e) => {
                 eprintln!("Failed to read config file '{}': {}", path, e);
                 return Err(ConfigError::LoadError(anyhow::anyhow!(
@@ -451,7 +448,7 @@ impl ConfigLoader {
             })
             .collect();
 
-        files.sort_by_key(|e| e.path());
+        files.sort_by_cached_key(|e| e.path());
 
         for entry in files {
             let path = entry.path();
@@ -477,6 +474,17 @@ impl ConfigLoader {
         Ok((dir.to_string(), merged))
     }
 
+    /// Build the error returned when every source failed, keeping the last
+    /// concrete cause visible instead of only writing it to the debug log.
+    fn all_sources_failed(last_error: Option<ConfigError>) -> ConfigError {
+        match last_error {
+            Some(e) => {
+                ConfigError::LoadError(anyhow::anyhow!("all config sources failed to load: {}", e))
+            }
+            None => ConfigError::LoadError(anyhow::anyhow!("all config sources failed to load")),
+        }
+    }
+
     fn parse_content(content: &str, format: ConfigFormat) -> ConfigResult<serde_json::Value> {
         let value = match format {
             ConfigFormat::Toml => toml::from_str(content).map_err(ConfigError::TomlParse)?,
@@ -490,8 +498,7 @@ impl ConfigLoader {
         match (base, merge) {
             (serde_json::Value::Object(mut base_map), serde_json::Value::Object(merge_map)) => {
                 for (key, value) in merge_map {
-                    if base_map.contains_key(&key) {
-                        let base_value = base_map.remove(&key).unwrap();
+                    if let Some(base_value) = base_map.remove(&key) {
                         base_map.insert(key, Self::deep_merge_json(base_value, value));
                     } else {
                         base_map.insert(key, value);
@@ -514,8 +521,7 @@ impl ConfigLoader {
             }
             (serde_json::Value::Object(mut base_map), serde_json::Value::Object(merge_map)) => {
                 for (key, value) in merge_map {
-                    if base_map.contains_key(&key) {
-                        let base_value = base_map.remove(&key).unwrap();
+                    if let Some(base_value) = base_map.remove(&key) {
                         base_map.insert(key, Self::accumulate_merge_json(base_value, value));
                     } else {
                         base_map.insert(key, value);
@@ -531,8 +537,7 @@ impl ConfigLoader {
         match (base, merge) {
             (serde_json::Value::Object(mut base_map), serde_json::Value::Object(merge_map)) => {
                 for (key, value) in merge_map {
-                    if base_map.contains_key(&key) {
-                        let base_value = base_map.remove(&key).unwrap();
+                    if let Some(base_value) = base_map.remove(&key) {
                         base_map.insert(key, Self::override_merge_json(base_value, value));
                     } else {
                         base_map.insert(key, value);
@@ -640,5 +645,65 @@ y = 1"#,
         assert!(!loader.sources().is_empty());
         let config = loader.load().await.unwrap();
         assert!(!config.as_object().unwrap().is_empty());
+    }
+}
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use crate::ConfigMergeStrategy;
+    use serde_json::json;
+
+    #[test]
+    fn test_override_merges_nested_objects() {
+        let mut loader = ConfigLoader::new()
+            .with_strategy(ConfigMergeStrategy::Override)
+            .add_inline(json!({"llm": {"model": "a", "temperature": 1}, "keep": true}))
+            .add_inline(json!({"llm": {"temperature": 2}}));
+
+        let value = loader.load_sync().expect("merge should succeed");
+        assert_eq!(value["llm"]["model"], "a");
+        assert_eq!(value["llm"]["temperature"], 2);
+        assert_eq!(value["keep"], true);
+    }
+
+    #[test]
+    fn test_deep_merge_merges_nested_objects() {
+        let mut loader = ConfigLoader::new()
+            .with_strategy(ConfigMergeStrategy::DeepMerge)
+            .add_inline(json!({"llm": {"model": "a", "temperature": 1}}))
+            .add_inline(json!({"llm": {"temperature": 2}}));
+
+        let value = loader.load_sync().expect("merge should succeed");
+        assert_eq!(value["llm"]["model"], "a");
+        assert_eq!(value["llm"]["temperature"], 2);
+    }
+
+    #[test]
+    fn test_accumulate_concatenates_arrays() {
+        let mut loader = ConfigLoader::new()
+            .with_strategy(ConfigMergeStrategy::Accumulate)
+            .add_inline(json!({"list": [1, 2]}))
+            .add_inline(json!({"list": [3]}));
+
+        let value = loader.load_sync().expect("merge should succeed");
+        assert_eq!(value["list"], json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_missing_file_error_keeps_its_cause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.toml");
+        let mut loader = ConfigLoader::new().add_file(&path);
+
+        let err = loader.load_sync().expect_err("a missing file must fail");
+        let message = err.to_string();
+        assert!(
+            matches!(err, ConfigError::LoadError(_)),
+            "missing-file failures keep the LoadError variant: {err:?}"
+        );
+        assert!(
+            message.contains("missing.toml"),
+            "the error should name the failing source, got: {message}"
+        );
     }
 }

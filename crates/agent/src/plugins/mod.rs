@@ -136,13 +136,28 @@ impl PluginRegistry {
     }
 
     /// Install `plugin`, returning the first name conflict it raised.
+    ///
+    /// An install is all-or-nothing: a plugin that registers some items and
+    /// then hits a conflict has those earlier registrations rolled back, so a
+    /// failed install never leaves half a plugin in the namespace.
     pub fn install(&mut self, plugin: &dyn Plugin) -> Result<(), PluginError> {
         self.errors.clear();
+        let snapshot = (
+            self.tools.clone(),
+            self.panels.clone(),
+            self.commands.clone(),
+            self.owners.clone(),
+        );
         plugin.register(self);
         if let Some(error) = self.errors.first().cloned() {
+            self.tools = snapshot.0;
+            self.panels = snapshot.1;
+            self.commands = snapshot.2;
+            self.owners = snapshot.3;
             self.errors.clear();
             Err(error)
         } else {
+            self.errors.clear();
             Ok(())
         }
     }
@@ -422,6 +437,40 @@ mod tests {
             registry.owner_of("shared_tool"),
             Some((ItemKind::Tool, "alpha"))
         );
+    }
+
+    struct PartialPlugin;
+
+    impl Plugin for PartialPlugin {
+        fn name(&self) -> &str {
+            "partial"
+        }
+
+        fn register(&self, registry: &mut PluginRegistry) {
+            // The tool lands before the panel collides on the shared name.
+            let _ = registry.register_tool(self.name(), Arc::new(EchoTool::new("partial_tool")));
+            let _ = registry.register_panel(self.name(), UiPanel::new(SHARED_TOOL, "Cross"));
+        }
+    }
+
+    #[test]
+    fn a_failed_install_rolls_back_earlier_items() {
+        let mut registry = PluginRegistry::new();
+        registry
+            .install(&NamedPlugin {
+                name: "alpha".into(),
+            })
+            .expect("alpha installs first");
+
+        let error = registry
+            .install(&PartialPlugin)
+            .expect_err("panel collides");
+        assert!(error.to_string().contains(SHARED_TOOL), "{error}");
+
+        // The tool registered before the collision is not left behind.
+        assert_eq!(registry.len(), 1);
+        assert!(registry.tool("partial_tool").is_none());
+        assert_eq!(registry.owner_of("partial_tool"), None);
     }
 
     #[test]

@@ -247,6 +247,54 @@ impl Default for AgentConfig {
   }
 }
 
+impl AgentConfig {
+  /// Reject negative counts that would wrap when cast to unsigned fields.
+  ///
+  /// `-1` as `u64` becomes a duration of centuries and `-1` as `u32` a
+  /// 4-billion token cap, so a typo would silently disable the limit.
+  fn validate(&self) -> Result<()> {
+    let negative = [
+      ("timeoutSecs", self.timeout_secs < 0),
+      ("maxTokens", self.max_tokens.is_some_and(|v| v < 0)),
+      ("maxSteps", self.max_steps.is_some_and(|v| v < 0)),
+      (
+        "circuitBreakerMaxFailures",
+        self.circuit_breaker_max_failures.is_some_and(|v| v < 0),
+      ),
+      (
+        "circuitBreakerCooldownSecs",
+        self.circuit_breaker_cooldown_secs.is_some_and(|v| v < 0),
+      ),
+      (
+        "rateLimitCapacity",
+        self.rate_limit_capacity.is_some_and(|v| v < 0),
+      ),
+      (
+        "rateLimitWindowSecs",
+        self.rate_limit_window_secs.is_some_and(|v| v < 0),
+      ),
+      (
+        "rateLimitMaxRetries",
+        self.rate_limit_max_retries.is_some_and(|v| v < 0),
+      ),
+      (
+        "rateLimitRetryBackoffSecs",
+        self.rate_limit_retry_backoff_secs.is_some_and(|v| v < 0),
+      ),
+    ];
+
+    for (name, is_negative) in negative {
+      if is_negative {
+        return Err(Error::new(
+          napi::Status::InvalidArg,
+          format!("{name} must be non-negative"),
+        ));
+      }
+    }
+    Ok(())
+  }
+}
+
 impl From<AgentConfig> for agent::AgentConfig {
   fn from(value: AgentConfig) -> Self {
     // 0 means "disable circuit breaker" - treat as None to disable entirely
@@ -310,6 +358,22 @@ pub struct Agent {
   bus_session: Option<Arc<crate::Session>>,
   stop_flag: std::sync::Arc<AtomicBool>,
   is_running: std::sync::Arc<AtomicBool>,
+  /// Set when `stop({ clearSession: true })` could not take the write lock
+  /// because a run owns the agent; the run clears the session when it ends.
+  pending_session_clear: std::sync::Arc<AtomicBool>,
+}
+
+/// Error returned by the synchronous setters when a run owns the agent.
+///
+/// These methods are called from the JavaScript thread and cannot await, so
+/// parking on the lock would freeze the event loop for the whole run (and can
+/// deadlock a tool call that needs the event loop). Refusing is the honest
+/// outcome.
+fn busy_error(action: &str) -> Error {
+  Error::new(
+    napi::Status::GenericFailure,
+    format!("Cannot {action}: the agent is running"),
+  )
 }
 
 #[napi]
@@ -317,6 +381,7 @@ impl Agent {
   #[napi(factory)]
   /// Create an agent from `config`.
   pub async fn create(config: AgentConfig) -> Result<Self> {
+    config.validate()?;
     let mut cfg: agent::AgentConfig = config.into();
     agent::agent::config::apply_model_defaults(&mut cfg);
 
@@ -333,6 +398,7 @@ impl Agent {
 
       stop_flag: std::sync::Arc::new(AtomicBool::new(false)),
       is_running: std::sync::Arc::new(AtomicBool::new(false)),
+      pending_session_clear: std::sync::Arc::new(AtomicBool::new(false)),
     })
   }
 
@@ -342,6 +408,7 @@ impl Agent {
     config: AgentConfig,
     _bus: &External<Arc<crate::Session>>,
   ) -> Result<Self> {
+    config.validate()?;
     let mut cfg: agent::AgentConfig = config.into();
     agent::agent::config::apply_model_defaults(&mut cfg);
 
@@ -360,6 +427,7 @@ impl Agent {
 
       stop_flag: std::sync::Arc::new(AtomicBool::new(false)),
       is_running: std::sync::Arc::new(AtomicBool::new(false)),
+      pending_session_clear: std::sync::Arc::new(AtomicBool::new(false)),
     })
   }
 
@@ -387,6 +455,7 @@ impl Agent {
       guard.run_simple(task_content).await
     };
     self.is_running.store(false, Ordering::SeqCst);
+    self.apply_pending_session_clear().await;
 
     result.map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
@@ -415,6 +484,7 @@ impl Agent {
       guard.react(task_content).await
     };
     self.is_running.store(false, Ordering::SeqCst);
+    self.apply_pending_session_clear().await;
 
     result.map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
   }
@@ -527,7 +597,13 @@ impl Agent {
     let plugin_arc: std::sync::Arc<dyn agent::agent::plugin::AgentPlugin> =
       std::sync::Arc::new(js_plugin);
 
-    let mut guard = self.inner.blocking_write();
+    // A run owns the agent for its whole lifetime; waiting for the write lock
+    // here would park the JavaScript thread (and deadlock a tool call that
+    // needs the event loop), so refuse instead.
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("register a plugin"))?;
     guard.add_plugin(plugin_arc);
     Ok(())
   }
@@ -535,7 +611,10 @@ impl Agent {
   #[napi]
   /// Close the agent and release resources.
   pub fn close(&self) -> Result<()> {
-    let mut guard = self.inner.blocking_write();
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("close the agent"))?;
     guard.clear_runtime_extensions();
     guard.stop();
     self.stop_flag.store(true, Ordering::SeqCst);
@@ -552,9 +631,16 @@ impl Agent {
 
     if let Some(opts) = options {
       if opts.clear_session.unwrap_or(false) {
-        let mut guard = self.inner.blocking_write();
-        guard.stop();
-        guard.session_mut().clear();
+        // Never block the JavaScript thread on a run that owns the agent; the
+        // run applies the clear through `apply_pending_session_clear` when it
+        // ends.
+        match self.inner.try_write() {
+          Ok(mut guard) => {
+            guard.stop();
+            guard.session_mut().clear();
+          }
+          Err(_) => self.pending_session_clear.store(true, Ordering::SeqCst),
+        }
       }
     }
 
@@ -582,10 +668,16 @@ impl Agent {
       ThreadsafeFunction<String, napi::Unknown<'static>, String, napi::Status, true, true>,
     >,
   ) -> Result<String> {
+    let schema: serde_json::Value = serde_json::from_str(&schema).map_err(|e| {
+      Error::new(
+        napi::Status::InvalidArg,
+        format!("invalid tool schema JSON: {e}"),
+      )
+    })?;
     let tool = JSTool {
       name: name.clone(),
       description,
-      schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
+      schema,
       cancelable,
       callback: callback.into(),
       cancel_callback: cancel_callback.map(Arc::new),
@@ -887,7 +979,20 @@ impl Agent {
     }.await;
 
     self.is_running.store(false, Ordering::SeqCst);
+    // The read guard was released when the block above ended, so a deferred
+    // session clear can take the write lock now.
+    self.apply_pending_session_clear().await;
     result
+  }
+
+  /// Honour a `stop({ clearSession: true })` that arrived while a run held the
+  /// agent, without parking the JavaScript thread on the lock.
+  async fn apply_pending_session_clear(&self) {
+    if self.pending_session_clear.swap(false, Ordering::SeqCst) {
+      let mut guard = self.inner.write().await;
+      guard.stop();
+      guard.session_mut().clear();
+    }
   }
 
   #[napi]
@@ -910,7 +1015,10 @@ impl Agent {
   #[napi]
   /// Restore the session from JSON.
   pub fn restore_session_json(&self, json: String) -> Result<()> {
-    let mut guard = self.inner.blocking_write();
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("restore the session"))?;
     let result = guard.session_mut().restore_from_json(&json);
     match result {
       Ok(()) => Ok(()),
@@ -936,7 +1044,10 @@ impl Agent {
   #[napi]
   /// Clear the session history.
   pub fn clear_session(&self) -> Result<()> {
-    let mut guard = self.inner.blocking_write();
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("clear the session"))?;
     guard.session_mut().clear();
     Ok(())
   }
@@ -952,7 +1063,10 @@ impl Agent {
   #[napi]
   /// Replace the opaque session context value.
   pub fn set_session_context(&self, context: serde_json::Value) -> Result<()> {
-    let mut guard = self.inner.blocking_write();
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("set the session context"))?;
     guard.session_mut().set_session_context(context);
     Ok(())
   }
@@ -960,7 +1074,10 @@ impl Agent {
   #[napi]
   /// Reset the opaque session context to null.
   pub fn clear_session_context(&self) -> Result<()> {
-    let mut guard = self.inner.blocking_write();
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("clear the session context"))?;
     guard.session_mut().clear_session_context();
     Ok(())
   }
@@ -968,7 +1085,10 @@ impl Agent {
   #[napi]
   /// Compact the session, keeping recent turns.
   pub fn compact_session(&self, keep_recent: u32, max_summary_chars: u32) -> Result<()> {
-    let mut guard = self.inner.blocking_write();
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("compact the session"))?;
     guard
       .session_mut()
       .compact(keep_recent as usize, max_summary_chars as usize);
@@ -1020,7 +1140,10 @@ impl Agent {
         ))
       }
     };
-    let mut guard = self.inner.blocking_write();
+    let mut guard = self
+      .inner
+      .try_write()
+      .map_err(|_| busy_error("add a message"))?;
     guard.add_message(msg);
     Ok(())
   }
@@ -1188,5 +1311,67 @@ mod tests {
       .execute("test_exec", &serde_json::json!({}))
       .unwrap();
     assert_eq!(result["result"], "async_executed");
+  }
+
+  #[test]
+  fn agent_config_rejects_negative_counts() {
+    let mut cfg = AgentConfig::default();
+    assert!(cfg.validate().is_ok());
+
+    cfg.timeout_secs = -1;
+    assert!(cfg.validate().is_err());
+
+    cfg.timeout_secs = 30;
+    cfg.max_tokens = Some(-5);
+    assert!(cfg.validate().is_err());
+
+    cfg.max_tokens = Some(256);
+    cfg.rate_limit_window_secs = Some(-1);
+    assert!(cfg.validate().is_err());
+  }
+
+  #[tokio::test]
+  async fn stop_with_clear_session_defers_the_clear_to_the_end_of_a_run() {
+    let agent = Agent::create(AgentConfig::default()).await.unwrap();
+    {
+      let mut guard = agent.inner.write().await;
+      guard.add_message(react::llm::LlmMessage::user_text("hello"));
+    }
+
+    // A run holds a read guard for its whole lifetime.
+    let running = agent.inner.read().await;
+
+    let result = agent
+      .stop(Some(StopOptions {
+        clear_session: Some(true),
+      }))
+      .expect("stop must not wait for the run to finish");
+    assert_eq!(result["stopped"], serde_json::json!(false));
+
+    // The session survives until the run releases the agent.
+    let kept = agent.inner.try_read().map(|g| g.session().messages().len());
+    assert_eq!(kept.ok(), Some(1));
+
+    drop(running);
+    agent.apply_pending_session_clear().await;
+    assert!(agent.inner.read().await.session().messages().is_empty());
+  }
+
+  #[tokio::test]
+  async fn session_setters_refuse_while_a_run_owns_the_agent() {
+    let agent = Agent::create(AgentConfig::default()).await.unwrap();
+    let running = agent.inner.read().await;
+
+    let err = agent
+      .clear_session()
+      .expect_err("clearing the session mid-run must be refused, not block");
+    assert!(
+      err.reason.contains("running"),
+      "unexpected error: {}",
+      err.reason
+    );
+
+    drop(running);
+    agent.clear_session().expect("clearing must work again");
   }
 }

@@ -103,8 +103,8 @@ async def test_callable_run_json_handler():
 
 
 @pytest.mark.asyncio
-async def test_callable_run_text_handler():
-    """Test Callable.run() with text handler"""
+async def test_callable_run_text_handler_rpc():
+    """Test Callable.run() with a text RPC handler"""
     from nbos import Callable, Caller
     
     bus = await Bus.create(BusConfig())
@@ -146,8 +146,8 @@ async def test_callable_run_text_handler():
 
 
 @pytest.mark.asyncio
-async def test_callable_run_json_handler():
-    """Test Callable.run_json() with JSON dict handler"""
+async def test_callable_run_json_handler_rpc():
+    """Test Callable.run_json() with a JSON RPC handler"""
     from nbos import Callable, Caller
     
     bus = await Bus.create(BusConfig())

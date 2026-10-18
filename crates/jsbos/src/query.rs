@@ -1,35 +1,9 @@
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use std::sync::Arc;
 
-fn call_string_handler(
-  handler: &ThreadsafeFunction<String, napi::Unknown<'static>>,
-  input: String,
-) -> std::result::Result<String, String> {
-  let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<String, String>>();
-  let tx_clone = tx.clone();
-
-  handler.call_with_return_value(
-    Ok(input),
-    ThreadsafeFunctionCallMode::NonBlocking,
-    move |result: std::result::Result<napi::Unknown<'_>, napi::Error>, _env| -> Result<()> {
-      match result {
-        Ok(value) => {
-          let string_value = value.coerce_to_string()?.into_utf8()?.as_str()?.to_string();
-          let _ = tx_clone.send(Ok(string_value));
-        }
-        Err(e) => {
-          let _ = tx_clone.send(Err(e.to_string()));
-        }
-      }
-      Ok(())
-    },
-  );
-
-  rx.recv()
-    .unwrap_or_else(|_| Err("handler channel closed".to_string()))
-}
+use crate::call_js_string_handler;
 
 #[napi]
 /// Runs queries against a queryable.
@@ -77,12 +51,10 @@ impl Query {
   #[napi]
   /// Query the handler, waiting up to `timeout_ms`.
   pub async fn query_text_timeout_ms(&self, payload: String, timeout_ms: i64) -> Result<String> {
+    let timeout = crate::millis_from_js("timeout_ms", timeout_ms)?;
     let out = self
       .inner
-      .query_with_timeout::<String, String>(
-        &payload,
-        std::time::Duration::from_millis(timeout_ms as u64),
-      )
+      .query_with_timeout::<String, String>(&payload, timeout)
       .await
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
     Ok(out)
@@ -120,7 +92,7 @@ impl Queryable {
     &self,
     handler: ThreadsafeFunction<String, napi::Unknown<'static>>,
   ) -> Result<()> {
-    let mut guard = self.handler.lock().unwrap();
+    let mut guard = crate::lock_recover(&self.handler);
     *guard = Some(Arc::new(handler));
     Ok(())
   }
@@ -130,11 +102,15 @@ impl Queryable {
   pub async fn start(&self) -> Result<()> {
     let mut guard = self.inner.lock().await;
 
-    if let Some(tsfn) = self.handler.lock().unwrap().take() {
+    if let Some(tsfn) = crate::lock_recover(&self.handler).take() {
       guard
         .set_handler(move |input: String| {
           let tsfn_clone = Arc::clone(&tsfn);
-          async move { call_string_handler(&tsfn_clone, input).map_err(bus::ZenohError::Query) }
+          async move {
+            call_js_string_handler(&tsfn_clone, input)
+              .await
+              .map_err(bus::ZenohError::Query)
+          }
         })
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
     }
@@ -157,7 +133,11 @@ impl Queryable {
     guard
       .set_handler(move |input: String| {
         let tsfn_clone = Arc::clone(&tsfn);
-        async move { call_string_handler(&tsfn_clone, input).map_err(bus::ZenohError::Query) }
+        async move {
+          call_js_string_handler(&tsfn_clone, input)
+            .await
+            .map_err(bus::ZenohError::Query)
+        }
       })
       .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
 
@@ -198,7 +178,11 @@ impl Queryable {
         let tsfn_clone = Arc::clone(&tsfn);
         async move {
           let _ = tx
-            .send(call_string_handler(&tsfn_clone, input).map_err(bus::ZenohError::Query))
+            .send(
+              call_js_string_handler(&tsfn_clone, input)
+                .await
+                .map_err(bus::ZenohError::Query),
+            )
             .await;
         }
       })

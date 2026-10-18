@@ -31,6 +31,12 @@ pub(crate) struct ToolEvent {
     /// Wall-clock execution time in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ms: Option<u64>,
+    /// When the call STARTED, in epoch milliseconds. The trajectory's timeline
+    /// needs a start time to place a call on a real time axis; a duration alone
+    /// cannot say where in the run it happened. Absent on records written before
+    /// this field existed, so the timeline falls back to step order for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) at: Option<u64>,
 }
 
 /// A goal transition recorded above a turn.
@@ -196,7 +202,28 @@ impl ContextBreakdown {
     }
 }
 
-/// The reader's own notes about one message.
+/// When one turn ran, in wall-clock milliseconds since the epoch.
+///
+/// The trajectory places every record on a real time axis, so a message needs
+/// its own clock: when the turn opened, when the model's first visible output
+/// arrived, and how long the turn took once it settled. All three are absent on
+/// records written before this existed, which is why the view reports an
+/// unavailable duration rather than a fabricated zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MessageTiming {
+    /// When the turn opened, i.e. when its user message was submitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) start: Option<u64>,
+    /// When the turn's first visible output - text, reasoning or a tool call -
+    /// arrived. The gap from `start` is the model's time to first activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) first_output: Option<u64>,
+    /// How long the turn ran, from `start` to its terminal event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ms: Option<u64>,
+}
+
+/// The reader's own notes about one message, and what it cost or took.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct MessageMeta {
     /// A goal transition to draw above this turn.
@@ -208,6 +235,9 @@ pub(crate) struct MessageMeta {
     /// What this turn cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) usage: Option<MessageUsage>,
+    /// When this turn ran, for the trajectory's time axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) timing: Option<MessageTiming>,
 }
 
 /// One message in a conversation.
@@ -261,6 +291,19 @@ impl ChatMessage {
         }
     }
 
+    /// This message's turn timing, when the record carries one.
+    pub(crate) fn timing(&self) -> Option<&MessageTiming> {
+        self.meta.as_ref()?.timing.as_ref()
+    }
+
+    /// The timing block for this message, created when it is absent.
+    pub(crate) fn timing_mut(&mut self) -> &mut MessageTiming {
+        self.meta
+            .get_or_insert_with(MessageMeta::default)
+            .timing
+            .get_or_insert_with(MessageTiming::default)
+    }
+
     /// Heuristic tokens this message contributes to the context.
     ///
     /// One price per present content block under the reference's heuristic: the
@@ -303,13 +346,20 @@ pub(crate) struct Session {
     #[serde(default)]
     pub(crate) workspace: String,
     /// The provider this session runs under, as a reference into the global
-    /// provider tree. `None` takes the workspace's default.
+    /// provider tree. `None` means this chat names no model - there is no
+    /// workspace default to take - and the composer refuses to send until one
+    /// is chosen here.
     ///
     /// A reference, never a base URL or a key: the credential belongs to the
     /// provider node, so rotating it must not have to rewrite every session.
     #[serde(default)]
     pub(crate) provider: Option<String>,
-    /// The model nickname inside that provider. `None` takes the workspace's.
+    /// The model nickname inside that provider.
+    ///
+    /// The pair is the session's explicit choice and the ONLY model selection,
+    /// written only when the composer picks a model in THIS chat. It is
+    /// deliberately not copied into a new session: a fresh chat starts with no
+    /// model and asks for one instead of inheriting a neighbour's.
     #[serde(default)]
     pub(crate) model: Option<String>,
     /// The preset this session runs, recorded when it is selected.
@@ -337,6 +387,31 @@ pub(crate) struct Session {
     /// Messages moved out by compaction.
     #[serde(default)]
     pub(crate) archived: Vec<serde_json::Value>,
+    /// The global index of messages[0] in the session's Parquet history.
+    ///
+    /// A paged session holds a WINDOW of its transcript in memory, so the
+    /// document and the log disagree about where the first row is until this
+    /// says where the window starts. Runtime state, never written: the log on
+    /// disk is the transcript, the document is metadata.
+    #[serde(skip)]
+    pub(crate) loaded_from: usize,
+    /// How far back the log has been read: the index ABOVE the oldest row this
+    /// session has already paged in.
+    ///
+    /// It is not the same fact as loaded_from. That one says where the window in
+    /// MEMORY starts, and it moves forward when old rows are dropped to bound
+    /// memory. This one only moves DOWN toward zero, so it is what answers "is
+    /// there more history above" - using the window's start for that would stop
+    /// the reader at the top of the loaded window instead of the top of the chat.
+    #[serde(skip)]
+    pub(crate) paged_from: Option<usize>,
+    /// Whether the full document has been read.
+    ///
+    /// Startup reads only metadata into each row; the plan, goal and archived
+    /// values are filled by `Store::ensure_document` when a session is selected
+    /// or mutated. A metadata-only row never rewrites those fields from empty.
+    #[serde(skip)]
+    pub(crate) loaded: bool,
 }
 
 impl Session {
@@ -358,6 +433,9 @@ impl Session {
             pinned: false,
             archived_at: None,
             archived: Vec::new(),
+            loaded_from: 0,
+            paged_from: None,
+            loaded: true,
         }
     }
 
@@ -367,10 +445,9 @@ impl Session {
     /// would resolve to nothing anyway, so it is reported as unchosen rather
     /// than sent on to fail as an unknown name.
     ///
-    /// In flight: the caps switch is what calls this. Until it lands the
-    /// method has no caller, so the allow marks an unfinished migration
-    /// rather than a decision.
-    #[allow(dead_code)]
+    /// This is the session's explicit choice, not a record of what a turn ran
+    /// against: the per-turn record lives on `MessageUsage::model`, because a
+    /// session may switch models between turns.
     pub(crate) fn choice(&self) -> crate::settings::resolve::SessionChoice {
         let named = match (self.provider.as_deref(), self.model.as_deref()) {
             (Some(provider), Some(model))
@@ -513,6 +590,7 @@ mod tests {
                 args: "{}".to_string(),
                 output: Some("ok".to_string()),
                 ms: None,
+                at: None,
             });
             message
         };

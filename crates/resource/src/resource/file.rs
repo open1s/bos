@@ -113,10 +113,15 @@ impl ResourceHandler for FileResource {
                 f.seek(SeekFrom::Start(offset))
                     .await
                     .map_err(ResourceError::Io)?;
-                let to_read = len.min(8 * 1024 * 1024) as usize;
-                let mut buf = vec![0u8; to_read];
-                let n = f.read(&mut buf).await.map_err(ResourceError::Io)?;
-                buf.truncate(n);
+                // A single read may return fewer bytes than requested even
+                // before EOF. Fill up to len or EOF, and let the buffer grow
+                // with the data instead of zero-filling a worst-case 8 MiB.
+                let limit = len.min(8 * 1024 * 1024);
+                let mut buf = Vec::new();
+                f.take(limit)
+                    .read_to_end(&mut buf)
+                    .await
+                    .map_err(ResourceError::Io)?;
                 Ok(ResourceOutput::ReadOk { data: buf })
             }
             ResourceAction::Write { offset, data } => {

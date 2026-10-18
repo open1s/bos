@@ -20,6 +20,14 @@ mod rkyv_tests {
     }
 
     #[test]
+    fn test_rkyv_deserialize_rejects_malformed_bytes() {
+        let backend = RkyvBackend;
+
+        assert!(backend.deserialize::<TestStruct>(&[]).is_err());
+        assert!(backend.deserialize::<TestStruct>(&[0xFF; 8]).is_err());
+    }
+
+    #[test]
     fn test_rkyv_serialize_primitive() {
         let backend = RkyvBackend;
         let value: u32 = 42;

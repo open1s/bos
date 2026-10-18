@@ -100,7 +100,7 @@ impl Bus {
   #[napi]
   /// Publish a text payload to `topic`.
   pub async fn publish_text(&self, topic: String, payload: String) -> Result<()> {
-    let mut guard = self.inner.lock().await;
+    let guard = self.inner.lock().await;
     guard
       .publish(&topic, &payload)
       .await
@@ -112,7 +112,7 @@ impl Bus {
   /// Publish a JSON payload to `topic`.
   pub async fn publish_json(&self, topic: String, data: serde_json::Value) -> Result<()> {
     let json_str = data.to_string();
-    let mut guard = self.inner.lock().await;
+    let guard = self.inner.lock().await;
     guard
       .publish(&topic, &json_str)
       .await

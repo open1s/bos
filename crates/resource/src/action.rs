@@ -86,7 +86,7 @@ pub enum ResourceAction {
     Status,
     /// List children / entries (where meaningful).
     List {
-        /// Optional glob or name filter.
+        /// Optional name filter: a literal substring, or `*` for everything.
         pattern: Option<String>,
     },
     /// Subscribe to push events (see [`ResourceEvent`]).
@@ -100,7 +100,8 @@ pub enum ResourceAction {
     Read {
         /// Byte offset to read from.
         offset: u64,
-        /// Number of bytes to read.
+        /// Number of bytes to read. Handlers cap a single buffered read
+        /// (8 MiB for files); use `read_stream` for larger transfers.
         len: u64,
     },
     /// Write `data` starting at `offset`.
@@ -162,7 +163,8 @@ pub enum ResourceAction {
     },
     /// Receive bytes from the connection.
     Recv {
-        /// Maximum bytes to receive.
+        /// Maximum bytes to receive (capped at 16 MiB per call by the socket
+        /// handler).
         max: u64,
     },
 
@@ -456,7 +458,7 @@ pub enum ResourceEvent {
 /// Serialize an action to bytes for transport.
 pub fn encode_action(action: &ResourceAction) -> Result<Vec<u8>, ResourceError> {
     to_bytes::<rkyv::rancor::Error>(action)
-        .map(|b| b.to_vec())
+        .map(|b| b.into_vec())
         .map_err(|e| ResourceError::Codec(e.to_string()))
 }
 
@@ -468,7 +470,7 @@ pub fn decode_action(bytes: &[u8]) -> Result<ResourceAction, ResourceError> {
 /// Serialize an output to bytes for transport.
 pub fn encode_output(out: &ResourceOutput) -> Result<Vec<u8>, ResourceError> {
     to_bytes::<rkyv::rancor::Error>(out)
-        .map(|b| b.to_vec())
+        .map(|b| b.into_vec())
         .map_err(|e| ResourceError::Codec(e.to_string()))
 }
 
@@ -480,7 +482,7 @@ pub fn decode_output(bytes: &[u8]) -> Result<ResourceOutput, ResourceError> {
 /// Serialize an event to bytes for transport.
 pub fn encode_event(ev: &ResourceEvent) -> Result<Vec<u8>, ResourceError> {
     to_bytes::<rkyv::rancor::Error>(ev)
-        .map(|b| b.to_vec())
+        .map(|b| b.into_vec())
         .map_err(|e| ResourceError::Codec(e.to_string()))
 }
 

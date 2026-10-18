@@ -14,6 +14,7 @@ pub use file::FileMemory;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -125,10 +126,9 @@ pub trait MemoryStore: Send + Sync {
         limit: usize,
         filter: Option<&MetadataFilter>,
     ) -> Vec<MemoryItem> {
-        let items: Vec<MemoryItem> = self
-            .all()
-            .await
-            .into_iter()
+        let all = self.all().await;
+        let items: Vec<&MemoryItem> = all
+            .iter()
             .filter(|item| filter.is_none_or(|filter| filter.matches(item)))
             .collect();
         rank(&items, query, limit)
@@ -216,10 +216,11 @@ impl MemoryStore for InMemoryMemory {
         filter: Option<&MetadataFilter>,
     ) -> Vec<MemoryItem> {
         let items = self.items.read().unwrap_or_else(|e| e.into_inner());
-        let filtered: Vec<MemoryItem> = items
+        // Rank over borrowed items and clone only the winners: a recall runs
+        // on every turn, and copying the whole store first was pure waste.
+        let filtered: Vec<&MemoryItem> = items
             .iter()
             .filter(|item| filter.is_none_or(|filter| filter.matches(item)))
-            .cloned()
             .collect();
         rank(&filtered, query, limit)
     }
@@ -246,25 +247,34 @@ impl MemoryStore for InMemoryMemory {
 /// Rank `items` for `query`: one point per query token present in the
 /// content, ties toward the more recently created item, and a blank query
 /// yields the most recent `limit` items.
-fn rank(items: &[MemoryItem], query: &str, limit: usize) -> Vec<MemoryItem> {
+fn rank(items: &[&MemoryItem], query: &str, limit: usize) -> Vec<MemoryItem> {
     if limit == 0 {
         return Vec::new();
     }
-    let query_tokens = tokenize(query);
+    // One point per *distinct* query token, as documented: a repeated word in
+    // the query must not outvote a second item that matches a different token.
+    let mut query_tokens = tokenize(query);
+    query_tokens.sort_unstable();
+    query_tokens.dedup();
     if query_tokens.is_empty() {
-        return items.iter().rev().take(limit).cloned().collect();
+        return items
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|item| (*item).clone())
+            .collect();
     }
     let mut scored: Vec<(usize, &MemoryItem)> = items
         .iter()
-        .map(|item| {
+        .filter_map(|item| {
             let content_tokens = tokenize(&item.content);
+            let content: HashSet<&str> = content_tokens.iter().map(String::as_str).collect();
             let score = query_tokens
                 .iter()
-                .filter(|token| content_tokens.contains(*token))
+                .filter(|token| content.contains(token.as_str()))
                 .count();
-            (score, item)
+            (score > 0).then_some((score, *item))
         })
-        .filter(|(score, _)| *score > 0)
         .collect();
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
@@ -288,6 +298,31 @@ fn tokenize(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The documented score is one point per *distinct* query token.
+    ///
+    /// `rust rust go` must score `rust` and `go` equally (one point each), so
+    /// the newer item wins the tie; counting the repeated token twice would
+    /// rank the older `rust` first.
+    #[tokio::test]
+    async fn repeated_query_tokens_count_once() {
+        let older = MemoryItem {
+            id: "older".into(),
+            content: "rust".into(),
+            metadata: None,
+            created_at_ms: 1,
+        };
+        let newer = MemoryItem {
+            id: "newer".into(),
+            content: "go".into(),
+            metadata: None,
+            created_at_ms: 2,
+        };
+        let memory = InMemoryMemory::from_items(vec![older, newer]);
+        let hits = memory.search("rust rust go", 2).await;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "newer", "distinct tokens tie; recency decides");
+    }
 
     #[tokio::test]
     async fn search_is_deterministic_within_a_millisecond() {

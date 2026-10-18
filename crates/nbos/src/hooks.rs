@@ -44,18 +44,24 @@ impl PyHookEvent {
     }
 }
 
-impl From<PyHookEvent> for InnerEvent {
-    fn from(e: PyHookEvent) -> Self {
-        match e.value.as_str() {
-            "BeforeToolCall" => InnerEvent::BeforeToolCall,
-            "AfterToolCall" => InnerEvent::AfterToolCall,
-            "BeforeLlmCall" => InnerEvent::BeforeLlmCall,
-            "AfterLlmCall" => InnerEvent::AfterLlmCall,
-            "OnMessage" => InnerEvent::OnMessage,
-            "OnComplete" => InnerEvent::OnComplete,
-            "OnError" => InnerEvent::OnError,
-            _ => InnerEvent::OnMessage,
-        }
+/// Parse a hook event name, rejecting unknown ones.
+///
+/// Silently mapping a typo to `OnMessage` would fire the hook on an unrelated
+/// event, which is worse than refusing the registration.
+pub(crate) fn parse_hook_event(name: &str) -> PyResult<InnerEvent> {
+    match name {
+        "BeforeToolCall" => Ok(InnerEvent::BeforeToolCall),
+        "AfterToolCall" => Ok(InnerEvent::AfterToolCall),
+        "BeforeLlmCall" => Ok(InnerEvent::BeforeLlmCall),
+        "AfterLlmCall" => Ok(InnerEvent::AfterLlmCall),
+        "OnMessage" => Ok(InnerEvent::OnMessage),
+        "OnComplete" => Ok(InnerEvent::OnComplete),
+        "OnError" => Ok(InnerEvent::OnError),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown hook event '{}'. Expected one of: BeforeToolCall, AfterToolCall, \
+             BeforeLlmCall, AfterLlmCall, OnMessage, OnComplete, OnError",
+            other
+        ))),
     }
 }
 
@@ -226,11 +232,12 @@ impl PyHookRegistry {
     }
 
     /// Register `callback` for `event`.
-    pub fn register(&self, event: PyHookEvent, callback: Py<PyAny>) {
-        let event: InnerEvent = event.into();
+    pub fn register(&self, event: PyHookEvent, callback: Py<PyAny>) -> PyResult<()> {
+        let event = parse_hook_event(&event.value)?;
         let hook = PythonHook {
             callback: callback.into(),
         };
         self.inner.register_blocking(event, Arc::new(hook));
+        Ok(())
     }
 }

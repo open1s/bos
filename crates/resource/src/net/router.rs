@@ -28,6 +28,14 @@ use crate::handler::ResourceHandler;
 use crate::meta::{ResourceInfo, ResourceMeta, ResourceType};
 use crate::transport::Transport;
 
+/// Bytes fetched per relayed `Read` page (matches `FileResource`'s buffered
+/// cap).
+const RELAY_PAGE: u64 = 8 * 1024 * 1024;
+
+/// Flush a relayed write once the pending buffer reaches this many bytes, so
+/// a large stream never accumulates in memory until `finish`.
+const RELAY_FLUSH_BYTES: usize = 8 * 1024 * 1024;
+
 /// Intermediate-side resource: accepts `Forward` actions and dispatches them
 /// to the configured downstream transport.
 pub struct RelayResource {
@@ -143,48 +151,63 @@ impl Transport for RelayTransport {
         len: Option<u64>,
     ) -> Result<crate::transport::ChunkStream> {
         // Relay is not a data-plane fast path: page through with plain
-        // `Read` invokes. 8 MiB per page matches FileResource's buffered cap.
-        let mut next = offset;
-        let mut left = len;
-        let mut chunks: Vec<crate::transport::Chunk> = Vec::new();
-        loop {
-            let want = match left {
-                Some(0) => break,
-                Some(l) => l.min(8 * 1024 * 1024),
-                None => 8 * 1024 * 1024,
-            };
-            match self
-                .invoke(
-                    uri,
-                    ResourceAction::Read {
-                        offset: next,
-                        len: want,
-                    },
-                )
-                .await
-            {
-                Ok(ResourceOutput::ReadOk { data }) => {
-                    let n = data.len() as u64;
-                    if n == 0 {
+        // `Read` invokes. Pages are fetched lazily as the consumer polls, so a
+        // large read is never buffered whole on the relay.
+        let transport = self.upstream.clone();
+        let relay_uri = self.relay_uri.clone();
+        let uri = uri.to_string();
+        let chunks = async_stream::stream! {
+            let mut next = offset;
+            let mut left = len;
+            loop {
+                let want = match left {
+                    Some(0) => break,
+                    Some(l) => l.min(RELAY_PAGE),
+                    None => RELAY_PAGE,
+                };
+                let payload = match encode_action(&ResourceAction::Read {
+                    offset: next,
+                    len: want,
+                }) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        yield Err(e.to_string());
                         break;
                     }
-                    chunks.push(Ok(data));
-                    next += n;
-                    if let Some(l) = &mut left {
-                        *l = l.saturating_sub(n);
+                };
+                match transport
+                    .invoke(
+                        &relay_uri,
+                        ResourceAction::Forward {
+                            uri: uri.clone(),
+                            payload,
+                        },
+                    )
+                    .await
+                {
+                    Ok(ResourceOutput::ReadOk { data }) => {
+                        let n = data.len() as u64;
+                        if n == 0 {
+                            break;
+                        }
+                        yield Ok(data);
+                        next = next.saturating_add(n);
+                        if let Some(l) = &mut left {
+                            *l = l.saturating_sub(n);
+                        }
+                    }
+                    Ok(other) => {
+                        yield Err(format!("relay chunk read: unexpected {other:?}"));
+                        break;
+                    }
+                    Err(e) => {
+                        yield Err(e.to_string());
+                        break;
                     }
                 }
-                Ok(other) => {
-                    chunks.push(Err(format!("relay chunk read: unexpected {other:?}")));
-                    break;
-                }
-                Err(e) => {
-                    chunks.push(Err(e.to_string()));
-                    break;
-                }
             }
-        }
-        Ok(Box::pin(futures::stream::iter(chunks)))
+        };
+        Ok(Box::pin(chunks))
     }
 
     async fn write_stream(
@@ -192,39 +215,39 @@ impl Transport for RelayTransport {
         uri: &str,
         offset: u64,
     ) -> Result<Box<dyn crate::transport::ChunkWriter>> {
-        // Buffered on the relay: chunks are accumulated and flushed as one
-        // `Write` on `finish`.
+        // Chunks are flushed through the relay in bounded pages, so a large
+        // write stream does not sit in memory until `finish`.
         Ok(Box::new(RelayChunkWriter {
             transport: self.upstream.clone(),
             relay_uri: self.relay_uri.clone(),
             uri: uri.to_string(),
             offset,
             buf: Vec::new(),
+            written: 0,
         }))
     }
 }
 
-/// Collect chunks and write them as one buffered `Write` through the relay.
+/// Collect chunks and write them through the relay in bounded pages.
 struct RelayChunkWriter {
     transport: Arc<dyn Transport>,
     relay_uri: String,
     uri: String,
     offset: u64,
     buf: Vec<u8>,
+    written: u64,
 }
 
-#[async_trait]
-impl crate::transport::ChunkWriter for RelayChunkWriter {
-    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
-        self.buf.extend_from_slice(chunk);
-        Ok(())
-    }
-
-    async fn finish(&mut self) -> Result<u64> {
-        let payload = crate::action::encode_action(&ResourceAction::Write {
-            offset: self.offset,
-            data: std::mem::take(&mut self.buf),
-        })?;
+impl RelayChunkWriter {
+    /// Send the pending buffer as one `Write` through the relay.
+    async fn flush(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let at = self.offset.saturating_add(self.written);
+        let data = std::mem::take(&mut self.buf);
+        let len = data.len() as u64;
+        let payload = encode_action(&ResourceAction::Write { offset: at, data })?;
         let out = self
             .transport
             .invoke(
@@ -236,10 +259,179 @@ impl crate::transport::ChunkWriter for RelayChunkWriter {
             )
             .await?;
         match out {
-            ResourceOutput::WriteOk { written } => Ok(written),
+            ResourceOutput::WriteOk { written } => {
+                if written != len {
+                    return Err(ResourceError::Other(format!(
+                        "relay write page: expected {len} bytes, wrote {written}"
+                    )));
+                }
+                self.written = self.written.saturating_add(written);
+                Ok(())
+            }
             other => Err(ResourceError::Other(format!(
                 "relay write expected WriteOk, got {other:?}"
             ))),
         }
+    }
+}
+
+#[async_trait]
+impl crate::transport::ChunkWriter for RelayChunkWriter {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        self.buf.extend_from_slice(chunk);
+        if self.buf.len() >= RELAY_FLUSH_BYTES {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<u64> {
+        self.flush().await?;
+        Ok(self.written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream::BoxStream;
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Minimal transport that answers relayed Read/Write forwards.
+    #[derive(Default)]
+    struct FakeTransport {
+        reads: AtomicUsize,
+        writes: Mutex<Vec<(u64, Vec<u8>)>>,
+        data: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl Transport for FakeTransport {
+        async fn invoke(&self, _uri: &str, action: ResourceAction) -> Result<ResourceOutput> {
+            let inner = match action {
+                ResourceAction::Forward { payload, .. } => decode_action(&payload)?,
+                other => {
+                    return Err(ResourceError::Unsupported(format!(
+                        "fake transport got {:?}",
+                        other.name()
+                    )))
+                }
+            };
+            match inner {
+                ResourceAction::Read { .. } => {
+                    if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Ok(ResourceOutput::ReadOk {
+                            data: self.data.clone(),
+                        })
+                    } else {
+                        Ok(ResourceOutput::ReadOk { data: Vec::new() })
+                    }
+                }
+                ResourceAction::Write { offset, data } => {
+                    self.writes
+                        .lock()
+                        .expect("write log")
+                        .push((offset, data.clone()));
+                    Ok(ResourceOutput::WriteOk {
+                        written: data.len() as u64,
+                    })
+                }
+                other => Err(ResourceError::Unsupported(format!(
+                    "fake transport does not serve {:?}",
+                    other.name()
+                ))),
+            }
+        }
+
+        async fn subscribe(
+            &self,
+            _uri: &str,
+            _events: Vec<String>,
+        ) -> Result<BoxStream<'static, ResourceEvent>> {
+            Err(ResourceError::Unsupported("fake subscribe".into()))
+        }
+
+        async fn list(
+            &self,
+            _agent: &str,
+            _kind: Option<ResourceType>,
+        ) -> Result<Vec<ResourceInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(&self, _agent: &str, _uri: &str) -> Result<Option<ResourceInfo>> {
+            Ok(None)
+        }
+
+        async fn read_stream(
+            &self,
+            _uri: &str,
+            _offset: u64,
+            _len: Option<u64>,
+        ) -> Result<crate::transport::ChunkStream> {
+            Err(ResourceError::Unsupported("fake read_stream".into()))
+        }
+
+        async fn write_stream(
+            &self,
+            _uri: &str,
+            _offset: u64,
+        ) -> Result<Box<dyn crate::transport::ChunkWriter>> {
+            Err(ResourceError::Unsupported("fake write_stream".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_read_stream_is_lazy() {
+        let fake = Arc::new(FakeTransport {
+            data: b"hello".to_vec(),
+            ..Default::default()
+        });
+        let relay = RelayTransport::new(fake.clone(), "downstream");
+
+        let mut stream = relay
+            .read_stream("file:///x", 0, None)
+            .await
+            .expect("stream");
+        assert_eq!(
+            fake.reads.load(Ordering::SeqCst),
+            0,
+            "read_stream must not fetch pages before the consumer polls"
+        );
+
+        let first = stream.next().await.expect("chunk").expect("ok");
+        assert_eq!(first, b"hello");
+        assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
+
+        assert!(stream.next().await.is_none(), "EOF ends the stream");
+        assert_eq!(fake.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn relay_write_stream_flushes_in_bounded_pages() {
+        let fake = Arc::new(FakeTransport::default());
+        let relay = RelayTransport::new(fake.clone(), "downstream");
+        let mut writer = relay.write_stream("file:///x", 0).await.expect("writer");
+
+        let chunk = vec![7u8; 5 * 1024 * 1024];
+        for _ in 0..3 {
+            writer.write_chunk(&chunk).await.expect("write chunk");
+        }
+        let total = writer.finish().await.expect("finish");
+        assert_eq!(total, 15 * 1024 * 1024);
+
+        let writes = fake.writes.lock().expect("write log");
+        assert!(
+            writes.len() >= 2,
+            "expected bounded flushes, got {} write(s)",
+            writes.len()
+        );
+        assert_eq!(writes[0].0, 0);
+        assert_eq!(
+            writes.iter().map(|(_, data)| data.len()).sum::<usize>(),
+            15 * 1024 * 1024
+        );
     }
 }

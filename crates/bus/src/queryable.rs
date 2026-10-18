@@ -15,6 +15,12 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use zenoh::query::Query;
 
+/// Capacity of the per-request channel that carries streamed reply items.
+///
+/// Handlers may produce more items than this; production and draining run
+/// concurrently so the handler is never blocked by an undrained channel.
+const STREAM_CHANNEL_CAPACITY: usize = 32;
+
 /// Serves queries on one topic with either a single-shot or a streaming handler.
 pub struct QueryableWrapper<Q, R>
 where
@@ -112,10 +118,17 @@ where
 
         let handle = tokio::spawn(async move {
             while let Ok(query) = queryable.recv_async().await {
-                if let Some(ref sh) = stream_handler {
-                    let _ = Self::handle_query_stream(&query, sh, &topic).await;
+                let result = if let Some(ref sh) = stream_handler {
+                    Self::handle_query_stream(&query, sh, &topic).await
                 } else if let Some(ref h) = handler {
-                    let _ = Self::handle_query(&query, h, &topic).await;
+                    Self::handle_query(&query, h, &topic).await
+                } else {
+                    Ok(())
+                };
+                if let Err(e) = result {
+                    // Do not drop the request silently: an undecodable or
+                    // payload-less query gets an error reply.
+                    let _ = query.reply_err(format!("Query failed: {}", e)).await;
                 }
             }
             Ok(())
@@ -190,18 +203,26 @@ where
                 .map_err(|e| ZenohError::Serialization(e.to_string()))?
         };
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<R, ZenohError>>(32);
-        handler(request, tx.clone()).await;
-        drop(tx);
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<R, ZenohError>>(STREAM_CHANNEL_CAPACITY);
+        // Run the handler alongside the drain loop. Awaiting the handler before
+        // draining would deadlock as soon as it produces more items than the
+        // channel capacity (or before the client starts reading replies).
+        let handler_task = tokio::spawn(handler(request, tx));
 
         while let Some(result) = rx.recv().await {
             match result {
                 Ok(response) => {
-                    let data = codec
-                        .encode(&response)
-                        .map_err(|e| ZenohError::Serialization(e.to_string()))?;
+                    let data = match codec.encode(&response) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            handler_task.abort();
+                            return Err(ZenohError::Serialization(e.to_string()));
+                        }
+                    };
                     if let Err(e) = query.reply(topic, data).await {
                         let _ = query.reply_err(format!("Reply error: {}", e)).await;
+                        handler_task.abort();
                         break;
                     }
                 }
@@ -209,10 +230,15 @@ where
                     let _ = query
                         .reply_err(format!("Stream handler error: {}", e))
                         .await;
+                    handler_task.abort();
                     break;
                 }
             }
         }
+
+        drop(rx);
+        // Reap the task so it cannot outlive the request it was serving.
+        let _ = handler_task.await;
 
         Ok(())
     }

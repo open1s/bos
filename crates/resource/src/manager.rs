@@ -72,9 +72,15 @@ impl ResourceManager {
     /// List all registered resources, bypassing policy. Used internally for
     /// bus-based discovery announcements.
     pub async fn list_all(&self) -> Vec<crate::meta::ResourceInfo> {
-        let handlers = self.handlers.read().await;
-        let mut out = Vec::new();
-        for slot in handlers.values() {
+        // Snapshot the slots and release the registry lock before taking any
+        // per-handler lock: a busy handler must not stall registration or
+        // auto-binding for the whole listing.
+        let slots: Vec<HandlerSlot> = {
+            let handlers = self.handlers.read().await;
+            handlers.values().cloned().collect()
+        };
+        let mut out = Vec::with_capacity(slots.len());
+        for slot in slots {
             let guard = slot.lock().await;
             let meta = guard.meta();
             out.push(crate::meta::ResourceInfo {
@@ -213,9 +219,14 @@ impl Dispatcher for ResourceManager {
     }
 
     async fn list(&self, agent: &str, kind: Option<ResourceType>) -> Result<Vec<ResourceInfo>> {
-        let handlers = self.handlers.read().await;
-        let mut out = Vec::new();
-        for slot in handlers.values() {
+        // Snapshot the slots and release the registry lock before taking any
+        // per-handler lock (see list_all).
+        let slots: Vec<HandlerSlot> = {
+            let handlers = self.handlers.read().await;
+            handlers.values().cloned().collect()
+        };
+        let mut out = Vec::with_capacity(slots.len());
+        for slot in slots {
             let guard = slot.lock().await;
             let meta = guard.meta();
             if kind.is_some() && Some(meta.kind) != kind {

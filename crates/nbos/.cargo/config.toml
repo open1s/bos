@@ -1,5 +1,12 @@
-# Use extension-module to avoid linking Python statically
-[build]
+# See the workspace `.cargo/config.toml`: the macOS-only link flag and
+# PYO3_USE_ABI3 are inherited there. This file is kept so `cd crates/nbos`
+# builds behave identically if the workspace config is ever split.
+# Python extension modules must not link libpython: pyo3 resolves the Python
+# symbols from the interpreter that loads the module. Only macOS needs the
+# `-undefined,dynamic_lookup` linker flag for that; GNU ld and MSVC reject it,
+# so it must stay scoped to macOS instead of applying to every workspace build
+# (which would break the Linux and Windows binding builds).
+[target.'cfg(target_os = "macos")']
 rustflags = ["-C", "link-args=-Wl,-undefined,dynamic_lookup"]
 
 [env]

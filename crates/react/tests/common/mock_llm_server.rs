@@ -28,6 +28,10 @@ pub enum MockReply {
         events: Vec<serde_json::Value>,
         append_done: bool,
     },
+    /// Raw response bytes written verbatim after the SSE headers. Lets a test
+    /// split a frame (for example inside a multi-byte character) at a byte
+    /// boundary the higher-level reply types cannot express.
+    RawChunks(Vec<Vec<u8>>),
 }
 
 pub struct MockLlmServer {
@@ -127,6 +131,15 @@ async fn serve_connection(
             );
             stream.write_all(head.as_bytes()).await?;
             stream.write_all(&body_bytes).await?;
+        }
+        MockReply::RawChunks(chunks) => {
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            stream.write_all(head.as_bytes()).await?;
+            for chunk in chunks {
+                stream.write_all(&chunk).await?;
+                stream.flush().await?;
+            }
         }
         MockReply::Sse {
             events,

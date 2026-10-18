@@ -14,16 +14,16 @@ pub enum ConfigFormat {
 impl ConfigFormat {
     /// Infer the format from a file extension.
     pub fn from_path(path: &str) -> Option<Self> {
-        let ext = std::path::Path::new(path)
-            .extension()?
-            .to_str()?
-            .to_lowercase();
+        let ext = std::path::Path::new(path).extension()?.to_str()?;
 
-        match ext.as_str() {
-            "toml" => Some(ConfigFormat::Toml),
-            "yaml" | "yml" => Some(ConfigFormat::Yaml),
-            "json" => Some(ConfigFormat::Json),
-            _ => None,
+        if ext.eq_ignore_ascii_case("toml") {
+            Some(ConfigFormat::Toml)
+        } else if ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml") {
+            Some(ConfigFormat::Yaml)
+        } else if ext.eq_ignore_ascii_case("json") {
+            Some(ConfigFormat::Json)
+        } else {
+            None
         }
     }
 
@@ -40,7 +40,11 @@ impl ConfigFormat {
 /// How multiple configuration sources are combined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConfigMergeStrategy {
-    /// Later values overwrite earlier ones, one level deep.
+    /// Later values overwrite earlier ones, recursing into nested objects.
+    ///
+    /// This is the default strategy. It currently merges nested objects
+    /// exactly like [`Self::DeepMerge`]; both variants are kept for API
+    /// compatibility.
     #[default]
     Override,
     /// Recurse into nested objects and merge key by key.

@@ -11,13 +11,17 @@ use std::sync::{Arc, OnceLock};
 
 use gpui_kit::{Image, ImageFormat};
 
-/// The product logo, decoded once and shared by every caller.
-pub(crate) fn logo() -> Arc<Image> {
-    static LOGO: OnceLock<Arc<Image>> = OnceLock::new();
-    LOGO.get_or_init(|| {
+/// The headline mark: the mantis-shrimp logo the product is branded with.
+///
+/// Cut from the 2048px source sheet - its near-white background flood-filled to
+/// transparency, trimmed to the subject, squared, scaled to 128 - because a 3 MB
+/// sheet is not something a binary should carry for a 34px draw.
+pub(crate) fn mark() -> Arc<Image> {
+    static MARK: OnceLock<Arc<Image>> = OnceLock::new();
+    MARK.get_or_init(|| {
         Arc::new(Image::from_bytes(
-            ImageFormat::Svg,
-            include_bytes!("assets/bos-harness-logo.svg").to_vec(),
+            ImageFormat::Png,
+            include_bytes!("assets/bsh-mark.png").to_vec(),
         ))
     })
     .clone()
@@ -61,5 +65,34 @@ pub(crate) fn install_dock_icon() {
         unsafe {
             NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&icon));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The headline mark is the mantis-shrimp emblem: an embedded PNG of the
+    /// measured draw size, with an alpha channel so the sheet's white paper is
+    /// gone rather than drawn as a light square on a dark theme.
+    #[test]
+    fn the_headline_mark_is_an_embedded_transparent_png() {
+        let image = mark();
+        assert!(matches!(image.format, ImageFormat::Png));
+        let bytes = &image.bytes;
+        assert_eq!(&bytes[1..4], b"PNG", "a real PNG signature");
+        assert_eq!(&bytes[12..16], b"IHDR", "the header comes first");
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        assert_eq!((width, height), (128, 128), "the cut-out square");
+        // Colour type 6 is RGBA; without it the white sheet would render as a
+        // pale tile behind the emblem on every dark theme.
+        assert_eq!(bytes[25], 6, "RGBA");
+        // A 3 MB source sheet must never ride in the binary for a 34px draw.
+        assert!(
+            bytes.len() < 64 * 1024,
+            "the embedded mark stays small: {} bytes",
+            bytes.len()
+        );
     }
 }

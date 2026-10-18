@@ -116,15 +116,29 @@ pub enum Content {
     Parts(Vec<ContentPart>),
 }
 
+/// Decode a JSON content-parts payload, if `text` can possibly be one.
+///
+/// Only a JSON object or array can decode as a `ContentPart`/parts list, so
+/// ordinary prompt text skips the two parse attempts that used to run on
+/// every message construction and every request build.
+pub(crate) fn parse_content_parts(text: &str) -> Option<Vec<ContentPart>> {
+    if !matches!(text.trim_start().as_bytes().first(), Some(b'[' | b'{')) {
+        return None;
+    }
+    if let Ok(parts) = serde_json::from_str::<Vec<ContentPart>>(text) {
+        return Some(parts);
+    }
+    serde_json::from_str::<ContentPart>(text)
+        .ok()
+        .map(|part| vec![part])
+}
+
 impl From<String> for Content {
     fn from(s: String) -> Self {
-        if let Ok(parts) = serde_json::from_str::<Vec<ContentPart>>(&s) {
-            return Content::Parts(parts);
+        match parse_content_parts(&s) {
+            Some(parts) => Content::Parts(parts),
+            None => Content::Text(s),
         }
-        if let Ok(part) = serde_json::from_str::<ContentPart>(&s) {
-            return Content::Parts(vec![part]);
-        }
-        Content::Text(s)
     }
 }
 
@@ -931,7 +945,26 @@ impl ReactSession for LlmSession {
 
 #[cfg(test)]
 mod tests {
-    use super::ApiMode;
+    use super::{parse_content_parts, ApiMode, Content, ContentPart};
+
+    #[test]
+    fn content_from_json_still_decodes_with_leading_whitespace() {
+        let content = Content::from("  [{\"type\":\"text\",\"text\":\"hi\"}]".to_string());
+        match content {
+            Content::Parts(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert!(matches!(&parts[0], ContentPart::Text { text } if text == "hi"));
+            }
+            other => panic!("expected parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_text_is_never_mistaken_for_content_parts() {
+        let text = "Explain {a: b} in prose";
+        assert!(parse_content_parts(text).is_none());
+        assert!(matches!(Content::from(text.to_string()), Content::Text(t) if t == text));
+    }
 
     #[test]
     fn api_mode_round_trips_through_its_wire_name() {

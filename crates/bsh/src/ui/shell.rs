@@ -3,10 +3,12 @@
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::*;
 
-use super::settings::SettingsInputs;
+use super::paging::{PageFlow, PageKey};
+use super::settings::{SettingsInputs, VaultInputs};
 use super::DivExt;
 use crate::runner::AgentEvent;
 use crate::state::{AppState, Overlay};
+use crate::store::{OlderPage, TracePage};
 
 /// How close to the end still counts as following the tail, in pixels.
 const TAIL_EPSILON: f32 = 24.0;
@@ -46,6 +48,17 @@ pub(crate) struct Shell {
     pub(crate) search: Entity<InputState>,
     /// The plugin-name filter on the plugin list pane.
     pub(crate) plugin_search: Entity<InputState>,
+    /// The Trajectory tab's own search field.
+    pub(crate) traj_search: Entity<InputState>,
+    /// Which measure the trajectory toolbar shows: 0 duration, 1 turns, 2 calls.
+    pub(crate) traj_mode: usize,
+    /// The selected trajectory event (an index into the rendered log).
+    pub(crate) traj_select: Option<usize>,
+    /// The detail panel's tab: 0 summary, 1 preview, 2 raw, 3 source.
+    pub(crate) traj_tab: usize,
+    /// What the trajectory search field holds, kept beside the entity so the
+    /// view can filter without reading it per row.
+    pub(crate) traj_query: String,
     /// The model-id filter on the fetched-model picker.
     pub(crate) picker_search: Entity<InputState>,
     /// The task-name filter on the Automation tasks pane.
@@ -88,8 +101,12 @@ pub(crate) struct Shell {
     pub(crate) add_display: Entity<InputState>,
     /// The base URL the add card is typed for.
     pub(crate) add_base_url: Entity<InputState>,
-    /// The API key the add card is typed for.
-    pub(crate) add_key: Entity<InputState>,
+    /// The vault entry the add card chose for the provider it will create.
+    ///
+    /// A pending choice, not a draft field: the provider does not exist until
+    /// Create, at which point this id lands on it. Choosing an entry clears the
+    /// plaintext field, so a created provider never carries both sources.
+    pub(crate) add_key_vault: Option<String>,
     /// The model leaves the open provider editor or add card is editing, with
     /// one text engine per row so a keystroke repaints its own row.
     pub(crate) model_rows: Vec<ModelRowEditor>,
@@ -132,6 +149,25 @@ pub(crate) struct Shell {
     /// session switch closes them all, the way the reference resets a turn's
     /// disclosure state.
     pub(crate) think_open: std::collections::HashSet<usize>,
+    /// The offsets the eased scroll last settled on.
+    ///
+    /// The kit's scroller applies a wheel delta on its own, and it does so before
+    /// this shell's listener sees the event - so the handler reads how far it
+    /// jumped and takes that back, letting the easing own the whole motion.
+    pub(crate) chat_last_offset: f32,
+    pub(crate) traj_last_offset: f32,
+    /// The chat transcript's eased scroll, and the trajectory tab's.
+    pub(crate) chat_smooth: super::smooth::Smooth,
+    pub(crate) traj_smooth: super::smooth::Smooth,
+    /// The trajectory tab's scroll position, so its wheel can be eased and a test
+    /// can read it.
+    pub(crate) traj_scroll: ScrollHandle,
+    /// The sidebar tree's scroll position, so the wheel, the keys and a test can
+    /// all address the same offset.
+    pub(crate) side_scroll: ScrollHandle,
+    /// The tree's focus. Arrow, Page and Home/End scroll it while it holds focus,
+    /// which is how a focused list behaves everywhere else.
+    pub(crate) side_focus: FocusHandle,
     /// The rail's scroll position, so the active mark can be kept in view.
     pub(crate) rail_scroll: ScrollHandle,
     /// The turn whose mark the pointer is over, which opens its preview card.
@@ -152,13 +188,64 @@ pub(crate) struct Shell {
     pub(crate) sidebar_user_w: Option<f32>,
     /// The sidebar resize in flight, if any.
     pub(crate) sidebar_drag: Option<SideDrag>,
+    /// The terminal's screen as of its last version, shared with the paint.
+    pub(crate) terminal_snapshot: std::rc::Rc<crate::terminal::Snapshot>,
+    /// The terminal screen version that copy was taken at.
+    pub(crate) terminal_version: u64,
+    /// The terminal pane's own focus, so typing reaches its PTY.
+    pub(crate) terminal_focus: FocusHandle,
+    /// The cell grid the pane's last prepaint measured, applied on the
+    /// terminal clock so the PTY is resized outside the paint phase, and read
+    /// by the pointer handlers to turn a position into a cell.
+    pub(crate) terminal_frame:
+        std::rc::Rc<std::cell::Cell<Option<super::right_panel::TerminalFrame>>>,
+
+    /// The session being renamed, by id, with the field that renames it.
+    pub(crate) renaming_session: Option<String>,
+    /// The workspace row being retitled, and its own engine for the same reason
+    /// the session rename keeps one.
+    pub(crate) renaming_workspace: Option<String>,
+    /// Whether the recycle bin is open, and what it listed when it opened.
+    pub(crate) trash_open: bool,
+    /// Whether the Built-in plugins pane's two groups are expanded.
+    pub(crate) plugins_session_open: bool,
+    pub(crate) plugins_global_open: bool,
+    /// The row a just-loaded page of older messages should leave at the top,
+    /// applied after it is painted so the reader's place does not jump.
+    pub(crate) older_anchor: Option<usize>,
+    /// The chat page flow: one read in flight plus one page read ahead. The
+    /// Parquet read runs on the background executor, never on this thread.
+    pub(crate) older: PageFlow<OlderPage>,
+    /// Trajectory rows paged out of the Parquet log, oldest page first, and the
+    /// number of pages loaded so far.
+    pub(crate) trace_rows: Vec<crate::history::ToolRow>,
+    /// The session the paged trace belongs to.
+    pub(crate) trace_session: Option<String>,
+    pub(crate) trace_pages: usize,
+    /// The trajectory page flow: the same one-in-flight/one-ahead rule as the
+    /// chat transcript.
+    pub(crate) trace: PageFlow<TracePage>,
+    /// Whether the log has no page past the ones already loaded.
+    ///
+    /// The trace asks for a page whenever the reader's wheel reaches the top,
+    /// and an exhausted log answers empty; without this latch a reader parked
+    /// at the top re-opened the Parquet index once per frame forever. A turn
+    /// ending is the only event that can grow the log, so that clears it.
+    trace_done: bool,
+    /// The histories this shell has already checked for one-time compaction.
+    /// A history is opened once per selection, and the rewrite is asked for
+    /// once, never from a frame.
+    compaction_checked: std::collections::HashSet<String>,
+    pub(crate) trash_entries: Vec<crate::trash::Entry>,
+    pub(crate) workspace_rename: Entity<InputState>,
+    /// The rename field's engine, built once so moving rows keeps focus.
+    pub(crate) session_rename: Entity<InputState>,
+    /// Whether the pointer is on the panel's seam, which reveals its bar.
+    pub(crate) right_hover: bool,
     /// The right panel's own state.
     pub(crate) right: super::right_panel::RightPanel,
     /// The workspace browser's place in the tree.
     pub(crate) files: super::right_panel::FilesPane,
-    /// The terminal's command line. Enter gates the command through regorus
-    /// before it is echoed and (once the PTY is wired) run.
-    pub(crate) terminal_input: Entity<InputState>,
     /// The viewport width as of the last frame, which is what the reference's
     /// sidebar auto-collapse measures.
     pub(crate) viewport_w: f32,
@@ -177,6 +264,16 @@ pub(crate) struct Shell {
     pub(crate) plugins: Vec<crate::plugins::PluginInfo>,
     /// The settings dialog's text fields.
     pub(crate) settings_inputs: SettingsInputs,
+    /// The Vault pane's text fields.
+    pub(crate) vault_inputs: VaultInputs,
+    /// The vault entry whose value is revealed inline, if any.
+    pub(crate) vault_revealed: Option<String>,
+    /// The vault entry awaiting a delete confirmation, if any.
+    pub(crate) vault_confirm_delete: Option<String>,
+    /// The last vault refusal, as the locale key the pane shows.
+    pub(crate) vault_error: Option<&'static str>,
+    /// Whether a key derivation is running, so the pane can say why it waits.
+    pub(crate) vault_busy: bool,
     /// Live subscriptions (input events).
     _subs: Vec<Subscription>,
 }
@@ -270,6 +367,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Self {
         state.restore_session();
+        // A workspace file written before the model became session-scoped
+        // still names one. It is handed to the session that is now open, once,
+        // so an upgrade does not strand the reader on "Select model".
+        state.adopt_legacy_model();
         // Measured: the reference reads its stored content width
         // (dsh.conversation.contentWidth) on every width publish, so a window
         // reopens on the column the reader dragged.
@@ -279,7 +380,14 @@ impl Shell {
         // The meter's tools bucket follows the tool array a request carries, so
         // it is seeded from the same registry the next turn will send: without
         // this the bucket reads zero until the first turn runs.
-        state.set_tools_schema(crate::caps::build_agent(&state.settings).tools_schema_chars);
+        let choice = state
+            .active_id
+            .as_deref()
+            .map(|id| state.session_choice(id))
+            .unwrap_or_default();
+        state.set_tools_schema(
+            crate::caps::build_agent(&state.settings, &state.vault, &choice).tools_schema_chars,
+        );
         // The tree order the sidebar last chose, from the settings file.
         state.sort =
             crate::store::SessionSort::from_persisted(&state.settings.global.general.session_sort);
@@ -309,12 +417,10 @@ impl Shell {
                 .auto_grow(1, crate::theme::QUEUE_EDITOR_MAX_ROWS)
                 .submit_on_enter(true)
         });
-        let terminal_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(crate::i18n::tr(lang, "right.terminal.placeholder"))
-        });
+        // A review note is prose, so the field grows: the reference's card is a
+        // wrapping textarea, not a one-line input.
         let files_note = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder(crate::i18n::tr(lang, "right.files.notePlaceholder"))
         });
         let search = cx.new(|cx| {
@@ -322,6 +428,9 @@ impl Shell {
         });
         let plugin_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.searchPlugins"))
+        });
+        let traj_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "traj.search"))
         });
         let picker_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.fetchSearch"))
@@ -332,7 +441,7 @@ impl Shell {
         let task_name = cx.new(|cx| InputState::new(window, cx));
         let task_prompt = cx.new(|cx| InputState::new(window, cx));
         let task_every = cx.new(|cx| InputState::new(window, cx));
-        let subs = vec![
+        let mut subs = vec![
             cx.subscribe_in(
                 &composer,
                 window,
@@ -375,19 +484,6 @@ impl Shell {
                 },
             ),
             cx.subscribe_in(
-                &terminal_input,
-                window,
-                |this: &mut Shell,
-                 _state: &Entity<InputState>,
-                 event: &InputEvent,
-                 window: &mut Window,
-                 cx: &mut Context<Shell>| {
-                    if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                        this.run_terminal_command(window, cx);
-                    }
-                },
-            ),
-            cx.subscribe_in(
                 &search,
                 window,
                 |this: &mut Shell,
@@ -416,6 +512,20 @@ impl Shell {
                 },
             ),
             cx.subscribe_in(
+                &traj_search,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        this.traj_query = this.traj_search.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
                 &picker_search,
                 window,
                 |this: &mut Shell,
@@ -436,12 +546,31 @@ impl Shell {
         let add_route = cx.new(|cx| InputState::new(window, cx));
         let add_display = cx.new(|cx| InputState::new(window, cx));
         let add_base_url = cx.new(|cx| InputState::new(window, cx));
-        let add_key = cx.new(|cx| InputState::new(window, cx).masked(true));
+
         let new_row_id = cx.new(|cx| InputState::new(window, cx));
         let new_row_name = cx.new(|cx| InputState::new(window, cx));
         let new_model_id = cx.new(|cx| InputState::new(window, cx));
         let new_model_name = cx.new(|cx| InputState::new(window, cx));
         let settings_inputs = SettingsInputs::new(window, cx);
+        let vault_inputs = VaultInputs::new(window, state.lang, cx);
+        // The passphrase fields repaint the strength and mismatch notes as they
+        // are typed; the add row validates on its press, not per keystroke.
+        for input in [&vault_inputs.passphrase, &vault_inputs.confirm] {
+            subs.push(cx.subscribe_in(
+                input,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        this.vault_error = None;
+                        cx.notify();
+                    }
+                },
+            ));
+        }
         let files_new = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(crate::i18n::tr(state.lang, "right.files.newPlaceholder"))
@@ -450,6 +579,44 @@ impl Shell {
             InputState::new(window, cx)
                 .placeholder(crate::i18n::tr(state.lang, "right.files.renamePlaceholder"))
         });
+        // The session rename field: one engine, moved from row to row the way
+        // the files pane's rename engine is, so a second rename reuses it.
+        let session_rename = cx.new(|cx| InputState::new(window, cx));
+        let workspace_rename = cx.new(|cx| InputState::new(window, cx));
+        subs.push(cx.subscribe_in(
+            &workspace_rename,
+            window,
+            |this: &mut Shell,
+             _state: &Entity<InputState>,
+             event: &InputEvent,
+             _window: &mut Window,
+             cx: &mut Context<Shell>| {
+                // Enter commits, and a blur deliberately does not cancel - the
+                // same reason the session field does not (the menu that opened
+                // it takes focus back in the frame it closes).
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.commit_workspace_rename(cx);
+                }
+            },
+        ));
+        subs.push(cx.subscribe_in(
+            &session_rename,
+            window,
+            |this: &mut Shell,
+             _state: &Entity<InputState>,
+             event: &InputEvent,
+             _window: &mut Window,
+             cx: &mut Context<Shell>| {
+                // Enter commits. A blur does NOT cancel: the field opens from a menu
+                // item, and the menu's close (or the composer taking focus back)
+                // blurs it in the same frame, which made the rename vanish the
+                // instant it appeared. The field closes when the reader commits it
+                // or opens another session.
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.commit_session_rename(cx);
+                }
+            },
+        ));
         let mut shell = Self {
             state,
             composer,
@@ -460,6 +627,11 @@ impl Shell {
             queue_open: false,
             search,
             plugin_search,
+            traj_search,
+            traj_mode: 0,
+            traj_select: None,
+            traj_tab: 0,
+            traj_query: String::new(),
             picker_search,
             task_search,
             task_name,
@@ -477,7 +649,7 @@ impl Shell {
             add_route,
             add_display,
             add_base_url,
-            add_key,
+            add_key_vault: None,
             model_rows: Vec::new(),
             new_row_id,
             new_row_name,
@@ -490,11 +662,23 @@ impl Shell {
             caps: Vec::new(),
             plugins: Vec::new(),
             settings_inputs,
+            vault_inputs,
+            vault_revealed: None,
+            vault_confirm_delete: None,
+            vault_error: None,
+            vault_busy: false,
             transcript_scroll: ScrollHandle::new(),
             tail_max: None,
             tail_session: None,
             following_tail: true,
             think_open: std::collections::HashSet::new(),
+            chat_last_offset: 0.0,
+            traj_last_offset: 0.0,
+            chat_smooth: super::smooth::Smooth::default(),
+            traj_smooth: super::smooth::Smooth::default(),
+            traj_scroll: ScrollHandle::new(),
+            side_scroll: ScrollHandle::new(),
+            side_focus: cx.focus_handle(),
             rail_scroll: ScrollHandle::new(),
             rail_hover: Some(58),
             rail_active: None,
@@ -507,9 +691,29 @@ impl Shell {
             chat_drag: None,
             chat_hover: None,
             sidebar_drag: None,
+            renaming_session: None,
+            session_rename,
+            renaming_workspace: None,
+            workspace_rename,
+            trash_open: false,
+            plugins_session_open: true,
+            trace_rows: Vec::new(),
+            trace_session: None,
+            trace_pages: 0,
+            trace: PageFlow::default(),
+            trace_done: false,
+            older_anchor: None,
+            older: PageFlow::default(),
+            compaction_checked: std::collections::HashSet::new(),
+            plugins_global_open: true,
+            trash_entries: Vec::new(),
+            terminal_snapshot: std::rc::Rc::new(crate::terminal::Snapshot::default()),
+            terminal_version: 0,
+            terminal_focus: cx.focus_handle(),
+            terminal_frame: std::rc::Rc::new(std::cell::Cell::new(None)),
+            right_hover: false,
             right: super::right_panel::RightPanel::default(),
             files: super::right_panel::FilesPane::new(files_new, files_rename, files_note),
-            terminal_input,
             models_fetched: None,
             models_fetch_failed: false,
             models_fetch_needs_base_url: false,
@@ -526,6 +730,26 @@ impl Shell {
             .push(cx.observe_window_appearance(window, |this, window, cx| {
                 this.appearance_changed(window, cx);
             }));
+        // The terminal clock: the PTY's reader thread fills the scrollback on
+        // its own, so the pane takes a copy whenever the version moved. A quiet
+        // terminal costs one compare, which is why the cadence can be fine.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(120))
+                .await;
+            if this
+                .update(cx, |this, cx| {
+                    // The policy file's stamp is checked here, not per frame:
+                    // an edited policy takes effect without a restart.
+                    this.refresh_terminal_policy(cx);
+                    this.sync_terminal(cx);
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
         // The jobs clock: the reference re-renders its elapsed figures once a
         // second while the panel is open over a live job, and bsh needs the same
         // cadence to expire an armed stop inside its measured window.
@@ -564,6 +788,9 @@ impl Shell {
         if let Some(section) = open_settings {
             shell.open_settings_at(section, window, cx);
         }
+        // Opening the restored session is the one moment a legacy log is
+        // checked; the rewrite itself runs on the background executor.
+        shell.maybe_compact_history(cx);
         shell
     }
 
@@ -593,7 +820,14 @@ impl Shell {
             .find(|leaf| !leaf.model.trim().is_empty())
             .map(|leaf| leaf.model.trim().to_string())
             .unwrap_or_default();
-        let api_key = node.api_key.clone();
+        // The vault is the only credential source, so the fetch resolves the
+        // same entry the agent build will: the chosen id, else the conventional
+        // provider:<id>:api_key entry.
+        let (api_key, _) = crate::caps::provider_credential(
+            provider,
+            node.api_key_vault.as_deref(),
+            &self.state.vault,
+        );
         let (tx, rx) = async_channel::bounded(1);
         self.state.runner.rt().spawn(async move {
             let vendor = react::llm::vendor::OpenAiVendor::new(endpoint, model, api_key);
@@ -668,7 +902,13 @@ impl Shell {
 
     /// Ask for files and mention them in the composer.
     pub(crate) fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let accepts = self.state.settings.accepts_image();
+        let choice = self
+            .state
+            .active_id
+            .as_deref()
+            .map(|id| self.state.session_choice(id))
+            .unwrap_or_default();
+        let accepts = self.state.settings.accepts_image_for(&choice);
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: true,
@@ -729,29 +969,40 @@ impl Shell {
             let Some(path) = paths.first() else {
                 return;
             };
-            let root = path.to_string_lossy().to_string();
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| root.clone());
             this.update_in(cx, |this, _window, cx| {
-                let existing = this
-                    .state
-                    .settings
-                    .global
-                    .workspaces
-                    .iter()
-                    .find(|w| w.root == root)
-                    .map(|w| w.id.clone());
-                let id =
-                    existing.unwrap_or_else(|| this.state.settings.note_workspace(&name, &root));
-                this.state.settings.global.general.active_workspace = id;
-                let _ = this.state.settings.save();
-                cx.notify();
+                this.adopt_workspace(path, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Register a directory as a workspace and switch to it.
+    ///
+    /// The half of [`Shell::add_workspace`] that does not need a dialog, so the
+    /// hero's "Add workspace..." row and the sidebar's button land in the same
+    /// place - and so a test can drive it without a picker.
+    pub(crate) fn adopt_workspace(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let root = path.to_string_lossy().to_string();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| root.clone());
+        let existing = self
+            .state
+            .settings
+            .global
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.root == root)
+            .map(|workspace| workspace.id.clone());
+        let id = existing.unwrap_or_else(|| self.state.adopt_workspace(&name, &root));
+        self.state.settings.global.general.active_workspace = id;
+        let _ = self.state.settings.save();
+        // A new workspace means a new tree and new notes, and the open file
+        // tabs belonged to the old root.
+        self.refile_workspace(cx);
+        cx.notify();
     }
 
     /// Open the settings dialog on a given rail section.
@@ -848,10 +1099,29 @@ impl Shell {
         }
         let input = crate::state::turn_input(&text, &attachments);
         let display = crate::state::display_text(&text, &attachments);
+        // The session on screen is the one this send opens a turn in, so its
+        // own model choice is what the gate and the build resolve.
+        let choice = self
+            .state
+            .active_id
+            .as_deref()
+            .map(|id| self.state.session_choice(id))
+            .unwrap_or_default();
         // A name the trees no longer define is refused where the reader can see
         // it, before a turn opens against a model nobody chose.
-        if let Some(key) = self.state.settings.refusal() {
+        if let Some(key) = self.state.settings.refusal_for(&choice) {
             let why = crate::i18n::tr(self.state.lang, key);
+            self.state.attachments = attachments;
+            self.state.notice(why);
+            return;
+        }
+        // A credential the vault was meant to supply but cannot, because the
+        // vault is locked, is refused here - before a turn opens - rather than
+        // handed to the provider as an empty key.
+        if let Some(error) =
+            crate::caps::credential_error(&self.state.settings, &self.state.vault, &choice)
+        {
+            let why = error.message(self.state.lang);
             self.state.attachments = attachments;
             self.state.notice(why);
             return;
@@ -884,13 +1154,34 @@ impl Shell {
         budget: usize,
         cx: &mut Context<Self>,
     ) {
-        let built = crate::caps::build_agent(&self.state.settings);
+        // The vault is the ONLY source for a provider credential: the entry
+        // (or provider:<id>:api_key) the session's selected provider names is
+        // resolved here, at build time, so the secret never has to be written
+        // into the settings file.
+        let choice = self.state.session_choice(&id);
+        // No turn opens against a model nobody chose. The composer gates this
+        // before it opens a turn; this is the same gate for the queue and the
+        // scheduler, whose session may have lost its model in between.
+        if let Some(key) = self.state.settings.refusal_for(&choice) {
+            let why = crate::i18n::tr(self.state.lang, key);
+            self.state
+                .apply_event(&id, crate::runner::AgentEvent::Error(why.clone()));
+            self.state.notice(why);
+            return;
+        }
+        let built = crate::caps::build_agent(&self.state.settings, &self.state.vault, &choice);
+        if let Some(error) = &built.credential_error {
+            // No turn opens without a credential: a locked vault names itself
+            // instead of sending the request unauthenticated.
+            self.state.notice(error.message(self.state.lang));
+            return;
+        }
         self.state.set_tools_schema(built.tools_schema_chars);
         let agent = built.agent;
         // The agent shares this store with its `update_plan` tool, so the
         // to-do panel reads the running plan through it.
         self.state.attach_plan(&id, agent.plan());
-        let cap = self.state.settings.effective().tool_output_cap;
+        let cap = self.state.effective_in(&id).tool_output_cap;
         let rx = self
             .state
             .runner
@@ -1009,6 +1300,9 @@ impl Shell {
                     // whatever waited behind it can start.
                     let _ = this.update(cx, |shell, cx| {
                         shell.state.finish_plan(&session_id);
+                        // A finished turn can append trajectory rows, so a page
+                        // the trace had exhausted is worth asking for again.
+                        shell.trace_done = false;
                         shell.drain_inbox(&session_id, cx);
                     });
                     break;
@@ -1019,6 +1313,7 @@ impl Shell {
             // queue behind it still belongs to the reader.
             let _ = this.update(cx, |shell, cx| {
                 shell.state.finish_plan(&id);
+                shell.trace_done = false;
                 shell.drain_inbox(&id, cx);
                 cx.notify();
             });
@@ -1032,6 +1327,373 @@ impl Shell {
     /// `crate::theme::chat_width_at`.
     pub(crate) fn chat_w(&self) -> f32 {
         crate::theme::resolve_content_width(self.conversation_w.as_f32(), self.chat_user_w)
+    }
+
+    /// Ask for the one-time legacy compaction, off the UI thread.
+    ///
+    /// A history is checked once per session selection: opening it is the cheap
+    /// manifest path, and only a log that predates the index (or carries a
+    /// scattered tail) is rewritten. The rewrite builds a sibling directory and
+    /// swaps it by rename, so no frame waits on it.
+    pub(crate) fn maybe_compact_history(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.state.active_id.clone() else {
+            return;
+        };
+        if !self.compaction_checked.insert(id.clone()) {
+            return;
+        }
+        if !self.state.store.history_needs_compaction(&id) {
+            return;
+        }
+        let Some(dir) = self.state.store.history_dir(&id) else {
+            return;
+        };
+        let target = dir.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::history::compact_directory(&target) })
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                // Another window finished the rewrite first. The cached index
+                // still names the files its swap removed, so it is dropped
+                // just the same, without a repaint to announce nothing new.
+                Ok(crate::history::Compaction::Noop) => {
+                    this.state.store.forget_history(&dir);
+                }
+                Ok(crate::history::Compaction::Rewritten { .. }) => {
+                    // The swap moved the whole directory, so the cached index
+                    // points at files that are gone: the next page read must
+                    // open the sealed one.
+                    this.state.store.forget_history(&dir);
+                    cx.notify();
+                }
+                // Busy: another compactor owns the marker and the live
+                // directory is still readable, so the cached index stays.
+                Ok(crate::history::Compaction::Busy) | Err(_) => {}
+            });
+        })
+        .detach();
+    }
+
+    /// Ask for the first trajectory page, or the next older one.
+    ///
+    /// The trace tab reads its tool rows from the Parquet log rather than from
+    /// the messages in memory, so a long run is scrollable without being
+    /// resident. The index snapshot is taken here; the decode runs on the
+    /// background executor and comes back through the entity. A page read ahead
+    /// is applied without touching the disk, and a request while one is loading
+    /// is the same request, so it is dropped.
+    ///
+    /// Returns whether a read started or a buffered page was applied.
+    pub(crate) fn request_trace_page(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.trace_done {
+            return false;
+        }
+        let Some(id) = self.state.active_id.clone() else {
+            return false;
+        };
+        let page = self.trace_pages;
+        if self.trace.is_busy() {
+            return false;
+        }
+        let key = PageKey {
+            session: id.clone(),
+            key: page,
+        };
+        if let Some(pending) = self
+            .trace
+            .take_ahead(|pending| pending.session == id && pending.page == page)
+        {
+            return self.land_trace(pending, cx);
+        }
+        self.trace.clear_ahead();
+        let Some(read) = self.state.begin_trace_page(&id, page) else {
+            self.trace_done = true;
+            return false;
+        };
+        if !self.trace.begin(key) {
+            return false;
+        }
+        cx.spawn(async move |this, cx| {
+            let page = cx
+                .background_executor()
+                .spawn(async move { read.read() })
+                .await;
+            let key = PageKey {
+                session: page.session.clone(),
+                key: page.page,
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.trace.finish(&key) {
+                    this.land_trace(page, cx);
+                }
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// Apply one decoded trajectory page above the loaded one.
+    fn land_trace(&mut self, page: TracePage, cx: &mut Context<Self>) -> bool {
+        if self.state.active_id.as_deref() != Some(page.session.as_str())
+            || page.page != self.trace_pages
+        {
+            return false;
+        }
+        if page.rows.is_empty() {
+            self.trace_done = true;
+            return false;
+        }
+        let added = page.rows.len();
+        // Each page is OLDER than the last, so it is prepended: the trace reads
+        // oldest to newest. The newest rows fall off the bottom once the loaded
+        // window is several pages wide, so a deep scroll cannot grow without
+        // bound; they are still in the Parquet log.
+        let mut rows = page.rows;
+        rows.extend(std::mem::take(&mut self.trace_rows));
+        const TRACE_MAX_ROWS: usize = 4 * crate::history::PAGE;
+        rows.truncate(TRACE_MAX_ROWS);
+        self.trace_rows = rows;
+        self.trace_pages += 1;
+        self.trace_session = self.state.active_id.clone();
+        self.start_trace_ahead(cx);
+        cx.notify();
+        added > 0
+    }
+
+    /// Read the next trajectory page ahead of the reader.
+    ///
+    /// At most one is in flight and one is buffered; a log that has no page
+    /// left latches the flow done so a reader parked at the top does not ask
+    /// again on every frame.
+    pub(crate) fn start_trace_ahead(&mut self, cx: &mut Context<Self>) {
+        if self.trace_done || self.trace.has_ahead() {
+            return;
+        }
+        let Some(id) = self.state.active_id.clone() else {
+            return;
+        };
+        let page = self.trace_pages;
+        let Some(read) = self.state.begin_trace_page(&id, page) else {
+            self.trace_done = true;
+            return;
+        };
+        let key = PageKey {
+            session: id,
+            key: page,
+        };
+        if !self.trace.begin_ahead(key) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let page = cx
+                .background_executor()
+                .spawn(async move { read.read() })
+                .await;
+            let key = PageKey {
+                session: page.session.clone(),
+                key: page.page,
+            };
+            let _ = this.update(cx, |this, _cx| {
+                if this.trace.finish_ahead(&key) {
+                    this.trace.store_ahead(page);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Jump to a turn from the rail.
+    ///
+    /// The newest mark is the way back to the live end: it re-engages the tail, so
+    /// the chat follows again from anywhere. Every other mark leaves the tail,
+    /// because a jump up the transcript must not be undone by the next frame.
+    pub(crate) fn jump_to_turn(&mut self, child: usize, newest: bool) {
+        if newest {
+            self.following_tail = true;
+            self.transcript_scroll.scroll_to_bottom();
+        } else {
+            self.following_tail = false;
+            self.transcript_scroll.scroll_to_top_of_item(child);
+        }
+    }
+
+    /// Page in the window of messages above the transcript when the reader
+    /// reaches its top.
+    ///
+    /// This is the memory half of the paged history: a session keeps only the
+    /// last windows of its Parquet log in memory, and the older ones arrive as
+    /// the reader scrolls to them. The read is SCHEDULED here, never performed
+    /// here, so a slow disk cannot stall the frame. The anchor is applied on a
+    /// later frame, so the message they were looking at stays where it was.
+    pub(crate) fn page_older_at_the_top(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(anchor) = self.older_anchor.take() {
+            self.transcript_scroll.scroll_to_top_of_item(anchor);
+            cx.notify();
+            return false;
+        }
+        // Both logs are paged per session: a session switch starts them over.
+        // The in-flight page, if any, lands into the flow of the session that
+        // asked for it and is dropped when the flow no longer names it.
+        if self.state.active_id != self.trace_session {
+            self.trace_session = self.state.active_id.clone();
+            self.trace_pages = 0;
+            self.trace_rows.clear();
+            self.trace_done = false;
+            self.trace.reset();
+            self.older.reset();
+        }
+        if self.state.tab == crate::state::Tab::Trajectory {
+            // The trace has its own paging: reaching its top pulls the next page
+            // of the trajectory log, and the rows arrive above what is drawn.
+            let at_top = f32::from(self.traj_scroll.offset().y) > -crate::theme::PAGE_TRIGGER;
+            return at_top && self.request_trace_page(cx);
+        }
+        if self.following_tail {
+            return false;
+        }
+        // Near the top: the scroller's offset is zero at the oldest painted
+        // row and negative going down.
+        if self.chat_last_offset < -(crate::theme::PAGE_TRIGGER) {
+            return false;
+        }
+        let at_start = self
+            .state
+            .active_session()
+            .map(|session| session.paged_from == Some(0))
+            .unwrap_or(true);
+        if at_start {
+            return false;
+        }
+        self.request_older_page(cx)
+    }
+
+    /// Ask for the window of older messages above the transcript.
+    ///
+    /// A page already read ahead is applied without touching the disk; a page
+    /// still loading coalesces this ask; otherwise the read is scheduled on the
+    /// background executor. The index snapshot is O(1) and the rows come back
+    /// through the entity, so the render path never blocks on the files.
+    pub(crate) fn request_older_page(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(read) = self.state.begin_older_read() else {
+            return false;
+        };
+        if self.older.is_busy() {
+            return false;
+        }
+        let key = PageKey {
+            session: read.session().to_string(),
+            key: read.from(),
+        };
+        if let Some(pending) = self
+            .older
+            .take_ahead(|pending| pending.session == key.session && pending.from == key.key)
+        {
+            return self.land_older(pending, cx);
+        }
+        self.older.clear_ahead();
+        self.start_older_read(read, key, cx);
+        true
+    }
+
+    /// Schedule one decoded window above the loaded chat.
+    fn start_older_read(
+        &mut self,
+        read: crate::store::OlderRead,
+        key: PageKey,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.older.begin(key) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let page = cx
+                .background_executor()
+                .spawn(async move { read.read() })
+                .await;
+            let key = PageKey {
+                session: page.session.clone(),
+                key: page.from,
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.older.finish(&key) {
+                    this.land_older(page, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Apply one decoded window above the loaded chat and keep the reader's
+    /// place.
+    fn land_older(&mut self, page: OlderPage, cx: &mut Context<Self>) -> bool {
+        if self.state.active_id.as_deref() != Some(page.session.as_str()) {
+            return false;
+        }
+        let added = self
+            .state
+            .finish_older_read(page, crate::theme::WINDOWS_KEPT);
+        if added == 0 {
+            return false;
+        }
+        if self.state.tab == crate::state::Tab::Trajectory {
+            self.traj_select = None;
+            self.traj_scroll.scroll_to_top_of_item(0);
+        } else {
+            // The anchor is the row the reader was looking at: it becomes the
+            // top of the viewport once the older rows are above it.
+            self.older_anchor = Some(added.saturating_sub(1));
+        }
+        self.start_older_ahead(cx);
+        cx.notify();
+        true
+    }
+
+    /// Read the window before the loaded one, ahead of the reader.
+    ///
+    /// At most one is in flight and one is buffered, and a log at its first row
+    /// has nothing to ask for. This is what makes the next scroll instant
+    /// without turning every reach into an eager whole-log load.
+    pub(crate) fn start_older_ahead(&mut self, cx: &mut Context<Self>) {
+        if self.older.has_ahead() {
+            return;
+        }
+        let Some(read) = self.state.begin_older_read() else {
+            return;
+        };
+        let key = PageKey {
+            session: read.session().to_string(),
+            key: read.from(),
+        };
+        if !self.older.begin_ahead(key) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let page = cx
+                .background_executor()
+                .spawn(async move { read.read() })
+                .await;
+            let key = PageKey {
+                session: page.session.clone(),
+                key: page.from,
+            };
+            let _ = this.update(cx, |this, _cx| {
+                if this.older.finish_ahead(&key) {
+                    this.older.store_ahead(page);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The left inset the transcript keeps, narrower than the right band.
+    ///
+    /// The chat is not centred: the right edge stays where the turn rail and
+    /// the composer expect it, and the left edge moves out, because the empty
+    /// strip beside the text was the widest thing on a wide window.
+    pub(crate) fn chat_left_inset(&self) -> f32 {
+        crate::theme::chat_left_inset(self.conversation_w.as_f32(), self.chat_w())
     }
 
     /// The measured width-handle strip for the live column.
@@ -1254,9 +1916,234 @@ impl Shell {
         }
     }
 
+    /// Put a session's title into the rename field, in place on its row.
+    ///
+    /// The reference renames inline, so the row the reader pointed at is where
+    /// the field appears; nothing opens over the conversation.
+    pub(crate) fn begin_session_rename(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(title) = self.state.session_title(id) else {
+            return;
+        };
+        self.renaming_session = Some(id.to_string());
+        let field = self.session_rename.clone();
+        field.update(cx, |state, cx| state.set_value(title, window, cx));
+        // Focus AFTER this frame: when the menu item was the door, the menu's own
+        // close handed focus back to whatever held it and our field blurred in the
+        // same dispatch, so the rename vanished as it appeared.
+        window.defer(cx, move |window, cx| {
+            field.update(cx, |state, cx| {
+                state.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.notify();
+    }
+
+    /// Apply the rename; a blank field leaves the title alone.
+    /// Ease the transcript towards its wheel target, one frame at a time.
+    ///
+    /// Returns whether another frame is needed. The target is set by
+    /// [`Shell::wheel_chat`], so a wheel event only decides WHERE to go; the
+    /// motion happens here, which is what makes it smooth instead of a jump.
+    pub(crate) fn advance_smooth(&mut self) -> bool {
+        let mut animating = false;
+        if self.chat_smooth.animating() {
+            let current = f32::from(self.transcript_scroll.offset().y);
+            if let Some(next) = self.chat_smooth.step(current) {
+                self.transcript_scroll.set_offset(point(px(0.0), px(next)));
+                animating = self.chat_smooth.animating();
+            }
+        }
+        if self.traj_smooth.animating() {
+            let current = f32::from(self.traj_scroll.offset().y);
+            if let Some(next) = self.traj_smooth.step(current) {
+                self.traj_scroll.set_offset(point(px(0.0), px(next)));
+                animating = animating || self.traj_smooth.animating();
+            }
+        }
+        animating
+    }
+
+    /// Take a wheel delta meant for the chat transcript.
+    ///
+    /// Two things happen, and both matter. The tail-follow is switched OFF: the
+    /// shell re-pins the transcript to the newest message every frame while it is
+    /// on, so a reader could not scroll up at all until they used the rail. And the
+    /// delta becomes a TARGET the frame loop eases towards, instead of an instant
+    /// jump.
+    pub(crate) fn wheel_chat(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if delta == 0.0 {
+            return;
+        }
+        self.following_tail = false;
+        // `jumped` is what the scroller itself did before this listener ran; taking
+        // it back leaves the easing as the only thing that moves the transcript.
+        let jumped = self.take_back_chat_jump();
+        let step = if jumped != 0.0 { jumped } else { delta };
+        let max = f32::from(self.transcript_scroll.max_offset().y);
+        self.chat_smooth.aim(super::smooth::wheel_target(
+            self.chat_last_offset,
+            step,
+            max,
+        ));
+        cx.notify();
+    }
+
+    /// Take a wheel delta meant for the trajectory tab.
+    pub(crate) fn wheel_trajectory(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if delta == 0.0 {
+            return;
+        }
+        let current = f32::from(self.traj_scroll.offset().y);
+        let jumped = current - self.traj_last_offset;
+        if jumped.abs() > 0.5 {
+            self.traj_scroll
+                .set_offset(point(px(0.0), px(self.traj_last_offset)));
+        }
+        let step = if jumped.abs() > 0.5 { jumped } else { delta };
+        let max = f32::from(self.traj_scroll.max_offset().y);
+        self.traj_smooth.aim(super::smooth::wheel_target(
+            self.traj_last_offset,
+            step,
+            max,
+        ));
+        cx.notify();
+    }
+
+    /// Undo whatever the scroller did on its own; returns how far it jumped.
+    fn take_back_chat_jump(&mut self) -> f32 {
+        let current = f32::from(self.transcript_scroll.offset().y);
+        let jumped = current - self.chat_last_offset;
+        if jumped.abs() > 0.5 {
+            self.transcript_scroll
+                .set_offset(point(px(0.0), px(self.chat_last_offset)));
+        }
+        jumped
+    }
+
+    /// The chat target for a delta, clamped to the scroller's range.
+    /// Open the workspace row's title for editing.
+    pub(crate) fn begin_workspace_rename(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = self
+            .state
+            .settings
+            .global
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .map(|workspace| workspace.name.clone())
+        else {
+            return;
+        };
+        self.renaming_workspace = Some(id.to_string());
+        let field = self.workspace_rename.clone();
+        field.update(cx, |state, cx| state.set_value(name, window, cx));
+        // Focus after this frame, for the reason the session field documents:
+        // the menu closes in the same dispatch and hands focus back first.
+        window.defer(cx, move |window, cx| {
+            field.update(cx, |state, cx| {
+                state.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.notify();
+    }
+
+    /// Commit the workspace rename, if the field is open.
+    pub(crate) fn commit_workspace_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.renaming_workspace.take() else {
+            return;
+        };
+        let name = self.workspace_rename.read(cx).value().to_string();
+        if !self.state.rename_workspace(&id, &name) {
+            // A blank name is not a rename; keep the field open rather than
+            // silently discarding the edit.
+            self.renaming_workspace = Some(id);
+        }
+        cx.notify();
+    }
+
+    /// Remove a workspace from the list, rehoming its chats.
+    pub(crate) fn delete_workspace(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.state.delete_workspace(id) {
+            // The file pane's paths belonged to the deleted root.
+            self.refile_workspace(cx);
+        }
+        cx.notify();
+    }
+
+    /// Delete a chat, out of the menu that asked for it.
+    ///
+    /// The row goes, the file goes with it (a list row leaving must not let a
+    /// transcript come back on the next launch), and any rename field on that
+    /// row is put away first so it cannot commit into a chat that no longer
+    /// exists.
+    pub(crate) fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.renaming_session.as_deref() == Some(id) {
+            self.renaming_session = None;
+        }
+        self.state.delete_session(id);
+        cx.notify();
+    }
+
+    /// Open a chat in a named workspace from its own row.
+    pub(crate) fn new_session_in_workspace(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(session) = self.state.new_session_in(id) {
+            self.state.select(&session);
+        }
+        self.refile_workspace(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn commit_session_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.renaming_session.take() else {
+            return;
+        };
+        let title = self.session_rename.read(cx).value().to_string();
+        self.state.rename_session(&id, &title);
+        cx.notify();
+    }
+
+    /// Drop the rename without touching the title.
+    pub(crate) fn cancel_session_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming_session.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Branch a session and open the copy, which is what Fork session means.
+    pub(crate) fn fork_session_at(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(forked) = self.state.fork_session(id) else {
+            return;
+        };
+        self.state.select(&forked);
+        self.maybe_compact_history(cx);
+        self.renaming_session = None;
+        cx.notify();
+    }
+
+    /// Put a session's id on the clipboard, which is what a bug report needs.
+    pub(crate) fn copy_session_id(&mut self, id: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
+        cx.notify();
+    }
     /// Select a session and focus the composer.
     pub(crate) fn open_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A rename belongs to the row it was opened on; moving to another
+        // session puts it away rather than leaving a field on an unselected row.
+        if self.renaming_session.as_deref() != Some(id) {
+            self.cancel_session_rename(cx);
+        }
         self.state.select(id);
+        self.maybe_compact_history(cx);
         self.composer
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
@@ -1336,7 +2223,17 @@ impl Render for Shell {
         } else {
             px(self.sidebar_w())
         };
-        self.conversation_w = window.viewport_size().width - sidebar;
+        // The conversation column is what the centre column actually gets, so
+        // an open right panel is part of the arithmetic: the panel is a sibling
+        // column in the same row, and measuring without it made the chat width,
+        // the width handles and the rail's own container query believe in space
+        // the layout had already given away.
+        let panel = if self.right.open {
+            px(self.right_panel_w())
+        } else {
+            px(0.0)
+        };
+        self.conversation_w = window.viewport_size().width - sidebar - panel;
         // The rail follows the active mark, unless the pointer is working it.
         self.follow_rail();
         // Follow the tail, the state the reference marks as data-chat-following-tail:
@@ -1365,13 +2262,36 @@ impl Render for Shell {
         }
         if self.following_tail {
             scroll.scroll_to_bottom();
-            if max <= px(0.0) {
-                // Nothing has been laid out yet, so the content height is still
-                // unknown: take one more frame and scroll once it is measured.
+            // The first frame on a new session lays the content out but reports
+            // no height yet, so one follow-up frame is what turns the measured
+            // height into an offset. That request is bounded by the measurement
+            // being MISSING: asking again while the height is still zero (an
+            // empty transcript, or the hero phase) repainted an idle shell at
+            // the display's frame rate forever.
+            if max <= px(0.0) && self.tail_max.is_none() {
                 cx.notify();
             }
         }
         self.tail_max = Some(max);
+        // The wheel's easing runs after the tail decision, and asks for the next
+        // frame while it is still moving.
+        if self.advance_smooth() {
+            cx.notify();
+        }
+        self.chat_last_offset = f32::from(self.transcript_scroll.offset().y);
+        self.traj_last_offset = f32::from(self.traj_scroll.offset().y);
+        self.page_older_at_the_top(cx);
+        // A rail whose marks overflow keeps the NEWEST mark in view: the reader
+        // is at the tail, and the last mark is the one they press to come back.
+        if self.following_tail {
+            // max_offset is a MAGNITUDE (positive), while the live offset runs
+            // from zero down to its negative: the rail is only at the bottom when
+            // the two agree in size.
+            let max = self.rail_scroll.max_offset().y;
+            if max > px(0.0) && self.rail_scroll.offset().y > -max {
+                self.rail_scroll.scroll_to_bottom();
+            }
+        }
         let overlay = if self.state.overlay == Overlay::Settings {
             // The panel is sized against the viewport, like the reference's
             // own min(800px, 100vh - 48px) height.
@@ -1390,6 +2310,7 @@ impl Render for Shell {
             };
         // The full-access risk gate is reachable from the General pane's row and
         // from the composer chip, so it is hosted here rather than inside either.
+        let trash = self.trash_open.then(|| self.render_trash(cx));
         let confirm_permission = if self.permission_confirm.is_some() {
             Some(self.render_permission_confirm(cx))
         } else {
@@ -1400,6 +2321,13 @@ impl Render for Shell {
         let confirm_provider_delete =
             if self.state.overlay == Overlay::Settings && self.state.removing_provider.is_some() {
                 Some(self.render_provider_delete(cx))
+            } else {
+                None
+            };
+        // The vault's own delete confirmation, drawn over the same panel.
+        let confirm_vault_delete =
+            if self.state.overlay == Overlay::Settings && self.vault_confirm_delete.is_some() {
+                Some(self.render_vault_delete(cx))
             } else {
                 None
             };
@@ -1415,9 +2343,43 @@ impl Render for Shell {
             // pressed strip but the MOVES to whatever is under the pointer,
             // so the frame carries those. It is a no-op without a drag.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                // A seam only follows a HELD pointer. The strip is 8px wide, so a
+                // horizontal drag leaves it at once; the release then went to
+                // whatever is under the pointer and the strip's own mouse-up
+                // never ran, leaving the drag armed - the panel kept resizing
+                // after the button came up. Reading the button off the move is
+                // the state a drag cannot drift out of.
+                if event.pressed_button.is_none() && this.right.drag.take().is_some() {
+                    cx.notify();
+                }
                 this.drag_sidebar_width(event.position.x.as_f32(), cx);
                 this.drag_right_panel_width(event.position.x.as_f32(), cx);
             }))
+            // The session menu's accelerators, handled at the frame so they work
+            // from wherever focus sits inside it - the composer, a field, a list
+            // row. They act on the session the reader has open.
+            .on_action(
+                cx.listener(|this, _: &super::session_menu::RenameSession, window, cx| {
+                    if let Some(id) = this.state.active_id.clone() {
+                        this.begin_session_rename(&id, window, cx);
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &super::session_menu::ForkSession, _window, cx| {
+                    if let Some(id) = this.state.active_id.clone() {
+                        this.fork_session_at(&id, cx);
+                    }
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &super::session_menu::ArchiveSession, _window, cx| {
+                    if let Some(id) = this.state.active_id.clone() {
+                        this.state.archive_session(&id);
+                        cx.notify();
+                    }
+                },
+            ))
             .bg(rgb(crate::theme::page()))
             .text_color(rgb(crate::theme::text()))
             .when(!self.sidebar_folded(), |root| {
@@ -1434,5 +2396,7 @@ impl Render for Shell {
             .when_some(confirm_delete, |root, confirm| root.child(confirm))
             .when_some(confirm_permission, |root, confirm| root.child(confirm))
             .when_some(confirm_provider_delete, |root, confirm| root.child(confirm))
+            .when_some(confirm_vault_delete, |root, confirm| root.child(confirm))
+            .when_some(trash, |root, panel| root.child(panel))
     }
 }

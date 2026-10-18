@@ -4,7 +4,7 @@
   "labels": ["dependencies"],
   "packageRules": [
     {
-      "matchPackageNames": ["@napi/cli", "napi", "napi-build", "napi-derive"],
+      "matchPackageNames": ["@napi-rs/cli", "napi", "napi-build", "napi-derive"],
       "addLabels": ["napi-rs"],
       "groupName": "napi-rs"
     },

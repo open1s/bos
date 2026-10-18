@@ -145,7 +145,9 @@ impl TokenUsage {
             prompt_tokens: prompt,
             completion_tokens: completion,
             cached_tokens: 0,
-            total_tokens: prompt + completion,
+            // Provider token counts are u32 inputs; a sum that overflows must
+            // saturate rather than panic in a debug build.
+            total_tokens: prompt.saturating_add(completion),
         }
     }
 }
@@ -303,10 +305,6 @@ impl TokenCounter {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Lifetime prompt and completion totals across every recorded request.
-    ///
-    /// Unlike [`TokenCounter::usage`], which reports only the current
-    /// request, these sums accumulate for as long as the counter exists.
     /// Lifetime count of prompt tokens the provider served from its cache.
     ///
     /// Zero for a provider that never reports the breakdown, which is why the
@@ -375,6 +373,12 @@ impl Default for TokenCounter {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    fn an_overflowing_token_sum_saturates() {
+        let usage = TokenUsage::new(u32::MAX, 10);
+        assert_eq!(usage.total_tokens, u32::MAX);
+    }
 
     #[test]
     fn a_provider_cache_breakdown_is_counted_and_absent_means_unknown() {

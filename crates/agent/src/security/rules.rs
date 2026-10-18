@@ -244,6 +244,10 @@ impl ToolRule {
 }
 
 /// Glob match supporting `*` as "any run of characters" (including empty).
+///
+/// The matcher backtracks on the most recent `*`, so literal segments must
+/// appear in order: `*a*b` rejects `ba` instead of scanning for `a` and then
+/// finding `b` anywhere after it.
 fn glob_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -252,28 +256,33 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         return pattern == text;
     }
 
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let Some((first, rest_parts)) = parts.split_first() else {
-        return false;
-    };
-    let Some((last, middle)) = rest_parts.split_last() else {
-        return text.starts_with(first);
-    };
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut p, mut t) = (0usize, 0usize);
+    // Where the last `*` started, and how much of the text it has consumed.
+    let mut backtrack: Option<(usize, usize)> = None;
 
-    let mut rest = match text.strip_prefix(first) {
-        Some(rest) => rest,
-        None => return false,
-    };
-    for part in middle {
-        if part.is_empty() {
-            continue;
-        }
-        match rest.find(part) {
-            Some(idx) => rest = &rest[idx + part.len()..],
-            None => return false,
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            backtrack = Some((p, t));
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some((star, consumed)) = backtrack {
+            // Let the star swallow one more character and retry the tail.
+            p = star + 1;
+            t = consumed + 1;
+            backtrack = Some((star, consumed + 1));
+        } else {
+            return false;
         }
     }
-    rest.ends_with(last)
+
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// The result of evaluating a tool call against a [`RuleSet`].
@@ -579,6 +588,21 @@ mod tests {
             .decide("anything", &json!({}), &global())
             .effect
             .is_allowed());
+    }
+
+    #[test]
+    fn glob_wildcards_keep_literal_segments_in_order() {
+        // The greedy scan this replaced accepted `ba` for `*a*b` because it
+        // searched for `a` and then only checked the suffix `b`.
+        assert!(!glob_match("*a*b", "ba"));
+        assert!(glob_match("*a*b", "a-b"));
+        assert!(glob_match("a*b*c", "axbyc"));
+        assert!(!glob_match("a*b*c", "axcb"));
+        assert!(glob_match("fs_*", "fs_read"));
+        assert!(glob_match("*_read", "fs_read"));
+        assert!(!glob_match("*_write", "fs_read"));
+        assert!(glob_match("**any**", "any"));
+        assert!(glob_match("**", ""));
     }
 
     #[test]

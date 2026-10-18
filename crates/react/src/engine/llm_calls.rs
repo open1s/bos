@@ -85,20 +85,24 @@ impl<A: ReActApp> ReActEngine<A> {
                 return result.map_err(ReactError::from);
             }
 
-            // Check if we should retry
-            attempt += 1;
+            // `max_retries` counts retries after the first attempt, matching
+            // `RateLimiterConfig` and `ReActResilience::execute_with`. Compare
+            // before incrementing so a limit of 3 retries makes four calls.
             if attempt >= max_retries {
                 info!("[TIMING] call_llm total (max retries): {:?}", t0.elapsed());
                 return result.map_err(ReactError::from);
             }
+            attempt += 1;
 
-            // Exponential backoff from the configured base, capped at 64x.
+            // Exponential backoff from the configured base, capped at 6x so
+            // a large retry budget cannot overflow the shift or the delay.
             let backoff = self
                 .resilience
                 .as_ref()
                 .map(|r| r.rate_limit_config().retry_backoff)
                 .unwrap_or(std::time::Duration::from_millis(500));
-            let delay = backoff * (1u32 << (attempt - 1)).min(6);
+            let factor = 1u32.checked_shl(attempt - 1).unwrap_or(u32::MAX).min(6);
+            let delay = backoff * factor;
             info!("[TIMING] call_llm retrying after {:?} delay", delay);
             match &self.resilience {
                 Some(resilience) => resilience.backoff(delay).await,

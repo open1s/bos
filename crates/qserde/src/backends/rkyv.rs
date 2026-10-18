@@ -28,12 +28,15 @@ impl RkyvBackend {
     }
 
     /// Deserialize bytes to a value using rkyv (zero-copy)
+    ///
+    /// The archived data is validated first, so malformed bytes are reported as
+    /// an error rather than being reinterpreted as an archive.
     pub fn deserialize<T>(&self, bytes: &[u8]) -> Result<T, QserdeError>
     where
         T: rkyv::Archive,
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>
+            + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
     {
-        unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(bytes) }
-            .map_err(|e| QserdeError::deserialize(e.to_string()))
+        rkyv::from_bytes::<T, RkyvError>(bytes).map_err(|e| QserdeError::deserialize(e.to_string()))
     }
 }
