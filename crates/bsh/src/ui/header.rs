@@ -251,7 +251,17 @@ impl Shell {
     ///
     /// Measured: the header is 76 tall over a `10px 28px 0 20px` padding with a
     /// `.5px` `border-l3` rule under it; the tab strip adds its own 10px margin.
+    ///
+    /// Folded, the row grows its left pad to 76: the window's traffic lights sit
+    /// at x=14 and run to about x=66, so the two controls the folded state adds
+    /// (Show left panel and Add Session) have to start past them rather than
+    /// underneath them. Open, the lights are over the sidebar and 20 is right.
     pub(crate) fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pad_left = if self.sidebar_folded() {
+            theme::SIDEBAR_LIGHT_PAD
+        } else {
+            20.0
+        };
         let header = div()
             .debug_selector(|| "hdr-header".to_string())
             .flex()
@@ -259,7 +269,7 @@ impl Shell {
             .min_h(px(76.0))
             .pt(px(10.0))
             .pr(px(28.0))
-            .pl(px(20.0))
+            .pl(px(pad_left))
             .child(self.title_row(cx))
             .child(self.tab_strip(cx));
         hairline_bottom(header).border_color(rgb(theme::border_soft()))
@@ -284,6 +294,47 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(10.0))
+            // The reference's folded state: with the sidebar away, the header's
+            // left edge carries the two controls the sidebar used to hold - the
+            // panel toggle that brings it back, and New Session - ahead of the
+            // title. When the sidebar is up, both live in it and the row starts
+            // at the title.
+            .when(self.sidebar_folded(), |row| {
+                row.child(
+                    div()
+                        .id("hdr-show-sidebar")
+                        .debug_selector(|| String::from("hdr-show-sidebar"))
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .child(icon(IconName::PanelLeft, 15.0, theme::muted()))
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.toggle_sidebar_at(window.viewport_size().width.as_f32(), cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id("hdr-new-session")
+                        .debug_selector(|| String::from("hdr-new-session"))
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .child(icon(IconName::Plus, 15.0, theme::muted()))
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.new_chat(window, cx);
+                        })),
+                )
+            })
             .child(
                 // Measured: the current crumb is 14px/20px at weight 500, label-primary.
                 txt(title, theme::BODY_SIZE, theme::text())
@@ -343,11 +394,13 @@ impl Shell {
             // ahead of the panel toggle; the editor is whichever known one is
             // actually installed.
             .children(self.open_controls(cx))
-            // The reference header ends with the panel toggle; language lives in
-            // settings and the account menu, and New session lives in the sidebar.
+            // The reference header ends with the right panel's toggle. The left
+            // column's controls live elsewhere: the sidebar's own strip carries
+            // its fold control while it is up, and the folded state carries
+            // Show-left-panel and New Session at the title row's left edge.
             .child(self.header_button(
-                "hdr-show-sidebar",
-                icon(IconName::PanelLeft, 15.0, theme::muted()),
+                "hdr-show-right-panel",
+                icon(IconName::PanelRight, 15.0, theme::muted()),
                 cx,
             ))
     }
@@ -902,6 +955,9 @@ impl Shell {
             .on_click(cx.listener(move |this, _event, window, cx| match id {
                 "hdr-show-sidebar" => {
                     this.toggle_sidebar_at(window.viewport_size().width.as_f32(), cx);
+                }
+                "hdr-show-right-panel" => {
+                    this.toggle_right_panel(cx);
                 }
                 _ => {
                     this.open_settings(window, cx);

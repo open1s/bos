@@ -22,6 +22,15 @@ use crate::ui::shell::Shell;
 use crate::ui::todo_panel::progress;
 use gpui_kit::component::ActiveTheme as _;
 
+/// Boot the kit and bind bsh's own keys, the way `ui::run` does.
+///
+/// A test that never walks `ui::run` never gets the cmd-s binding the files
+/// editor relies on, so every test boots through here instead.
+fn init_test_app(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    cx.update(crate::ui::bind_global_actions);
+}
+
 /// Holds the shell so the window can render an entity the test also keeps.
 struct Harness {
     shell: Entity<Shell>,
@@ -129,7 +138,7 @@ fn the_progress_summary_counts_each_status() {
 /// by default, sitting on the composer stack's own 6px gap above the card.
 #[gpui::test]
 fn the_todo_panel_takes_the_measured_chrome(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_plan(
             "todo-chrome",
@@ -188,7 +197,7 @@ fn the_todo_panel_takes_the_measured_chrome(cx: &mut TestAppContext) {
 /// The header toggles the list open, which is the only control the panel has.
 #[gpui::test]
 fn the_todo_header_expands_the_list(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_plan(
             "todo-expand",
@@ -230,7 +239,7 @@ fn the_todo_header_expands_the_list(cx: &mut TestAppContext) {
 /// A session with no plan draws no panel, which is what the reference does.
 #[gpui::test]
 fn the_todo_panel_is_hidden_without_a_plan(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("todo-empty"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -270,7 +279,7 @@ fn state_with_queue(label: &str, texts: &[&str]) -> AppState {
 /// exposes no size hook - the same limit recorded for the font-size step.
 #[gpui::test]
 fn the_composer_editor_grows_to_its_measured_ceiling(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("composer-grow", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -331,7 +340,7 @@ fn the_composer_editor_grows_to_its_measured_ceiling(cx: &mut TestAppContext) {
 /// draft and stops at the measured 127px ceiling, and the row grows with it.
 #[gpui::test]
 fn the_queue_editor_grows_to_its_measured_ceiling(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_queue("queue-grow", &["first wait"]);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -418,7 +427,7 @@ fn set_queue_draft(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str
 /// message waits.
 #[gpui::test]
 fn the_queue_dock_takes_the_measured_chrome(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_queue("queue-chrome", &["first wait", "second wait"]);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -468,7 +477,7 @@ fn the_queue_dock_takes_the_measured_chrome(cx: &mut TestAppContext) {
 /// header and draws its row directly, which is the reference's own rule.
 #[gpui::test]
 fn the_queue_dock_lists_its_rows(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_queue("queue-rows", &["first wait", "second wait"]);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -510,7 +519,7 @@ fn the_queue_dock_lists_its_rows(cx: &mut TestAppContext) {
 /// One waiting message draws its row directly, with no count header at all.
 #[gpui::test]
 fn a_lone_queued_message_draws_no_header(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_queue("queue-single", &["only wait"]);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -534,7 +543,7 @@ fn a_lone_queued_message_draws_no_header(cx: &mut TestAppContext) {
 /// The row's own remove drops the message, and the dock goes away with it.
 #[gpui::test]
 fn the_queue_row_removes_its_message(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_queue("queue-remove", &["only wait"]);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -569,7 +578,7 @@ fn the_queue_row_removes_its_message(cx: &mut TestAppContext) {
 /// rewrites the message in place.
 #[gpui::test]
 fn the_queue_row_edits_its_message(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_queue("queue-edit", &["first wait"]);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -628,7 +637,7 @@ fn the_queue_row_edits_its_message(cx: &mut TestAppContext) {
 /// into an idle session.
 #[gpui::test]
 fn sending_while_a_turn_runs_queues_the_message(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("queue-send", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -739,7 +748,7 @@ fn the_queue_is_a_line_of_identified_rows() {
 /// and the next launch read.
 #[gpui::test]
 fn the_plan_store_lands_on_the_session(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("todo-plan-live"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -792,9 +801,12 @@ fn the_plan_store_lands_on_the_session(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn header_panel_toggle_click_flips_the_sidebar(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = AppState::with_store(scratch_store("header"));
+        let mut state = AppState::with_store(scratch_store("header"));
+        // The header carries the sidebar toggle only while the sidebar is
+        // folded - the reference's folded state - so the test starts there.
+        state.sidebar_collapsed = true;
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -804,10 +816,14 @@ fn header_panel_toggle_click_flips_the_sidebar(cx: &mut TestAppContext) {
     let before = cx.update(|_, cx| shell.read(cx).state.sidebar_collapsed);
     let bounds = cx
         .debug_bounds("hdr-show-sidebar")
-        .expect("the panel toggle is rendered");
+        .expect("the panel toggle is rendered while the sidebar is folded");
     cx.simulate_click(bounds.center(), Modifiers::default());
     let after = cx.update(|_, cx| shell.read(cx).state.sidebar_collapsed);
     assert_ne!(before, after, "the click must reach the toggle handler");
+    assert!(
+        cx.debug_bounds("hdr-show-sidebar").is_none(),
+        "once the sidebar is up the toggle goes back to the sidebar strip"
+    );
 }
 
 /// The centre column, from the reference's own `ConversationRoot.module.css`:
@@ -816,7 +832,7 @@ fn header_panel_toggle_click_flips_the_sidebar(cx: &mut TestAppContext) {
 /// transcript column.
 #[gpui::test]
 fn the_centre_column_takes_the_measured_chrome(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("centre-chrome"));
         tests_pin_reference_defaults(&mut state);
@@ -883,7 +899,7 @@ fn the_centre_column_takes_the_measured_chrome(cx: &mut TestAppContext) {
 /// inset by the root's 6/12 padding instead of by each child.
 #[gpui::test]
 fn the_sidebar_takes_the_measured_chrome(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("sidebar-chrome"));
         tests_pin_reference_defaults(&mut state);
@@ -951,7 +967,7 @@ fn the_sidebar_takes_the_measured_chrome(cx: &mut TestAppContext) {
 /// the pin landed while the selection did not move.
 #[gpui::test]
 fn pinning_an_inactive_row_does_not_open_it(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("pin"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1026,7 +1042,7 @@ fn pinning_an_inactive_row_does_not_open_it(cx: &mut TestAppContext) {
 /// The sidebar search control toggles the session-name filter.
 #[gpui::test]
 fn search_control_click_opens_the_filter(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("search"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1045,7 +1061,7 @@ fn search_control_click_opens_the_filter(cx: &mut TestAppContext) {
 /// Both tablist entries switch the main column.
 #[gpui::test]
 fn tab_click_switches_the_main_column(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("tabs"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1071,7 +1087,7 @@ fn tab_click_switches_the_main_column(cx: &mut TestAppContext) {
 /// The sidebar gear opens the settings dialog.
 #[gpui::test]
 fn settings_gear_click_opens_the_dialog(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("gear"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1090,7 +1106,7 @@ fn settings_gear_click_opens_the_dialog(cx: &mut TestAppContext) {
 /// data-chat-following-tail, so a transcript must not open on the oldest turn.
 #[gpui::test]
 fn transcript_opens_at_the_newest_message(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("tail", 12);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1117,7 +1133,7 @@ fn transcript_opens_at_the_newest_message(cx: &mut TestAppContext) {
 /// `20px + secondary delta` line - and clicking the row opens and closes the body.
 #[gpui::test]
 fn the_think_row_takes_the_measured_disclosure_chrome(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("think-row", 1);
         let id = state.active_id.clone().expect("an active session");
@@ -1189,7 +1205,7 @@ fn the_think_row_takes_the_measured_disclosure_chrome(cx: &mut TestAppContext) {
 /// user bubble on radius-xl 20 over `10px 16px` with the measured 22px conversation line.
 #[gpui::test]
 fn the_transcript_takes_the_measured_chrome(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("transcript-chrome", 60);
         let id = state.active_id.clone().expect("an active session");
@@ -1271,7 +1287,7 @@ fn the_transcript_takes_the_measured_chrome(cx: &mut TestAppContext) {
 /// move the transcript, so the tick is wired to the scroll handle, not just drawn.
 #[gpui::test]
 fn rail_tick_click_scrolls_the_transcript(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("rail", 30);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1321,7 +1337,7 @@ fn rail_tick_click_scrolls_the_transcript(cx: &mut TestAppContext) {
 /// instead of the first one in the rail.
 #[gpui::test]
 fn nav_row_click_opens_the_section_it_names(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("nav", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1351,7 +1367,7 @@ fn nav_row_click_opens_the_section_it_names(cx: &mut TestAppContext) {
 /// the agent is built from - so the pane is not a read-only list.
 #[gpui::test]
 fn plugin_switch_writes_the_disabled_plugin(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("plugin-switch", 2);
         let shell = cx
@@ -1388,7 +1404,7 @@ fn plugin_switch_writes_the_disabled_plugin(cx: &mut TestAppContext) {
 /// field is bound to the setting rather than a label that looks like one.
 #[gpui::test]
 fn agent_loop_pane_loads_the_step_ceiling(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("agent-loop", 2);
         state.settings.workspace.agent.max_steps = 23;
@@ -1419,7 +1435,7 @@ fn agent_loop_pane_loads_the_step_ceiling(cx: &mut TestAppContext) {
 /// must come from what the agent was built from.
 #[gpui::test]
 fn plugins_row_opens_the_builtin_plugins_pane(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("plugins", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1623,7 +1639,7 @@ fn seed_provider(global: &mut crate::settings::global::GlobalSettings, id: &str,
 /// catalog, with the reference's fallback for an unresolved model.
 #[gpui::test]
 fn the_model_chip_opens_its_menu_in_place(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("composer-model", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1655,7 +1671,7 @@ fn the_model_chip_opens_its_menu_in_place(cx: &mut TestAppContext) {
 /// chevron for the shared ongoing dot and leaves the trigger enabled.
 #[gpui::test]
 fn the_model_chip_swaps_its_chevron_for_the_ongoing_dot(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("composer-model-busy", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1744,7 +1760,7 @@ fn the_model_menu_reads_the_catalog_and_names_the_effort() {
 /// the pane is wired rather than a list.
 #[gpui::test]
 fn preset_row_click_selects_the_preset(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("preset-row", 2);
         state.settings.global.presets.insert(
@@ -1781,7 +1797,7 @@ fn preset_row_click_selects_the_preset(cx: &mut TestAppContext) {
 /// directions, so the row cannot pass by being permanently on or off.
 #[gpui::test]
 fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("parallel-switch", 2);
         state.settings.workspace.agent.parallel_tool_calls = false;
@@ -1830,7 +1846,7 @@ fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
 /// every mode is one the setting itself can hold.
 #[gpui::test]
 fn the_permission_chip_opens_the_mode_menu_in_place(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("composer-permission", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -1924,7 +1940,7 @@ fn every_permission_label_resolves_to_copy() {
 /// The workspace tree opens in the order the sidebar last chose.
 #[gpui::test]
 fn the_sidebar_order_survives_a_restart(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("sort-restart", 1);
         state.settings.global.general.session_sort =
@@ -1948,7 +1964,7 @@ fn the_sidebar_order_survives_a_restart(cx: &mut TestAppContext) {
 /// The header carries the open controls ahead of the panel toggle.
 #[gpui::test]
 fn the_header_offers_to_open_the_workspace(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("open-workspace", 1);
         // The open controls resolve the active id through the registry, so the
@@ -1999,7 +2015,7 @@ fn the_header_offers_to_open_the_workspace(cx: &mut TestAppContext) {
 /// With no workspace registered there is nothing to open, so the control is absent.
 #[gpui::test]
 fn the_header_hides_the_open_control_without_a_workspace(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("open-workspace-none", 1);
         state.settings.global.general.active_workspace = String::new();
@@ -2035,7 +2051,7 @@ fn the_header_hides_the_open_control_without_a_workspace(cx: &mut TestAppContext
 /// field, and the add block is a single button that swaps for the add card.
 #[gpui::test]
 fn the_models_pane_is_the_reference_card_list(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("models-cards", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
@@ -2151,7 +2167,7 @@ fn the_models_pane_is_the_reference_card_list(cx: &mut TestAppContext) {
 /// session count and every discovered profile - are not part of that pane.
 #[gpui::test]
 fn the_general_pane_carries_no_build_facts(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("general-about", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
@@ -2172,7 +2188,7 @@ fn the_general_pane_carries_no_build_facts(cx: &mut TestAppContext) {
 /// agent is built with is what the pane picked.
 #[gpui::test]
 fn api_protocol_row_writes_the_setting(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("api-mode", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
@@ -2262,7 +2278,7 @@ fn background_jobs_exclude_the_session_on_screen(_cx: &mut TestAppContext) {
 /// The header counts the background turns, and picking one brings it forward.
 #[gpui::test]
 fn the_header_counts_background_jobs(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("jobs-header", 1);
         let running = state.active_id.clone().expect("a session is active");
@@ -2339,7 +2355,7 @@ fn the_chat_column_takes_the_measured_clamp() {
 /// the fixed 680 bsh drew. The floor and the mid range are the pure test's.
 #[gpui::test]
 fn the_composer_stack_follows_the_measured_clamp(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("chat-clamp", 2);
         tests_pin_reference_defaults(&mut state);
@@ -2378,7 +2394,7 @@ fn the_composer_stack_follows_the_measured_clamp(cx: &mut TestAppContext) {
 /// instead of falling back to the clamp.
 #[gpui::test]
 fn the_stored_content_width_wins_over_the_clamp(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("chat-stored", 2);
         state.settings.global.general.content_width = Some(800.0);
@@ -2414,7 +2430,7 @@ fn the_stored_content_width_wins_over_the_clamp(cx: &mut TestAppContext) {
 /// layers, and the bar is the measured 2 x 72 centred in its strip.
 #[gpui::test]
 fn the_chat_handle_bar_takes_the_measured_column(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("chat-bar", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -2452,7 +2468,7 @@ fn the_chat_handle_bar_takes_the_measured_column(cx: &mut TestAppContext) {
 /// body's clear (which ends the hover) wipes it the same instant.
 #[gpui::test]
 fn the_chat_handle_hover_reveals_and_the_body_move_clears_it(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("chat-hover", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -2526,7 +2542,7 @@ fn the_dragged_content_width_takes_the_measured_bounds() {
 /// 2 + 24px)` off the body on the left and `left:` on the right.
 #[gpui::test]
 fn the_chat_handles_park_outside_the_content_column(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("chat-handles", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -2628,7 +2644,7 @@ fn the_sidebar_fold_follows_the_auto_collapse_breakpoint() {
 /// the real window width into the same field.
 #[gpui::test]
 fn the_narrow_viewport_auto_collapses_the_sidebar(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("sidebar-narrow", 2);
         tests_pin_reference_defaults(&mut state);
@@ -2723,7 +2739,7 @@ fn the_sidebar_width_takes_the_measured_bounds() {
 /// that takes the 280 store default until it is dragged.
 #[gpui::test]
 fn the_sidebar_handle_takes_the_measured_strip(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("sidebar-strip", 2);
         tests_pin_reference_defaults(&mut state);
@@ -2756,7 +2772,7 @@ fn the_sidebar_handle_takes_the_measured_strip(cx: &mut TestAppContext) {
 /// own 40px is the width's 40px, because this column is not centred.
 #[gpui::test]
 fn the_sidebar_handle_drag_sets_and_stores_the_width(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("sidebar-drag", 2);
         tests_pin_reference_defaults(&mut state);
@@ -2796,7 +2812,7 @@ fn the_sidebar_handle_drag_sets_and_stores_the_width(cx: &mut TestAppContext) {
 /// expanded (the collapsed sidebar is 0 wide on darwin).
 #[gpui::test]
 fn the_sidebar_handle_is_gone_when_collapsed(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("sidebar-folded", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -2833,7 +2849,7 @@ fn the_sidebar_handle_is_gone_when_collapsed(cx: &mut TestAppContext) {
 /// under `dsh.conversation.contentWidth`; the harness presses the real handle.
 #[gpui::test]
 fn the_chat_handle_drag_sets_and_stores_the_width(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("chat-drag", 2);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -2914,7 +2930,7 @@ fn the_job_count_takes_the_reference_plural_rule() {
 /// 12px chevron.
 #[gpui::test]
 fn the_jobs_trigger_takes_the_measured_chrome(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("jobs-chrome", 1);
         let running = state.active_id.clone().expect("a session is active");
@@ -2960,7 +2976,7 @@ fn the_jobs_trigger_takes_the_measured_chrome(cx: &mut TestAppContext) {
 /// it.
 #[gpui::test]
 fn the_jobs_trigger_opens_its_panel_in_place(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("jobs-open", 1);
         let running = state.active_id.clone().expect("a session is active");
@@ -2993,7 +3009,7 @@ fn the_jobs_trigger_opens_its_panel_in_place(cx: &mut TestAppContext) {
 /// Watching the only running turn is not a background job, so no chip is drawn.
 #[gpui::test]
 fn the_header_hides_the_job_chip_without_background_work(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("jobs-none", 1);
         let running = state.active_id.clone().expect("a session is active");
@@ -3024,7 +3040,7 @@ fn the_header_hides_the_job_chip_without_background_work(cx: &mut TestAppContext
 /// would be a race, and the palette swap itself was proven by screenshot.
 #[gpui::test]
 fn only_the_system_mode_follows_a_live_appearance_change(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("appearance", 1);
         state.settings.global.general.theme_mode = "system".to_string();
@@ -3079,7 +3095,7 @@ fn only_the_system_mode_follows_a_live_appearance_change(cx: &mut TestAppContext
 /// and reads the draft back.
 #[gpui::test]
 fn the_model_catalog_handlers_write_the_draft(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("catalog", 1);
         state.settings.workspace.general.provider = "work".to_string();
@@ -3632,7 +3648,7 @@ fn the_catalogue_provider_chooser_is_a_select_of_ids(cx: &mut TestAppContext) {
 /// list the select-all pair acts on rather than only the rows on screen.
 #[gpui::test]
 fn the_picker_search_narrows_the_candidates(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("picker-search", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
@@ -3702,7 +3718,7 @@ fn the_picker_search_narrows_the_candidates(cx: &mut TestAppContext) {
 /// only looks wired still fails.
 #[gpui::test]
 fn the_picker_adds_every_selected_fetched_model(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("picker", 1);
         state.settings.workspace.general.provider = "work".to_string();
@@ -3774,7 +3790,7 @@ fn the_picker_adds_every_selected_fetched_model(cx: &mut TestAppContext) {
 /// here, with no state of its own to keep in sync.
 #[gpui::test]
 fn the_builtin_plugins_pane_reads_the_draft(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("builtin-plugins", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("plugins"), state, cx));
@@ -3833,7 +3849,7 @@ fn the_plugin_keys_resolve_in_both_locales() {
 /// automation section and raise no notice.
 #[gpui::test]
 fn the_automation_row_opens_the_automation_section(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("nav-automation"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -3905,7 +3921,7 @@ fn the_provider_form_keys_resolve_in_both_locales() {
 /// 14px and the stepper walks it to the measured top of the range.
 #[gpui::test]
 fn the_font_size_stepper_moves_the_conversation_text(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("font-size"));
         tests_pin_reference_defaults(&mut state);
@@ -3976,7 +3992,7 @@ fn the_font_size_stepper_moves_the_conversation_text(cx: &mut TestAppContext) {
 /// presses the Light cube for real and reads the setting back.
 #[gpui::test]
 fn the_appearance_cubes_set_the_colour_mode(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("appearance-cubes"));
         tests_pin_reference_defaults(&mut state);
@@ -4029,7 +4045,7 @@ fn the_appearance_cubes_set_the_colour_mode(cx: &mut TestAppContext) {
 /// header is 54 tall with a 28x28 close, and a text field's chrome is 34 tall.
 #[gpui::test]
 fn the_settings_dialog_takes_the_measured_shape(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("settings-shape"));
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("shell"), state, cx));
@@ -4080,7 +4096,7 @@ fn the_settings_dialog_takes_the_measured_shape(cx: &mut TestAppContext) {
 /// content delta, h4 the body size). This pins the wiring, not the pixels.
 #[gpui::test]
 fn the_markdown_scale_carries_the_reference_metrics(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("markdown-scale"));
         tests_pin_reference_defaults(&mut state);
@@ -4112,7 +4128,7 @@ fn the_markdown_scale_carries_the_reference_metrics(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_plugin_list_says_so_when_there_are_no_plugins(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("plugin-none"));
         let shell = cx
@@ -4149,7 +4165,7 @@ fn the_plugin_list_says_so_when_there_are_no_plugins(cx: &mut TestAppContext) {
 /// matcher the session-name search uses.
 #[gpui::test]
 fn the_plugin_list_filter_hides_rows_and_says_so(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("plugin-search"));
         let shell = cx
@@ -4187,7 +4203,7 @@ fn the_plugin_list_filter_hides_rows_and_says_so(cx: &mut TestAppContext) {
 /// so the fields are bound to the row rather than a label that looks like one.
 #[gpui::test]
 fn editing_a_provider_loads_it_into_the_form(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("edit-provider", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
@@ -4235,7 +4251,7 @@ fn editing_a_provider_loads_it_into_the_form(cx: &mut TestAppContext) {
 /// records both.
 #[gpui::test]
 fn the_input_type_chips_write_the_draft(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("input-types", 1);
         state.settings.workspace.general.provider = "p".to_string();
@@ -4300,7 +4316,7 @@ fn the_input_type_chips_write_the_draft(cx: &mut TestAppContext) {
 /// seeded so the click has to drop the one that was clicked, not the last one.
 #[gpui::test]
 fn clicking_an_attachment_chip_removes_it(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("attach-chip", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -4346,7 +4362,7 @@ fn clicking_an_attachment_chip_removes_it(cx: &mut TestAppContext) {
 /// session is gone cannot open one at all.
 #[gpui::test]
 fn a_scheduled_turn_lands_in_its_own_session(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("schedule-turn", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -4407,7 +4423,7 @@ fn a_scheduled_turn_lands_in_its_own_session(cx: &mut TestAppContext) {
 /// touches the network.
 #[gpui::test]
 fn the_tick_switches_off_a_task_whose_session_is_gone(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("schedule-gone"));
         state
@@ -4443,7 +4459,7 @@ fn the_tick_switches_off_a_task_whose_session_is_gone(cx: &mut TestAppContext) {
 /// The pane draws the tasks the DRAFT holds, which is what its own Save writes.
 #[gpui::test]
 fn the_automation_pane_lists_a_task_from_the_draft(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("schedule-pane"));
         state.settings.global.schedules.clear();
@@ -4497,7 +4513,7 @@ fn the_automation_pane_lists_a_task_from_the_draft(cx: &mut TestAppContext) {
 /// The reference draws a dialog here; the three presses below are the real ones.
 #[gpui::test]
 fn the_delete_control_asks_before_it_deletes(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("schedule-delete"));
         state.settings.global.schedules.clear();
@@ -4702,7 +4718,7 @@ fn the_rail_preview_budgets_match_the_reference() {
 /// and 100px tall, hanging 10px off the frame (`right: calc(100% + 10px)`).
 #[gpui::test]
 fn the_rail_preview_opens_on_hover(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("rail-preview", 3);
         let id = state.active_id.clone().expect("an active session");
@@ -4767,7 +4783,7 @@ fn the_rail_preview_opens_on_hover(cx: &mut TestAppContext) {
 /// `if (items.length < 2) return null`: a lone turn draws no rail.
 #[gpui::test]
 fn the_rail_hides_with_a_single_turn(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("rail-single", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -4789,7 +4805,7 @@ fn the_rail_hides_with_a_single_turn(cx: &mut TestAppContext) {
 /// label. The counts pill waits for a step, the usage pill for billed usage.
 #[gpui::test]
 fn the_stat_pills_take_the_measured_chrome(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("stat-chrome", 2);
         let id = state.active_id.clone().expect("an active session");
@@ -4852,7 +4868,7 @@ fn the_stat_pills_take_the_measured_chrome(cx: &mut TestAppContext) {
 /// second press closes it.
 #[gpui::test]
 fn the_usage_pill_opens_the_measured_token_dialog(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("stat-dialog", 1);
         let id = state.active_id.clone().expect("an active session");
@@ -4928,7 +4944,7 @@ fn the_usage_pill_opens_the_measured_token_dialog(cx: &mut TestAppContext) {
 /// breakdown panel 8px above it with the reference's own three legend rows.
 #[gpui::test]
 fn the_context_meter_opens_the_measured_breakdown_panel(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("context-meter", 1);
         tests_pin_reference_defaults(&mut state);
@@ -5020,7 +5036,7 @@ fn the_context_meter_opens_the_measured_breakdown_panel(cx: &mut TestAppContext)
 /// side) centred under a 32-tall headline, over a 28-tall workspace chip.
 #[gpui::test]
 fn the_hero_takes_the_measured_chrome(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = AppState::with_store(scratch_store("hero-chrome"));
         tests_pin_reference_defaults(&mut state);
@@ -5063,7 +5079,7 @@ fn the_hero_takes_the_measured_chrome(cx: &mut TestAppContext) {
 /// The reference's hero phase is a blank conversation on the chat tab.
 #[gpui::test]
 fn the_hero_phase_follows_the_turns(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let mut state = AppState::with_store(scratch_store("hero-phase"));
     let id = state.active_id.clone().expect("an active session");
     assert!(state.hero_phase(), "a blank chat is the hero phase");
@@ -5078,7 +5094,7 @@ fn the_hero_phase_follows_the_turns(cx: &mut TestAppContext) {
 /// The composer carries the reference's own placeholder for the phase.
 #[gpui::test]
 fn the_composer_placeholder_follows_the_hero_phase(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("hero-placeholder"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -5127,7 +5143,7 @@ fn the_composer_placeholder_follows_the_hero_phase(cx: &mut TestAppContext) {
 /// The hero's workspace picker moves the blank chat it sits over.
 #[gpui::test]
 fn the_hero_workspace_picker_moves_the_chat(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("hero-workspace"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -5171,7 +5187,7 @@ fn the_hero_workspace_picker_moves_the_chat(cx: &mut TestAppContext) {
 /// tooltipped with `input.commands` on the top side after 500ms.
 #[gpui::test]
 fn the_composer_add_control_is_the_measured_round_plus(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("composer-add", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -5204,7 +5220,7 @@ fn the_composer_add_control_is_the_measured_round_plus(cx: &mut TestAppContext) 
 /// not resize it - only the stop state swaps its glyph.
 #[gpui::test]
 fn the_composer_primary_button_is_the_measured_34_round_action(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("composer-primary", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -5254,7 +5270,7 @@ fn the_primary_control_stops_only_while_the_draft_is_empty() {
 /// opens a menu, so each carries the `.chevron` in label-caption (the 14px box).
 #[gpui::test]
 fn the_composer_chips_take_the_measured_select_trigger(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("composer-chips", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -5293,7 +5309,7 @@ fn the_composer_chips_take_the_measured_select_trigger(cx: &mut TestAppContext) 
 /// choice row writes, so the chip's own label follows the mode it changed.
 #[gpui::test]
 fn the_permission_chip_writes_the_mode_its_menu_offers(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("composer-permission-mode", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -5383,7 +5399,7 @@ fn the_kill_phase_windows_are_the_measured_ones() {
 fn the_job_stop_arms_then_stops_within_its_window(cx: &mut TestAppContext) {
     use crate::ui::header::{JobArm, JobPhase};
     use std::time::{Duration, Instant};
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("jobs-arm", 1);
         let active = state.active_id.clone().expect("an active session");
@@ -5514,7 +5530,7 @@ fn the_settings_rail_is_the_five_measured_cells() {
 #[gpui::test]
 fn the_builtin_plugins_pane_hosts_the_reference_views(cx: &mut TestAppContext) {
     use super::settings::section_index;
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("settings-views"));
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("plugins"), state, cx));
@@ -5686,7 +5702,7 @@ fn set_command_draft(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &s
 /// choosing a row consumes its own `/token` before it runs.
 #[gpui::test]
 fn the_add_control_opens_the_measured_command_card(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("command-menu", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -5784,7 +5800,7 @@ fn the_at_trigger_lists_workspace_files_and_sessions(cx: &mut TestAppContext) {
     std::fs::write(root.join("alpha.txt"), "a").expect("a file");
     std::fs::write(root.join("beta.md"), "b").expect("a file");
     std::fs::write(root.join("sub/gamma.rs"), "c").expect("a file");
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("command-refs", 1);
         state.settings.ensure_workspace();
@@ -5865,7 +5881,7 @@ fn the_at_trigger_lists_workspace_files_and_sessions(cx: &mut TestAppContext) {
 /// dialog writes.
 #[gpui::test]
 fn the_coding_view_toggle_gates_the_trajectory_tab(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("coding-view"));
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
@@ -5923,7 +5939,7 @@ fn the_coding_view_toggle_gates_the_trajectory_tab(cx: &mut TestAppContext) {
 /// and drives the one state `reveal_config_shared` sets on a refused open.
 #[gpui::test]
 fn the_general_header_carries_the_reference_document_action(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("open-config"));
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
@@ -5956,7 +5972,7 @@ fn the_general_header_carries_the_reference_document_action(cx: &mut TestAppCont
 /// drawn disabled, and the handler refuses even if it is reached.
 #[gpui::test]
 fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::component::init);
+    init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("risk-gate"));
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -6049,4 +6065,454 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
         !cx.update(|_, cx| shell.read(cx).permission_acknowledged),
         "the acknowledgement resets, so the next gate starts shut"
     );
+}
+
+/// A state whose workspace root is a scratch directory holding a few entries,
+/// so the browser lists a tree the test itself built and never the real one.
+fn state_with_workspace_tree(label: &str) -> AppState {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("bsh-scratch-ws-{label}"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::create_dir_all(root.join("src"));
+    let _ = std::fs::create_dir_all(root.join("docs"));
+    let _ = std::fs::write(root.join("src/lib.rs"), b"pub fn x() {}\n");
+    let _ = std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"x\"\n");
+    let _ = std::fs::write(root.join("README.md"), b"# x\n");
+    let mut state = AppState::with_store(scratch_store(label));
+    state.settings.active_workspace = label.to_string();
+    state.settings.workspaces.push(crate::settings::Workspace {
+        id: label.to_string(),
+        name: label.to_string(),
+        root: root.to_string_lossy().to_string(),
+        ..Default::default()
+    });
+    state
+}
+
+/// The header's right control opens the panel, and the panel starts on the
+/// reference's own three Start cards.
+#[gpui::test]
+fn the_header_opens_the_right_panel_on_its_start_screen(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-open");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    assert!(
+        cx.debug_bounds("right-panel").is_none(),
+        "the panel starts folded, so the transcript keeps the width"
+    );
+
+    let toggle = cx
+        .debug_bounds("hdr-show-right-panel")
+        .expect("the header carries the right panel's toggle");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.open),
+        "the toggle must unfold the panel"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.tab).is_none(),
+        "and it lands on the Start screen, not on a pane"
+    );
+
+    for card in [
+        "right-card-right.tab.files",
+        "right-card-right.tab.terminal",
+        "right-card-right.tab.browser",
+    ] {
+        assert!(
+            cx.debug_bounds(card).is_some(),
+            "the Start screen carries the {card} card"
+        );
+    }
+}
+
+/// The Files card opens the browser, directories lead, and a file opens in the
+/// editor with the save control beside it.
+#[gpui::test]
+fn the_files_pane_lists_the_workspace_and_opens_a_file(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-files");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The panel starts folded, so the Start screen's cards are not on screen
+    // until the header's toggle puts them there.
+    let toggle = cx
+        .debug_bounds("hdr-show-right-panel")
+        .expect("the header carries the right panel's toggle");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let card = cx
+        .debug_bounds("right-card-right.tab.files")
+        .expect("the Files card renders");
+    cx.simulate_click(card.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.tab.is_some()),
+        "the card must put the Files pane up"
+    );
+    let rows = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .files
+            .roots
+            .iter()
+            .map(|row| (row.name.clone(), row.dir))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        rows,
+        vec![
+            ("docs".to_string(), true),
+            ("src".to_string(), true),
+            ("Cargo.toml".to_string(), false),
+            ("README.md".to_string(), false),
+        ],
+        "directories lead the listing and the noise skips keep it readable"
+    );
+
+    // Choosing a directory expands its branch in place rather than opening an
+    // editor, which is what makes the listing a tree.
+    let src = cx
+        .debug_bounds("file-row-src")
+        .expect("the src row renders");
+    cx.simulate_click(src.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .files
+                .expanded
+                .iter()
+                .any(|rel| rel == std::path::Path::new("src"))
+        }),
+        "a directory row expands its branch"
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).files.tabs.is_empty()),
+        "and opens no tab"
+    );
+    assert!(
+        cx.debug_bounds("file-row-lib.rs").is_some(),
+        "the branch's own entries render under it"
+    );
+
+    // A file row still opens as a tab, from wherever it sits in the tree.
+    let readme = cx
+        .debug_bounds("file-row-README.md")
+        .expect("the README row renders");
+    cx.simulate_click(readme.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let opened = cx.update(|_, cx| shell.read(cx).files.active_tab().is_some());
+    assert!(opened, "a file row must open it as a tab");
+    assert!(
+        cx.debug_bounds("files-editor").is_some(),
+        "the editor body renders"
+    );
+    // The document surface is the editor and nothing else: the tab chip names
+    // the file and cmd-s saves, so no path bar or save button rides on it.
+    assert!(
+        cx.debug_bounds("files-save").is_none(),
+        "no save button on the surface"
+    );
+    assert!(
+        cx.debug_bounds("files-header").is_none(),
+        "no tree header over a document"
+    );
+    assert!(
+        cx.debug_bounds("files-manage").is_none(),
+        "no new-file strip over a document"
+    );
+    assert!(
+        cx.debug_bounds("file-tab-README.md").is_some(),
+        "and the tab strip carries the file"
+    );
+    // The document owns the whole panel body, the way the reference's dock
+    // hands it the full pane: the tree is not squeezed in beside it.
+    let panel = cx
+        .debug_bounds("files-pane")
+        .expect("the pane renders")
+        .size
+        .width;
+    let editor = cx
+        .debug_bounds("files-editor")
+        .expect("the editor renders")
+        .size
+        .width;
+    assert_eq!(
+        editor, panel,
+        "the editor spans the pane instead of sitting beside the tree"
+    );
+    assert!(
+        cx.debug_bounds("file-row-README.md").is_none(),
+        "the tree steps aside while a document is open"
+    );
+}
+
+/// A second file opens beside the first rather than replacing it, pressing a
+/// tab focuses it, and closing the last one hands the panel back to the tree.
+#[gpui::test]
+fn opening_a_second_file_adds_a_tab_and_keeps_the_first(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-tabs");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+        });
+    });
+    for name in ["README.md", "Cargo.toml"] {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.open_file(std::path::Path::new(name), window, cx);
+            });
+        });
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).files.tabs.len()),
+        2,
+        "the second file adds a tab beside the first rather than replacing it"
+    );
+    assert!(
+        cx.debug_bounds("file-tab-README.md").is_some()
+            && cx.debug_bounds("file-tab-Cargo.toml").is_some(),
+        "and the strip carries both"
+    );
+
+    // Pressing the first tab focuses it without reopening the file.
+    let first = cx
+        .debug_bounds("file-tab-README.md")
+        .expect("the README tab renders")
+        .center();
+    cx.simulate_click(first, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).files.active),
+        Some(0),
+        "pressing a tab focuses it"
+    );
+
+    // Closing the active tab hands the body back to the tree, which is what
+    // the Files chip names.
+    let close = cx
+        .debug_bounds("file-tab-close-README.md")
+        .expect("the tab's close renders")
+        .center();
+    cx.simulate_click(close, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).files.tabs.len()),
+        1,
+        "the close drops the tab"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).files.active),
+        None,
+        "closing the tab on screen returns to the tree"
+    );
+
+    // Closing the last one empties the editor area, so the tree takes over.
+    let close = cx
+        .debug_bounds("file-tab-close-Cargo.toml")
+        .expect("the last tab's close renders")
+        .center();
+    cx.simulate_click(close, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).files.tabs.is_empty()),
+        "the last tab closes too"
+    );
+    assert!(
+        cx.debug_bounds("files-editor").is_none(),
+        "and the editor column goes with it"
+    );
+}
+
+/// The editor's buffer marks the file dirty on a change and the save clears it,
+/// which is the whole of the edit loop the panel promises.
+#[gpui::test]
+fn an_edit_marks_the_file_dirty_and_save_clears_it(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-dirty");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_file(std::path::Path::new("README.md"), window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let editor = cx
+        .update(|_, cx| {
+            shell
+                .read(cx)
+                .files
+                .active_tab()
+                .and_then(|tab| tab.editor.clone())
+        })
+        .expect("README.md opens in an editor");
+    cx.update(|window, cx| {
+        // `set_value` deliberately suppresses Change - it is a load, not an
+        // edit - so the test edits the way a reader does, through the path
+        // that records an undo and therefore emits the event the dirty mark
+        // hangs off.
+        editor.update(cx, |state, cx| {
+            state.replace_all("# edited\n", window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .files
+            .active_tab()
+            .is_some_and(|tab| tab.dirty)),
+        "a change to the buffer marks the file dirty"
+    );
+
+    // cmd-s is the whole save affordance now: the action dispatches through
+    // the focused editor and bubbles to the files body's handler.
+    cx.update(|window, cx| {
+        // The action dispatches through the focused editor, so focus it first
+        // the way a reader who clicked into the buffer already has.
+        editor.update(cx, |state, cx| {
+            gpui_kit::Focusable::focus_handle(state, cx).focus(window, cx);
+        });
+        window.dispatch_keystroke(
+            gpui_kit::Keystroke::parse("cmd-s").expect("cmd-s parses"),
+            cx,
+        );
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| shell
+            .read(cx)
+            .files
+            .active_tab()
+            .is_some_and(|tab| tab.dirty)),
+        "saving clears the dirty mark"
+    );
+    let written = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-scratch-ws-right-dirty/README.md"),
+    )
+    .expect("the save reaches the disk");
+    assert_eq!(written, "# edited\n", "and writes the buffer back");
+}
+
+/// A note pins to the open file at the editor's cursor line, shows in the
+/// drawer, and survives a reload of the workspace's sidecar.
+#[gpui::test]
+fn a_note_pins_to_the_file_and_survives_a_reload(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-notes");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+            this.open_file(std::path::Path::new("README.md"), window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // A file with no notes keeps the surface clean, so the reader opens the
+    // drawer through the toggle that rides the document's corner.
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).files.notes_open),
+        "a file with no notes opens clean"
+    );
+    let toggle = cx
+        .debug_bounds("files-notes-toggle")
+        .expect("the notes toggle renders")
+        .center();
+    cx.simulate_click(toggle, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).files.notes_open),
+        "the toggle opens the drawer"
+    );
+
+    // Type into the note field and press the add control.
+    let field = cx
+        .debug_bounds("files-note-field")
+        .expect("the note field renders")
+        .center();
+    cx.simulate_click(field, Modifiers::default());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.files.note_text.update(cx, |state, cx| {
+                state.set_value("remember to mention the bus", window, cx);
+            });
+        });
+    });
+    let add = cx
+        .debug_bounds("files-note-add")
+        .expect("the add control renders")
+        .center();
+    cx.simulate_click(add, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert_eq!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .files
+            .notes
+            .on(std::path::Path::new("README.md"))
+            .len()),
+        1,
+        "the note pins to the open file"
+    );
+    assert!(
+        cx.debug_bounds("files-note-L1").is_some(),
+        "and the drawer lists it under its line anchor"
+    );
+
+    // The sidecar on disk carries it, so another launch sees the same note.
+    let sidecar = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-scratch-ws-right-notes/.bsh/annotations.json"),
+    )
+    .expect("the note is written to the workspace's sidecar");
+    assert!(sidecar.contains("remember to mention the bus"));
 }

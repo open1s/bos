@@ -396,6 +396,22 @@ impl AppState {
         }
     }
 
+    /// The active workspace's filesystem root: the root the panel browses and
+    /// the root the agent's own tools are confined to.
+    ///
+    /// The reference asks its remote `fileReferences` for the same tree, so the
+    /// two views agree by construction. None while no workspace is selected or
+    /// its folder has gone; a panel over none says so rather than opening on a
+    /// directory it cannot read.
+    pub(crate) fn workspace_root(&self) -> Option<std::path::PathBuf> {
+        self.settings
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.settings.active_workspace)
+            .map(|workspace| std::path::PathBuf::from(&workspace.root))
+            .filter(|root| root.is_dir())
+    }
+
     /// Whether a session is currently streaming.
     pub(crate) fn is_streaming(&self, id: &str) -> bool {
         self.streams.contains_key(id)

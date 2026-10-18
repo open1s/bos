@@ -152,6 +152,10 @@ pub(crate) struct Shell {
     pub(crate) sidebar_user_w: Option<f32>,
     /// The sidebar resize in flight, if any.
     pub(crate) sidebar_drag: Option<SideDrag>,
+    /// The right panel's own state.
+    pub(crate) right: super::right_panel::RightPanel,
+    /// The workspace browser's place in the tree.
+    pub(crate) files: super::right_panel::FilesPane,
     /// The viewport width as of the last frame, which is what the reference's
     /// sidebar auto-collapse measures.
     pub(crate) viewport_w: f32,
@@ -414,6 +418,18 @@ impl Shell {
         let new_model_id = cx.new(|cx| InputState::new(window, cx));
         let new_model_name = cx.new(|cx| InputState::new(window, cx));
         let settings_inputs = SettingsInputs::new(window, cx);
+        let files_new = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(state.lang, "right.files.newPlaceholder"))
+        });
+        let files_rename = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(state.lang, "right.files.renamePlaceholder"))
+        });
+        let files_note = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(state.lang, "right.files.notePlaceholder"))
+        });
         let mut shell = Self {
             state,
             composer,
@@ -471,6 +487,8 @@ impl Shell {
             chat_drag: None,
             chat_hover: None,
             sidebar_drag: None,
+            right: super::right_panel::RightPanel::default(),
+            files: super::right_panel::FilesPane::new(files_new, files_rename, files_note),
             models_fetched: None,
             models_fetch_failed: false,
             models_fetch_needs_base_url: false,
@@ -1377,6 +1395,7 @@ impl Render for Shell {
             // so the frame carries those. It is a no-op without a drag.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 this.drag_sidebar_width(event.position.x.as_f32(), cx);
+                this.drag_right_panel_width(event.position.x.as_f32(), cx);
             }))
             .bg(rgb(crate::theme::page()))
             .text_color(rgb(crate::theme::text()))
@@ -1384,6 +1403,7 @@ impl Render for Shell {
                 root.child(self.render_sidebar(cx))
             })
             .child(self.render_main_column(cx))
+            .when_some(self.render_right_panel(cx), |root, panel| root.child(panel))
             // The reference draws its DragHandle over the seam at z-index 11,
             // and only while the column is expanded.
             .when(!self.sidebar_folded(), |root| {

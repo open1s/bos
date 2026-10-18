@@ -531,13 +531,7 @@ impl Shell {
     /// confined to (the reference asks its remote `fileReferences` for the same
     /// list).
     fn workspace_root(&self) -> Option<PathBuf> {
-        let settings = &self.state.settings;
-        settings
-            .global
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == settings.global.general.active_workspace)
-            .map(|workspace| PathBuf::from(&workspace.root))
+        self.state.workspace_root()
     }
 
     /// The display name of the workspace a row belongs to.

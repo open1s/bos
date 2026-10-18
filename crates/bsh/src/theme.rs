@@ -561,6 +561,12 @@ pub(crate) const SIDEBAR_MAX: f32 = 420.0;
 /// margin-left:-4px, so it straddles the seam.
 pub(crate) const SIDEBAR_HANDLE_W: f32 = 8.0;
 
+/// The left pad the header needs while the sidebar is folded, so the folded
+/// state's two controls clear the window's traffic lights, which sit at x=14
+/// and run about 52px wide. The sidebar's own strip uses the same figure for
+/// the same reason.
+pub(crate) const SIDEBAR_LIGHT_PAD: f32 = 76.0;
+
 /// The reference's SIDEBAR_AUTO_COLLAPSE: below this viewport width the
 /// sidebar folds to its collapsed width unless the reader expanded it over
 /// the squeezed centre. The comparison is strict, so exactly 1024 is not narrow.
@@ -588,6 +594,64 @@ pub(crate) fn resolve_sidebar_width(stored: Option<f32>) -> f32 {
         .round()
         .clamp(SIDEBAR_MIN, SIDEBAR_MAX)
 }
+
+/// The right panel's store default width.
+///
+/// The reference's panel is wider than the sidebar because it holds an editor
+/// beside a file list, and its own default lands at this figure; a drag
+/// replaces it the same way.
+pub(crate) const RIGHT_PANEL_W: f32 = 480.0;
+
+/// The contract range a right-panel drag cannot leave.
+pub(crate) const RIGHT_PANEL_MIN: f32 = 320.0;
+pub(crate) const RIGHT_PANEL_MAX: f32 = 760.0;
+
+/// The panel's own width: the dragged preference, or the default, clamped and
+/// rounded the way the sidebar's is.
+pub(crate) fn resolve_right_panel_width(stored: Option<f32>) -> f32 {
+    stored
+        .unwrap_or(RIGHT_PANEL_W)
+        .round()
+        .clamp(RIGHT_PANEL_MIN, RIGHT_PANEL_MAX)
+}
+
+/// The share of the viewport the panel is allowed to eat, so a maximised
+/// panel still leaves the transcript readable beside it.
+pub(crate) const RIGHT_PANEL_MAX_SHARE: f32 = 0.5;
+
+/// The resolved panel width for a viewport: the stored width, or the larger
+/// of the panel default and half the viewport when the reader asked for the
+/// panel to fill what it can.
+pub(crate) fn right_panel_width_at(viewport: f32, stored: Option<f32>) -> f32 {
+    resolve_right_panel_width(stored).min(viewport * RIGHT_PANEL_MAX_SHARE)
+}
+
+/// The right panel's row height, matching the sidebar's own rows so a
+/// switching reader never re-measures the list.
+pub(crate) const RIGHT_ROW_H: f32 = 28.0;
+
+/// The Start card's measured min-height: the reference's own `min-height:56px`
+/// on its guide entry, which is what sets the card's box before its 14/20
+/// padding adds to it.
+pub(crate) const RIGHT_CARD_H: f32 = 56.0;
+
+/// The Start card's measured width. The reference pins its guide entry to
+/// 380px inside a centred column, so the cards read as a stack of plates
+/// rather than as rows filling whatever the panel happens to be.
+pub(crate) const RIGHT_CARD_W: f32 = 380.0;
+
+/// The panel's header and tab-bar height.
+pub(crate) const RIGHT_BAR_H: f32 = 40.0;
+
+/// The padding the panel draws around its own body.
+pub(crate) const RIGHT_PAD: f32 = 12.0;
+
+/// The mono size the Start cards draw their shortcut hint at, matching the
+/// reference's own 11px description and hint figures.
+pub(crate) const RIGHT_HINT_SIZE: f32 = 11.0;
+
+/// The 38px header height the reference's own FilesBody measures.
+pub(crate) const FILES_HEADER_H: f32 = 38.0;
 
 /// The floor of the reference's chat column, centred in the main area.
 ///

@@ -12,6 +12,7 @@ pub(crate) mod meter;
 mod session_menu;
 
 pub(crate) mod queue_dock;
+pub(crate) mod right_panel;
 pub(crate) mod settings;
 pub(crate) mod shell;
 #[cfg(test)]
@@ -144,6 +145,16 @@ impl Startup {
 }
 
 /// Open the window and run the application.
+/// The app-level key bindings bsh adds on top of the kit's own.
+///
+/// The files editor has no save button on its surface, so cmd-s is the whole
+/// save affordance; the binding is global because the action bubbles from the
+/// focused editor through the files body. Tests bind it too, since they never
+/// walk [`run`].
+pub(crate) fn bind_global_actions(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("cmd-s", right_panel::SaveFile, None)]);
+}
+
 pub(crate) fn run(startup: Startup) {
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
@@ -164,6 +175,7 @@ pub(crate) fn run(startup: Startup) {
             // it on screen (CG reports only unoccluded windows).
             cx.activate(true);
             gpui_kit::init(cx);
+            bind_global_actions(cx);
             gpui_kit::open_window(
                 WindowOptions {
                     // The reference is a frameless window: its content starts at y=0 and
