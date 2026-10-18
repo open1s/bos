@@ -6265,6 +6265,114 @@ fn the_files_pane_lists_the_workspace_and_opens_a_file(cx: &mut TestAppContext) 
     );
 }
 
+/// The New-file strip has no permanent home in the reference: a double-click
+/// on the tree's blank space is what brings the field up, a single press takes
+/// it back down, and once a name is created the file joins the tree.
+#[gpui::test]
+fn double_clicking_the_blank_tree_adds_a_file(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("right-blank-new");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The panel starts folded, so the Start screen's cards are not on screen
+    // until the header's toggle puts them there.
+    let toggle = cx
+        .debug_bounds("hdr-show-right-panel")
+        .expect("the header carries the right panel's toggle");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Go straight to the Files tab the way the card does.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // With nothing open the tree owns the surface, and its blank area is there
+    // to catch the gesture.
+    assert!(
+        cx.debug_bounds("file-row-README.md").is_some(),
+        "the tree renders"
+    );
+    let blank = cx
+        .debug_bounds("files-blank")
+        .expect("the blank area under the rows renders");
+    assert!(
+        cx.debug_bounds("files-new").is_none(),
+        "the new-file field is absent before the gesture"
+    );
+
+    // Two presses in the same spot read as a double-click and bring the field.
+    // The blank fills the remaining height, so its center is always on screen.
+    let spot = blank.center();
+    cx.simulate_click(spot, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.simulate_click(spot, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.update(|_, cx| shell.read(cx).files.new_file_open),
+        "a double-click on blank space opens the new-file field"
+    );
+    assert!(
+        cx.debug_bounds("files-new").is_some(),
+        "and the field is on screen"
+    );
+
+    // A single press takes it away again, so the gesture is easy to undo.
+    cx.simulate_click(spot, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).files.new_file_open),
+        "a single press on blank space closes the field"
+    );
+
+    // Bring it back and name the file the way the pane does.
+    cx.simulate_click(spot, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.simulate_click(spot, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let input = cx
+        .debug_bounds("files-new-input")
+        .expect("the name field renders");
+    cx.simulate_click(input.center(), Modifiers::default());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.files
+                .new_name
+                .update(cx, |state, cx| state.set_value("note.txt", window, cx));
+        });
+    });
+    let create = cx
+        .debug_bounds("files-create")
+        .expect("the create button renders");
+    cx.simulate_click(create.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .files
+                .roots
+                .iter()
+                .any(|row| row.name == "note.txt")
+        }),
+        "creating the file adds it to the tree"
+    );
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).files.new_file_open),
+        "and the field retires once the file exists"
+    );
+}
+
 /// A second file opens beside the first rather than replacing it, pressing a
 /// tab focuses it, and closing the last one hands the panel back to the tree.
 #[gpui::test]

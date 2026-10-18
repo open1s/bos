@@ -35,6 +35,19 @@ use crate::theme;
 // native document editor does it.
 actions!(bsh_files, [SaveFile]);
 
+/// How close in time two blank-space presses must be to read as a double-click.
+///
+/// macOS tracks its own double-click interval, but the harness's synthetic
+/// clicks carry no timing, so the pane measures it: a second press inside this
+/// window, and inside [`SELF_DOUBLE_PX`] of the first, is a double-click.
+const SELF_DOUBLE_MS: u64 = 400;
+
+/// How close in space two blank-space presses must be to read as a double-click.
+///
+/// Roughly the width of a fingertip's drift between two presses of the same
+/// spot; a press on the far side of the blank area is a different intention.
+const SELF_DOUBLE_PX: f32 = 6.0;
+
 /// The wording the panel reports an I/O failure with.
 ///
 /// The reference prints its own `fileReferences` error text beside the row
@@ -132,6 +145,19 @@ pub(crate) struct FilesPane {
     /// arms it, the second deletes, which is the reference's own two-press
     /// guard. A rel rather than a name for the same reason `renaming` is.
     pub(crate) deleting: Option<PathBuf>,
+    /// Whether the new-file field is showing. The tree keeps no permanent
+    /// create row: a double-click on its blank space is what asks for one, and
+    /// it goes away once the file is made or the tree is left.
+    pub(crate) new_file_open: bool,
+    /// Where and when the blank space was last pressed, so two presses close
+    /// together in space and time read as a double-click.
+    ///
+    /// gpui's [`gpui::ClickEvent::click_count`] is the natural signal, but the
+    /// test harness's synthetic clicks always report a count of one, and the
+    /// gesture is worth driving from a test. So the blank handler tracks the
+    /// prior press itself: a second press within [`SELF_DOUBLE_MS`] milliseconds
+    /// and [`SELF_DOUBLE_PX`] pixels of the last one opens the field.
+    pub(crate) last_blank_press: Option<(gpui::Point<gpui::Pixels>, std::time::Instant)>,
     /// The notes the reader has pinned to this workspace's files, loaded from
     /// the workspace's own `.bsh` directory and written back on every change.
     pub(crate) notes: crate::notes::Notes,
@@ -186,6 +212,8 @@ impl FilesPane {
             renaming: None,
             rename_name,
             deleting: None,
+            new_file_open: false,
+            last_blank_press: None,
             notes: crate::notes::Notes::default(),
             notes_open: false,
             note_text,
@@ -631,6 +659,12 @@ impl Shell {
                 pane.when(self.files.active_tab().is_none(), |pane| {
                     pane.child(self.files_header(&root, cx))
                 })
+                // The new-file row appears only when a double-click on the
+                // tree's blank space asked for it (see `blank_clicked`).
+                .when(
+                    self.files.active_tab().is_none() && self.files.new_file_open,
+                    |pane| pane.child(self.files_new_row(cx)),
+                )
                 // The save-failure line stays on both surfaces: feedback is
                 // not chrome, and it only renders when something went wrong.
                 .when_some(self.files.error.clone(), |pane, error| {
@@ -678,16 +712,19 @@ impl Shell {
             )
     }
 
-    /// The 38px header bar and the manage strip under it.
+    /// The 38px header bar, plus the rename row while one is in flight.
+    ///
+    /// The new-file field that used to sit here as a permanent strip is gone:
+    /// the reader asks for it with a double-click on the tree's blank space
+    /// (see [`Shell::blank_double_clicked`]), so the tree's own chrome is just
+    /// the path and its tools.
     fn files_header(&self, root: &Path, cx: &mut Context<Self>) -> impl IntoElement {
-        let lang = self.state.lang;
         let path = root.display().to_string();
-        let renaming = self.files.renaming.clone();
-        let shown = renaming.is_some();
         // The header itself is the reference's measured 38px bar: path on the
-        // left, tools on the right, a .5px rule under it. The manage strip bsh
-        // adds sits beneath rather than inside, so the measured bar stays
-        // measured and the create/rename fields still have somewhere to live.
+        // left, tools on the right, a .5px rule under it. The new-file and
+        // rename fields no longer ride here — the gesture that summons them
+        // lives on the tree's blank space (see [`Shell::blank_double_clicked`]),
+        // so this bar stays the measured 38px and nothing more.
         div()
             .debug_selector(|| String::from("files-header"))
             .flex_none()
@@ -765,66 +802,74 @@ impl Shell {
                             })),
                     ),
             )
-            // The manage strip: always there and never modal, so a reader who
-            // types a name and presses the button gets a file while one who
-            // does not is never blocked by a dialog to dismiss.
+    }
+
+    /// The new-file field, shown only after a double-click on the tree's blank
+    /// space.
+    ///
+    /// The permanent manage strip is gone: creating a file is a gesture, not
+    /// chrome that sits on screen. This row is that gesture made visible, and
+    /// it carries the same rename field below it when a rename is in flight so
+    /// both mutations share one place to type.
+    fn files_new_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = self.state.lang;
+        let renaming = self.files.renaming.clone();
+        let shown = renaming.is_some();
+        div()
+            .debug_selector(|| String::from("files-manage"))
+            .w_full()
+            .flex_none()
+            .px(px(theme::RIGHT_PAD))
+            .pt(px(6.0))
+            .pb(px(2.0))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
             .child(
                 div()
-                    .debug_selector(|| String::from("files-manage"))
+                    .debug_selector(|| String::from("files-new"))
                     .w_full()
-                    .flex_none()
-                    .px(px(theme::RIGHT_PAD))
-                    .pt(px(6.0))
-                    .pb(px(2.0))
                     .flex()
-                    .flex_col()
-                    .gap(px(4.0))
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
                     .child(
                         div()
-                            .debug_selector(|| String::from("files-new"))
-                            .w_full()
+                            .debug_selector(|| String::from("files-new-input"))
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                Input::new(&self.files.new_name)
+                                    .appearance(false)
+                                    .h(px(28.0)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("files-create")
+                            .debug_selector(|| String::from("files-create"))
+                            .h(px(28.0))
+                            .px(px(10.0))
+                            .rounded(px(theme::RADIUS_SM))
+                            .border_1()
+                            .border_color(rgb(theme::border()))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::hover())))
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.0))
+                            .gap(px(4.0))
+                            .child(icon(IconName::Plus, 13.0, theme::text()))
                             .child(
-                                div().flex_1().min_w_0().child(
-                                    Input::new(&self.files.new_name)
-                                        .appearance(false)
-                                        .h(px(28.0)),
-                                ),
+                                txt(lang.tr("right.files.new"), theme::CHIP_SIZE, theme::text())
+                                    .font_weight(FontWeight::MEDIUM),
                             )
-                            .child(
-                                div()
-                                    .id("files-create")
-                                    .debug_selector(|| String::from("files-create"))
-                                    .h(px(28.0))
-                                    .px(px(10.0))
-                                    .rounded(px(theme::RADIUS_SM))
-                                    .border_1()
-                                    .border_color(rgb(theme::border()))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(theme::hover())))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(4.0))
-                                    .child(icon(IconName::Plus, 13.0, theme::text()))
-                                    .child(
-                                        txt(
-                                            lang.tr("right.files.new"),
-                                            theme::CHIP_SIZE,
-                                            theme::text(),
-                                        )
-                                        .font_weight(FontWeight::MEDIUM),
-                                    )
-                                    .on_click(cx.listener(|this, _event, window, cx| {
-                                        this.create_file(window, cx);
-                                    })),
-                            ),
-                    )
-                    .when(shown, |strip| strip.child(self.files_rename_row(cx))),
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.create_file(window, cx);
+                            })),
+                    ),
             )
+            .when(shown, |strip| strip.child(self.files_rename_row(cx)))
     }
 
     /// The rename row, which only exists while a row is being renamed.
@@ -931,7 +976,53 @@ impl Shell {
                 }
             }
         }
-        list
+        // A double-click on the space below the last row asks for a new file
+        // there. gpui exposes no on_double_click, and its ClickEvent's
+        // click_count is unreliable for a synthesized press, so the pane reads
+        // the gesture itself: two presses close together in time and space.
+        // The blank div fills the pane's remaining height, so the gesture has
+        // somewhere to land that is never a row.
+        list.child(
+            div()
+                .id("files-blank")
+                .debug_selector(|| String::from("files-blank"))
+                .w_full()
+                .flex_1()
+                .min_h(px(48.0))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                    let gpui::ClickEvent::Mouse(mouse) = event else {
+                        return;
+                    };
+                    let now = std::time::Instant::now();
+                    let here = mouse.up.position;
+                    let is_double = match this.files.last_blank_press {
+                        Some((there, then)) => {
+                            let near = (here - there).magnitude() < f64::from(SELF_DOUBLE_PX);
+                            let soon = now.duration_since(then)
+                                < std::time::Duration::from_millis(SELF_DOUBLE_MS);
+                            near && soon
+                        }
+                        None => false,
+                    };
+                    // A double-click consumes the press it was built from, so
+                    // the next click starts a fresh sequence rather than reading
+                    // as yet another double-click. The same reset applies when
+                    // a lone press closes the field, so the reader's next
+                    // double-click isn't mistaken for a single.
+                    let consumed = is_double || this.files.new_file_open;
+                    this.files.last_blank_press = if consumed { None } else { Some((here, now)) };
+                    if is_double {
+                        this.blank_double_clicked(window, cx);
+                    } else if this.files.new_file_open {
+                        // A lone press on blank space retires the new-file
+                        // field, so the tree stays quiet when the reader is
+                        // just clearing the gesture away.
+                        this.files.new_file_open = false;
+                        cx.notify();
+                    }
+                })),
+        )
     }
 
     /// One row of the tree, with the actions that appear on hover.
@@ -1808,6 +1899,8 @@ impl Shell {
                 self.files.new_name.update(cx, |state, cx| {
                     state.set_value(String::new(), window, cx);
                 });
+                // The file exists, so the field that asked for it retires.
+                self.files.new_file_open = false;
                 self.refresh_branch(Path::new(""), cx);
             }
             Err(error) => {
@@ -1815,6 +1908,23 @@ impl Shell {
                 cx.notify();
             }
         }
+    }
+
+    /// Open the new-file field after a double-click on the tree's blank space.
+    ///
+    /// There is no permanent create row in the reference, and a modal dialog
+    /// would block a reader who only meant to clear the selection. So the
+    /// gesture simply reveals the inline field and hands it the keyboard: the
+    /// reader types a name and presses the button (or Enter) to make the file,
+    /// and a single click elsewhere dismisses it.
+    pub(crate) fn blank_double_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.files.renaming = None;
+        self.files.new_file_open = true;
+        let focus = self.files.new_name.clone();
+        focus.update(cx, |state, cx| {
+            state.focus_handle(cx).focus(window, cx);
+        });
+        cx.notify();
     }
 
     /// Arm a row's delete: the first press marks it, the second deletes.
