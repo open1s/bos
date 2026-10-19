@@ -15,6 +15,7 @@ mod editors;
 pub(crate) mod files;
 pub(crate) mod history;
 pub(crate) mod i18n;
+pub(crate) mod mcp;
 pub(crate) mod model;
 pub(crate) mod notes;
 pub(crate) mod plugins;

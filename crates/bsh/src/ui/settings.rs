@@ -14,6 +14,7 @@ use gpui_kit::*;
 use super::shell::{ModelRowEditor, ModelsAddRoute, Shell};
 use super::{hairline_all, hairline_bottom, hairline_top, icon, txt, DivExt, IconName};
 use crate::i18n::{tr, tr_args, Lang};
+use crate::settings::mcp::{McpScope, McpServer, McpTransport};
 use crate::settings::Settings;
 use crate::theme;
 
@@ -580,6 +581,7 @@ impl Shell {
                 self.state.draft(),
                 &self.state.vault,
                 &crate::settings::resolve::SessionChoice::default(),
+                &self.state.mcp,
             );
             self.caps = crate::caps::capabilities(&built.agent);
             self.plugins = built.plugins;
@@ -656,7 +658,7 @@ impl Shell {
             5 => self.section_plugins(cx),
             6 => self.section_shell(cx),
             7 => self.section_agent_loop(cx),
-            8 => self.section_mcp(),
+            8 => self.section_mcp(cx),
             9 => self.section_archived(cx),
             10 => self.section_workspaces(cx),
             11 => self.section_context(cx),
@@ -4401,19 +4403,25 @@ impl Shell {
             }))
             .into_any_element()
     }
-    /// The Built-in plugins pane's Plugin list, in the reference's own shape.
+    /// The Built-in plugins pane, in the reference's own shape.
     ///
     /// Measured from `dsh-client-ui-plugins`: a tab strip (Plugin list / MCP /
-    /// Plugin Market), a full-width search field, then two collapsible groups -
-    /// the SESSION plugins an agent preset composes, and the GLOBAL plugins the
-    /// system and every session share - drawn as cards two per row, each with a
-    /// name, a description and a state.
+    /// Plugin Market), then the ACTIVE tab's body. The Plugin list tab is a
+    /// full-width search field over two collapsible groups - the SESSION plugins
+    /// an agent preset composes, and the GLOBAL plugins the system and every
+    /// session share - drawn as cards two per row. The MCP tab is this crate's
+    /// server management (`mcp_rows`), drawn in the same pane rather than on a
+    /// page of its own.
     fn section_builtin_plugins(
         &self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let lang = self.state.lang;
         let mut rows: Vec<AnyElement> = vec![self.plugin_tabs(cx)];
+        if self.plugins_tab == 1 {
+            rows.extend(self.mcp_rows(cx));
+            return ("settings.plugins", "settings.mcpIntro", rows);
+        }
         rows.push(
             div()
                 .mb(px(10.0))
@@ -4568,20 +4576,16 @@ impl Shell {
             .unwrap_or_else(|| tr(self.state.lang, "settings.pluginsNoTools"))
     }
 
-    /// The tab strip the Plugin list view opens with.
+    /// The tab strip the Built-in plugins pane opens with.
     ///
-    /// "MCP" is a real tab - it moves the dialog to that pane. "Plugin Market"
-    /// is drawn DISABLED: this deployment ships no market, and a tab that looks
-    /// pressable but does nothing is what the standing rule forbids.
+    /// "Plugin list" and "MCP" are REAL tabs: each sets the pane's tab, and the
+    /// same pane draws that tab's body under the strip. "Plugin Market" is drawn
+    /// DISABLED: this deployment ships no market, and a tab that looks pressable
+    /// but does nothing is what the standing rule forbids.
     fn plugin_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
-        let active = div()
-            .pb(px(8.0))
-            .border_b_2()
-            .border_color(rgb(theme::text()))
-            .child(txt(tr(lang, "settings.pluginsTabs"), 13.0, theme::text()));
-        let mcp_index = section_index("mcp");
-        div()
+        let pane = section_index("plugins");
+        let mut strip = div()
             .debug_selector(|| String::from("plugins-tabs"))
             .flex()
             .flex_row()
@@ -4589,26 +4593,42 @@ impl Shell {
             .gap(px(18.0))
             .mb(px(10.0))
             .border_b_1()
-            .border_color(rgb(theme::border_soft()))
-            .child(active)
-            .child(
+            .border_color(rgb(theme::border_soft()));
+        for (tab, key, id) in [
+            (0, "settings.pluginsTabs", "plugins-tab-list"),
+            (1, "settings.pluginsTabMcp", "plugins-tab-mcp"),
+        ] {
+            let selected = self.plugins_tab == tab;
+            strip = strip.child(
                 div()
-                    .id("plugins-tab-mcp")
-                    .debug_selector(|| String::from("plugins-tab-mcp"))
+                    .id(SharedString::from(id))
+                    .debug_selector(move || id.to_string())
                     .pb(px(8.0))
                     .cursor_pointer()
+                    .when(selected, |cell| {
+                        cell.border_b_2().border_color(rgb(theme::text()))
+                    })
                     .child(txt(
-                        tr(lang, "settings.pluginsTabMcp"),
+                        tr(lang, key),
                         13.0,
-                        theme::muted(),
+                        if selected {
+                            theme::text()
+                        } else {
+                            theme::muted()
+                        },
                     ))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        if let Some(index) = mcp_index {
+                        this.plugins_tab = tab;
+                        // A tab belongs to the pane, not to a section of its own:
+                        // selecting it keeps the dialog on Built-in plugins.
+                        if let Some(index) = pane {
                             this.state.settings_section = index;
-                            cx.notify();
                         }
+                        cx.notify();
                     })),
-            )
+            );
+        }
+        strip
             .child(
                 div()
                     .debug_selector(|| String::from("plugins-tab-market"))
@@ -4787,30 +4807,558 @@ impl Shell {
         }
         card.into_any_element()
     }
-    /// MCP servers.
-    fn section_mcp(&self) -> (&'static str, &'static str, Vec<AnyElement>) {
+    /// Load one entry into the MCP form, or blank it for a new one.
+    fn mcp_fill_form(
+        &mut self,
+        server: Option<&McpServer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (name, command, args, url, http) = match server {
+            Some(server) => {
+                let (command, args, url, http) = match &server.transport {
+                    McpTransport::Stdio { command, args } => {
+                        (command.clone(), args.join(" "), String::new(), false)
+                    }
+                    McpTransport::Http { url } => (String::new(), String::new(), url.clone(), true),
+                };
+                (server.name.clone(), command, args, url, http)
+            }
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                false,
+            ),
+        };
+        set(&self.mcp_name, name, window, cx);
+        set(&self.mcp_command, command, window, cx);
+        set(&self.mcp_args, args, window, cx);
+        set(&self.mcp_url, url, window, cx);
+        self.mcp_http = http;
+    }
+
+    /// Open the MCP form on a blank entry.
+    pub(crate) fn mcp_begin_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mcp_fill_form(None, window, cx);
+        self.mcp_form_open = true;
+        self.mcp_editing = None;
+        self.mcp_scope = McpScope::Global;
+        self.mcp_refusal = None;
+        cx.notify();
+    }
+
+    /// Open the MCP form on an existing entry.
+    pub(crate) fn mcp_begin_edit(
+        &mut self,
+        scope: McpScope,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(server) = self
+            .state
+            .draft()
+            .mcp_servers_of(scope)
+            .into_iter()
+            .find(|server| server.name.eq_ignore_ascii_case(name))
+        else {
+            return;
+        };
+        self.mcp_fill_form(Some(&server), window, cx);
+        self.mcp_form_open = true;
+        self.mcp_editing = Some((scope, server.name.clone()));
+        self.mcp_scope = scope;
+        self.mcp_refusal = None;
+        cx.notify();
+    }
+
+    /// Save the form's entry into the draft, or say why it cannot.
+    pub(crate) fn mcp_save(&mut self, cx: &mut Context<Self>) {
+        let name = self.mcp_name.read(cx).value().trim().to_string();
+        let transport = if self.mcp_http {
+            McpTransport::Http {
+                url: self.mcp_url.read(cx).value().trim().to_string(),
+            }
+        } else {
+            McpTransport::Stdio {
+                command: self.mcp_command.read(cx).value().trim().to_string(),
+                args: self
+                    .mcp_args
+                    .read(cx)
+                    .value()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+            }
+        };
+        // An edit keeps the row's enabled state: changing an address must not
+        // silently reconnect a server the reader had parked.
+        let enabled = match &self.mcp_editing {
+            Some((scope, original)) => self
+                .state
+                .draft()
+                .mcp_servers_of(*scope)
+                .into_iter()
+                .find(|server| server.name.eq_ignore_ascii_case(original))
+                .map(|server| server.enabled)
+                .unwrap_or(true),
+            None => true,
+        };
+        let server = McpServer {
+            name,
+            transport,
+            enabled,
+            scope: self.mcp_scope,
+        };
+        let outcome = match &self.mcp_editing {
+            Some((scope, original)) if *scope == self.mcp_scope => self
+                .state
+                .draft_mut()
+                .update_mcp_server(*scope, original, server),
+            Some((scope, original)) => {
+                // Moving an entry between documents: validate and add in the
+                // target first, so a refusal leaves the original where it was.
+                let target = self.mcp_scope;
+                let outcome = self.state.draft_mut().add_mcp_server(target, server);
+                if outcome.is_ok() {
+                    self.state.draft_mut().remove_mcp_server(*scope, original);
+                }
+                outcome
+            }
+            None => self
+                .state
+                .draft_mut()
+                .add_mcp_server(self.mcp_scope, server),
+        };
+        match outcome {
+            Ok(()) => {
+                self.mcp_form_open = false;
+                self.mcp_editing = None;
+                self.mcp_refusal = None;
+            }
+            Err(refusal) => self.mcp_refusal = Some(refusal.key()),
+        }
+        cx.notify();
+    }
+
+    /// Close the MCP form without writing.
+    pub(crate) fn mcp_cancel(&mut self, cx: &mut Context<Self>) {
+        self.mcp_form_open = false;
+        self.mcp_editing = None;
+        self.mcp_refusal = None;
+        cx.notify();
+    }
+
+    /// Drop one server from the document that owns it.
+    pub(crate) fn mcp_remove(&mut self, scope: McpScope, name: &str, cx: &mut Context<Self>) {
+        self.state.draft_mut().remove_mcp_server(scope, name);
+        if self
+            .mcp_editing
+            .as_ref()
+            .is_some_and(|(edited_scope, edited)| {
+                *edited_scope == scope && edited.eq_ignore_ascii_case(name)
+            })
+        {
+            self.mcp_form_open = false;
+            self.mcp_editing = None;
+        }
+        cx.notify();
+    }
+
+    /// Connect or park one server.
+    pub(crate) fn mcp_toggle(&mut self, scope: McpScope, name: &str, cx: &mut Context<Self>) {
+        let Some(mut server) = self
+            .state
+            .draft()
+            .mcp_servers_of(scope)
+            .into_iter()
+            .find(|server| server.name.eq_ignore_ascii_case(name))
+        else {
+            return;
+        };
+        server.enabled = !server.enabled;
+        let outcome = self
+            .state
+            .draft_mut()
+            .update_mcp_server(scope, name, server);
+        self.mcp_refusal = outcome.err().map(|refusal| refusal.key());
+        cx.notify();
+    }
+
+    /// One segmented transport/scope choice.
+    fn mcp_segment(
+        &self,
+        id: &'static str,
+        label: String,
+        selected: bool,
+        cx: &mut Context<Self>,
+        run: impl Fn(&mut Shell) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_string())
+            .h(px(28.0))
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .rounded(px(6.0))
+            .when(selected, |cell| cell.bg(rgb(theme::accent())))
+            .when(!selected, |cell| cell.bg(rgb(theme::hover())))
+            .child(txt(
+                label,
+                12.0,
+                if selected {
+                    theme::page()
+                } else {
+                    theme::text()
+                },
+            ))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                run(this);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// One MCP server card: identity, transport, the live connection state and
+    /// the four actions the document supports.
+    fn mcp_row(&self, index: usize, server: &McpServer, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let name = server.name.clone();
+        let scope = server.scope;
+        // A draft row whose configuration is not the committed one cannot be
+        // connected yet, and saying so is what makes the dialog Save legible.
+        let pending = !self.state.settings.mcp_servers().iter().any(|committed| {
+            committed.name == server.name
+                && committed.signature() == server.signature()
+                && committed.enabled == server.enabled
+        });
+        let (status, ink) = if !server.enabled {
+            (lang.tr("settings.mcpDisabled"), theme::faint())
+        } else if pending {
+            (lang.tr("settings.mcpSaveToConnect"), theme::warn())
+        } else if let Some(error) = self.state.mcp.error(&server.name) {
+            (
+                format!("{} · {error}", lang.tr("settings.mcpFailed")),
+                theme::error(),
+            )
+        } else if let Some(count) = self.state.mcp.tool_count(&server.name) {
+            let key = if count == 1 {
+                "settings.mcpConnectedOne"
+            } else {
+                "settings.mcpConnected"
+            };
+            (
+                crate::i18n::tr_args(lang, key, &[("count", count.to_string())]),
+                theme::success(),
+            )
+        } else {
+            (lang.tr("settings.mcpNotConnected"), theme::faint())
+        };
+        // The exact names the model can call, not only a count: this is what
+        // makes "it is connected" checkable against the next request.
+        let tools = if server.enabled {
+            self.state.mcp.tool_names(&server.name)
+        } else {
+            None
+        };
+        let edit = {
+            let name = name.clone();
+            div()
+                .id(SharedString::from(format!("mcp-edit-{index}")))
+                .debug_selector(move || format!("mcp-edit-{index}"))
+                .cursor_pointer()
+                .child(txt(lang.tr("settings.mcpEdit"), 12.0, theme::muted()))
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.mcp_begin_edit(scope, &name, window, cx);
+                }))
+        };
+        let remove = {
+            let name = name.clone();
+            div()
+                .id(SharedString::from(format!("mcp-remove-{index}")))
+                .debug_selector(move || format!("mcp-remove-{index}"))
+                .cursor_pointer()
+                .child(txt(lang.tr("settings.mcpDelete"), 12.0, theme::muted()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.mcp_remove(scope, &name, cx);
+                }))
+        };
+        let toggle = {
+            let name = name.clone();
+            let key = if server.enabled {
+                "settings.mcpDisable"
+            } else {
+                "settings.mcpEnable"
+            };
+            div()
+                .id(SharedString::from(format!("mcp-toggle-{index}")))
+                .debug_selector(move || format!("mcp-toggle-{index}"))
+                .cursor_pointer()
+                .child(txt(lang.tr(key), 12.0, theme::muted()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.mcp_toggle(scope, &name, cx);
+                }))
+        };
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                txt(name, 13.0, theme::text())
+                    .font_weight(FontWeight::MEDIUM)
+                    .flex_1()
+                    .min_w_0(),
+            )
+            .child(
+                div()
+                    .px(px(6.0))
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.0))
+                    .bg(rgb(theme::hover()))
+                    .child(txt(lang.tr(scope.label_key()), 10.0, theme::muted())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(edit)
+                    .child(remove)
+                    .child(toggle),
+            );
+        let card = hairline_all(
+            div()
+                .debug_selector(move || format!("mcp-row-{index}"))
+                .p(px(12.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border())),
+        )
+        .child(head)
+        .child(
+            txt(server.transport_summary(), 12.0, theme::muted())
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap(),
+        )
+        .child(
+            txt(status, 12.0, ink)
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap(),
+        );
+        let mut card = card;
+        if let Some(tools) = tools {
+            if tools.is_empty() {
+                card = card.child(txt(lang.tr("settings.mcpNoTools"), 11.0, theme::faint()));
+            } else {
+                card = card.child(txt(lang.tr("settings.mcpTools"), 11.0, theme::faint()));
+                let mut grid = div().flex().flex_row().flex_wrap().gap(px(4.0));
+                for tool in tools {
+                    grid = grid.child(
+                        div()
+                            .h(px(18.0))
+                            .px(px(6.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(rgb(theme::hover()))
+                            .child(txt(tool, 11.0, theme::text()).font_family(theme::CODE_FONT)),
+                    );
+                }
+                card = card.child(grid);
+            }
+        }
+        card.into_any_element()
+    }
+
+    /// The form that adds or edits one server.
+    fn mcp_form(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let transport = {
+            let mut row = div().flex().flex_row().gap(px(4.0));
+            row = row.child(self.mcp_segment(
+                "mcp-transport-stdio",
+                lang.tr("settings.mcpStdio"),
+                !self.mcp_http,
+                cx,
+                |this| this.mcp_http = false,
+            ));
+            row = row.child(self.mcp_segment(
+                "mcp-transport-http",
+                lang.tr("settings.mcpHttp"),
+                self.mcp_http,
+                cx,
+                |this| this.mcp_http = true,
+            ));
+            row.into_any_element()
+        };
+        let scope = {
+            let mut row = div().flex().flex_row().gap(px(4.0));
+            for (value, id, key) in [
+                (
+                    McpScope::Global,
+                    "mcp-scope-global",
+                    "settings.mcpScopeGlobal",
+                ),
+                (
+                    McpScope::Workspace,
+                    "mcp-scope-workspace",
+                    "settings.mcpScopeWorkspace",
+                ),
+            ] {
+                let selected = self.mcp_scope == value;
+                row = row.child(
+                    self.mcp_segment(id, lang.tr(key), selected, cx, move |this| {
+                        this.mcp_scope = value;
+                    }),
+                );
+            }
+            row.into_any_element()
+        };
+        let mut fields = div().flex().flex_col().gap(px(12.0));
+        fields = fields
+            .child(self.editor_field(
+                "settings.mcpName",
+                self.editor_input(&self.mcp_name, "mcp-field-name".to_string()),
+            ))
+            .child(self.editor_field("settings.mcpTransport", transport));
+        if self.mcp_http {
+            fields = fields.child(self.editor_field(
+                "settings.mcpUrl",
+                self.editor_input(&self.mcp_url, "mcp-field-url".to_string()),
+            ));
+        } else {
+            fields = fields
+                .child(self.editor_field(
+                    "settings.mcpCommand",
+                    self.editor_input(&self.mcp_command, "mcp-field-command".to_string()),
+                ))
+                .child(self.editor_field(
+                    "settings.mcpArgs",
+                    self.editor_input(&self.mcp_args, "mcp-field-args".to_string()),
+                ));
+        }
+        fields = fields.child(self.editor_field("settings.mcpScope", scope));
+        let save = div()
+            .id("mcp-save")
+            .debug_selector(|| "mcp-save".to_string())
+            .h(px(28.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .rounded(px(6.0))
+            .bg(rgb(theme::accent()))
+            .cursor_pointer()
+            .child(txt(lang.tr("settings.mcpSave"), 12.0, theme::page()))
+            .on_click(cx.listener(|this, _event, _window, cx| this.mcp_save(cx)));
+        let cancel = div()
+            .id("mcp-cancel")
+            .debug_selector(|| "mcp-cancel".to_string())
+            .h(px(28.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .rounded(px(6.0))
+            .bg(rgb(theme::hover()))
+            .cursor_pointer()
+            .child(txt(lang.tr("settings.cancel"), 12.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| this.mcp_cancel(cx)));
+        let actions = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(save)
+            .child(cancel);
+        let mut card = hairline_all(
+            div()
+                .debug_selector(|| "mcp-form".to_string())
+                .p(px(12.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border())),
+        )
+        .child(fields)
+        .child(actions);
+        if let Some(key) = self.mcp_refusal {
+            card = card.child(self.settings_note(key, true));
+        }
+        card.into_any_element()
+    }
+
+    /// The MCP tab's body: the servers, the add control and the open form.
+    ///
+    /// It is a tab of the Built-in plugins pane, so it carries no page title of
+    /// its own - the strip above it says which tab the reader is on.
+    fn mcp_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let lang = self.state.lang;
         let mut rows: Vec<AnyElement> = Vec::new();
-        let servers = &self.state.draft().global.mcp_servers;
+        let servers = self.state.draft().mcp_servers();
         if servers.is_empty() {
             rows.push(
-                txt(
-                    tr(self.state.lang, "settings.mcpEmpty"),
-                    13.0,
-                    theme::muted(),
-                )
-                .into_any_element(),
+                txt(lang.tr("settings.mcpEmpty"), 13.0, theme::muted())
+                    .pb(px(1.0))
+                    .into_any_element(),
             );
         }
         for (index, server) in servers.iter().enumerate() {
-            let name = server
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unnamed")
-                .to_string();
-            rows.push(self.settings_row("settings.mcp", format!("{index}. {name}")));
+            rows.push(self.mcp_row(index, server, cx));
         }
-        rows.push(self.settings_note("settings.mcpPending", true));
-        ("settings.mcp", "settings.mcpPending", rows)
+        rows.push(
+            hairline_all(
+                div()
+                    .id("mcp-add")
+                    .debug_selector(|| "mcp-add".to_string())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .self_start()
+                    .gap(px(4.0))
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(theme::page()))
+                    .border_color(rgb(theme::border()))
+                    .cursor_pointer()
+                    .child(icon(IconName::Plus, 14.0, theme::text()))
+                    .child(txt(lang.tr("settings.mcpAdd"), 12.0, theme::text()))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.mcp_begin_add(window, cx);
+                    })),
+            )
+            .into_any_element(),
+        );
+        if self.mcp_form_open {
+            rows.push(self.mcp_form(cx));
+        }
+        rows
+    }
+
+    /// The MCP view: the Built-in plugins pane opened on its MCP tab.
+    ///
+    /// `--settings=mcp` and any older deep link still land here, and they land on
+    /// the pane the tab belongs to rather than on a separate page.
+    fn section_mcp(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (&'static str, &'static str, Vec<AnyElement>) {
+        self.plugins_tab = 1;
+        self.section_builtin_plugins(cx)
     }
 
     /// Archived sessions, restored in place.

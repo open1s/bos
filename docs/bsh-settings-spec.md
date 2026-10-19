@@ -240,15 +240,29 @@ not a resolution level.
 prompt sections the model sees: it has to be reconstructible from the session
 log alone. An id nothing defines **refuses the turn** instead of falling back.
 
-**Inheritable** (`temperature`, `reasoning_effort`, `skills_dir`, `memory_path`,
-`mcp_servers`): absent in the workspace inherits. Every one is `Option<T>`, so
-absence is genuinely distinguishable from a value. The old `0.0`-and-`""`
-sentinel scheme is gone.
+**Inheritable** (`temperature`, `reasoning_effort`, `skills_dir`, `memory_path`):
+absent in the workspace inherits. Every one is `Option<T>`, so absence is
+genuinely distinguishable from a value. The old `0.0`-and-`""` sentinel scheme
+is gone.
 
-**MCP servers** are merged: the global list is the machine's, the workspace's is
-the project's; a workspace entry with the same name wins. An entry with no
-`name` cannot be matched, so it is appended rather than dropped. The global
-order survives and a collision is replaced in place.
+**MCP servers** are LISTS, merged: the global list is the machine's, the
+workspace's is the project's; a workspace entry with the same name wins. An
+entry with no `name` cannot be matched, so it is appended rather than dropped.
+The global order survives and a collision is replaced in place.
+
+An entry is `{name, command, args}` for a stdio server or `{name, url}` for a
+streamable HTTP one, plus an optional `enabled` (default `true`) so a server
+can be parked without deleting it. The name is the tool namespace, so it is
+limited to `[A-Za-z0-9._-]`: the registry exposes a server's tool as
+`<name>_<tool>`.
+
+**Connections are a pool, not a document read.** `src/mcp.rs` keeps one live
+connection per enabled server, reconciled at launch, after the MCP pane saves,
+and when the active workspace changes; an unchanged server keeps its process,
+and a reconfigured one is dropped (its child is killed on drop) and reopened.
+`caps::build_agent` registers the pool's tools on every turn, so a server the
+pane configured is a tool the model can actually call. A connection failure is
+kept as an error the pane shows; it never blocks a turn.
 
 **Implemented in `src/settings/resolve.rs`**, which returns *data* and never
 wording, so the view owns the copy:

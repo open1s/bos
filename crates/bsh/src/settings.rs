@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod global;
+pub(crate) mod mcp;
 pub(crate) mod provider;
 pub(crate) mod resolve;
 pub(crate) mod workspace;
@@ -624,6 +625,85 @@ impl Settings {
         path
     }
 
+    /// Every effective MCP server: the global entries in file order, with a
+    /// workspace entry of the same name replacing its global twin.
+    pub(crate) fn mcp_servers(&self) -> Vec<mcp::McpServer> {
+        mcp::merge(
+            &mcp::parse_list(&self.global.mcp_servers, mcp::McpScope::Global),
+            &mcp::parse_list(&self.workspace.agent.mcp_servers, mcp::McpScope::Workspace),
+        )
+    }
+
+    /// The entries one document holds.
+    pub(crate) fn mcp_servers_of(&self, scope: mcp::McpScope) -> Vec<mcp::McpServer> {
+        match scope {
+            mcp::McpScope::Global => {
+                mcp::parse_list(&self.global.mcp_servers, mcp::McpScope::Global)
+            }
+            mcp::McpScope::Workspace => {
+                mcp::parse_list(&self.workspace.agent.mcp_servers, mcp::McpScope::Workspace)
+            }
+        }
+    }
+
+    /// The mutable list one document owns.
+    fn mcp_list_mut(&mut self, scope: mcp::McpScope) -> &mut Vec<serde_json::Value> {
+        match scope {
+            mcp::McpScope::Global => &mut self.global.mcp_servers,
+            mcp::McpScope::Workspace => &mut self.workspace.agent.mcp_servers,
+        }
+    }
+
+    /// Add a server to one document.
+    ///
+    /// The pane edits the DRAFT, so nothing reaches disk until the dialog
+    /// saves; a refusal leaves the list exactly as it was.
+    pub(crate) fn add_mcp_server(
+        &mut self,
+        scope: mcp::McpScope,
+        server: mcp::McpServer,
+    ) -> Result<(), mcp::McpRefusal> {
+        let others = self.mcp_servers_of(scope);
+        server.validate(&others, None)?;
+        self.mcp_list_mut(scope).push(server.to_value());
+        Ok(())
+    }
+
+    /// Replace the entry called `original` in one document.
+    pub(crate) fn update_mcp_server(
+        &mut self,
+        scope: mcp::McpScope,
+        original: &str,
+        server: mcp::McpServer,
+    ) -> Result<(), mcp::McpRefusal> {
+        let others = self.mcp_servers_of(scope);
+        server.validate(&others, Some(original))?;
+        let list = self.mcp_list_mut(scope);
+        let Some(index) = list.iter().position(|value| {
+            value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(original))
+        }) else {
+            return Err(mcp::McpRefusal::NotFound);
+        };
+        list[index] = server.to_value();
+        Ok(())
+    }
+
+    /// Drop one server from one document.
+    pub(crate) fn remove_mcp_server(&mut self, scope: mcp::McpScope, name: &str) -> bool {
+        let list = self.mcp_list_mut(scope);
+        let before = list.len();
+        list.retain(|value| {
+            !value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|entry| entry.eq_ignore_ascii_case(name))
+        });
+        before != list.len()
+    }
+
     /// The model nicknames one provider carries, for the menu and the pane.
     pub(crate) fn catalog(&self, provider: &str) -> Vec<String> {
         self.global.models_of(provider).keys().cloned().collect()
@@ -700,6 +780,7 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::global::{self, GlobalSettings, ModelEntry};
+    use super::mcp::{McpRefusal, McpScope, McpServer, McpTransport};
     use super::workspace::WorkspaceSettings;
     use super::Settings;
 
@@ -1114,6 +1195,99 @@ mod tests {
             settings.catalog("p"),
             vec!["fast".to_string(), "slow".to_string()]
         );
+    }
+
+    /// MCP entries live in the document that owns them; the effective list lets
+    /// a workspace entry override a global one by name.
+    #[test]
+    fn the_mcp_documents_hold_their_own_servers() {
+        let http = |url: &str| McpTransport::Http {
+            url: url.to_string(),
+        };
+        let mut settings = Settings::default();
+        let global = McpServer {
+            name: "github".to_string(),
+            transport: http("https://a.example"),
+            enabled: true,
+            scope: McpScope::Global,
+        };
+        settings
+            .add_mcp_server(McpScope::Global, global.clone())
+            .expect("the first entry is added");
+        assert_eq!(settings.global.mcp_servers.len(), 1);
+        assert!(settings.mcp_servers_of(McpScope::Workspace).is_empty());
+        assert_eq!(settings.mcp_servers().len(), 1);
+
+        // The same name in the workspace document overrides, rather than
+        // duplicating, its global twin.
+        settings
+            .add_mcp_server(
+                McpScope::Workspace,
+                McpServer {
+                    transport: http("https://b.example"),
+                    scope: McpScope::Workspace,
+                    ..global.clone()
+                },
+            )
+            .expect("an override is a different document");
+        assert_eq!(settings.mcp_servers().len(), 1);
+        assert_eq!(
+            settings.mcp_servers()[0].transport,
+            http("https://b.example")
+        );
+        assert_eq!(settings.mcp_servers()[0].scope, McpScope::Workspace);
+
+        // A duplicate in the SAME document is refused and changes nothing.
+        assert_eq!(
+            settings.add_mcp_server(
+                McpScope::Global,
+                McpServer {
+                    transport: http("https://c.example"),
+                    ..global.clone()
+                },
+            ),
+            Err(McpRefusal::NameTaken)
+        );
+        assert_eq!(
+            settings.global.mcp_servers.len(),
+            1,
+            "the refused add wrote nothing"
+        );
+
+        // An in-place edit changes the override, not its twin.
+        let mut edited = settings.mcp_servers_of(McpScope::Workspace)[0].clone();
+        edited.transport = http("https://d.example");
+        settings
+            .update_mcp_server(McpScope::Workspace, "github", edited)
+            .expect("the edit lands");
+        assert_eq!(
+            settings.mcp_servers()[0].transport,
+            http("https://d.example")
+        );
+        assert_eq!(settings.global.mcp_servers[0]["url"], "https://a.example");
+
+        // A rename that no longer collides becomes a second effective row,
+        // and deleting each row addresses its own document.
+        let mut renamed = settings.mcp_servers_of(McpScope::Workspace)[0].clone();
+        renamed.name = "docs".to_string();
+        settings
+            .update_mcp_server(McpScope::Workspace, "github", renamed)
+            .expect("the rename lands");
+        let names: Vec<String> = settings
+            .mcp_servers()
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+        assert_eq!(names, ["github", "docs"]);
+        assert!(settings.remove_mcp_server(McpScope::Workspace, "docs"));
+        assert_eq!(
+            settings.mcp_servers()[0].name,
+            "github",
+            "removing the override reveals the global entry"
+        );
+        assert!(settings.remove_mcp_server(McpScope::Global, "github"));
+        assert!(settings.mcp_servers().is_empty());
+        assert!(!settings.remove_mcp_server(McpScope::Global, "gone"));
     }
 
     /// A task is registered against the file, and the cadence it carries is

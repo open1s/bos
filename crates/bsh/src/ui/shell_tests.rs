@@ -3818,6 +3818,7 @@ fn the_tools_pane_switches_the_hosted_web_search(cx: &mut TestAppContext) {
             shell.read(cx).state.draft(),
             &shell.read(cx).state.vault,
             &crate::settings::resolve::SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
         )
         .agent
         .config()
@@ -4603,10 +4604,10 @@ fn the_markdown_scale_carries_the_reference_metrics(cx: &mut TestAppContext) {
     );
 }
 
-/// The Plugin list's MCP tab is a real control: the pane's only route to the MCP
-/// servers now that neither the sidebar nor a view list names it.
+/// The Built-in plugins pane's tabs switch its BODY in place: MCP is a tab
+/// beside Plugin list, not a page of its own, and both stay in the same pane.
 #[gpui::test]
-fn the_plugins_pane_mcp_tab_opens_the_mcp_section(cx: &mut TestAppContext) {
+fn the_plugins_pane_tabs_switch_the_body_in_place(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("plugins-views", 1);
@@ -4614,15 +4615,184 @@ fn the_plugins_pane_mcp_tab_opens_the_mcp_section(cx: &mut TestAppContext) {
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("plugins-session").is_some(),
+        "the plugin list is the first tab"
+    );
+    assert!(
+        cx.debug_bounds("mcp-add").is_none(),
+        "and the MCP body is not drawn yet"
+    );
 
     let tab = cx.debug_bounds("plugins-tab-mcp").expect("the MCP tab");
     cx.simulate_click(tab.center(), Modifiers::default());
-    let section = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.settings_section);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (section, plugins_tab) = cx.update(|_, cx| {
+        let state = &harness.read(cx).shell.read(cx).state;
+        (
+            state.settings_section,
+            harness.read(cx).shell.read(cx).plugins_tab,
+        )
+    });
     assert_eq!(
         section,
-        section_index("mcp").expect("the mcp section"),
-        "the tab moves the dialog to the MCP pane"
+        section_index("plugins").expect("the plugins section"),
+        "the tab keeps the dialog on Built-in plugins"
     );
+    assert_eq!(plugins_tab, 1, "the MCP tab is the active one");
+    assert!(
+        cx.debug_bounds("mcp-add").is_some(),
+        "the MCP body draws inside the pane"
+    );
+    assert!(
+        cx.debug_bounds("plugins-session").is_none(),
+        "the plugin list is replaced, not stacked under it"
+    );
+
+    let list = cx
+        .debug_bounds("plugins-tab-list")
+        .expect("the Plugin list tab");
+    cx.simulate_click(list.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let plugins_tab = cx.update(|_, cx| harness.read(cx).shell.read(cx).plugins_tab);
+    assert_eq!(plugins_tab, 0, "the list tab comes back");
+    assert!(
+        cx.debug_bounds("plugins-session").is_some(),
+        "with the plugin list body"
+    );
+    assert!(cx.debug_bounds("mcp-add").is_none());
+}
+
+/// The MCP pane manages servers: add, edit, disable, move between documents
+/// and delete. Everything lands in the DRAFT, which is what the dialog saves.
+#[gpui::test]
+fn the_mcp_pane_manages_the_draft(cx: &mut TestAppContext) {
+    use crate::settings::mcp::{McpScope, McpTransport};
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("mcp-pane"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("mcp"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Add a stdio server through the form.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.mcp_begin_add(window, cx);
+            this.mcp_name.update(cx, |state, cx| {
+                state.set_value("github".to_string(), window, cx);
+            });
+            this.mcp_command.update(cx, |state, cx| {
+                state.set_value("npx".to_string(), window, cx);
+            });
+            this.mcp_args.update(cx, |state, cx| {
+                state.set_value("-y @mcp/github".to_string(), window, cx);
+            });
+            this.mcp_save(cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let global = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .mcp_servers
+            .clone()
+    });
+    assert_eq!(global.len(), 1, "the add saved one entry");
+    assert_eq!(global[0]["name"], "github");
+    assert_eq!(global[0]["command"], "npx");
+    assert_eq!(global[0]["args"], serde_json::json!(["-y", "@mcp/github"]));
+    assert!(cx.debug_bounds("mcp-form").is_none(), "a saved form closes");
+    assert!(cx.debug_bounds("mcp-row-0").is_some(), "and the row draws");
+
+    // Edit it onto HTTP.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.mcp_begin_edit(McpScope::Global, "github", window, cx);
+            this.mcp_http = true;
+            this.mcp_url.update(cx, |state, cx| {
+                state.set_value("https://mcp.example/v1".to_string(), window, cx);
+            });
+            this.mcp_save(cx);
+        })
+    });
+    let server = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .mcp_servers()
+            .remove(0)
+    });
+    assert_eq!(
+        server.transport,
+        McpTransport::Http {
+            url: "https://mcp.example/v1".to_string()
+        },
+        "the edit replaced the transport"
+    );
+
+    // Disable, then move it into the workspace document.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            this.mcp_toggle(McpScope::Global, "github", _cx)
+        });
+    });
+    let enabled =
+        cx.update(|_, cx| harness.read(cx).shell.read(cx).state.draft().mcp_servers()[0].enabled);
+    assert!(!enabled, "the toggle writes the flag");
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.mcp_begin_edit(McpScope::Global, "github", window, cx);
+            this.mcp_scope = McpScope::Workspace;
+            this.mcp_save(cx);
+        })
+    });
+    let (global, workspace) = cx.update(|_, cx| {
+        let state = &harness.read(cx).shell.read(cx).state;
+        (
+            state.draft().global.mcp_servers.len(),
+            state.draft().workspace.agent.mcp_servers.len(),
+        )
+    });
+    assert_eq!(global, 0, "the entry left the global document");
+    assert_eq!(workspace, 1, "and landed in the workspace one");
+    let still_disabled =
+        cx.update(|_, cx| !harness.read(cx).shell.read(cx).state.draft().mcp_servers()[0].enabled);
+    assert!(
+        still_disabled,
+        "editing an address must not silently re-enable a parked server"
+    );
+
+    // Delete it from the document that now owns it.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.mcp_remove(McpScope::Workspace, "github", cx);
+        })
+    });
+    let workspace = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .mcp_servers
+            .len()
+    });
+    assert_eq!(workspace, 0, "delete drops the entry");
 }
 /// The Plugin list draws the reference's own empty line when the inventory is
 /// empty, instead of a blank column.
@@ -7118,11 +7288,16 @@ fn choosing_a_model_switches_the_one_the_next_turn_builds() {
         "and the menu checks the row the chip names"
     );
     assert!(
-        crate::caps::build_agent(&state.settings, &state.vault, &state.session_choice(&id),)
-            .agent
-            .config()
-            .model
-            .contains("second-id"),
+        crate::caps::build_agent(
+            &state.settings,
+            &state.vault,
+            &state.session_choice(&id),
+            &crate::mcp::McpPool::default(),
+        )
+        .agent
+        .config()
+        .model
+        .contains("second-id"),
         "the agent for this session is built against the chosen model"
     );
     assert!(
@@ -7130,6 +7305,7 @@ fn choosing_a_model_switches_the_one_the_next_turn_builds() {
             &state.settings,
             &state.vault,
             &crate::settings::resolve::SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
         )
         .agent
         .config()
@@ -7184,11 +7360,16 @@ fn the_effort_level_reaches_the_request() {
     state.select_model_from("p", "thinking");
     let id = state.active_id.clone().expect("the session on screen");
     let effort = |state: &AppState| {
-        crate::caps::build_agent(&state.settings, &state.vault, &state.session_choice(&id))
-            .agent
-            .config()
-            .reasoning_effort
-            .clone()
+        crate::caps::build_agent(
+            &state.settings,
+            &state.vault,
+            &state.session_choice(&id),
+            &crate::mcp::McpPool::default(),
+        )
+        .agent
+        .config()
+        .reasoning_effort
+        .clone()
     };
     assert_eq!(
         effort(&state).as_deref(),

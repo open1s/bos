@@ -281,6 +281,62 @@ mod tests {
         );
     }
 
+    /// The MCP pane's whole vocabulary resolves in both locales, including the
+    /// connected count template the row builds.
+    #[test]
+    fn mcp_pane_keys_resolve_in_both_locales() {
+        for key in [
+            "settings.mcp",
+            "settings.mcpIntro",
+            "settings.mcpEmpty",
+            "settings.mcpAdd",
+            "settings.mcpEdit",
+            "settings.mcpDelete",
+            "settings.mcpEnable",
+            "settings.mcpDisable",
+            "settings.mcpDisabled",
+            "settings.mcpNotConnected",
+            "settings.mcpFailed",
+            "settings.mcpConnected",
+            "settings.mcpName",
+            "settings.mcpTransport",
+            "settings.mcpStdio",
+            "settings.mcpHttp",
+            "settings.mcpCommand",
+            "settings.mcpArgs",
+            "settings.mcpUrl",
+            "settings.mcpScope",
+            "settings.mcpScopeGlobal",
+            "settings.mcpScopeWorkspace",
+            "settings.mcpSave",
+            "settings.mcpNameEmpty",
+            "settings.mcpNameInvalid",
+            "settings.mcpNameTaken",
+            "settings.mcpNeedsCommand",
+            "settings.mcpNeedsUrl",
+            "settings.mcpUrlScheme",
+            "settings.mcpMissing",
+            "settings.mcpConnectFailed",
+            "settings.mcpConnectedOne",
+            "settings.mcpTools",
+            "settings.mcpNoTools",
+            "settings.mcpSaveToConnect",
+        ] {
+            assert_ne!(tr(Lang::En, key), key, "{key} missing from en");
+            assert_ne!(tr(Lang::Zh, key), key, "{key} missing from zh");
+        }
+        assert_eq!(
+            tr(Lang::En, "settings.mcpConnected").replace("{count}", "3"),
+            "Connected · 3 tools",
+            "the row's count is the pane's own template"
+        );
+        assert_eq!(
+            tr(Lang::En, "settings.mcpConnectFailed").replace("{names}", "github"),
+            "Could not connect MCP servers: github",
+            "the failure notice names the servers"
+        );
+    }
+
     /// The provider's vault chooser vocabulary resolves in both locales,
     /// including the two templates that carry an entry id.
     #[test]

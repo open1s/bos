@@ -89,10 +89,15 @@ pub(crate) struct BuiltAgent {
 /// named. A vault that exists but is locked - and a named entry that does not
 /// exist - is reported through 'BuiltAgent::credential_error' instead of
 /// silently leaving the key empty.
+///
+/// `mcp` is the live server pool: its tools are registered under their
+/// server namespace, so a configured MCP server reaches the model on the very
+/// next turn without the settings pane being the only place that knows it.
 pub(crate) fn build_agent(
     settings: &Settings,
     vault: &Vault,
     choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
 ) -> BuiltAgent {
     let eff = settings.effective_for(choice);
     let (api_key, credential_error) = provider_api_key(&eff, vault);
@@ -207,6 +212,13 @@ pub(crate) fn build_agent(
         if let Some(tool) = registry.tool(&name) {
             agent.add_tool(tool);
         }
+    }
+
+    // MCP tools come from the live pool rather than from the document: the
+    // connection is the expensive part and it is shared across turns. A name
+    // the registry already holds is skipped by the registration itself.
+    for tool in mcp.tools() {
+        let _ = agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone());
     }
 
     if !eff.skills_dir.trim().is_empty() {
@@ -340,9 +352,12 @@ pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
     let mut caps = Vec::new();
     if let Some(registry) = agent.registry() {
         for name in registry.list() {
+            // Async tools (MCP among them) live in their own map, so a
+            // sync-only lookup left every MCP row in the Tools pane blank.
             let description = registry
                 .get(&name)
                 .map(|tool| tool.description().to_string())
+                .or_else(|| registry.get_async(&name).map(|tool| tool.description()))
                 .unwrap_or_default();
             caps.push(CapInfo {
                 name,
@@ -532,12 +547,22 @@ mod tests {
     /// A build that consults no vault, which is what every non-credential test
     /// wants.
     fn build(settings: &Settings) -> BuiltAgent {
-        build_agent(settings, &Vault::disabled(), &SessionChoice::default())
+        build_agent(
+            settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+        )
     }
 
     /// A build for one explicit session choice.
     fn build_for(settings: &Settings, choice: &SessionChoice) -> BuiltAgent {
-        build_agent(settings, &Vault::disabled(), choice)
+        build_agent(
+            settings,
+            &Vault::disabled(),
+            choice,
+            &crate::mcp::McpPool::default(),
+        )
     }
 
     /// The choice the credential fixtures name: the `work` provider's leaf.
@@ -641,6 +666,59 @@ mod tests {
             build_for(&settings, &choice).agent.config().model,
             "p/session-model",
             "the session's own pair is the endpoint the next turn runs on"
+        );
+    }
+
+    /// A connected MCP server's tools reach the agent, namespaced by server.
+    ///
+    /// This is the seam that makes the settings pane real: the same build a turn
+    /// runs registers what the pool connected.
+    #[test]
+    fn a_connected_mcp_server_reaches_the_agent() {
+        use react::tool::registry::AsyncTool;
+        use std::sync::Arc;
+        let echo: Arc<dyn AsyncTool> = Arc::new(agent::tools::AsyncFunctionTool::from_fn(
+            "github_search",
+            "Search GitHub",
+            serde_json::json!({ "type": "object", "properties": {} }),
+            |_args| async move { Ok(serde_json::json!({"ok": true})) },
+        ));
+        let pool = crate::mcp::McpPool::with_tools(vec![crate::mcp::McpTool {
+            namespace: "github".to_string(),
+            name: "search".to_string(),
+            adapter: echo,
+        }]);
+        let built = build_agent(
+            &bare(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &pool,
+        );
+        let names = built
+            .agent
+            .registry()
+            .map(|registry| registry.async_tool_names())
+            .unwrap_or_default();
+        assert!(
+            names.contains(&"github_search".to_string()),
+            "the server's tool is registered: {names:?}"
+        );
+        // And it is callable through the same registry the engine dispatches
+        // on, not merely listed.
+        let value = built
+            .agent
+            .registry()
+            .expect("the build has a registry")
+            .execute("github_search", &serde_json::json!({}))
+            .expect("the MCP-backed tool runs");
+        assert_eq!(value["ok"], serde_json::json!(true));
+        // And the Tools pane can describe it, which only works when the
+        // capability projection reads the async map too.
+        let caps = crate::caps::capabilities(&built.agent);
+        assert!(
+            caps.iter()
+                .any(|cap| cap.name == "github_search" && !cap.description.is_empty()),
+            "the MCP tool is listed with its description: {caps:?}"
         );
     }
 
@@ -896,7 +974,12 @@ mod tests {
         let secret = "sk-vault-only-value";
         let vault = vault_holding("agent", &crate::vault::provider_key("work"), secret);
 
-        let built = build_agent(&settings, &vault, &work_choice());
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
         assert_eq!(
             built.agent.config().api_key,
             secret,
@@ -938,7 +1021,12 @@ mod tests {
         drop(created);
         let vault = Vault::new(path);
 
-        let built = build_agent(&settings, &vault, &work_choice());
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
         assert!(
             matches!(
                 &built.credential_error,
@@ -976,7 +1064,12 @@ mod tests {
         assert!(!vault.is_unlocked(), "the Vault pane reads locked");
         assert!(vault.is_app_available(), "the app still has its table");
 
-        let built = build_agent(&settings, &vault, &work_choice());
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
         assert_eq!(built.agent.config().api_key, "sk-app-still-works");
         assert!(
             built.credential_error.is_none(),
@@ -994,7 +1087,12 @@ mod tests {
             provider.legacy_api_key = Some("sk-plaintext-legacy".to_string());
         }
         let vault = vault_holding("plaintext", "keys/other", "sk-vault-other");
-        let built = build_agent(&settings, &vault, &work_choice());
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
         assert!(
             built.agent.config().api_key.is_empty(),
             "the legacy value never authenticates a request"
@@ -1023,7 +1121,12 @@ mod tests {
         vault
             .put(&crate::vault::provider_key("work"), "sk-conventional-stale")
             .expect("the conventional entry");
-        let built = build_agent(&settings, &vault, &work_choice());
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
         assert_eq!(built.agent.config().api_key, secret);
         assert!(
             built.credential_error.is_none(),
@@ -1044,7 +1147,12 @@ mod tests {
             provider.api_key_vault = Some("keys/absent".to_string());
         }
         let vault = vault_holding("named-missing", "keys/other", "sk-unrelated");
-        let built = build_agent(&settings, &vault, &work_choice());
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
         assert!(
             built.agent.config().api_key.is_empty(),
             "an unresolved named entry cannot become an empty-key request"
@@ -1106,7 +1214,12 @@ mod tests {
         }
         let secret = "sk-never-in-settings";
         let vault = vault_holding("roundtrip", "keys/chosen", secret);
-        let built = build_agent(&settings, &vault, &work_choice());
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
         assert_eq!(built.agent.config().api_key, secret);
 
         let text = toml::to_string(&settings.global).expect("the settings document");
@@ -1140,7 +1253,12 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("bsh-caps-no-vault-{}", std::process::id()));
         let vault = Vault::new(directory.join(".vault.bin"));
-        let built = build_agent(&settings, &vault, &work_choice());
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
         assert!(built.agent.config().api_key.is_empty());
         assert!(
             built.credential_error.is_none(),

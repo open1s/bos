@@ -167,6 +167,11 @@ pub(crate) struct AppState {
     inbox_seq: u64,
     /// The streaming runtime.
     pub(crate) runner: Runner,
+    /// The live MCP connections every agent build shares.
+    ///
+    /// A server is a process or an endpoint, so connecting is expensive and
+    /// must survive across turns; the pool reconciles when the settings change.
+    pub(crate) mcp: crate::mcp::McpPool,
     /// A transient line of feedback.
     pub(crate) notice: Option<String>,
     /// Whether the usage pill's dialog is open.
@@ -260,6 +265,7 @@ impl AppState {
             picker_query: String::new(),
             attachments: Vec::new(),
             runner: Runner::new(),
+            mcp: crate::mcp::McpPool::default(),
             notice: None,
             stat_open: false,
             meter_open: false,
@@ -483,6 +489,23 @@ impl AppState {
         }
     }
 
+    /// Reconcile the MCP pool with the servers the settings name.
+    ///
+    /// Connecting is a process spawn or an HTTP handshake, so it happens when
+    /// the configuration changes or at launch, never per frame. Servers whose
+    /// configuration is unchanged keep their live connection.
+    pub(crate) fn refresh_mcp(&mut self) {
+        let servers = self.settings.mcp_servers();
+        let failed = self.mcp.sync(self.runner.rt(), &servers);
+        if !failed.is_empty() {
+            self.notice(crate::i18n::tr_args(
+                self.lang,
+                "settings.mcpConnectFailed",
+                &[("names", failed.join(", "))],
+            ));
+        }
+    }
+
     /// Show a session in the window.
     ///
     /// This is a view change, not a runtime one: another session's turn keeps
@@ -512,6 +535,9 @@ impl AppState {
             self.save_session(&id);
         }
         let _ = self.settings.save();
+        // The workspace document also names MCP servers, so the effective
+        // list just changed.
+        self.refresh_mcp();
     }
 
     /// Re-read the workspace registry into the store's root map.
@@ -622,6 +648,7 @@ impl AppState {
             self.store.rehome_orphans(&next);
         }
         let _ = self.settings.save();
+        self.refresh_mcp();
         true
     }
 
@@ -1488,6 +1515,9 @@ impl AppState {
         match self.settings.save() {
             Ok(()) => {
                 self.overlay = Overlay::None;
+                // The MCP pane is config, and config is only real once the
+                // pool reflects it: reconcile now rather than at the next turn.
+                self.refresh_mcp();
                 Ok(())
             }
             Err(error) => {

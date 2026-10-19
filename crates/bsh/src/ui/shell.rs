@@ -7,6 +7,7 @@ use super::paging::{PageFlow, PageKey};
 use super::settings::{SettingsInputs, VaultInputs};
 use super::DivExt;
 use crate::runner::AgentEvent;
+use crate::settings::mcp::McpScope;
 use crate::state::{AppState, Overlay};
 use crate::store::{OlderPage, TracePage};
 
@@ -210,6 +211,9 @@ pub(crate) struct Shell {
     /// Whether the Built-in plugins pane's two groups are expanded.
     pub(crate) plugins_session_open: bool,
     pub(crate) plugins_global_open: bool,
+    /// Which tab of the Built-in plugins pane is showing: 0 = Plugin list,
+    /// 1 = MCP. The MCP management lives IN that pane, beside the list.
+    pub(crate) plugins_tab: usize,
     /// The row a just-loaded page of older messages should leave at the top,
     /// applied after it is painted so the reader's place does not jump.
     pub(crate) older_anchor: Option<usize>,
@@ -274,6 +278,21 @@ pub(crate) struct Shell {
     pub(crate) vault_error: Option<&'static str>,
     /// Whether a key derivation is running, so the pane can say why it waits.
     pub(crate) vault_busy: bool,
+    /// Whether the MCP pane's add/edit form is open.
+    pub(crate) mcp_form_open: bool,
+    /// The entry the form edits, as the document and name it started from.
+    pub(crate) mcp_editing: Option<(McpScope, String)>,
+    /// Where a new entry is saved.
+    pub(crate) mcp_scope: McpScope,
+    /// Whether the form is on the HTTP transport.
+    pub(crate) mcp_http: bool,
+    /// The standing form refusal, as the locale key the pane shows.
+    pub(crate) mcp_refusal: Option<&'static str>,
+    /// The form's text fields: name, command, arguments and URL.
+    pub(crate) mcp_name: Entity<InputState>,
+    pub(crate) mcp_command: Entity<InputState>,
+    pub(crate) mcp_args: Entity<InputState>,
+    pub(crate) mcp_url: Entity<InputState>,
     /// Live subscriptions (input events).
     _subs: Vec<Subscription>,
 }
@@ -371,6 +390,9 @@ impl Shell {
         // still names one. It is handed to the session that is now open, once,
         // so an upgrade does not strand the reader on "Select model".
         state.adopt_legacy_model();
+        // MCP servers are committed configuration, so the live connections are
+        // reconciled once at launch rather than on a render path.
+        state.refresh_mcp();
         // Measured: the reference reads its stored content width
         // (dsh.conversation.contentWidth) on every width publish, so a window
         // reopens on the column the reader dragged.
@@ -386,7 +408,8 @@ impl Shell {
             .map(|id| state.session_choice(id))
             .unwrap_or_default();
         state.set_tools_schema(
-            crate::caps::build_agent(&state.settings, &state.vault, &choice).tools_schema_chars,
+            crate::caps::build_agent(&state.settings, &state.vault, &choice, &state.mcp)
+                .tools_schema_chars,
         );
         // The tree order the sidebar last chose, from the settings file.
         state.sort =
@@ -551,6 +574,10 @@ impl Shell {
         let new_row_name = cx.new(|cx| InputState::new(window, cx));
         let new_model_id = cx.new(|cx| InputState::new(window, cx));
         let new_model_name = cx.new(|cx| InputState::new(window, cx));
+        let mcp_name = cx.new(|cx| InputState::new(window, cx));
+        let mcp_command = cx.new(|cx| InputState::new(window, cx));
+        let mcp_args = cx.new(|cx| InputState::new(window, cx));
+        let mcp_url = cx.new(|cx| InputState::new(window, cx));
         let settings_inputs = SettingsInputs::new(window, cx);
         let vault_inputs = VaultInputs::new(window, state.lang, cx);
         // The passphrase fields repaint the strength and mismatch notes as they
@@ -667,6 +694,15 @@ impl Shell {
             vault_confirm_delete: None,
             vault_error: None,
             vault_busy: false,
+            mcp_form_open: false,
+            mcp_editing: None,
+            mcp_scope: McpScope::Global,
+            mcp_http: false,
+            mcp_refusal: None,
+            mcp_name,
+            mcp_command,
+            mcp_args,
+            mcp_url,
             transcript_scroll: ScrollHandle::new(),
             tail_max: None,
             tail_session: None,
@@ -706,6 +742,7 @@ impl Shell {
             older: PageFlow::default(),
             compaction_checked: std::collections::HashSet::new(),
             plugins_global_open: true,
+            plugins_tab: 0,
             trash_entries: Vec::new(),
             terminal_snapshot: std::rc::Rc::new(crate::terminal::Snapshot::default()),
             terminal_version: 0,
@@ -1169,7 +1206,12 @@ impl Shell {
             self.state.notice(why);
             return;
         }
-        let built = crate::caps::build_agent(&self.state.settings, &self.state.vault, &choice);
+        let built = crate::caps::build_agent(
+            &self.state.settings,
+            &self.state.vault,
+            &choice,
+            &self.state.mcp,
+        );
         if let Some(error) = &built.credential_error {
             // No turn opens without a credential: a locked vault names itself
             // instead of sending the request unauthenticated.
