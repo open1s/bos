@@ -16,8 +16,54 @@ use super::global::{GlobalSettings, ModelRef, Preset, WorkspaceRef};
 use super::workspace::WorkspaceSettings;
 use super::{dir, TranscriptPolicy};
 
-/// The skill folder used when neither level names one.
-const FRAMEWORK_SKILLS_DIR: &str = "~/.bos/skills";
+/// One skill source after resolution: the label, the expanded path, and whether
+/// the directory is actually there.
+///
+/// `exists` is carried rather than re-tested per row so a render never touches
+/// the filesystem: the scan that fills the pane already asked, and the answer is
+/// a fact about a moment, not about the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedSource {
+    /// The display name the pane shows and the card's initial comes from.
+    pub(crate) name: String,
+    /// The path as stored, with the tilde still in it, for display.
+    pub(crate) path: String,
+    /// The expanded directory a scan would read.
+    pub(crate) dir: PathBuf,
+    /// Whether the reader left it switched on.
+    pub(crate) enabled: bool,
+    /// Whether the directory is there.
+    pub(crate) exists: bool,
+    /// How many skills this source contributed AFTER dedupe. A source that lost
+    /// every name to an earlier one counts what it still owns, which is what the
+    /// card's number means to a reader: "what do I get from here".
+    pub(crate) count: usize,
+}
+
+/// One skill, already deduplicated, with the source it came from.
+///
+/// The name is the key: a directory per skill with the agent crate's own
+/// manifest reader, and the FIRST source in precedence order wins a collision,
+/// so a project directory shadows a shared one without a rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveredSkill {
+    /// The skill's own name, from its frontmatter.
+    pub(crate) name: String,
+    /// The one-line description from its frontmatter.
+    pub(crate) description: String,
+    /// The skill's own directory.
+    pub(crate) dir: PathBuf,
+    /// The skill's manifest, `<dir>/SKILL.md`. This is what the build registers:
+    /// the agent crate parses frontmatter from the file, so handing it the file
+    /// keeps one reader authoritative.
+    pub(crate) manifest: PathBuf,
+    /// The name of the source that supplied it.
+    pub(crate) source: String,
+    /// Whether the reader switched THIS skill off. A skill that lost the name to
+    /// an earlier source is not listed at all, so this is only ever the shadowing
+    /// copy's flag.
+    pub(crate) enabled: bool,
+}
 
 /// The connection and model facts one request needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,8 +193,19 @@ pub(crate) struct Resolution {
     pub(crate) memory_enabled: bool,
     /// The memory file in effect.
     pub(crate) memory_path: PathBuf,
-    /// Where skill folders live.
-    pub(crate) skills_dir: PathBuf,
+    /// Every skill source in effect, in precedence order (first wins).
+    ///
+    /// The workspace's own directory, when it names one, is PREPENDED: it is the
+    /// most specific answer, and the reference ranks project roots above user
+    /// roots for exactly that reason. Sources the reader switched off are
+    /// absent, so a build reading this list cannot see a disabled directory.
+    pub(crate) skill_sources: Vec<ResolvedSource>,
+
+    /// Every discovered skill, deduplicated first-wins, with its source.
+    ///
+    /// This is the catalogue the pane lists and the build registers from, so the
+    /// count the pane shows and the skills the agent receives come from one scan.
+    pub(crate) skills: Vec<DiscoveredSkill>,
     /// Send-side token ceiling; 0 disables compaction.
     pub(crate) context_budget: usize,
     /// Seconds one shell command may run before it is killed.
@@ -227,12 +284,11 @@ pub(crate) fn resolve(
         _ => None,
     };
 
-    let raw_skills = workspace
-        .agent
-        .skills_dir
-        .clone()
-        .or_else(|| global.skills_dir.clone())
-        .unwrap_or_else(|| FRAMEWORK_SKILLS_DIR.to_string());
+    // The sources: the workspace's own directory first, then the global list.
+    // The workspace's is ADDRESSED as its own kind of source rather than
+    // replacing the list, so a project that adds a directory keeps the shared
+    // ones and simply outranks them.
+    let (skill_sources, skills) = discover_skills(global, workspace, &workspace.disabled.skills);
 
     Resolution {
         model,
@@ -257,7 +313,8 @@ pub(crate) fn resolve(
             Some(path) if !path.is_empty() => expand(path),
             _ => dir().join("memory.jsonl"),
         },
-        skills_dir: expand(&raw_skills),
+        skill_sources,
+        skills,
         context_budget: workspace.agent.context_budget,
         shell_timeout_secs: workspace.agent.shell_timeout_secs,
         tool_output_cap: workspace.agent.tool_output_cap,
@@ -288,6 +345,130 @@ impl Resolution {
         }
         self.model.refusal()
     }
+}
+
+/// Every source in effect and the deduplicated skills they hold.
+///
+/// The scan is the agent crate's OWN reader ([\`agent::skills::SkillLoader\`]), not a
+/// second parser: the manifest format, the frontmatter keys and the \`SKILL.md\`
+/// convention are defined once, and a pane that agreed with the agent only by
+/// coincidence would eventually list a skill the agent refuses to load.
+///
+/// Order is the rule. Sources are walked in precedence order and a name already
+/// seen is skipped, so the FIRST source wins and the later copy contributes
+/// nothing. \`disabled\` filters per skill, and a skill that lost its name to an
+/// earlier source never appears, even if the reader switched the winner off -
+/// shadowing is about which directory is authoritative, not about which copy is
+/// convenient.
+///
+/// Nothing is created: a source whose directory is absent is reported with
+/// \`exists: false\` and contributes no skills, so merely opening the pane cannot
+/// scatter \`.claude\` directories across a machine that never had them.
+pub(crate) fn discover_skills(
+    global: &GlobalSettings,
+    workspace: &WorkspaceSettings,
+    disabled: &[String],
+) -> (Vec<ResolvedSource>, Vec<DiscoveredSkill>) {
+    let mut sources: Vec<ResolvedSource> = Vec::new();
+    // The workspace's own directory, when it names one, leads: it is the most
+    // specific answer about this project.
+    if let Some(own) = workspace
+        .agent
+        .skills_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+    {
+        sources.push(resolved_source(
+            super::global::source_name_for(own),
+            own.to_string(),
+            true,
+        ));
+    }
+    for source in global.skill_sources() {
+        // A repeat of the workspace's own directory is one source, not two: the
+        // pane would otherwise show the same path twice and count it twice.
+        if sources.iter().any(|existing| existing.path == source.path) {
+            continue;
+        }
+        sources.push(resolved_source(source.name, source.path, source.enabled));
+    }
+
+    let mut skills: Vec<DiscoveredSkill> = Vec::new();
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for source in sources.iter_mut() {
+        if !source.enabled || !source.exists {
+            continue;
+        }
+        for meta in scan_dir(&source.dir) {
+            if !claimed.insert(meta.name.clone()) {
+                continue;
+            }
+            source.count += 1;
+            let enabled = !disabled.iter().any(|off| off == &meta.name);
+            skills.push(DiscoveredSkill {
+                name: meta.name,
+                description: meta.description,
+                dir: meta.dir,
+                manifest: meta.manifest,
+                source: source.name.clone(),
+                enabled,
+            });
+        }
+    }
+    (sources, skills)
+}
+
+/// One stored source, with its directory expanded and tested for existence.
+fn resolved_source(name: String, path: String, enabled: bool) -> ResolvedSource {
+    let dir = expand(&path);
+    let exists = dir.is_dir();
+    let name = if name.trim().is_empty() {
+        super::global::source_name_for(&path)
+    } else {
+        name
+    };
+    ResolvedSource {
+        name,
+        path,
+        dir,
+        enabled,
+        exists,
+        count: 0,
+    }
+}
+
+/// The skills one directory holds, through the agent crate's own reader.
+///
+/// An unreadable directory is an empty one: a pane that failed to open a
+/// directory has nothing to show for it, and refusing the whole scan because one
+/// source is unreadable would hide every other source's skills.
+fn scan_dir(dir: &std::path::Path) -> Vec<ScannedSkill> {
+    let mut loader = agent::skills::SkillLoader::new(dir.to_path_buf());
+    let Ok(metas) = loader.discover() else {
+        return Vec::new();
+    };
+    metas
+        .into_iter()
+        .map(|meta| ScannedSkill {
+            name: meta.name,
+            description: meta.description,
+            dir: meta
+                .path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| dir.to_path_buf()),
+            manifest: meta.path,
+        })
+        .collect()
+}
+
+/// A skill as its directory reported it, before dedupe assigns a source.
+struct ScannedSkill {
+    name: String,
+    description: String,
+    dir: PathBuf,
+    manifest: PathBuf,
 }
 
 /// Pick the model: the session's own choice, else none.
@@ -358,6 +539,7 @@ fn expand(raw: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::global::SkillSource;
 
     const GLOBAL: &str = r#"
 schema_version = 1
@@ -576,28 +758,235 @@ mcp_servers = [
         assert_eq!(merged.len(), 2, "a server with no name cannot be matched");
     }
 
+    /// A scratch directory no other test shares, removed on the way in.
+    fn scratch(label: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-skill-tests")
+            .join(format!("{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// Write one skill directory: \`<root>/<name>/SKILL.md\` with frontmatter.
+    ///
+    /// The manifest is the agent crate's own shape - a \`---\` fence, \`name\` and
+    /// \`description\` - so the fixture proves the SAME reader is used rather than
+    /// a second parser that happens to agree.
+    fn write_skill(root: &std::path::Path, name: &str, description: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("the skill directory");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\nBody of {name}.\n"),
+        )
+        .expect("the skill manifest");
+    }
+
+    /// A global tree with two sources, \`first\` then \`second\`.
+    fn two_sources(first: &std::path::Path, second: &std::path::Path) -> GlobalSettings {
+        let mut built = GlobalSettings::from_toml("").expect("parses");
+        built.set_skill_sources(vec![
+            SkillSource {
+                name: "First".to_string(),
+                path: first.to_string_lossy().to_string(),
+                enabled: true,
+            },
+            SkillSource {
+                name: "Second".to_string(),
+                path: second.to_string_lossy().to_string(),
+                enabled: true,
+            },
+        ]);
+        built
+    }
+
+    /// The first source wins a name collision, and the shadowed copy does not
+    /// appear twice.
     #[test]
-    fn the_skill_folder_goes_workspace_global_then_framework() {
-        let global = global();
-        assert!(
-            bare().skills_dir.ends_with(".bos/skills"),
-            "the global value applies when the workspace names none"
-        );
+    fn the_first_source_wins_a_skill_name_collision() {
+        let first = scratch("dedupe-first");
+        let second = scratch("dedupe-second");
+        write_skill(&first, "shared", "from the first source");
+        write_skill(&second, "shared", "from the second source");
+        write_skill(&second, "only-second", "unique to the second");
 
-        let text = "[agent]\nskills_dir = \"/tmp/mine\"\n";
-        let own = WorkspaceSettings::from_toml(text).expect("parses");
-        assert_eq!(
-            resolve(&global, &own, None, &SessionChoice::default()).skills_dir,
-            PathBuf::from("/tmp/mine")
-        );
-
-        let none = GlobalSettings::from_toml("").expect("parses");
+        let global = two_sources(&first, &second);
         let empty = WorkspaceSettings::from_toml("").expect("parses");
+        let (sources, skills) = discover_skills(&global, &empty, &[]);
+
+        assert_eq!(skills.len(), 2, "the shadowed copy is not listed twice");
+        let shared = skills
+            .iter()
+            .find(|skill| skill.name == "shared")
+            .expect("the shared name");
+        assert_eq!(
+            shared.description, "from the first source",
+            "the FIRST source in order wins, not the last scanned"
+        );
+        assert_eq!(shared.source, "First");
+        assert_eq!(
+            sources[0].count, 1,
+            "the winner counts it; the loser does not"
+        );
+        assert_eq!(sources[1].count, 1, "the second keeps only its unique name");
+    }
+
+    /// A source the reader switched off contributes nothing, and its skills are
+    /// absent rather than merely marked.
+    #[test]
+    fn a_disabled_source_contributes_no_skills() {
+        let first = scratch("off-first");
+        let second = scratch("off-second");
+        write_skill(&first, "a", "one");
+        write_skill(&second, "b", "two");
+
+        let mut global = two_sources(&first, &second);
+        global.skill_sources[0].enabled = false;
+        let empty = WorkspaceSettings::from_toml("").expect("parses");
+        let (sources, skills) = discover_skills(&global, &empty, &[]);
+
+        assert!(!sources[0].enabled, "the flag survives the scan");
+        assert_eq!(sources[0].count, 0, "a switched-off source holds nothing");
         assert!(
-            resolve(&none, &empty, None, &SessionChoice::default())
-                .skills_dir
-                .ends_with(".bos/skills"),
-            "the framework default is the last resort"
+            skills.iter().all(|skill| skill.source != "First"),
+            "the disabled source's skills are absent, not just flagged: {skills:?}"
+        );
+        assert_eq!(skills.len(), 1);
+    }
+
+    /// A disabled skill is listed with \`enabled: false\` so the pane can switch it
+    /// back on, while \`enabled_skills\` - what a build reads - drops it.
+    #[test]
+    fn a_disabled_skill_is_listed_but_not_buildable() {
+        let first = scratch("off-skill");
+        write_skill(&first, "keep", "kept");
+        write_skill(&first, "off", "switched off");
+
+        let global = two_sources(&first, &scratch("off-skill-empty"));
+        let empty = WorkspaceSettings::from_toml("").expect("parses");
+        let (_, skills) = discover_skills(&global, &empty, &["off".to_string()]);
+
+        let off = skills
+            .iter()
+            .find(|skill| skill.name == "off")
+            .expect("the switched-off skill is still listed, so it can come back");
+        assert!(!off.enabled, "and it reads as off");
+        let (sources, _) = discover_skills(&global, &empty, &["off".to_string()]);
+        assert_eq!(
+            sources
+                .iter()
+                .find(|source| source.name == "First")
+                .map(|source| source.count),
+            Some(2),
+            "the source still counts it: it is discovered, just not registered"
+        );
+    }
+
+    /// A source whose directory is absent is reported as absent and creates
+    /// nothing on disk: a pane that opened \`~/.codex\` into existence would be a
+    /// side effect nobody asked for.
+    #[test]
+    fn a_missing_directory_is_not_a_source_and_is_not_created() {
+        let missing = scratch("absent-parent").join("never-there");
+        let mut global = GlobalSettings::from_toml("").expect("parses");
+        global.set_skill_sources(vec![SkillSource {
+            name: "Codex".to_string(),
+            path: missing.to_string_lossy().to_string(),
+            enabled: true,
+        }]);
+        let empty = WorkspaceSettings::from_toml("").expect("parses");
+        let (sources, skills) = discover_skills(&global, &empty, &[]);
+
+        assert_eq!(sources.len(), 1, "it is listed, so the reader sees the row");
+        assert!(!sources[0].exists, "and it says the directory is not there");
+        assert!(skills.is_empty());
+        assert!(
+            !missing.exists(),
+            "discovery must not create the directory it looked for"
+        );
+    }
+
+    /// A file that still carries the retired single directory parses, and its
+    /// value becomes ONE source - first, because it is what that build scanned.
+    #[test]
+    fn an_old_single_dir_settings_file_migrates_to_the_list() {
+        let legacy = GlobalSettings::from_toml("skills_dir = \"/tmp/legacy-skills\"\n")
+            .expect("an old file still parses");
+        assert_eq!(
+            legacy.skills_dir.as_deref(),
+            Some("/tmp/legacy-skills"),
+            "the retired field is still read"
+        );
+        let sources = legacy.skill_sources();
+        assert_eq!(
+            sources[0].path, "/tmp/legacy-skills",
+            "the migrated directory LEADS: it is what the old build was scanning"
+        );
+        assert!(sources[0].enabled);
+        assert!(
+            sources.iter().any(|source| source.path == "~/.bos/skills"),
+            "and the executor defaults are kept beside it rather than replacing it"
+        );
+
+        // Once the pane saves, the retired field is cleared so it cannot seed the
+        // list a second time on the next read.
+        let mut migrated = legacy;
+        migrated.set_skill_sources(sources);
+        assert!(migrated.skills_dir.is_none());
+        let text = migrated.to_toml().expect("renders");
+        assert!(
+            !text.contains("skills_dir"),
+            "the retired field is not written back: {text}"
+        );
+        assert!(text.contains("legacy-skills"));
+    }
+
+    /// A file with no \`skills_dir\` and no sources falls back to the executor
+    /// defaults, always leading with the framework directory this build owns.
+    #[test]
+    fn a_fresh_install_offers_the_framework_directory_first() {
+        let fresh = GlobalSettings::from_toml("").expect("parses");
+        let sources = fresh.skill_sources();
+        assert!(
+            !sources.is_empty(),
+            "a fresh install still knows where skills would go"
+        );
+        assert_eq!(
+            sources[0].path, "~/.bos/skills",
+            "the framework directory is the one this build owns, so it leads"
+        );
+    }
+
+    /// The workspace's own directory is the most specific answer, so it is
+    /// prepended and a build sees it before every global source.
+    #[test]
+    fn the_workspace_directory_leads_the_sources() {
+        let own =
+            WorkspaceSettings::from_toml("[agent]\nskills_dir = \"/tmp/mine\"\n").expect("parses");
+        let global = GlobalSettings::from_toml("").expect("parses");
+        let (sources, _) = discover_skills(&global, &own, &[]);
+        assert_eq!(
+            sources[0].path, "/tmp/mine",
+            "the project's own directory outranks the machine's"
+        );
+    }
+
+    /// The same directory named twice is ONE source: the pane would otherwise
+    /// draw the same path on two cards and count its skills twice.
+    #[test]
+    fn a_directory_named_twice_is_one_source() {
+        let own = WorkspaceSettings::from_toml("[agent]\nskills_dir = \"~/.bos/skills\"\n")
+            .expect("parses");
+        let global = GlobalSettings::from_toml("").expect("parses");
+        let (sources, _) = discover_skills(&global, &own, &[]);
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|source| source.path == "~/.bos/skills")
+                .count(),
+            1,
+            "the workspace's copy folds into the global one, it does not double it"
         );
     }
 

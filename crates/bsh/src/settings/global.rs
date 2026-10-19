@@ -193,6 +193,42 @@ impl std::fmt::Display for SettingsError {
 
 impl std::error::Error for SettingsError {}
 
+/// One directory skills are discovered in.
+///
+/// The list of these is ORDERED and the order is the precedence: a skill name
+/// found in an earlier source wins over the same name in a later one, so a
+/// project directory can shadow a shared one without renaming anything. This
+/// mirrors the reference's own root rank table (measured in
+/// `@deepseek-ai/dsh-skill-filesystem`: project `.dsh/skills` 100, project
+/// `.agents/skills` 200, custom 300, user `.dsh/skills` 400, user
+/// `.agents/skills` 500, bundled 600), which the settings file flattens into
+/// one list the reader can reorder and switch off.
+///
+/// `name` is the label the pane shows; `path` is stored as written (a leading
+/// `~` is expanded at read time) so the file stays portable between machines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillSource {
+    /// The display name, e.g. `Bos` or `DSH`.
+    pub(crate) name: String,
+    /// The directory, as the reader typed it.
+    pub(crate) path: String,
+    /// Whether this source contributes skills. A switched-off source is kept in
+    /// the list, with its path, so switching it back on needs no retyping.
+    pub(crate) enabled: bool,
+}
+
+impl Default for SkillSource {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            path: String::new(),
+            enabled: true,
+        }
+    }
+}
+
 /// A reference to one model in the provider tree.
 ///
 /// The session and the workspace both name a model this way. It is a pointer,
@@ -215,8 +251,19 @@ pub(crate) struct GlobalSettings {
     /// Machine preferences: the app's appearance and behaviour.
     pub(crate) general: General,
     /// The skill folder every workspace inherits unless it sets its own.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Retired INPUT: a file that still carries a single directory parses, and
+    /// its value is migrated into `skill_sources` once, at which point this is
+    /// empty and never written back. Kept as an `Option` so "an old file has
+    /// one" is distinguishable from "a new file has none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) skills_dir: Option<String>,
+    /// Every directory skills are discovered in, in precedence order.
+    ///
+    /// The first source wins a name collision. Empty means the reader has not
+    /// opened the Skills pane yet, in which case `skill_sources()` supplies the
+    /// discovered defaults rather than scanning nothing.
+    pub(crate) skill_sources: Vec<SkillSource>,
     /// MCP servers every workspace gets, merged with each workspace's own.
     pub(crate) mcp_servers: Vec<serde_json::Value>,
     /// The provider tree, keyed by a concrete provider id.
@@ -247,6 +294,7 @@ impl Default for GlobalSettings {
             schema_version: 0,
             general: General::default(),
             skills_dir: None,
+            skill_sources: Vec::new(),
             schedules: Vec::new(),
             mcp_servers: Vec::new(),
             providers: BTreeMap::new(),
@@ -261,6 +309,67 @@ impl Default for GlobalSettings {
 /// The preset a fresh install selects.
 fn default_preset() -> String {
     "standard".to_string()
+}
+
+/// The executor directories a fresh install looks in, in precedence order.
+///
+/// The framework's own directory leads because it is the one this build owns and
+/// writes: `~/.bos/skills`. The rest are the directories other agent runtimes
+/// on the machine keep their skills in, in the reference's own rank order
+/// (measured in `@deepseek-ai/dsh-skill-filesystem`: user `~/.dsh/skills` 400,
+/// user `~/.agents/skills` 500), followed by the wider set the pane offers.
+/// Each is only a CANDIDATE: discovery keeps a source whose directory exists and
+/// silently drops one that does not, so a machine that never installed Codex
+/// shows no Codex card and, importantly, nothing is created.
+pub(crate) const EXECUTOR_DIRS: &[(&str, &str)] = &[
+    ("Bos", "~/.bos/skills"),
+    ("DSH", "~/.dsh/skills"),
+    ("Agents", "~/.agents/skills"),
+    ("Claude", "~/.claude/skills"),
+    ("Codebuddy", "~/.codebuddy/skills"),
+    ("Codex", "~/.codex/skills"),
+];
+
+/// The display name of the executor that owns a directory, or the directory's
+/// own last segment when it is not one of the known executors.
+pub(crate) fn source_name_for(path: &str) -> String {
+    let trimmed = path.trim().trim_end_matches('/');
+    if let Some((name, _)) = EXECUTOR_DIRS.iter().find(|(_, p)| *p == trimmed) {
+        return (*name).to_string();
+    }
+    trimmed
+        .rsplit('/')
+        .next()
+        .filter(|leaf| !leaf.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+/// The executor directories that exist on this machine, in rank order.
+///
+/// Existence is the only test: a directory that is not there is not a source, so
+/// a fresh install shows the framework directory (created by this build on
+/// demand) and whatever else the machine actually has. Nothing is created here.
+pub(crate) fn default_skill_sources() -> Vec<SkillSource> {
+    EXECUTOR_DIRS
+        .iter()
+        .filter(|(_, path)| source_exists(path))
+        .map(|(name, path)| SkillSource {
+            name: (*name).to_string(),
+            path: (*path).to_string(),
+            enabled: true,
+        })
+        .collect()
+}
+
+/// Whether a stored directory path exists, expanding a leading tilde.
+///
+/// The framework directory counts as existing even before its first skill is
+/// written, because this build owns it and the pane should show where skills
+/// would go rather than an empty rail on a fresh install.
+fn source_exists(path: &str) -> bool {
+    let expanded = PathBuf::from(shellexpand::tilde(path).into_owned());
+    expanded.is_dir() || path.trim().trim_end_matches('/') == "~/.bos/skills"
 }
 
 /// Machine preferences and window state.
@@ -603,6 +712,59 @@ impl GlobalSettings {
             }
         }
         Ok(())
+    }
+
+    /// Every skill source, migrated and defaulted.
+    ///
+    /// Three states fold into one answer, in this order:
+    ///
+    /// 1. a file that still carries the retired single `skills_dir` is read as
+    ///    ONE source, placed first, because it is the directory that build was
+    ///    actually scanning - a migration that dropped it would lose skills;
+    /// 2. a file that already names sources answers with exactly those, in
+    ///    order, so a source the reader removed stays removed;
+    /// 3. a file with neither is a fresh install, and the answer is the
+    ///    discovered defaults.
+    ///
+    /// The migration is a READ, not a write: `Settings::load` never touches the
+    /// disk, so opening the app cannot rewrite a configuration it merely read.
+    /// The pane persists the migrated list the first time it saves.
+    pub(crate) fn skill_sources(&self) -> Vec<SkillSource> {
+        if !self.skill_sources.is_empty() {
+            return self.skill_sources.clone();
+        }
+        match self
+            .skills_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+        {
+            Some(legacy) => {
+                let mut sources = vec![SkillSource {
+                    name: source_name_for(legacy),
+                    path: legacy.to_string(),
+                    enabled: true,
+                }];
+                // The other executor directories still exist beside the legacy
+                // one, so the migration keeps them rather than narrowing the
+                // install to the single directory an old file happened to name.
+                for built in default_skill_sources() {
+                    if !sources.iter().any(|s| s.path == built.path) {
+                        sources.push(built);
+                    }
+                }
+                sources
+            }
+            None => default_skill_sources(),
+        }
+    }
+
+    /// Replace the source list outright.
+    pub(crate) fn set_skill_sources(&mut self, sources: Vec<SkillSource>) {
+        self.skill_sources = sources;
+        // The retired field would otherwise keep re-seeding the list on the next
+        // read of a file that has already been migrated.
+        self.skills_dir = None;
     }
 
     /// The preset an id names, or none while nothing defines it.

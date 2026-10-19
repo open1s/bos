@@ -534,6 +534,37 @@ struct GateButton {
     action: fn(&mut Shell, &mut Context<Shell>),
 }
 
+/// Which of the Skills pane's two disclosure controls a press flips.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkillsControl {
+    /// The browse-all list over every discovered skill.
+    Browse,
+    /// The executor-dirs list over the sources themselves.
+    Dirs,
+}
+
+/// The tint a source card's initial is drawn in, derived from the source name.
+///
+/// Six executor cards have to be distinguishable at a glance, and a colour
+/// chosen per name - rather than a seventh table mapping names to colours - is
+/// the one form that cannot fall out of step when a custom directory is added:
+/// any name at all gets a stable tint.
+fn source_tint(name: &str) -> u32 {
+    // A small, fixed palette rather than a hue wheel: the cards sit on a white
+    // pane and a saturated random hue would fight the accent the pane already
+    // uses for "on".
+    const TINTS: [u32; 6] = [
+        0x4176E6, // the accent blue
+        0x2E9E6B, // green
+        0xB8791E, // amber
+        0x8B5CF6, // violet
+        0xD9534F, // red
+        0x2F7D8C, // teal
+    ];
+    let sum: usize = name.bytes().map(|byte| byte as usize).sum();
+    TINTS[sum % TINTS.len()]
+}
+
 /// One option of a [`SelectRow`]: the value the setting stores and the label
 /// the reference shows for it.
 ///
@@ -4413,7 +4444,7 @@ impl Shell {
     /// server management (`mcp_rows`), drawn in the same pane rather than on a
     /// page of its own.
     fn section_builtin_plugins(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let lang = self.state.lang;
@@ -4421,6 +4452,10 @@ impl Shell {
         if self.plugins_tab == 1 {
             rows.extend(self.mcp_rows(cx));
             return ("settings.plugins", "settings.mcpIntro", rows);
+        }
+        if self.plugins_tab == 2 {
+            rows.extend(self.skills_rows(cx));
+            return ("settings.plugins", "settings.skillsIntro", rows);
         }
         rows.push(
             div()
@@ -4576,12 +4611,607 @@ impl Shell {
             .unwrap_or_else(|| tr(self.state.lang, "settings.pluginsNoTools"))
     }
 
+    /// Switch one source on or off in the DRAFT.
+    ///
+    /// The write goes to the draft and nowhere else: Save is the one door a
+    /// settings change goes through, so Cancel discards it like every other pane.
+    pub(crate) fn toggle_source(&mut self, name: &str, cx: &mut Context<Self>) {
+        let mut sources = self.state.draft().global.skill_sources();
+        for source in sources.iter_mut() {
+            if source.name == name {
+                source.enabled = !source.enabled;
+            }
+        }
+        self.state.draft_mut().global.set_skill_sources(sources);
+        cx.notify();
+    }
+
+    /// Drop one source from the DRAFT.
+    ///
+    /// The framework directory is not removable: it is the one this build owns
+    /// and writes, and a list without it would leave nothing to discover a
+    /// first-run skill in. The refusal is silent to the click because the
+    /// control is not drawn for that row, so there is no press to answer.
+    pub(crate) fn remove_source(&mut self, name: &str, cx: &mut Context<Self>) {
+        let mut sources = self.state.draft().global.skill_sources();
+        sources.retain(|source| source.name != name || source.path == "~/.bos/skills");
+        self.state.draft_mut().global.set_skill_sources(sources);
+        cx.notify();
+    }
+
+    /// Add the custom directory the form holds to the DRAFT.
+    ///
+    /// An empty path adds nothing: a source with no directory has nothing to
+    /// scan and would draw an empty card the reader cannot interpret. The name
+    /// is optional and falls back to the path's last segment, which is what a
+    /// reader who typed only a path expects to see.
+    pub(crate) fn add_source(&mut self, cx: &mut Context<Self>) {
+        let path = self.skill_add_path.read(cx).value().trim().to_string();
+        if path.is_empty() {
+            return;
+        }
+        let typed_name = self.skill_add_name.read(cx).value().trim().to_string();
+        let name = if typed_name.is_empty() {
+            crate::settings::global::source_name_for(&path)
+        } else {
+            typed_name
+        };
+        let mut sources = self.state.draft().global.skill_sources();
+        if sources.iter().any(|source| source.path == path) {
+            // The same directory twice is one source, so a repeat press does
+            // nothing rather than drawing a duplicate card.
+            return;
+        }
+        sources.push(crate::settings::global::SkillSource {
+            name,
+            path,
+            enabled: true,
+        });
+        self.state.draft_mut().global.set_skill_sources(sources);
+        self.skill_add_open = false;
+        cx.notify();
+    }
+
+    /// The Skills tab: where skills come from and which ones are on.
+    ///
+    /// It lives here rather than on a rail cell of its own because the rail is
+    /// the reference's five measured `settings.section` registrations plus the
+    /// Vault, and a seventh cell would be a deviation with nothing behind it.
+    /// The reference's own plugin pane is already the place a "what is installed
+    /// and what is on" question is answered, and its tab strip is this strip, so
+    /// Skills is the third REAL tab beside Plugin list and MCP.
+    ///
+    /// Shape, top to bottom: the measured hint line, the two controls (browse
+    /// all, executor dirs), then one card per SOURCE - a coloured initial, the
+    /// executor name, the skill count and the path. Both controls are
+    /// disclosures over that grid, so the grid is what the pane always shows.
+    fn skills_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let lang = self.state.lang;
+        let sources = self.state.draft().global.skill_sources();
+        // The catalogue is DISCOVERED against the draft, so a toggle the reader
+        // has not saved yet already changes the counts they see. Building it here
+        // rather than reading a cached list is what keeps the pane and the agent
+        // from disagreeing about what "on" means.
+        // The scan runs against the DRAFT through the one resolution the build
+        // uses, so the counts on the cards, the list under Browse all, and the
+        // skills the agent receives are three readings of a single fact. A second
+        // scan here would be a second answer waiting to disagree.
+        let effective = self.state.draft().effective();
+        let resolved = effective.skill_sources.clone();
+        let skills = effective.skills.clone();
+        let _ = &sources;
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        rows.push(
+            txt(tr(lang, "settings.skillsPick"), 12.0, theme::faint())
+                .pb(px(10.0))
+                .into_any_element(),
+        );
+        rows.push(self.skills_controls(&resolved, skills.len(), cx));
+
+        if self.skills_browse_open {
+            rows.extend(self.skills_browse(&skills, cx));
+        }
+        if self.skills_dirs_open {
+            rows.extend(self.skills_dirs(&resolved, cx));
+        } else {
+            // The grid is the pane's resting state: one card per executor
+            // directory, two to a row, exactly as the reference draws its own.
+            for pair in resolved.chunks(2) {
+                let mut row = div().flex().flex_row().gap(px(8.0)).pb(px(8.0));
+                for source in pair {
+                    row = row.child(self.skill_source_card(source, cx));
+                }
+                if pair.len() == 1 {
+                    row = row.child(div().flex_1());
+                }
+                rows.push(row.into_any_element());
+            }
+        }
+        rows
+    }
+
+    /// The two controls above the grid: browse all, and executor dirs.
+    fn skills_controls(
+        &self,
+        sources: &[crate::settings::resolve::ResolvedSource],
+        total: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .pb(px(12.0))
+            .child(self.skills_control(
+                "skills-browse",
+                tr_args(
+                    lang,
+                    "settings.skillsBrowseAll",
+                    &[("count", total.to_string())],
+                ),
+                self.skills_browse_open,
+                SkillsControl::Browse,
+                cx,
+            ))
+            .child(self.skills_control(
+                "skills-dirs",
+                tr_args(
+                    lang,
+                    "settings.skillsExecutorDirs",
+                    &[("count", sources.len().to_string())],
+                ),
+                self.skills_dirs_open,
+                SkillsControl::Dirs,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// One of the pane's two disclosure controls.
+    fn skills_control(
+        &self,
+        id: &'static str,
+        label: String,
+        open: bool,
+        which: SkillsControl,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        hairline_all(
+            div()
+                .id(SharedString::from(id))
+                .debug_selector(move || id.to_string())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .h(px(30.0))
+                .px(px(10.0))
+                .rounded(px(8.0))
+                .bg(rgb(if open {
+                    theme::new_session_fill()
+                } else {
+                    theme::page()
+                }))
+                .border_color(rgb(theme::border()))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::hover())))
+                .child(icon(
+                    if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    },
+                    12.0,
+                    theme::muted(),
+                ))
+                .child(txt(label, 12.0, theme::text()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    match which {
+                        SkillsControl::Browse => {
+                            this.skills_browse_open = !this.skills_browse_open;
+                        }
+                        SkillsControl::Dirs => this.skills_dirs_open = !this.skills_dirs_open,
+                    }
+                    cx.notify();
+                })),
+        )
+        .into_any_element()
+    }
+
+    /// One source card: a coloured initial, the name, the count and the path.
+    ///
+    /// The initial's colour is derived from the name, so the six executor cards
+    /// are visually distinct without a second table to keep in step - the same
+    /// trick the reference's own avatar marks use.
+    fn skill_source_card(
+        &self,
+        source: &crate::settings::resolve::ResolvedSource,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let initial = source
+            .name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_default();
+        let card_id = format!("skills-source-{}", source.name);
+        let selector = card_id.clone();
+        let toggle_name = source.name.clone();
+        let on = source.enabled;
+        div()
+            .id(SharedString::from(card_id))
+            .debug_selector(move || selector.clone())
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .p(px(10.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .bg(rgb(theme::page()))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .flex_none()
+                            .rounded(px(6.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgb(source_tint(&source.name)))
+                            .child(txt(initial, 11.0, theme::page())),
+                    )
+                    .child(
+                        txt(source.name.clone(), 13.0, theme::text())
+                            .flex_1()
+                            .min_w_0(),
+                    )
+                    .child(txt(
+                        tr_args(
+                            lang,
+                            "settings.skillsCount",
+                            &[("count", source.count.to_string())],
+                        ),
+                        12.0,
+                        theme::faint(),
+                    ))
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .flex_none()
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(rgb(if on {
+                                theme::accent()
+                            } else {
+                                theme::border_strong()
+                            }))
+                            .bg(rgb(if on { theme::accent() } else { theme::page() }))
+                            .when(on, |boxed| {
+                                boxed.child(icon(IconName::Check, 10.0, theme::page()))
+                            }),
+                    ),
+            )
+            .child(
+                txt(source.path.clone(), 12.0, theme::muted())
+                    .line_height(px(17.0))
+                    .overflow_hidden(),
+            )
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.toggle_source(&toggle_name, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The browse-all disclosure: every discovered skill, its source, and its
+    /// own switch.
+    fn skills_browse(
+        &mut self,
+        skills: &[crate::settings::resolve::DiscoveredSkill],
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let lang = self.state.lang;
+        let query = self.skill_query.clone();
+        let mut rows: Vec<AnyElement> = vec![div()
+            .mb(px(10.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(30.0))
+            .px(px(10.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .child(icon(IconName::Search, 13.0, theme::faint()))
+            .child(Input::new(&self.skill_search).appearance(false))
+            .into_any_element()];
+        let listed: Vec<&crate::settings::resolve::DiscoveredSkill> = skills
+            .iter()
+            .filter(|skill| {
+                query.is_empty()
+                    || crate::state::matches(&query, &skill.name)
+                    || crate::state::matches(&query, &skill.source)
+            })
+            .collect();
+        if listed.is_empty() {
+            rows.push(
+                txt(tr(lang, "settings.skillsNone"), 12.0, theme::faint())
+                    .pb(px(10.0))
+                    .into_any_element(),
+            );
+        }
+        for (index, skill) in listed.iter().enumerate() {
+            let name = skill.name.clone();
+            let on = skill.enabled;
+            let row_id = format!("skills-browse-{index}");
+            let selector = row_id.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(row_id))
+                    .debug_selector(move || selector.clone())
+                    .py(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .border_b_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::hover())))
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .flex_none()
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(rgb(if on {
+                                theme::accent()
+                            } else {
+                                theme::border_strong()
+                            }))
+                            .bg(rgb(if on { theme::accent() } else { theme::page() }))
+                            .when(on, |boxed| {
+                                boxed.child(icon(IconName::Check, 10.0, theme::page()))
+                            }),
+                    )
+                    .child(txt(name.clone(), 13.0, theme::text()).w(px(160.0)))
+                    .child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(1.0))
+                            .rounded(px(4.0))
+                            .bg(rgb(theme::new_session_fill()))
+                            .child(txt(skill.source.clone(), 11.0, theme::muted())),
+                    )
+                    .child(txt(skill.description.clone(), 12.0, theme::faint()).flex_1())
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.toggle_skill_off(&name);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    /// The executor-dirs disclosure: every source, its switch, a remove control
+    /// and the add form.
+    fn skills_dirs(
+        &mut self,
+        sources: &[crate::settings::resolve::ResolvedSource],
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let lang = self.state.lang;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            let name = source.name.clone();
+            let on = source.enabled;
+            let missing = !source.exists;
+            let row_id = format!("skills-dir-{index}");
+            let selector = row_id.clone();
+            let remove_name = name.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(row_id))
+                    .debug_selector(move || selector.clone())
+                    .py(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .border_b_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("skills-dir-toggle-{index}")))
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .flex_none()
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(rgb(if on {
+                                theme::accent()
+                            } else {
+                                theme::border_strong()
+                            }))
+                            .bg(rgb(if on { theme::accent() } else { theme::page() }))
+                            .cursor_pointer()
+                            .when(on, |boxed| {
+                                boxed.child(icon(IconName::Check, 10.0, theme::page()))
+                            })
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.toggle_source(&name, cx);
+                            })),
+                    )
+                    .child(txt(source.name.clone(), 13.0, theme::text()).w(px(120.0)))
+                    .child(txt(source.path.clone(), 12.0, theme::faint()).flex_1())
+                    .child(
+                        // A directory that is not there says so rather than
+                        // showing a silent zero: the reader can then fix the path
+                        // instead of wondering why the card is empty.
+                        txt(
+                            if missing {
+                                tr(lang, "settings.skillsMissing")
+                            } else {
+                                tr_args(
+                                    lang,
+                                    "settings.skillsCount",
+                                    &[("count", source.count.to_string())],
+                                )
+                            },
+                            11.0,
+                            if missing {
+                                theme::warn()
+                            } else {
+                                theme::faint()
+                            },
+                        )
+                        .w(px(60.0)),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("skills-dir-remove-{index}")))
+                            .debug_selector(move || format!("skills-dir-remove-{index}"))
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::hover())))
+                            .child(txt(tr(lang, "settings.skillsRemove"), 11.0, theme::muted()))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.remove_source(&remove_name, cx);
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows.push(
+            hairline_all(
+                div()
+                    .id("skills-add-toggle")
+                    .debug_selector(|| "skills-add-toggle".to_string())
+                    .mt(px(10.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .self_start()
+                    .gap(px(4.0))
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(theme::page()))
+                    .border_color(rgb(theme::border()))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::hover())))
+                    .child(icon(IconName::Plus, 13.0, theme::text()))
+                    .child(txt(tr(lang, "settings.skillsAdd"), 12.0, theme::text()))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.skill_add_open = !this.skill_add_open;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element(),
+        );
+        if self.skill_add_open {
+            rows.push(self.skills_add_form(cx));
+        }
+        rows
+    }
+
+    /// The add-custom-dir form: a path and a name, then the write.
+    fn skills_add_form(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        hairline_all(
+            div()
+                .mt(px(8.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .p(px(10.0))
+                .rounded(px(8.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border()))
+                .child(self.skills_field(
+                    "skills-add-path",
+                    tr(lang, "settings.skillsPath"),
+                    &self.skill_add_path,
+                ))
+                .child(self.skills_field(
+                    "skills-add-name",
+                    tr(lang, "settings.skillsName"),
+                    &self.skill_add_name,
+                ))
+                .child(
+                    div()
+                        .id("skills-add-save")
+                        .debug_selector(|| "skills-add-save".to_string())
+                        .self_start()
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .rounded(px(6.0))
+                        .bg(rgb(theme::accent()))
+                        .cursor_pointer()
+                        .child(txt(tr(lang, "settings.skillsAddSave"), 12.0, theme::page()))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.add_source(cx);
+                        })),
+                ),
+        )
+        .into_any_element()
+    }
+
+    /// One labelled field of the add form.
+    fn skills_field(
+        &self,
+        id: &'static str,
+        label: String,
+        input: &Entity<InputState>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(txt(label, 12.0, theme::muted()).w(px(80.0)))
+            .child(
+                div()
+                    .id(SharedString::from(id))
+                    .debug_selector(move || id.to_string())
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .child(Input::new(input).appearance(false)),
+            )
+            .into_any_element()
+    }
+
     /// The tab strip the Built-in plugins pane opens with.
     ///
-    /// "Plugin list" and "MCP" are REAL tabs: each sets the pane's tab, and the
-    /// same pane draws that tab's body under the strip. "Plugin Market" is drawn
-    /// DISABLED: this deployment ships no market, and a tab that looks pressable
-    /// but does nothing is what the standing rule forbids.
+    /// "Plugin list", "MCP" and "Skills" are REAL tabs: each sets the pane's
+    /// tab, and the same pane draws that tab's body under the strip. "Plugin
+    /// Market" is drawn DISABLED: this deployment ships no market, and a tab
+    /// that looks pressable but does nothing is what the standing rule forbids.
     fn plugin_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let pane = section_index("plugins");
@@ -4597,6 +5227,7 @@ impl Shell {
         for (tab, key, id) in [
             (0, "settings.pluginsTabs", "plugins-tab-list"),
             (1, "settings.pluginsTabMcp", "plugins-tab-mcp"),
+            (2, "settings.pluginsTabSkills", "plugins-tab-skills"),
         ] {
             let selected = self.plugins_tab == tab;
             strip = strip.child(

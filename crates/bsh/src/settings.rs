@@ -182,8 +182,14 @@ pub(crate) struct Effective {
     pub(crate) web_tools_enabled: bool,
     /// The default permission mode for new sessions.
     pub(crate) permission: String,
-    /// Skills directory.
-    pub(crate) skills_dir: String,
+    /// Every skill source in precedence order, with its count and existence.
+    ///
+    /// Switched-OFF sources are kept here so the pane can draw them and switch
+    /// them back on; \`enabled_skills\` is what a build reads.
+    pub(crate) skill_sources: Vec<resolve::ResolvedSource>,
+    /// The discovered, deduplicated catalogue: every skill, with its source and
+    /// its own on/off flag. The pane lists this and the build registers from it.
+    pub(crate) skills: Vec<resolve::DiscoveredSkill>,
     /// Send-side token ceiling.
     pub(crate) context_budget: usize,
     /// Shell command timeout in seconds.
@@ -198,10 +204,21 @@ pub(crate) struct Effective {
     pub(crate) performance_usage: String,
     /// Tool names switched off.
     pub(crate) disabled_tools: Vec<String>,
-    /// Skill names switched off.
-    pub(crate) disabled_skills: Vec<String>,
     /// The plugin ids the preset mounts. The complete set, not a delta.
     pub(crate) preset_plugins: Vec<String>,
+}
+
+impl Effective {
+    /// The skills a build should register: the discovered catalogue with the
+    /// switched-off ones removed.
+    ///
+    /// This is the whole of the skill gate. A skill whose source is off never
+    /// reaches the catalogue at all (the scan skips it), and a skill switched off
+    /// on its own is dropped here, so the agent can only receive a directory that
+    /// survived both flags.
+    pub(crate) fn enabled_skills(&self) -> impl Iterator<Item = &resolve::DiscoveredSkill> {
+        self.skills.iter().filter(|skill| skill.enabled)
+    }
 }
 
 /// The harness data directory.
@@ -595,7 +612,8 @@ impl Settings {
             file_tools_enabled: resolution.file_tools_enabled,
             web_tools_enabled: resolution.web_tools_enabled,
             permission: resolution.permission,
-            skills_dir: resolution.skills_dir.to_string_lossy().to_string(),
+            skill_sources: resolution.skill_sources.clone(),
+            skills: resolution.skills.clone(),
             context_budget: resolution.context_budget,
             shell_timeout_secs: resolution.shell_timeout_secs,
             tool_output_cap: resolution.tool_output_cap,
@@ -603,7 +621,6 @@ impl Settings {
             transcript_view: resolution.transcript_view,
             performance_usage: general.performance_usage.clone(),
             disabled_tools: resolution.disabled_tools,
-            disabled_skills: resolution.disabled_skills,
             preset_plugins: resolution.plugins,
         }
     }

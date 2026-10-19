@@ -221,11 +221,14 @@ pub(crate) fn build_agent(
         let _ = agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone());
     }
 
-    if !eff.skills_dir.trim().is_empty() {
-        let dir = expand_path(&eff.skills_dir);
-        if dir.is_dir() {
-            let _ = agent.register_skills_from_dir_denying(dir, &eff.disabled_skills);
-        }
+    // Skills come from the ENABLED sources the resolution already scanned, and
+    // only from the skills it kept: turning a source off removes its skills from
+    // this list, and turning a skill off removes that one. Registering from the
+    // resolved catalogue rather than re-walking the directories is what makes
+    // the pane's toggle and the agent's build one fact instead of two scans that
+    // agree by luck.
+    for skill in eff.enabled_skills() {
+        let _ = agent.register_skill_manifest(skill.manifest.clone());
     }
 
     if eff.memory_enabled {
@@ -865,6 +868,119 @@ mod tests {
         assert!(
             shell.tools.is_empty(),
             "the registry must hold none of its tools, and caps adds exactly those"
+        );
+    }
+
+    /// A scratch directory no other test shares.
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-caps-skill-tests")
+            .join(format!("{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// Write one skill directory the way the agent crate reads it.
+    fn write_skill(root: &std::path::Path, name: &str, description: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("the skill directory");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\nBody of {name}.\n"),
+        )
+        .expect("the skill manifest");
+    }
+
+    /// A settings tree whose only skill source is \`root\`, named \`First\`.
+    fn with_one_source(root: &std::path::Path) -> Settings {
+        let mut settings = bare();
+        settings
+            .global
+            .set_skill_sources(vec![crate::settings::global::SkillSource {
+                name: "First".to_string(),
+                path: root.to_string_lossy().to_string(),
+                enabled: true,
+            }]);
+        settings
+    }
+
+    /// The skill names the built agent carries, sorted.
+    fn skill_names(built: &BuiltAgent) -> Vec<String> {
+        let mut names: Vec<String> = built
+            .agent
+            .get_skills_content()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A source the reader switched off takes its skills out of the AGENT, not
+    /// just out of the pane. Paired with the enabled case, so the filter cannot
+    /// pass by registering nothing at all.
+    #[test]
+    fn a_disabled_source_is_absent_from_the_built_agent() {
+        let root = scratch("source-off");
+        write_skill(&root, "alpha", "one");
+        write_skill(&root, "beta", "two");
+
+        let on = with_one_source(&root);
+        assert_eq!(
+            skill_names(&build(&on)),
+            vec!["alpha".to_string(), "beta".to_string()],
+            "the premise: an enabled source registers its skills"
+        );
+
+        let mut off = with_one_source(&root);
+        off.global.skill_sources[0].enabled = false;
+        assert!(
+            skill_names(&build(&off)).is_empty(),
+            "turning the source off must remove its skills from the agent itself"
+        );
+    }
+
+    /// A skill switched off on its own is absent from the agent while its
+    /// siblings stay, and it is still discoverable so the pane can list it.
+    #[test]
+    fn a_disabled_skill_is_absent_from_the_built_agent() {
+        let root = scratch("skill-off");
+        write_skill(&root, "alpha", "one");
+        write_skill(&root, "beta", "two");
+
+        let mut settings = with_one_source(&root);
+        settings.workspace.disabled.skills = vec!["alpha".to_string()];
+
+        let built = build(&settings);
+        assert_eq!(
+            skill_names(&built),
+            vec!["beta".to_string()],
+            "the switched-off skill is gone and its sibling is not"
+        );
+        let eff = settings.effective();
+        assert!(
+            eff.skills
+                .iter()
+                .any(|skill| skill.name == "alpha" && !skill.enabled),
+            "the catalogue still carries it, so the pane can switch it back on"
+        );
+        assert_eq!(
+            eff.enabled_skills().count(),
+            1,
+            "and exactly one skill is buildable"
+        );
+    }
+
+    /// A source whose directory does not exist registers nothing rather than
+    /// failing the build: the pane must not be able to break a turn by existing.
+    #[test]
+    fn a_source_that_is_not_there_registers_nothing() {
+        let missing = scratch("source-missing").join("absent");
+        let settings = with_one_source(&missing);
+        assert!(
+            skill_names(&build(&settings)).is_empty(),
+            "a directory that is not there contributes no skills and no error"
         );
     }
 

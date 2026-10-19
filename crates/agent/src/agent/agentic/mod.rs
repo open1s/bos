@@ -781,6 +781,52 @@ impl Agent {
         self.register_skills_from_dir_denying(dir, &[])
     }
 
+    /// Register the one skill whose manifest is `manifest`.
+    ///
+    /// This is the seam a caller uses when it has ALREADY decided which skills
+    /// belong in the agent: a settings pane that discovered and deduplicated
+    /// them across several roots knows more than a walk of one directory does,
+    /// so it hands over each survivor rather than re-deriving the set here. The
+    /// manifest is the skill's own `<skill-dir>/SKILL.md`; the parsing is the
+    /// same reader every other registration path uses, so the frontmatter format
+    /// stays defined in exactly one place.
+    ///
+    /// A manifest that has vanished since the scan is a no-op, not an error: the
+    /// caller's list was authoritative at the moment it was taken, and a skill
+    /// deleted in between should thin the set rather than fail the turn.
+    pub fn register_skill_manifest(
+        &mut self,
+        manifest: std::path::PathBuf,
+    ) -> Result<(), crate::skills::SkillError> {
+        use crate::skills::SkillLoader;
+        // The loader discovers skills as CHILD directories of the root it is
+        // given, so the root is the skill directory's PARENT - the source
+        // directory itself - and the manifest is re-checked under that name.
+        let Some(root) = manifest
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf)
+        else {
+            return Ok(());
+        };
+        let mut loader = SkillLoader::new(root);
+        let Ok(metas) = loader.discover() else {
+            return Ok(());
+        };
+        for meta in metas {
+            if meta.path != manifest {
+                continue;
+            }
+            let content = loader
+                .load(&meta.name)
+                .ok_or_else(|| crate::skills::SkillError::NotFound(meta.name.clone()))?;
+            self.skills.push(content);
+        }
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        Ok(())
+    }
+
     /// Register skills from a directory, skipping every skill whose name appears
     /// in `deny`.
     ///

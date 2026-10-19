@@ -212,8 +212,24 @@ pub(crate) struct Shell {
     pub(crate) plugins_session_open: bool,
     pub(crate) plugins_global_open: bool,
     /// Which tab of the Built-in plugins pane is showing: 0 = Plugin list,
-    /// 1 = MCP. The MCP management lives IN that pane, beside the list.
+    /// 1 = MCP, 2 = Skills. The MCP and Skills management live IN that pane,
+    /// beside the list.
     pub(crate) plugins_tab: usize,
+    /// The Skills pane's own sub-view: whether the browse-all list and the
+    /// executor-dirs list are open. Both are disclosures over the card grid, so
+    /// they are pane state rather than settings.
+    pub(crate) skills_browse_open: bool,
+    pub(crate) skills_dirs_open: bool,
+    /// The skill-name filter on the browse-all list.
+    pub(crate) skill_search: Entity<InputState>,
+    /// What that field holds, kept beside the entity so the list can filter
+    /// without reading the engine per row.
+    pub(crate) skill_query: String,
+    /// The source being added, as a path and a label, while the add control is
+    /// open. Both are kept so the refusal can name what was typed.
+    pub(crate) skill_add_open: bool,
+    pub(crate) skill_add_path: Entity<InputState>,
+    pub(crate) skill_add_name: Entity<InputState>,
     /// The row a just-loaded page of older messages should leave at the top,
     /// applied after it is painted so the reader's place does not jump.
     pub(crate) older_anchor: Option<usize>,
@@ -452,6 +468,17 @@ impl Shell {
         let plugin_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.searchPlugins"))
         });
+        let skill_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.skillsSearch"))
+        });
+        let skill_add_path = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "settings.skillsPathHint"))
+        });
+        let skill_add_name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "settings.skillsNameHint"))
+        });
         let traj_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "traj.search"))
         });
@@ -530,6 +557,20 @@ impl Shell {
                  cx: &mut Context<Shell>| {
                     if matches!(event, InputEvent::Change) {
                         this.state.plugin_query = this.plugin_search.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &skill_search,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        this.skill_query = this.skill_search.read(cx).value().to_string();
                         cx.notify();
                     }
                 },
@@ -654,6 +695,11 @@ impl Shell {
             queue_open: false,
             search,
             plugin_search,
+            skill_search,
+            skill_query: String::new(),
+            skill_add_open: false,
+            skill_add_path,
+            skill_add_name,
             traj_search,
             traj_mode: 0,
             traj_select: None,
@@ -743,6 +789,8 @@ impl Shell {
             compaction_checked: std::collections::HashSet::new(),
             plugins_global_open: true,
             plugins_tab: 0,
+            skills_browse_open: false,
+            skills_dirs_open: false,
             trash_entries: Vec::new(),
             terminal_snapshot: std::rc::Rc::new(crate::terminal::Snapshot::default()),
             terminal_version: 0,

@@ -4356,6 +4356,414 @@ fn the_plugin_keys_resolve_in_both_locales() {
     }
 }
 
+/// Every label the Skills pane draws resolves in both locales; a typo would
+/// otherwise render the key itself, which is invisible to the compiler.
+#[test]
+fn the_skills_keys_resolve_in_both_locales() {
+    for key in [
+        "settings.pluginsTabSkills",
+        "settings.skillsIntro",
+        "settings.skillsPick",
+        "settings.skillsBrowseAll",
+        "settings.skillsExecutorDirs",
+        "settings.skillsCount",
+        "settings.skillsMissing",
+        "settings.skillsRemove",
+        "settings.skillsAdd",
+        "settings.skillsAddSave",
+        "settings.skillsPath",
+        "settings.skillsName",
+        "settings.skillsPathHint",
+        "settings.skillsNameHint",
+        "settings.skillsSearch",
+        "settings.skillsNone",
+    ] {
+        assert_ne!(
+            crate::i18n::tr(crate::i18n::Lang::En, key),
+            key,
+            "{key} missing from en"
+        );
+        assert_ne!(
+            crate::i18n::tr(crate::i18n::Lang::Zh, key),
+            key,
+            "{key} missing from zh"
+        );
+    }
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::En, "settings.skillsBrowseAll").replace("{count}", "7"),
+        "Browse all skills (7)",
+        "the count reaches the label the reader sees"
+    );
+}
+
+/// A skill directory the Skills pane tests own, removed on the way in.
+fn skills_scratch(label: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/bsh-skill-pane-tests")
+        .join(format!("{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    dir
+}
+
+/// Write one skill the way the agent crate reads it.
+fn skills_write(root: &std::path::Path, name: &str) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).expect("the skill directory");
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: the {name} skill\n---\n\nBody.\n"),
+    )
+    .expect("the manifest");
+}
+
+/// The draft a Skills test seeded, so the pane and the build read one premise.
+fn seed_sources(shell: &mut Shell, sources: Vec<crate::settings::global::SkillSource>) {
+    shell.plugins_tab = 2;
+    shell.state.draft_mut().global.set_skill_sources(sources);
+}
+
+/// The pane lists one card per source, with the count each contributed.
+#[gpui::test]
+fn the_skills_pane_lists_the_sources_with_their_counts(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    let first = skills_scratch("pane-first");
+    let second = skills_scratch("pane-second");
+    skills_write(&first, "alpha");
+    skills_write(&first, "beta");
+    skills_write(&second, "gamma");
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view({
+        let first = first.clone();
+        let second = second.clone();
+        move |window, cx| {
+            let state = AppState::with_store(scratch_store("skills-pane-list"));
+            let shell = cx.new(|cx| {
+                let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+                seed_sources(
+                    &mut shell,
+                    vec![
+                        crate::settings::global::SkillSource {
+                            name: "First".to_string(),
+                            path: first.to_string_lossy().to_string(),
+                            enabled: true,
+                        },
+                        crate::settings::global::SkillSource {
+                            name: "Second".to_string(),
+                            path: second.to_string_lossy().to_string(),
+                            enabled: true,
+                        },
+                    ],
+                );
+                shell
+            });
+            Harness { shell }
+        }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let counted = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, _| {
+            let draft = shell.state.draft().clone();
+            let (sources, skills) = crate::settings::resolve::discover_skills(
+                &draft.global,
+                &draft.workspace,
+                &draft.workspace.disabled.skills,
+            );
+            (
+                sources
+                    .iter()
+                    .map(|source| (source.name.clone(), source.count))
+                    .collect::<Vec<_>>(),
+                skills.len(),
+            )
+        })
+    });
+    assert_eq!(
+        counted,
+        (vec![("First".to_string(), 2), ("Second".to_string(), 1)], 3),
+        "one card per source, each carrying what it contributed"
+    );
+    assert!(
+        cx.debug_bounds("skills-source-First").is_some(),
+        "the card is drawn, not only counted"
+    );
+    assert!(
+        cx.debug_bounds("skills-source-Second").is_some(),
+        "and so is the second source"
+    );
+    assert!(
+        cx.debug_bounds("skills-browse").is_some(),
+        "the Browse all skills control is on the pane"
+    );
+    assert!(
+        cx.debug_bounds("skills-dirs").is_some(),
+        "and so is the Executor dirs control"
+    );
+
+    // The Browse-all control is REAL: pressing it opens a list with one row per
+    // discovered skill and its source, so a control that only looked wired fails
+    // here rather than passing on the card grid alone.
+    let browse = cx.debug_bounds("skills-browse").expect("the control");
+    cx.simulate_click(browse.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let opened = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, _| shell.skills_browse_open)
+    });
+    assert!(opened, "the press opened the browse-all disclosure");
+    assert!(
+        cx.debug_bounds("skills-browse-0").is_some()
+            && cx.debug_bounds("skills-browse-2").is_some(),
+        "one row per discovered skill is drawn"
+    );
+
+    // And the Executor dirs control opens the source list with its add control.
+    let dirs = cx.debug_bounds("skills-dirs").expect("the control");
+    cx.simulate_click(dirs.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("skills-dir-0").is_some(),
+        "the source list is drawn"
+    );
+    assert!(
+        cx.debug_bounds("skills-add-toggle").is_some(),
+        "and the add-a-directory control with it"
+    );
+}
+
+/// A source press changes the DRAFT, and the built agent follows it once the
+/// dialog saves - the pane's toggle is the agent's toggle, not a label.
+#[gpui::test]
+fn toggling_a_source_changes_the_draft_and_the_built_agent(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    let root = skills_scratch("pane-toggle");
+    skills_write(&root, "alpha");
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view({
+        let root = root.clone();
+        move |window, cx| {
+            let state = AppState::with_store(scratch_store("skills-pane-toggle"));
+            let shell = cx.new(|cx| {
+                let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+                seed_sources(
+                    &mut shell,
+                    vec![crate::settings::global::SkillSource {
+                        name: "First".to_string(),
+                        path: root.to_string_lossy().to_string(),
+                        enabled: true,
+                    }],
+                );
+                shell
+            });
+            Harness { shell }
+        }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // The premise: the build already carries the skill.
+    let before = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, _| {
+            shell
+                .state
+                .draft()
+                .effective()
+                .enabled_skills()
+                .map(|skill| skill.name.clone())
+                .collect::<Vec<_>>()
+        })
+    });
+    assert_eq!(before, vec!["alpha".to_string()], "the premise");
+
+    // Press the source card: it switches the source off in the draft.
+    let card = cx
+        .debug_bounds("skills-source-First")
+        .expect("the source card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let off = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, _| {
+            let draft = shell.state.draft();
+            (
+                draft.global.skill_sources()[0].enabled,
+                draft
+                    .effective()
+                    .enabled_skills()
+                    .map(|skill| skill.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+    });
+    assert_eq!(
+        off,
+        (false, Vec::<String>::new()),
+        "one press switches the source off in the draft, and the build follows it"
+    );
+
+    // Saving writes that decision, and the committed tree builds the same way.
+    cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, cx| shell.save_settings(cx));
+    });
+    let (saved, built_skills) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, _| {
+            // The BUILT agent, from the committed tree: this is the question the
+            // round has to answer, not merely what the draft holds.
+            let built = crate::caps::build_agent(
+                &shell.state.settings,
+                &shell.state.vault,
+                &crate::settings::resolve::SessionChoice::default(),
+                &crate::mcp::McpPool::default(),
+            );
+            let mut names: Vec<String> = built
+                .agent
+                .get_skills_content()
+                .into_iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            names.sort();
+            (
+                shell.state.settings.global.skill_sources()[0].enabled,
+                names,
+            )
+        })
+    });
+    assert!(
+        !saved,
+        "Save is the door the change goes through, and it carried the switch"
+    );
+    assert!(
+        built_skills.is_empty(),
+        "the SAVED tree builds an agent without the switched-off source's skills, \
+         got {built_skills:?}"
+    );
+
+    // Paired: switching it back on and saving restores the skill, so the
+    // assertion above cannot pass by the build never carrying skills at all.
+    // The press is the pane's own handler rather than a click: Save closed the
+    // dialog (the reference's own close), so there is no card on screen to press.
+    cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, cx| shell.toggle_source("First", cx));
+    });
+    cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, cx| shell.save_settings(cx));
+    });
+    let restored = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, _| {
+            let built = crate::caps::build_agent(
+                &shell.state.settings,
+                &shell.state.vault,
+                &crate::settings::resolve::SessionChoice::default(),
+                &crate::mcp::McpPool::default(),
+            );
+            built
+                .agent
+                .get_skills_content()
+                .into_iter()
+                .map(|(name, _)| name.to_string())
+                .collect::<Vec<_>>()
+        })
+    });
+    assert_eq!(
+        restored,
+        vec!["alpha".to_string()],
+        "switching the source back on and saving restores it to the agent"
+    );
+}
+
+/// Adding and removing a custom directory writes the DRAFT, and a removal never
+/// takes the framework directory away.
+#[gpui::test]
+fn a_custom_directory_is_added_and_removed_in_the_draft(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    let custom = skills_scratch("pane-custom");
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view({
+        move |window, cx| {
+            let state = AppState::with_store(scratch_store("skills-pane-custom"));
+            let shell = cx.new(|cx| {
+                let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+                shell.plugins_tab = 2;
+                shell
+            });
+            Harness { shell }
+        }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Add the custom directory through the pane's own handler.
+    cx.update(|window, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, cx| {
+            shell.skill_add_open = true;
+            let path = custom.to_string_lossy().to_string();
+            shell
+                .skill_add_path
+                .clone()
+                .update(cx, |state, cx| state.set_value(path, window, cx));
+            shell.skill_add_name.clone().update(cx, |state, cx| {
+                state.set_value("Custom".to_string(), window, cx)
+            });
+            shell.add_source(cx);
+        });
+    });
+    let added = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, _| {
+            shell
+                .state
+                .draft()
+                .global
+                .skill_sources()
+                .iter()
+                .map(|source| source.name.clone())
+                .collect::<Vec<_>>()
+        })
+    });
+    assert!(
+        added.contains(&"Custom".to_string()),
+        "the typed directory joined the draft: {added:?}"
+    );
+
+    // Remove it again, and the framework directory survives the removal.
+    cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, cx| shell.remove_source("Custom", cx));
+    });
+    cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, cx| shell.remove_source("Bos", cx));
+    });
+    let left = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, _| {
+            shell
+                .state
+                .draft()
+                .global
+                .skill_sources()
+                .iter()
+                .map(|source| source.path.clone())
+                .collect::<Vec<_>>()
+        })
+    });
+    assert!(
+        !left.iter().any(|path| path.contains("pane-custom")),
+        "the custom directory is gone: {left:?}"
+    );
+    assert!(
+        left.iter().any(|path| path == "~/.bos/skills"),
+        "the framework directory cannot be removed: {left:?}"
+    );
+}
+
 /// Every sentence the provider form can draw resolves in both locales; a typo
 /// would otherwise render the key itself.
 #[test]
