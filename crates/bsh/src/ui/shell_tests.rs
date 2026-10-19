@@ -4238,7 +4238,7 @@ fn the_picker_adds_every_selected_fetched_model(cx: &mut TestAppContext) {
     assert!(closed, "the picker closes once the ids are added");
 }
 
-/// The Built-in plugins pane is the reference own section, and its rows are real:
+/// The Extensions pane is the reference own section, and its rows are real:
 /// they read the draft, so a plugin switched off in the inventory reads as off
 /// here, with no state of its own to keep in sync.
 #[gpui::test]
@@ -4264,7 +4264,7 @@ fn the_builtin_plugins_pane_reads_the_draft(cx: &mut TestAppContext) {
     assert!(enabled(cx, "files"), "another plugin is unaffected");
 }
 
-/// The Built-in plugins pane has the reference shape: a tab strip, a search
+/// The Extensions pane has the reference shape: a tab strip, a search
 /// field, and the two collapsible groups the reference draws.
 #[gpui::test]
 fn the_plugins_pane_has_the_reference_shape(cx: &mut TestAppContext) {
@@ -5012,7 +5012,7 @@ fn the_markdown_scale_carries_the_reference_metrics(cx: &mut TestAppContext) {
     );
 }
 
-/// The Built-in plugins pane's tabs switch its BODY in place: MCP is a tab
+/// The Extensions pane's tabs switch its BODY in place: MCP is a tab
 /// beside Plugin list, not a page of its own, and both stay in the same pane.
 #[gpui::test]
 fn the_plugins_pane_tabs_switch_the_body_in_place(cx: &mut TestAppContext) {
@@ -5045,7 +5045,7 @@ fn the_plugins_pane_tabs_switch_the_body_in_place(cx: &mut TestAppContext) {
     assert_eq!(
         section,
         section_index("plugins").expect("the plugins section"),
-        "the tab keeps the dialog on Built-in plugins"
+        "the tab keeps the dialog on Extensions"
     );
     assert_eq!(plugins_tab, 1, "the MCP tab is the active one");
     assert!(
@@ -6607,6 +6607,19 @@ fn the_settings_rail_is_the_measured_cells_plus_the_vault() {
             "agent-presets",
         ],
         "the measured settings.section registrations, with the Vault after Account"
+    );
+    // The cell is BSH's own word for what it holds - the reference's section id
+    // is still `plugins`, but the label a reader sees says what the pane
+    // actually lists, which is extensions rather than only built-in plugins.
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::En, "settings.plugins"),
+        "Extensions",
+        "the rail cell is labelled Extensions"
+    );
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::Zh, "settings.plugins"),
+        "扩展",
+        "and its Chinese label is 扩展"
     );
 }
 

@@ -41,7 +41,7 @@ pub(crate) const SECTIONS: [&str; 15] = [
 /// The rail's cells: the reference's five, plus the Vault.
 ///
 /// DSH registers five `settings.section`s and sorts them by `order`: account
-/// (-10), general (0), models (10), plugins (15, "Built-in plugins") and
+/// (-10), general (0), models (10), plugins (15, "Extensions") and
 /// agent-presets (20). The Vault is a BSH addition and sits after Account, the
 /// surface it is administered from. Everything else this crate's `SECTIONS`
 /// carries is a card, a tab or a sidebar panel in the reference, so it is not a
@@ -4434,7 +4434,7 @@ impl Shell {
             }))
             .into_any_element()
     }
-    /// The Built-in plugins pane, in the reference's own shape.
+    /// The Extensions pane, in the reference's own shape.
     ///
     /// Measured from `dsh-client-ui-plugins`: a tab strip (Plugin list / MCP /
     /// Plugin Market), then the ACTIVE tab's body. The Plugin list tab is a
@@ -5206,7 +5206,7 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The tab strip the Built-in plugins pane opens with.
+    /// The tab strip the Extensions pane opens with.
     ///
     /// "Plugin list", "MCP" and "Skills" are REAL tabs: each sets the pane's
     /// tab, and the same pane draws that tab's body under the strip. "Plugin
@@ -5251,7 +5251,7 @@ impl Shell {
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.plugins_tab = tab;
                         // A tab belongs to the pane, not to a section of its own:
-                        // selecting it keeps the dialog on Built-in plugins.
+                        // selecting it keeps the dialog on Extensions.
                         if let Some(index) = pane {
                             this.state.settings_section = index;
                         }
@@ -5934,7 +5934,7 @@ impl Shell {
 
     /// The MCP tab's body: the servers, the add control and the open form.
     ///
-    /// It is a tab of the Built-in plugins pane, so it carries no page title of
+    /// It is a tab of the Extensions pane, so it carries no page title of
     /// its own - the strip above it says which tab the reader is on.
     fn mcp_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let lang = self.state.lang;
@@ -5980,7 +5980,7 @@ impl Shell {
         rows
     }
 
-    /// The MCP view: the Built-in plugins pane opened on its MCP tab.
+    /// The MCP view: the Extensions pane opened on its MCP tab.
     ///
     /// `--settings=mcp` and any older deep link still land here, and they land on
     /// the pane the tab belongs to rather than on a separate page.

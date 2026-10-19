@@ -208,10 +208,10 @@ pub(crate) struct Shell {
     pub(crate) renaming_workspace: Option<String>,
     /// Whether the recycle bin is open, and what it listed when it opened.
     pub(crate) trash_open: bool,
-    /// Whether the Built-in plugins pane's two groups are expanded.
+    /// Whether the Extensions pane's two groups are expanded.
     pub(crate) plugins_session_open: bool,
     pub(crate) plugins_global_open: bool,
-    /// Which tab of the Built-in plugins pane is showing: 0 = Plugin list,
+    /// Which tab of the Extensions pane is showing: 0 = Plugin list,
     /// 1 = MCP, 2 = Skills. The MCP and Skills management live IN that pane,
     /// beside the list.
     pub(crate) plugins_tab: usize,
