@@ -37,6 +37,8 @@ pub(crate) enum Kind {
     /// nests those under their parent as SUBTOOL. The nesting is derived from
     /// the recorded times rather than stored, so no schema carries a parent.
     Subtool,
+    /// A compaction: the turn an older span was condensed into a checkpoint.
+    Compaction,
 }
 
 impl Kind {
@@ -48,6 +50,7 @@ impl Kind {
             Kind::Context => "traj.kindContext",
             Kind::Error => "traj.kindError",
             Kind::Subtool => "traj.kindSubtool",
+            Kind::Compaction => "traj.kindCompaction",
         }
     }
 
@@ -59,6 +62,7 @@ impl Kind {
             Kind::Context => theme::success(),
             Kind::Error => theme::error(),
             Kind::Subtool => theme::warn(),
+            Kind::Compaction => theme::muted(),
         }
     }
 }
@@ -196,11 +200,41 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 .find_map(|m| m.tools.iter().find_map(|t| t.at)),
         });
     }
+    // A compaction happens between turns, so its row sits where the boundary it
+    // installed is: above the checkpoint the model was given in place of the
+    // folded history. The marker names how much moved and what replaced it.
+    let mut markers = session.compactions.iter().peekable();
     for (index, message) in session.messages.iter().enumerate() {
         if message.role == crate::model::Role::User {
             turn += 1;
         }
         let turn_now = turn.max(1);
+        // `compacted` is a GLOBAL transcript index; the trajectory walks the
+        // loaded window, so compare through `loaded_from`.
+        if session.loaded_from + index == session.compacted {
+            if let Some(record) = markers.next() {
+                out.push(Event {
+                    kind: Kind::Compaction,
+                    turn: turn_now,
+                    title: crate::i18n::tr_args(
+                        lang,
+                        "msg.compaction.completed",
+                        &[
+                            ("items", record.items.to_string()),
+                            ("tokens", record.tokens.to_string()),
+                        ],
+                    ),
+                    outcome: String::new(),
+                    raw: record.summary.clone(),
+                    source: "Compaction".to_string(),
+                    ms: None,
+                    live: false,
+                    message: usize::MAX,
+                    tool: usize::MAX,
+                    at: None,
+                });
+            }
+        }
         let live = streaming && index == last;
         // The message's own clock is the turn's recorded start. A record with
         // no timing falls back to its first call, then to the call before it,
@@ -1055,6 +1089,65 @@ mod tests {
             Some(2_500),
             "the model row owns the turn's settled span"
         );
+    }
+
+    /// A compaction is a row of its own, placed where the boundary it installed
+    /// is, and it carries the same count the transcript marker reports.
+    #[test]
+    fn a_compaction_is_a_trajectory_row() {
+        let mut session = session_with(vec![
+            ChatMessage::user("one"),
+            ChatMessage::assistant(),
+            ChatMessage::user("two"),
+            ChatMessage::assistant(),
+        ]);
+        // The boundary folds the first three rows, leaving the last.
+        session.compacted = 2;
+        session.compactions.push(crate::model::CompactionRecord {
+            at: 0,
+            items: 3,
+            tokens: 512,
+            summary: "## Current Work".to_string(),
+            manual: true,
+            after: 4,
+        });
+        let log = events_for(&session, false, Lang::En);
+        let row = log
+            .iter()
+            .find(|event| event.kind == Kind::Compaction)
+            .expect("the compaction is a row");
+        assert!(
+            row.title.contains("3"),
+            "it names the items folded: {}",
+            row.title
+        );
+        assert!(
+            row.title.contains("512"),
+            "and the tokens freed: {}",
+            row.title
+        );
+        assert_eq!(row.raw, "## Current Work", "the raw tab is the checkpoint");
+        // The row sits at the boundary: before the message it replaced the
+        // history of, and after the rows that were folded.
+        let marker_at = log
+            .iter()
+            .position(|event| event.kind == Kind::Compaction)
+            .expect("a position");
+        assert!(marker_at > 0, "rows precede it");
+        assert!(
+            log[marker_at + 1..]
+                .iter()
+                .any(|event| event.kind == Kind::User),
+            "and the retained tail follows it"
+        );
+    }
+
+    /// A session that was never compacted has no such row.
+    #[test]
+    fn an_uncompacted_session_has_no_compaction_row() {
+        let session = session_with(vec![ChatMessage::user("hello"), ChatMessage::assistant()]);
+        let log = events_for(&session, false, Lang::En);
+        assert!(log.iter().all(|event| event.kind != Kind::Compaction));
     }
 
     /// A record written before the clock existed reports no duration; the view

@@ -86,3 +86,10 @@ opt-level = 3
 
 [profile.dev.package.poly1305]
 opt-level = 3
+
+# The tool-boundary policy engine is an interpreter, so a debug build's lack of
+# optimisation is the whole cost of a check. Compiling regorus optimised keeps
+# the 10 us budget measurable (and the perf smoke test meaningful) in the test
+# profile, exactly as the KDF above is compiled optimised for the same reason.
+[profile.dev.package.regorus]
+opt-level = 3

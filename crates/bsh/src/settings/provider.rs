@@ -39,7 +39,8 @@ static NO_MODELS: BTreeMap<String, ModelEntry> = BTreeMap::new();
 /// and the form keeps every field the user typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderRefusal {
-    /// No provider id was given.
+    /// A required provider name (or, at the store's own guard, provider id)
+    /// was left blank.
     NameEmpty,
     /// A provider needs a base URL.
     NeedsBaseUrl,

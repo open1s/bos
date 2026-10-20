@@ -6,23 +6,24 @@
 //! the agent until Save; Cancel drops the draft.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputContentType, InputState};
+use gpui_kit::component::input::{Input, InputContentType, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use agent::extensions::ExtensionStandard;
 
-use super::shell::{ModelRowEditor, ModelsAddRoute, Shell};
+use super::shell::{ModelRowEditor, ModelsAddRoute, PresetEditor, Shell};
 use super::{hairline_all, hairline_bottom, hairline_top, icon, txt, DivExt, IconName};
 use crate::i18n::{tr, tr_args, Lang};
 use crate::settings::mcp::{McpScope, McpServer, McpTransport};
+use crate::settings::resolve::DiscoveredSkill;
 use crate::settings::Settings;
 use crate::theme;
 
 /// The rail, in display order; the index is the section number narrowest the
 /// state stores. Public within the crate so the command line can deep-link.
-pub(crate) const SECTIONS: [&str; 15] = [
+pub(crate) const SECTIONS: [&str; 16] = [
     "settings.account",
     "settings.vault",
     "settings.general",
@@ -38,6 +39,7 @@ pub(crate) const SECTIONS: [&str; 15] = [
     "settings.agent-presets",
     "settings.plugins",
     "settings.automation",
+    "settings.policy",
 ];
 
 /// The rail's cells: the reference's five, plus the Vault.
@@ -272,6 +274,9 @@ pub(crate) fn load_provider_into_form(
     set_value(&shell.add_base_url, provider.base_url.clone(), window, cx);
     // One editor per leaf, so the reference's per-row inputs are per-row
     // engines rather than one shared field that collapses every row into one.
+    let lang = shell.state.lang;
+    let id_hint = crate::i18n::tr(lang, "settings.modelId");
+    let name_hint = crate::i18n::tr(lang, "settings.providerDisplayName");
     shell.model_rows = provider
         .models
         .iter()
@@ -279,20 +284,18 @@ pub(crate) fn load_provider_into_form(
             key: key.clone(),
             entry: entry.clone(),
             id: cx.new(|cx| {
-                let mut state = InputState::new(window, cx);
+                let mut state = InputState::new(window, cx).placeholder(id_hint.clone());
                 state.set_value(entry.model.clone(), window, cx);
                 state
             }),
             name: cx.new(|cx| {
-                let mut state = InputState::new(window, cx);
+                let mut state = InputState::new(window, cx).placeholder(name_hint.clone());
                 state.set_value(entry.name.clone().unwrap_or_default(), window, cx);
                 state
             }),
             open: false,
         })
         .collect();
-    set_value(&shell.new_row_id, String::new(), window, cx);
-    set_value(&shell.new_row_name, String::new(), window, cx);
     set_value(&shell.new_model_id, String::new(), window, cx);
     set_value(&shell.new_model_name, String::new(), window, cx);
     shell.catalogue_choice = None;
@@ -303,6 +306,16 @@ pub(crate) fn load_provider_into_form(
 /// Replace one text engine's value, without firing a change event.
 fn set_value(
     input: &Entity<InputState>,
+    value: String,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) {
+    input.update(cx, |state, cx| state.set_value(value, window, cx));
+}
+
+/// Replace a multiline editor's value.
+fn set_textarea_value(
+    input: &Entity<TextareaState>,
     value: String,
     window: &mut Window,
     cx: &mut Context<Shell>,
@@ -545,6 +558,103 @@ enum SkillsControl {
     Dirs,
 }
 
+/// Which focused skills write a switch performs when it flips.
+///
+/// Both writes copy exactly one fact out of the draft, so they cannot commit
+/// an unrelated edit the reader has not Saved.
+#[derive(Clone)]
+enum SkillWrite {
+    /// The workspace's per-skill off list.
+    Disabled,
+    /// One executor directory's own enabled flag.
+    Source(String),
+}
+
+/// Which skills the browse-all list shows: All, the enabled ones, or the
+/// switched-off ones.
+///
+/// Pane state, not a setting. The reference stores no such preference, and a
+/// filter that survived a reopen would hide half the catalogue behind a choice
+/// the reader made once and forgot - so every open of the tab starts on All.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum SkillFilter {
+    /// Every discovered skill, on or off.
+    #[default]
+    All,
+    /// Only the skills a build would register.
+    Enabled,
+    /// Only the switched-off ones, so they can be switched back on.
+    Disabled,
+}
+
+impl SkillFilter {
+    /// Whether a skill with this enabled flag belongs under this filter.
+    pub(crate) fn matches(self, enabled: bool) -> bool {
+        match self {
+            Self::All => true,
+            Self::Enabled => enabled,
+            Self::Disabled => !enabled,
+        }
+    }
+
+    /// The label the segment draws.
+    ///
+    /// Enabled and Disabled reuse the pane's existing state words - the same two
+    /// the source rows carry - so the filter and the rows cannot drift apart.
+    pub(crate) fn label_key(self) -> &'static str {
+        match self {
+            Self::All => "settings.skillsFilterAll",
+            Self::Enabled => "settings.pluginEnabled",
+            Self::Disabled => "settings.pluginDisabled",
+        }
+    }
+
+    /// The debug selector stem the segment and its count carry.
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::All => "skills-filter-all",
+            Self::Enabled => "skills-filter-enabled",
+            Self::Disabled => "skills-filter-disabled",
+        }
+    }
+}
+
+/// Whether a skill survives the search field: its name or its source.
+fn skill_matches(query: &str, skill: &DiscoveredSkill) -> bool {
+    query.is_empty()
+        || crate::state::matches(query, &skill.name)
+        || crate::state::matches(query, &skill.source)
+}
+
+/// The browse rows: the search AND the state filter, in catalogue order.
+///
+/// One function for the list and its empty state, so what the pane draws and
+/// what it says about drawing nothing cannot disagree.
+pub(crate) fn browse_skills<'a>(
+    skills: &'a [DiscoveredSkill],
+    query: &str,
+    filter: SkillFilter,
+) -> Vec<&'a DiscoveredSkill> {
+    skills
+        .iter()
+        .filter(|skill| filter.matches(skill.enabled) && skill_matches(query, skill))
+        .collect()
+}
+
+/// The three counts the filter shows, in All / Enabled / Disabled order.
+///
+/// Every count applies the current SEARCH but NOT the current state choice:
+/// pressing Disabled must still report how many are enabled, or the control
+/// would read "All 123 / Enabled 0 / Disabled 3" and the way back would vanish.
+pub(crate) fn skill_filter_counts(skills: &[DiscoveredSkill], query: &str) -> [usize; 3] {
+    let mut counts = [0usize; 3];
+    for skill in skills.iter().filter(|skill| skill_matches(query, skill)) {
+        counts[0] += 1;
+        counts[if skill.enabled { 1 } else { 2 }] += 1;
+    }
+    counts
+}
+
 /// The tint a source card's initial is drawn in, derived from the source name.
 ///
 /// Six executor cards have to be distinguishable at a glance, and a colour
@@ -628,10 +738,46 @@ struct PluginListRow {
     title_pill: Option<AnyElement>,
     /// The 12px tertiary one-line description.
     description: String,
-    /// The muted version/source suffix on the description line.
+    /// The version/source suffix on the description line.
     meta: String,
+    /// The ink that suffix takes. Status words (Connected, Failed) keep their
+    /// meaning colour; ordinary metadata uses the faint tone.
+    meta_ink: u32,
     /// The far-right control (a toggle, or nothing).
     trailing: AnyElement,
+}
+
+/// One preset card's data, gathered before the card builder borrows the context.
+struct PresetCardData {
+    id: String,
+    display: String,
+    description: String,
+    plugins: Vec<String>,
+    builtin: bool,
+    level: Option<String>,
+    permission: Option<String>,
+    read: Option<Vec<String>>,
+    write: Option<Vec<String>>,
+    deny: Vec<String>,
+    egress: Option<Vec<String>>,
+    web_search: Option<bool>,
+    parallel_tool_calls: Option<bool>,
+    mcp_tools: Option<Vec<String>>,
+    builtin_policy: Vec<String>,
+    policy_mode: Option<String>,
+    blocked: bool,
+    tools: Option<Vec<String>>,
+    skills: Option<Vec<String>>,
+    mcps: Option<Vec<String>>,
+    extensions: Option<Vec<String>>,
+    system_prompt: Option<String>,
+    has_policy: bool,
+    trusted: bool,
+    is_default: bool,
+    in_chat: bool,
+    has_chat: bool,
+    details_open: bool,
+    slot: String,
 }
 
 impl Shell {
@@ -733,7 +879,8 @@ impl Shell {
             11 => self.section_context(cx),
             12 => self.section_agent_presets(cx),
             13 => self.section_builtin_plugins(cx),
-            _ => self.section_automation(cx),
+            14 => self.section_automation(cx),
+            _ => self.section_policy(cx),
         };
 
         // Measured (SettingsRoot.module.css): a 54px header row holding the section
@@ -825,6 +972,7 @@ impl Shell {
                     .min_w_0()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.settings_scroll)
                     .px(px(24.0))
                     .pb(px(24.0))
                     .flex()
@@ -867,7 +1015,8 @@ impl Shell {
         // Measured (SettingsRoot.module.css): 800 wide and as tall as
         // min(800, viewport - 48) - the mask's own 24px inset on each side - on
         // radius-panel (28) with the prominent elevation and no border.
-        let panel_w = (view_width - 48.0).clamp(320.0, 800.0);
+        let panel_max = if section == 12 { 1080.0 } else { 800.0 };
+        let panel_w = (view_width - 48.0).clamp(320.0, panel_max);
         let panel_h = (view_height - 48.0).clamp(240.0, 800.0);
 
         div()
@@ -876,6 +1025,14 @@ impl Shell {
             .left(px(0.0))
             .right(px(0.0))
             .bottom(px(0.0))
+            // The dialog floats over the conversation, so it must own the
+            // pointer and the wheel: without this a scroll over the scrim (or
+            // over a pane section that does not scroll) reached the transcript
+            // behind and moved the page instead of the dialog.
+            .occlude()
+            .on_scroll_wheel(cx.listener(|_this, _event, _window, cx| {
+                cx.stop_propagation();
+            }))
             .bg(rgba(0x0F111580))
             .flex()
             .items_center()
@@ -1715,61 +1872,1173 @@ impl Shell {
     }
 
     /// Models: the endpoint and the system prompt.
+    /// Policy: the latest audit and the egress allowlist.
+    ///
+    /// BSH has no reference pane for this, so it follows the settings chrome
+    /// rather than a measured DSH sheet. The audit is a snapshot refreshed by
+    /// its own control; the allowlist edits the workspace file and applies on
+    /// the next turn.
+    fn section_policy(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> (&'static str, &'static str, Vec<AnyElement>) {
+        let lang = self.state.lang;
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        rows.push(self.plugins_section_header("policy-audit-header", "settings.policyAudit"));
+        match self.state.policy_audit.as_ref() {
+            Some(audit) => {
+                let summary = tr_args(
+                    lang,
+                    "settings.policySummary",
+                    &[
+                        ("allows", audit.allows.total.to_string()),
+                        ("denials", audit.denials_total.to_string()),
+                    ],
+                );
+                rows.push(
+                    txt(summary, 13.0, theme::text())
+                        .mb(px(4.0))
+                        .into_any_element(),
+                );
+                let counts = tr_args(
+                    lang,
+                    "settings.policyCounts",
+                    &[
+                        ("reads", audit.allows.reads.to_string()),
+                        ("writes", audit.allows.writes.to_string()),
+                        ("egress", audit.allows.egress.to_string()),
+                        ("spawns", audit.allows.spawns.to_string()),
+                    ],
+                );
+                rows.push(
+                    txt(counts, 12.0, theme::muted())
+                        .mb(px(4.0))
+                        .into_any_element(),
+                );
+                rows.push(
+                    txt(
+                        format!(
+                            "{}: {}",
+                            tr(lang, "settings.policyBackend"),
+                            audit.evaluator
+                        ),
+                        12.0,
+                        theme::muted(),
+                    )
+                    .mb(px(8.0))
+                    .into_any_element(),
+                );
+                if let Some(error) = &audit.error {
+                    rows.push(
+                        txt(error.clone(), 12.0, theme::error())
+                            .mb(px(8.0))
+                            .into_any_element(),
+                    );
+                }
+                if audit.denials.is_empty() {
+                    rows.push(
+                        txt(tr(lang, "settings.policyNoDenials"), 12.0, theme::muted())
+                            .mb(px(8.0))
+                            .into_any_element(),
+                    );
+                } else {
+                    for entry in audit.denials.iter().rev().take(8) {
+                        let head = format!(
+                            "{} · {} · {}",
+                            entry.rule.as_deref().unwrap_or("-"),
+                            entry.tool,
+                            entry.target
+                        );
+                        let mut row = div().flex().flex_col().gap(px(2.0)).py(px(4.0)).child(txt(
+                            head,
+                            12.0,
+                            theme::text(),
+                        ));
+                        if let Some(reason) = &entry.reason {
+                            row = row.child(txt(reason.clone(), 11.0, theme::muted()));
+                        }
+                        rows.push(row.into_any_element());
+                    }
+                }
+            }
+            None => rows.push(
+                txt(tr(lang, "settings.policyNoAudit"), 12.0, theme::muted())
+                    .mb(px(8.0))
+                    .into_any_element(),
+            ),
+        }
+
+        let refresh = div()
+            .id("policy-refresh")
+            .debug_selector(|| "policy-refresh".to_string())
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(tr(lang, "settings.policyRefresh"), 12.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.state.refresh_policy_audit();
+                cx.notify();
+            }));
+        let clear = div()
+            .id("policy-clear")
+            .debug_selector(|| "policy-clear".to_string())
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(tr(lang, "settings.policyClear"), 12.0, theme::text()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.state.clear_policy_audit();
+                cx.notify();
+            }));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .mb(px(18.0))
+                .child(refresh)
+                .child(clear)
+                .into_any_element(),
+        );
+
+        rows.push(
+            self.plugins_section_header("policy-allowlist-header", "settings.policyAllowlist"),
+        );
+        rows.push(
+            txt(
+                tr(lang, "settings.policyAllowlistHint"),
+                12.0,
+                theme::muted(),
+            )
+            .mb(px(6.0))
+            .into_any_element(),
+        );
+        if self.state.egress_allowlist.is_empty() {
+            rows.push(
+                txt(
+                    tr(lang, "settings.policyAllowlistEmpty"),
+                    12.0,
+                    theme::faint(),
+                )
+                .mb(px(6.0))
+                .into_any_element(),
+            );
+        } else {
+            for entry in &self.state.egress_allowlist {
+                let value = entry.clone();
+                let removed = entry.clone();
+                rows.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .py(px(3.0))
+                        .child(txt(value, 12.0, theme::text()))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("policy-remove-{removed}")))
+                                .debug_selector({
+                                    let removed = removed.clone();
+                                    move || format!("policy-remove-{removed}")
+                                })
+                                .cursor_pointer()
+                                .rounded(px(4.0))
+                                .hover(|style| style.bg(rgb(theme::hover())))
+                                .child(icon(IconName::Trash, 12.0, theme::faint()))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    if let Err(error) = this.state.remove_egress_allowlist(&removed)
+                                    {
+                                        this.state.notice(error);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let add = div()
+            .id("policy-add")
+            .debug_selector(|| "policy-add".to_string())
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(tr(lang, "settings.policyAdd"), 12.0, theme::text()))
+            .on_click(cx.listener(|this, _event, window, cx| {
+                let value = this.policy_entry.read(cx).value().to_string();
+                match this.state.add_egress_allowlist(&value) {
+                    Ok(()) => {
+                        this.policy_entry
+                            .update(cx, |state, cx| state.set_value("", window, cx));
+                    }
+                    Err(error) => this.state.notice(error),
+                }
+                cx.notify();
+            }));
+        rows.push(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .mt(px(6.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Input::new(&self.policy_entry).appearance(false)),
+                )
+                .child(add)
+                .into_any_element(),
+        );
+
+        ("settings.policy", "settings.policyHint", rows)
+    }
+
+    /// Open the custom preset editor as a TOML buffer.
+    fn open_preset_editor(&mut self, id: &str, window: &mut Window, cx: &mut Context<Shell>) {
+        let preset = self
+            .state
+            .draft()
+            .global
+            .presets
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        // The full annotated template, not a pretty-print of only the set
+        // fields: an unset field stays a commented example, so editing cannot
+        // silently turn "inherit" into a value.
+        let text = preset.to_toml_template();
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder(tr(self.state.lang, "settings.presetEditHint"))
+        });
+        set_textarea_value(&input, text, window, cx);
+        self.preset_editor = Some(PresetEditor {
+            id: id.to_string(),
+            text: input,
+        });
+        self.preset_editor_error = None;
+        // The editor sits below the grid; bring it into view when it opens.
+        self.settings_scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    /// Parse the TOML buffer and put the edited preset back into the draft.
+    fn save_preset_editor(&mut self, window: &mut Window, cx: &mut Context<Shell>) {
+        let Some(editor) = &self.preset_editor else {
+            return;
+        };
+        let id = editor.id.clone();
+        let text = editor.text.read(cx).value().to_string();
+        #[derive(serde::Deserialize)]
+        struct PresetFile {
+            preset: crate::settings::global::Preset,
+        }
+        match toml::from_str::<PresetFile>(&text) {
+            Ok(file) => {
+                self.state
+                    .draft_mut()
+                    .global
+                    .presets
+                    .insert(id.clone(), file.preset);
+                self.preset_editor = None;
+                self.preset_editor_error = None;
+                self.preset_details = None;
+                self.state
+                    .notice(tr(self.state.lang, "settings.presetSaved").to_string());
+                cx.notify();
+            }
+            Err(error) => {
+                self.preset_editor_error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+        let _ = window;
+    }
+
+    /// Remove a custom preset from the draft and clear any reference to it.
+    fn delete_preset(&mut self, id: &str, cx: &mut Context<Shell>) {
+        self.state.draft_mut().global.presets.remove(id);
+        if self.state.draft().global.default_preset == id {
+            self.state.draft_mut().global.default_preset.clear();
+        }
+        if let Some(session) = self.state.active_id.clone() {
+            if self.state.active_session_preset().as_deref() == Some(id) {
+                self.state.select_session_preset(&session, "");
+            }
+        }
+        self.preset_editor = None;
+        self.preset_editor_error = None;
+        self.preset_details = None;
+        self.state
+            .notice(tr(self.state.lang, "settings.presetDeleted").to_string());
+        cx.notify();
+    }
+
     /// Agent presets: the declarative agent a preset file names.
     ///
-    /// Selecting one is not a label - the preset supplies the model, prompt and
-    /// step ceiling through effective(), and narrows the tools the agent is
-    /// built with, so pressing a row changes what the next turn runs on.
+    /// DSH-shaped: a Built-in grid of cards and a Custom section. Each card
+    /// names the mode, its description, its built-in tag and id, with Mode
+    /// details, trust and Use in this chat in the footer.
     fn section_agent_presets(
         &self,
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
+        let lang = self.state.lang;
         let draft = self.state.draft();
         let active = draft.global.default_preset.clone();
+        let chat = self.state.active_session_preset();
+        let has_chat = self.state.active_id.is_some();
         let listed: Vec<String> = draft.global.preset_ids();
-        let mut rows: Vec<AnyElement> = vec![div()
-            .debug_selector(|| "preset-default".to_string())
-            .id(SharedString::from("preset-default"))
-            .px(px(6.0))
-            .py(px(6.0))
-            .rounded(px(5.0))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::hover())))
-            .when(active.is_empty(), |element| {
-                element.bg(rgb(theme::selected_row()))
-            })
-            .child(txt(
-                tr(self.state.lang, "settings.presetDefault"),
-                13.0,
-                theme::text(),
-            ))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.state.select_preset("");
-                cx.notify();
-            }))
-            .into_any_element()];
+        let mut rows: Vec<AnyElement> =
+            vec![
+                txt(tr(lang, "settings.presetScopeHint"), 12.0, theme::muted())
+                    .mb(px(12.0))
+                    .into_any_element(),
+            ];
+
+        // The no-preset choice is a compact row, not a mode card: it inherits
+        // rather than naming a preset.
+        let no_in_chat = chat.is_none() && has_chat;
+        rows.push(
+            div()
+                .debug_selector(|| "preset-default".to_string())
+                .id("preset-default")
+                .mb(px(10.0))
+                .p(px(10.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.state.select_preset("");
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .child(
+                            txt(tr(lang, "settings.presetDefault"), 12.0, theme::text())
+                                .font_weight(FontWeight::MEDIUM),
+                        )
+                        .child(txt(
+                            tr(lang, "settings.presetDefaultHint"),
+                            11.0,
+                            theme::muted(),
+                        )),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "preset-use-default".to_string())
+                        .id("preset-use-default")
+                        .px(px(8.0))
+                        .py(px(3.0))
+                        .rounded(px(6.0))
+                        .child(txt(
+                            if no_in_chat {
+                                tr(lang, "settings.presetInUse")
+                            } else {
+                                tr(lang, "settings.presetUseInChat")
+                            },
+                            11.0,
+                            theme::muted(),
+                        ))
+                        .when(!no_in_chat, |control| {
+                            control
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(theme::hover())))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    if let Some(session) = this.state.active_id.clone() {
+                                        this.state.select_session_preset(&session, "");
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }))
+                        }),
+                )
+                .into_any_element(),
+        );
+
+        let mut cards: Vec<(usize, bool, AnyElement)> = Vec::new();
         for (index, name) in listed.into_iter().enumerate() {
-            let selected = name == active;
-            let picked = name.clone();
+            let preset = draft.global.preset(&name).unwrap_or_default();
+            let builtin = draft.global.preset_is_shipped(&name);
+            let display = preset.name.clone().unwrap_or_else(|| match name.as_str() {
+                "standard" => tr(lang, "settings.presetStandard").to_string(),
+                "ptc" => tr(lang, "settings.presetPtc").to_string(),
+                "creator" => tr(lang, "settings.presetCreator").to_string(),
+                "read-only" => tr(lang, "settings.presetReadOnly").to_string(),
+                _ => name.clone(),
+            });
+            let description = preset
+                .description
+                .clone()
+                .unwrap_or_else(|| match name.as_str() {
+                    "standard" => tr(lang, "settings.presetStandardHint").to_string(),
+                    "ptc" => tr(lang, "settings.presetPtcHint").to_string(),
+                    "creator" => tr(lang, "settings.presetCreatorHint").to_string(),
+                    "read-only" => tr(lang, "settings.presetReadOnlyHint").to_string(),
+                    _ => tr(lang, "settings.presetCustomHint").to_string(),
+                });
+            let data = PresetCardData {
+                id: name.clone(),
+                display,
+                description,
+                plugins: preset.plugins,
+                builtin,
+                level: preset.level,
+                permission: preset.permission,
+                read: preset.read,
+                write: preset.write,
+                deny: preset.deny,
+                egress: preset.egress,
+                web_search: preset.web_search,
+                parallel_tool_calls: preset.parallel_tool_calls,
+                mcp_tools: preset.mcp_tools,
+                builtin_policy: preset.builtin_policy,
+                blocked: preset.policy_mode.as_deref() == Some("required")
+                    && preset.policy.is_some()
+                    && !preset.trusted,
+                policy_mode: preset.policy_mode,
+                tools: preset.tools,
+                skills: preset.skills,
+                mcps: preset.mcps,
+                extensions: preset.extensions,
+                system_prompt: preset.system_prompt,
+                has_policy: preset.policy.is_some(),
+                trusted: preset.trusted,
+                is_default: name == active,
+                in_chat: chat.as_deref() == Some(name.as_str()),
+                has_chat,
+                details_open: self.preset_details.as_deref() == Some(name.as_str()),
+                slot: index.to_string(),
+            };
+            cards.push((index, builtin, self.preset_card(data, cx)));
+        }
+        let (builtins, customs): (Vec<_>, Vec<_>) =
+            cards.into_iter().partition(|(_, builtin, _)| *builtin);
+        let builtin_cards: Vec<AnyElement> =
+            builtins.into_iter().map(|(_, _, card)| card).collect();
+        let custom_cards: Vec<AnyElement> = customs.into_iter().map(|(_, _, card)| card).collect();
+        let grid = |cards: Vec<AnyElement>| -> AnyElement {
+            div()
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_stretch()
+                .gap(px(12.0))
+                .children(cards)
+                .into_any_element()
+        };
+        rows.push(
+            txt(
+                tr(lang, "settings.presetBuiltInSection"),
+                11.0,
+                theme::muted(),
+            )
+            .font_weight(FontWeight::SEMIBOLD)
+            .mb(px(6.0))
+            .into_any_element(),
+        );
+        rows.push(grid(builtin_cards));
+        rows.push(
+            txt(
+                tr(lang, "settings.presetCustomSection"),
+                11.0,
+                theme::muted(),
+            )
+            .font_weight(FontWeight::SEMIBOLD)
+            .mt(px(18.0))
+            .mb(px(6.0))
+            .into_any_element(),
+        );
+        rows.push(grid(custom_cards));
+        if let Some(editor) = &self.preset_editor {
+            let editor_id = editor.id.clone();
+            let editor_input = editor.text.clone();
+            let error = self.preset_editor_error.clone();
+            let delete_id = editor_id.clone();
+            // A card, not a floating field: the editor owns a surface, a fixed
+            // code well and a footer, so its height is bounded instead of
+            // growing over whatever follows. The inner editor is the kit's, so
+            // its white/dark editor_background is framed by the well rather
+            // than replaced.
+            let block = div()
+                .debug_selector(|| "preset-editor".to_string())
+                .id("preset-editor")
+                .w_full()
+                .mt(px(12.0))
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(rgb(theme::border()))
+                .bg(rgb(theme::new_session_fill()))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(14.0))
+                        .pt(px(12.0))
+                        .pb(px(8.0))
+                        .child(
+                            div()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .min_w_0()
+                                .child(
+                                    txt(tr(lang, "settings.presetEditTitle"), 14.0, theme::text())
+                                        .font_weight(FontWeight::MEDIUM),
+                                )
+                                .child(
+                                    txt(editor_id.clone(), 11.0, theme::faint())
+                                        .font_family(theme::CODE_FONT),
+                                ),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .border_1()
+                                .border_color(rgb(theme::border_soft()))
+                                .child(
+                                    txt("TOML", 9.0, theme::muted()).font_family(theme::CODE_FONT),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "preset-editor-delete".to_string())
+                                .id("preset-editor-delete")
+                                .h(px(26.0))
+                                .px(px(8.0))
+                                .rounded(px(7.0))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(theme::hover())))
+                                .child(txt(tr(lang, "settings.presetDelete"), 11.0, theme::error()))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.delete_preset(&delete_id, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    txt(tr(lang, "settings.presetEditHint"), 11.0, theme::muted())
+                        .px(px(14.0))
+                        .pb(px(10.0)),
+                )
+                .child(
+                    div().px(px(14.0)).child(
+                        div()
+                            .w_full()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(rgb(theme::border_soft()))
+                            .bg(rgb(theme::page()))
+                            .overflow_hidden()
+                            .child(
+                                Textarea::new(&editor_input)
+                                    .appearance(false)
+                                    .font_family(theme::CODE_FONT)
+                                    .text_size(px(12.0))
+                                    .h(px(300.0)),
+                            ),
+                    ),
+                )
+                .child(
+                    div()
+                        .mt(px(10.0))
+                        .px(px(14.0))
+                        .py(px(10.0))
+                        .border_t_1()
+                        .border_color(rgb(theme::border_soft()))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(div().flex_1().min_w_0().children(error.map(|error| {
+                            txt(
+                                format!("{}: {error}", tr(lang, "settings.presetInvalid")),
+                                11.0,
+                                theme::error(),
+                            )
+                            .into_any_element()
+                        })))
+                        .child(
+                            div()
+                                .debug_selector(|| "preset-editor-cancel".to_string())
+                                .id("preset-editor-cancel")
+                                .px(px(10.0))
+                                .py(px(5.0))
+                                .rounded(px(8.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(theme::hover())))
+                                .child(txt(tr(lang, "settings.presetCancel"), 12.0, theme::muted()))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.preset_editor = None;
+                                    this.preset_editor_error = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "preset-editor-save".to_string())
+                                .id("preset-editor-save")
+                                .px(px(12.0))
+                                .py(px(5.0))
+                                .rounded(px(8.0))
+                                .bg(rgb(theme::text()))
+                                .cursor_pointer()
+                                .hover(|style| style.opacity(0.9))
+                                .child(txt(tr(lang, "settings.presetSave"), 12.0, theme::page()))
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.save_preset_editor(window, cx);
+                                })),
+                        ),
+                );
+            // Focus mode: while a buffer is open the roster yields the pane to
+            // it, so the code well and its Cancel/Save are on screen without
+            // scrolling. Cancel/Save brings the roster straight back.
+            rows.truncate(1);
+            rows.push(block.into_any_element());
+        }
+
+        if self.preset_editor.is_none() {
             rows.push(
                 div()
-                    .debug_selector(move || format!("preset-{index}"))
-                    .id(SharedString::from(format!("preset-{index}")))
-                    .px(px(6.0))
-                    .py(px(6.0))
-                    .rounded(px(5.0))
+                    .debug_selector(|| "preset-add-custom".to_string())
+                    .id("preset-add-custom")
+                    .w_full()
+                    .mt(px(12.0))
+                    .px(px(14.0))
+                    .py(px(12.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_dashed()
+                    .border_color(rgb(theme::border()))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(theme::hover())))
-                    .when(selected, |element| element.bg(rgb(theme::selected_row())))
-                    .child(txt(name, 13.0, theme::text()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.select_preset(&picked);
+                    .child(
+                        div()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(rgb(theme::border_soft()))
+                            .bg(rgb(theme::page()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon(IconName::Plus, 13.0, theme::muted())),
+                    )
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                txt(tr(lang, "settings.presetCreate"), 13.0, theme::text())
+                                    .font_weight(FontWeight::MEDIUM),
+                            )
+                            .child(txt(
+                                tr(lang, "settings.presetCreateHint"),
+                                11.0,
+                                theme::muted(),
+                            )),
+                    )
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        let id = this.state.add_custom_preset();
+                        this.preset_details = Some(id);
+                        this.state
+                            .notice(tr(this.state.lang, "settings.presetAdded").to_string());
                         cx.notify();
                     }))
                     .into_any_element(),
             );
         }
         ("settings.agent-presets", "settings.agentPresetsHint", rows)
+    }
+
+    /// One DSH-shaped preset card: name, built-in/status tags, description and
+    /// a footer with Mode details, trust and Use in this chat.
+    fn preset_card(&self, data: PresetCardData, cx: &mut Context<Shell>) -> AnyElement {
+        let lang = self.state.lang;
+        let PresetCardData {
+            id,
+            display,
+            description,
+            plugins,
+            builtin,
+            level,
+            permission,
+            read,
+            write,
+            deny,
+            egress,
+            web_search,
+            parallel_tool_calls,
+            mcp_tools,
+            builtin_policy,
+            policy_mode,
+            blocked,
+            tools,
+            skills,
+            mcps,
+            extensions,
+            system_prompt,
+            has_policy,
+            trusted,
+            is_default,
+            in_chat,
+            has_chat,
+            details_open,
+            slot,
+        } = data;
+        if id.is_empty() {
+            return div().into_any_element();
+        }
+        let selector = format!("preset-{slot}");
+        let debug_selector = selector.clone();
+        let pick_default = id.clone();
+        let edge = if is_default || in_chat {
+            theme::accent()
+        } else {
+            theme::border_soft()
+        };
+        let badge = |label: String, color: u32| -> AnyElement {
+            div()
+                .px(px(7.0))
+                .py(px(2.0))
+                .rounded(px(999.0))
+                .border_1()
+                .border_color(rgb(color))
+                .child(txt(label, 10.0, color))
+                .into_any_element()
+        };
+        let solid = |label: String, bg: u32, fg: u32| -> AnyElement {
+            div()
+                .px(px(8.0))
+                .py(px(2.0))
+                .rounded(px(999.0))
+                .bg(rgb(bg))
+                .child(txt(label, 10.0, fg))
+                .into_any_element()
+        };
+        let level_label = |level: &str| match level {
+            "standard" => tr(lang, "settings.presetLevelStandard").to_string(),
+            "ptc" => tr(lang, "settings.presetLevelPtc").to_string(),
+            "creator" => tr(lang, "settings.presetLevelCreator").to_string(),
+            "read-only" => tr(lang, "settings.presetLevelReadOnly").to_string(),
+            "inspect" => tr(lang, "settings.presetLevelInspect").to_string(),
+            "review" => tr(lang, "settings.presetLevelReview").to_string(),
+            "research" => tr(lang, "settings.presetLevelResearch").to_string(),
+            "docs" => tr(lang, "settings.presetLevelDocs").to_string(),
+            "code" => tr(lang, "settings.presetLevelCode").to_string(),
+            "admin" => tr(lang, "settings.presetLevelAdmin").to_string(),
+            other => other.to_string(),
+        };
+        let level_color = |level: &str| match level {
+            "ptc" | "creator" => theme::accent(),
+            "code" => theme::success(),
+            "read-only" | "docs" | "research" | "admin" => theme::accent(),
+            _ => theme::muted(),
+        };
+        let permission_text = match permission.as_deref() {
+            Some("read-only") => tr(lang, "settings.presetPermissionReadOnly").to_string(),
+            Some("workspace-write") => tr(lang, "settings.presetPermissionWorkspace").to_string(),
+            Some("danger-full-access") => tr(lang, "settings.presetPermissionFull").to_string(),
+            _ => tr(lang, "settings.presetInherit").to_string(),
+        };
+        let path_value = |list: &Option<Vec<String>>| match list {
+            None => tr(lang, "settings.presetAllPaths").to_string(),
+            Some(items) if items.is_empty() => tr(lang, "settings.presetNone").to_string(),
+            Some(items) => items.join(", "),
+        };
+
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                txt(display, 16.0, theme::text())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .min_w_0()
+                    .truncate(),
+            )
+            .when(builtin, |row| {
+                row.child(badge(
+                    tr(lang, "settings.presetBuiltIn").to_string(),
+                    theme::muted(),
+                ))
+            })
+            .when(is_default, |row| {
+                row.child(solid(
+                    tr(lang, "settings.presetDefaultBadge").to_string(),
+                    theme::text(),
+                    theme::page(),
+                ))
+            })
+            .when(in_chat && has_chat, |row| {
+                row.child(solid(
+                    tr(lang, "settings.presetInUse").to_string(),
+                    theme::accent(),
+                    theme::page(),
+                ))
+            })
+            .child(div().flex_1())
+            .when_some(level.clone(), |row, level| {
+                let level_slot = slot.clone();
+                row.child(
+                    div()
+                        .debug_selector(move || format!("preset-level-{level_slot}"))
+                        .child(txt(level_label(&level), 10.0, level_color(&level))),
+                )
+            })
+            .child(txt(id.clone(), 11.0, theme::faint()));
+
+        let mut footer = div()
+            .flex()
+            .items_center()
+            .gap(px(14.0))
+            .mt(px(14.0))
+            .pt(px(10.0))
+            .border_t_1()
+            .border_color(rgb(theme::border_soft()));
+        let toggle = id.clone();
+        let details_slot = slot.clone();
+        footer = footer.child(
+            div()
+                .debug_selector(move || format!("preset-details-{details_slot}"))
+                .id(SharedString::from(format!("preset-details-{slot}")))
+                .cursor_pointer()
+                .child(txt(
+                    tr(lang, "settings.presetModeDetails"),
+                    11.0,
+                    theme::muted(),
+                ))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.preset_details = if this.preset_details.as_deref() == Some(&toggle) {
+                        None
+                    } else {
+                        Some(toggle.clone())
+                    };
+                    cx.stop_propagation();
+                    cx.notify();
+                })),
+        );
+        if has_policy {
+            let toggle = id.clone();
+            let trusted_now = trusted;
+            let trust_slot = slot.clone();
+            let label = if trusted {
+                tr(lang, "settings.presetPolicyTrusted").to_string()
+            } else {
+                tr(lang, "settings.presetPolicyUntrusted").to_string()
+            };
+            let ink = if trusted {
+                theme::success()
+            } else {
+                theme::muted()
+            };
+            let trust_edge = if trusted {
+                theme::success()
+            } else {
+                theme::border()
+            };
+            footer = footer.child(
+                div()
+                    .debug_selector(move || format!("preset-trust-{trust_slot}"))
+                    .id(SharedString::from(format!("preset-trust-{slot}")))
+                    .px(px(5.0))
+                    .py(px(1.0))
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(rgb(trust_edge))
+                    .cursor_pointer()
+                    .child(txt(label, 10.0, ink))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.set_preset_trusted(&toggle, !trusted_now);
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            );
+        }
+        if has_chat {
+            let picked = id.clone();
+            let use_slot = slot.clone();
+            let label = if blocked {
+                tr(lang, "settings.presetTrustToUse").to_string()
+            } else if in_chat {
+                tr(lang, "settings.presetInUse").to_string()
+            } else {
+                tr(lang, "settings.presetUseInChat").to_string()
+            };
+            let ink = if in_chat || blocked {
+                theme::muted()
+            } else {
+                theme::accent()
+            };
+            let mut use_link = div()
+                .debug_selector(move || format!("preset-use-{use_slot}"))
+                .id(SharedString::from(format!("preset-use-{slot}")))
+                .child(txt(label, 11.0, ink));
+            if in_chat || blocked {
+                use_link = use_link
+                    .cursor_default()
+                    .on_click(cx.listener(|_this, _event, _window, cx| cx.stop_propagation()));
+            } else {
+                use_link = use_link
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.8))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        if let Some(session) = this.state.active_id.clone() {
+                            this.state.select_session_preset(&session, &picked);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }));
+            }
+            footer = footer.child(use_link);
+        }
+        if !builtin {
+            let edit_id = id.clone();
+            let edit_slot = slot.clone();
+            footer = footer.child(
+                div()
+                    .debug_selector(move || format!("preset-edit-{edit_slot}"))
+                    .id(SharedString::from(format!("preset-edit-{slot}")))
+                    .cursor_pointer()
+                    .child(txt(tr(lang, "settings.presetEdit"), 11.0, theme::accent()))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.open_preset_editor(&edit_id, window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            );
+            let delete_id = id.clone();
+            let delete_slot = slot.clone();
+            footer = footer.child(
+                div()
+                    .debug_selector(move || format!("preset-delete-{delete_slot}"))
+                    .id(SharedString::from(format!("preset-delete-{slot}")))
+                    .cursor_pointer()
+                    .child(txt(tr(lang, "settings.presetDelete"), 11.0, theme::error()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.delete_preset(&delete_id, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            );
+        }
+        footer = footer
+            .child(div().flex_1())
+            .child(icon(IconName::FileText, 14.0, theme::faint()));
+
+        let mut card = div()
+            .debug_selector(move || debug_selector.clone())
+            .id(SharedString::from(selector))
+            .w(px(330.0))
+            .flex_grow(1.0)
+            .min_w(px(250.0))
+            .p(px(16.0))
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(rgb(edge))
+            .when(is_default, |element| element.bg(rgb(theme::selected_row())))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.state.select_preset(&pick_default);
+                cx.notify();
+            }))
+            .child(header)
+            .child(
+                txt(description, 13.0, theme::muted())
+                    .mt(px(10.0))
+                    .line_height(px(20.0)),
+            )
+            .child(footer);
+
+        if details_open {
+            let value =
+                |list: &Option<Vec<String>>, all: &'static str, none: &'static str| match list {
+                    Some(items) if items.is_empty() => tr(lang, none).to_string(),
+                    Some(items) => items.join(", "),
+                    None => tr(lang, all).to_string(),
+                };
+            let row = |label: String, value: String| {
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .py(px(2.0))
+                    .child(txt(label, 11.0, theme::faint()).w(px(84.0)).flex_none())
+                    .child(txt(value, 11.0, theme::text()).flex_1().min_w_0())
+                    .into_any_element()
+            };
+            let mut policy_sources = vec![tr(lang, "settings.presetPolicyBaseline").to_string()];
+            if read.is_some() || write.is_some() || !deny.is_empty() {
+                policy_sources.push(tr(lang, "settings.presetPolicyScope").to_string());
+            }
+            if egress.is_some() {
+                policy_sources.push(tr(lang, "settings.presetPolicyEgress").to_string());
+            }
+            if permission.as_deref() == Some("read-only")
+                && !builtin_policy.iter().any(|id| id == "read-only")
+            {
+                policy_sources.push(tr(lang, "settings.presetPolicyPermission").to_string());
+            }
+            policy_sources.extend(builtin_policy.iter().cloned());
+            if has_policy {
+                policy_sources.push(if trusted {
+                    tr(lang, "settings.presetPolicyCustom").to_string()
+                } else {
+                    tr(lang, "settings.presetPolicyCustomUntrusted").to_string()
+                });
+            }
+            if policy_mode.as_deref() == Some("required") {
+                policy_sources.push(tr(lang, "settings.presetPolicyRequired").to_string());
+            }
+            let security_text = format!(
+                "{}: {}",
+                tr(lang, "settings.presetPolicySources"),
+                policy_sources.join(", ")
+            );
+            let mcp_text = value(&mcps, "settings.presetAllMcps", "settings.presetNone");
+            let mcp_text = match &mcp_tools {
+                Some(items) if items.is_empty() => {
+                    format!("{mcp_text} · tools: {}", tr(lang, "settings.presetNone"))
+                }
+                Some(items) => format!("{mcp_text} · tools: {}", items.join(", ")),
+                None => mcp_text,
+            };
+            let persona = system_prompt
+                .as_deref()
+                .map(|prompt| {
+                    prompt
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or("")
+                        .chars()
+                        .take(96)
+                        .collect::<String>()
+                })
+                .filter(|prompt| !prompt.is_empty())
+                .unwrap_or_else(|| tr(lang, "settings.presetWorkspacePrompt").to_string());
+            let details_slot = slot.clone();
+            card = card.child(
+                div()
+                    .debug_selector(move || format!("preset-config-{details_slot}"))
+                    .mt(px(12.0))
+                    .pt(px(8.0))
+                    .border_t_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(row(
+                        tr(lang, "settings.presetAccessLabel").to_string(),
+                        permission_text,
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetPathsLabel").to_string(),
+                        format!(
+                            "{}: {} · {}: {} · {}: {}",
+                            tr(lang, "settings.presetReadPath"),
+                            path_value(&read),
+                            tr(lang, "settings.presetWritePath"),
+                            path_value(&write),
+                            tr(lang, "settings.presetDenyPath"),
+                            if deny.is_empty() {
+                                tr(lang, "settings.presetNone").to_string()
+                            } else {
+                                deny.join(", ")
+                            }
+                        ),
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetNetworkLabel").to_string(),
+                        match (&egress, web_search) {
+                            (Some(items), _) if items.is_empty() => {
+                                tr(lang, "settings.presetNoNetwork").to_string()
+                            }
+                            (Some(items), _) => items.join(", "),
+                            (None, Some(false)) => tr(lang, "settings.presetNoNetwork").to_string(),
+                            (None, Some(true)) => tr(lang, "settings.presetWebSearch").to_string(),
+                            (None, None) => tr(lang, "settings.presetInherit").to_string(),
+                        },
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetParallelLabel").to_string(),
+                        match parallel_tool_calls {
+                            Some(true) => tr(lang, "settings.presetOn").to_string(),
+                            Some(false) => tr(lang, "settings.presetOff").to_string(),
+                            None => tr(lang, "settings.presetInherit").to_string(),
+                        },
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetBundlesLabel").to_string(),
+                        if plugins.is_empty() {
+                            tr(lang, "settings.presetNone").to_string()
+                        } else {
+                            plugins.join(", ")
+                        },
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetToolsLabel").to_string(),
+                        value(&tools, "settings.presetAllTools", "settings.presetNone"),
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetSkillsLabel").to_string(),
+                        value(&skills, "settings.presetAllSkills", "settings.presetNone"),
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetMcpsLabel").to_string(),
+                        mcp_text,
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetExtensionsLabel").to_string(),
+                        value(
+                            &extensions,
+                            "settings.presetAllExtensions",
+                            "settings.presetNone",
+                        ),
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetPersonaLabel").to_string(),
+                        persona,
+                    ))
+                    .child(row(
+                        tr(lang, "settings.presetSecurityLabel").to_string(),
+                        security_text,
+                    )),
+            );
+        }
+
+        card.into_any_element()
     }
 
     /// The Models pane, in the reference's own three parts.
@@ -1814,7 +3083,7 @@ impl Shell {
                 .justify_center()
                 .py(px(12.0))
                 .px(px(14.0))
-                .rounded(px(16.0))
+                .rounded(px(10.0))
                 .bg(rgb(theme::page()))
                 .border_color(rgb(theme::border_soft()))
                 .child(txt(lang.tr("settings.modelsEmpty"), 12.0, theme::faint())),
@@ -1822,8 +3091,13 @@ impl Shell {
         .into_any_element()
     }
 
-    /// One provider card: the measured row head, and the editor under it while
-    /// this provider is the one being edited.
+    /// One provider card: the reference's row head, modernised to the pane's
+    /// white-surface language, and the editor under it while this provider is
+    /// the one being edited.
+    ///
+    /// Measured for this round: a 14px radius over the soft hairline, 16px of
+    /// padding, an 8px rhythm between the head and the editor, the identity at
+    /// 16/600, and Edit/Delete as the Extensions pane's quiet 12px links.
     fn provider_card(
         &self,
         id: &str,
@@ -1840,7 +3114,13 @@ impl Shell {
             .items_center()
             .gap(px(6.0))
             .min_w_0()
-            .child(txt(name.clone(), 14.0, theme::text()).font_weight(FontWeight::MEDIUM));
+            .child(
+                txt(name.clone(), 16.0, theme::text())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .min_w_0()
+                    .text_ellipsis()
+                    .whitespace_nowrap(),
+            );
         if provider.declared {
             identity = identity.child(
                 hairline_all(
@@ -1877,35 +3157,33 @@ impl Shell {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(4.0))
+                .gap(px(2.0))
                 .ml_auto()
                 .child(
-                    div()
-                        .id(format!("provider-edit-{index}"))
-                        .debug_selector(move || format!("provider-edit-{index}"))
-                        .cursor_pointer()
-                        .child(txt(lang.tr("settings.editProvider"), 12.0, theme::muted()))
-                        .on_click(cx.listener({
-                            let owned = owned.clone();
-                            move |this, _event, window, cx| {
-                                load_provider_into_form(this, &owned, window, cx);
-                                cx.notify();
-                            }
-                        })),
+                    self.models_link(
+                        format!("provider-edit-{index}"),
+                        lang.tr("settings.editProvider"),
+                    )
+                    .on_click(cx.listener({
+                        let owned = owned.clone();
+                        move |this, _event, window, cx| {
+                            load_provider_into_form(this, &owned, window, cx);
+                            cx.notify();
+                        }
+                    })),
                 )
                 .child(
-                    div()
-                        .id(format!("provider-remove-{index}"))
-                        .debug_selector(move || format!("provider-remove-{index}"))
-                        .cursor_pointer()
-                        .child(txt(lang.tr("settings.modelsRemove"), 12.0, theme::muted()))
-                        .on_click(cx.listener({
-                            let owned = owned.clone();
-                            move |this, _event, _window, cx| {
-                                this.state.begin_provider_remove(&owned);
-                                cx.notify();
-                            }
-                        })),
+                    self.models_link(
+                        format!("provider-remove-{index}"),
+                        lang.tr("settings.modelsRemove"),
+                    )
+                    .on_click(cx.listener({
+                        let owned = owned.clone();
+                        move |this, _event, _window, cx| {
+                            this.state.begin_provider_remove(&owned);
+                            cx.notify();
+                        }
+                    })),
                 ),
         );
         let mut card = hairline_all(
@@ -1915,9 +3193,9 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
-                .py(px(12.0))
-                .px(px(14.0))
-                .rounded(px(16.0))
+                .p(px(16.0))
+                .mb(px(8.0))
+                .rounded(px(14.0))
                 .bg(rgb(theme::page()))
                 .border_color(rgb(theme::border_soft()))
                 .child(head),
@@ -1935,37 +3213,42 @@ impl Shell {
         // The measured editor field order: the credential, then the fold that
         // holds the endpoint, the protocol and the display name.
         body.push(self.provider_api_key_field(id, cx));
+        // The fold is the Extensions pane's 56px disclosure row, not a bare
+        // text line: the tinted glyph, the title, its description and the
+        // trailing chevron carry the same metrics as a list row.
         let open = self.models_advanced_open;
-        let fold = div()
-            .id("models-customized")
-            .debug_selector(|| "models-customized".to_string())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .cursor_pointer()
-            .child(if open {
-                icon(IconName::ChevronDown, 12.0, theme::muted())
-            } else {
-                icon(IconName::ChevronRight, 12.0, theme::muted())
+        body.push(
+            self.plugin_list_row(PluginListRow {
+                selector: "models-customized".to_string(),
+                icon: self.plugin_icon(Some(IconName::Settings), None, theme::accent()),
+                title: lang.tr("settings.customized"),
+                title_pill: None,
+                description: lang.tr("settings.customizedHint"),
+                meta: String::new(),
+                meta_ink: theme::faint(),
+                trailing: if open {
+                    icon(IconName::ChevronDown, 12.0, theme::faint()).into_any_element()
+                } else {
+                    icon(IconName::ChevronRight, 12.0, theme::faint()).into_any_element()
+                },
             })
-            .child(txt(lang.tr("settings.customized"), 12.0, theme::muted()))
+            .cursor_pointer()
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.models_advanced_open = !open;
                 cx.notify();
             }))
-            .into_any_element();
-        body.push(fold);
+            .into_any_element(),
+        );
         if open {
-            body.push(self.editor_field(
+            body.push(self.models_field(
                 "settings.customBaseUrl",
                 self.editor_input(&self.add_base_url, "field-editor-base-url".to_string()),
             ));
-            body.push(self.editor_field(
+            body.push(self.models_field(
                 "settings.displayName",
                 self.editor_input(&self.add_display, "field-editor-display".to_string()),
             ));
-            body.push(self.editor_field("settings.apiMode", self.api_mode_choices(cx)));
+            body.push(self.models_field("settings.apiMode", self.api_mode_choices(cx)));
             body.push(
                 txt(lang.tr("settings.advancedHint"), 12.0, theme::faint()).into_any_element(),
             );
@@ -1983,18 +3266,22 @@ impl Shell {
             );
         }
         let owned = id.to_string();
+        // The pair under the editor: Apply is the pane's one filled action and
+        // Cancel is the outlined one, both at the 34px control height and the
+        // radius the fields use.
         let apply = div()
             .id(SharedString::from("models-apply"))
             .debug_selector(|| "models-apply".to_string())
             .flex()
             .items_center()
             .justify_center()
-            .h(px(36.0))
-            .px(px(14.0))
-            .rounded(px(8.0))
-            .bg(rgb(theme::text()))
+            .h(px(34.0))
+            .px(px(16.0))
+            .rounded(px(10.0))
+            .bg(rgb(theme::accent()))
             .cursor_pointer()
-            .child(txt(lang.tr("settings.apply"), 14.0, theme::page()))
+            .hover(|style| style.opacity(0.9))
+            .child(txt(lang.tr("settings.apply"), 12.0, theme::page()))
             .on_click(cx.listener({
                 let owned = owned.clone();
                 move |this, _event, window, cx| {
@@ -2002,30 +3289,34 @@ impl Shell {
                 }
             }))
             .into_any_element();
-        let cancel = div()
-            .id(SharedString::from("models-editor-cancel"))
-            .debug_selector(|| "models-editor-cancel".to_string())
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(36.0))
-            .px(px(14.0))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(rgb(theme::border()))
-            .cursor_pointer()
-            .child(txt(lang.tr("settings.cancel"), 14.0, theme::text()))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.state.editing_provider = None;
-                this.model_rows.clear();
-                this.models_advanced_open = false;
-                cx.notify();
-            }))
-            .into_any_element();
+        let cancel = hairline_all(
+            div()
+                .id(SharedString::from("models-editor-cancel"))
+                .debug_selector(|| "models-editor-cancel".to_string())
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(34.0))
+                .px(px(16.0))
+                .rounded(px(10.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border()))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .child(txt(lang.tr("settings.cancel"), 12.0, theme::text()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.state.editing_provider = None;
+                    this.model_rows.clear();
+                    this.models_advanced_open = false;
+                    cx.notify();
+                })),
+        )
+        .into_any_element();
         let actions = div()
             .flex()
             .flex_row()
             .items_center()
+            .justify_end()
             .gap(px(8.0))
             .child(apply)
             .child(cancel);
@@ -2035,14 +3326,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(12.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.0))
-                    .pt(px(12.0))
-                    .children(body),
-            )
+            .child(div().flex().flex_col().gap(px(8.0)).children(body))
             .child(actions)
             .into_any_element()
     }
@@ -2106,7 +3390,7 @@ impl Shell {
                     )),
             );
         }
-        self.editor_field("settings.apiKey", column.into_any_element())
+        self.models_field("settings.apiKey", column.into_any_element())
     }
 
     /// The vault source control: one button naming the current source, opening
@@ -2133,18 +3417,40 @@ impl Shell {
         } else {
             "provider-vault-choose"
         };
+        let printed = label.clone();
+        let shown = label.clone();
         div()
+            .w_full()
             .debug_selector(move || debug.to_string())
             .child(
                 Button::new("provider-api-key-vault")
                     .ghost()
-                    .h(px(32.0))
-                    .px(px(10.0))
-                    .rounded(px(8.0))
-                    .bg(rgb(theme::selected_row()))
+                    .w_full()
+                    .h(px(34.0))
+                    .px(px(12.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(theme::new_session_fill()))
                     .cursor_pointer()
-                    .label(label)
-                    .icon(IconName::ChevronDown)
+                    .accessibility_label(label)
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("provider-vault-label-{printed}")
+                                    })
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .child(txt(shown, 14.0, theme::text())),
+                            )
+                            .child(icon(IconName::ChevronDown, 12.0, theme::faint())),
+                    )
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                         let mut menu = menu.min_w(px(260.0));
                         if entries.is_empty() && source.is_none() {
@@ -2242,7 +3548,7 @@ impl Shell {
                 txt(lang.tr("settings.vaultKeyFromVault"), 12.0, theme::faint()),
             ));
         }
-        self.editor_field("settings.apiKey", column.into_any_element())
+        self.models_field("settings.apiKey", column.into_any_element())
     }
 
     /// The add card's vault source control, matching the editor's chooser.
@@ -2262,18 +3568,38 @@ impl Shell {
         } else {
             "add-vault-choose"
         };
+        let printed = label.clone();
+        let shown = label.clone();
         div()
+            .w_full()
             .debug_selector(move || debug.to_string())
             .child(
                 Button::new("add-api-key-vault")
                     .ghost()
-                    .h(px(32.0))
-                    .px(px(10.0))
-                    .rounded(px(8.0))
-                    .bg(rgb(theme::selected_row()))
+                    .w_full()
+                    .h(px(34.0))
+                    .px(px(12.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(theme::new_session_fill()))
                     .cursor_pointer()
-                    .label(label)
-                    .icon(IconName::ChevronDown)
+                    .accessibility_label(label)
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("add-vault-label-{printed}"))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .child(txt(shown, 14.0, theme::text())),
+                            )
+                            .child(icon(IconName::ChevronDown, 12.0, theme::faint())),
+                    )
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                         let mut menu = menu.min_w(px(260.0));
                         if entries.is_empty() && source.is_none() {
@@ -2318,9 +3644,23 @@ impl Shell {
     /// The rows are read on the click, not on a keystroke, so a half-typed
     /// row never reaches the tree; and the provider id is not editable,
     /// because it is the registry key the wire model carries.
-    fn apply_provider_edit(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn apply_provider_edit(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let base_url = self.add_base_url.read(cx).value().trim().to_string();
         let name = self.add_display.read(cx).value().trim().to_string();
+        // The name is a required, user-typed field: an edit that clears it is
+        // refused before anything is written, so a provider never loses the
+        // name the card shows.
+        if name.is_empty() {
+            self.state.provider_refusal =
+                Some(crate::settings::provider::ProviderRefusal::NameEmpty.key());
+            cx.notify();
+            return;
+        }
         if base_url.is_empty() {
             self.state.provider_refusal =
                 Some(crate::settings::provider::ProviderRefusal::NeedsBaseUrl.key());
@@ -2365,11 +3705,8 @@ impl Shell {
         // The head carries the inherited/customized meta and the reset link,
         // which drops the whole catalog override in one press.
         let owned = id.to_string();
-        let reset = div()
-            .id(SharedString::from("models-reset"))
-            .debug_selector(|| "models-reset".to_string())
-            .cursor_pointer()
-            .child(txt(lang.tr("settings.resetModels"), 12.0, theme::muted()))
+        let reset = self
+            .models_link("models-reset".to_string(), lang.tr("settings.resetModels"))
             .on_click(cx.listener({
                 let owned = owned.clone();
                 move |this, _event, _window, cx| {
@@ -2382,8 +3719,7 @@ impl Shell {
                     this.models_fetching = false;
                     cx.notify();
                 }
-            }))
-            .into_any_element();
+            }));
         // While the ask is in flight the trigger names the ask, so a
         // second press does not start a second request.
         let fetch_label = if self.models_fetching {
@@ -2391,27 +3727,45 @@ impl Shell {
         } else {
             lang.tr("settings.models.fetchModels")
         };
-        let fetch = div()
-            .id(SharedString::from("models-fetch"))
-            .debug_selector(|| "models-fetch".to_string())
-            .cursor_pointer()
-            .child(txt(fetch_label, 12.0, theme::muted()))
+        let fetch = self
+            .models_link("models-fetch".to_string(), fetch_label)
             .on_click(cx.listener({
                 let owned = owned.clone();
                 move |this, _event, _window, cx| {
                     this.fetch_models(&owned, cx);
                 }
-            }))
-            .into_any_element();
-        // The measured catalogue heading: the title above the meta line,
-        // in one column, with the link buttons parked at its top right.
+            }));
+        // The section header: 'Models' at 14/600 beside its two quiet actions,
+        // then the catalogue's own meta line under it, 2px apart - the
+        // reference's modelCatalogHeading column with the toolbar on the
+        // title's line.
         let heading = div()
             .flex()
             .flex_col()
             .gap(px(2.0))
             .child(
-                txt(lang.tr("settings.models"), 12.0, theme::muted())
-                    .font_weight(FontWeight::MEDIUM),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        txt(lang.tr("settings.models"), 14.0, theme::text())
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    // Restore defaults leads the toolbar, and the fetch follows
+                    // it, which is the order the reference's own catalog
+                    // toolbar names.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(reset)
+                            .child(fetch),
+                    ),
             )
             .child(txt(
                 if customized {
@@ -2422,24 +3776,7 @@ impl Shell {
                 12.0,
                 theme::faint(),
             ));
-        // Restore defaults leads the toolbar, and the fetch follows it, which is
-        // the order the reference's own catalog toolbar names.
-        let actions = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(reset)
-            .child(fetch);
-        let head = div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .justify_between()
-            .gap(px(12.0))
-            .child(heading)
-            .child(actions);
-        rows.push(head.into_any_element());
+        rows.push(heading.into_any_element());
         if !customized {
             rows.push(
                 div()
@@ -2447,7 +3784,7 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .py(px(12.0))
-                    .rounded(px(16.0))
+                    .rounded(px(10.0))
                     .border_1()
                     .border_color(rgb(theme::border_soft()))
                     .child(txt(lang.tr("settings.modelsEmpty"), 12.0, theme::faint()))
@@ -2458,16 +3795,55 @@ impl Shell {
             rows.push(self.model_row(id, index, cx));
         }
         rows.extend(self.fetch_rows(id, cx));
-        // The row the add control needs: the reference pairs its add button
-        // with the id being added, so the press has something to add. Without
-        // these fields the button could only ever report `settings.modelIdRequired`
-        // about a field the pane never drew.
+        // The add row is one 34px field beside the soft "+ Add model" pill:
+        // the reference's own add control appends a row, while this form lands
+        // the typed id directly, so it keeps the one field the press reads.
+        // The optional display name is offered once an id has been typed, so
+        // the row is not a pair of empty inputs at rest.
         //
         // The editor's own engines, not the add card's: this form adds a model
         // to the provider already open, which is a different fact from the one
         // the custom route types for a provider that does not exist yet.
         let new_id_selector = SharedString::from("model-new-id");
         let new_name_selector = SharedString::from("model-new-name");
+        let typed_id = self.new_model_id.read(cx).value().trim().to_string();
+        let add = div()
+            .id(SharedString::from("model-add"))
+            .debug_selector(|| "model-add".to_string())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(34.0))
+            .px(px(14.0))
+            .rounded(px(999.0))
+            .bg(rgb(theme::new_session_fill()))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(icon(IconName::Plus, 12.0, theme::text()))
+            .child(txt(lang.tr("settings.addModel"), 12.0, theme::text()))
+            .on_click(cx.listener({
+                let owned = owned.clone();
+                move |this, _event, window, cx| {
+                    let typed = this.new_model_id.read(cx).value().trim().to_string();
+                    let named = this.new_model_name.read(cx).value().trim().to_string();
+                    let outcome = this.state.add_model(&owned, &typed, &named, &typed, "");
+                    this.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
+                    // A row that landed leaves the field empty, so the next
+                    // press adds a second model rather than re-adding this
+                    // one. A refusal keeps the text, because the reader has
+                    // to correct what they typed.
+                    if outcome.is_ok() {
+                        this.new_model_id.update(cx, |state, cx| {
+                            state.set_value(String::new(), window, cx);
+                        });
+                        this.new_model_name.update(cx, |state, cx| {
+                            state.set_value(String::new(), window, cx);
+                        });
+                    }
+                    this.reload_model_rows(&owned, window, cx);
+                }
+            }));
         rows.push(
             div()
                 .flex()
@@ -2478,83 +3854,41 @@ impl Shell {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(
+                        .child(hairline_all(
                             Input::new(&self.new_model_id)
                                 .id(SharedString::from("model-new-id-field"))
                                 .appearance(false)
                                 .w_full()
-                                .h(px(28.0))
-                                .rounded(px(4.0))
+                                .h(px(34.0))
+                                .rounded(px(10.0))
                                 .bg(rgb(theme::page()))
-                                .border_1()
-                                .border_color(rgb(theme::border()))
-                                .px(px(8.0)),
-                        )
+                                .border_color(rgb(theme::border_soft()))
+                                .px(px(10.0)),
+                        ))
                         .debug_selector(move || new_id_selector.to_string()),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            Input::new(&self.new_model_name)
-                                .id(SharedString::from("model-new-name-field"))
-                                .appearance(false)
-                                .w_full()
-                                .h(px(28.0))
-                                .rounded(px(4.0))
-                                .bg(rgb(theme::page()))
-                                .border_1()
-                                .border_color(rgb(theme::border()))
-                                .px(px(8.0)),
-                        )
-                        .debug_selector(move || new_name_selector.to_string()),
-                )
+                .when(!typed_id.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(hairline_all(
+                                Input::new(&self.new_model_name)
+                                    .id(SharedString::from("model-new-name-field"))
+                                    .appearance(false)
+                                    .w_full()
+                                    .h(px(34.0))
+                                    .rounded(px(10.0))
+                                    .bg(rgb(theme::page()))
+                                    .border_color(rgb(theme::border_soft()))
+                                    .px(px(10.0)),
+                            ))
+                            .debug_selector(move || new_name_selector.to_string()),
+                    )
+                })
+                .child(add)
                 .into_any_element(),
         );
-        // The measured `addModelButton`: a 28px link-sized control on a
-        // `.5px` l3 rule, its own 4px gap and `align-self: flex-start`.
-        let add = hairline_all(
-            div()
-                .id(SharedString::from("model-add"))
-                .debug_selector(|| "model-add".to_string())
-                .flex()
-                .flex_row()
-                .items_center()
-                .self_start()
-                .gap(px(4.0))
-                .h(px(28.0))
-                .px(px(10.0))
-                .rounded(px(4.0))
-                .bg(rgb(theme::page()))
-                .border_color(rgb(theme::border()))
-                .cursor_pointer()
-                .child(icon(IconName::Plus, 14.0, theme::text()))
-                .child(txt(lang.tr("settings.addModel"), 12.0, theme::text()))
-                .on_click(cx.listener({
-                    let owned = owned.clone();
-                    move |this, _event, window, cx| {
-                        let typed = this.new_model_id.read(cx).value().trim().to_string();
-                        let named = this.new_model_name.read(cx).value().trim().to_string();
-                        let outcome = this.state.add_model(&owned, &typed, &named, &typed, "");
-                        this.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
-                        // A row that landed leaves the fields empty, so the next
-                        // press adds a second model rather than re-adding this
-                        // one. A refusal keeps the text, because the reader has
-                        // to correct what they typed.
-                        if outcome.is_ok() {
-                            this.new_model_id.update(cx, |state, cx| {
-                                state.set_value(String::new(), window, cx);
-                            });
-                            this.new_model_name.update(cx, |state, cx| {
-                                state.set_value(String::new(), window, cx);
-                            });
-                        }
-                        this.reload_model_rows(&owned, window, cx);
-                    }
-                })),
-        );
-        rows.push(add.into_any_element());
         rows
     }
 
@@ -2575,14 +3909,17 @@ impl Shell {
             cx.notify();
             return;
         };
+        let lang = self.state.lang;
+        let id_hint = crate::i18n::tr(lang, "settings.modelId");
+        let name_hint = crate::i18n::tr(lang, "settings.providerDisplayName");
         self.model_rows = provider
             .models
             .iter()
             .map(|(key, entry)| ModelRowEditor {
                 key: key.clone(),
                 entry: entry.clone(),
-                id: cx.new(|cx| InputState::new(window, cx)),
-                name: cx.new(|cx| InputState::new(window, cx)),
+                id: cx.new(|cx| InputState::new(window, cx).placeholder(id_hint.clone())),
+                name: cx.new(|cx| InputState::new(window, cx).placeholder(name_hint.clone())),
                 open: false,
             })
             .collect();
@@ -2598,8 +3935,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// One measured model row: the id and name inputs, the chevron and the
-    /// trash, with the declared input types under the row.
     /// The endpoint model picker: what a successful fetch returned, which of
     /// it is ticked, and the adopt control that turns the ticks into rows.
     ///
@@ -2728,29 +4063,37 @@ impl Shell {
         rows
     }
 
+    /// One model row in the Extensions pane's row language: a 56px line
+    /// holding the two 34px fields, the chevron and the quiet trash, with the
+    /// declared input types under it while it is open.
+    ///
+    /// The row is its own hover surface and each field carries one soft
+    /// hairline; the card-inside-a-card border the old row drew is gone.
     fn model_row(&self, id: &str, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let Some(row) = self.model_rows.get(index) else {
             return div().into_any_element();
         };
-        let id_input = Input::new(&row.id)
-            .appearance(false)
-            .flex_1()
-            .h(px(32.0))
-            .rounded(px(8.0))
-            .bg(rgb(theme::page()))
-            .border_1()
-            .border_color(rgb(theme::border()))
-            .px(px(10.0));
-        let name_input = Input::new(&row.name)
-            .appearance(false)
-            .flex_1()
-            .h(px(32.0))
-            .rounded(px(8.0))
-            .bg(rgb(theme::page()))
-            .border_1()
-            .border_color(rgb(theme::border()))
-            .px(px(10.0));
+        let id_input = hairline_all(
+            Input::new(&row.id)
+                .appearance(false)
+                .flex_1()
+                .h(px(34.0))
+                .rounded(px(10.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border_soft()))
+                .px(px(10.0)),
+        );
+        let name_input = hairline_all(
+            Input::new(&row.name)
+                .appearance(false)
+                .flex_1()
+                .h(px(34.0))
+                .rounded(px(10.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border_soft()))
+                .px(px(10.0)),
+        );
         let open = row.open;
         let tip = lang.tr("settings.models.modelAdvanced");
         let chevron = div()
@@ -2761,8 +4104,9 @@ impl Shell {
             .justify_center()
             .w(px(28.0))
             .h(px(28.0))
-            .rounded(px(8.0))
+            .rounded(px(6.0))
             .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
             .child(if open {
                 icon(IconName::ChevronDown, 12.0, theme::faint())
             } else {
@@ -2787,8 +4131,9 @@ impl Shell {
             .justify_center()
             .w(px(28.0))
             .h(px(28.0))
-            .rounded(px(8.0))
+            .rounded(px(6.0))
             .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
             .child(icon(IconName::Trash, 14.0, theme::faint()))
             .on_click(cx.listener({
                 let owned = owned.clone();
@@ -2798,38 +4143,35 @@ impl Shell {
                 }
             }))
             .into_any_element();
-        let entry = hairline_all(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .py(px(6.0))
-                .px(px(8.0))
-                .rounded(px(16.0))
-                .bg(rgb(theme::page()))
-                .border_color(rgb(theme::border_soft()))
-                .child(
+        let entry = div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .h(px(56.0))
+                    .px(px(8.0))
+                    .rounded(px(8.0))
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(id_input)
+                    .child(name_input)
+                    .child(chevron)
+                    .child(trash),
+            )
+            .when(open, |row| {
+                row.child(
                     div()
                         .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(id_input)
-                        .child(name_input)
-                        .child(chevron)
-                        .child(trash),
+                        .flex_col()
+                        .gap(px(8.0))
+                        .px(px(8.0))
+                        .pb(px(8.0))
+                        .child(self.model_input_types(id, &leaf, index, cx)),
                 )
-                .when(open, |row| {
-                    row.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.0))
-                            .pt(px(6.0))
-                            .child(self.model_input_types(id, &leaf, index, cx)),
-                    )
-                }),
-        );
+            });
         entry.into_any_element()
     }
 
@@ -2914,6 +4256,38 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The models pane's field: a 12px faint label above its control, 6px
+    /// apart. The Extensions rows put their labels in the faint tone, and the
+    /// pane follows that language rather than the older weighted label.
+    fn models_field(&self, label: &'static str, control: AnyElement) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(txt(lang.tr(label), 12.0, theme::faint()))
+            .child(control)
+            .into_any_element()
+    }
+
+    /// A quiet 12px text action: no fill at rest, the Extensions pane's hover
+    /// surface under the pointer. The caller supplies the click behaviour, so
+    /// one definition keeps every card action the same size and ink.
+    fn models_link(&self, id: String, label: String) -> Stateful<Div> {
+        let debug = id.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || debug.clone())
+            .flex()
+            .items_center()
+            .h(px(24.0))
+            .px(px(8.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(label, 12.0, theme::muted()))
+    }
+
     /// A bare text input: the measured input, without the kit's wrapper chrome.
     fn editor_input(&self, input: &Entity<InputState>, id: String) -> AnyElement {
         let selector = id.clone();
@@ -2988,33 +4362,34 @@ impl Shell {
         }
         row.into_any_element()
     }
-    /// The dashed add button, and the card it swaps for once it is open.
+    /// The full-width soft add control, and the card it swaps for once it is
+    /// open.
+    ///
+    /// The control carries no border: the new-session fill is the surface, the
+    /// same quiet affordance the Extensions pane adds rows with.
     pub(crate) fn add_provider_block(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         if !self.models_add_open {
             return div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .gap(px(6.0))
+                .w_full()
                 .child(
                     div()
                         .id(SharedString::from("provider-add"))
                         .debug_selector(|| "provider-add".to_string())
                         .flex()
-                        .flex_1()
+                        .flex_row()
                         .items_center()
                         .justify_center()
                         .gap(px(6.0))
-                        .h(px(44.0))
-                        .min_w(px(180.0))
-                        .rounded(px(16.0))
-                        .border_1()
-                        .border_color(rgb(theme::border()))
+                        .h(px(34.0))
+                        .w_full()
+                        .rounded(px(10.0))
+                        .bg(rgb(theme::new_session_fill()))
                         .cursor_pointer()
-                        .child(icon(IconName::Plus, 14.0, theme::text()))
-                        .child(txt(lang.tr("settings.add"), 14.0, theme::text()))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                        .hover(|style| style.bg(rgb(theme::hover())))
+                        .child(icon(IconName::Plus, 12.0, theme::text()))
+                        .child(txt(lang.tr("settings.add"), 12.0, theme::text()))
+                        .on_click(cx.listener(move |this, _event, window, cx| {
                             let addable = this.state.draft().global.addable_providers();
                             this.models_add_route = if addable.is_empty() {
                                 ModelsAddRoute::Custom
@@ -3023,6 +4398,10 @@ impl Shell {
                             };
                             this.models_add_open = true;
                             this.add_key_vault = None;
+                            // The name is never carried over from a previous
+                            // form: the field starts empty, so Create always
+                            // requires fresh user input.
+                            set_value(&this.add_display, String::new(), window, cx);
                             cx.notify();
                         }))
                         .into_any_element(),
@@ -3193,12 +4572,24 @@ impl Shell {
             }
             boxed = boxed.child(options.into_any_element());
         }
-        div()
+        // The name is a required, user-typed field on both routes, so the
+        // catalogue route asks for it before the API key rather than deriving
+        // it from the provider id.
+        let named = self.add_display.read(cx).value().trim().to_string();
+        let mut column = div()
             .flex()
             .flex_col()
             .gap(px(12.0))
             .child(self.editor_field("settings.provider", boxed.into_any_element()))
-            .child(self.add_api_key_field(cx))
+            .child(self.editor_field(
+                "settings.displayName",
+                self.editor_input(&self.add_display, "add-display".to_string()),
+            ))
+            .child(self.add_api_key_field(cx));
+        if named.is_empty() {
+            column = column.child(self.add_note(lang.tr("settings.providerNameEmpty")));
+        }
+        column
             .child(self.add_actions(&chosen, cx))
             .into_any_element()
     }
@@ -3208,51 +4599,25 @@ impl Shell {
     fn custom_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let route = self.add_route.read(cx).value().trim().to_string();
+        let named = self.add_display.read(cx).value().trim().to_string();
         let base_url = self.add_base_url.read(cx).value().trim().to_string();
         let taken = self.state.draft().global.providers.contains_key(&route);
         let address = crate::settings::provider::base_url_refusal(&base_url);
-        let ready = !route.is_empty()
-            && !base_url.is_empty()
-            && address.is_none()
-            && !taken
-            && !self.state.draft().global.providers.is_empty()
-            && !self.model_rows.is_empty();
-        let _ = ready;
-        let model_field = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(txt(lang.tr("settings.modelId"), 12.0, theme::muted()))
-            .child(
-                Input::new(&self.new_row_id)
-                    .id(SharedString::from("add-model-id"))
-                    .appearance(false)
-                    .flex_1()
-                    .h(px(36.0))
-                    .rounded(px(8.0))
-                    .bg(rgb(theme::page()))
-                    .border_1()
-                    .border_color(rgb(theme::border()))
-                    .px(px(12.0)),
-            )
-            .child(
-                Input::new(&self.new_row_name)
-                    .id(SharedString::from("add-model-name"))
-                    .appearance(false)
-                    .flex_1()
-                    .h(px(36.0))
-                    .rounded(px(8.0))
-                    .bg(rgb(theme::page()))
-                    .border_1()
-                    .border_color(rgb(theme::border()))
-                    .px(px(12.0)),
-            );
+        // No model field here. A provider is created with provider facts alone
+        // and starts with an empty catalogue; the provider's own editor draws
+        // the "Add model" row that fills it. The duplicate-id sentence below is
+        // about the PROVIDER id, so it stays directly under that field.
         let mut column = div().flex().flex_col().gap(px(14.0));
+        column = column.child(self.editor_field(
+            "settings.customRoute",
+            self.editor_input(&self.add_route, "add-route".to_string()),
+        ));
+        if route.is_empty() {
+            column = column.child(self.add_note(lang.tr("settings.providerIdRequired")));
+        } else if taken {
+            column = column.child(self.add_note(lang.tr("settings.providerIdTaken")));
+        }
         column = column
-            .child(self.editor_field(
-                "settings.customRoute",
-                self.editor_input(&self.add_route, "add-route".to_string()),
-            ))
             .child(self.editor_field(
                 "settings.displayName",
                 self.editor_input(&self.add_display, "add-display".to_string()),
@@ -3262,17 +4627,14 @@ impl Shell {
                 self.editor_input(&self.add_base_url, "add-base-url".to_string()),
             ))
             .child(self.editor_field("settings.apiMode", self.api_mode_choices(cx)))
-            .child(self.add_api_key_field(cx))
-            .child(model_field);
+            .child(self.add_api_key_field(cx));
         // The refusals the reference prints above the create button, in the
         // order it checks them.
-        if route.is_empty() {
-            column = column.child(self.add_note(lang.tr("settings.providerIdRequired")));
-        } else if taken {
-            column = column.child(self.add_note(lang.tr("settings.providerIdTaken")));
+        if named.is_empty() {
+            column = column.child(self.add_note(lang.tr("settings.providerNameEmpty")));
         }
         if base_url.is_empty() {
-            column = column.child(self.add_note(lang.tr("settings.customNeedsBaseUrl")));
+            column = column.child(self.add_note(lang.tr("settings.models.customNeedsBaseUrl")));
         } else if let Some(refusal) = address {
             column = column.child(self.add_note(lang.tr(refusal.key())));
         }
@@ -3345,21 +4707,31 @@ impl Shell {
         let route = self.models_add_route;
         let base_url = self.add_base_url.read(cx).value().trim().to_string();
         let named = self.add_display.read(cx).value().trim().to_string();
-        let typed = self.new_row_id.read(cx).value().trim().to_string();
+        // The provider name is a required user input on both routes, never
+        // derived from the id: an empty field creates nothing, and the add
+        // card already draws the reason beside its Create action.
+        if named.is_empty() {
+            cx.notify();
+            return;
+        }
         let vault_entry = self.add_key_vault.clone();
         let outcome = match route {
             ModelsAddRoute::Catalogue => self.state.add_shipped_provider(id),
-            ModelsAddRoute::Custom => self.state.add_custom_provider(
-                id,
-                &named,
-                &base_url,
-                &[crate::settings::global::ModelEntry::named(&typed)],
-            ),
+            // A custom provider is created with no models. Its editor's own
+            // "Add model" row fills the catalogue afterwards, so creation no
+            // longer depends on a model id typed into the add card.
+            ModelsAddRoute::Custom => self.state.add_custom_provider(id, &named, &base_url, &[]),
         };
         self.state.provider_refusal = outcome.err().map(|refusal| refusal.key());
         if outcome.is_ok() {
             if let Some(entry) = vault_entry.as_deref() {
                 self.state.set_provider_api_key_vault(id, Some(entry));
+            }
+            // The catalogue route takes its endpoint from the shipped family;
+            // the name is still the reader's own text, so it lands after the
+            // family does. The custom route already wrote it in one call.
+            if route == ModelsAddRoute::Catalogue {
+                self.state.set_provider_name(id, &named);
             }
             // Adding a provider no longer selects it for anything: a model is
             // chosen per chat from the composer, and the workspace document
@@ -3486,12 +4858,30 @@ impl Shell {
                     .child(txt(description, 12.0, theme::faint()).flex_1())
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         if is_skill {
-                            this.state.toggle_skill_off(&name);
+                            // The Tools pane lists the same skills, so its
+                            // switch is the same immediate write: one fact,
+                            // one door, whichever pane draws it.
+                            this.toggle_skill(&name, cx);
                         } else {
                             this.state.toggle_tool_off(&name);
+                            cx.notify();
                         }
-                        cx.notify();
                     }))
+                    .into_any_element(),
+            );
+        }
+        // The Tools pane lists the same skills, so its switches share the same
+        // immediate write and the same refusal surface.
+        if let Some(error) = &self.skills_save_error {
+            rows.insert(
+                0,
+                div()
+                    .debug_selector(|| "skills-save-error".to_string())
+                    .child(self.market_banner(tr_args(
+                        lang,
+                        "settings.skillsSaveError",
+                        &[("error", error.clone())],
+                    )))
                     .into_any_element(),
             );
         }
@@ -4704,18 +6094,8 @@ impl Shell {
             return ("settings.pluginsPageTitle", "settings.marketIntro", rows);
         }
         rows.push(
-            div()
+            self.plugins_search_box(&self.plugin_search)
                 .mb(px(16.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .h(px(34.0))
-                .px(px(10.0))
-                .rounded(px(10.0))
-                .bg(rgb(theme::new_session_fill()))
-                .child(icon(IconName::Search, 14.0, theme::faint()))
-                .child(Input::new(&self.plugin_search).appearance(false))
                 .into_any_element(),
         );
 
@@ -4843,6 +6223,25 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The full-width search field every Extensions tab opens with.
+    ///
+    /// One definition for the four tabs, so the list, MCP, Skills and Market
+    /// panes cannot drift into four different search boxes.
+    fn plugins_search_box(&self, input: &Entity<InputState>) -> Div {
+        div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(34.0))
+            .px(px(10.0))
+            .rounded(px(10.0))
+            .bg(rgb(theme::new_session_fill()))
+            .child(icon(IconName::Search, 14.0, theme::faint()))
+            .child(Input::new(input).appearance(false))
+    }
+
     /// A section heading: 14px semibold in the tertiary colour, no rule.
     fn plugins_section_header(&self, id: &'static str, title: &'static str) -> AnyElement {
         div()
@@ -4897,6 +6296,7 @@ impl Shell {
             title_pill,
             description,
             meta,
+            meta_ink,
             trailing,
         } = row;
         let debug = selector.clone();
@@ -4930,7 +6330,7 @@ impl Shell {
             );
         if !meta.is_empty() {
             description_row = description_row.child(
-                txt(meta, 11.0, theme::faint())
+                txt(meta, 11.0, meta_ink)
                     .flex_none()
                     .text_ellipsis()
                     .whitespace_nowrap(),
@@ -5021,6 +6421,14 @@ impl Shell {
                 IconName::SquareTerminal,
                 theme::success(),
             ),
+            (
+                "policy",
+                "settings.policy",
+                "settings.policyHint",
+                "policy",
+                IconName::Lock,
+                theme::accent(),
+            ),
         ] {
             let Some(section) = section_index(pane) else {
                 continue;
@@ -5033,6 +6441,7 @@ impl Shell {
                     title_pill: None,
                     description: tr(lang, description),
                     meta: String::new(),
+                    meta_ink: theme::faint(),
                     trailing: div().into_any_element(),
                 })
                 .cursor_pointer()
@@ -5072,6 +6481,7 @@ impl Shell {
             title_pill: Some(pill),
             description: tr(lang, "settings.developerToolsDescription"),
             meta: String::new(),
+            meta_ink: theme::faint(),
             trailing: toggle,
         })
         .mb(px(8.0))
@@ -5103,9 +6513,12 @@ impl Shell {
             } else {
                 tr_args(lang, "settings.pluginsProblemTooltip", &[("kinds", kinds)])
             };
+            // "Problem" promises the package itself is broken. A readable
+            // package that merely declares one unsupported part is PARTIAL:
+            // Canva's MCP server still works while its app connector does not.
             pills.push(self.plugin_pill(
                 format!("installed-problem-{id}"),
-                tr(lang, "settings.pluginsProblem"),
+                tr(lang, plugin.problem_label_key()),
                 theme::warn(),
                 Some(tip),
             ));
@@ -5159,6 +6572,7 @@ impl Shell {
                 title_pill: pill,
                 description: plugin.description.clone(),
                 meta,
+                meta_ink: theme::faint(),
                 trailing: toggle,
             })
             .cursor_pointer()
@@ -5199,11 +6613,11 @@ impl Shell {
             lines = lines.child(self.installed_trust_section(plugin, cx));
         }
         lines = lines
-            .child(self.installed_detail_line(
+            .child(self.settings_detail_line(
                 "settings.pluginsDetailStandard",
                 plugin.standard.label().to_string(),
             ))
-            .child(self.installed_detail_line(
+            .child(self.settings_detail_line(
                 "settings.pluginsDetailVersion",
                 if plugin.version.is_empty() {
                     "—".to_string()
@@ -5211,7 +6625,7 @@ impl Shell {
                     plugin.version.clone()
                 },
             ))
-            .child(self.installed_detail_line(
+            .child(self.settings_detail_line(
                 "settings.pluginsDetailSource",
                 if plugin.source_label.is_empty() {
                     "—".to_string()
@@ -5219,7 +6633,7 @@ impl Shell {
                     plugin.source_label.clone()
                 },
             ))
-            .child(self.installed_detail_line(
+            .child(self.settings_detail_line(
                 "settings.pluginsDetailInstallTarget",
                 if plugin.install_target.is_empty() {
                     "—".to_string()
@@ -5228,7 +6642,7 @@ impl Shell {
                 },
             ))
             .child(
-                self.installed_detail_line(
+                self.settings_detail_line(
                     "settings.pluginsDetailPath",
                     plugin
                         .path
@@ -5236,7 +6650,7 @@ impl Shell {
                         .unwrap_or_else(|| tr(lang, "settings.pluginsNoPath")),
                 ),
             )
-            .child(self.installed_detail_line(
+            .child(self.settings_detail_line(
                 "settings.pluginsDetailCapabilities",
                 if plugin.capabilities.is_empty() {
                     tr(lang, "settings.pluginsNoCapabilities")
@@ -5244,17 +6658,33 @@ impl Shell {
                     plugin.capability_line()
                 },
             ));
-        if plugin.load_error.is_some() || !plugin.refusals.is_empty() {
+        if let Some(error) = &plugin.load_error {
             lines = lines.child(
                 txt(tr(lang, "settings.pluginsProblem"), 11.0, theme::faint())
                     .font_weight(FontWeight::MEDIUM),
             );
-        }
-        if let Some(error) = &plugin.load_error {
             lines = lines.child(
                 div()
                     .debug_selector(|| format!("installed-load-error-{}", plugin.id))
                     .child(txt(error.clone(), 11.0, theme::error()).line_height(px(15.0))),
+            );
+        }
+        if !plugin.refusals.is_empty() {
+            lines = lines.child(
+                txt(
+                    tr(lang, "settings.pluginsUnsupportedParts"),
+                    11.0,
+                    theme::faint(),
+                )
+                .font_weight(FontWeight::MEDIUM),
+            );
+            lines = lines.child(
+                txt(
+                    tr(lang, "settings.pluginsPartialHint"),
+                    11.0,
+                    theme::faint(),
+                )
+                .line_height(px(15.0)),
             );
         }
         for (index, refusal) in plugin.refusals.iter().enumerate() {
@@ -5390,7 +6820,7 @@ impl Shell {
     }
 
     /// One label/value line in the installed disclosure.
-    fn installed_detail_line(&self, label: &'static str, value: String) -> AnyElement {
+    fn settings_detail_line(&self, label: &'static str, value: String) -> AnyElement {
         div()
             .flex()
             .flex_row()
@@ -5554,6 +6984,7 @@ impl Shell {
         self.market = scan.plugins;
         self.market_error = (!scan.errors.is_empty()).then(|| scan.errors.join("; "));
         self.market_loaded = true;
+        self.market_limit = 60;
         self.market_fetch_error = None;
         self.market_install_error = None;
         self.fetch_builtin_providers(cx);
@@ -5966,20 +7397,10 @@ impl Shell {
     /// list uses, so Save remains the one commit and Cancel discards them.
     fn market_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let lang = self.state.lang;
-        let mut rows = self.market_sources(cx);
-        rows.push(
-            txt(tr(lang, "settings.marketLocalOnly"), 11.0, theme::faint())
-                .pb(px(4.0))
-                .into_any_element(),
-        );
-        rows.push(
-            txt(tr(lang, "settings.marketApplyHint"), 11.0, theme::faint())
-                .pb(px(8.0))
-                .into_any_element(),
-        );
+        let mut rows: Vec<AnyElement> = Vec::new();
         rows.push(
             div()
-                .mb(px(10.0))
+                .mb(px(16.0))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -5988,28 +7409,19 @@ impl Shell {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .h(px(38.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .px(px(12.0))
-                        .rounded(px(12.0))
-                        .bg(rgb(theme::new_session_fill()))
-                        .child(icon(IconName::Search, 14.0, theme::faint()))
-                        .child(Input::new(&self.market_search).appearance(false)),
+                        .child(self.plugins_search_box(&self.market_search)),
                 )
                 .child(
                     div()
                         .id(SharedString::from("market-refresh"))
                         .debug_selector(|| String::from("market-refresh"))
-                        .h(px(38.0))
+                        .h(px(34.0))
                         .px(px(12.0))
                         .flex()
                         .flex_row()
                         .items_center()
                         .gap(px(6.0))
-                        .rounded(px(12.0))
+                        .rounded(px(10.0))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(theme::hover())))
                         .child(icon(IconName::RefreshCw, 13.0, theme::muted()))
@@ -6018,6 +7430,17 @@ impl Shell {
                             this.refresh_market(cx);
                         })),
                 )
+                .into_any_element(),
+        );
+        rows.extend(self.market_sources(cx));
+        rows.push(
+            txt(tr(lang, "settings.marketLocalOnly"), 11.0, theme::faint())
+                .pb(px(4.0))
+                .into_any_element(),
+        );
+        rows.push(
+            txt(tr(lang, "settings.marketApplyHint"), 11.0, theme::faint())
+                .pb(px(8.0))
                 .into_any_element(),
         );
         let codex = self
@@ -6163,60 +7586,70 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        const MARKET_PAGE: usize = 60;
-        let shown = &listed[..listed.len().min(MARKET_PAGE)];
-        for pair in shown.chunks(2) {
-            let mut row = div().flex().flex_row().gap(px(10.0)).pb(px(10.0));
-            for index in pair {
-                let plugin = &self.market[*index];
-                row = row.child(self.market_card(
-                    *index,
-                    plugin,
-                    installed.contains(&plugin.id),
-                    !disabled.contains(&plugin.id),
-                    cx,
-                ));
-            }
-            if pair.len() == 1 {
-                row = row.child(div().flex_1());
-            }
-            rows.push(row.into_any_element());
-        }
-        if listed.len() > MARKET_PAGE {
+        let limit = self.market_limit.min(listed.len());
+        // The cap belongs ABOVE the list: a reader who sees only the first
+        // screen must know a large catalog is windowed, not exhausted.
+        if listed.len() > limit {
             rows.push(
-                txt(
-                    tr_args(
-                        lang,
-                        "settings.marketLimited",
-                        &[
-                            ("shown", MARKET_PAGE.to_string()),
-                            ("total", listed.len().to_string()),
-                        ],
-                    ),
-                    11.0,
-                    theme::faint(),
-                )
-                .pb(px(8.0))
-                .into_any_element(),
+                div()
+                    .mb(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        txt(
+                            tr_args(
+                                lang,
+                                "settings.marketLimited",
+                                &[
+                                    ("shown", limit.to_string()),
+                                    ("total", listed.len().to_string()),
+                                ],
+                            ),
+                            11.0,
+                            theme::faint(),
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    )
+                    .child(
+                        div()
+                            .id("market-show-more")
+                            .debug_selector(|| String::from("market-show-more"))
+                            .h(px(28.0))
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(999.0))
+                            .bg(rgb(theme::new_session_fill()))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::hover())))
+                            .child(txt(
+                                tr(lang, "settings.marketShowMore"),
+                                11.0,
+                                theme::text(),
+                            ))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.market_limit = this.market_limit.saturating_add(60);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
             );
         }
+        let shown = &listed[..limit];
+        for index in shown {
+            let plugin = &self.market[*index];
+            rows.push(self.market_row(
+                *index,
+                plugin,
+                installed.contains(&plugin.id),
+                !disabled.contains(&plugin.id),
+                cx,
+            ));
+        }
         rows
-    }
-
-    /// One installed/enabled marker on a market card. It is only drawn for an
-    /// installed package, because an uninstalled row has no enable state.
-    fn market_status_pill(&self, label: String, color: u32, id: String) -> AnyElement {
-        div()
-            .id(SharedString::from(id.clone()))
-            .debug_selector(move || id.clone())
-            .px(px(7.0))
-            .h(px(18.0))
-            .flex()
-            .items_center()
-            .rounded(px(6.0))
-            .bg(rgb(color))
-            .child(txt(label, 9.0, theme::page()))
-            .into_any_element()
     }
 
     /// Enable or disable one INSTALLED market plugin in the draft.
@@ -6284,9 +7717,10 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One market card: standard badge, name, version, description, install
-    /// state and the control that changes it.
-    fn market_card(
+    /// One market package as a 56px list row: tinted standard mark, name,
+    /// standard/install pills, description and version/source suffix, with the
+    /// Install or Installed controls at the far right.
+    fn market_row(
         &self,
         index: usize,
         plugin: &crate::market::MarketPlugin,
@@ -6305,168 +7739,102 @@ impl Shell {
                 }
             }
         };
-        let head = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .px(px(7.0))
-                    .h(px(18.0))
-                    .flex()
-                    .items_center()
-                    .rounded(px(6.0))
-                    .bg(rgb(badge_color))
-                    .child(txt(badge, 9.0, theme::page())),
-            )
-            .child(
-                txt(plugin.name.clone(), 13.0, theme::text())
-                    .font_weight(FontWeight::MEDIUM)
-                    .line_height(px(17.0))
-                    .max_h(px(34.0))
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden(),
-            )
-            .when(!plugin.version.is_empty(), |row| {
-                row.child(
-                    div()
-                        .px(px(6.0))
-                        .h(px(18.0))
-                        .flex()
-                        .items_center()
-                        .rounded(px(6.0))
-                        .bg(rgb(theme::new_session_fill()))
-                        .child(txt(
-                            if plugin.version == "latest" {
-                                plugin.version.clone()
-                            } else {
-                                format!("v{}", plugin.version)
-                            },
-                            10.0,
-                            theme::faint(),
-                        )),
-                )
-            });
-        let mut body = div().flex().flex_col().gap(px(4.0)).child(
-            txt(plugin.description.clone(), 12.0, theme::muted())
-                .line_height(px(17.0))
-                .max_h(px(38.0))
-                .overflow_hidden(),
-        );
+        let initial = plugin
+            .name
+            .chars()
+            .find(|character| character.is_alphanumeric())
+            .map(|character| character.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let mut pills = vec![self.plugin_pill(
+            format!("market-badge-{index}"),
+            badge.to_string(),
+            badge_color,
+            None,
+        )];
         if installed {
-            let mut status =
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(self.market_status_pill(
-                        tr(lang, "settings.marketInstalled"),
-                        theme::accent(),
-                        format!("market-status-installed-{index}"),
-                    ));
-            status = if enabled {
-                status.child(self.market_status_pill(
-                    tr(lang, "settings.marketEnabled"),
-                    theme::success(),
-                    format!("market-status-enabled-{index}"),
-                ))
+            pills.push(self.plugin_pill(
+                format!("market-status-installed-{index}"),
+                tr(lang, "settings.marketInstalled"),
+                theme::accent(),
+                None,
+            ));
+            // An installed row is the exception where the state is spelled
+            // out: the switch is at the far right and the reader is comparing
+            // installed packages against installable ones.
+            pills.push(self.plugin_pill(
+                format!(
+                    "market-status-{}-{index}",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                tr(
+                    lang,
+                    if enabled {
+                        "settings.marketEnabled"
+                    } else {
+                        "settings.marketDisabled"
+                    },
+                ),
+                if enabled {
+                    theme::success()
+                } else {
+                    theme::muted()
+                },
+                None,
+            ));
+        }
+        if plugin.refusals > 0 {
+            pills.push(self.plugin_pill(
+                format!("market-status-refused-{index}"),
+                tr_args(
+                    lang,
+                    "settings.marketRefusedShort",
+                    &[("count", plugin.refusals.to_string())],
+                ),
+                theme::warn(),
+                None,
+            ));
+        }
+        let pills = Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .children(pills)
+                .into_any_element(),
+        );
+        let mut meta_parts = Vec::new();
+        if !plugin.version.is_empty() {
+            meta_parts.push(if plugin.version == "latest" {
+                plugin.version.clone()
             } else {
-                status.child(self.market_status_pill(
-                    tr(lang, "settings.marketDisabled"),
-                    theme::border_strong(),
-                    format!("market-status-disabled-{index}"),
-                ))
-            };
-            body = body.child(status);
+                format!("v{}", plugin.version)
+            });
+        }
+        if !plugin.source_label.is_empty() {
+            meta_parts.push(plugin.source_label.clone());
         }
         if !plugin.capabilities.is_empty() {
-            body = body.child(txt(
+            meta_parts.push(
                 plugin
                     .capabilities
                     .iter()
                     .map(|capability| capability.as_str())
                     .collect::<Vec<_>>()
                     .join(" · "),
-                10.0,
-                theme::faint(),
-            ));
-        }
-        if plugin.refusals > 0 {
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(icon(IconName::TriangleAlert, 10.0, theme::warn()))
-                    .child(txt(
-                        tr_args(
-                            lang,
-                            "settings.marketRefused",
-                            &[("count", plugin.refusals.to_string())],
-                        ),
-                        10.0,
-                        theme::warn(),
-                    )),
             );
         }
+        let meta = meta_parts.join(" · ");
         let mut actions = div().flex().flex_row().items_center().gap(px(6.0));
         if installed {
-            let toggle_selector = format!("market-toggle-{index}");
             let toggle_id = plugin.id.clone();
-            actions = actions.child(
-                div()
-                    .id(SharedString::from(toggle_selector.clone()))
-                    .debug_selector(move || toggle_selector.clone())
-                    .h(px(26.0))
-                    .px(px(8.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(5.0))
-                    .rounded(px(999.0))
-                    .bg(rgb(theme::new_session_fill()))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .w(px(22.0))
-                            .h(px(12.0))
-                            .rounded(px(999.0))
-                            .bg(rgb(if enabled {
-                                theme::accent()
-                            } else {
-                                theme::border_strong()
-                            }))
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .w(px(8.0))
-                                    .h(px(8.0))
-                                    .rounded(px(999.0))
-                                    .bg(rgb(theme::page()))
-                                    .ml(px(if enabled { 12.0 } else { 2.0 })),
-                            ),
-                    )
-                    .child(txt(
-                        tr(
-                            lang,
-                            if enabled {
-                                "settings.marketEnabled"
-                            } else {
-                                "settings.marketDisabled"
-                            },
-                        ),
-                        10.0,
-                        theme::muted(),
-                    ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.toggle_market_plugin(&toggle_id, cx);
-                    })),
-            );
+            actions = actions.child(self.switch(
+                format!("market-toggle-{index}"),
+                enabled,
+                true,
+                move |shell, _on, cx| shell.toggle_market_plugin(&toggle_id, cx),
+                cx,
+            ));
             let uninstall_selector = format!("market-uninstall-{index}");
             let uninstall_id = plugin.id.clone();
             actions = actions.child(
@@ -6541,51 +7909,17 @@ impl Shell {
             };
             actions = actions.child(button);
         }
-        div()
-            .id(SharedString::from(format!("market-card-{index}")))
-            .debug_selector(move || format!("market-card-{index}"))
-            .flex_1()
-            .min_w_0()
-            .h(px(210.0))
-            .flex()
-            .flex_col()
-            .justify_between()
-            .gap(px(8.0))
-            .p(px(14.0))
-            .rounded(px(14.0))
-            .border_1()
-            .border_color(rgb(theme::border_soft()))
-            .bg(rgb(theme::page()))
-            .overflow_hidden()
-            .hover(|style| {
-                style
-                    .bg(rgb(theme::hover()))
-                    .border_color(rgb(theme::border()))
-            })
-            .child(div().flex().flex_col().gap(px(6.0)).child(head).child(body))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(4.0))
-                            .child(icon(IconName::Globe, 10.0, theme::faint()))
-                            .child(
-                                txt(plugin.source_label.clone(), 10.0, theme::faint())
-                                    .max_w(px(130.0))
-                                    .overflow_hidden(),
-                            ),
-                    )
-                    .child(actions),
-            )
-            .into_any_element()
+        self.plugin_list_row(PluginListRow {
+            selector: format!("market-card-{index}"),
+            icon: self.plugin_icon(None, Some(initial), badge_color),
+            title: plugin.name.clone(),
+            title_pill: pills,
+            description: plugin.description.clone(),
+            meta,
+            meta_ink: theme::faint(),
+            trailing: actions.into_any_element(),
+        })
+        .into_any_element()
     }
 
     pub(crate) fn toggle_source(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -6596,6 +7930,31 @@ impl Shell {
             }
         }
         self.state.draft_mut().global.set_skill_sources(sources);
+        // An executor directory is concrete configuration, not a preference
+        // waiting for Save: the same restart that loses a skill would lose the
+        // directory that holds it. Only this directory's flag is written.
+        self.write_skill_state(cx, SkillWrite::Source(name.to_string()));
+    }
+
+    /// Flip one skill's switch and write it immediately.
+    ///
+    /// The switch is the WHOLE interaction here - there is no Apply beside it
+    /// and no sentence telling the reader to Save - so the decision has to
+    /// survive a restart on its own. Toggling the same skill again removes it
+    /// from the list and rewrites the file, which is what makes a second press
+    /// an undo rather than another draft change.
+    pub(crate) fn toggle_skill(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.state.toggle_skill_off(name);
+        self.write_skill_state(cx, SkillWrite::Disabled);
+    }
+
+    /// Write one skills fact and surface a refused write in the pane.
+    fn write_skill_state(&mut self, cx: &mut Context<Self>, what: SkillWrite) {
+        let outcome = match what {
+            SkillWrite::Disabled => self.state.persist_disabled_skills(),
+            SkillWrite::Source(name) => self.state.persist_skill_source_enabled(&name),
+        };
+        self.skills_save_error = outcome.err().map(|error| error.to_string());
         cx.notify();
     }
 
@@ -6654,57 +8013,144 @@ impl Shell {
     /// and what is on" question is answered, and its tab strip is this strip, so
     /// Skills is the third REAL tab beside Plugin list and MCP.
     ///
-    /// Shape, top to bottom: the measured hint line, the two controls (browse
-    /// all, executor dirs), then one card per SOURCE - a coloured initial, the
-    /// executor name, the skill count and the path. Both controls are
-    /// disclosures over that grid, so the grid is what the pane always shows.
+    /// Shape, top to bottom: the shared search row, the All / Enabled /
+    /// Disabled filter under it, the two disclosure rows (browse all, executor
+    /// dirs), then one 56px row per SOURCE - a coloured initial, the executor
+    /// name, its state pill, the path and the count. The same row shape carries
+    /// the browse-all list and the dir manager, so the whole tab reads as one
+    /// list instead of cards above a table.
+    ///
+    /// The state filter narrows the BROWSE list only. A source row stands for a
+    /// directory, and "is this skill on" says nothing about a directory that
+    /// holds a dozen of them, so filtering the sources by it would hide a
+    /// directory because one skill inside it is off. The search still narrows
+    /// both, which is the axis the two lists share.
     fn skills_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let lang = self.state.lang;
-        let sources = self.state.draft().global.skill_sources();
         // The catalogue is DISCOVERED against the draft, so a toggle the reader
         // has not saved yet already changes the counts they see. Building it here
         // rather than reading a cached list is what keeps the pane and the agent
         // from disagreeing about what "on" means.
-        // The scan runs against the DRAFT through the one resolution the build
-        // uses, so the counts on the cards, the list under Browse all, and the
-        // skills the agent receives are three readings of a single fact. A second
-        // scan here would be a second answer waiting to disagree.
         let effective = self.state.draft().effective();
         let resolved = effective.skill_sources.clone();
         let skills = effective.skills.clone();
-        let _ = &sources;
+        let query = self.skill_query.trim().to_string();
+        let counts = skill_filter_counts(&skills, &query);
         let mut rows: Vec<AnyElement> = Vec::new();
 
+        // A switch writes immediately, so a refused write must be visible in
+        // the pane that offered it: the row would otherwise read "off" while
+        // the file still said "on", which is the bug this persistence closes.
+        if let Some(error) = &self.skills_save_error {
+            rows.push(
+                div()
+                    .debug_selector(|| "skills-save-error".to_string())
+                    .child(self.market_banner(tr_args(
+                        lang,
+                        "settings.skillsSaveError",
+                        &[("error", error.clone())],
+                    )))
+                    .into_any_element(),
+            );
+        }
+        // The same search row the Plugin list and MCP tabs open with; it filters
+        // the source rows and the browse-all list alike.
         rows.push(
-            txt(tr(lang, "settings.skillsPick"), 12.0, theme::faint())
-                .pb(px(10.0))
+            self.plugins_search_box(&self.skill_search)
+                .mb(px(10.0))
                 .into_any_element(),
         );
+        // The state filter sits directly under the search it composes with, and
+        // its counts are read from the same catalogue the list is drawn from -
+        // so a toggle, a keystroke and the numbers move in one frame.
+        rows.push(self.skills_filter(counts, cx));
         rows.push(self.skills_controls(&resolved, skills.len(), cx));
 
         if self.skills_browse_open {
-            rows.extend(self.skills_browse(&skills, cx));
+            rows.extend(self.skills_browse(&skills, &query, cx));
         }
         if self.skills_dirs_open {
             rows.extend(self.skills_dirs(&resolved, cx));
         } else {
-            // The grid is the pane's resting state: one card per executor
-            // directory, two to a row, exactly as the reference draws its own.
-            for pair in resolved.chunks(2) {
-                let mut row = div().flex().flex_row().gap(px(8.0)).pb(px(8.0));
-                for source in pair {
-                    row = row.child(self.skill_source_card(source, cx));
-                }
-                if pair.len() == 1 {
-                    row = row.child(div().flex_1());
-                }
-                rows.push(row.into_any_element());
+            let listed: Vec<&crate::settings::resolve::ResolvedSource> = resolved
+                .iter()
+                .filter(|source| {
+                    query.is_empty()
+                        || crate::state::matches(&query, &source.name)
+                        || crate::state::matches(&query, &source.path)
+                })
+                .collect();
+            if listed.is_empty() {
+                rows.push(
+                    txt(tr(lang, "settings.skillsNone"), 12.0, theme::faint())
+                        .pb(px(10.0))
+                        .into_any_element(),
+                );
+            } else {
+                rows.push(
+                    self.plugins_section_header("skills-sources-header", "settings.skillsSources"),
+                );
+            }
+            for source in listed {
+                rows.push(self.skill_source_row(source, cx));
             }
         }
         rows
     }
 
-    /// The two controls above the grid: browse all, and executor dirs.
+    /// The All / Enabled / Disabled filter under the search field.
+    ///
+    /// A segmented control in the pane's own language - the same 28px cells the
+    /// MCP transport choice draws: no card, no border, the accent fill for the
+    /// chosen one - because the filter is one view of one list, not a second
+    /// surface. Each cell carries its count; those counts are computed from the
+    /// CURRENT search, so typing narrows them in the same frame it narrows the
+    /// list, and they ignore which segment is chosen so the other two stay
+    /// readable while one is pressed.
+    fn skills_filter(&self, counts: [usize; 3], cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let mut segments = div()
+            .debug_selector(|| String::from("skills-filter"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .mb(px(12.0));
+        for (filter, count) in [
+            (SkillFilter::All, counts[0]),
+            (SkillFilter::Enabled, counts[1]),
+            (SkillFilter::Disabled, counts[2]),
+        ] {
+            let selected = self.skill_filter == filter;
+            let ink = if selected {
+                theme::page()
+            } else {
+                theme::text()
+            };
+            let count_ink = if selected {
+                theme::page()
+            } else {
+                theme::faint()
+            };
+            // The count rides in the debug selector so a test can assert the
+            // NUMBER the frame drew, not only the number the model computed.
+            let count_selector = format!("{}-count-{count}", filter.id());
+            segments = segments.child(
+                Self::segment_cell(filter.id(), selected, cx, move |shell| {
+                    shell.skill_filter = filter;
+                })
+                .child(txt(tr(lang, filter.label_key()), 12.0, ink))
+                .child(
+                    txt(count.to_string(), 11.0, count_ink)
+                        .debug_selector(move || count_selector.clone()),
+                ),
+            );
+        }
+        segments.into_any_element()
+    }
+
+    /// The two disclosure rows above the list, drawn exactly like the plugin
+    /// rows they sit beside: icon, title, description and a chevron.
     fn skills_controls(
         &self,
         sources: &[crate::settings::resolve::ResolvedSource],
@@ -6714,10 +8160,9 @@ impl Shell {
         let lang = self.state.lang;
         div()
             .flex()
-            .flex_row()
-            .items_center()
+            .flex_col()
             .gap(px(8.0))
-            .pb(px(12.0))
+            .mb(px(8.0))
             .child(self.skills_control(
                 "skills-browse",
                 tr_args(
@@ -6725,6 +8170,7 @@ impl Shell {
                     "settings.skillsBrowseAll",
                     &[("count", total.to_string())],
                 ),
+                tr(lang, "settings.skillsPick"),
                 self.skills_browse_open,
                 SkillsControl::Browse,
                 cx,
@@ -6736,6 +8182,7 @@ impl Shell {
                     "settings.skillsExecutorDirs",
                     &[("count", sources.len().to_string())],
                 ),
+                tr(lang, "settings.skillsDirsHint"),
                 self.skills_dirs_open,
                 SkillsControl::Dirs,
                 cx,
@@ -6743,63 +8190,73 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One of the pane's two disclosure controls.
+    /// One of the pane's two disclosure rows.
     fn skills_control(
         &self,
         id: &'static str,
         label: String,
+        description: String,
         open: bool,
         which: SkillsControl,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        hairline_all(
-            div()
-                .id(SharedString::from(id))
-                .debug_selector(move || id.to_string())
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .h(px(30.0))
-                .px(px(10.0))
-                .rounded(px(8.0))
-                .bg(rgb(if open {
-                    theme::new_session_fill()
+        self.plugin_list_row(PluginListRow {
+            selector: id.to_string(),
+            icon: self.plugin_icon(
+                Some(match which {
+                    SkillsControl::Browse => IconName::BookOpen,
+                    SkillsControl::Dirs => IconName::Folder,
+                }),
+                None,
+                if open {
+                    theme::accent()
                 } else {
-                    theme::page()
-                }))
-                .border_color(rgb(theme::border()))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::hover())))
-                .child(icon(
-                    if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    },
-                    12.0,
-                    theme::muted(),
-                ))
-                .child(txt(label, 12.0, theme::text()))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    match which {
-                        SkillsControl::Browse => {
-                            this.skills_browse_open = !this.skills_browse_open;
-                        }
-                        SkillsControl::Dirs => this.skills_dirs_open = !this.skills_dirs_open,
-                    }
-                    cx.notify();
-                })),
-        )
+                    theme::muted()
+                },
+            ),
+            title: label,
+            title_pill: None,
+            description,
+            meta: String::new(),
+            meta_ink: theme::faint(),
+            trailing: icon(
+                if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                },
+                14.0,
+                theme::muted(),
+            )
+            .into_any_element(),
+        })
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            match which {
+                SkillsControl::Browse => {
+                    this.skills_browse_open = !this.skills_browse_open;
+                }
+                SkillsControl::Dirs => this.skills_dirs_open = !this.skills_dirs_open,
+            }
+            cx.notify();
+        }))
         .into_any_element()
     }
 
-    /// One source card: a coloured initial, the name, the count and the path.
-    ///
-    /// The initial's colour is derived from the name, so the six executor cards
-    /// are visually distinct without a second table to keep in step - the same
-    /// trick the reference's own avatar marks use.
-    fn skill_source_card(
+    /// "1 skill" / "26 skills", the count label every skills row shares.
+    fn skill_count_label(&self, count: usize) -> String {
+        let key = if count == 1 {
+            "settings.skillsCountOne"
+        } else {
+            "settings.skillsCount"
+        };
+        tr_args(self.state.lang, key, &[("count", count.to_string())])
+    }
+
+    /// One skill source as a 56px list row: tinted initial, name, state pill,
+    /// path, contributed count and the switch. Pressing anywhere on the row
+    /// toggles the same draft flag the switch does.
+    fn skill_source_row(
         &self,
         source: &crate::settings::resolve::ResolvedSource,
         cx: &mut Context<Self>,
@@ -6811,181 +8268,150 @@ impl Shell {
             .next()
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_default();
-        let card_id = format!("skills-source-{}", source.name);
-        let selector = card_id.clone();
-        let toggle_name = source.name.clone();
         let on = source.enabled;
-        div()
-            .id(SharedString::from(card_id))
-            .debug_selector(move || selector.clone())
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .p(px(10.0))
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(rgb(theme::border()))
-            .bg(rgb(theme::page()))
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(theme::hover())))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .flex_none()
-                            .rounded(px(6.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(source_tint(&source.name)))
-                            .child(txt(initial, 11.0, theme::page())),
-                    )
-                    .child(
-                        txt(source.name.clone(), 13.0, theme::text())
-                            .flex_1()
-                            .min_w_0(),
-                    )
-                    .child(txt(
-                        tr_args(
-                            lang,
-                            "settings.skillsCount",
-                            &[("count", source.count.to_string())],
-                        ),
-                        12.0,
-                        theme::faint(),
-                    ))
-                    .child(
-                        div()
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .flex_none()
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(rgb(if on {
-                                theme::accent()
-                            } else {
-                                theme::border_strong()
-                            }))
-                            .bg(rgb(if on { theme::accent() } else { theme::page() }))
-                            .when(on, |boxed| {
-                                boxed.child(icon(IconName::Check, 10.0, theme::page()))
-                            }),
-                    ),
-            )
-            .child(
-                txt(source.path.clone(), 12.0, theme::muted())
-                    .line_height(px(17.0))
-                    .overflow_hidden(),
-            )
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.toggle_source(&toggle_name, cx);
-            }))
-            .into_any_element()
+        let missing = !source.exists;
+        // A normal row is quiet: the switch already says on. Only the two
+        // EXCEPTIONAL states get a pill, so six healthy sources do not repeat
+        // "Enabled" six times.
+        let mut pills = Vec::new();
+        if missing {
+            pills.push(self.plugin_pill(
+                format!("skills-source-missing-{}", source.name),
+                tr(lang, "settings.skillsMissing"),
+                theme::warn(),
+                None,
+            ));
+        }
+        if !on {
+            pills.push(self.plugin_pill(
+                format!("skills-source-state-{}", source.name),
+                tr(lang, "settings.pluginDisabled"),
+                theme::muted(),
+                None,
+            ));
+        }
+        let pill = (!pills.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .children(pills)
+                .into_any_element()
+        });
+        let toggle_name = source.name.clone();
+        let toggle = self.switch(
+            format!("skills-source-toggle-{}", source.name),
+            on,
+            true,
+            move |shell, _on, cx| shell.toggle_source(&toggle_name, cx),
+            cx,
+        );
+        let row_name = source.name.clone();
+        self.plugin_list_row(PluginListRow {
+            selector: format!("skills-source-{}", source.name),
+            icon: self.plugin_icon(None, Some(initial), source_tint(&source.name)),
+            title: source.name.clone(),
+            title_pill: pill,
+            description: source.path.clone(),
+            meta: if missing {
+                tr(lang, "settings.skillsMissing")
+            } else {
+                self.skill_count_label(source.count)
+            },
+            meta_ink: if missing {
+                theme::warn()
+            } else {
+                theme::faint()
+            },
+            trailing: toggle,
+        })
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.toggle_source(&row_name, cx);
+        }))
+        .into_any_element()
     }
 
-    /// The browse-all disclosure: every discovered skill, its source, and its
-    /// own switch.
+    /// The browse-all disclosure: every discovered skill the search and the
+    /// state filter keep, as the same 56px row. The top-level search field and
+    /// the segment above it both narrow this list, so there is no second search
+    /// box inside the disclosure.
+    ///
+    /// The rows are keyed by NAME rather than position: an id that moved when a
+    /// filter hid a row would point the next press at a different skill.
     fn skills_browse(
         &mut self,
-        skills: &[crate::settings::resolve::DiscoveredSkill],
+        skills: &[DiscoveredSkill],
+        query: &str,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let lang = self.state.lang;
-        let query = self.skill_query.clone();
-        let mut rows: Vec<AnyElement> = vec![div()
-            .mb(px(10.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .h(px(30.0))
-            .px(px(10.0))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(rgb(theme::border()))
-            .child(icon(IconName::Search, 13.0, theme::faint()))
-            .child(Input::new(&self.skill_search).appearance(false))
-            .into_any_element()];
-        let listed: Vec<&crate::settings::resolve::DiscoveredSkill> = skills
-            .iter()
-            .filter(|skill| {
-                query.is_empty()
-                    || crate::state::matches(&query, &skill.name)
-                    || crate::state::matches(&query, &skill.source)
-            })
-            .collect();
+        let filter = self.skill_filter;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let listed = browse_skills(skills, query, filter);
         if listed.is_empty() {
+            // Distinguish an empty catalogue from a filter that hid everything:
+            // "no skills in the enabled directories" would be a lie while a
+            // switched-off skill sits one segment away.
+            let key = if skills.is_empty() {
+                "settings.skillsNone"
+            } else {
+                "settings.skillsNoMatch"
+            };
             rows.push(
-                txt(tr(lang, "settings.skillsNone"), 12.0, theme::faint())
-                    .pb(px(10.0))
+                txt(tr(lang, key), 12.0, theme::faint())
+                    .mb(px(8.0))
                     .into_any_element(),
             );
         }
-        for (index, skill) in listed.iter().enumerate() {
-            let name = skill.name.clone();
+        for skill in listed {
             let on = skill.enabled;
-            let row_id = format!("skills-browse-{index}");
-            let selector = row_id.clone();
+            let toggle_name = skill.name.clone();
+            let toggle = self.switch(
+                format!("skills-browse-toggle-{}", skill.name),
+                on,
+                true,
+                move |shell, _on, cx| shell.toggle_skill(&toggle_name, cx),
+                cx,
+            );
+            let row_name = skill.name.clone();
+            let source_pill = self.plugin_pill(
+                format!("skills-browse-source-{}", skill.name),
+                skill.source.clone(),
+                theme::muted(),
+                None,
+            );
+            let initial = skill
+                .source
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_default();
             rows.push(
-                div()
-                    .id(SharedString::from(row_id))
-                    .debug_selector(move || selector.clone())
-                    .py(px(8.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .border_b_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(
-                        div()
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .flex_none()
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(rgb(if on {
-                                theme::accent()
-                            } else {
-                                theme::border_strong()
-                            }))
-                            .bg(rgb(if on { theme::accent() } else { theme::page() }))
-                            .when(on, |boxed| {
-                                boxed.child(icon(IconName::Check, 10.0, theme::page()))
-                            }),
-                    )
-                    .child(txt(name.clone(), 13.0, theme::text()).w(px(160.0)))
-                    .child(
-                        div()
-                            .px(px(6.0))
-                            .py(px(1.0))
-                            .rounded(px(4.0))
-                            .bg(rgb(theme::new_session_fill()))
-                            .child(txt(skill.source.clone(), 11.0, theme::muted())),
-                    )
-                    .child(txt(skill.description.clone(), 12.0, theme::faint()).flex_1())
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.toggle_skill_off(&name);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
+                self.plugin_list_row(PluginListRow {
+                    selector: format!("skills-browse-{}", skill.name),
+                    icon: self.plugin_icon(None, Some(initial), source_tint(&skill.source)),
+                    title: skill.name.clone(),
+                    title_pill: Some(source_pill),
+                    description: skill.description.clone(),
+                    meta: String::new(),
+                    meta_ink: theme::faint(),
+                    trailing: toggle,
+                })
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.toggle_skill(&row_name, cx);
+                }))
+                .into_any_element(),
             );
         }
         rows
     }
 
-    /// The executor-dirs disclosure: every source, its switch, a remove control
-    /// and the add form.
+    /// The executor-dirs disclosure: the same row shape as the source list,
+    /// with the switch and the remove control at the far right, then the add
+    /// action and its form.
     fn skills_dirs(
         &mut self,
         sources: &[crate::settings::resolve::ResolvedSource],
@@ -6994,113 +8420,90 @@ impl Shell {
         let lang = self.state.lang;
         let mut rows: Vec<AnyElement> = Vec::new();
         for (index, source) in sources.iter().enumerate() {
-            let name = source.name.clone();
             let on = source.enabled;
             let missing = !source.exists;
-            let row_id = format!("skills-dir-{index}");
-            let selector = row_id.clone();
-            let remove_name = name.clone();
+            let toggle_name = source.name.clone();
+            let toggle = self.switch(
+                format!("skills-dir-toggle-{index}"),
+                on,
+                true,
+                move |shell, _on, cx| shell.toggle_source(&toggle_name, cx),
+                cx,
+            );
+            let remove_name = source.name.clone();
+            let remove = div()
+                .id(SharedString::from(format!("skills-dir-remove-{index}")))
+                .debug_selector(move || format!("skills-dir-remove-{index}"))
+                .h(px(24.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::hover())))
+                .child(txt(tr(lang, "settings.skillsRemove"), 11.0, theme::muted()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.remove_source(&remove_name, cx);
+                }));
+            let trailing = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .child(toggle)
+                .child(remove)
+                .into_any_element();
+            let initial = source
+                .name
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_default();
+            let pill = missing.then(|| {
+                self.plugin_pill(
+                    format!("skills-dir-missing-{index}"),
+                    tr(lang, "settings.skillsMissing"),
+                    theme::warn(),
+                    None,
+                )
+            });
             rows.push(
-                div()
-                    .id(SharedString::from(row_id))
-                    .debug_selector(move || selector.clone())
-                    .py(px(8.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .border_b_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("skills-dir-toggle-{index}")))
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .flex_none()
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(rgb(if on {
-                                theme::accent()
-                            } else {
-                                theme::border_strong()
-                            }))
-                            .bg(rgb(if on { theme::accent() } else { theme::page() }))
-                            .cursor_pointer()
-                            .when(on, |boxed| {
-                                boxed.child(icon(IconName::Check, 10.0, theme::page()))
-                            })
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.toggle_source(&name, cx);
-                            })),
-                    )
-                    .child(txt(source.name.clone(), 13.0, theme::text()).w(px(120.0)))
-                    .child(txt(source.path.clone(), 12.0, theme::faint()).flex_1())
-                    .child(
-                        // A directory that is not there says so rather than
-                        // showing a silent zero: the reader can then fix the path
-                        // instead of wondering why the card is empty.
-                        txt(
-                            if missing {
-                                tr(lang, "settings.skillsMissing")
-                            } else {
-                                tr_args(
-                                    lang,
-                                    "settings.skillsCount",
-                                    &[("count", source.count.to_string())],
-                                )
-                            },
-                            11.0,
-                            if missing {
-                                theme::warn()
-                            } else {
-                                theme::faint()
-                            },
-                        )
-                        .w(px(60.0)),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("skills-dir-remove-{index}")))
-                            .debug_selector(move || format!("skills-dir-remove-{index}"))
-                            .px(px(8.0))
-                            .py(px(2.0))
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(theme::hover())))
-                            .child(txt(tr(lang, "settings.skillsRemove"), 11.0, theme::muted()))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.remove_source(&remove_name, cx);
-                            })),
-                    )
-                    .into_any_element(),
+                self.plugin_list_row(PluginListRow {
+                    selector: format!("skills-dir-{index}"),
+                    icon: self.plugin_icon(None, Some(initial), source_tint(&source.name)),
+                    title: source.name.clone(),
+                    title_pill: pill,
+                    description: source.path.clone(),
+                    meta: self.skill_count_label(source.count),
+                    meta_ink: theme::faint(),
+                    trailing,
+                })
+                .into_any_element(),
             );
         }
         rows.push(
-            hairline_all(
-                div()
-                    .id("skills-add-toggle")
-                    .debug_selector(|| "skills-add-toggle".to_string())
-                    .mt(px(10.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .self_start()
-                    .gap(px(4.0))
-                    .h(px(28.0))
-                    .px(px(10.0))
-                    .rounded(px(8.0))
-                    .bg(rgb(theme::page()))
-                    .border_color(rgb(theme::border()))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(icon(IconName::Plus, 13.0, theme::text()))
-                    .child(txt(tr(lang, "settings.skillsAdd"), 12.0, theme::text()))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.skill_add_open = !this.skill_add_open;
-                        cx.notify();
-                    })),
-            )
-            .into_any_element(),
+            div()
+                .id("skills-add-toggle")
+                .debug_selector(|| "skills-add-toggle".to_string())
+                .mt(px(10.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .self_start()
+                .gap(px(6.0))
+                .h(px(30.0))
+                .px(px(12.0))
+                .rounded(px(999.0))
+                .bg(rgb(theme::new_session_fill()))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::hover())))
+                .child(icon(IconName::Plus, 13.0, theme::text()))
+                .child(txt(tr(lang, "settings.skillsAdd"), 12.0, theme::text()))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.skill_add_open = !this.skill_add_open;
+                    cx.notify();
+                }))
+                .into_any_element(),
         );
         if self.skill_add_open {
             rows.push(self.skills_add_form(cx));
@@ -7111,43 +8514,40 @@ impl Shell {
     /// The add-custom-dir form: a path and a name, then the write.
     fn skills_add_form(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
-        hairline_all(
-            div()
-                .mt(px(8.0))
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .p(px(10.0))
-                .rounded(px(8.0))
-                .bg(rgb(theme::page()))
-                .border_color(rgb(theme::border()))
-                .child(self.skills_field(
-                    "skills-add-path",
-                    tr(lang, "settings.skillsPath"),
-                    &self.skill_add_path,
-                ))
-                .child(self.skills_field(
-                    "skills-add-name",
-                    tr(lang, "settings.skillsName"),
-                    &self.skill_add_name,
-                ))
-                .child(
-                    div()
-                        .id("skills-add-save")
-                        .debug_selector(|| "skills-add-save".to_string())
-                        .self_start()
-                        .px(px(12.0))
-                        .py(px(4.0))
-                        .rounded(px(6.0))
-                        .bg(rgb(theme::accent()))
-                        .cursor_pointer()
-                        .child(txt(tr(lang, "settings.skillsAddSave"), 12.0, theme::page()))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.add_source(cx);
-                        })),
-                ),
-        )
-        .into_any_element()
+        div()
+            .mt(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .p(px(12.0))
+            .rounded(px(12.0))
+            .bg(rgb(theme::new_session_fill()))
+            .child(self.skills_field(
+                "skills-add-path",
+                tr(lang, "settings.skillsPath"),
+                &self.skill_add_path,
+            ))
+            .child(self.skills_field(
+                "skills-add-name",
+                tr(lang, "settings.skillsName"),
+                &self.skill_add_name,
+            ))
+            .child(
+                div()
+                    .id("skills-add-save")
+                    .debug_selector(|| "skills-add-save".to_string())
+                    .self_start()
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .rounded(px(6.0))
+                    .bg(rgb(theme::accent()))
+                    .cursor_pointer()
+                    .child(txt(tr(lang, "settings.skillsAddSave"), 12.0, theme::page()))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.add_source(cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     /// One labelled field of the add form.
@@ -7228,6 +8628,11 @@ impl Shell {
                         // selecting it keeps the dialog on Extensions.
                         if let Some(index) = pane {
                             this.state.settings_section = index;
+                        }
+                        // The Skills state filter belongs to this visit, not to
+                        // the store: reopening the tab starts from All.
+                        if tab == 2 {
+                            this.skill_filter = SkillFilter::All;
                         }
                         // The market walks local package directories, so it is
                         // read when the tab is first opened, never per frame.
@@ -7436,6 +8841,39 @@ impl Shell {
         cx.notify();
     }
 
+    /// One cell of the app's segmented control.
+    ///
+    /// One definition for both segmented controls the settings dialog draws -
+    /// the MCP transport/scope choice and the Skills state filter - so they
+    /// cannot drift into two heights or two fills. 28 tall, 10px inline padding,
+    /// radius 6, filled with the accent while chosen and the hover wash
+    /// otherwise. The caller adds the cell's content, because a label with a
+    /// trailing count is still one choice.
+    fn segment_cell(
+        id: &'static str,
+        selected: bool,
+        cx: &mut Context<Shell>,
+        run: impl Fn(&mut Shell) + 'static,
+    ) -> Stateful<Div> {
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_string())
+            .h(px(28.0))
+            .px(px(10.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .cursor_pointer()
+            .rounded(px(6.0))
+            .when(selected, |cell| cell.bg(rgb(theme::accent())))
+            .when(!selected, |cell| cell.bg(rgb(theme::hover())))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                run(this);
+                cx.notify();
+            }))
+    }
+
     /// One segmented transport/scope choice.
     fn mcp_segment(
         &self,
@@ -7445,17 +8883,7 @@ impl Shell {
         cx: &mut Context<Self>,
         run: impl Fn(&mut Shell) + 'static,
     ) -> AnyElement {
-        div()
-            .id(SharedString::from(id))
-            .debug_selector(move || id.to_string())
-            .h(px(28.0))
-            .px(px(10.0))
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .rounded(px(6.0))
-            .when(selected, |cell| cell.bg(rgb(theme::accent())))
-            .when(!selected, |cell| cell.bg(rgb(theme::hover())))
+        Self::segment_cell(id, selected, cx, run)
             .child(txt(
                 label,
                 12.0,
@@ -7465,15 +8893,15 @@ impl Shell {
                     theme::text()
                 },
             ))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                run(this);
-                cx.notify();
-            }))
             .into_any_element()
     }
 
-    /// One MCP server card: identity, transport, the live connection state and
-    /// the four actions the document supports.
+    /// One MCP server as a 56px list row, the same row the Plugin list draws:
+    /// tinted transport square, name, scope pill, transport summary, the live
+    /// status in its own colour and the enable switch at the far right.
+    ///
+    /// Pressing the row opens the disclosure with the exact tool names and the
+    /// Edit/Delete actions, so the resting list stays one line per server.
     fn mcp_row(&self, index: usize, server: &McpServer, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let name = server.name.clone();
@@ -7485,152 +8913,190 @@ impl Shell {
                 && committed.signature() == server.signature()
                 && committed.enabled == server.enabled
         });
-        let (status, ink) = if !server.enabled {
-            (lang.tr("settings.mcpDisabled"), theme::faint())
+        // The row carries a SHORT status pill beside the name; the full reason
+        // lives in the disclosure. A long error in the row's meta truncated
+        // itself under the switch in the live pane, which made a failed server
+        // unreadable rather than urgent.
+        let scope_label = lang.tr(scope.label_key());
+        let failure = self.state.mcp.error(&server.name).map(str::to_string);
+        let (status_key, ink, meta) = if !server.enabled {
+            ("settings.mcpStatusOff", theme::faint(), scope_label)
         } else if pending {
-            (lang.tr("settings.mcpSaveToConnect"), theme::warn())
-        } else if let Some(error) = self.state.mcp.error(&server.name) {
-            (
-                format!("{} · {error}", lang.tr("settings.mcpFailed")),
-                theme::error(),
-            )
+            ("settings.mcpStatusPending", theme::warn(), scope_label)
+        } else if failure.is_some() {
+            ("settings.mcpStatusFailed", theme::error(), scope_label)
         } else if let Some(count) = self.state.mcp.tool_count(&server.name) {
             let key = if count == 1 {
-                "settings.mcpConnectedOne"
+                "settings.mcpToolCountOne"
             } else {
-                "settings.mcpConnected"
+                "settings.mcpToolCount"
             };
             (
-                crate::i18n::tr_args(lang, key, &[("count", count.to_string())]),
+                "settings.mcpStatusConnected",
                 theme::success(),
+                format!(
+                    "{scope_label} · {}",
+                    crate::i18n::tr_args(lang, key, &[("count", count.to_string())])
+                ),
             )
         } else {
-            (lang.tr("settings.mcpNotConnected"), theme::faint())
+            ("settings.mcpStatusIdle", theme::faint(), scope_label)
         };
-        // The exact names the model can call, not only a count: this is what
-        // makes "it is connected" checkable against the next request.
-        let tools = if server.enabled {
-            self.state.mcp.tool_names(&server.name)
-        } else {
-            None
-        };
-        let edit = {
-            let name = name.clone();
-            div()
-                .id(SharedString::from(format!("mcp-edit-{index}")))
-                .debug_selector(move || format!("mcp-edit-{index}"))
-                .cursor_pointer()
-                .child(txt(lang.tr("settings.mcpEdit"), 12.0, theme::muted()))
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.mcp_begin_edit(scope, &name, window, cx);
-                }))
-        };
-        let remove = {
-            let name = name.clone();
-            div()
-                .id(SharedString::from(format!("mcp-remove-{index}")))
-                .debug_selector(move || format!("mcp-remove-{index}"))
-                .cursor_pointer()
-                .child(txt(lang.tr("settings.mcpDelete"), 12.0, theme::muted()))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.mcp_remove(scope, &name, cx);
-                }))
-        };
-        let toggle = {
-            let name = name.clone();
-            let key = if server.enabled {
-                "settings.mcpDisable"
-            } else {
-                "settings.mcpEnable"
-            };
-            div()
-                .id(SharedString::from(format!("mcp-toggle-{index}")))
-                .debug_selector(move || format!("mcp-toggle-{index}"))
-                .cursor_pointer()
-                .child(txt(lang.tr(key), 12.0, theme::muted()))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.mcp_toggle(scope, &name, cx);
-                }))
-        };
-        let head = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                txt(name, 13.0, theme::text())
-                    .font_weight(FontWeight::MEDIUM)
-                    .flex_1()
-                    .min_w_0(),
-            )
-            .child(
-                div()
-                    .px(px(6.0))
-                    .h(px(18.0))
-                    .flex()
-                    .items_center()
-                    .rounded(px(4.0))
-                    .bg(rgb(theme::hover()))
-                    .child(txt(lang.tr(scope.label_key()), 10.0, theme::muted())),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(edit)
-                    .child(remove)
-                    .child(toggle),
-            );
-        let card = hairline_all(
-            div()
-                .debug_selector(move || format!("mcp-row-{index}"))
-                .p(px(12.0))
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .bg(rgb(theme::page()))
-                .border_color(rgb(theme::border())),
-        )
-        .child(head)
-        .child(
-            txt(server.transport_summary(), 12.0, theme::muted())
-                .min_w_0()
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap(),
-        )
-        .child(
-            txt(status, 12.0, ink)
-                .min_w_0()
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap(),
+        let status = self.plugin_pill(
+            format!("mcp-status-{index}"),
+            lang.tr(status_key),
+            ink,
+            None,
         );
-        let mut card = card;
-        if let Some(tools) = tools {
-            if tools.is_empty() {
-                card = card.child(txt(lang.tr("settings.mcpNoTools"), 11.0, theme::faint()));
-            } else {
-                card = card.child(txt(lang.tr("settings.mcpTools"), 11.0, theme::faint()));
-                let mut grid = div().flex().flex_row().flex_wrap().gap(px(4.0));
-                for tool in tools {
-                    grid = grid.child(
-                        div()
-                            .h(px(18.0))
-                            .px(px(6.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(4.0))
-                            .bg(rgb(theme::hover()))
-                            .child(txt(tool, 11.0, theme::text()).font_family(theme::CODE_FONT)),
-                    );
+        let (glyph, tint) = match &server.transport {
+            McpTransport::Stdio { .. } => (IconName::SquareTerminal, theme::accent()),
+            McpTransport::Http { .. } => (IconName::Globe, theme::success()),
+        };
+        let toggle_name = name.clone();
+        let toggle = self.switch(
+            format!("mcp-toggle-{index}"),
+            server.enabled,
+            true,
+            move |shell, _on, cx| shell.mcp_toggle(scope, &toggle_name, cx),
+            cx,
+        );
+        let open = self.mcp_open.as_deref() == Some(name.as_str());
+        let key = name.clone();
+        let row = self
+            .plugin_list_row(PluginListRow {
+                selector: format!("mcp-row-{index}"),
+                icon: self.plugin_icon(Some(glyph), None, tint),
+                title: name.clone(),
+                title_pill: Some(status),
+                // A failed row leads with WHY, not with its launch line: the
+                // transport is still in the disclosure when it is needed.
+                description: failure.unwrap_or_else(|| server.transport_summary()),
+                meta,
+                meta_ink: theme::faint(),
+                trailing: toggle,
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if this.mcp_open.as_deref() == Some(key.as_str()) {
+                    this.mcp_open = None;
+                } else {
+                    this.mcp_open = Some(key.clone());
                 }
-                card = card.child(grid);
+                cx.notify();
+            }));
+        let mut block = div().flex().flex_col().mb(px(8.0)).child(row);
+        if open {
+            block = block.child(self.mcp_detail(index, server, cx));
+        }
+        block.into_any_element()
+    }
+
+    /// The disclosure under an MCP row: identity, the exact tools the model can
+    /// call, and the two destructive edits kept out of the resting row.
+    fn mcp_detail(&self, index: usize, server: &McpServer, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let name = server.name.clone();
+        let scope = server.scope;
+        let mut lines = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .p(px(10.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::new_session_fill()));
+        let status = if !server.enabled {
+            lang.tr("settings.mcpStatusOff")
+        } else if self.state.mcp.error(&server.name).is_some() {
+            lang.tr("settings.mcpStatusFailed")
+        } else if self.state.mcp.tool_count(&server.name).is_some() {
+            lang.tr("settings.mcpStatusConnected")
+        } else {
+            lang.tr("settings.mcpStatusIdle")
+        };
+        lines = lines
+            .child(self.settings_detail_line("settings.mcpName", server.name.clone()))
+            .child(self.settings_detail_line("settings.mcpTransport", server.transport_summary()))
+            .child(self.settings_detail_line("settings.mcpScope", lang.tr(scope.label_key())))
+            .child(self.settings_detail_line("settings.mcpStatus", status));
+        if let Some(error) = self.state.mcp.error(&server.name) {
+            lines = lines.child(
+                div()
+                    .debug_selector(|| format!("mcp-error-{index}"))
+                    .child(txt(error.to_string(), 11.0, theme::error()).line_height(px(15.0))),
+            );
+        }
+        if server.enabled {
+            match self.state.mcp.tool_names(&server.name) {
+                Some(tools) if tools.is_empty() => {
+                    lines = lines.child(txt(lang.tr("settings.mcpNoTools"), 11.0, theme::faint()));
+                }
+                Some(tools) => {
+                    lines = lines.child(txt(lang.tr("settings.mcpTools"), 11.0, theme::faint()));
+                    let mut grid = div().flex().flex_row().flex_wrap().gap(px(4.0));
+                    for tool in tools {
+                        grid = grid.child(
+                            div()
+                                .h(px(18.0))
+                                .px(px(6.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.0))
+                                .bg(rgb(theme::hover()))
+                                .child(
+                                    txt(tool, 11.0, theme::text()).font_family(theme::CODE_FONT),
+                                ),
+                        );
+                    }
+                    lines = lines.child(grid);
+                }
+                None => {}
             }
         }
-        card.into_any_element()
+        let edit_name = name.clone();
+        let edit = div()
+            .id(SharedString::from(format!("mcp-edit-{index}")))
+            .debug_selector(move || format!("mcp-edit-{index}"))
+            .h(px(26.0))
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .rounded(px(7.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(lang.tr("settings.mcpEdit"), 11.0, theme::text()))
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.mcp_begin_edit(scope, &edit_name, window, cx);
+            }));
+        let remove_name = name.clone();
+        let remove = div()
+            .id(SharedString::from(format!("mcp-remove-{index}")))
+            .debug_selector(move || format!("mcp-remove-{index}"))
+            .h(px(26.0))
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .rounded(px(7.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(lang.tr("settings.mcpDelete"), 11.0, theme::error()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.mcp_remove(scope, &remove_name, cx);
+            }));
+        lines = lines.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .child(edit)
+                .child(remove),
+        );
+        div()
+            .id(SharedString::from(format!("mcp-detail-{index}")))
+            .debug_selector(move || format!("mcp-detail-{index}"))
+            .mb(px(8.0))
+            .child(lines)
+            .into_any_element()
     }
 
     /// The form that adds or edits one server.
@@ -7732,76 +9198,106 @@ impl Shell {
             .gap(px(8.0))
             .child(save)
             .child(cancel);
-        let mut card = hairline_all(
-            div()
-                .debug_selector(|| "mcp-form".to_string())
-                .p(px(12.0))
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .bg(rgb(theme::page()))
-                .border_color(rgb(theme::border())),
-        )
-        .child(fields)
-        .child(actions);
+        let mut card = div()
+            .debug_selector(|| "mcp-form".to_string())
+            .p(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .rounded(px(12.0))
+            .bg(rgb(theme::new_session_fill()))
+            .child(fields)
+            .child(actions);
         if let Some(key) = self.mcp_refusal {
             card = card.child(self.settings_note(key, true));
         }
         card.into_any_element()
     }
 
-    /// The MCP tab's body: the servers, the add control and the open form.
+    /// The MCP tab's body in the Plugin list's own shape: a full-width search
+    /// row with the primary Add action, then one 56px row per server, then the
+    /// open form.
     ///
-    /// It is a tab of the Extensions pane, so it carries no page title of
-    /// its own - the strip above it says which tab the reader is on.
+    /// It is a tab of the Extensions pane, so it carries no page title of its
+    /// own - the strip above it says which tab the reader is on.
     fn mcp_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let lang = self.state.lang;
         let mut rows: Vec<AnyElement> = Vec::new();
         let servers = self.state.draft().mcp_servers();
+        let query = self.mcp_query.trim().to_string();
+        let listed: Vec<(usize, &McpServer)> = servers
+            .iter()
+            .enumerate()
+            .filter(|(_, server)| {
+                query.is_empty()
+                    || crate::state::matches(&query, &server.name)
+                    || crate::state::matches(&query, &server.transport_summary())
+                    || crate::state::matches(&query, &lang.tr(server.scope.label_key()))
+            })
+            .collect();
+        rows.push(
+            div()
+                .mb(px(16.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.plugins_search_box(&self.mcp_search)),
+                )
+                .child(
+                    div()
+                        .id("mcp-add")
+                        .debug_selector(|| "mcp-add".to_string())
+                        .h(px(34.0))
+                        .px(px(14.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .rounded(px(999.0))
+                        .bg(rgb(theme::accent()))
+                        .cursor_pointer()
+                        .hover(|style| style.opacity(0.9))
+                        .child(icon(IconName::Plus, 12.0, theme::page()))
+                        .child(txt(lang.tr("settings.mcpAdd"), 12.0, theme::page()))
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.mcp_begin_add(window, cx);
+                        })),
+                )
+                .into_any_element(),
+        );
         if servers.is_empty() {
             rows.push(
                 txt(lang.tr("settings.mcpEmpty"), 13.0, theme::muted())
                     .pb(px(1.0))
                     .into_any_element(),
             );
+        } else if listed.is_empty() {
+            rows.push(
+                txt(tr(lang, "settings.noMatchingPlugins"), 13.0, theme::muted())
+                    .pb(px(1.0))
+                    .into_any_element(),
+            );
         }
-        for (index, server) in servers.iter().enumerate() {
+        for (index, server) in listed {
             rows.push(self.mcp_row(index, server, cx));
         }
-        rows.push(
-            hairline_all(
-                div()
-                    .id("mcp-add")
-                    .debug_selector(|| "mcp-add".to_string())
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .self_start()
-                    .gap(px(4.0))
-                    .h(px(28.0))
-                    .px(px(10.0))
-                    .rounded(px(4.0))
-                    .bg(rgb(theme::page()))
-                    .border_color(rgb(theme::border()))
-                    .cursor_pointer()
-                    .child(icon(IconName::Plus, 14.0, theme::text()))
-                    .child(txt(lang.tr("settings.mcpAdd"), 12.0, theme::text()))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.mcp_begin_add(window, cx);
-                    })),
-            )
-            .into_any_element(),
-        );
         if self.mcp_form_open {
             rows.push(self.mcp_form(cx));
         }
         rows
     }
 
-    /// The MCP view: the Extensions pane opened on its MCP tab.
+    /// The MCP view's fallback render arm.
     ///
-    /// `--settings=mcp` and any older deep link still land here, and they land on
-    /// the pane the tab belongs to rather than on a separate page.
+    /// The `--settings=mcp` deep link is mapped in `open_settings_at` onto the
+    /// Extensions section plus the MCP tab, because that is where the tab strip
+    /// lives. This arm still draws the same body for any stale section index, so
+    /// a caller cannot fall through to a blank pane.
     fn section_mcp(
         &mut self,
         cx: &mut Context<Self>,

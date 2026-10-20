@@ -1,10 +1,12 @@
 //! The root view: state ownership, layout, and the streaming pump.
 
+use std::collections::BTreeSet;
+
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::*;
 
 use super::paging::{PageFlow, PageKey};
-use super::settings::{SettingsInputs, TrustConfirm, VaultInputs};
+use super::settings::{SettingsInputs, SkillFilter, TrustConfirm, VaultInputs};
 use super::DivExt;
 use crate::runner::AgentEvent;
 use crate::settings::mcp::McpScope;
@@ -15,6 +17,12 @@ use crate::store::{OlderPage, TracePage};
 const TAIL_EPSILON: f32 = 24.0;
 
 /// The window's only view.
+/// The custom preset editor: one TOML buffer keyed by preset id.
+pub(crate) struct PresetEditor {
+    pub(crate) id: String,
+    pub(crate) text: Entity<TextareaState>,
+}
+
 pub(crate) struct Shell {
     /// The model list the last successful fetch returned, if any.
     pub(crate) models_fetched: Option<Vec<String>>,
@@ -31,9 +39,9 @@ pub(crate) struct Shell {
     pub(crate) state: AppState,
     /// The composer's text engine.
     pub(crate) composer: Entity<TextareaState>,
-    /// Whether the composer currently carries the hero's placeholder, so the
-    /// refresh only runs when the phase actually flips.
-    placeholder_hero: bool,
+    /// The placeholder key the composer currently carries, so the refresh only
+    /// runs when the phase (hero, conversation, plan mode) actually flips.
+    placeholder_key: &'static str,
     /// Whether the to-do panel's list is expanded. The reference starts it
     /// collapsed and keeps the state per mounted panel, not per session.
     pub(crate) todo_open: bool,
@@ -49,6 +57,14 @@ pub(crate) struct Shell {
     pub(crate) search: Entity<InputState>,
     /// The plugin-name filter on the plugin list pane.
     pub(crate) plugin_search: Entity<InputState>,
+    /// The egress allowlist entry field in the policy pane.
+    pub(crate) policy_entry: Entity<InputState>,
+    /// The preset card whose config details are expanded, if any.
+    pub(crate) preset_details: Option<String>,
+    /// The custom preset being edited as TOML, if any.
+    pub(crate) preset_editor: Option<PresetEditor>,
+    /// The parse error from the last preset editor save.
+    pub(crate) preset_editor_error: Option<String>,
     /// The Trajectory tab's own search field.
     pub(crate) traj_search: Entity<InputState>,
     /// Which measure the trajectory toolbar shows: 0 duration, 1 turns, 2 calls.
@@ -115,17 +131,10 @@ pub(crate) struct Shell {
     /// The model leaves the open provider editor or add card is editing, with
     /// one text engine per row so a keystroke repaints its own row.
     pub(crate) model_rows: Vec<ModelRowEditor>,
-    /// A new model id row the add card is filling in.
-    pub(crate) new_row_id: Entity<InputState>,
-    /// The new model row's display name.
-    pub(crate) new_row_name: Entity<InputState>,
     /// The model id the open provider editor is adding.
     ///
-    /// The editor's own field, not the add card's: the custom route types a
-    /// model id for a provider that does not exist yet, and this one types a
-    /// model id for the provider already open. They are different facts, so a
-    /// shared engine would carry text from one form into the other and let
-    /// someone add a model they never typed here.
+    /// The editor's own field: a model row is added to the provider already
+    /// open, and the add-provider card no longer asks for a model at all.
     pub(crate) new_model_id: Entity<InputState>,
     /// The display name the editor's new model row will take.
     pub(crate) new_model_name: Entity<InputState>,
@@ -141,6 +150,9 @@ pub(crate) struct Shell {
     pub(crate) catalogue_open: bool,
     /// The transcript scroll position, so the turn rail can jump within it.
     pub(crate) transcript_scroll: ScrollHandle,
+    /// The measured height of every transcript row, so offscreen rows cost a
+    /// spacer instead of a full message element on every frame.
+    pub(crate) transcript_layout: std::cell::RefCell<super::transcript::TranscriptLayout>,
     /// The transcript content height as of the last frame. Following the tail
     /// compares against it, so content that grew this frame still counts as
     /// "the reader was at the bottom".
@@ -154,6 +166,11 @@ pub(crate) struct Shell {
     /// session switch closes them all, the way the reference resets a turn's
     /// disclosure state.
     pub(crate) think_open: std::collections::HashSet<usize>,
+    /// The compaction markers the reader has expanded, by record index.
+    ///
+    /// Scoped like the reasoning disclosures: a session switch closes them,
+    /// because the indices name rows in the transcript that just changed.
+    pub(crate) compaction_open: std::collections::HashSet<usize>,
     /// The offsets the eased scroll last settled on.
     ///
     /// The kit's scroller applies a wheel delta on its own, and it does so before
@@ -175,6 +192,9 @@ pub(crate) struct Shell {
     pub(crate) side_focus: FocusHandle,
     /// The rail's scroll position, so the active mark can be kept in view.
     pub(crate) rail_scroll: ScrollHandle,
+    /// The settings dialog's options box, so a write inside the pane can be
+    /// shown not to move it and a test can read the same offset the reader sees.
+    pub(crate) settings_scroll: ScrollHandle,
     /// The turn whose mark the pointer is over, which opens its preview card.
     pub(crate) rail_hover: Option<usize>,
     /// The conversation column's width as of the last frame, less the sidebar.
@@ -237,6 +257,9 @@ pub(crate) struct Shell {
     pub(crate) market_search: Entity<InputState>,
     /// What that field holds, kept beside the entity so the list can filter.
     pub(crate) market_query: String,
+    /// How many filtered market rows are shown. The catalogs carry thousands of
+    /// remote entries, so the pane renders a window and Show more grows it.
+    pub(crate) market_limit: usize,
     /// The "add a remote index source" field.
     pub(crate) market_url: Entity<InputState>,
     /// How many remote index fetches are in flight. A count, not a flag:
@@ -252,11 +275,23 @@ pub(crate) struct Shell {
     /// Whether the market's source editor is expanded. Collapsed by default so
     /// the catalog gets the pane; the header still names the built-in count.
     pub(crate) market_sources_open: bool,
+    /// Why the last immediate skills write failed, if it did.
+    ///
+    /// The Skills switches do not wait for the dialog's Save, so a refused
+    /// write is the only place a reader can learn that the switch did not
+    /// reach disk: it is drawn in the pane rather than swallowed.
+    pub(crate) skills_save_error: Option<String>,
     /// The Skills pane's own sub-view: whether the browse-all list and the
     /// executor-dirs list are open. Both are disclosures over the card grid, so
     /// they are pane state rather than settings.
     pub(crate) skills_browse_open: bool,
     pub(crate) skills_dirs_open: bool,
+    /// Which of All / Enabled / Disabled the browse-all list shows.
+    ///
+    /// View state, not a setting: it is reset when the Settings dialog opens and
+    /// when the Skills tab is pressed, so it can never quietly hide a skill on
+    /// the next visit. See `SkillFilter`.
+    pub(crate) skill_filter: SkillFilter,
     /// The skill-name filter on the browse-all list.
     pub(crate) skill_search: Entity<InputState>,
     /// What that field holds, kept beside the entity so the list can filter
@@ -309,8 +344,30 @@ pub(crate) struct Shell {
     /// The background job whose stop button is armed (or showing a failure),
     /// with the instant that phase began.
     pub(crate) jobs_arm: Option<super::header::JobArm>,
+    /// Whether the header's background-jobs popover is open.
+    pub(crate) jobs_open: bool,
+    /// The job ids whose output panel is expanded inline.
+    pub(crate) jobs_expanded: BTreeSet<String>,
+    /// Cached output per expanded job, keyed by id and re-read only when the
+    /// ring's length moves, so a frame never clones 64 KiB of output twice.
+    pub(crate) jobs_output_cache: std::collections::HashMap<String, (usize, u64, String, bool)>,
+    /// The running and settled counts the last frame resolved, and the roster
+    /// version and session they were resolved for. A frame compares two values
+    /// instead of walking the roster, which is what keeps the header cheap.
+    pub(crate) jobs_counts: (usize, usize),
+    jobs_counts_for: Option<String>,
+    jobs_counts_version: u64,
     /// The composer command menu (the reference's add listbox).
     pub(crate) command_menu: super::command_menu::CommandMenu,
+    /// The composer's slash palette: the grouped Add / Commands / Skills card.
+    pub(crate) slash: super::slash_palette::SlashPalette,
+    /// The inline note the composer is editing, if any.
+    pub(crate) note: Option<super::slash_palette::NoteKind>,
+    /// The note editor's text engine, built once at launch.
+    pub(crate) note_input: Entity<InputState>,
+    /// The window height as of the last frame, which caps the palette's list at
+    /// about 60% of the surface it opens over.
+    pub(crate) viewport_h: f32,
     /// The turn the rail was last scrolled to, so the follow fires once per
     /// change instead of every frame.
     rail_active: Option<usize>,
@@ -331,6 +388,14 @@ pub(crate) struct Shell {
     pub(crate) vault_error: Option<&'static str>,
     /// Whether a key derivation is running, so the pane can say why it waits.
     pub(crate) vault_busy: bool,
+    /// The server-name filter on the MCP tab.
+    pub(crate) mcp_search: Entity<InputState>,
+    /// What that field holds, kept beside the entity so the list can filter
+    /// without reading the engine per row.
+    pub(crate) mcp_query: String,
+    /// The MCP server whose disclosure is open, by name. One at a time, the
+    /// same rule the installed-plugin rows follow.
+    pub(crate) mcp_open: Option<String>,
     /// Whether the MCP pane's add/edit form is open.
     pub(crate) mcp_form_open: bool,
     /// The entry the form edits, as the document and name it started from.
@@ -460,10 +525,9 @@ impl Shell {
             .as_deref()
             .map(|id| state.session_choice(id))
             .unwrap_or_default();
-        state.set_tools_schema(
-            crate::caps::build_agent(&state.settings, &state.vault, &choice, &state.mcp)
-                .tools_schema_chars,
-        );
+        let built = crate::caps::build_agent(&state.settings, &state.vault, &choice, &state.mcp);
+        state.set_tools_schema(built.tools_schema_chars);
+        state.set_policy(built.policy.clone());
         // The tree order the sidebar last chose, from the settings file.
         state.sort =
             crate::store::SessionSort::from_persisted(&state.settings.global.general.session_sort);
@@ -471,11 +535,16 @@ impl Shell {
         // Measured: the hero editor draws its own placeholder, so the phase
         // the restore landed in picks the string.
         let hero = state.hero_phase();
-        let placeholder = if hero {
+        // Plan mode outranks the blank/hero phase: the composer asks for a task
+        // to plan while the mode is on.
+        let placeholder_key = if state.active_plan_mode() {
+            "composer.planPlaceholder"
+        } else if hero {
             "composer.heroPlaceholder"
         } else {
             "composer.placeholder"
         };
+        let placeholder = placeholder_key;
         // Measured: the composer is a soft-wrapping editor that grows with its
         // content behind a 336px ceiling, and Enter submits while Shift+Enter
         // opens a line - which is the kit's own rule once the field is multi
@@ -504,6 +573,12 @@ impl Shell {
         });
         let plugin_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.searchPlugins"))
+        });
+        let policy_entry = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.policyAddHint"))
+        });
+        let mcp_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.mcpSearch"))
         });
         let market_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.marketSearch"))
@@ -545,17 +620,29 @@ impl Shell {
                  cx: &mut Context<Shell>| match event {
                     InputEvent::Change => {
                         this.composer_value = this.composer.read(cx).value().to_string();
-                        // The card follows the draft: a `/` token shows the command
-                        // source, an `@` token the reference source, and neither
-                        // closes it.
+                        // A completed mention typed by hand becomes a chip the
+                        // moment it is finished, so the draft reads the way the
+                        // reference's does while the reader is still in it. The
+                        // rewrite is skipped when nothing changed, which keeps it
+                        // off the typing path for ordinary prose.
+                        this.chip_open_draft(window, cx);
+                        // The overlay follows the draft: a LEADING `/` opens the
+                        // slash palette, a mid-draft `/` token shows the command
+                        // source, and an `@` token the reference source.
+                        this.slash.sync(this.composer_value.as_str(), &this.state);
                         this.command_menu.sync(this.composer_value.as_str());
                         cx.notify();
                     }
                     InputEvent::PressEnter { shift: false, .. } => {
-                        // The reference gives Enter to the open menu first: the
+                        // The reference gives Enter to the open overlay first: the
                         // highlighted row runs, and the composer keeps its draft.
-                        if this.command_menu.open {
+                        if this.slash.open {
+                            this.run_slash_row(this.slash.active, window, cx);
+                        } else if this.command_menu.open {
                             this.run_row(this.command_menu.active, window, cx);
+                        } else if this.run_command_line(window, cx) {
+                            // A typed /plan or /goal line is a command, not a
+                            // message; its output stays in the UI.
                         } else {
                             this.send(window, cx);
                         }
@@ -605,6 +692,20 @@ impl Shell {
                 },
             ),
             cx.subscribe_in(
+                &mcp_search,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        this.mcp_query = this.mcp_search.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
                 &market_search,
                 window,
                 |this: &mut Shell,
@@ -614,6 +715,9 @@ impl Shell {
                  cx: &mut Context<Shell>| {
                     if matches!(event, InputEvent::Change) {
                         this.market_query = this.market_search.read(cx).value().to_string();
+                        // A new search starts the window over: keeping a grown
+                        // limit would render hundreds of rows for a new query.
+                        this.market_limit = 60;
                         cx.notify();
                     }
                 },
@@ -668,10 +772,25 @@ impl Shell {
         let add_display = cx.new(|cx| InputState::new(window, cx));
         let add_base_url = cx.new(|cx| InputState::new(window, cx));
 
-        let new_row_id = cx.new(|cx| InputState::new(window, cx));
-        let new_row_name = cx.new(|cx| InputState::new(window, cx));
-        let new_model_id = cx.new(|cx| InputState::new(window, cx));
-        let new_model_name = cx.new(|cx| InputState::new(window, cx));
+        // The models pane's add row: the id field carries the pane's own hint,
+        // which is the only place the bare add row says what it takes.
+        let model_id_hint = crate::i18n::tr(lang, "settings.modelId");
+        let model_name_hint = crate::i18n::tr(lang, "settings.providerDisplayName");
+        let new_model_id =
+            cx.new(|cx| InputState::new(window, cx).placeholder(model_id_hint.clone()));
+        let new_model_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder(model_name_hint.clone()));
+        // The add row's optional display-name field appears once the id has
+        // text, so the row stays one field until there is something to name.
+        subs.push(cx.subscribe_in(
+            &new_model_id,
+            window,
+            |_this: &mut Shell, _state, event: &InputEvent, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
         let mcp_name = cx.new(|cx| InputState::new(window, cx));
         let mcp_command = cx.new(|cx| InputState::new(window, cx));
         let mcp_args = cx.new(|cx| InputState::new(window, cx));
@@ -708,6 +827,24 @@ impl Shell {
         // the files pane's rename engine is, so a second rename reuses it.
         let session_rename = cx.new(|cx| InputState::new(window, cx));
         let workspace_rename = cx.new(|cx| InputState::new(window, cx));
+        // The composer's inline note editor (the Goal and Feedback commands):
+        // one engine, with its placeholder re-pointed when it opens.
+        let note_input = cx.new(|cx| InputState::new(window, cx));
+        subs.push(cx.subscribe_in(
+            &note_input,
+            window,
+            |this: &mut Shell,
+             _state: &Entity<InputState>,
+             event: &InputEvent,
+             window: &mut Window,
+             cx: &mut Context<Shell>| {
+                // Enter commits, which is the same contract the rename fields
+                // follow. Escape is handled by the note card's key listener.
+                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                    this.commit_note(window, cx);
+                }
+            },
+        ));
         subs.push(cx.subscribe_in(
             &workspace_rename,
             window,
@@ -742,27 +879,67 @@ impl Shell {
                 }
             },
         ));
+        // The palette's keys are intercepted ABOVE the kit's input: the input
+        // binds up, down, tab and escape in its own key context, so a raw key
+        // listener on an ancestor never sees them. An interceptor runs before
+        // action dispatch, which is the only seam that can claim those keys
+        // while the card is open, and it is gated on the card being open and the
+        // composer holding focus.
+        let palette = cx.weak_entity();
+        subs.push(cx.intercept_keystrokes(move |event, window, cx| {
+            let Some(shell) = palette.upgrade() else {
+                return;
+            };
+            if !shell.read(cx).composer_focused(window, cx) {
+                return;
+            }
+            // The plus card is a listbox too: while it is open the arrows move
+            // its highlight and Escape closes it, exactly as they do for the
+            // slash palette. Without this the card answered no key at all.
+            if !shell.read(cx).slash.open && shell.read(cx).command_menu.trigger.is_some() {
+                let key = event.keystroke.key.as_str();
+                if matches!(key, "up" | "down" | "escape") {
+                    shell.update(cx, |this, cx| this.command_card_key(key, cx));
+                    cx.stop_propagation();
+                }
+                return;
+            }
+            if !shell.read(cx).slash.open {
+                return;
+            }
+            let keystroke = event.keystroke.clone();
+            let handled = shell.update(cx, |this, cx| this.slash_key(&keystroke, cx));
+            if handled == super::slash_palette::SlashKey::Handled {
+                cx.stop_propagation();
+            }
+        }));
         let mut shell = Self {
             state,
             composer,
-            placeholder_hero: hero,
+            placeholder_key,
             todo_open: false,
             queue_edit,
             queue_edit_for: None,
             queue_open: false,
             search,
             plugin_search,
+            policy_entry,
+            preset_details: None,
+            preset_editor: None,
+            preset_editor_error: None,
             market: Vec::new(),
             market_loaded: false,
             market_error: None,
             market_search,
             market_query: String::new(),
+            market_limit: 60,
             market_url,
             market_fetching: 0,
             market_fetch_error: None,
             market_installing: None,
             market_install_error: None,
             market_sources_open: false,
+            skills_save_error: None,
             skill_search,
             skill_query: String::new(),
             skill_add_open: false,
@@ -794,8 +971,6 @@ impl Shell {
             add_base_url,
             add_key_vault: None,
             model_rows: Vec::new(),
-            new_row_id,
-            new_row_name,
             new_model_id,
             new_model_name,
             models_advanced_open: false,
@@ -810,6 +985,9 @@ impl Shell {
             vault_confirm_delete: None,
             vault_error: None,
             vault_busy: false,
+            mcp_search,
+            mcp_query: String::new(),
+            mcp_open: None,
             mcp_form_open: false,
             mcp_editing: None,
             mcp_scope: McpScope::Global,
@@ -820,10 +998,14 @@ impl Shell {
             mcp_args,
             mcp_url,
             transcript_scroll: ScrollHandle::new(),
+            transcript_layout: std::cell::RefCell::new(
+                super::transcript::TranscriptLayout::default(),
+            ),
             tail_max: None,
             tail_session: None,
             following_tail: true,
             think_open: std::collections::HashSet::new(),
+            compaction_open: std::collections::HashSet::new(),
             chat_last_offset: 0.0,
             traj_last_offset: 0.0,
             chat_smooth: super::smooth::Smooth::default(),
@@ -832,6 +1014,7 @@ impl Shell {
             side_scroll: ScrollHandle::new(),
             side_focus: cx.focus_handle(),
             rail_scroll: ScrollHandle::new(),
+            settings_scroll: ScrollHandle::new(),
             rail_hover: Some(58),
             rail_active: None,
             conversation_w: px(0.0),
@@ -839,7 +1022,17 @@ impl Shell {
             sidebar_user_w,
             viewport_w,
             jobs_arm: None,
+            jobs_open: false,
+            jobs_expanded: BTreeSet::new(),
+            jobs_output_cache: std::collections::HashMap::new(),
+            jobs_counts: (0, 0),
+            jobs_counts_for: None,
+            jobs_counts_version: 0,
             command_menu: super::command_menu::CommandMenu::default(),
+            slash: super::slash_palette::SlashPalette::default(),
+            note: None,
+            note_input,
+            viewport_h: window.viewport_size().height.as_f32(),
             chat_drag: None,
             chat_hover: None,
             sidebar_drag: None,
@@ -861,6 +1054,7 @@ impl Shell {
             plugins_tab: 0,
             skills_browse_open: false,
             skills_dirs_open: false,
+            skill_filter: SkillFilter::All,
             trash_entries: Vec::new(),
             terminal_snapshot: std::rc::Rc::new(crate::terminal::Snapshot::default()),
             terminal_version: 0,
@@ -915,6 +1109,30 @@ impl Shell {
             if this
                 .update(cx, |this, cx| {
                     this.tick_jobs(std::time::Instant::now(), cx);
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+        // A child turn streams outside the parent's event channel, so the
+        // subagent rows and the selected transcript need their own fast clock.
+        // It is idle-cheap: the update is a lock check and a notify only while
+        // a child is actually running.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            if this
+                .update(cx, |this, cx| {
+                    if this.state.subagents.running_count() == 0 {
+                        return;
+                    }
+                    if this.state.subagent.is_some() {
+                        this.state.refresh_subagent_preview();
+                    }
+                    cx.notify();
                 })
                 .is_err()
             {
@@ -1094,9 +1312,9 @@ impl Shell {
                 if !mention.is_empty() {
                     let current = this.composer.read(cx).value().to_string();
                     let next = format!("{current}{mention}");
-                    this.composer
-                        .update(cx, |state, cx| state.set_value(next.clone(), window, cx));
-                    this.composer_value = next;
+                    // Appending a picked path is an INSERT: the caret belongs
+                    // after it, not back at the draft's start.
+                    this.set_composer_text(&next, window, cx);
                 }
                 cx.notify();
             })
@@ -1168,12 +1386,32 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.open_settings(window, cx);
+        // The MCP view is a TAB of the Extensions pane, not a rail cell of its
+        // own. Landing on the old section index drew the MCP body with no tab
+        // strip and no selected rail row, which is not the pane the reader sees
+        // after two clicks. Map the deep link onto Extensions + the MCP tab.
+        let mut section = section;
+        if Some(section) == super::settings::section_index("mcp") {
+            self.plugins_tab = 1;
+            if let Some(plugins) = super::settings::section_index("plugins") {
+                section = plugins;
+            }
+        }
         self.state.settings_section = section;
     }
 
     /// Open the settings dialog, loading the fields from the saved settings.
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.open_settings();
+        self.preset_editor = None;
+        self.preset_editor_error = None;
+        self.preset_details = None;
+        // The Skills filter is view state, not a preference: every open starts
+        // from All, so a reader never lands on a pane that hides half the
+        // catalogue behind a choice they made on an earlier visit.
+        self.skill_filter = SkillFilter::All;
+        // A write failure belongs to the visit that saw it, like the filter.
+        self.skills_save_error = None;
         // The dialog opens on a fresh read of the installed packages: a package
         // may have been installed, removed or upgraded by another process since
         // the cache was filled, and this is a user action, not a render.
@@ -1192,6 +1430,9 @@ impl Shell {
     /// cancelled dialog kept the language it had merely been trying on.
     pub(crate) fn cancel_settings(&mut self, cx: &mut Context<Self>) {
         self.state.cancel_settings();
+        self.preset_editor = None;
+        self.preset_editor_error = None;
+        self.preset_details = None;
         let committed = &self.state.settings.global.general;
         self.state.lang = crate::i18n::Lang::from_locale(&committed.lang);
         let mode = committed.theme_mode.clone();
@@ -1201,18 +1442,32 @@ impl Shell {
     }
 
     /// Keep the dialog's settings, persist them, and rebuild the capability list.
+    ///
+    /// The dialog stays open: Save is a commit, not a close. The draft is taken
+    /// by the commit, so a second Save starts from the committed document plus
+    /// the field values - never from `Settings::default()`, which would wipe
+    /// every pane the fields do not cover.
     pub(crate) fn save_settings(&mut self, cx: &mut Context<Self>) {
-        let mut draft = self.state.draft.clone().unwrap_or_default();
+        let mut draft = self
+            .state
+            .draft
+            .clone()
+            .unwrap_or_else(|| self.state.settings.clone());
         self.settings_inputs.read(&mut draft, cx);
         self.state.draft = Some(draft);
         match self.state.commit_settings() {
             Ok(()) => {
+                self.preset_editor = None;
+                self.preset_editor_error = None;
+                self.preset_details = None;
                 self.caps.clear();
                 self.plugins.clear();
                 // A save can change the inventory (an installed package added
                 // or removed in the draft), so the next list re-reads packages.
                 self.installed_cache.clear();
                 self.developer_tools_failed = false;
+                // A full Save supersedes any earlier focused-write refusal.
+                self.skills_save_error = None;
                 self.state
                     .notice(crate::i18n::tr(self.state.lang, "settings.saved").to_string());
             }
@@ -1236,10 +1491,46 @@ impl Shell {
         super::settings::reveal_config_shared(self, cx);
     }
 
+    /// The claim hint for a command token that fills the draft, which is the
+    /// reference's `hint.<command>` placeholder.
+    ///
+    /// It shows only while the token is the WHOLE input, so typing the argument
+    /// returns the placeholder to the ordinary one.
+    fn claim_hint(&self) -> Option<&'static str> {
+        let text = self.composer_value.trim();
+        if text == "/plan" {
+            return Some("hint.plan");
+        }
+        if text == "/goal" {
+            return Some(
+                if self
+                    .state
+                    .active_session()
+                    .and_then(|session| session.goal.as_ref())
+                    .is_some()
+                {
+                    "hint.goal.active"
+                } else {
+                    "hint.goal"
+                },
+            );
+        }
+        None
+    }
+
     /// Send the composer's text, or queue it while the session is running.
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        if let Some(id) = self
+            .state
+            .subagent
+            .as_ref()
+            .map(|subagent| subagent.id.clone())
+        {
+            self.send_to_subagent(id, text, window, cx);
             return;
         }
         let attachments = std::mem::take(&mut self.state.attachments);
@@ -1253,13 +1544,23 @@ impl Shell {
         // same submission as an ordinary queue row and the preferences pane
         // reports the gap rather than claiming a delivery it cannot make.
         if let Some(id) = self.state.active_id.clone() {
-            if self.state.is_streaming(&id) {
+            // A running turn is the reference's ordinary queue case. A manual
+            // compaction is the second: its own prompts are "accepted and start
+            // after it finishes", so a submission made while the summarizer
+            // works must wait rather than open a turn under it.
+            if self.state.is_streaming(&id) || self.state.is_compacting(&id) {
                 self.state.enqueue(&id, text, attachments);
                 self.clear_composer(window, cx);
                 return;
             }
         }
-        let input = crate::state::turn_input(&text, &attachments);
+        // Plan mode and any @reference guidance travel on the REQUEST, not on
+        // the transcript: the reader's line stays what they typed. The goal is
+        // NOT put on an ordinary request - the reference keeps goal state out of
+        // model context and sends it only in a goal round's prompt.
+        let plan = self.state.active_plan_mode();
+        let request = crate::state::turn_text(&text, plan);
+        let input = crate::state::turn_input(&request, &attachments);
         let display = crate::state::display_text(&text, &attachments);
         // The session on screen is the one this send opens a turn in, so its
         // own model choice is what the gate and the build resolve.
@@ -1297,6 +1598,325 @@ impl Shell {
     }
 
     /// Empty the composer after a submission left it.
+    /// Continue the selected child run with a follow-up prompt.
+    fn send_to_subagent(
+        &mut self,
+        id: String,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent) = self.state.subagents.agent(&id) else {
+            self.state
+                .notice(crate::i18n::tr(self.state.lang, "subagents.unavailable").to_string());
+            return;
+        };
+        let Some(run) = self
+            .state
+            .subagents
+            .snapshot()
+            .into_iter()
+            .find(|run| run.id == id)
+        else {
+            self.state
+                .notice(crate::i18n::tr(self.state.lang, "subagents.unavailable").to_string());
+            return;
+        };
+        // A follow-up is another child turn, so it asks the same spawn
+        // question the tool asks. The check runs before `begin_followup`
+        // mutates the run: a denial leaves the child exactly as it was.
+        let eff = self.state.effective_in(&run.session);
+        let policy = crate::caps::policy_for_effective(&self.state.settings, &eff);
+        if let Err(refusal) =
+            crate::caps::check_spawn(&policy, "subagent", &run.session, &eff.preset_id, &eff.root)
+        {
+            self.state.notice(refusal);
+            return;
+        }
+        if !self.state.subagents.begin_followup(&id, &prompt) {
+            self.state
+                .notice(crate::i18n::tr(self.state.lang, "subagents.busy").to_string());
+            return;
+        }
+        self.state.refresh_subagent_preview();
+        self.state.persist_subagents();
+        self.clear_composer(window, cx);
+        let registry = self.state.subagents.clone();
+        let stream_registry = self.state.subagents.clone();
+        let stream_id = id.clone();
+        // The engine awaits a Tokio timer for its LLM timeout; GPUI's executor
+        // is not a Tokio runtime, so the child turn must be spawned on the
+        // runner's runtime and only its result awaited from the UI task.
+        let handle = self.state.runner.spawn_task(async move {
+            let guard = agent.lock().await;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                crate::caps::stream_child(&guard, prompt, stream_registry, &stream_id),
+            )
+            .await
+            .map_err(|_| "subagent timed out".to_string())
+            .and_then(|result| result);
+            let usage = guard.last_token_usage().unwrap_or((0, 0));
+            let transcript = crate::caps::child_transcript(&guard);
+            (result, usage, transcript)
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.await;
+            let _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok((Ok((text, usage)), _, transcript)) => {
+                        registry.finish(&id, text, usage, transcript);
+                    }
+                    Ok((Err(error), usage, transcript)) => {
+                        registry.fail(&id, error, Some(usage), transcript);
+                    }
+                    Err(error) => {
+                        registry.fail(
+                            &id,
+                            format!("subagent task ended: {error}"),
+                            None,
+                            Vec::new(),
+                        );
+                    }
+                }
+                this.state.refresh_subagent_preview();
+                this.state.persist_subagents();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Condense the active session's older history into a model-written
+    /// checkpoint, the way the reference's `/compact` does.
+    ///
+    /// The work is an auxiliary model request, not a turn: no tool is offered,
+    /// nothing is appended to the transcript, and the reader can keep typing -
+    /// a prompt sent meanwhile queues exactly as it does during a turn. The
+    /// request runs on the runner's Tokio runtime, because the engine awaits a
+    /// Tokio timer for its timeout and GPUI's executor has no reactor.
+    ///
+    /// Everything that can refuse does so before the request is built: no
+    /// session, a streaming turn, no chosen model, no credential, or nothing
+    /// old enough to fold. The checkpoint is installed only after the summary
+    /// returns, so a failed or stopped request leaves the session untouched.
+    /// Move the plus card's highlight with the arrow keys, or close it.
+    ///
+    /// The kit's textarea consumes arrows in its own key context, so the card
+    /// is driven from the same app-level interceptor the slash palette uses.
+    pub(crate) fn command_card_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(trigger) = self.command_menu.trigger else {
+            return;
+        };
+        let rows = self.card_rows(trigger).len();
+        if rows == 0 {
+            return;
+        }
+        match key {
+            "down" => {
+                self.command_menu.active = (self.command_menu.active + 1) % rows;
+            }
+            "up" => {
+                self.command_menu.active = (self.command_menu.active + rows - 1) % rows;
+            }
+            "escape" => {
+                self.command_menu.close();
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn compact_history(&mut self, cx: &mut Context<Self>) {
+        let lang = self.state.lang;
+        let Some(id) = self.state.active_id.clone() else {
+            self.state.notice(lang.tr("slash.nothingToCompact"));
+            cx.notify();
+            return;
+        };
+        // Admission first, the reference's own order: compactNow "requires an
+        // idle agent with no waking queued work", so a stream, another
+        // compaction, or a prompt already waiting behind this session all
+        // report busy before the selection runs.
+        if self.state.is_streaming(&id)
+            || self.state.is_compacting(&id)
+            || self.state.has_queued(&id)
+        {
+            self.refuse_compact(&id, "slash.compactBusy", true, cx);
+            return;
+        }
+        if !self.state.has_compactable_history(&id) {
+            self.refuse_compact(&id, "slash.nothingToCompact", false, cx);
+            return;
+        }
+        // The same gate a turn passes: compaction is a model call, so it needs
+        // a chosen, credentialed model. Refusing here costs no request. The
+        // reference's summarizer throws when no provider/model resolves, and
+        // `compactNow` classifies that as a summary failure, so the command
+        // reports the same text rather than inventing a fourth outcome.
+        let choice = self.state.session_choice(&id);
+        if self.state.settings.refusal_for(&choice).is_some() {
+            self.refuse_compact(&id, "slash.compactSummary", true, cx);
+            return;
+        }
+        let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
+            &self.state.settings,
+            &self.state.vault,
+            &choice,
+            &self.state.mcp,
+            &id,
+            &id,
+            self.state.subagents.clone(),
+            self.state.jobs.clone(),
+        );
+        if built.credential_error.is_some() {
+            self.refuse_compact(&id, "slash.compactSummary", true, cx);
+            return;
+        }
+        let agent = built.agent;
+        // The manual command condenses everything safe, which is the
+        // contract's own rule for `/compact`: it does not wait for pressure,
+        // so it retains no minimum tail beyond a balanced cut.
+        let retain = AppState::COMPACT_RETAIN;
+        // The transcript the summarizer will carry, and the boundary that span
+        // ends at. Both come from one reading of the NEXT REQUEST's window: a
+        // replayed checkpoint plus the rows after `session.compacted`. Asking
+        // the whole on-screen transcript would fold rows that left the context
+        // long ago and land the boundary before the current one.
+        let (messages, start, replayed) = {
+            let Some(session) = self.state.store.session(&id) else {
+                self.state.notice(lang.tr("slash.nothingToCompact"));
+                cx.notify();
+                return;
+            };
+            let messages = self.state.request_transcript(session);
+            let replayed = usize::from(self.state.has_replayed_checkpoint(session));
+            let mut probe = agent::agent::AgentSession::new();
+            probe.restore_messages(crate::caps::agent_messages(&messages));
+            let Some((removed, _)) = probe.split_for_compaction_at(retain) else {
+                self.refuse_compact(&id, "slash.nothingToCompact", false, cx);
+                return;
+            };
+            let start = AppState::compaction_boundary(session, removed.len(), replayed);
+            (messages, start, replayed)
+        };
+        // The agent must carry the same history the boundary was computed from,
+        // or the summarizer would fold a different span than the one installed.
+        // This bridge is text-only: images in the span are not shown to the
+        // summarizer and tool calls/results are display-only rows, so the
+        // reference's image-offload and tool-pairing protections have no seam
+        // here. Reported rather than faked.
+        agent
+            .session()
+            .restore_messages(crate::caps::agent_messages(&messages));
+
+        self.state.begin_compact_command(&id);
+        self.state.start_compacting(&id);
+        self.state.notice(lang.tr("slash.compacting"));
+        cx.notify();
+
+        let signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = self
+            .state
+            .runner
+            .spawn_task(async move { agent.compact_now(retain, &signal).await });
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.await;
+            let _ = this.update(cx, |this, cx| {
+                // The shipped taxonomy also distinguishes `changed`, `commit`
+                // and `persistence`. bsh cannot produce them: the summary is
+                // installed and saved in one synchronous step after the request
+                // returns, there is no second writer that could rewrite the
+                // selected span while it is summarized, and `save_session`
+                // discards its error. Reporting one of those strings would be
+                // inventing a failure the reader could never act on, so only
+                // the reachable classes appear: `busy` (the gates above),
+                // `cancelled` (the unreachable stop arm), and `summary`.
+                let (text, error, landed) = match outcome {
+                    // The command reports the SHADOWED span's price, which is
+                    // what the shipped command's `shadowedTokenCount` names,
+                    // not the net difference after the checkpoint is inserted.
+                    Ok(Ok(Some(report))) => (
+                        crate::i18n::tr_args(
+                            lang,
+                            "slash.compacted",
+                            &[
+                                ("count", report.replaced.to_string()),
+                                ("tokens", report.before_tokens.to_string()),
+                            ],
+                        ),
+                        false,
+                        Some(crate::model::CompactionReport {
+                            // A replayed checkpoint is a synthetic head, not a
+                            // transcript row, so it does not inflate the count
+                            // the marker reports.
+                            items: report.replaced.saturating_sub(replayed),
+                            tokens: report.before_tokens,
+                            summary: report.summary,
+                            manual: true,
+                        }),
+                    ),
+                    Ok(Ok(None)) => (lang.tr("slash.nothingToCompact"), false, None),
+                    // Cancellation is unreachable today - the command exposes no
+                    // stop control and the signal is never set - but the arm is
+                    // here so a future cancel seam cannot be misreported as a
+                    // summary failure.
+                    Ok(Err(agent::AgentError::Stopped)) => {
+                        (lang.tr("slash.compactCancelled"), true, None)
+                    }
+                    Ok(Err(_)) | Err(_) => (lang.tr("slash.compactSummary"), true, None),
+                };
+                if let Some(report) = landed {
+                    // A landed checkpoint replaces the command row, which is
+                    // the reference's `CompactionCommandCard` rule; the marker
+                    // above the boundary is what the reader keeps instead.
+                    if this.state.land_manual_compaction(&id, start, report) == 0 {
+                        let text = lang.tr("slash.nothingToCompact");
+                        this.state.finish_compact_command(&id, text.clone(), false);
+                    }
+                } else {
+                    this.state.finish_compact_command(&id, text.clone(), error);
+                }
+                this.state.stop_compacting(&id);
+                this.state.notice(text);
+                // Prompts sent while the summarizer ran are accepted and start
+                // after it finishes, which is the reference's inbox rule.
+                this.drain_inbox(&id, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Report one `/compact` outcome that never opened a request.
+    ///
+    /// The reference returns these from the command handler, so they are
+    /// `command/done` rows: the transcript keeps the card and the outcome text.
+    fn refuse_compact(&mut self, id: &str, key: &'static str, error: bool, cx: &mut Context<Self>) {
+        let text = self.state.lang.tr(key);
+        self.state.begin_compact_command(id);
+        self.state.finish_compact_command(id, text.clone(), error);
+        self.state.notice(text);
+        cx.notify();
+    }
+
+    /// The typed `/compact` line: the command takes NO arguments.
+    ///
+    /// The shipped handler refuses a non-empty trimmed input with its usage
+    /// line and `kind: "error"`; a bare invocation is the ordinary command.
+    /// Routing it here means `/compact` is a command even while the slash card
+    /// is closed, instead of being sent to the model as prose.
+    pub(crate) fn compact_command_line(&mut self, args: &str, cx: &mut Context<Self>) {
+        if !args.trim().is_empty() {
+            let Some(id) = self.state.active_id.clone() else {
+                return;
+            };
+            self.refuse_compact(&id, "slash.compactUsage", true, cx);
+            return;
+        }
+        self.compact_history(cx);
+    }
+
     fn clear_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -1308,7 +1928,7 @@ impl Shell {
     ///
     /// The composer, the scheduler and the queue all reach a turn this way, so
     /// the agent they run is built and accounted for identically.
-    fn spawn_turn(
+    pub(crate) fn spawn_turn(
         &mut self,
         id: String,
         input: react::llm::Content,
@@ -1331,11 +1951,15 @@ impl Shell {
             self.state.notice(why);
             return;
         }
-        let built = crate::caps::build_agent(
+        let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
             &self.state.settings,
             &self.state.vault,
             &choice,
             &self.state.mcp,
+            &id,
+            &id,
+            self.state.subagents.clone(),
+            self.state.jobs.clone(),
         );
         if let Some(error) = &built.credential_error {
             // No turn opens without a credential: a locked vault names itself
@@ -1344,15 +1968,33 @@ impl Shell {
             return;
         }
         self.state.set_tools_schema(built.tools_schema_chars);
+        self.state.set_policy(built.policy.clone());
         let agent = built.agent;
         // The agent shares this store with its `update_plan` tool, so the
         // to-do panel reads the running plan through it.
         self.state.attach_plan(&id, agent.plan());
         let cap = self.state.effective_in(&id).tool_output_cap;
+        // The automatic trigger prices the request the turn is about to send:
+        // the history window plus the rows `begin_turn_in` just appended (the
+        // user prompt and its empty assistant placeholder). Above the workspace
+        // ceiling the runner condenses the oldest balanced span before the turn
+        // streams, which is the reference's pressure listener.
+        let auto_retain = {
+            // The two rows begin_turn_in appended, borrowed rather than cloned:
+            // this runs on every send.
+            let appended: &[crate::model::ChatMessage] = self
+                .state
+                .store
+                .session(&id)
+                .map(|session| &session.messages[session.messages.len().saturating_sub(2)..])
+                .unwrap_or(&[]);
+            self.state
+                .auto_compaction_retain(&id, &transcript, appended, budget)
+        };
         let rx = self
             .state
             .runner
-            .spawn(&id, agent, input, transcript, budget, cap);
+            .spawn(&id, agent, input, transcript, auto_retain, cap);
         self.pump(id, rx, cx);
     }
 
@@ -1384,7 +2026,9 @@ impl Shell {
         let Some(queued) = self.state.pop_inbox(id) else {
             return;
         };
-        let input = crate::state::turn_input(&queued.text, &queued.attachments);
+        let plan = self.state.plan_mode(id);
+        let request = crate::state::turn_text(&queued.text, plan);
+        let input = crate::state::turn_input(&request, &queued.attachments);
         let display = crate::state::display_text(&queued.text, &queued.attachments);
         let Some((transcript, budget)) = self.state.begin_turn_in(id, &display) else {
             return;
@@ -1424,7 +2068,9 @@ impl Shell {
                 self.state.settings.global.toggle_schedule(&id);
                 continue;
             };
-            let input = crate::state::turn_input(&task.prompt, &[]);
+            let plan = self.state.plan_mode(&task.session_id);
+            let request = crate::state::turn_text(&task.prompt, plan);
+            let input = crate::state::turn_input(&request, &[]);
             self.spawn_turn(task.session_id.clone(), input, transcript, budget, cx);
             self.state.settings.global.mark_schedule_ran(&id, now);
         }
@@ -1456,7 +2102,9 @@ impl Shell {
 
         cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv().await {
-                let terminal = matches!(&event, AgentEvent::Done | AgentEvent::Error(_));
+                let done = matches!(&event, AgentEvent::Done);
+                let failed = matches!(&event, AgentEvent::Error(_));
+                let terminal = done || failed;
                 let session_id = id.clone();
                 let _ = this.update(cx, |shell, cx| {
                     shell.state.apply_event(&session_id, event);
@@ -1467,10 +2115,18 @@ impl Shell {
                     // whatever waited behind it can start.
                     let _ = this.update(cx, |shell, cx| {
                         shell.state.finish_plan(&session_id);
+                        shell.state.persist_subagents();
                         // A finished turn can append trajectory rows, so a page
                         // the trace had exhausted is worth asking for again.
                         shell.trace_done = false;
                         shell.drain_inbox(&session_id, cx);
+                        // An armed goal keeps going: a completed round starts the
+                        // next one, and a failed round disarms rather than looping.
+                        if failed {
+                            shell.disarm_goal_on_error(&session_id, cx);
+                        } else {
+                            shell.continue_goal(&session_id, cx);
+                        }
                     });
                     break;
                 }
@@ -1480,6 +2136,7 @@ impl Shell {
             // queue behind it still belongs to the reader.
             let _ = this.update(cx, |shell, cx| {
                 shell.state.finish_plan(&id);
+                shell.state.persist_subagents();
                 shell.trace_done = false;
                 shell.drain_inbox(&id, cx);
                 cx.notify();
@@ -1922,6 +2579,9 @@ impl Shell {
             // would store the copy from before the drag. The commit is what
             // moves the draft into the document and writes it.
             let _ = self.state.commit_settings();
+            // The drag kept the previous width's row heights so it could stay
+            // cheap; now that the width is settled, measure them exactly once.
+            self.transcript_layout.get_mut().request_remeasure();
         }
         cx.notify();
     }
@@ -1966,9 +2626,10 @@ impl Shell {
         });
         if armed {
             self.jobs_arm = None;
-            let live = self.state.is_streaming(id);
-            self.state.stop(id);
-            if !live {
+            // The stop is the roster's own kill: it marks the job and signals
+            // the whole process group. A job that already settled reports
+            // false, which is the reference's failed phase.
+            if !self.state.jobs.kill(id) {
                 self.jobs_arm = Some(super::header::JobArm {
                     id: id.to_string(),
                     phase: super::header::JobPhase::Failed,
@@ -2002,11 +2663,109 @@ impl Shell {
     /// which is the only state in which the trigger, and so the popover, can be
     /// drawn.
     pub(crate) fn tick_jobs(&mut self, at: std::time::Instant, cx: &mut Context<Self>) {
-        let live = !self.state.background_jobs().is_empty();
+        // The roster's version is what makes a settlement repaint once. A
+        // running job also needs the tick for its elapsed figure; a settled
+        // roster with nothing expanded is idle-cheap.
+        let version = self.state.jobs.version();
+        let live = self.state.has_running_jobs();
+        let changed = version != self.jobs_counts_version;
+        if changed {
+            self.refresh_jobs_snapshot();
+            self.prune_job_output_cache();
+        }
+        let subagents = self
+            .state
+            .subagent_runs()
+            .iter()
+            .any(|run| run.status.is_running());
+        if self.state.subagent.is_some() {
+            self.state.refresh_subagent_preview();
+        }
+        self.state.persist_subagents();
         let expired = self.expire_job_arm(at);
-        if live || expired {
+        if live || changed || subagents || expired {
             cx.notify();
         }
+    }
+
+    /// Resolve the chip counts once per roster version or session switch, so
+    /// the header does not walk the job roster on every frame.
+    pub(crate) fn refresh_jobs_snapshot(&mut self) {
+        let version = self.state.jobs.version();
+        let active = self.state.active_id.clone();
+        if version == self.jobs_counts_version && active == self.jobs_counts_for {
+            return;
+        }
+        self.jobs_counts = self.state.job_counts();
+        self.jobs_counts_for = active;
+        self.jobs_counts_version = version;
+    }
+
+    /// Re-read the output of every expanded row, rebuilding a cached string
+    /// only when its ring moved. The popover calls this once per frame; a
+    /// static row compares two integers and copies nothing.
+    pub(crate) fn refresh_job_output_cache(&mut self) {
+        if !self.jobs_open || self.jobs_expanded.is_empty() {
+            self.jobs_output_cache.clear();
+            return;
+        }
+        let ids: Vec<String> = self.jobs_expanded.iter().cloned().collect();
+        for id in ids {
+            match self.state.jobs.output_state(&id) {
+                Some((bytes, dropped)) => {
+                    let stale = self
+                        .jobs_output_cache
+                        .get(&id)
+                        .is_none_or(|(held, gone, _, _)| *held != bytes || *gone != dropped);
+                    if stale {
+                        if let Some(output) = self.state.jobs.output_for(&id) {
+                            self.jobs_output_cache.insert(
+                                id,
+                                (
+                                    output.bytes,
+                                    output.dropped,
+                                    output.text,
+                                    output.dropped > 0,
+                                ),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    self.jobs_output_cache.remove(&id);
+                }
+            }
+        }
+        let expanded = self.jobs_expanded.clone();
+        self.jobs_output_cache.retain(|id, _| expanded.contains(id));
+    }
+
+    /// The exact text the expanded row draws, or None when it is not expanded.
+    pub(crate) fn job_output_cached(&self, id: &str) -> Option<(&str, bool)> {
+        self.jobs_output_cache
+            .get(id)
+            .map(|(_, _, text, truncated)| (text.as_str(), *truncated))
+    }
+
+    /// Drop cache entries for jobs the active session no longer lists.
+    fn prune_job_output_cache(&mut self) {
+        let live: std::collections::HashSet<String> = self
+            .state
+            .active_id
+            .as_deref()
+            .map(|id| {
+                self.state
+                    .jobs
+                    .list_for_session(id)
+                    .into_iter()
+                    .map(|job| job.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.jobs_expanded.retain(|id| live.contains(id));
+        let expanded = self.jobs_expanded.clone();
+        self.jobs_output_cache
+            .retain(|id, _| live.contains(id) && expanded.contains(id));
     }
 
     /// The reference's own fold resolution: below the 1024 breakpoint the
@@ -2071,6 +2830,10 @@ impl Shell {
             // Same as the content width: the value lives in the draft now, so
             // only a commit writes it where the next launch reads it.
             let _ = self.state.commit_settings();
+            // A wider or narrower sidebar changes the conversation column and
+            // with it the transcript's width, so the rows are measured once
+            // here, after the drag rather than on every pointer move.
+            self.transcript_layout.get_mut().request_remeasure();
         }
         cx.notify();
     }
@@ -2364,18 +3127,23 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The hero editor carries its own placeholder, so re-point the composer
-        // whenever the phase flips - a session switch, a new chat, the first
-        // turn. Updating it only on the flip keeps the notify out of the frame
-        // loop it would otherwise join.
-        let hero = self.state.hero_phase();
-        if hero != self.placeholder_hero {
-            self.placeholder_hero = hero;
-            let placeholder = if hero {
-                "composer.heroPlaceholder"
-            } else {
-                "composer.placeholder"
-            };
+        // The chip counts are cached per roster version, and the expanded job
+        // rows read their output here: an unchanged ring costs two integers
+        // instead of a 64 KiB copy.
+        self.refresh_jobs_snapshot();
+        self.refresh_job_output_cache();
+        // The composer's placeholder names the current mode: plan mode asks for
+        // a task to plan, a blank session asks what to build, a conversation
+        // asks for the next message. Updating it only on the flip keeps the
+        // notify out of the frame loop it would otherwise join.
+        let placeholder = match self.claim_hint() {
+            Some(claim) => claim,
+            None if self.state.active_plan_mode() => "composer.planPlaceholder",
+            None if self.state.hero_phase() => "composer.heroPlaceholder",
+            None => "composer.placeholder",
+        };
+        if placeholder != self.placeholder_key {
+            self.placeholder_key = placeholder;
             let text = self.state.lang.tr(placeholder);
             self.composer
                 .update(cx, |input, cx| input.set_placeholder(text, window, cx));
@@ -2383,8 +3151,16 @@ impl Render for Shell {
         // The rail's container is the conversation column, which is the window
         // less the sidebar (`@container (width <= 900px)` hides the frame).
         // The frame's width is what the reference's auto-collapse measures, so
-        // record it before the fold is resolved.
+        // record it before the fold is resolved. The height caps the slash
+        // palette's list, so it is recorded from the same measurement.
         self.viewport_w = window.viewport_size().width.as_f32();
+        self.viewport_h = window.viewport_size().height.as_f32();
+        // The key interceptor has no window, so a Tab completion hands its text
+        // here and the frame that owns a window writes it. This is the same
+        // pattern the hero placeholder uses.
+        if let Some(text) = self.slash.pending.take() {
+            self.set_composer_text(&text, window, cx);
+        }
         let sidebar = if self.sidebar_folded() {
             px(0.0)
         } else {
@@ -2413,10 +3189,16 @@ impl Render for Shell {
             self.tail_max = None;
             self.following_tail = true;
             self.think_open.clear();
+            self.compaction_open.clear();
             self.rail_hover = None;
             self.rail_active = None;
             self.state.stat_open = false;
             self.state.meter_open = false;
+            // The jobs popover is scoped to the session it was opened in, so a
+            // switch closes it and drops the expanded rows with its output.
+            self.jobs_open = false;
+            self.jobs_expanded.clear();
+            self.jobs_output_cache.clear();
         }
         let scroll = &self.transcript_scroll;
         let offset = scroll.offset().y;
@@ -2520,7 +3302,7 @@ impl Render for Shell {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 // A seam only follows a HELD pointer. The strip is 8px wide, so a
                 // horizontal drag leaves it at once; the release then went to
-                // whatever is under the pointer and the strip's own mouse-up
+                // whatever was under the pointer and the strip's own mouse-up
                 // never ran, leaving the drag armed - the panel kept resizing
                 // after the button came up. Reading the button off the move is
                 // the state a drag cannot drift out of.
@@ -2530,6 +3312,18 @@ impl Render for Shell {
                 this.drag_sidebar_width(event.position.x.as_f32(), cx);
                 this.drag_right_panel_width(event.position.x.as_f32(), cx);
             }))
+            // The reference dismisses its jobs popover on a press outside it.
+            // The trigger and the panel stop their own presses, so this only
+            // sees a click that landed elsewhere.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    if this.jobs_open {
+                        this.jobs_open = false;
+                        cx.notify();
+                    }
+                }),
+            )
             // The session menu's accelerators, handled at the frame so they work
             // from wherever focus sits inside it - the composer, a field, a list
             // row. They act on the session the reader has open.
@@ -2562,6 +3356,10 @@ impl Render for Shell {
             })
             .child(self.render_main_column(cx))
             .when_some(self.render_right_panel(cx), |root, panel| root.child(panel))
+            // The jobs popover is painted after every column so it can overlap
+            // the transcript and the right panel; it is opened from the header
+            // chip and closes on an outside press (below) or a session switch.
+            .when_some(self.render_jobs_panel(cx), |root, panel| root.child(panel))
             // The reference draws its DragHandle over the seam at z-index 11,
             // and only while the column is expanded.
             .when(!self.sidebar_folded(), |root| {

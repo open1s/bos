@@ -10,87 +10,101 @@ use gpui_kit::component::{
     ActiveTheme as _,
 };
 use gpui_kit::*;
-use std::sync::atomic::{AtomicU32, Ordering};
-static PAGE_C: AtomicU32 = AtomicU32::new(0xFFFFFF);
-static SIDEBAR_BG_C: AtomicU32 = AtomicU32::new(0xE8E9EB);
-static SELECTED_ROW_C: AtomicU32 = AtomicU32::new(0xDDDEE1);
-static NEW_SESSION_FILL_C: AtomicU32 = AtomicU32::new(0xF2F3F5);
-static HOVER_C: AtomicU32 = AtomicU32::new(0xE1E3E7);
-static TEXT_C: AtomicU32 = AtomicU32::new(0x0F1115);
-static MUTED_C: AtomicU32 = AtomicU32::new(0x6B7280);
-static FAINT_C: AtomicU32 = AtomicU32::new(0x8A90A0);
-static BORDER_SOFT_C: AtomicU32 = AtomicU32::new(0xEBEBEB);
-static BORDER_C: AtomicU32 = AtomicU32::new(0xD8DBE2);
-static BORDER_STRONG_C: AtomicU32 = AtomicU32::new(0xB3B8C4);
-static ACCENT_C: AtomicU32 = AtomicU32::new(0x4176E6);
-static ERROR_C: AtomicU32 = AtomicU32::new(0xD23F3F);
-static SUCCESS_C: AtomicU32 = AtomicU32::new(0x2F9E63);
-static WARN_C: AtomicU32 = AtomicU32::new(0xB8860B);
-static USER_BUBBLE_C: AtomicU32 = AtomicU32::new(0xF2F3F5);
-/// The page background.
-pub(crate) fn page() -> u32 {
-    PAGE_C.load(Ordering::Relaxed)
+use std::cell::Cell;
+
+/// The 16 colour tokens the views read.
+///
+/// One value per token, kept together so a sync swaps the whole palette in one
+/// store instead of leaving half of it on the previous theme.
+#[derive(Clone, Copy)]
+struct Palette {
+    page: u32,
+    sidebar_bg: u32,
+    selected_row: u32,
+    new_session_fill: u32,
+    hover: u32,
+    text: u32,
+    muted: u32,
+    faint: u32,
+    border_soft: u32,
+    border: u32,
+    border_strong: u32,
+    accent: u32,
+    error: u32,
+    success: u32,
+    warn: u32,
+    user_bubble: u32,
 }
-/// The sidebar background.
-pub(crate) fn sidebar_bg() -> u32 {
-    SIDEBAR_BG_C.load(Ordering::Relaxed)
+
+impl Palette {
+    /// The shipped light palette, which is also a thread's initial value.
+    const SHIPPED: Self = Self {
+        page: 0xFFFFFF,
+        sidebar_bg: 0xE8E9EB,
+        selected_row: 0xDDDEE1,
+        new_session_fill: 0xF2F3F5,
+        hover: 0xE1E3E7,
+        text: 0x0F1115,
+        muted: 0x6B7280,
+        faint: 0x8A90A0,
+        border_soft: 0xEBEBEB,
+        border: 0xD8DBE2,
+        border_strong: 0xB3B8C4,
+        accent: 0x4176E6,
+        error: 0xD23F3F,
+        success: 0x2F9E63,
+        warn: 0xB8860B,
+        user_bubble: 0xF2F3F5,
+    };
 }
-/// The highlighted session row.
-pub(crate) fn selected_row() -> u32 {
-    SELECTED_ROW_C.load(Ordering::Relaxed)
+
+thread_local! {
+    /// The palette most recently synced ON THIS THREAD.
+    ///
+    /// A GPUI App is not Send and paints on one thread, so in the app a thread's
+    /// palette is the window's palette. Keeping it per-thread is what makes it
+    /// per-CONTEXT for the test binary: cargo runs each case on its own thread,
+    /// and a process-global copy let one test's `theme::apply` repaint another
+    /// test's frame - the race this file's own test note warns about.
+    static PALETTE: Cell<Palette> = const { Cell::new(Palette::SHIPPED) };
 }
-/// The New Session button fill.
-pub(crate) fn new_session_fill() -> u32 {
-    NEW_SESSION_FILL_C.load(Ordering::Relaxed)
+
+/// Read one token from the current thread's palette.
+macro_rules! palette_token {
+    ($name:ident, $field:ident) => {
+        /// The colour token, from the palette last synced on this thread.
+        pub(crate) fn $name() -> u32 {
+            PALETTE.with(|cell| cell.get().$field)
+        }
+    };
 }
-/// The hovered row fill.
-pub(crate) fn hover() -> u32 {
-    HOVER_C.load(Ordering::Relaxed)
+
+palette_token!(page, page);
+palette_token!(sidebar_bg, sidebar_bg);
+palette_token!(selected_row, selected_row);
+palette_token!(new_session_fill, new_session_fill);
+palette_token!(hover, hover);
+palette_token!(text, text);
+palette_token!(muted, muted);
+palette_token!(faint, faint);
+palette_token!(border_soft, border_soft);
+palette_token!(border, border);
+palette_token!(border_strong, border_strong);
+palette_token!(accent, accent);
+palette_token!(error, error);
+palette_token!(success, success);
+palette_token!(warn, warn);
+palette_token!(user_bubble, user_bubble);
+
+/// The reference's plan-chip fill, `--dsw-alias-state-business-tertiary`.
+///
+/// The kit exposes no "business" state family, so it is derived the way the
+/// reference's own token is: the business primary (bsh's accent) mixed 12% into
+/// the page. The chip's text is the business primary itself.
+pub(crate) fn accent_soft() -> u32 {
+    blend(accent(), page(), 0.88)
 }
-/// Primary text.
-pub(crate) fn text() -> u32 {
-    TEXT_C.load(Ordering::Relaxed)
-}
-/// Secondary text.
-pub(crate) fn muted() -> u32 {
-    MUTED_C.load(Ordering::Relaxed)
-}
-/// The faintest text.
-pub(crate) fn faint() -> u32 {
-    FAINT_C.load(Ordering::Relaxed)
-}
-/// Hairline borders.
-pub(crate) fn border_soft() -> u32 {
-    BORDER_SOFT_C.load(Ordering::Relaxed)
-}
-/// Field and card borders.
-pub(crate) fn border() -> u32 {
-    BORDER_C.load(Ordering::Relaxed)
-}
-/// The strongest border, for dialogs and outer frames.
-pub(crate) fn border_strong() -> u32 {
-    BORDER_STRONG_C.load(Ordering::Relaxed)
-}
-/// The action colour.
-pub(crate) fn accent() -> u32 {
-    ACCENT_C.load(Ordering::Relaxed)
-}
-/// Errors.
-pub(crate) fn error() -> u32 {
-    ERROR_C.load(Ordering::Relaxed)
-}
-/// Successes.
-pub(crate) fn success() -> u32 {
-    SUCCESS_C.load(Ordering::Relaxed)
-}
-/// Warnings.
-pub(crate) fn warn() -> u32 {
-    WARN_C.load(Ordering::Relaxed)
-}
-/// The user bubble fill.
-pub(crate) fn user_bubble() -> u32 {
-    USER_BUBBLE_C.load(Ordering::Relaxed)
-}
+
 /// How much wider the composer card is than the chat column.
 ///
 /// Measured: `--dsh-composer-card-max-width` is the chat content width plus
@@ -644,8 +658,15 @@ pub(crate) const RIGHT_PANEL_MAX_SHARE: f32 = 0.5;
 /// The resolved panel width for a viewport: the stored width, or the larger
 /// of the panel default and half the viewport when the reader asked for the
 /// panel to fill what it can.
-pub(crate) fn right_panel_width_at(viewport: f32, stored: Option<f32>) -> f32 {
-    resolve_right_panel_width(stored).min(viewport * RIGHT_PANEL_MAX_SHARE)
+///
+/// The share is of what is LEFT for the panel, which the caller has already
+/// taken the sidebar out of. Capping against the WINDOW let the panel and the
+/// sidebar add up to more than the window - a 480 panel and a 280 sidebar
+/// inside a 700 window overflowed the row on the right, so the panel's own
+/// right edge (and the editor drawn to it) landed off screen. The share still
+/// means what it meant: the panel never eats more than half of its own space.
+pub(crate) fn right_panel_width_at(available: f32, stored: Option<f32>) -> f32 {
+    resolve_right_panel_width(stored).min((available * RIGHT_PANEL_MAX_SHARE).max(RIGHT_PANEL_MIN))
 }
 
 /// The right panel's row height, matching the sidebar's own rows so a
@@ -831,27 +852,31 @@ pub(crate) const INSET: f32 = 64.0;
 /// `--ds-font-family-code`. A tool call and its result are written in it, the
 /// way the reference renders those rows.
 pub(crate) const CODE_FONT: &str = "Menlo";
-/// Copy the active kit theme into the token accessors.
+/// Copy the active kit theme into this thread's token block.
 pub(crate) fn sync(cx: &App) {
     let t = cx.theme();
     let fg = t.foreground;
     let bg = t.background;
-    put(&PAGE_C, t.background);
-    put(&SIDEBAR_BG_C, t.sidebar);
-    put(&SELECTED_ROW_C, t.sidebar_accent);
-    put(&NEW_SESSION_FILL_C, t.secondary);
-    put(&HOVER_C, t.secondary_hover);
-    put(&TEXT_C, fg);
-    put(&MUTED_C, t.muted_foreground);
-    put(&FAINT_C, t.muted_foreground);
-    put(&BORDER_SOFT_C, t.border);
-    put_u32(&BORDER_C, mix(fg, bg, 0.16));
-    put_u32(&BORDER_STRONG_C, mix(fg, bg, 0.32));
-    put(&ACCENT_C, t.primary);
-    put(&ERROR_C, t.danger);
-    put(&SUCCESS_C, t.success);
-    put(&WARN_C, t.warning);
-    put(&USER_BUBBLE_C, t.secondary);
+    PALETTE.with(|cell| {
+        cell.set(Palette {
+            page: hx(t.background),
+            sidebar_bg: hx(t.sidebar),
+            selected_row: hx(t.sidebar_accent),
+            new_session_fill: hx(t.secondary),
+            hover: hx(t.secondary_hover),
+            text: hx(fg),
+            muted: hx(t.muted_foreground),
+            faint: hx(t.muted_foreground),
+            border_soft: hx(t.border),
+            border: mix(fg, bg, 0.16),
+            border_strong: mix(fg, bg, 0.32),
+            accent: hx(t.primary),
+            error: hx(t.danger),
+            success: hx(t.success),
+            warn: hx(t.warning),
+            user_bubble: hx(t.secondary),
+        });
+    });
 }
 /// Switch between the kit's light and dark palettes.
 pub(crate) fn toggle(window: &mut Window, cx: &mut App) {
@@ -939,17 +964,10 @@ pub(crate) fn mode(cx: &App) -> &'static str {
     cx.theme().mode.name()
 }
 
-fn put_u32(cell: &AtomicU32, value: u32) {
-    cell.store(value, Ordering::Relaxed);
-}
-
-fn put(cell: &AtomicU32, color: Hsla) {
+fn hx(color: Hsla) -> u32 {
     let c = Rgba::from(color);
     let ch = |v: f32| ((v.clamp(0.0, 1.0)) * 255.0).round() as u32;
-    cell.store(
-        (ch(c.r) << 16) | (ch(c.g) << 8) | ch(c.b),
-        Ordering::Relaxed,
-    );
+    (ch(c.r) << 16) | (ch(c.g) << 8) | ch(c.b)
 }
 
 /// Blend two packed colours in RGB space; `t` is the share of `b`.
@@ -1013,6 +1031,26 @@ mod tests {
         assert_eq!(super::body_line_at(14), 24.0, "the body line height");
         assert_eq!(super::body_line_at(22), 32.0, "and it moves with the delta");
         assert_eq!(super::table_line_at(22), 29.0, "22px + the secondary delta");
+    }
+
+    /// A palette synced on one thread cannot repaint another.
+    ///
+    /// The tokens were 16 process-global atomics, and cargo runs every case on
+    /// its own thread, so one case's `theme::apply` rewrote the colours of a
+    /// frame another case was asserting on. Each thread now carries its own
+    /// block, which is the test binary's per-context value and the app's real
+    /// value too (a GPUI App paints on one thread).
+    #[test]
+    fn the_palette_is_per_thread() {
+        let shipped = super::Palette::SHIPPED.page;
+        super::PALETTE.with(|cell| {
+            let mut palette = super::Palette::SHIPPED;
+            palette.page = 0x010203;
+            cell.set(palette);
+        });
+        let other = std::thread::spawn(super::page).join().expect("the thread");
+        assert_eq!(super::page(), 0x010203, "this thread keeps its own palette");
+        assert_eq!(other, shipped, "a new thread starts from the shipped one");
     }
 
     #[test]

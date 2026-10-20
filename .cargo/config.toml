@@ -9,3 +9,20 @@ rustflags = ["-C", "link-args=-Wl,-undefined,dynamic_lookup"]
 [env]
 # Let maturin auto-detect Python
 PYO3_USE_ABI3 = "0"
+
+# Cap the test harness default at four threads.
+#
+# bsh's 212 `#[gpui::test]` cases each boot a whole GPUI app and window, and
+# a window costs ~4s of SYSTEM cpu (measured: one trivial test is 7.4s wall,
+# 2.0s user, 4.4s sys). Left at one thread per core the run parks all of them
+# in the window server at once - the shell_tests binary alone measured 380s
+# user + 206s sys inside 85s of wall time, i.e. ~7 cores saturated - which
+# starves every other process on the machine for the length of the run.
+# Four keeps the same wall time (190s vs 182s at the default) while leaving
+# the rest of the machine responsive. Override per run with
+# `RUST_TEST_THREADS=<n> cargo test ...`.
+RUST_TEST_THREADS = "4"
+
+[http]
+proxy = "http://127.0.0.1:9981"
+timeout = 120

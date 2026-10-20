@@ -533,6 +533,10 @@ pub(crate) struct ModelEntry {
 /// prompt and no step cap** - the mounted plugins own the model-visible tools
 /// and prompt sections, and the model is session and workspace state. A shipped
 /// preset publishes no `name`: the dictionaries carry its copy.
+///
+/// BSH adds two fields the reference does not have: `policy`, a Rego module the
+/// preset may contribute, and `trusted`, the reader's explicit permission for
+/// it to apply. An untrusted policy is ignored, never failed.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -550,6 +554,293 @@ pub(crate) struct Preset {
     /// Roster order.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) order: Option<i64>,
+    /// Authorization tier for display and risk grouping:
+    /// inspect, review, research, docs, code or admin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) level: Option<String>,
+    /// The permission ceiling this preset grants: read_only,
+    /// workspace_write or full_access. The session's permission is capped by
+    /// this value; a preset can never raise it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) permission: Option<String>,
+    /// Read roots, workspace-relative. None inherits the workspace; an empty
+    /// list allows no reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) read: Option<Vec<String>>,
+    /// Write roots, workspace-relative. None inherits the workspace; an empty
+    /// list allows no writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) write: Option<Vec<String>>,
+    /// Denied path roots. Always unioned with the baseline and never widened.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) deny: Vec<String>,
+    /// Egress allowlist. None inherits the workspace allowlist; an empty list
+    /// denies all egress; entries are intersected with the workspace list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) egress: Option<Vec<String>>,
+    /// Whether hosted web search is offered. None inherits the model setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) web_search: Option<bool>,
+    /// Whether the turn may issue tool calls in parallel. None inherits the
+    /// workspace/model setting; PTC sets it true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parallel_tool_calls: Option<bool>,
+    /// Optional MCP tool allowlist, in namespace_tool form. None allows every
+    /// tool of the allowed servers; an empty list allows none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mcp_tools: Option<Vec<String>>,
+    /// Binary-shipped Rego module ids. These are trusted by construction and
+    /// are combined with the custom policy below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) builtin_policy: Vec<String>,
+    /// Whether the custom policy is required for the preset to be usable:
+    /// required or advisory. Required and untrusted makes the preset refuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) policy_mode: Option<String>,
+    /// Explicit tool allowlist, or none for every tool the mounted bundles
+    /// and the permission mode provide. An empty list mounts no tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tools: Option<Vec<String>>,
+    /// Explicit skill allowlist, or none for every enabled skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) skills: Option<Vec<String>>,
+    /// Explicit MCP server allowlist (server namespaces), or none for every
+    /// server the pool connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mcps: Option<Vec<String>>,
+    /// Explicit installed-extension allowlist (settings ids), or none for
+    /// every enabled extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) extensions: Option<Vec<String>>,
+    /// The LLM persona/system prompt this preset applies, or none for the
+    /// workspace prompt. When set it replaces the workspace prompt for the
+    /// chats that select this preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system_prompt: Option<String>,
+    /// A Rego module this preset contributes as a policy source.
+    ///
+    /// It may only NARROW the workspace/baseline policy: composition is
+    /// intersection. It is ignored until [`Preset::trusted`] is true, so a
+    /// preset edited into the settings file cannot silently take authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) policy: Option<String>,
+    /// Whether the reader trusted this preset to contribute its policy.
+    ///
+    /// A preset with no policy needs no trust. The agent-presets pane writes
+    /// this flag through an explicit control; the value is persisted with the
+    /// preset declaration.
+    #[serde(default)]
+    pub(crate) trusted: bool,
+}
+
+impl Preset {
+    /// Render this declaration as a full, annotated TOML template.
+    ///
+    /// Every field is present: a set field is an active assignment, an unset one
+    /// is a commented example. Opening the editor and saving without changing a
+    /// commented field therefore keeps "inherit" instead of silently turning it
+    /// into a value, while a reader can still discover every option. The output
+    /// parses back into the same declaration; a multi-line `policy` or
+    /// `system_prompt` normalizes its trailing newline.
+    pub(crate) fn to_toml_template(&self) -> String {
+        let mut out = String::from(
+            "# Custom agent preset. Every field is optional.\n\
+             # A commented field is unset and inherits the workspace/default behaviour.\n\
+             # Remove an assignment to inherit again. Save the preset, then Save settings.\n\
+             \n[preset]\n\n",
+        );
+
+        out.push_str("# Display name and one-line description on the roster card.\n");
+        push_optional_string(&mut out, "name", self.name.as_deref(), "\"Custom\"");
+        push_optional_string(
+            &mut out,
+            "description",
+            self.description.as_deref(),
+            "\"What this preset is for.\"",
+        );
+        out.push_str(
+            "# Roster order (lower first) and authorization tier:\n\
+             # inspect | review | research | docs | code | admin.\n",
+        );
+        push_optional_order(&mut out, self.order);
+        push_optional_string(&mut out, "level", self.level.as_deref(), "\"read-only\"");
+        out.push('\n');
+
+        out.push_str(
+            "# Permission ceiling: read-only | workspace-write | danger-full-access.\n\
+             # It caps the session's permission and can never raise it.\n",
+        );
+        push_optional_string(
+            &mut out,
+            "permission",
+            self.permission.as_deref(),
+            "\"read-only\"",
+        );
+        out.push_str("# Workspace-relative roots. Unset inherits the workspace; [] allows none.\n");
+        push_optional_list(&mut out, "read", self.read.as_deref(), "[\".\"]");
+        push_optional_list(
+            &mut out,
+            "write",
+            self.write.as_deref(),
+            "[\"docs\", \"README.md\"]",
+        );
+        out.push_str("# Always denied, unioned with the baseline's .git/.bsh rules.\n");
+        push_list(&mut out, "deny", &self.deny);
+        out.push('\n');
+
+        out.push_str("# Complete mounted plugin set: shell, files, plan. [] mounts nothing.\n");
+        push_list(&mut out, "plugins", &self.plugins);
+        out.push_str(
+            "# Tool allowlist. Unset inherits the mounted bundles; [] mounts no tools.\n\
+             # Vocabulary: bash, job_output, job_kill, read_file, write_file, edit_file,\n\
+             # list_dir, update_plan, subagent. run_in_background follows bash.\n",
+        );
+        push_optional_list(
+            &mut out,
+            "tools",
+            self.tools.as_deref(),
+            "[\"read_file\", \"list_dir\", \"update_plan\"]",
+        );
+        out.push('\n');
+
+        out.push_str(
+            "# Egress allowlist. Unset inherits the workspace list; [] denies all egress.\n",
+        );
+        push_optional_list(&mut out, "egress", self.egress.as_deref(), "[]");
+        out.push_str(
+            "# Hosted web search and parallel tool calls. Unset inherits the\n\
+             # model/workspace setting.\n",
+        );
+        push_optional_bool(&mut out, "web_search", self.web_search, "true");
+        push_optional_bool(
+            &mut out,
+            "parallel_tool_calls",
+            self.parallel_tool_calls,
+            "false",
+        );
+        out.push('\n');
+
+        out.push_str(
+            "# Allowlists for skills, MCP servers, MCP tools (namespace_tool) and\n\
+             # installed extensions. Unset inherits; [] allows none.\n",
+        );
+        push_optional_list(&mut out, "skills", self.skills.as_deref(), "[\"alpha\"]");
+        push_optional_list(&mut out, "mcps", self.mcps.as_deref(), "[\"github\"]");
+        push_optional_list(
+            &mut out,
+            "mcp_tools",
+            self.mcp_tools.as_deref(),
+            "[\"github_search\"]",
+        );
+        push_optional_list(
+            &mut out,
+            "extensions",
+            self.extensions.as_deref(),
+            "[\"dsh-echo\"]",
+        );
+        out.push('\n');
+
+        out.push_str("# The LLM persona. Unset keeps the workspace prompt.\n");
+        push_optional_text(
+            &mut out,
+            "system_prompt",
+            self.system_prompt.as_deref(),
+            "\"You are terse.\"",
+        );
+        out.push('\n');
+
+        out.push_str(
+            "# Binary-shipped Rego modules: deny-secrets, read-only, no-shell,\n\
+             # no-egress, docs-only, deny-git-writes.\n",
+        );
+        push_list(&mut out, "builtin_policy", &self.builtin_policy);
+        out.push_str(
+            "# Custom Rego policy (narrowing only). policy_mode: required | advisory.\n\
+             # required + untrusted refuses the preset; advisory ignores an untrusted\n\
+             # module.\n",
+        );
+        push_optional_string(
+            &mut out,
+            "policy_mode",
+            self.policy_mode.as_deref(),
+            "\"advisory\"",
+        );
+        out.push_str(&format!("trusted = {}\n", self.trusted));
+        push_policy(&mut out, self.policy.as_deref());
+        out
+    }
+}
+
+/// One TOML basic string, quoted and escaped by the TOML serializer itself.
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+/// One active string array.
+fn push_list(out: &mut String, key: &str, values: &[String]) {
+    let items: Vec<String> = values.iter().map(|item| toml_string(item)).collect();
+    out.push_str(&format!("{key} = [{}]\n", items.join(", ")));
+}
+
+/// A set string, or the commented example that documents it.
+fn push_optional_string(out: &mut String, key: &str, value: Option<&str>, example: &str) {
+    match value {
+        Some(value) => out.push_str(&format!("{key} = {}\n", toml_string(value))),
+        None => out.push_str(&format!("# {key} = {example}\n")),
+    }
+}
+
+/// A set array, or the commented example that documents it.
+fn push_optional_list(out: &mut String, key: &str, value: Option<&[String]>, example: &str) {
+    match value {
+        Some(values) => push_list(out, key, values),
+        None => out.push_str(&format!("# {key} = {example}\n")),
+    }
+}
+
+/// A set boolean, or the commented example that documents it.
+fn push_optional_bool(out: &mut String, key: &str, value: Option<bool>, example: &str) {
+    match value {
+        Some(value) => out.push_str(&format!("{key} = {value}\n")),
+        None => out.push_str(&format!("# {key} = {example}\n")),
+    }
+}
+
+/// A set order, or the commented example that documents it.
+fn push_optional_order(out: &mut String, value: Option<i64>) {
+    match value {
+        Some(value) => out.push_str(&format!("order = {value}\n")),
+        None => out.push_str("# order = 100\n"),
+    }
+}
+
+/// A set string, using a readable literal block when it spans lines.
+fn push_optional_text(out: &mut String, key: &str, value: Option<&str>, example: &str) {
+    match value {
+        Some(text) if text.contains('\n') && !text.contains("'''") => {
+            out.push_str(&format!("{key} = '''\n{}\n'''\n", text.trim_end()));
+        }
+        Some(text) => out.push_str(&format!("{key} = {}\n", toml_string(text))),
+        None => out.push_str(&format!("# {key} = {example}\n")),
+    }
+}
+
+/// A set Rego module as a literal block, or the commented example to copy.
+fn push_policy(out: &mut String, policy: Option<&str>) {
+    match policy {
+        Some(rego) if !rego.contains("'''") => {
+            out.push_str(&format!("policy = '''\n{}\n'''\n", rego.trim_end()));
+        }
+        Some(rego) => out.push_str(&format!("policy = {}\n", toml_string(rego))),
+        None => out.push_str(
+            "# policy = '''\n\
+             # package policy.custom\n\
+             #\n\
+             # # rule: custom-allow\n\
+             # verdict := {\"allow\": true, \"rule\": \"custom-allow\"}\n\
+             # '''\n",
+        ),
+    }
 }
 
 /// The presets the binary itself ships, as (id, mounted plugins).
@@ -559,8 +850,97 @@ pub(crate) struct Preset {
 /// against a host-plane PTC runtime this deployment composes nowhere, and
 /// `cordis` is a Cordis plugin composition with no counterpart, so shipping
 /// either would be a name with nothing behind it.
-const BUILT_IN_PRESETS: &[(&str, &[&str])] =
-    &[("standard", &["shell", "files", "plan"]), ("minimal", &[])];
+const BUILT_IN_PRESET_IDS: &[&str] = &["standard", "ptc", "creator", "read-only"];
+
+/// The sensitive path prefixes every shipped narrow preset denies.
+fn preset_deny_paths() -> Vec<String> {
+    [".git", ".bsh", ".env", "secrets", ".ssh", ".aws"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The shipped declaration for an id, or none.
+///
+/// Standard mounts the three core bundles and inherits every tool, skill, MCP
+/// server, extension and the workspace prompt. Minimal starts from no tools at
+/// all: no bundles, and explicit empty allowlists for skills, MCP servers and
+/// extensions so it stays a chat-only preset.
+fn built_in_preset(id: &str) -> Option<Preset> {
+    let standard_bundles = vec!["shell".to_string(), "files".to_string(), "plan".to_string()];
+    let standard_guard = || {
+        (
+            preset_deny_paths(),
+            vec!["deny-secrets".to_string(), "deny-git-writes".to_string()],
+        )
+    };
+    match id {
+        "standard" => Some(Preset {
+            level: Some("standard".to_string()),
+            plugins: standard_bundles,
+            deny: standard_guard().0,
+            builtin_policy: standard_guard().1,
+            order: Some(10),
+            ..Preset::default()
+        }),
+        "ptc" => Some(Preset {
+            level: Some("ptc".to_string()),
+            plugins: standard_bundles,
+            deny: standard_guard().0,
+            builtin_policy: standard_guard().1,
+            web_search: Some(true),
+            parallel_tool_calls: Some(true),
+            system_prompt: Some(
+                "You run programmatic tool calling. Batch independent tool calls, then filter, organize, deduplicate, count and summarize the results. Prefer one plan over many tiny round trips.".to_string(),
+            ),
+            order: Some(20),
+            ..Preset::default()
+        }),
+        "creator" => Some(Preset {
+            level: Some("creator".to_string()),
+            plugins: standard_bundles,
+            deny: standard_guard().0,
+            builtin_policy: standard_guard().1,
+            web_search: Some(true),
+            system_prompt: Some(
+                "You extend bsh through conversation. Inspect the existing extension and settings formats before writing; create extension packages, skills and presets inside the workspace, and keep changes reversible.".to_string(),
+            ),
+            order: Some(40),
+            ..Preset::default()
+        }),
+        "read-only" => Some(Preset {
+            level: Some("read-only".to_string()),
+            permission: Some("read-only".to_string()),
+            read: Some(vec![".".to_string()]),
+            write: Some(Vec::new()),
+            deny: preset_deny_paths(),
+            plugins: vec!["files".to_string(), "plan".to_string()],
+            tools: Some(vec![
+                "read_file".to_string(),
+                "list_dir".to_string(),
+                "update_plan".to_string(),
+            ]),
+            skills: Some(Vec::new()),
+            mcps: Some(Vec::new()),
+            extensions: Some(Vec::new()),
+            egress: Some(Vec::new()),
+            web_search: Some(true),
+            builtin_policy: vec![
+                "deny-secrets".to_string(),
+                "read-only".to_string(),
+                "no-shell".to_string(),
+                "no-egress".to_string(),
+            ],
+            policy_mode: Some("required".to_string()),
+            system_prompt: Some(
+                "You are a read-only analyst. Read the workspace and search the web when useful, but never modify files, run commands, or claim you did. If a change is needed, propose it and stop.".to_string(),
+            ),
+            order: Some(50),
+            ..Preset::default()
+        }),
+        _ => None,
+    }
+}
 
 /// The providers the binary itself knows how to speak to, as
 /// (id, display name, default base URL, default protocol).
@@ -619,7 +999,7 @@ pub(crate) fn built_in(id: &str) -> Option<(&'static str, &'static str, &'static
 /// A declaration with the same id replaces the shipped row rather than adding
 /// to it, so a pane asks this to tell a restored default from a user's own.
 pub(crate) fn ships_preset(id: &str) -> bool {
-    BUILT_IN_PRESETS.iter().any(|(name, _)| *name == id)
+    BUILT_IN_PRESET_IDS.contains(&id)
 }
 
 /// The standard an installed package was read as.
@@ -921,13 +1301,7 @@ impl GlobalSettings {
         if let Some(declared) = self.presets.get(id) {
             return Some(declared.clone());
         }
-        BUILT_IN_PRESETS
-            .iter()
-            .find(|(name, _)| *name == id)
-            .map(|(_, plugins)| Preset {
-                plugins: plugins.iter().map(|p| (*p).to_string()).collect(),
-                ..Preset::default()
-            })
+        built_in_preset(id)
     }
 
     /// Every preset id on the roster, shipped ones included, in display order.
@@ -937,9 +1311,12 @@ impl GlobalSettings {
             .iter()
             .map(|(id, preset)| (preset.order.unwrap_or(0), id.clone()))
             .collect();
-        for (id, _) in BUILT_IN_PRESETS {
+        for id in BUILT_IN_PRESET_IDS {
             if !self.presets.contains_key(*id) {
-                rows.push((0, (*id).to_string()));
+                let order = built_in_preset(id)
+                    .and_then(|preset| preset.order)
+                    .unwrap_or(0);
+                rows.push((order, (*id).to_string()));
             }
         }
         rows.sort();
@@ -1335,6 +1712,130 @@ updated_at = 2
             reloaded, original,
             "a save/load round trip must not lose a field"
         );
+    }
+
+    /// One TOML file wrapper, so a template can be parsed as the editor does.
+    #[derive(serde::Deserialize)]
+    struct TemplateFile {
+        preset: Preset,
+    }
+
+    /// The editor's template documents every field, and a fully populated
+    /// declaration survives a render/parse round trip. Multi-line strings
+    /// normalize their trailing newline by construction.
+    #[test]
+    fn the_preset_template_lists_every_field_and_round_trips() {
+        let preset = Preset {
+            plugins: vec!["shell".to_string(), "files".to_string()],
+            name: Some("Full".to_string()),
+            description: Some("All fields set".to_string()),
+            order: Some(7),
+            level: Some("code".to_string()),
+            permission: Some("workspace-write".to_string()),
+            read: Some(vec![".".to_string()]),
+            write: Some(vec!["docs".to_string()]),
+            deny: vec![".git".to_string()],
+            egress: Some(vec!["1.2.3.4".to_string()]),
+            web_search: Some(false),
+            parallel_tool_calls: Some(true),
+            mcp_tools: Some(vec!["github_search".to_string()]),
+            builtin_policy: vec!["deny-secrets".to_string()],
+            policy_mode: Some("advisory".to_string()),
+            tools: Some(vec!["read_file".to_string(), "subagent".to_string()]),
+            skills: Some(vec!["alpha".to_string()]),
+            mcps: Some(vec!["github".to_string()]),
+            extensions: Some(vec!["dsh-echo".to_string()]),
+            system_prompt: Some("You are terse.\nAnswer briefly.".to_string()),
+            policy: Some(
+                "package policy.custom\n\n# rule: custom-allow\nverdict := {\"allow\": true, \"rule\": \"custom-allow\"}\n"
+                    .to_string(),
+            ),
+            trusted: true,
+        };
+        let text = preset.to_toml_template();
+        for key in [
+            "name",
+            "description",
+            "order",
+            "level",
+            "permission",
+            "read",
+            "write",
+            "deny",
+            "plugins",
+            "tools",
+            "egress",
+            "web_search",
+            "parallel_tool_calls",
+            "skills",
+            "mcps",
+            "mcp_tools",
+            "extensions",
+            "system_prompt",
+            "builtin_policy",
+            "policy_mode",
+            "trusted",
+            "policy",
+        ] {
+            assert!(
+                text.lines().any(|line| {
+                    line.trim_start_matches("# ")
+                        .trim_start()
+                        .starts_with(&format!("{key} ="))
+                }),
+                "the template must document {key}:\n{text}"
+            );
+        }
+        let parsed: TemplateFile = toml::from_str(&text).expect("the template parses");
+        let normalized =
+            |value: &Option<String>| value.as_ref().map(|text| format!("{}\n", text.trim_end()));
+        let mut expected = preset.clone();
+        expected.system_prompt = normalized(&preset.system_prompt);
+        expected.policy = normalized(&preset.policy);
+        assert_eq!(parsed.preset, expected, "the template round-trips:\n{text}");
+    }
+
+    /// A commented field is what keeps "inherit" intact: a default preset
+    /// renders every optional field as a comment, and parses back unchanged.
+    #[test]
+    fn the_preset_template_keeps_unset_fields_unset() {
+        let preset = Preset::default();
+        let text = preset.to_toml_template();
+        for key in [
+            "name",
+            "description",
+            "order",
+            "level",
+            "permission",
+            "read",
+            "write",
+            "egress",
+            "web_search",
+            "parallel_tool_calls",
+            "mcp_tools",
+            "policy_mode",
+            "tools",
+            "skills",
+            "mcps",
+            "extensions",
+            "system_prompt",
+            "policy",
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("# {key} ="))),
+                "an unset {key} must stay a commented example:\n{text}"
+            );
+        }
+        for key in ["plugins", "deny", "builtin_policy", "trusted"] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{key} ="))),
+                "{key} has a concrete default and must be active:\n{text}"
+            );
+        }
+        let parsed: TemplateFile = toml::from_str(&text).expect("the template parses");
+        assert_eq!(parsed.preset, preset);
     }
 
     #[test]

@@ -36,6 +36,10 @@ pub enum AgentError {
     /// Serialization or deserialization failed.
     #[error("Serialization error: {0}")]
     Serde(String),
+
+    /// The caller cancelled the operation.
+    #[error("operation stopped by the caller")]
+    Stopped,
 }
 
 impl From<SkillError> for AgentError {

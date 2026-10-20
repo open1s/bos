@@ -52,6 +52,82 @@ const SELF_DOUBLE_MS: u64 = 400;
 /// spot; a press on the far side of the blank area is a different intention.
 const SELF_DOUBLE_PX: f32 = 6.0;
 
+/// The top-left a document-anchored overlay sits at, in the editor's own
+/// coordinates.
+///
+/// The kit reports text boxes in WINDOW space - `range_to_bounds` is
+/// `text_bounds().origin + glyph offset` - while `absolute()` places a child
+/// against its PARENT. The editor's box is that parent, so subtracting its
+/// origin is the whole conversion. Without it the offset was added twice
+/// (once by the kit, once by the panel sitting to the window's right), which
+/// is why the note affordance only showed while the editor happened to start
+/// at the window's left edge.
+///
+/// The point is the middle of the part of `bounds` the document SHOWS: the
+/// control sits on the text the reader marked rather than hanging off one
+/// edge, and it is pulled back inside the editor so a selection on the last
+/// line cannot push it out of the document.
+fn document_point(bounds: Bounds<Pixels>, editor: Bounds<Pixels>, size: f32) -> (f32, f32) {
+    // A long line runs past the right edge, so the horizontal middle is taken
+    // from the slice the editor actually shows; the vertical middle is the
+    // line's own, which `anchor_line` has already picked from the visible rows.
+    let visible = bounds.intersect(&editor);
+    let center_x = if f32::from(visible.size.width) > 0.0 {
+        visible.center().x
+    } else {
+        bounds.center().x
+    };
+    let x = f32::from(center_x - editor.origin.x) - size / 2.0;
+    let y = f32::from(bounds.center().y - editor.origin.y) - size / 2.0;
+    let max_x = (f32::from(editor.size.width) - size - 4.0).max(4.0);
+    let max_y = (f32::from(editor.size.height) - size - 4.0).max(4.0);
+    (x.clamp(4.0, max_x), y.clamp(4.0, max_y))
+}
+
+/// The line the note affordance rides: the middle of the part of the selection
+/// the viewport shows, as a one-based line number, or `None` when the marks are
+/// entirely outside the laid-out rows.
+///
+/// The whole-range box cannot be the answer. The kit lays out only the visible
+/// lines, so a selection whose first or last line has scrolled out arrives
+/// with a degenerate box - which made the + vanish the moment the reader
+/// scrolled, even while most of the marked text was still on screen. Picking a
+/// line that IS laid out and asking for that line's own slice keeps the
+/// control on the document: it follows the selection through the scroll, and it
+/// goes only when the marks do.
+pub(crate) fn anchor_line(
+    text: &str,
+    range: &std::ops::Range<usize>,
+    rows: &std::ops::Range<usize>,
+) -> Option<usize> {
+    if range.start >= range.end || rows.start >= rows.end {
+        return None;
+    }
+    let first = crate::notes::line_at_offset(text, range.start);
+    // The end of a selection that stops at a line break points at the next
+    // line, which would name a row the reader never marked.
+    let last = crate::notes::line_at_offset(text, range.end.saturating_sub(1));
+    // `rows` is zero-based and half-open; the line numbers are one-based.
+    let visible_first = rows.start + 1;
+    let visible_last = rows.end;
+    let from = first.max(visible_first);
+    let to = last.min(visible_last);
+    if from > to {
+        return None;
+    }
+    Some(from + (to - from) / 2)
+}
+
+/// [`document_point`]'s conversion for an overlay that keeps the measured
+/// box's own top-left instead of centring on it - a note card hangs UNDER its
+/// anchor line, so it wants the line's bottom edge, not its middle.
+fn document_origin(bounds: Bounds<Pixels>, editor: Bounds<Pixels>) -> (f32, f32) {
+    (
+        f32::from(bounds.origin.x - editor.origin.x),
+        f32::from(bounds.origin.y - editor.origin.y),
+    )
+}
+
 /// The wording the panel reports an I/O failure with.
 ///
 /// The reference prints its own `fileReferences` error text beside the row
@@ -512,6 +588,13 @@ impl Shell {
         let width = self.right_panel_w();
         let column = div()
             .debug_selector(|| String::from("right-panel"))
+            // The panel is a fixed column BESIDE a flex-1 main column, so a
+            // width that does not fit does not shrink the chat - the row
+            // overflows the window and the panel's right edge lands off screen,
+            // taking its controls with it. The resolved width cannot know its
+            // sibling, so the floor of a real panel is enforced here, where the
+            // flex row is the thing doing the fitting.
+            .min_w(px(theme::RIGHT_PANEL_MIN))
             .w(px(width))
             .h_full()
             .flex_shrink_0()
@@ -1926,6 +2009,10 @@ impl Shell {
         let tops: Vec<(usize, f32)> = {
             let state = editor.read(cx);
             let text = state.value();
+            // The kit answers in window space; the cards are positioned inside
+            // the editor, so its own box is what they are measured against. No
+            // box yet means no first layout, and no card can be placed either.
+            let editor_box = state.text_bounds();
             self.files
                 .notes
                 .on(rel)
@@ -1935,10 +2022,8 @@ impl Shell {
                     let line = note.line?;
                     let start = crate::notes::line_start_offset(text.as_ref(), line);
                     let bounds = state.range_to_bounds(&(start..start))?;
-                    Some((
-                        index,
-                        f32::from(bounds.origin.y) + f32::from(bounds.size.height) + 6.0,
-                    ))
+                    let (_, y) = document_origin(bounds, editor_box?);
+                    Some((index, y + f32::from(bounds.size.height) + 6.0))
                 })
                 .collect()
         };
@@ -2014,9 +2099,29 @@ impl Shell {
         if range.start >= range.end {
             return None;
         }
-        let bounds = state.range_to_bounds(&range)?;
-        let top = f32::from(bounds.origin.y) + f32::from(bounds.size.height) - 9.0;
-        let left = (f32::from(bounds.origin.x) - 26.0).max(4.0);
+        // The control rides a line of the selection that the viewport actually
+        // holds, so it follows the marks through a scroll instead of vanishing
+        // with them. `anchor_line` names that line; its own slice of the
+        // selection is the box to centre on, and `document_point` converts that
+        // box's window coordinates into the editor's.
+        let text = state.value();
+        let rows = state.visible_row_range()?;
+        let line = anchor_line(text.as_ref(), &range, &rows)?;
+        let start = crate::notes::line_start_offset(text.as_ref(), line);
+        let line_end = text.as_ref()[start..]
+            .find('\n')
+            .map(|at| start + at)
+            .unwrap_or(text.len());
+        // The part of the selection on that line. A selection that stops at the
+        // line break leaves an empty slice there, so the line's first character
+        // becomes the anchor instead of a zero-width box.
+        let from = range.start.max(start).min(line_end);
+        let to = range.end.min(line_end).max(from + 1).min(text.len());
+        let bounds = state
+            .range_to_bounds(&(from..to))
+            .or_else(|| state.range_to_bounds(&(start..(start + 1).min(text.len()))))?;
+        let editor = state.text_bounds()?;
+        let (left, top) = document_point(bounds, editor, 20.0);
         Some(
             div()
                 .debug_selector(|| String::from("files-comment-plus"))
@@ -2035,12 +2140,11 @@ impl Shell {
                 .cursor_pointer()
                 .hover(|s| s.opacity(0.85))
                 .child(icon(IconName::Plus, 12.0, theme::page()))
-                // KNOWN GAP: a press on this does not route while the editor holds
-                // the pointer - it takes the mouse-down for its own selection, and
-                // neither a click handler nor a mouse-down one on this sibling
-                // wins. The action below is what the button calls, and it is
-                // verified; making the button itself reachable needs an overlay
-                // layer, not another handler here.
+                // The press routes: this is the control a reader actually presses,
+                // and doing so is what surfaced the duplicate-field crash. The
+                // harness cannot drive it - a synthetic press through the focused
+                // editor lands on the editor - so the tests call the action it
+                // fires and assert the control is on screen and on the selection.
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.open_comment_card(cx);
                 }))
@@ -2074,19 +2178,24 @@ impl Shell {
         };
 
         // The card hangs directly under the lines being commented, the way the
-        // reference puts it: `range_to_bounds` gives the selection's own box
-        // inside the editor, so the card starts one gap below its bottom edge.
-        // No clamp - clamping is what put it back at the pane's top, far from the
-        // lines the reader had just picked.
+        // reference puts it: `range_to_bounds` gives the selection's own box, so
+        // the card starts one gap below its bottom edge. The box is in window
+        // space, so it is converted into the editor's before it is used as a
+        // `top()` - the same conversion the + uses.
         let selection_bottom = self
             .files
             .active_tab()
             .and_then(|tab| tab.editor.clone())
             .and_then(|editor| {
                 let state = editor.read(cx);
-                state.range_to_bounds(&state.selected_range())
-            })
-            .map(|bounds| f32::from(bounds.origin.y) + f32::from(bounds.size.height) + 8.0);
+                let selection = state.range_to_bounds(&state.selected_range())?;
+                let editor_box = state.text_bounds()?;
+                // The BOTTOM edge, from the normalised corners: the kit's box
+                // has a negative height when the range ends on a shorter line,
+                // and adding that put the card above the lines it describes.
+                let bottom = selection.origin.y.max(selection.bottom_right().y);
+                Some(f32::from(bottom - editor_box.origin.y) + 8.0)
+            });
         let send_rel = rel.to_path_buf();
         let can_send = !self.files.note_text.read(cx).value().trim().is_empty();
         div()
@@ -2220,85 +2329,92 @@ impl Shell {
             .flex_col()
             .gap(px(6.0))
             // The pin field is always there, so adding a note is one click and
-            // one keystroke away rather than a mode the reader has to enter.
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .debug_selector(|| String::from("files-note-field"))
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                Textarea::new(&self.files.note_text)
-                                    .appearance(false)
-                                    .h(px(56.0)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("files-note-add")
-                            .debug_selector(|| String::from("files-note-add"))
-                            .h(px(28.0))
-                            .px(px(10.0))
-                            .rounded(px(theme::RADIUS_SM))
-                            .border_1()
-                            .border_color(rgb(theme::border()))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(theme::hover())))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(4.0))
-                            .child(icon(IconName::Plus, 13.0, theme::text()))
-                            .child(
-                                txt(
-                                    lang.tr("right.files.noteAdd"),
-                                    theme::CHIP_SIZE,
-                                    theme::text(),
-                                )
-                                .font_weight(FontWeight::MEDIUM),
-                            )
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.pin_note(window, cx);
-                            })),
-                    )
-                    // The review goes to the model: the notes a reader wrote are a
-                    // prompt they should not have to retype. Only offered when
-                    // there is something to send.
-                    .when(!notes.is_empty(), |row| {
-                        let send_rel = rel.to_path_buf();
-                        row.child(
+            // one keystroke away rather than a mode the reader has to enter -
+            // except while the review card is up, because the card hosts the
+            // SAME `note_text` entity. A frame that draws one entity twice
+            // duplicates its accessibility node, which gpui-pre panics on in a
+            // debug build: that was the crash a press on the + hit, since
+            // raising the card also raises this drawer. One draft, one field.
+            .when(!self.files.comment_open, |drawer| {
+                drawer.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
                             div()
-                                .id("files-note-send")
-                                .debug_selector(|| String::from("files-note-send"))
+                                .debug_selector(|| String::from("files-note-field"))
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    Textarea::new(&self.files.note_text)
+                                        .appearance(false)
+                                        .h(px(56.0)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("files-note-add")
+                                .debug_selector(|| String::from("files-note-add"))
                                 .h(px(28.0))
                                 .px(px(10.0))
                                 .rounded(px(theme::RADIUS_SM))
-                                .bg(rgb(theme::accent()))
+                                .border_1()
+                                .border_color(rgb(theme::border()))
                                 .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::hover())))
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap(px(4.0))
-                                .child(icon(IconName::ArrowUp, 13.0, theme::page()))
+                                .child(icon(IconName::Plus, 13.0, theme::text()))
                                 .child(
                                     txt(
-                                        lang.tr("right.files.noteSend"),
+                                        lang.tr("right.files.noteAdd"),
                                         theme::CHIP_SIZE,
-                                        theme::page(),
+                                        theme::text(),
                                     )
                                     .font_weight(FontWeight::MEDIUM),
                                 )
-                                .on_click(cx.listener(move |this, _event, window, cx| {
-                                    this.send_review_to_chat(&send_rel, window, cx);
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.pin_note(window, cx);
                                 })),
                         )
-                    }),
-            )
+                        // The review goes to the model: the notes a reader wrote are a
+                        // prompt they should not have to retype. Only offered when
+                        // there is something to send.
+                        .when(!notes.is_empty(), |row| {
+                            let send_rel = rel.to_path_buf();
+                            row.child(
+                                div()
+                                    .id("files-note-send")
+                                    .debug_selector(|| String::from("files-note-send"))
+                                    .h(px(28.0))
+                                    .px(px(10.0))
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .bg(rgb(theme::accent()))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(icon(IconName::ArrowUp, 13.0, theme::page()))
+                                    .child(
+                                        txt(
+                                            lang.tr("right.files.noteSend"),
+                                            theme::CHIP_SIZE,
+                                            theme::page(),
+                                        )
+                                        .font_weight(FontWeight::MEDIUM),
+                                    )
+                                    .on_click(cx.listener(move |this, _event, window, cx| {
+                                        this.send_review_to_chat(&send_rel, window, cx);
+                                    })),
+                            )
+                        }),
+                )
+            })
             .children(notes.iter().enumerate().map(|(index, note)| {
                 let anchor = note.anchor();
                 let text = note.text.clone();
@@ -2415,7 +2531,22 @@ impl Shell {
                                     .w_full()
                                     .flex()
                                     .flex_col()
-                                    .child(Editor::new(editor).h_full().w_full()),
+                                    // The parent every document-anchored overlay is
+                                    // measured against: the kit answers text boxes in
+                                    // WINDOW space, so the overlay container has to be
+                                    // the editor box for `document_point` subtraction
+                                    // to be the whole conversion.
+                                    .relative()
+                                    .child(Editor::new(editor).h_full().w_full())
+                                    // Pinned notes, the + that follows a selection and
+                                    // the review card come LAST so they paint over the
+                                    // document: added before the editor they were drawn
+                                    // UNDER it, and the editor swallowed their presses.
+                                    .children(self.notes_inline(&rel, cx))
+                                    .children(self.comment_plus(cx))
+                                    .when(self.files.comment_open, |fill| {
+                                        fill.child(self.comment_card(&rel, cx))
+                                    }),
                             ),
                     ),
                 (None, Kind::Image) => {
@@ -2469,14 +2600,6 @@ impl Shell {
                         .line_height(px(18.0)),
                     ),
             })
-            // The + that follows a selection, and the review card under it. Both
-            // come LAST so they paint over the document: added before the editor
-            // they were drawn UNDER it, and the editor swallowed their presses.
-            .children(self.notes_inline(&rel, cx))
-            .children(self.comment_plus(cx))
-            .when(self.files.comment_open, |editor| {
-                editor.child(self.comment_card(&rel, cx))
-            })
     }
 }
 
@@ -2500,20 +2623,26 @@ impl Shell {
     }
 
     /// The right panel column width for this frame, resolved from the reader's
-    /// dragged preference against the viewport, the same way the sidebar's is.
+    /// dragged preference against the space the row has left, the same way the
+    /// sidebar's is.
     pub(crate) fn right_panel_w(&self) -> f32 {
+        // The panel shares the row with the sidebar and the chat, so the space
+        // it may claim is the window less the sidebar - not the window. The
+        // reference's own `rightPanel: cols.right` and `sidebar: cols.sidebar`
+        // sum to the same quantity: the share is a share of the row.
+        let taken = if self.sidebar_folded() {
+            0.0
+        } else {
+            self.sidebar_w()
+        };
+        let available = (self.viewport_w - taken).max(theme::RIGHT_PANEL_MIN);
         if self.right.maximized {
             // Every pixel the sidebar is not using: the maximised panel is the
             // reader saying "this is the thing I am working in", and the header
             // still carries the control that gives the space back.
-            let taken = if self.sidebar_folded() {
-                0.0
-            } else {
-                self.sidebar_w()
-            };
-            return (self.viewport_w - taken).max(theme::RIGHT_PANEL_MIN);
+            return available;
         }
-        theme::right_panel_width_at(self.viewport_w, self.right.user_w)
+        theme::right_panel_width_at(available, self.right.user_w)
     }
 
     /// Open a pane from the Start screen or the tab strip.
@@ -3243,7 +3372,7 @@ fn size_label(size: u64, dir: bool) -> String {
 mod tests {
     use gpui_kit::{FontStyle, FontWeight, Keystroke, Modifiers};
 
-    use super::{grid_fonts, terminal_key_bytes};
+    use super::{anchor_line, grid_fonts, terminal_key_bytes};
 
     fn key(key: &str, key_char: Option<&str>) -> Keystroke {
         Keystroke {
@@ -3268,6 +3397,27 @@ mod tests {
             terminal_key_bytes(&key("s", Some("ß"))),
             Some("ß".as_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn the_anchor_line_is_the_middle_of_the_part_in_view() {
+        let text = "one\ntwo\nthree\nfour\nfive\nsix\n";
+        // Lines two through four: "two" up to the start of "five".
+        let range = text.find("two").unwrap()..text.find("five").unwrap();
+        // Everything laid out: the middle of lines 2..=4.
+        assert_eq!(anchor_line(text, &range, &(0..10)), Some(3));
+        // The first line scrolled above the viewport; the middle is unchanged.
+        assert_eq!(anchor_line(text, &range, &(1..10)), Some(3));
+        // Only the tail is laid out: the middle of what is left is line 4.
+        assert_eq!(anchor_line(text, &range, &(3..10)), Some(4));
+        // The whole selection scrolled past: no line to ride.
+        assert_eq!(anchor_line(text, &range, &(5..10)), None);
+    }
+
+    #[test]
+    fn an_empty_selection_has_no_anchor() {
+        assert_eq!(anchor_line("one\ntwo\n", &(0..0), &(0..10)), None);
+        assert_eq!(anchor_line("one\ntwo\n", &(3..3), &(0..10)), None);
     }
 
     #[test]

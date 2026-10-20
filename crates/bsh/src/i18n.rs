@@ -121,6 +121,90 @@ mod tests {
         );
     }
 
+    /// Every compact outcome is the shipped command's own wording, in both
+    /// locales, with the UI rows the reference localizes taken from its zh
+    /// dictionary rather than translated by hand.
+    #[test]
+    fn compact_outcomes_use_the_reference_wording() {
+        assert_eq!(
+            tr(Lang::En, "slash.compactBusy"),
+            "Compaction is unavailable because this process has an active compaction, or the agent is not idle."
+        );
+        assert_eq!(
+            tr(Lang::En, "slash.nothingToCompact"),
+            "No compactable history yet."
+        );
+        assert_eq!(
+            tr(Lang::En, "slash.compacted"),
+            "Compacted {count} history items (~{tokens} tokens)."
+        );
+        assert_eq!(
+            tr(Lang::En, "slash.compactUsage"),
+            "Usage: /compact (no arguments)"
+        );
+        assert_eq!(
+            tr(Lang::En, "slash.compactSummary"),
+            "Compaction could not produce a useful summary. The attempt is recorded in the session log."
+        );
+        assert_eq!(
+            tr(Lang::En, "slash.compactCancelled"),
+            "Compaction cancelled."
+        );
+        assert_eq!(
+            tr(Lang::En, "slash.compactChanged"),
+            "The history selected for compaction changed before it could be replaced. The attempt is recorded in the session log."
+        );
+        assert_eq!(
+            tr(Lang::En, "slash.compactCommit"),
+            "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying."
+        );
+        assert_eq!(
+            tr(Lang::En, "slash.compactPersistence"),
+            "Compaction finished, but the session could not be saved."
+        );
+        // The two rows the reference ships a Chinese dictionary for.
+        assert_eq!(tr(Lang::Zh, "slash.compacting"), "正在压缩…");
+        assert_eq!(
+            tr(Lang::Zh, "slash.compacted"),
+            "已压缩 {count} 条历史记录（约 {tokens} tokens）"
+        );
+        assert_eq!(
+            tr(Lang::En, "msg.compaction.running"),
+            "Compacting context…"
+        );
+        assert_eq!(tr(Lang::Zh, "msg.compaction.running"), "正在压缩…");
+        assert_eq!(tr(Lang::Zh, "msg.compaction.expand"), "点击查看压缩摘要");
+        assert_eq!(tr(Lang::Zh, "msg.compaction.unavailable"), "压缩摘要不可用");
+        assert_eq!(tr(Lang::En, "msg.compaction.commandTitle"), "compact");
+        assert_eq!(tr(Lang::Zh, "msg.compaction.commandTitle"), "compact");
+        // The finished line carries the two counts the shipped command
+        // reports: replaced history items and the shadowed span's tokens.
+        assert_eq!(
+            tr_args(
+                Lang::En,
+                "slash.compacted",
+                &[("count", "4".to_string()), ("tokens", "500".to_string())],
+            ),
+            "Compacted 4 history items (~500 tokens)."
+        );
+        assert_eq!(
+            tr_args(
+                Lang::Zh,
+                "slash.compacted",
+                &[("count", "4".to_string()), ("tokens", "500".to_string())],
+            ),
+            "已压缩 4 条历史记录（约 500 tokens）"
+        );
+        assert_eq!(
+            tr_args(
+                Lang::En,
+                "msg.compaction.completed",
+                &[("items", "4".to_string()), ("tokens", "500".to_string())],
+            ),
+            "Compacted 4 history items (~500 tokens)"
+        );
+    }
+
     #[test]
     fn navigation_keys_resolve_in_both_locales() {
         for key in [
@@ -321,6 +405,15 @@ mod tests {
         for key in [
             "settings.mcp",
             "settings.mcpIntro",
+            "settings.mcpSearch",
+            "settings.mcpStatus",
+            "settings.mcpStatusConnected",
+            "settings.mcpStatusFailed",
+            "settings.mcpStatusPending",
+            "settings.mcpStatusOff",
+            "settings.mcpStatusIdle",
+            "settings.mcpToolCount",
+            "settings.mcpToolCountOne",
             "settings.mcpEmpty",
             "settings.mcpAdd",
             "settings.mcpEdit",

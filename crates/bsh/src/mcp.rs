@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent::mcp::{McpClient, McpToolAdapter};
+use agent::policy::{Action, PolicyInput, Target};
 use react::tool::registry::AsyncTool;
 
 use crate::settings::mcp::{McpServer, McpTransport};
@@ -182,6 +183,11 @@ struct Connected {
 pub(crate) struct McpPool {
     servers: HashMap<String, Connected>,
     errors: HashMap<String, String>,
+    /// The tool-boundary gate every HTTP transport asks before a request.
+    ///
+    /// The turn's build installs it; existing connections share the slot, so
+    /// a policy that changes between turns reaches them without a respawn.
+    egress: agent::mcp::http_transport::EgressSlot,
 }
 
 impl McpPool {
@@ -226,7 +232,7 @@ impl McpPool {
                 }
             }
             let name = launch.name.clone();
-            match connect(rt, &launch) {
+            match connect(rt, &launch, &self.egress) {
                 Ok((client, tools)) => {
                     self.servers.insert(
                         name,
@@ -278,6 +284,13 @@ impl McpPool {
     /// Why one server is not connected, when it is not.
     pub(crate) fn error(&self, name: &str) -> Option<&str> {
         self.errors.get(name).map(String::as_str)
+    }
+
+    /// Install the turn's egress gate for every HTTP transport, live or future.
+    pub(crate) fn set_egress_gate(&self, gate: Arc<agent::policy::EgressGate>) {
+        if let Ok(mut slot) = self.egress.lock() {
+            *slot = Some(gate);
+        }
     }
 
     /// Build a pool around already-made tools, without opening a connection.
@@ -535,9 +548,31 @@ fn schema_or_empty(schema: &serde_json::Value) -> serde_json::Value {
 fn connect(
     rt: &tokio::runtime::Runtime,
     launch: &Launch,
+    egress: &agent::mcp::http_transport::EgressSlot,
 ) -> Result<(Arc<McpClient>, Vec<McpTool>), String> {
     // The timeout must be CONSTRUCTED inside the runtime: a timer created
     // without a reactor panics before it can ever be awaited.
+    // A stdio server is a process spawn, so it asks the same policy the shell
+    // does. The extension trust gate has already decided WHICH packages may
+    // contribute a server; this check lets a workspace policy deny the spawn
+    // itself (and records it in the audit).
+    let gate = egress.lock().ok().and_then(|slot| slot.clone());
+    if let (Some(gate), McpTransport::Stdio { .. }) = (&gate, &launch.transport) {
+        let cwd = launch
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let decision = gate.policy().check(
+            &PolicyInput::new("mcp", Action::Spawn, Target::path(cwd))
+                .with_session(gate.session())
+                .with_preset(gate.preset()),
+        );
+        if decision.is_denied() {
+            return Err(gate.policy().refusal(&decision));
+        }
+    }
+
     let outcome = rt.block_on(async {
         tokio::time::timeout(CONNECT_TIMEOUT, async {
             let client = match &launch.transport {
@@ -552,7 +587,9 @@ fn connect(
                         .await
                         .map_err(|error| error.to_string())?
                 }
-                McpTransport::Http { url } => McpClient::connect_http(url.clone()),
+                McpTransport::Http { url } => {
+                    McpClient::connect_http_with_egress(url.clone(), egress.clone())
+                }
             };
             client
                 .initialize()
@@ -635,6 +672,49 @@ mod tests {
         assert!(pool.error("missing").is_some(), "the reason is kept");
         assert_eq!(pool.tools().count(), 0);
         assert_eq!(pool.tool_count("missing"), None);
+    }
+
+    /// A workspace policy can refuse an MCP stdio spawn even after the
+    /// extension trust gate allowed the package: the policy sees the spawn, the
+    /// refusal names its rule, and no child is started.
+    #[test]
+    fn a_workspace_policy_can_refuse_an_mcp_stdio_spawn() {
+        use agent::policy::{
+            baseline_source, EgressGate, PolicyData, PolicySet, PolicySource, SystemResolver,
+        };
+
+        let deny = PolicySource::new(
+            "deny-mcp",
+            r#"package policy.denymcp
+
+# rule: no-mcp-spawn
+verdict := {"allow": false, "rule": "no-mcp-spawn", "reason": "mcp spawns are refused"} if {
+    input.action == "spawn"
+} else := {"allow": true, "rule": "deny-policy-allow"}
+"#,
+        );
+        let set = Arc::new(PolicySet::compile(
+            [baseline_source(), deny],
+            PolicyData::new("/tmp"),
+        ));
+        let gate = Arc::new(EgressGate::new(
+            set,
+            Arc::new(SystemResolver),
+            "session",
+            "preset",
+            "mcp",
+        ));
+        let mut pool = McpPool::default();
+        pool.set_egress_gate(gate);
+        let failed = pool.sync_all(
+            &runtime(),
+            &[stdio("denied", "bsh-never-spawned", true)],
+            &[],
+        );
+        assert_eq!(failed, ["denied"]);
+        let error = pool.error("denied").unwrap_or_default();
+        assert!(error.contains("no-mcp-spawn"), "{error}");
+        assert_eq!(pool.tool_count("denied"), None);
     }
 
     /// The pane shows the exact names the model will call, not just a count.

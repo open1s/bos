@@ -33,7 +33,12 @@ toml = { workspace = true }
 serde_yaml = { workspace = true }
 dashmap = { workspace = true }
 tempfile = "3.8"
-dirs = "6.0.0"
+dirs = "7.0.0"
+# The tool-boundary policy engine. This is the workspace's regorus 0.13
+# (already used by bsh's terminal gate and the resource crate); the `arc`
+# default feature makes Engine Send + Sync, so one precompiled engine can sit
+# behind a Mutex and be shared by the sync tool trait.
+regorus = { workspace = true }
 
 [dev-dependencies]
 ureq = "3.3"

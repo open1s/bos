@@ -11,6 +11,8 @@ use gpui_kit::{
     VisualTestContext, Window,
 };
 
+use agent::Tool as _;
+
 use crate::i18n::Lang;
 use crate::model::{
     ChatMessage, MessageMeta, MessageUsage, PlanItem, PlanStatus, PlanStore, ToolEvent,
@@ -43,6 +45,54 @@ impl Render for Harness {
     }
 }
 
+/// The frame ceiling for a UI assertion that waits on a settled state.
+///
+/// A correct state settles in one or two frames; a predicate that never holds
+/// must fail with its own name rather than hang the suite, so every wait is
+/// bounded instead of retrying forever.
+const DRAW_UNTIL_MAX: usize = 8;
+
+/// Pump frames until `predicate` holds, or fail naming it at the bound.
+///
+/// RULE: a test may not depend on a SINGLE draw after a state change. A click
+/// schedules work rather than finishing it inline - a focus move lands on the
+/// next dispatch, a text run is laid out on the next frame, a scroller measures
+/// after the layout pass, and an editor records its own box during PAINT - so
+/// "click, draw once, assert" passes on an idle machine and loses the frame
+/// under the suite's real load. Wait on the observable here instead.
+///
+/// `what` is the predicate's name in the failure, because a closure cannot
+/// spell its own intent: "the name field renders" fails far more usefully than
+/// an `Option::expect` ten frames later.
+fn draw_until(
+    cx: &mut VisualTestContext,
+    what: &str,
+    max_frames: usize,
+    mut predicate: impl FnMut(&mut VisualTestContext) -> bool,
+) {
+    for _ in 0..max_frames {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if predicate(cx) {
+            return;
+        }
+    }
+    panic!(
+        "draw_until: `{what}` still did not hold after {max_frames} frames. A test may not depend on a single draw after a state change"
+    );
+}
+
+/// Press the same spot twice with NO frame in between.
+///
+/// The tree reads a double-click from wall-clock time (`SELF_DOUBLE_MS`),
+/// not from gpui's synthetic click count, so any work - including a draw, which
+/// can outlast the window when the suite is loaded - between the two presses
+/// turns the gesture into two singles. A test that opens the field this way
+/// must use these two back-to-back presses.
+fn press_twice(cx: &mut VisualTestContext, spot: gpui_kit::Point<gpui_kit::Pixels>) {
+    cx.simulate_click(spot, Modifiers::default());
+    cx.simulate_click(spot, Modifiers::default());
+}
+
 /// Pin the reference's own defaults on a test state.
 ///
 /// `AppState::with_store` loads the real `~/.bos/bsh/settings.toml`, so a
@@ -59,12 +109,96 @@ fn tests_pin_reference_defaults(state: &mut AppState) {
 
 /// A store rooted in the build directory: a test must never touch real sessions.
 /// The label keeps tests apart - they run in parallel inside one process.
-fn scratch_store(label: &str) -> Store {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+fn scratch_home(label: &str) -> std::path::PathBuf {
+    // The process id is part of the path as well as the label: two test
+    // processes (a second checkout's run, or a re-run started while the first
+    // is finishing) otherwise remove and rewrite each other's scratch roots.
+    // `skills_scratch` already carried it.
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target")
-        .join(format!("bsh-scratch-{label}"));
+        .join(format!("bsh-scratch-{label}-{}", std::process::id()))
+}
+
+fn scratch_store(label: &str) -> Store {
+    let dir = scratch_home(label);
     let _ = std::fs::remove_dir_all(&dir);
     Store::open_at(dir)
+}
+
+/// Read both settings documents back from the scratch home, the way a relaunch
+/// does. `Settings::load` reads the user's real paths, so a test that wants the
+/// file it just wrote loads each document from this home instead.
+fn reloaded_settings(home: &std::path::Path) -> crate::settings::Settings {
+    let global = crate::settings::global::GlobalSettings::load(&home.join("settings.toml"))
+        .expect("the global settings reload");
+    let workspace = crate::settings::workspace::WorkspaceSettings::load(
+        &crate::settings::workspace::WorkspaceSettings::path(home),
+    )
+    .expect("the workspace settings reload");
+    crate::settings::Settings {
+        global,
+        workspace,
+        save_root: Some(home.to_path_buf()),
+        ..crate::settings::Settings::default()
+    }
+}
+
+/// The skill names a build from these settings registers, read from the agent
+/// itself rather than from the settings tree that fed it.
+fn built_skill_names(
+    settings: &crate::settings::Settings,
+    vault: &crate::vault::Vault,
+) -> Vec<String> {
+    crate::caps::build_agent(
+        settings,
+        vault,
+        &crate::settings::resolve::SessionChoice::default(),
+        &crate::mcp::McpPool::default(),
+    )
+    .agent
+    .get_skills_content()
+    .into_iter()
+    .map(|(name, _)| name.to_string())
+    .collect()
+}
+
+/// The settings dialog's options-box offset, as the reader's scroll.
+fn settings_offset(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> f32 {
+    let shell = shell.clone();
+    cx.update(|_, cx| f32::from(shell.read(cx).settings_scroll.offset().y))
+}
+
+/// One wheel detent over the options box, followed by the frame it schedules.
+fn wheel_settings_pane(cx: &mut VisualTestContext, dy: f32) {
+    let pane = cx.debug_bounds("settings-pane").expect("the options box");
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            gpui_kit::PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
+                position: pane.center(),
+                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(dy))),
+                modifiers: Modifiers::default(),
+                touch_phase: gpui_kit::TouchPhase::Moved,
+            }),
+            cx,
+        );
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// The first switch of a list that the scrolled pane still shows, by selector.
+fn visible_switch(cx: &mut VisualTestContext, selectors: &[&'static str]) -> &'static str {
+    let pane = cx.debug_bounds("settings-pane").expect("the options box");
+    selectors
+        .iter()
+        .copied()
+        .find(|selector| {
+            cx.debug_bounds(selector).is_some_and(|bounds| {
+                let center = bounds.center();
+                center.y > pane.origin.y + px(8.0)
+                    && center.y < pane.origin.y + pane.size.height - px(8.0)
+            })
+        })
+        .expect("a switch inside the pane")
 }
 
 /// A store with one session carrying that many user turns, so the transcript is
@@ -1274,17 +1408,17 @@ fn the_transcript_takes_the_measured_chrome(cx: &mut TestAppContext) {
         .debug_bounds("turn-rail-track")
         .expect("the rail track renders");
 
+    // The rail rests at its bottom (the newest mark is in view), so the idle
+    // mark asserted here is the one just above it; the frame only BUILDS the
+    // marks in its 420px window.
     let idle = cx
-        .debug_bounds("turn-tick-0")
+        .debug_bounds("turn-tick-58")
         .expect("an idle tick renders");
-    let bar = cx.debug_bounds("turn-bar-0").expect("its bar renders");
+    let bar = cx.debug_bounds("turn-bar-58").expect("its bar renders");
     let last_tick = cx
         .debug_bounds("turn-tick-59")
         .expect("the last tick renders");
     let last_bar = cx.debug_bounds("turn-bar-59").expect("its bar renders");
-    let bubble = cx
-        .debug_bounds("user-bubble-0")
-        .expect("the short bubble renders");
 
     assert_eq!(
         track.size.height,
@@ -1326,6 +1460,24 @@ fn the_transcript_takes_the_measured_chrome(cx: &mut TestAppContext) {
         px(20.0),
         "and the newest mark is the live one at the tail"
     );
+    // The first turn is far above the tail, so the WINDOWED transcript keeps it
+    // as a spacer until it is scrolled to. Scroll there and read the bubble.
+    let shell = cx.update(|_, cx| _harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell.following_tail = false;
+            shell.transcript_scroll.scroll_to_top_of_item(0);
+        });
+    });
+    draw_until(
+        cx,
+        "the first bubble scrolled into view",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("user-bubble-0").is_some(),
+    );
+    let bubble = cx
+        .debug_bounds("user-bubble-0")
+        .expect("the short bubble renders once scrolled to");
     assert_eq!(
         bubble.size.height,
         px(42.0),
@@ -1335,6 +1487,151 @@ fn the_transcript_takes_the_measured_chrome(cx: &mut TestAppContext) {
         bubble.origin.x + bubble.size.width,
         transcript.origin.x + transcript.size.width - px(crate::theme::INSET),
         "the bubble ends at the transcript's content edge"
+    );
+}
+
+/// The compaction marker is a real disclosure: it renders at the checkpoint
+/// event - after the retained tail - with its own summary line, and pressing it
+/// reveals the checkpoint body.
+#[gpui::test]
+fn the_compaction_marker_expands_to_the_checkpoint(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("compact-marker", 6);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            // A compaction folds all but the last message, leaving the
+            // checkpoint as the request's first row.
+            session.compacted = session.messages.len() - 1;
+            session.compactions.push(crate::model::CompactionRecord {
+                at: 0,
+                items: 11,
+                tokens: 4_096,
+                summary: "## Current Work\n\n- the checkpoint body".to_string(),
+                manual: true,
+                // The seeded sessions end on an EMPTY assistant placeholder;
+                // the checkpoint event sorts after the last real message.
+                after: session.messages.len() - 1,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // Scroll to the top so the marker is inside the windowed transcript.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell.following_tail = false;
+            shell.transcript_scroll.scroll_to_top_of_item(0);
+        });
+    });
+    draw_until(cx, "the compaction marker renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("compaction-row-0").is_some()
+    });
+    // Bring the marker into the viewport: it sits at the checkpoint, which with
+    // six turns of history is below the fold.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell.transcript_scroll.scroll_to_top_of_item(0);
+        });
+    });
+    // The reference anchors the marker at the checkpoint event, which is
+    // appended after the whole retained tail: child 0 is the timestamp row,
+    // then one child per message, then the marker. Scrolling to that child is
+    // itself evidence that the marker sits at the end rather than above the
+    // boundary.
+    let checkpoint_child = cx.update(|_, cx| {
+        let session = shell
+            .read(cx)
+            .state
+            .active_session()
+            .cloned()
+            .expect("a session");
+        assert_eq!(
+            session.compactions.first().map(|record| record.after),
+            Some(session.messages.len() - 1),
+            "the record remembers the last real message at commit"
+        );
+        session.messages.len()
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell
+                .transcript_scroll
+                .scroll_to_top_of_item(checkpoint_child);
+        });
+    });
+    draw_until(cx, "the marker is in view", DRAW_UNTIL_MAX, |cx| {
+        let Some(row) = cx.debug_bounds("compaction-row-0") else {
+            return false;
+        };
+        let Some(pane) = cx.debug_bounds("transcript") else {
+            return false;
+        };
+        row.origin.y >= pane.origin.y && row.center().y <= pane.origin.y + pane.size.height
+    });
+    // The header carries the count and the token figure the contract reports.
+    assert!(
+        cx.debug_bounds("compaction-title-0").is_some(),
+        "the marker leads with its title"
+    );
+    assert!(
+        cx.debug_bounds("compaction-summary-0").is_some(),
+        "and its summary line"
+    );
+    assert!(
+        cx.debug_bounds("compaction-body-0").is_none(),
+        "the body is closed until the row is pressed"
+    );
+
+    let row = cx.debug_bounds("compaction-row-0").expect("the marker row");
+    let centre = row.center();
+    // The marker must be inside the viewport to be pressable: the harness
+    // reports a clipped row's bounds happily while a click there is a silent
+    // no-op, so the row is scrolled to first.
+    let transcript = cx.debug_bounds("transcript").expect("the transcript pane");
+    assert!(
+        row.origin.y >= transcript.origin.y && centre.y <= transcript.origin.y + transcript.size.height,
+        "the premise: the marker is inside the transcript viewport, row={row:?} pane={transcript:?}"
+    );
+    cx.simulate_click(centre, Modifiers::default());
+    draw_until(cx, "the marker opened", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("compaction-body-0").is_some()
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).compaction_open.contains(&0)),
+        "the open state is recorded on the shell"
+    );
+    // Pressing again closes it, so the control is a toggle and not one-way.
+    // The body just expanded, which moves the header, so its box is read again
+    // rather than reusing the pre-expansion centre.
+    let reopened = cx.debug_bounds("compaction-row-0").expect("the marker row");
+    cx.simulate_click(reopened.center(), Modifiers::default());
+    draw_until(cx, "the marker closed", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("compaction-body-0").is_none()
+    });
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).compaction_open.contains(&0)),
+        "and the state is cleared"
+    );
+}
+
+/// A session that has never been compacted draws no marker at all, so the row
+/// is evidence of a real compaction rather than of every chat.
+#[gpui::test]
+fn an_uncompacted_session_draws_no_marker(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("compact-none", 4);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("compaction-row-0").is_none(),
+        "no compaction means no marker"
     );
 }
 
@@ -1848,8 +2145,15 @@ fn an_added_provider_carries_its_vault_choice(cx: &mut TestAppContext) {
         })
     });
 
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| this.create_provider("openai", cx));
+    // The provider name is required user input on both add routes, so the test
+    // types one before Create.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.add_display.update(cx, |input, cx| {
+                input.set_value("OpenAI".to_string(), window, cx)
+            });
+            this.create_provider("openai", cx);
+        });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let (carried, text) = cx.update(|_, cx| {
@@ -1882,7 +2186,7 @@ fn an_added_provider_carries_its_vault_choice(cx: &mut TestAppContext) {
 fn vault_with_entry(label: &str, name: &str, secret: &str) -> crate::vault::Vault {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target")
-        .join(format!("bsh-scratch-vault-{label}"));
+        .join(format!("bsh-scratch-vault-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("the scratch directory");
     let mut vault = crate::vault::Vault::new(directory.join("vault.bin"));
@@ -2040,6 +2344,9 @@ fn preset_row_click_selects_the_preset(cx: &mut TestAppContext) {
                 plugins: vec!["bash".to_string()],
                 description: None,
                 order: None,
+                policy: None,
+                trusted: false,
+                ..Default::default()
             },
         );
         state.settings.global.default_preset = "careful".to_string();
@@ -2061,6 +2368,770 @@ fn preset_row_click_selects_the_preset(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let picked = cx.update(|_, cx| shell.read(cx).state.draft().global.default_preset.clone());
     assert_eq!(picked, "", "the default row must clear the selection");
+}
+
+/// A preset that carries a policy has a trust control; pressing it flips the
+/// draft without selecting the preset, and the row click still selects. That is
+/// the preset-as-authority UI: the policy is visible, and it is not applied
+/// until the reader trusts it.
+#[gpui::test]
+fn preset_trust_click_flips_the_draft_without_selecting(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preset-trust", 1);
+        state.settings.global.presets.insert(
+            "careful".to_string(),
+            crate::settings::global::Preset {
+                name: Some("careful".to_string()),
+                plugins: vec!["files".to_string()],
+                description: None,
+                order: Some(-1),
+                policy: Some(
+                    "package policy.careful\nverdict := {\"allow\": true, \"rule\": \"careful-allow\"}"
+                        .to_string(),
+                ),
+                trusted: false,
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = String::new();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let trust = cx
+        .debug_bounds("preset-trust-0")
+        .expect("the trust control");
+    cx.simulate_click(trust.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (trusted, active) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state
+                .draft()
+                .global
+                .presets
+                .get("careful")
+                .is_some_and(|preset| preset.trusted),
+            state.draft().global.default_preset.clone(),
+        )
+    });
+    assert!(trusted, "the trust control flips the flag");
+    assert!(active.is_empty(), "trusting a preset must not select it");
+
+    let row = cx.debug_bounds("preset-0").expect("the preset row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let active = cx.update(|_, cx| shell.read(cx).state.draft().global.default_preset.clone());
+    assert_eq!(active, "careful", "the row body still selects the preset");
+}
+
+/// "Use in this chat" is DSH's per-session enablement: it writes the session's
+/// preset, leaves the global default alone, and the no-preset card clears it.
+#[gpui::test]
+fn preset_use_in_chat_writes_the_session_not_the_default(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preset-use-chat", 1);
+        state.settings.global.presets.insert(
+            "careful".to_string(),
+            crate::settings::global::Preset {
+                name: Some("careful".to_string()),
+                plugins: vec!["files".to_string()],
+                description: Some("Narrow tools".to_string()),
+                order: Some(-1),
+                policy: None,
+                trusted: false,
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = String::new();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let active = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
+
+    let use_chat = cx.debug_bounds("preset-use-0").expect("the use action");
+    cx.simulate_click(use_chat.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (session_preset, default, choice) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state.active_session_preset(),
+            state.draft().global.default_preset.clone(),
+            state.session_choice(&active).preset,
+        )
+    });
+    assert_eq!(session_preset.as_deref(), Some("careful"));
+    assert_eq!(choice.as_deref(), Some("careful"));
+    assert!(
+        default.is_empty(),
+        "using a preset in a chat must not change the global default"
+    );
+
+    let clear = cx
+        .debug_bounds("preset-use-default")
+        .expect("the default action");
+    cx.simulate_click(clear.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let session_preset = cx.update(|_, cx| shell.read(cx).state.active_session_preset());
+    assert_eq!(session_preset, None, "the no-preset card clears the chat");
+}
+
+/// The composer shows the session's preset and its menu opens in place, the
+/// same way the model chip does.
+#[gpui::test]
+fn the_hero_preset_chip_names_the_session_preset(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("agent-preset", 0);
+        state.settings.global.presets.insert(
+            "careful".to_string(),
+            crate::settings::global::Preset {
+                name: Some("careful".to_string()),
+                plugins: vec!["files".to_string()],
+                description: None,
+                order: Some(-1),
+                policy: None,
+                trusted: false,
+                ..Default::default()
+            },
+        );
+        if let Some(id) = state.active_id.clone() {
+            state.select_session_preset(&id, "careful");
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    assert!(
+        cx.debug_bounds("agent-preset").is_some(),
+        "the hero row carries the preset chip"
+    );
+    assert!(
+        cx.debug_bounds("agent-preset-chevron").is_some(),
+        "the chip carries its menu mark"
+    );
+    let chip = cx.debug_bounds("agent-preset").expect("the preset chip");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (overlay, section) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            matches!(state.overlay, Overlay::Settings),
+            state.settings_section,
+        )
+    });
+    let landed = section_index("agent-presets").expect("the presets section");
+    assert!(
+        !overlay || section != landed,
+        "the chip changes the chat's preset in place; it does not navigate"
+    );
+}
+
+/// A chat with history names its applied preset in the header, after the title
+/// and before the background-jobs chip; the hero row's chip is absent there so
+/// the same control is never drawn twice.
+#[gpui::test]
+fn the_header_shows_the_applied_preset_for_a_chat(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("header-agent-preset", 2);
+        state.settings.global.presets.insert(
+            "careful".to_string(),
+            crate::settings::global::Preset {
+                name: Some("careful".to_string()),
+                plugins: vec!["files".to_string()],
+                description: None,
+                order: Some(-1),
+                policy: None,
+                trusted: false,
+                ..Default::default()
+            },
+        );
+        if let Some(id) = state.active_id.clone() {
+            state.select_session_preset(&id, "careful");
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("agent-preset").is_some(),
+        "the header carries the applied preset"
+    );
+    assert!(
+        cx.debug_bounds("hero-workspace-row").is_none(),
+        "a chat with history does not draw the hero row"
+    );
+}
+
+/// A card's Details disclosure lists the applied tools, skills, MCP servers,
+/// extensions, persona and security without selecting the preset.
+#[gpui::test]
+fn preset_details_show_the_applied_config(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preset-details", 1);
+        state.settings.global.presets.insert(
+            "scoped".to_string(),
+            crate::settings::global::Preset {
+                name: Some("scoped".to_string()),
+                plugins: vec!["files".to_string()],
+                tools: Some(vec!["read_file".to_string()]),
+                skills: Some(vec!["alpha".to_string()]),
+                mcps: Some(vec!["github".to_string()]),
+                extensions: Some(vec!["dsh-echo".to_string()]),
+                system_prompt: Some("You are terse.".to_string()),
+                order: Some(-1),
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = String::new();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    assert!(
+        cx.debug_bounds("preset-config-0").is_none(),
+        "details start collapsed"
+    );
+    let details = cx
+        .debug_bounds("preset-details-0")
+        .expect("the details control");
+    cx.simulate_click(details.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("preset-config-0").is_some(),
+        "details expand the applied configuration"
+    );
+    let default = cx.update(|_, cx| shell.read(cx).state.draft().global.default_preset.clone());
+    assert!(
+        default.is_empty(),
+        "opening details must not select the preset"
+    );
+
+    let details = cx
+        .debug_bounds("preset-details-0")
+        .expect("the details control");
+    cx.simulate_click(details.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("preset-config-0").is_none(),
+        "details collapse again"
+    );
+}
+
+/// Selecting a preset for the session is what the next turn builds: the
+/// session's choice names the preset, and the build puts its persona into the
+/// agent config the LLM call reads. This is the same path the hero/header chip
+/// and the pane's Use in this chat write.
+#[test]
+fn a_selected_session_preset_carries_its_persona_into_the_llm_config() {
+    let mut state = state_with_turns("preset-persona", 1);
+    state.settings.global.presets.insert(
+        "scoped".to_string(),
+        crate::settings::global::Preset {
+            name: Some("scoped".to_string()),
+            plugins: vec!["files".to_string()],
+            system_prompt: Some("You are terse.".to_string()),
+            order: Some(-1),
+            ..Default::default()
+        },
+    );
+    let id = state.active_id.clone().expect("a session");
+    state.select_session_preset(&id, "scoped");
+    let choice = state.session_choice(&id);
+    assert_eq!(choice.preset.as_deref(), Some("scoped"));
+    let built = crate::caps::build_agent_for_session(
+        &state.settings,
+        &state.vault,
+        &choice,
+        &state.mcp,
+        &id,
+    );
+    assert_eq!(
+        built.agent.config().system_prompt,
+        "You are terse.",
+        "the session preset's persona is the prompt the LLM call receives"
+    );
+}
+
+/// A required custom policy that is not trusted cannot be applied to a chat;
+/// the card shows the level and the use action becomes inert until trust.
+#[gpui::test]
+fn a_required_untrusted_preset_cannot_be_used_in_a_chat(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preset-required", 1);
+        state.settings.global.presets.insert(
+            "strict".to_string(),
+            crate::settings::global::Preset {
+                name: Some("strict".to_string()),
+                plugins: vec!["files".to_string()],
+                permission: Some("read-only".to_string()),
+                policy: Some(
+                    "package policy.strict\n# rule: allow\nverdict := {\"allow\": true}"
+                        .to_string(),
+                ),
+                policy_mode: Some("required".to_string()),
+                trusted: false,
+                order: Some(-1),
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = String::new();
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    assert!(
+        cx.debug_bounds("preset-level-1").is_some(),
+        "the built-in inspect card carries a level badge"
+    );
+    let blocked = cx.debug_bounds("preset-use-0").expect("the use action");
+    cx.simulate_click(blocked.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.active_session_preset()),
+        None,
+        "an untrusted required policy blocks the session apply"
+    );
+
+    let trust = cx
+        .debug_bounds("preset-trust-0")
+        .expect("the trust control");
+    cx.simulate_click(trust.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let use_chat = cx.debug_bounds("preset-use-0").expect("the use action");
+    cx.simulate_click(use_chat.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.active_session_preset()),
+        Some("strict".to_string()),
+        "trusting the policy makes the preset applicable"
+    );
+}
+
+/// The Custom section's dashed control adds a card immediately and opens its
+/// configuration details.
+#[gpui::test]
+fn adding_a_custom_preset_creates_a_card(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("preset-add-custom", 1);
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    assert!(
+        cx.debug_bounds("preset-add-custom").is_some(),
+        "the dashed Custom control is present"
+    );
+    let add = cx
+        .debug_bounds("preset-add-custom")
+        .expect("the add control");
+    cx.simulate_click(add.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (has_custom, details) = cx.update(|_, cx| {
+        let this = shell.read(cx);
+        (
+            this.state.draft().global.presets.contains_key("custom"),
+            this.preset_details.clone(),
+        )
+    });
+    assert!(has_custom, "the template is added to the draft");
+    assert_eq!(details.as_deref(), Some("custom"));
+    assert!(
+        cx.debug_bounds("preset-4").is_some(),
+        "the new custom card is in the grid"
+    );
+    assert!(
+        cx.debug_bounds("preset-config-4").is_some(),
+        "the new card opens its details"
+    );
+}
+
+/// A custom preset can be edited as TOML in the pane, saved into the draft,
+/// and deleted from the draft; deleting also clears the default/session refs.
+#[gpui::test]
+fn a_custom_preset_can_be_edited_and_deleted(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preset-edit", 1);
+        state.settings.global.presets.insert(
+            "scoped".to_string(),
+            crate::settings::global::Preset {
+                name: Some("Original".to_string()),
+                permission: Some("read-only".to_string()),
+                order: Some(-1),
+                ..Default::default()
+            },
+        );
+        state.settings.global.default_preset = "scoped".to_string();
+        if let Some(id) = state.active_id.clone() {
+            state.select_session_preset(&id, "scoped");
+        }
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-presets"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let edit = cx.debug_bounds("preset-edit-0").expect("the edit action");
+    cx.simulate_click(edit.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let editor = cx
+        .debug_bounds("preset-editor")
+        .expect("the TOML editor opens");
+    assert!(
+        f32::from(editor.size.height) > 300.0,
+        "the editor card owns a real code well, not a zero-height frame: {editor:?}"
+    );
+    assert!(
+        cx.debug_bounds("preset-add-custom").is_none(),
+        "the roster yields the pane while the buffer is open, so nothing overlaps the editor"
+    );
+    let text = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .preset_editor
+            .as_ref()
+            .expect("the editor")
+            .text
+            .clone()
+    });
+    let template = cx.update(|_, cx| text.read(cx).value().to_string());
+    for key in [
+        "# policy_mode =",
+        "# egress =",
+        "# mcp_tools =",
+        "# policy =",
+    ] {
+        assert!(
+            template.contains(key),
+            "the editor starts from the full template ({key} missing):\n{template}"
+        );
+    }
+    cx.update(|window, cx| {
+        text.update(cx, |state, cx| {
+            state.set_value(
+                "[preset]\nname = \"Edited\"\npermission = \"read-only\"\n",
+                window,
+                cx,
+            );
+        });
+    });
+    let save = cx
+        .debug_bounds("preset-editor-save")
+        .expect("the save control");
+    let pane = cx
+        .debug_bounds("settings-pane")
+        .expect("the scrolling settings pane");
+    assert!(
+        save.bottom() <= pane.bottom(),
+        "the save control must be on screen when the editor opens: save={save:?} pane={pane:?}"
+    );
+    cx.simulate_click(save.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .draft()
+                .global
+                .presets
+                .get("scoped")
+                .and_then(|preset| preset.name.clone())
+        }),
+        Some("Edited".to_string())
+    );
+    assert!(
+        cx.debug_bounds("preset-add-custom").is_some(),
+        "saving brings the roster back"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.settings_scroll.scroll_to_bottom());
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let delete = cx
+        .debug_bounds("preset-delete-0")
+        .expect("the delete action");
+    cx.simulate_click(delete.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (exists, default, session) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state.draft().global.presets.contains_key("scoped"),
+            state.draft().global.default_preset.clone(),
+            state.active_session_preset(),
+        )
+    });
+    assert!(!exists, "the custom preset is deleted");
+    assert!(default.is_empty(), "the default reference is cleared");
+    assert_eq!(session, None, "the session reference is cleared");
+}
+
+/// The header carries a subagent trigger when a child ran, and its menu lists
+/// the child's title, prompt, token count and duration.
+#[gpui::test]
+fn the_header_lists_subagent_runs(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("subagents", 1);
+        let parent = state.active_id.clone().expect("a session");
+        let id = state.subagents.begin(
+            &parent,
+            &parent,
+            1,
+            0,
+            "Inspect the files",
+            "List the workspace files",
+        );
+        state.subagents.finish(
+            &id,
+            "the files are listed".to_string(),
+            (1200, 3400),
+            vec![
+                crate::subagent::SubagentMessage {
+                    role: "user".to_string(),
+                    content: "List the workspace files".to_string(),
+                    tool: None,
+                },
+                crate::subagent::SubagentMessage {
+                    role: "assistant".to_string(),
+                    content: "the files are listed".to_string(),
+                    tool: None,
+                },
+            ],
+        );
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let chip = cx
+        .debug_bounds("hdr-subagents")
+        .expect("the subagent trigger");
+    harness.update(cx, |harness, cx| {
+        harness.shell.update(cx, |shell, _| {
+            assert_eq!(
+                shell.subagent_chip_label().as_deref(),
+                Some("1 subagent"),
+                "an unselected child reads as a count"
+            );
+        });
+    });
+    assert!(
+        cx.debug_bounds("hdr-subagents-count").is_some(),
+        "the count label draws"
+    );
+    cx.simulate_click(chip.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("subagent-parent-row").is_none(),
+        "the root conversation is not listed as a subagent"
+    );
+    let row = cx
+        .debug_bounds("subagent-row-0")
+        .expect("the child row is listed");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    harness.update(cx, |harness, cx| {
+        harness.shell.update(cx, |shell, _| {
+            assert_eq!(
+                shell.subagent_chip_label().as_deref(),
+                Some("Inspect the files"),
+                "a selected child names itself"
+            );
+        });
+    });
+    assert!(
+        cx.debug_bounds("user-bubble-0").is_some(),
+        "the child renders through the main chat transcript"
+    );
+    assert!(
+        cx.debug_bounds("composer-card").is_some(),
+        "the composer stays available for a subagent follow-up"
+    );
+    assert!(
+        cx.debug_bounds("composer-editor").is_some(),
+        "the subagent prompt input is present"
+    );
+    assert!(
+        cx.debug_bounds("subagent-readonly").is_none(),
+        "the read-only frame is gone"
+    );
+    assert!(
+        cx.debug_bounds("user-bubble-0").is_some(),
+        "the child prompt uses the normal user bubble"
+    );
+    harness.update(cx, |harness, cx| {
+        harness.shell.update(cx, |shell, cx| {
+            shell.state.tab = Tab::Trajectory;
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("trajectory").is_some(),
+        "the child uses the same trajectory view"
+    );
+    harness.update(cx, |harness, cx| {
+        harness.shell.update(cx, |shell, cx| {
+            shell.state.tab = Tab::Chat;
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let back = cx.debug_bounds("subagent-back").expect("the parent link");
+    cx.simulate_click(back.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("user-bubble-0").is_some(),
+        "the parent link returns to the parent conversation"
+    );
+}
+
+/// A subagent popover is FLAT: every run starts at the same left edge (depth
+/// never indents a row again), and a long prompt or title stays inside the
+/// measured popover instead of widening the panel or clipping past its edge.
+#[gpui::test]
+fn subagent_rows_are_flat_and_clipped_to_the_popover(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("subagents-flat", 1);
+        let parent = state.active_id.clone().expect("a session");
+        let long = "Tell me ONE short, clean programming joke. Do NOT use any of these jokes \
+                    (they have already been told). This prompt is deliberately long so the row \
+                    has to ellipsise it instead of widening the popover.";
+        let first = state
+            .subagents
+            .begin(&parent, &parent, 1, 0, "Tell a programming joke", long);
+        state
+            .subagents
+            .finish(&first, "done".to_string(), (100, 2_000), Vec::new());
+        let nested = state.subagents.begin(
+            &parent,
+            &parent,
+            2,
+            0,
+            "Compute 1+1 with a title long enough to need ellipsis",
+            long,
+        );
+        state
+            .subagents
+            .finish(&nested, "2".to_string(), (100, 2_000), Vec::new());
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let chip = cx.debug_bounds("hdr-subagents").expect("the trigger");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let first = cx
+        .debug_bounds("subagent-row-0")
+        .expect("the first child row");
+    let nested = cx
+        .debug_bounds("subagent-row-1")
+        .expect("the nested child row");
+    assert_eq!(
+        first.origin.x, nested.origin.x,
+        "depth must not indent a row: every run starts on the same edge"
+    );
+    assert!(
+        first.size.width <= px(400.0) && nested.size.width <= px(400.0),
+        "a row stays inside the measured popover: first={:?} nested={:?}",
+        first.size,
+        nested.size
+    );
+
+    let first_summary = cx
+        .debug_bounds("subagent-summary-0")
+        .expect("the first summary");
+    let nested_summary = cx
+        .debug_bounds("subagent-summary-1")
+        .expect("the nested summary");
+    assert!(
+        first_summary.origin.x + first_summary.size.width
+            <= first.origin.x + first.size.width + px(0.5),
+        "the long summary is clipped to its row, not to the popover's edge"
+    );
+    assert!(
+        nested_summary.origin.x + nested_summary.size.width
+            <= nested.origin.x + nested.size.width + px(0.5),
+        "and a nested row clips its summary the same way"
+    );
+}
+
+/// The policy pane reads the audit and edits the workspace allowlist: Add
+/// persists an address and Remove takes it back out.
+#[gpui::test]
+fn the_policy_pane_adds_and_removes_allowlist_entries(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let base =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bsh-shell-policy-pane");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("scratch");
+    let base_for_state = base.clone();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("policy-pane", 1);
+        let id = state
+            .settings
+            .note_workspace("scratch", &base_for_state.to_string_lossy());
+        state.settings.global.general.active_workspace = id;
+        state.refresh_egress_allowlist();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("policy"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    assert!(
+        cx.debug_bounds("policy-refresh").is_some(),
+        "the audit controls are on the pane"
+    );
+    assert!(
+        cx.debug_bounds("policy-add").is_some(),
+        "the allowlist editor is on the pane"
+    );
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.policy_entry
+                .update(cx, |state, cx| state.set_value("127.0.0.1", window, cx));
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let add = cx.debug_bounds("policy-add").expect("the add control");
+    cx.simulate_click(add.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let entries = cx.update(|_, cx| shell.read(cx).state.egress_allowlist.clone());
+    assert_eq!(entries, vec!["127.0.0.1".to_string()]);
+
+    let remove = cx
+        .debug_bounds("policy-remove-127.0.0.1")
+        .expect("the remove control");
+    cx.simulate_click(remove.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let entries = cx.update(|_, cx| shell.read(cx).state.egress_allowlist.clone());
+    assert!(entries.is_empty(), "removing the row drops the entry");
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// The agent-loop switch flips the setting the next turn is built from, in both
@@ -2168,8 +3239,11 @@ fn the_permission_chip_names_the_mode() {
     );
     assert_eq!(
         crate::ui::composer::permission_label_key("not-a-mode"),
-        "permission.presetWorkspaceWrite",
-        "an unrecognised mode names the confined default the build falls back to"
+        "permission.presetReadOnly",
+        // NEW SEMANTICS: PermissionResolution normalises an unknown mode to
+        // read-only (fail closed), so the label names the tier the build obeys,
+        // not the old writable-looking fallback.
+        "an unrecognised mode names the read-only tier the resolution chooses"
     );
 }
 /// Every permission label resolves to real copy, and the three modes differ.
@@ -2436,6 +3510,378 @@ fn the_models_pane_is_the_reference_card_list(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("add-create").is_some(), "the create action");
 }
 
+/// The modernised model row is still a row with both of its controls: the
+/// chevron that expands its detail and the trash that removes it, by the
+/// selectors the pane has always carried.
+#[gpui::test]
+fn the_modern_model_row_keeps_its_chevron_and_delete(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("model-row-parts", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // Seeded after assembly, which reloads the draft over anything set before it.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
+            load_provider_into_form(this, "work", window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let chevron = cx
+        .debug_bounds("model-row-0")
+        .expect("the row still carries its expand chevron");
+    let delete = cx
+        .debug_bounds("model-row-remove-0")
+        .expect("the row still carries its delete control");
+    assert!(
+        delete.center().x > chevron.center().x,
+        "the delete control is the far-right one: chevron {chevron:?}, delete {delete:?}"
+    );
+    assert!(
+        (chevron.center().y.as_f32() - delete.center().y.as_f32()).abs() < 1.0,
+        "both controls sit on the row's one 56px line"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).model_rows.len()),
+        1,
+        "the seeded leaf is the row both controls belong to"
+    );
+}
+
+/// The vault select still prints `vault: <id>` after a choice: the modernised
+/// control keeps the label's meaning, not only its look.
+#[gpui::test]
+fn the_vault_select_prints_the_chosen_id(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("vault-select-label", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
+            this.state.vault = vault_with_entry("select-label", "keys/work", "sk-secret");
+            load_provider_into_form(this, "work", window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("provider-vault-choose").is_some(),
+        "the premise: nothing is chosen yet, so the control invites a choice"
+    );
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.choose_provider_vault_key("work", Some("keys/work"), window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("provider-vault-source").is_some(),
+        "the control keeps the selector the pane's other tests use"
+    );
+    let lang = cx.update(|_, cx| shell.read(cx).state.lang);
+    let expected = format!(
+        "provider-vault-label-{}",
+        crate::ui::settings::vault_source_label(lang, Some("keys/work"))
+    );
+    // `debug_bounds` takes a `&'static str`, so the expected key is leaked for
+    // the test's lifetime rather than guessed at.
+    let selector: &'static str = Box::leak(expected.into_boxed_str());
+    assert!(
+        cx.debug_bounds(selector).is_some(),
+        "the select prints `vault: keys/work` after the choice"
+    );
+}
+
+/// Both add routes always draw the Provider name field, and Create refuses an
+/// empty one: the name is user input, never derived from the provider id.
+#[gpui::test]
+fn creating_a_provider_requires_a_typed_name(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("provider-name-required", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.models_add_open = true;
+            this.models_add_route = crate::ui::shell::ModelsAddRoute::Catalogue;
+            this.catalogue_choice = Some("openai".to_string());
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("add-display").is_some(),
+        "the catalogue route always asks for a provider name"
+    );
+
+    // An empty field refuses before anything lands.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.create_provider("openai", cx));
+    });
+    let created = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .providers
+            .contains_key("openai")
+    });
+    assert!(!created, "an empty name creates nothing");
+
+    // The custom route carries the same required field.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.models_add_route = crate::ui::shell::ModelsAddRoute::Custom;
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("add-display").is_some(),
+        "the custom route always asks for a provider name"
+    );
+
+    // Typed input is the only thing that creates, and it is stored.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.models_add_route = crate::ui::shell::ModelsAddRoute::Catalogue;
+            this.add_display.update(cx, |input, cx| {
+                input.set_value("OpenAI".to_string(), window, cx)
+            });
+            this.create_provider("openai", cx);
+        });
+    });
+    let named = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .providers
+            .get("openai")
+            .and_then(|provider| provider.name.clone())
+    });
+    assert_eq!(
+        named.as_deref(),
+        Some("OpenAI"),
+        "the typed name is the provider's name"
+    );
+}
+
+/// The add-provider card carries provider facts only. The model-id block it
+/// used to draw under the API key - the label and two empty inputs - is gone;
+/// models are added in the open provider's editor instead.
+#[gpui::test]
+fn the_add_provider_card_draws_no_model_block(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("add-card-no-model", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // Open the card on the custom route, which is the one that used to ask
+    // for a model id.
+    let add = cx.debug_bounds("provider-add").expect("the add control");
+    cx.simulate_click(add.center(), Modifiers::default());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.models_add_route = crate::ui::shell::ModelsAddRoute::Custom;
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // The fields the card keeps are on screen.
+    for selector in ["add-route", "add-display", "add-base-url", "add-create"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the add card still draws {selector}"
+        );
+    }
+    // The removed block carried these two element ids. The positive probes
+    // above prove the selector lookup itself works on this card, and the form
+    // state that fed the block is gone with it.
+    assert!(
+        cx.debug_bounds("add-model-id").is_none(),
+        "the add card no longer draws a model-id input"
+    );
+    assert!(
+        cx.debug_bounds("add-model-name").is_none(),
+        "the add card no longer draws a model-name input"
+    );
+}
+
+/// Create is complete with provider facts alone: the new provider exists with
+/// an EMPTY catalogue, and its editor's "Add model" row fills it later.
+#[gpui::test]
+fn creating_a_custom_provider_starts_with_an_empty_catalogue(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("empty-catalogue", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.models_add_open = true;
+            this.models_add_route = crate::ui::shell::ModelsAddRoute::Custom;
+            this.add_route.update(cx, |input, cx| {
+                input.set_value("acme".to_string(), window, cx)
+            });
+            this.add_display.update(cx, |input, cx| {
+                input.set_value("Acme".to_string(), window, cx)
+            });
+            this.add_base_url.update(cx, |input, cx| {
+                input.set_value("https://acme.example/v1".to_string(), window, cx)
+            });
+            this.create_provider("acme", cx);
+        });
+    });
+
+    let (created, models, open, refusal) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.state.draft().global.providers.contains_key("acme"),
+            shell.state.draft().catalog("acme").to_vec(),
+            shell.models_add_open,
+            shell.state.provider_refusal,
+        )
+    });
+    assert!(created, "the provider lands without a model id");
+    assert!(
+        models.is_empty(),
+        "the catalogue starts empty rather than with a placeholder model: {models:?}"
+    );
+    assert!(!open, "a successful create closes the add card");
+    assert_eq!(refusal, None, "creation is not refused");
+}
+
+/// The display-name label resolves in both dictionaries, so the field never
+/// renders the literal key the screenshot showed.
+#[test]
+fn the_display_name_label_resolves_in_both_locales() {
+    let en = crate::i18n::tr(crate::i18n::Lang::En, "settings.displayName");
+    let zh = crate::i18n::tr(crate::i18n::Lang::Zh, "settings.displayName");
+    assert_eq!(en, "Display name");
+    assert_eq!(zh, "显示名称");
+    for label in [&en, &zh] {
+        assert!(
+            !label.contains("settings."),
+            "the label is copy, not a raw key: {label}"
+        );
+    }
+}
+
+/// Clearing the provider name in the editor refuses Apply and leaves the editor
+/// open, so a provider never loses the name its card shows.
+#[gpui::test]
+fn applying_an_empty_provider_name_is_refused(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("provider-name-apply", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "work",
+                "https://work.example",
+            );
+            this.state
+                .draft_mut()
+                .global
+                .set_provider_name("work", "Work");
+            load_provider_into_form(this, "work", window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // The field starts with the stored name; clearing it refuses the apply.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.add_display
+                .update(cx, |input, cx| input.set_value(String::new(), window, cx));
+            this.apply_provider_edit("work", window, cx);
+        });
+    });
+    let (open, stored, refusal) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.state.editing_provider.clone(),
+            shell
+                .state
+                .draft()
+                .global
+                .providers
+                .get("work")
+                .and_then(|provider| provider.name.clone()),
+            shell.state.provider_refusal,
+        )
+    });
+    assert_eq!(
+        open.as_deref(),
+        Some("work"),
+        "the editor stays open on an empty name"
+    );
+    assert_eq!(
+        stored.as_deref(),
+        Some("Work"),
+        "the stored name is untouched"
+    );
+    assert_eq!(refusal, Some("settings.providerNameEmpty"));
+
+    // A typed name is the only way through.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.add_display.update(cx, |input, cx| {
+                input.set_value("Work Two".to_string(), window, cx)
+            });
+            this.apply_provider_edit("work", window, cx);
+        });
+    });
+    let (open, stored) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.state.editing_provider.clone(),
+            shell
+                .state
+                .draft()
+                .global
+                .providers
+                .get("work")
+                .and_then(|provider| provider.name.clone()),
+        )
+    });
+    assert_eq!(open, None, "a named apply closes the editor");
+    assert_eq!(stored.as_deref(), Some("Work Two"));
+}
+
 /// General carries the reference's rows and stops at its own current-version
 /// line: the build facts bsh used to list there - the data directory, the
 /// session count and every discovered profile - are not part of that pane.
@@ -2520,969 +3966,642 @@ fn api_protocol_row_writes_the_setting(cx: &mut TestAppContext) {
     assert_eq!(mode, "chat", "picking chat writes it back");
 }
 
-/// The background jobs are the running turns the reader is not looking at,
-/// newest first, each with a title to show.
-#[gpui::test]
-fn background_jobs_exclude_the_session_on_screen(_cx: &mut TestAppContext) {
-    let mut state = state_with_turns("jobs-order", 1);
-    let a = state.active_id.clone().expect("a session is active");
-    let _ = state.new_session();
-    let b = state.active_id.clone().expect("a session is active");
-    let _ = state.new_session();
-    let c = state.active_id.clone().expect("a session is active");
-    assert_ne!(a, b, "a new chat must be its own session");
-    state.streams.insert(a.clone(), 10);
-    state.streams.insert(b.clone(), 20);
-    state.streams.insert(c.clone(), 30);
-
-    let jobs = state.background_jobs();
-    assert_eq!(
-        jobs.len(),
-        2,
-        "the session on screen is not a background job"
-    );
-    assert_eq!(jobs[0].0, b, "the newest job comes first");
-    assert_eq!(jobs[1].0, a, "the older job follows");
-    assert!(
-        !jobs[0].1.is_empty(),
-        "a job is listed under its session title"
-    );
+/// Start a real background shell through the shell's own roster, the way the
+/// turn's bash tool does. The job belongs to \`session\` because that is the
+/// principal the tool passes; no policy is installed, so the spawn is allowed.
+fn spawn_background_job(state: &AppState, session: &str, command: &str) -> String {
+    let tool = agent::tools::BashTool::new("bash").with_jobs(state.jobs.clone(), session);
+    let value = tool
+        .run(&serde_json::json!({
+            "command": command,
+            "run_in_background": true
+        }))
+        .expect("the background spawn is accepted");
+    value["job_id"]
+        .as_str()
+        .expect("the spawn returns a job id")
+        .to_string()
 }
 
-/// The header counts the background turns, and picking one brings it forward.
-#[gpui::test]
-fn the_header_counts_background_jobs(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("jobs-header", 1);
-        let running = state.active_id.clone().expect("a session is active");
-        let _ = state.new_session();
-        // The shell restores the session the settings name, so pin that to the
-        // new one: the turn then runs in the session the reader is not looking
-        // at, which is what makes it a background job.
-        state.settings.global.general.active_session =
-            state.active_id.clone().expect("a session is active");
-        state.streams.insert(running, 10);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
+/// The job ids the session on screen would draw, newest first.
+fn visible_job_ids(state: &AppState) -> Vec<String> {
+    state
+        .background_jobs()
+        .into_iter()
+        .map(|job| job.id)
+        .collect()
+}
+
+/// Press the header trigger and let the frame that opens the popover render.
+fn open_jobs_popover(cx: &mut VisualTestContext) {
+    let chip = cx
+        .debug_bounds("hdr-jobs")
+        .expect("a session with jobs draws the trigger");
+    cx.simulate_click(chip.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    // The chip is a kit Button, which records no bounds the harness can look up,
-    // so the observable is the label the shell would draw before the click.
-    let (job, label) = cx.update(|_, cx| {
-        let shell = harness.read(cx).shell.clone();
-        let shell = shell.read(cx);
-        let jobs = shell.state.background_jobs();
-        assert_eq!(jobs.len(), 1, "one background turn");
-        let label = shell.job_label().expect("a counted job has a label");
-        (jobs[0].0.clone(), label)
-    });
-    assert!(
-        label.contains('1'),
-        "the chip names how many run in the background: {label}"
-    );
-    cx.update(|_, cx| {
-        let shell = harness.read(cx).shell.clone();
-        shell.update(cx, |this, cx| this.open_job(&job, cx));
-        assert_eq!(
-            shell.read(cx).state.active_id.as_deref(),
-            Some(job.as_str()),
-            "picking a job must bring its session to the front"
-        );
-        assert!(
-            shell.read(cx).state.background_jobs().is_empty(),
-            "that job is the session on screen now, so it is no longer background"
-        );
-    });
 }
 
-/// The chat content width: the reference's clamp with its bands trimmed, so a
-/// wide window gives the transcript most of the column instead of two empty
-/// margins either side of it.
+/// Press a control by its debug selector and draw the frame it changed.
+fn press_selector(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} must be on screen"));
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// The reference's own count wording and plural rule, in both the live and the
+/// settled form:
+/// t(count === 1 ? "count.live.one" : "count.live.other", { count }).
 #[test]
-fn the_chat_column_takes_the_measured_clamp() {
-    use crate::theme::{chat_width_at, CHAT_W};
+fn the_job_count_takes_the_reference_plural_rule() {
+    use crate::i18n::Lang;
     assert_eq!(
-        chat_width_at(0.0),
-        CHAT_W,
-        "a column with no measurement yet lands on the 680 floor"
+        super::header::job_count_label(Lang::En, 1, true),
+        "1 background job running",
+        "the singular live form is the reference's own"
     );
     assert_eq!(
-        chat_width_at(740.0),
-        CHAT_W,
-        "666 of a 740 column clamps up to the floor"
-    );
-    assert!(
-        (chat_width_at(1000.0) - 900.0).abs() < 0.01,
-        "a laptop column takes .8 of it: {}",
-        chat_width_at(1000.0)
+        super::header::job_count_label(Lang::En, 3, true),
+        "3 background jobs running"
     );
     assert_eq!(
-        chat_width_at(2000.0),
-        1800.0,
-        "a wide column takes .9 of it, not a cap"
+        super::header::job_count_label(Lang::En, 1, false),
+        "1 background job",
+        "the settled form drops the running participle"
+    );
+    assert_eq!(
+        super::header::job_count_label(Lang::En, 78, false),
+        "78 background jobs",
+        "and carries the count"
+    );
+    assert_eq!(
+        super::header::job_count_label(Lang::Zh, 2, true),
+        "2 个后台任务运行中",
+        "the Chinese form does not inflect, but takes the count"
+    );
+    assert_eq!(
+        super::header::job_count_label(Lang::Zh, 2, false),
+        "2 个后台任务"
     );
 }
 
-/// And the clamp is LIVE: at the harness's own window the composer stack is the
-/// live chat column plus the measured 32, which is the capped width rather than
-/// the fixed 680 bsh drew. The floor and the mid range are the pure test's.
+/// The row status words the reference draws: the exit code once settled, the
+/// live word while running, and the killed word after a stop.
+#[test]
+fn the_job_status_words_are_the_reference_ones() {
+    use crate::i18n::Lang;
+    use agent::jobs::JobStatus;
+    assert_eq!(
+        super::header::job_status_label(JobStatus::Succeeded { code: 0 }, Lang::En),
+        "exit code: 0"
+    );
+    assert_eq!(
+        super::header::job_status_label(JobStatus::Failed { code: 7 }, Lang::En),
+        "exit code: 7"
+    );
+    assert_eq!(
+        super::header::job_status_label(JobStatus::Running, Lang::En),
+        "running"
+    );
+    assert_eq!(
+        super::header::job_status_label(JobStatus::Killed, Lang::En),
+        "killed"
+    );
+    assert_eq!(
+        super::header::job_status_label(JobStatus::Succeeded { code: 0 }, Lang::Zh),
+        "退出码 0"
+    );
+}
+
+/// The roster is scoped to the session on screen: switching sessions swaps the
+/// rows, and the other session never leaks into the list.
+#[test]
+fn background_jobs_are_scoped_to_the_active_session() {
+    let mut state = state_with_turns("jobs-scope", 1);
+    let a = state.active_id.clone().expect("a session is active");
+    let b = state.new_session().expect("a second session");
+    let older = state.jobs.begin(&a, "bash", "one");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let newer = state.jobs.begin(&a, "bash", "two");
+    let other = state.jobs.begin(&b, "bash", "other");
+    state
+        .jobs
+        .finish(&older, agent::jobs::JobStatus::Succeeded { code: 0 });
+    state
+        .jobs
+        .finish(&newer, agent::jobs::JobStatus::Succeeded { code: 0 });
+    state
+        .jobs
+        .finish(&other, agent::jobs::JobStatus::Failed { code: 1 });
+
+    state.select(&a);
+    assert_eq!(
+        visible_job_ids(&state),
+        vec![newer, older],
+        "newest first, and only this session"
+    );
+    state.select(&b);
+    assert_eq!(visible_job_ids(&state), vec![other]);
+    assert_eq!(state.job_counts(), (0, 1));
+}
+
+/// A running background bash produces the measured chip with count 1 and a
+/// Running row in the popover.
 #[gpui::test]
-fn the_composer_stack_follows_the_measured_clamp(cx: &mut TestAppContext) {
+fn a_running_background_bash_draws_its_row(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("chat-clamp", 2);
-        tests_pin_reference_defaults(&mut state);
+        let mut state = state_with_turns("jobs-running-row", 1);
+        let session = state.active_id.clone().expect("a session is active");
+        state.settings.global.general.active_session = session.clone();
+        spawn_background_job(&state, &session, "sleep 30");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let column = cx.update(|_, cx| harness.read(cx).shell.read(cx).conversation_w.as_f32());
-    let stack = cx
-        .debug_bounds("composer-stack")
-        .expect("the composer stack")
-        .size
-        .width
-        .as_f32();
-    // The harness window is wide enough for the cap to be the binding term, so
-    // this test discriminates: the fixed 680 bsh drew before would be 712 here.
-    assert!(
-        column * crate::theme::CHAT_SHARE > crate::theme::CHAT_W,
-        "the harness window has to be wide enough for the clamp to bite: column {column}"
-    );
-    assert_eq!(
-        stack,
-        crate::theme::chat_width_at(column) + crate::theme::COMPOSER_WIDEN,
-        "the composer stack is the live chat width plus the measured 32"
-    );
-    assert_ne!(
-        stack,
-        crate::theme::CHAT_W + crate::theme::COMPOSER_WIDEN,
-        "the fixed width bsh drew before this was live"
-    );
-    let _ = harness;
-}
 
-/// The stored width is read back on the next window: the reference reads its
-/// client store on every width publish, so a reload keeps the dragged column
-/// instead of falling back to the clamp.
-#[gpui::test]
-fn the_stored_content_width_wins_over_the_clamp(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("chat-stored", 2);
-        state.settings.global.general.content_width = Some(800.0);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let (chat, stored) = cx.update(|_, cx| {
+    let (job, label) = cx.update(|_, cx| {
         let shell = harness.read(cx).shell.read(cx);
+        let jobs = shell.state.background_jobs();
+        assert_eq!(jobs.len(), 1, "the chip counts one job");
+        assert!(jobs[0].is_running(), "and it is still running");
         (
-            shell.chat_w(),
-            shell.state.settings.global.general.content_width,
+            jobs[0].id.clone(),
+            shell.job_label().expect("a running job draws the chip"),
         )
     });
-    assert_eq!(chat, 800.0, "the stored width overrides the clamp's 920");
-    assert_eq!(stored, Some(800.0));
-    let drawn = cx
-        .debug_bounds("composer-stack")
-        .expect("the composer stack")
-        .size
-        .width
-        .as_f32();
-    assert_eq!(
-        drawn,
-        800.0 + crate::theme::COMPOSER_WIDEN,
-        "and it is what gets drawn"
+    assert_eq!(label, "1 background job running");
+    let chip = cx.debug_bounds("hdr-jobs").expect("the measured trigger");
+    assert_eq!(chip.size.height, px(28.0), "the measured min-height:28px");
+    assert!(
+        cx.debug_bounds("hdr-jobs-dot").is_some(),
+        "a running row leads the trigger with the ongoing dot"
     );
-    let _ = harness;
-}
+    let chevron = cx
+        .debug_bounds("hdr-jobs-chevron")
+        .expect("and the chevron closes it");
+    assert_eq!(chevron.size.width, px(12.0));
+    assert_eq!(chevron.size.height, px(12.0));
 
-/// The measured bar reuses only two-stop gradients - gpui-pre's Background
-/// holds a fixed pair of stops - so the CSS's four stops are three stacked
-/// layers, and the bar is the measured 2 x 72 centred in its strip.
-#[gpui::test]
-fn the_chat_handle_bar_takes_the_measured_column(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("chat-bar", 2);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let strip = cx
-        .debug_bounds("chat-handle-left")
-        .expect("the left handle");
-    let bar = cx
-        .debug_bounds("chat-handle-bar-left")
-        .expect("the measured bar");
-    assert_eq!(bar.size.width, px(crate::theme::HANDLE_BAR_W), "2px wide");
-    assert_eq!(bar.size.height, px(crate::theme::HANDLE_BAR_H), "72 tall");
-    assert_eq!(
-        crate::theme::HANDLE_BAR_FADE * 2.0 + crate::theme::HANDLE_BAR_BAND,
-        crate::theme::HANDLE_BAR_H,
-        "28 + 16 + 28 is the measured column"
-    );
-    let measured_inset = (crate::theme::HANDLE_STRIP_W - crate::theme::HANDLE_BAR_W) / 2.0;
-    let bar_inset = (bar.origin.x - strip.origin.x).as_f32();
+    open_jobs_popover(cx);
+    assert!(cx.debug_bounds("jobs-panel").is_some(), "the popover opens");
     assert!(
-        (bar_inset - measured_inset).abs() < 1.0,
-        "a 2px column centred in the 10px strip is the measured 4px inset, measured {bar_inset}"
+        cx.debug_bounds("jobs-running-count").is_some(),
+        "the Running section leads it"
     );
     assert!(
-        (bar.center().y - strip.center().y).as_f32().abs() < 1.0,
-        "and it sits at the CSS default pointer-y of 50%"
-    );
-    let _ = harness;
-}
-
-/// The bar shows on hover and while dragging - the reference's :hover and
-/// [data-dragging] - and the strip's own move has to stop propagating, or the
-/// body's clear (which ends the hover) wipes it the same instant.
-#[gpui::test]
-fn the_chat_handle_hover_reveals_and_the_body_move_clears_it(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("chat-hover", 2);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let strip = cx
-        .debug_bounds("chat-handle-left")
-        .expect("the left handle");
-    cx.simulate_mouse_move(
-        strip.center(),
-        None::<gpui_kit::MouseButton>,
-        Modifiers::default(),
-    );
-    let hovered = cx.update(|_, cx| harness.read(cx).shell.read(cx).chat_hover);
-    assert_eq!(
-        hovered,
-        Some(super::shell::HandleSide::Left),
-        "the strip's own move sets the hover"
-    );
-    let body = cx.debug_bounds("chat-body").expect("the body");
-    cx.simulate_mouse_move(
-        body.center(),
-        None::<gpui_kit::MouseButton>,
-        Modifiers::default(),
-    );
-    let cleared = cx.update(|_, cx| harness.read(cx).shell.read(cx).chat_hover);
-    assert_eq!(
-        cleared, None,
-        "and the body's own move ends it, so leaving the handles hides the bar"
-    );
-    let _ = harness;
-}
-
-/// The reference's own drag bounds, straight from its `resolveContentWidth`:
-/// `const max = Math.max(CONTENT_MIN, columnWidth - CONTENT_EDGE_BUDGET)` with
-/// CONTENT_MIN 640 and CONTENT_EDGE_BUDGET 176, so a stored preference is
-/// clamped into [640, max(640, column - 176)] and nothing else moves.
-#[test]
-fn the_dragged_content_width_takes_the_measured_bounds() {
-    use crate::theme::resolve_content_width;
-    assert_eq!(
-        resolve_content_width(1640.0, None),
-        1476.0,
-        "with no preference the column is the chat width: 1640 * .9"
-    );
-    assert_eq!(
-        resolve_content_width(1640.0, Some(600.0)),
-        640.0,
-        "a preference below the floor clamps up to 640, not to the clamp's 680"
-    );
-    assert_eq!(
-        resolve_content_width(1640.0, Some(2000.0)),
-        1576.0,
-        "and above the cap to the column less its two gutters"
-    );
-    assert_eq!(
-        resolve_content_width(1640.0, Some(800.0)),
-        800.0,
-        "a preference inside the bounds is kept as it is"
-    );
-    assert_eq!(
-        resolve_content_width(700.0, Some(900.0)),
-        640.0,
-        "a column too narrow for the budget still floors the preference"
-    );
-}
-
-/// The gaps the step rows used to have: a language for the body, a byte badge,
-/// a patch instead of raw JSON for a write or an edit.
-#[test]
-fn a_step_row_knows_its_language_size_and_patch() {
-    use super::transcript::{code_lang, format_bytes, tool_bytes, tool_diff};
-    assert_eq!(code_lang("bash", "{}"), Some("bash"));
-    assert_eq!(
-        code_lang("write_file", r#"{"path": "src/main.rs"}"#),
-        Some("rust"),
-        "a file step is highlighted as the file it wrote"
-    );
-    assert_eq!(
-        code_lang("update_plan", "{}"),
-        None,
-        "and a step with no code claims no language"
-    );
-    assert_eq!(format_bytes(812), "812 B");
-    assert_eq!(format_bytes(7_373), "7.2 KB");
-
-    let mut running = crate::model::ToolEvent {
-        name: "bash".to_string(),
-        args: "{\"command\": \"ls\"}".to_string(),
-        output: None,
-        ms: None,
-        at: None,
-    };
-    assert_eq!(
-        tool_bytes(&running),
-        running.args.len(),
-        "a live step counts its arguments"
-    );
-    running.output = Some("a\nb".to_string());
-    assert_eq!(tool_bytes(&running), 3, "a finished one its output");
-
-    let patch = tool_diff(
-        "edit_file",
-        r#"{"path": "a.rs", "old_string": "one\ntwo", "new_string": "one\nthree"}"#,
-    )
-    .expect("an edit is a patch");
-    assert_eq!(
-        patch,
-        vec![
-            ('-', "one".to_string()),
-            ('-', "two".to_string()),
-            ('+', "one".to_string()),
-            ('+', "three".to_string())
-        ],
-        "the replaced lines come out, the new ones go in"
+        cx.debug_bounds("job-row-0").is_some(),
+        "the running job draws its row"
     );
     assert!(
-        tool_diff("bash", "{}").is_none(),
-        "a command is not a patch"
+        cx.debug_bounds("job-status-0").is_some(),
+        "the row carries its status word"
     );
-    assert_eq!(
-        super::transcript::output_body(r#"{"stdout": "hi\nthere", "stderr": "", "exit_code": 0}"#),
-        "hi\nthere",
-        "a command output reads as its stream, not its envelope"
-    );
-    assert_eq!(
-        super::transcript::output_body(r#"{"stdout": "out", "stderr": "boom"}"#),
-        "out\nboom",
-        "and a failure keeps its stderr beside it"
-    );
-    assert_eq!(
-        super::transcript::output_body("plain"),
-        "plain",
-        "anything else is passed through"
-    );
-}
-/// A settled turn shows one summary line per step, and a click opens its body -
-/// the trace shape a reader scans a finished turn in.
-#[gpui::test]
-fn a_settled_turns_step_rows_collapse(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("step-fold", 1);
-        let id = state.active_id.clone().expect("an active session");
-        if let Some(session) = state.store.session_mut(&id) {
-            if let Some(message) = session.messages.last_mut() {
-                message.tools.push(crate::model::ToolEvent {
-                    name: "bash".to_string(),
-                    args: "{\"command\": \"cargo test\"}".to_string(),
-                    output: Some("ok".to_string()),
-                    ms: Some(12),
-                    at: None,
-                });
-            }
-        }
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-
-    // One turn is [user, assistant], so the tool hangs off message 1.
+    assert!(cx.debug_bounds("job-time-0").is_some(), "and its duration");
     assert!(
-        !cx.update(|_, cx| shell.read(cx).state.tool_open(1, 0)),
-        "a settled turn starts folded"
-    );
-    let head = cx.debug_bounds("tool-head-1-0").expect("the step row");
-    cx.simulate_click(head.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.update(|_, cx| shell.read(cx).state.tool_open(1, 0)),
-        "and a click opens it"
+        cx.debug_bounds("job-stop-0").is_some(),
+        "a running row can be stopped"
     );
     assert!(
-        cx.debug_bounds("tool-1-0").is_some(),
-        "the row itself is drawn"
+        cx.debug_bounds("job-output-0").is_none(),
+        "and starts collapsed"
     );
-}
-/// A step row is labelled by what it DID, and summarised by the first useful
-/// field of its arguments - not by the whole JSON object.
-#[test]
-fn a_step_row_is_kinded_and_summarised() {
-    use super::transcript::{tool_kind_key, tool_summary};
-    assert_eq!(tool_kind_key("bash"), "tool.kind.bash");
-    assert_eq!(tool_kind_key("write_file"), "tool.kind.write");
-    assert_eq!(
-        tool_kind_key("mcp__github__search"),
-        "tool.kind.other",
-        "an unknown tool still reads as a step"
-    );
-    assert_eq!(
-        tool_summary(r#"{"command": "cargo test -p bsh", "timeout": 300}"#),
-        "cargo test -p bsh",
-        "the command is the summary, not the object"
-    );
-    assert_eq!(
-        tool_summary(r#"{"path": "src/main.rs", "content": "x"}"#),
-        "src/main.rs",
-        "a file step is summarised by its path"
-    );
-    assert_eq!(
-        tool_summary("{\"a\": 1}"),
-        "{\"a\": 1}",
-        "an object with no string value falls back to its own text"
-    );
-    let long = tool_summary(&format!("{{\"command\": \"{}\"}}", "x".repeat(200)));
-    assert!(long.ends_with('…'), "and a long value clips: {long}");
-}
-/// The meter leads the status row, so the old leftward offset that placed it
-/// near the card's left third is gone with `meter_shift`.
-/// The transcript is not centred: its left inset is 40% of the band, while the
-/// right keeps the band the turn rail and the composer were laid out with - so
-/// the empty strip beside the text shrinks without moving the composer.
-#[test]
-fn the_transcript_takes_only_four_tenths_of_the_left_band() {
-    use crate::theme::{chat_left_inset, chat_width_at, CHAT_LEFT_SHARE};
-    let column = 1000.0;
-    let chat = chat_width_at(column);
-    let band = (column - chat) / 2.0;
-    assert_eq!(
-        chat_left_inset(column, chat),
-        (band * CHAT_LEFT_SHARE).round(),
-        "the left inset is the share of the band the right side still holds"
-    );
-    assert!(
-        chat_left_inset(column, chat) < band / 2.0,
-        "which is less than half the band it was"
-    );
-    assert_eq!(
-        chat_left_inset(0.0, chat_width_at(0.0)),
-        0.0,
-        "an unmeasured column has no band to split"
-    );
-}
-/// The measured handle strip: `min(10px, calc((100% - var(--dsh-chat-content-width))
-/// / 2 - 24px - 24px))`, parked `right: calc(50% + var(--dsh-chat-content-width) /
-/// 2 + 24px)` off the body on the left and `left:` on the right.
-#[gpui::test]
-fn the_chat_handles_park_outside_the_content_column(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("chat-handles", 2);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let (column, content) = cx.update(|_, cx| {
-        let shell = harness.read(cx).shell.read(cx);
-        (shell.conversation_w.as_f32(), shell.chat_w())
-    });
-    let body = cx.debug_bounds("chat-body").expect("the measured body");
-    let left = cx
-        .debug_bounds("chat-handle-left")
-        .expect("the left handle");
-    let right = cx
-        .debug_bounds("chat-handle-right")
-        .expect("the right handle");
-    assert_eq!(
-        left.size.width,
-        px(crate::theme::HANDLE_STRIP_W),
-        "this gutter is wide enough for the full strip"
-    );
-    assert_eq!(
-        right.size.width,
-        px(crate::theme::HANDLE_STRIP_W),
-        "and on the other side"
-    );
-    let offset = column / 2.0 + content / 2.0 + crate::theme::HANDLE_OFFSET;
-    // The transcript is not centred: the left handle follows the narrowed inset,
-    // the right one keeps the symmetric offset.
-    let inset = crate::theme::chat_left_inset(column, content);
-    assert_eq!(
-        (left.origin.x - body.origin.x).as_f32(),
-        (inset - crate::theme::HANDLE_OFFSET - crate::theme::HANDLE_STRIP_W).max(0.0),
-        "the left handle parks outside the narrowed left inset"
-    );
-    assert_eq!(
-        (right.origin.x - body.origin.x).as_f32(),
-        offset,
-        "and the right one keeps the symmetric offset"
-    );
-    let content_left = body.origin.x + px(inset);
-    let content_right = body.origin.x + px(column / 2.0 + content / 2.0);
-    // GPUI snaps the painted content column to a device pixel, so the
-    // clearance is the measured 24 within one - the padding is painted after
-    // snapping, which the exact origin assertions above already pin.
-    let left_clear = (content_left - (left.origin.x + left.size.width)).as_f32();
-    let right_clear = (right.origin.x - content_right).as_f32();
-    assert!(
-        (left_clear - crate::theme::HANDLE_OFFSET).abs() <= 1.0,
-        "24px clear of the content column's own edge, measured {left_clear}"
-    );
-    assert!(
-        (right_clear - crate::theme::HANDLE_OFFSET).abs() <= 1.0,
-        "on both sides. measured {right_clear}"
-    );
-    let _ = harness;
-}
-
-/// The reference's own fold rule: narrow ? !narrowExpanded : storedCollapsed,
-/// over SIDEBAR_AUTO_COLLAPSE 1024, with a strict comparison.
-#[test]
-fn the_sidebar_fold_follows_the_auto_collapse_breakpoint() {
-    use crate::theme::sidebar_folded;
-    assert!(
-        !sidebar_folded(1920.0, false, false),
-        "wide, nothing stored"
-    );
-    assert!(
-        sidebar_folded(1920.0, true, false),
-        "wide, the reader folded it"
-    );
-    assert!(
-        sidebar_folded(1920.0, true, true),
-        "narrowExpanded governs only a narrow viewport"
-    );
-    assert!(
-        sidebar_folded(900.0, false, false),
-        "narrow folds by itself"
-    );
-    assert!(
-        !sidebar_folded(900.0, false, true),
-        "unless expanded by hand"
-    );
-    assert!(
-        !sidebar_folded(900.0, true, true),
-        "and that expand wins over a stored fold"
-    );
-    assert!(
-        !sidebar_folded(1024.0, false, false),
-        "the comparison is strict"
-    );
-    assert!(sidebar_folded(1023.9, false, false));
-}
-
-/// The auto-collapse as the shell resolves it. The harness cannot resize its
-/// window - gpui-pre's Window::resize does not move the viewport - so the narrow
-/// case is asserted on the resolution the render pass consults (sidebar_folded
-/// over the recorded viewport) rather than on the painted tree; the painted
-/// consequence is the stored-fold test's, at the harness width. The measurement
-/// is set WITHOUT notifying: a notify schedules a frame here, and render re-reads
-/// the real window width into the same field.
-#[gpui::test]
-fn the_narrow_viewport_auto_collapses_the_sidebar(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("sidebar-narrow", 2);
-        tests_pin_reference_defaults(&mut state);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    let measure = |cx: &mut VisualTestContext, width: f32| {
-        cx.update(|_, cx| {
-            let shell = harness.read(cx).shell.clone();
-            shell.update(cx, |shell, _| shell.viewport_w = width);
-        });
-    };
-    let read = |cx: &mut VisualTestContext| {
-        cx.update(|_, cx| {
-            let shell = harness.read(cx).shell.read(cx);
-            (
-                shell.viewport_w,
-                shell.sidebar_folded(),
-                shell.sidebar_w(),
-                shell.state.sidebar_collapsed,
-                shell.state.narrow_expanded,
-            )
-        })
-    };
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("sidebar").is_some(),
-        "the harness opens at 1920, so the column is drawn"
-    );
-    measure(cx, 900.0);
-    let (viewport, folded, width, stored, expanded) = read(cx);
-    assert_eq!(viewport, 900.0, "the measurement render would read");
-    assert!(
-        folded,
-        "under the breakpoint it folds to its collapsed width"
-    );
-    assert_eq!(width, 280.0, "and keeps the width it would return to");
-    assert!(!stored && !expanded, "with neither flag touched");
+    // The child is real, so the test must reap it.
     cx.update(|_, cx| {
-        let shell = harness.read(cx).shell.clone();
-        shell.update(cx, |shell, cx| shell.toggle_sidebar_at(900.0, cx));
+        harness.read(cx).shell.read(cx).state.jobs.kill(&job);
     });
-    let (_, _, _, stored, expanded) = read(cx);
-    assert!(
-        !crate::theme::sidebar_folded(900.0, stored, expanded),
-        "and the narrow toggle expands it over the squeezed centre"
-    );
-    assert!(expanded, "through the runtime flag");
-    assert!(!stored, "which is not the stored collapse");
-    measure(cx, 1920.0);
-    let (viewport, folded, ..) = read(cx);
-    assert_eq!(viewport, 1920.0);
-    assert!(!folded, "a wide viewport falls back to the stored flag");
-    cx.update(|_, cx| {
-        let shell = harness.read(cx).shell.clone();
-        shell.update(cx, |shell, cx| shell.toggle_sidebar_at(1920.0, cx));
-    });
-    let (_, _, _, stored, expanded) = read(cx);
-    assert!(
-        crate::theme::sidebar_folded(1920.0, stored, expanded),
-        "which this toggle flipped"
-    );
-    assert!(stored, "storing the fold");
-    assert!(expanded, "and leaving the runtime flag alone");
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("sidebar").is_none(),
-        "so the drawn column leaves at the harness width"
-    );
-    let _ = harness;
 }
 
-/// The reference's own sidebar contract: setSidebar keeps
-/// layoutInfo.sidebar through clampWidth(px, 264, 420), over a 280 store
-/// default, rounded to a whole pixel.
-#[test]
-fn the_sidebar_width_takes_the_measured_bounds() {
-    use crate::theme::resolve_sidebar_width;
-    assert_eq!(resolve_sidebar_width(None), 280.0, "the store default");
-    assert_eq!(resolve_sidebar_width(Some(300.0)), 300.0);
-    assert_eq!(resolve_sidebar_width(Some(100.0)), 264.0, "the floor");
-    assert_eq!(resolve_sidebar_width(Some(900.0)), 420.0, "the ceiling");
-    assert_eq!(
-        resolve_sidebar_width(Some(300.6)),
-        301.0,
-        "clampWidth rounds"
-    );
-}
-
-/// The reference's DragHandle is an 8px col-resize strip at left:
-/// cols.sidebar with margin-left:-4px, so it straddles the seam of a column
-/// that takes the 280 store default until it is dragged.
+/// A settled row shows its exit code and duration, and the chip switches from
+/// the live wording to the settled one.
 #[gpui::test]
-fn the_sidebar_handle_takes_the_measured_strip(cx: &mut TestAppContext) {
+fn a_finished_job_shows_its_exit_code_and_duration(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("sidebar-strip", 2);
-        tests_pin_reference_defaults(&mut state);
+        let mut state = state_with_turns("jobs-finished-row", 1);
+        let session = state.active_id.clone().expect("a session is active");
+        state.settings.global.general.active_session = session.clone();
+        let id = spawn_background_job(&state, &session, "printf hello-job");
+        let settled = state
+            .jobs
+            .wait_for(&id, std::time::Duration::from_secs(5))
+            .expect("the job exists");
+        assert!(
+            settled.status.is_settled(),
+            "the command must end before the row is measured"
+        );
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let column = cx.debug_bounds("sidebar").expect("the sidebar column");
-    let strip = cx.debug_bounds("sidebar-handle").expect("the resize strip");
-    assert_eq!(column.size.width, px(280.0), "the store default");
-    assert_eq!(
-        strip.size.width,
-        px(crate::theme::SIDEBAR_HANDLE_W),
-        "the measured 8px strip"
-    );
-    let seam = (strip.origin.x - column.origin.x).as_f32();
-    assert!(
-        (seam - (280.0 - crate::theme::SIDEBAR_HANDLE_W / 2.0)).abs() < 1.0,
-        "margin-left:-4px straddles the seam, measured {seam}"
-    );
-    assert!(
-        (strip.size.height - column.size.height).as_f32().abs() < 1.0,
-        "and it spans the frame top to bottom"
-    );
-    let _ = harness;
-}
-
-/// The drag: the reference records the column width and the pointer x at
-/// pointerdown and then sets base + dx, clamped to 264..420 - the pointer's
-/// own 40px is the width's 40px, because this column is not centred.
-#[gpui::test]
-fn the_sidebar_handle_drag_sets_and_stores_the_width(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("sidebar-drag", 2);
-        tests_pin_reference_defaults(&mut state);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let strip = cx.debug_bounds("sidebar-handle").expect("the strip");
-    let origin = strip.center();
-    let moved = gpui_kit::point(origin.x + px(40.0), origin.y);
-    cx.simulate_mouse_down(origin, gpui_kit::MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_move(
-        moved,
-        Some(gpui_kit::MouseButton::Left),
-        Modifiers::default(),
-    );
-    cx.simulate_mouse_up(moved, gpui_kit::MouseButton::Left, Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let stored = cx.update(|_, cx| {
+    let job = cx.update(|_, cx| {
         harness
             .read(cx)
             .shell
             .read(cx)
             .state
-            .settings
-            .global
-            .general
-            .sidebar_width
+            .background_jobs()
+            .first()
+            .expect("the settled job")
+            .id
+            .clone()
     });
-    assert_eq!(stored, Some(320.0), "the store keeps base + dx");
-    let column = cx.debug_bounds("sidebar").expect("the sidebar column");
-    assert_eq!(column.size.width, px(320.0), "and the column followed it");
-    let _ = harness;
+
+    let (label, status) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        let status = shell
+            .state
+            .jobs
+            .job(&job)
+            .expect("the job is still listed")
+            .status;
+        (
+            shell.job_label().expect("a settled job draws the chip"),
+            status,
+        )
+    });
+    assert_eq!(label, "1 background job", "the settled count wording");
+    assert_eq!(status, agent::jobs::JobStatus::Succeeded { code: 0 });
+    assert_eq!(
+        super::header::job_status_label(status, Lang::En),
+        "exit code: 0",
+        "the row's own status word"
+    );
+    assert!(
+        cx.debug_bounds("hdr-jobs-dot").is_none(),
+        "nothing runs, so the ongoing dot is absent"
+    );
+    open_jobs_popover(cx);
+    assert!(
+        cx.debug_bounds("jobs-settled-count").is_some(),
+        "the Finished section carries the count"
+    );
+    assert!(cx.debug_bounds("jobs-clear").is_some(), "and its Clear");
+    assert!(
+        cx.debug_bounds("job-row-0").is_some(),
+        "the settled row is listed"
+    );
+    assert!(
+        cx.debug_bounds("job-status-0").is_some(),
+        "with its exit code"
+    );
+    assert!(cx.debug_bounds("job-time-0").is_some(), "and its duration");
+    assert!(
+        cx.debug_bounds("job-stop-0").is_none(),
+        "a settled row has nothing to stop"
+    );
 }
 
-/// The reference renders its sidebar DragHandle only while the column is
-/// expanded (the collapsed sidebar is 0 wide on darwin).
+/// Expanding a row shows the bounded captured output inline.
 #[gpui::test]
-fn the_sidebar_handle_is_gone_when_collapsed(cx: &mut TestAppContext) {
+fn expanding_a_job_shows_its_captured_output(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("sidebar-folded", 2);
+        let mut state = state_with_turns("jobs-expand", 1);
+        let session = state.active_id.clone().expect("a session is active");
+        state.settings.global.general.active_session = session.clone();
+        let id = spawn_background_job(&state, &session, "printf hello-job");
+        state
+            .jobs
+            .wait_for(&id, std::time::Duration::from_secs(5))
+            .expect("the job exists");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    let job = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .background_jobs()
+            .first()
+            .expect("the settled job")
+            .id
+            .clone()
+    });
+    open_jobs_popover(cx);
+    press_selector(cx, "job-chevron-0");
     assert!(
-        cx.debug_bounds("sidebar-handle").is_some(),
-        "the strip is drawn while the column is expanded"
+        cx.debug_bounds("job-output-0").is_some(),
+        "the chevron expands the output panel"
+    );
+    let shown = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .job_output_cached(&job)
+            .map(|(text, _)| text.to_string())
+    });
+    assert_eq!(
+        shown.as_deref(),
+        Some("hello-job"),
+        "the panel draws the captured bytes"
+    );
+    // Pressing it again collapses the row.
+    press_selector(cx, "job-chevron-0");
+    assert!(
+        cx.debug_bounds("job-output-0").is_none(),
+        "a second press collapses it"
+    );
+}
+
+/// Clear drops settled jobs and leaves a running one alone; the chip falls back
+/// to the live count.
+#[gpui::test]
+fn clear_removes_settled_rows_and_keeps_running(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("jobs-clear", 1);
+        let session = state.active_id.clone().expect("a session is active");
+        state.settings.global.general.active_session = session.clone();
+        let done = spawn_background_job(&state, &session, "printf done");
+        state
+            .jobs
+            .wait_for(&done, std::time::Duration::from_secs(5))
+            .expect("the job exists");
+        spawn_background_job(&state, &session, "sleep 30");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (done, live) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        let jobs = shell.state.background_jobs();
+        let done = jobs
+            .iter()
+            .find(|job| !job.is_running())
+            .expect("the settled job")
+            .id
+            .clone();
+        let live = jobs
+            .iter()
+            .find(|job| job.is_running())
+            .expect("the running job")
+            .id
+            .clone();
+        (done, live)
+    });
+    open_jobs_popover(cx);
+    press_selector(cx, "jobs-clear");
+    let (settled, running, label) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        (
+            shell
+                .state
+                .jobs
+                .settled_count(shell.state.active_id.as_deref().expect("a session")),
+            shell
+                .state
+                .jobs
+                .running_count(shell.state.active_id.as_deref().expect("a session")),
+            shell.job_label(),
+        )
+    });
+    assert_eq!(settled, 0, "Clear removed every settled job");
+    cx.update(|_, cx| {
+        assert!(
+            harness
+                .read(cx)
+                .shell
+                .read(cx)
+                .state
+                .jobs
+                .job(&done)
+                .is_none(),
+            "the settled job is gone from the roster"
+        );
+    });
+    assert_eq!(running, 1, "and kept the running one");
+    assert_eq!(label.as_deref(), Some("1 background job running"));
+    assert!(
+        cx.debug_bounds("job-row-1").is_none(),
+        "the cleared row is gone"
+    );
+    assert!(
+        cx.debug_bounds("job-row-0").is_some(),
+        "the running row stays"
     );
     cx.update(|_, cx| {
+        harness.read(cx).shell.read(cx).state.jobs.kill(&live);
+    });
+}
+
+/// Stopping a running job marks it Killed and the whole process group is gone,
+/// proven by the pid disappearing and a marker the command would have written.
+#[gpui::test]
+fn killing_a_job_marks_it_killed_and_ends_its_process(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let marker = std::env::temp_dir().join(format!(
+        "bsh-job-kill-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let command = format!("sleep 30; printf made > {}", marker.display());
+    let marker_for_window = marker.clone();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("jobs-kill", 1);
+        let session = state.active_id.clone().expect("a session is active");
+        state.settings.global.general.active_session = session.clone();
+        spawn_background_job(&state, &session, &command);
+        let _ = &marker_for_window;
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (job, pid) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        let job = shell
+            .state
+            .background_jobs()
+            .into_iter()
+            .next()
+            .expect("the running job");
+        let pid = job.pid.expect("the spawn recorded its pid");
+        (job.id, pid)
+    });
+    open_jobs_popover(cx);
+    press_selector(cx, "job-stop-0");
+    let armed = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .jobs_arm
+            .as_ref()
+            .map(|arm| arm.id.clone())
+    });
+    assert_eq!(
+        armed.as_deref(),
+        Some(job.as_str()),
+        "the first press only arms"
+    );
+    press_selector(cx, "job-stop-0");
+    let status = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        shell
+            .state
+            .jobs
+            .job(&job)
+            .expect("the job is still listed")
+            .status
+    });
+    assert_eq!(status, agent::jobs::JobStatus::Killed);
+    let mut gone = false;
+    for _ in 0..60 {
+        if !agent::jobs::pid_exists(pid) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(gone, "the killed process group is still alive (pid {pid})");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !marker.exists(),
+        "the command outlived its kill and wrote the marker"
+    );
+    let _ = std::fs::remove_file(&marker);
+}
+
+/// Switching sessions swaps the chip's count and the popover's rows: the other
+/// session's jobs are never drawn.
+#[gpui::test]
+fn switching_sessions_shows_that_sessions_jobs(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("jobs-switch", 1);
+        let a = state.active_id.clone().expect("a session is active");
+        let b = state.new_session().expect("a second session");
+        let one = state.jobs.begin(&a, "bash", "one");
+        state
+            .jobs
+            .finish(&one, agent::jobs::JobStatus::Succeeded { code: 0 });
+        let two = state.jobs.begin(&b, "bash", "two");
+        let three = state.jobs.begin(&b, "bash", "three");
+        state
+            .jobs
+            .finish(&two, agent::jobs::JobStatus::Succeeded { code: 0 });
+        state
+            .jobs
+            .finish(&three, agent::jobs::JobStatus::Failed { code: 4 });
+        state.settings.global.general.active_session = a.clone();
+        state.select(&a);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let first = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        (shell.job_label(), visible_job_ids(&shell.state))
+    });
+    assert_eq!(first.0.as_deref(), Some("1 background job"));
+    assert_eq!(first.1.len(), 1);
+
+    cx.update(|_, cx| {
         let shell = harness.read(cx).shell.clone();
-        shell.update(cx, |shell, cx| {
-            // The harness viewport is 1920, so this is the wide branch: the
-            // reference's toggle flips the STORED collapse there.
-            let viewport = shell.viewport_w;
-            shell.toggle_sidebar_at(viewport, cx);
+        shell.update(cx, |this, cx| {
+            let b = this
+                .state
+                .store
+                .sessions
+                .iter()
+                .find(|session| session.id != this.state.active_id.clone().unwrap_or_default())
+                .map(|session| session.id.clone())
+                .expect("the other session");
+            this.state.select(&b);
+            cx.notify();
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("sidebar-handle").is_none(),
-        "and it leaves with the column"
-    );
-    assert!(
-        cx.debug_bounds("sidebar").is_none(),
-        "nor is the column drawn"
-    );
-    let _ = harness;
-}
-
-/// The drag itself. The reference's `outwardWidth` is `base + outward * 2`,
-/// signed toward the dragged side, and its commit stores the RESOLVED width
-/// under `dsh.conversation.contentWidth`; the harness presses the real handle.
-#[gpui::test]
-fn the_chat_handle_drag_sets_and_stores_the_width(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("chat-drag", 2);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let before = cx.update(|_, cx| harness.read(cx).shell.read(cx).chat_w());
-    let handle = cx
-        .debug_bounds("chat-handle-right")
-        .expect("the right handle");
-    let origin = handle.center();
-    let moved = gpui_kit::point(origin.x + px(40.0), origin.y);
-    cx.simulate_mouse_down(origin, gpui_kit::MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_move(moved, None::<gpui_kit::MouseButton>, Modifiers::default());
-    cx.simulate_mouse_up(moved, gpui_kit::MouseButton::Left, Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let (after, stored) = cx.update(|_, cx| {
+    let second = cx.update(|_, cx| {
         let shell = harness.read(cx).shell.read(cx);
-        (
-            shell.chat_w(),
-            shell.state.settings.global.general.content_width,
-        )
+        (shell.job_label(), visible_job_ids(&shell.state))
     });
-    assert_eq!(
-        after,
-        before + 80.0,
-        "40px of pointer is 80px of width while the column stays centred"
-    );
-    assert_eq!(stored, Some(after), "the commit stores the resolved width");
-    let stack = cx
-        .debug_bounds("composer-stack")
-        .expect("the composer stack")
-        .size
-        .width
-        .as_f32();
-    assert_eq!(
-        stack,
-        after + crate::theme::COMPOSER_WIDEN,
-        "and the live column follows the drag"
-    );
-    let _ = harness;
+    assert_eq!(second.0.as_deref(), Some("2 background jobs"));
+    assert_eq!(second.1.len(), 2);
+    assert_ne!(first.1, second.1, "the rows belong to the new session");
 }
 
-/// The reference's own count wording and plural rule:
-/// `t(count === 1 ? "count.live.one" : "count.live.other", { count })`.
-#[test]
-fn the_job_count_takes_the_reference_plural_rule() {
-    use crate::i18n::Lang;
-    assert_eq!(
-        super::header::job_count_label(Lang::En, 1),
-        "1 background job running",
-        "the singular form is the reference's own"
-    );
-    assert_eq!(
-        super::header::job_count_label(Lang::En, 3),
-        "3 background jobs running",
-        "and the plural form follows it"
-    );
-    assert_eq!(
-        super::header::job_count_label(Lang::Zh, 1),
-        "1 个后台任务运行中",
-        "the Chinese form does not inflect, but takes the count"
-    );
-    assert_eq!(
-        super::header::job_count_label(Lang::Zh, 2),
-        "2 个后台任务运行中"
-    );
-    assert_ne!(
-        super::header::job_count_label(Lang::En, 1),
-        "jobs.countLiveOne",
-        "and both keys resolve"
-    );
-}
-
-/// The reference's jobs trigger is not the grey pill bsh drew before: it is
-/// `.trigger{min-height:28px;border-radius:radius-sm;gap:3px;padding:3px 2px}`
-/// in label-tertiary, holding the ongoing `StateDot`, the counted span and a
-/// 12px chevron.
+/// The chip count and the row order are stable across three draws: a settling
+/// job moves between sections but never reshuffles its neighbours.
 #[gpui::test]
-fn the_jobs_trigger_takes_the_measured_chrome(cx: &mut TestAppContext) {
+fn the_job_label_and_rows_are_stable_across_three_draws(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("jobs-chrome", 1);
-        let running = state.active_id.clone().expect("a session is active");
-        let _ = state.new_session();
-        // The turn belongs to the session the shell does not come back to, which
-        // is what makes it a background job.
-        state.settings.global.general.active_session =
-            state.active_id.clone().expect("a session is active");
-        state.streams.insert(running, 10);
+        let mut state = state_with_turns("jobs-stable", 1);
+        let session = state.active_id.clone().expect("a session is active");
+        state.settings.global.general.active_session = session.clone();
+        let older = state.jobs.begin(&session, "bash", "older");
+        state
+            .jobs
+            .finish(&older, agent::jobs::JobStatus::Succeeded { code: 0 });
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newer = state.jobs.begin(&session, "bash", "newer");
+        state
+            .jobs
+            .finish(&newer, agent::jobs::JobStatus::Failed { code: 1 });
+        spawn_background_job(&state, &session, "sleep 30");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let chip = cx
-        .debug_bounds("hdr-jobs")
-        .expect("a background turn draws the measured trigger");
-    assert_eq!(chip.size.height, px(28.0), "the measured min-height:28px");
-    assert!(
-        cx.debug_bounds("hdr-jobs-dot").is_some(),
-        "the ongoing StateDot leads the trigger"
-    );
-    assert!(
-        cx.debug_bounds("hdr-jobs-count").is_some(),
-        "the count span follows it"
-    );
-    let chevron = cx
-        .debug_bounds("hdr-jobs-chevron")
-        .expect("and the chevron closes it");
+    open_jobs_popover(cx);
+    let mut seen: Vec<(Option<String>, Vec<String>, Vec<f32>)> = Vec::new();
+    for _ in 0..3 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (label, ids) = cx.update(|_, cx| {
+            let shell = harness.read(cx).shell.read(cx);
+            (shell.job_label(), visible_job_ids(&shell.state))
+        });
+        let tops = ["job-row-0", "job-row-1", "job-row-2"]
+            .into_iter()
+            .map(|selector| {
+                cx.debug_bounds(selector)
+                    .expect("the row is on screen")
+                    .origin
+                    .y
+                    .as_f32()
+            })
+            .collect();
+        seen.push((label, ids, tops));
+    }
+    assert_eq!(seen[0], seen[1], "the second draw matches the first");
+    assert_eq!(seen[1], seen[2], "and the third matches the second");
     assert_eq!(
-        chevron.size.width,
-        px(12.0),
-        "IconChevronDownOutlineRegular at 12"
+        seen[0].0.as_deref(),
+        Some("1 background job running"),
+        "one live row and two settled ones"
     );
-    assert_eq!(chevron.size.height, px(12.0), "in both axes");
-    let _ = harness;
-}
-
-/// The measured trigger opens the jobs panel IN PLACE, over the session the
-/// reader is on: the click must not navigate, and building the panel has to run
-/// the measured section header without falling over. The kit draws a popup in
-/// its own layer, so the harness cannot read the opened rows - the observable is
-/// the shell the click left behind, exactly as the model chip's own test reads
-/// it.
-#[gpui::test]
-fn the_jobs_trigger_opens_its_panel_in_place(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("jobs-open", 1);
-        let running = state.active_id.clone().expect("a session is active");
-        let _ = state.new_session();
-        state.settings.global.general.active_session =
-            state.active_id.clone().expect("a session is active");
-        state.streams.insert(running, 10);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
+    let live = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .background_jobs()
+            .into_iter()
+            .find(|job| job.is_running())
+            .expect("the running job")
+            .id
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    let before = cx.update(|_, cx| shell.read(cx).state.active_id.clone());
-
-    let chip = cx.debug_bounds("hdr-jobs").expect("the measured trigger");
-    cx.simulate_click(chip.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let after = cx.update(|_, cx| shell.read(cx).state.active_id.clone());
-    assert_eq!(
-        before, after,
-        "the trigger opens its panel in place instead of moving the reader"
-    );
-    assert!(
-        cx.debug_bounds("hdr-jobs").is_some(),
-        "and the trigger it opened from stays on screen"
-    );
-}
-
-/// Watching the only running turn is not a background job, so no chip is drawn.
-#[gpui::test]
-fn the_header_hides_the_job_chip_without_background_work(cx: &mut TestAppContext) {
-    init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("jobs-none", 1);
-        let running = state.active_id.clone().expect("a session is active");
-        // The running turn belongs to the session the shell comes back to, so it
-        // is the one on screen and not a background job.
-        state.settings.global.general.active_session = running.clone();
-        state.streams.insert(running, 10);
-        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
-        Harness { shell }
+    cx.update(|_, cx| {
+        harness.read(cx).shell.read(cx).state.jobs.kill(&live);
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let jobs = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.background_jobs());
-    assert!(
-        jobs.is_empty(),
-        "the session on screen is not a background job"
-    );
-    let label = cx.update(|_, cx| harness.read(cx).shell.read(cx).job_label());
-    assert!(
-        label.is_none(),
-        "with nothing in the background there is no chip to draw"
-    );
 }
 
 /// The appearance handler is the gate the System option promises: it is wired to
 /// the host switch, but only a System mode follows it. The observable is the kit
-/// theme mode, which is per-app in the harness - bsh own copied palette tokens are
-/// process-global and other tests rewrite them in parallel, so asserting on those
-/// would be a race, and the palette swap itself was proven by screenshot.
+/// theme mode, which is per-app in the harness. bsh's copied palette tokens are
+/// per-THREAD (see `theme::PALETTE`), so another case cannot rewrite this one's
+/// colours; the palette swap itself was proven by screenshot.
 #[gpui::test]
 fn only_the_system_mode_follows_a_live_appearance_change(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -3652,13 +4771,13 @@ fn the_model_catalog_handlers_write_the_draft(cx: &mut TestAppContext) {
     assert_eq!(models, ["o3".to_string()], "delete removes exactly one id");
 }
 
-/// A successful commit closes the dialog; the refusal half is pinned next to it.
+/// A successful commit KEEPS the dialog open; the refusal half is pinned next
+/// to it.
 ///
-/// `commit_settings` clears the overlay only after the write lands, so the pair
-/// is: refuse -> stays open with the draft; save -> closes. A save that left the
-/// pane up would look exactly like a refusal the reader cannot see the reason for.
+/// Save is a commit, not a close: both outcomes leave the pane where the reader
+/// was, and only the close control (or Cancel, which discards) ends the session.
 #[gpui::test]
-fn a_successful_commit_closes_the_dialog(cx: &mut TestAppContext) {
+fn a_successful_commit_keeps_the_dialog_open(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("commit-closes"));
@@ -3678,8 +4797,8 @@ fn a_successful_commit_closes_the_dialog(cx: &mut TestAppContext) {
     });
     let overlay = cx.update(|_, cx| format!("{:?}", harness.read(cx).shell.read(cx).state.overlay));
     assert!(
-        !overlay.contains("Settings"),
-        "a successful save closes the dialog, got {overlay}"
+        overlay.contains("Settings"),
+        "a successful save keeps the dialog open, got {overlay}"
     );
     let permission = cx.update(|_, cx| {
         harness
@@ -3825,6 +4944,46 @@ fn the_tools_pane_switches_the_hosted_web_search(cx: &mut TestAppContext) {
         .web_search
     });
     assert!(!built, "the built agent follows the switch");
+}
+
+/// The footer Save commits without closing, and a second press commits again
+/// from the saved document - not from `Settings::default()`, which would wipe
+/// every field the inputs do not carry.
+#[gpui::test]
+fn save_keeps_the_dialog_open_and_a_second_save_keeps_the_document(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("save-keeps-open"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.draft_mut().global.general.content_font_size = 16;
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    for _ in 0..2 {
+        let save = cx
+            .debug_bounds("settings-save")
+            .expect("the footer Save is on screen");
+        cx.simulate_click(save.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (overlay, font) = cx.update(|_, cx| {
+            let this = harness.read(cx).shell.read(cx);
+            (
+                format!("{:?}", this.state.overlay),
+                this.state.settings.global.general.content_font_size,
+            )
+        });
+        assert!(
+            overlay.contains("Settings"),
+            "Save keeps the dialog open, got {overlay}"
+        );
+        assert_eq!(font, 16, "the committed document survives a repeated Save");
+    }
 }
 
 /// The save bar is pinned under the scrolling box, not carried in it.
@@ -4814,6 +5973,9 @@ fn the_plugin_keys_resolve_in_both_locales() {
         "settings.pluginsExperimentalPill",
         "settings.pluginsInstalled",
         "settings.pluginsProblem",
+        "settings.pluginsPartial",
+        "settings.pluginsPartialHint",
+        "settings.pluginsUnsupportedParts",
         "settings.pluginsProblemTooltip",
         "settings.pluginsLoadErrorTooltip",
         "settings.pluginsNeedsTrust",
@@ -4868,11 +6030,13 @@ fn the_plugin_keys_resolve_in_both_locales() {
         "settings.marketError",
         "settings.marketInstallError",
         "settings.marketLimited",
+        "settings.marketShowMore",
         "settings.marketInstall",
         "settings.marketUninstall",
         "settings.marketEnabled",
         "settings.marketDisabled",
         "settings.marketRefused",
+        "settings.marketRefusedShort",
     ] {
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             assert_ne!(crate::i18n::tr(lang, key), key, "missing locale value");
@@ -4888,9 +6052,12 @@ fn the_skills_keys_resolve_in_both_locales() {
         "settings.pluginsTabSkills",
         "settings.skillsIntro",
         "settings.skillsPick",
+        "settings.skillsDirsHint",
+        "settings.skillsSources",
         "settings.skillsBrowseAll",
         "settings.skillsExecutorDirs",
         "settings.skillsCount",
+        "settings.skillsCountOne",
         "settings.skillsMissing",
         "settings.skillsRemove",
         "settings.skillsAdd",
@@ -4901,6 +6068,10 @@ fn the_skills_keys_resolve_in_both_locales() {
         "settings.skillsNameHint",
         "settings.skillsSearch",
         "settings.skillsNone",
+        "settings.skillsNoMatch",
+        "settings.skillsFilterAll",
+        "settings.pluginEnabled",
+        "settings.pluginDisabled",
     ] {
         assert_ne!(
             crate::i18n::tr(crate::i18n::Lang::En, key),
@@ -4917,6 +6088,28 @@ fn the_skills_keys_resolve_in_both_locales() {
         crate::i18n::tr(crate::i18n::Lang::En, "settings.skillsBrowseAll").replace("{count}", "7"),
         "Browse all skills (7)",
         "the count reaches the label the reader sees"
+    );
+    // The two state segments reuse the pane's existing words, so the filter and
+    // the source rows cannot drift apart.
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::En, "settings.skillsFilterAll"),
+        "All"
+    );
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::Zh, "settings.skillsFilterAll"),
+        "全部"
+    );
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::En, "settings.pluginEnabled"),
+        "Enabled"
+    );
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::En, "settings.pluginDisabled"),
+        "Disabled"
+    );
+    assert_eq!(
+        crate::i18n::tr(crate::i18n::Lang::Zh, "settings.pluginDisabled"),
+        "已停用"
     );
 }
 
@@ -5174,8 +6367,8 @@ fn the_skills_pane_lists_the_sources_with_their_counts(cx: &mut TestAppContext) 
     });
     assert!(opened, "the press opened the browse-all disclosure");
     assert!(
-        cx.debug_bounds("skills-browse-0").is_some()
-            && cx.debug_bounds("skills-browse-2").is_some(),
+        cx.debug_bounds("skills-browse-alpha").is_some()
+            && cx.debug_bounds("skills-browse-gamma").is_some(),
         "one row per discovered skill is drawn"
     );
 
@@ -5304,8 +6497,8 @@ fn toggling_a_source_changes_the_draft_and_the_built_agent(cx: &mut TestAppConte
 
     // Paired: switching it back on and saving restores the skill, so the
     // assertion above cannot pass by the build never carrying skills at all.
-    // The press is the pane's own handler rather than a click: Save closed the
-    // dialog (the reference's own close), so there is no card on screen to press.
+    // The press is the pane's own handler rather than a click, so the test
+    // does not depend on the card's laid-out position in the scroller.
     cx.update(|_, cx| {
         let shell = harness.read(cx).shell.clone();
         shell.update(cx, |shell, cx| shell.toggle_source("First", cx));
@@ -5336,6 +6529,417 @@ fn toggling_a_source_changes_the_draft_and_the_built_agent(cx: &mut TestAppConte
         vec!["alpha".to_string()],
         "switching the source back on and saving restores it to the agent"
     );
+}
+
+/// One catalogue entry for the filter tests, with no files behind it.
+fn skill_entry(
+    name: &str,
+    source: &str,
+    enabled: bool,
+) -> crate::settings::resolve::DiscoveredSkill {
+    let dir = std::path::PathBuf::from("/tmp/bsh-filter-tests").join(name);
+    crate::settings::resolve::DiscoveredSkill {
+        name: name.to_string(),
+        description: format!("the {name} skill"),
+        dir: dir.clone(),
+        manifest: dir.join("SKILL.md"),
+        source: source.to_string(),
+        enabled,
+        user_only: false,
+    }
+}
+
+/// The filter is a facet over the search, not a replacement for it: each
+/// segment narrows the rows, and every count applies the search alone so the two
+/// unchosen segments still report their sizes.
+#[test]
+fn the_skill_filter_counts_and_narrows_the_catalogue() {
+    use super::settings::{browse_skills, skill_filter_counts, SkillFilter};
+    let skills = vec![
+        skill_entry("alpha", "First", true),
+        skill_entry("beta", "First", true),
+        skill_entry("gamma", "Second", false),
+    ];
+    let names = |query: &str, filter: SkillFilter| {
+        browse_skills(&skills, query, filter)
+            .into_iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<String>>()
+    };
+    let expected = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(skill_filter_counts(&skills, ""), [3, 2, 1]);
+    assert_eq!(
+        names("", SkillFilter::All),
+        expected(&["alpha", "beta", "gamma"])
+    );
+    assert_eq!(
+        names("", SkillFilter::Enabled),
+        expected(&["alpha", "beta"])
+    );
+    assert_eq!(names("", SkillFilter::Disabled), expected(&["gamma"]));
+
+    // The search composes with the state facet, by name and by source.
+    assert_eq!(skill_filter_counts(&skills, "bet"), [1, 1, 0]);
+    assert_eq!(names("bet", SkillFilter::All), expected(&["beta"]));
+    assert!(names("bet", SkillFilter::Disabled).is_empty());
+    assert_eq!(skill_filter_counts(&skills, "second"), [1, 0, 1]);
+    assert_eq!(names("second", SkillFilter::Disabled), expected(&["gamma"]));
+
+    // A query no skill carries empties every facet rather than falling back.
+    assert_eq!(skill_filter_counts(&skills, "delta"), [0, 0, 0]);
+}
+
+/// A Skills pane over one scratch directory, opened on its tab with the
+/// browse-all list already showing.
+///
+/// `disabled` is the workspace's SAVED off list, so the premise a test asks for
+/// is what the dialog actually loads.
+fn skills_pane<'a>(
+    cx: &'a mut TestAppContext,
+    store: &'static str,
+    root: std::path::PathBuf,
+    disabled: Vec<String>,
+) -> (Entity<Harness>, &'a mut VisualTestContext) {
+    // The kit and the shell's key bindings, the way every pane test opens.
+    init_test_app(cx);
+    // The harness hands back the window context it just built, so the caller
+    // drives the SAME window the pane was rendered into.
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store(store));
+        state.settings.workspace.disabled.skills = disabled.clone();
+        let root = root.clone();
+        let shell = cx.new(move |cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            seed_sources(
+                &mut shell,
+                vec![crate::settings::global::SkillSource {
+                    name: "First".to_string(),
+                    path: root.to_string_lossy().to_string(),
+                    enabled: true,
+                }],
+            );
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let browse = cx
+        .debug_bounds("skills-browse")
+        .expect("the browse-all control is on the pane");
+    cx.simulate_click(browse.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    (harness, cx)
+}
+
+/// Type into the Skills search the way a keystroke does.
+///
+/// The kit's `set_value` deliberately suppresses `InputEvent::Change` - it is a
+/// load, not an edit - so the field is loaded and the event a real key fires is
+/// emitted, which runs the listener that copies the value into `skill_query`.
+fn set_skill_query(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str) {
+    let shell = shell.clone();
+    let text = text.to_string();
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.skill_search.clone().update(cx, |state, cx| {
+                state.set_value(text.clone(), window, cx);
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
+            });
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// The All / Enabled / Disabled segments narrow the browse list, and the counts
+/// they draw are read from the same catalogue as the rows: one switched-off
+/// skill of two reads "All 2 / Enabled 1 / Disabled 1" in the frame itself.
+#[gpui::test]
+fn the_skills_filter_narrows_the_browse_list(cx: &mut TestAppContext) {
+    use super::settings::SkillFilter;
+    let root = skills_scratch("pane-filter");
+    skills_write(&root, "alpha");
+    skills_write(&root, "beta");
+    let (harness, cx) = skills_pane(cx, "skills-pane-filter", root, vec!["alpha".to_string()]);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The count rides in the debug selector, so this asserts the NUMBER the
+    // frame drew rather than only the number the model computed.
+    assert!(
+        cx.debug_bounds("skills-filter-all-count-2").is_some(),
+        "All counts the whole catalogue"
+    );
+    assert!(
+        cx.debug_bounds("skills-filter-enabled-count-1").is_some(),
+        "one skill is on"
+    );
+    assert!(
+        cx.debug_bounds("skills-filter-disabled-count-1").is_some(),
+        "and one is off"
+    );
+
+    // All is the opening view.
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).skill_filter),
+        SkillFilter::All,
+        "the pane opens on All"
+    );
+    assert!(cx.debug_bounds("skills-browse-alpha").is_some());
+    assert!(cx.debug_bounds("skills-browse-beta").is_some());
+
+    // Enabled keeps the on skill and drops the off one.
+    let enabled = cx
+        .debug_bounds("skills-filter-enabled")
+        .expect("the Enabled segment");
+    cx.simulate_click(enabled.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).skill_filter),
+        SkillFilter::Enabled,
+        "the press chose Enabled"
+    );
+    assert!(
+        cx.debug_bounds("skills-browse-beta").is_some(),
+        "the enabled skill stays"
+    );
+    assert!(
+        cx.debug_bounds("skills-browse-alpha").is_none(),
+        "the disabled skill is not drawn under Enabled"
+    );
+
+    // Disabled is the mirror image, so the filter is not a one-way hide.
+    let disabled = cx
+        .debug_bounds("skills-filter-disabled")
+        .expect("the Disabled segment");
+    cx.simulate_click(disabled.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("skills-browse-alpha").is_some(),
+        "the disabled skill is listed under Disabled"
+    );
+    assert!(cx.debug_bounds("skills-browse-beta").is_none());
+    assert!(
+        cx.debug_bounds("skills-filter-all-count-2").is_some(),
+        "and the other segments still report their sizes"
+    );
+
+    // All comes back, and the choice was never persisted.
+    let all = cx
+        .debug_bounds("skills-filter-all")
+        .expect("the All segment");
+    cx.simulate_click(all.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("skills-browse-alpha").is_some());
+    assert!(cx.debug_bounds("skills-browse-beta").is_some());
+    assert_eq!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .settings
+            .workspace
+            .disabled
+            .skills
+            .clone()),
+        vec!["alpha".to_string()],
+        "the filter is view state: it wrote nothing to the saved tree"
+    );
+
+    // Reopening the tab starts over: it is a view of this visit.
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.skill_filter = SkillFilter::Disabled));
+    let tab = cx
+        .debug_bounds("plugins-tab-skills")
+        .expect("the Skills tab");
+    cx.simulate_click(tab.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).skill_filter),
+        SkillFilter::All,
+        "pressing the tab again resets the filter"
+    );
+
+    // Opening the dialog resets it too, the other way the pane is reopened.
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.skill_filter = SkillFilter::Disabled));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| shell.open_settings(window, cx));
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).skill_filter),
+        SkillFilter::All,
+        "opening Settings starts from All"
+    );
+}
+
+/// Toggling a skill inside a filtered view drops the row and moves the counts in
+/// the same frame, and Save carries the decision into the built agent.
+#[gpui::test]
+fn toggling_a_skill_inside_the_filter_updates_the_list_and_the_agent(cx: &mut TestAppContext) {
+    let root = skills_scratch("pane-filter-toggle");
+    skills_write(&root, "alpha");
+    skills_write(&root, "beta");
+    let (harness, cx) = skills_pane(cx, "skills-pane-filter-toggle", root, Vec::new());
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // Narrow to the enabled ones, then switch alpha off from inside that view.
+    let enabled = cx
+        .debug_bounds("skills-filter-enabled")
+        .expect("the Enabled segment");
+    cx.simulate_click(enabled.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "both skills are on under the Enabled segment",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("skills-filter-enabled-count-2").is_some(),
+    );
+    let toggle = cx
+        .debug_bounds("skills-browse-toggle-alpha")
+        .expect("alpha's own switch");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+
+    // The row left the list and the numbers moved, with no reload in between.
+    draw_until(
+        cx,
+        "the switched-off row leaves the Enabled view",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("skills-browse-alpha").is_none(),
+    );
+    assert!(
+        cx.debug_bounds("skills-browse-beta").is_some(),
+        "its sibling is untouched"
+    );
+    assert!(
+        cx.debug_bounds("skills-filter-all-count-2").is_some(),
+        "All still counts both skills"
+    );
+    assert!(
+        cx.debug_bounds("skills-filter-enabled-count-1").is_some(),
+        "one fewer is on"
+    );
+    assert!(
+        cx.debug_bounds("skills-filter-disabled-count-1").is_some(),
+        "and one more is off"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .disabled
+            .skills
+            .clone()),
+        vec!["alpha".to_string()],
+        "the switch wrote disabled_skills, the existing path"
+    );
+
+    // The other direction still lists it, so it can be switched back on.
+    let disabled = cx
+        .debug_bounds("skills-filter-disabled")
+        .expect("the Disabled segment");
+    cx.simulate_click(disabled.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the switched-off skill is still offered under Disabled",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("skills-browse-alpha").is_some(),
+    );
+
+    // Save is the door: the COMMITTED tree builds an agent without it, while
+    // the sibling's instructions stay in place.
+    cx.update(|_, cx| shell.update(cx, |shell, cx| shell.save_settings(cx)));
+    let content = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, _| {
+            let built = crate::caps::build_agent(
+                &shell.state.settings,
+                &shell.state.vault,
+                &crate::settings::resolve::SessionChoice::default(),
+                &crate::mcp::McpPool::default(),
+            );
+            built
+                .agent
+                .get_skills_content()
+                .into_iter()
+                .map(|(name, body)| (name.to_string(), body.to_string()))
+                .collect::<Vec<_>>()
+        })
+    });
+    assert!(
+        content.iter().all(|(name, _)| name != "alpha"),
+        "the saved tree builds an agent without the switched-off skill: {content:?}"
+    );
+    assert!(
+        content
+            .iter()
+            .any(|(name, body)| name == "beta" && body.contains("Body.")),
+        "its enabled sibling is still registered: {content:?}"
+    );
+}
+
+/// The search and the state filter are two facets of one list: typing narrows
+/// the rows and the counts, and a segment narrows what the search left.
+#[gpui::test]
+fn searching_and_filtering_the_skills_compose(cx: &mut TestAppContext) {
+    let root = skills_scratch("pane-filter-search");
+    skills_write(&root, "alpha");
+    skills_write(&root, "beta");
+    let (harness, cx) = skills_pane(
+        cx,
+        "skills-pane-filter-search",
+        root,
+        vec!["alpha".to_string()],
+    );
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // Typing narrows the counts: one match, split into one enabled.
+    set_skill_query(&shell, cx, "bet");
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).skill_query.clone()),
+        "bet",
+        "the keystroke reached the pane's query"
+    );
+    assert!(
+        cx.debug_bounds("skills-filter-all-count-1").is_some(),
+        "All counts the match only"
+    );
+    assert!(cx.debug_bounds("skills-filter-enabled-count-1").is_some());
+    assert!(cx.debug_bounds("skills-filter-disabled-count-0").is_some());
+    assert!(cx.debug_bounds("skills-browse-beta").is_some());
+    assert!(cx.debug_bounds("skills-browse-alpha").is_none());
+
+    // Searching by SOURCE and asking for the disabled ones intersects the two
+    // facets instead of letting either replace the other.
+    set_skill_query(&shell, cx, "first");
+    let disabled = cx
+        .debug_bounds("skills-filter-disabled")
+        .expect("the Disabled segment");
+    cx.simulate_click(disabled.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("skills-browse-alpha").is_some(),
+        "the off skill still matches by source"
+    );
+    assert!(
+        cx.debug_bounds("skills-browse-beta").is_none(),
+        "the on skill is filtered out by state"
+    );
+    assert!(
+        cx.debug_bounds("skills-filter-all-count-2").is_some(),
+        "both skills match the source search"
+    );
+    assert!(cx.debug_bounds("skills-filter-enabled-count-1").is_some());
+
+    // A query nothing carries empties the list; the segments all read zero.
+    set_skill_query(&shell, cx, "gamma");
+    assert!(cx.debug_bounds("skills-filter-all-count-0").is_some());
+    assert!(cx.debug_bounds("skills-filter-disabled-count-0").is_some());
+    assert!(cx.debug_bounds("skills-browse-alpha").is_none());
+    assert!(cx.debug_bounds("skills-browse-beta").is_none());
 }
 
 /// Adding and removing a custom directory writes the DRAFT, and a removal never
@@ -5429,11 +7033,16 @@ fn a_custom_directory_is_added_and_removed_in_the_draft(cx: &mut TestAppContext)
 #[test]
 fn the_provider_form_keys_resolve_in_both_locales() {
     for key in [
+        // The display-name label's own key: without it the field renders the
+        // literal "settings.displayName", which is the bug this pins.
+        "settings.displayName",
         "settings.providerDisplayName",
         "settings.providerNameEmpty",
         "settings.providerNeedsBaseUrl",
         "settings.providerNeedsModel",
+        "settings.providerIdRequired",
         "settings.providerIdTaken",
+        "settings.models.customNeedsBaseUrl",
         "settings.editProvider",
         "settings.saveProvider",
         "settings.cancelEdit",
@@ -5781,6 +7390,27 @@ fn the_market_tab_lists_both_standards_in_place(cx: &mut TestAppContext) {
         cx.debug_bounds("market-card-1").is_some(),
         "the DSH row draws beside it"
     );
+    let first = cx
+        .debug_bounds("market-card-0")
+        .expect("the first market row");
+    let second = cx
+        .debug_bounds("market-card-1")
+        .expect("the second market row");
+    assert_eq!(
+        first.origin.x, second.origin.x,
+        "the market is one vertical list, not a two-up grid"
+    );
+    assert!(
+        second.origin.y > first.origin.y,
+        "the second row sits under the first ({} -> {})",
+        first.origin.y,
+        second.origin.y
+    );
+    assert!(
+        first.size.width > px(400.0),
+        "a market row takes the pane width ({}px)",
+        first.size.width
+    );
     assert!(
         cx.debug_bounds("market-sources-toggle").is_some(),
         "the source disclosure is available"
@@ -5855,6 +7485,57 @@ fn the_plugin_tabs_stay_pinned_while_the_market_scrolls(cx: &mut TestAppContext)
         "the wheel actually moves the market body ({} -> {})",
         card.origin.y,
         card_after.origin.y
+    );
+}
+
+/// A large catalog is shown as a window with an explicit Show more, not a
+/// silent cut: the reader can tell how much exists and keep going.
+#[gpui::test]
+fn the_market_windows_a_large_catalog_with_show_more(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("market-window", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            shell.market = (0..61)
+                .map(|index| {
+                    let mut plugin = remote_market_fixture();
+                    plugin.id = format!("remote-{index}");
+                    plugin.name = format!("Remote {index}");
+                    plugin
+                })
+                .collect();
+            shell.market_loaded = true;
+            shell.plugins_tab = 3;
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("market-card-0").is_some() && cx.debug_bounds("market-card-59").is_some(),
+        "the first window is drawn"
+    );
+    assert!(
+        cx.debug_bounds("market-card-60").is_none(),
+        "the 61st row is past the window"
+    );
+    let more = cx
+        .debug_bounds("market-show-more")
+        .expect("the show-more control");
+    assert!(
+        cx.debug_bounds("market-show-more").is_some(),
+        "and the cap is stated"
+    );
+    cx.simulate_click(more.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("market-card-60").is_some(),
+        "Show more grows the window"
+    );
+    assert!(
+        cx.debug_bounds("market-show-more").is_none(),
+        "and disappears once every match is shown"
     );
 }
 
@@ -6405,6 +8086,115 @@ fn the_mcp_pane_manages_the_draft(cx: &mut TestAppContext) {
     });
     assert_eq!(workspace, 0, "delete drops the entry");
 }
+
+/// `--settings=mcp` must land on the Extensions pane with the MCP tab chosen:
+/// the MCP body is a tab, so the old section index drew it without the strip.
+#[gpui::test]
+fn the_mcp_deep_link_opens_the_extensions_tab(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("mcp-deep-link", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("mcp"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (tab, section) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        (shell.plugins_tab, shell.state.settings_section)
+    });
+    assert_eq!(tab, 1, "the MCP tab is the active tab");
+    assert_eq!(
+        section,
+        section_index("plugins").expect("the Extensions section"),
+        "the dialog stays on Extensions, where the tab strip lives"
+    );
+    assert!(
+        cx.debug_bounds("plugins-tabs").is_some(),
+        "the tab strip is drawn for the deep link, not only for a click"
+    );
+    assert!(
+        cx.debug_bounds("plugins-tab-mcp").is_some(),
+        "and the MCP tab is one of its cells"
+    );
+}
+
+/// The MCP tab now draws the Plugin list's own row: the resting list is one
+/// line per server, the row opens the tool disclosure, and the switch writes
+/// the flag without also collapsing that disclosure.
+#[gpui::test]
+fn the_mcp_list_row_opens_its_detail_and_the_switch_is_not_a_row_press(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("mcp-list-row", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("mcp"), state, cx);
+            shell
+                .state
+                .draft_mut()
+                .global
+                .mcp_servers
+                .push(serde_json::json!({
+                    "name": "local-echo",
+                    "command": "echo",
+                    "args": [],
+                    "enabled": true
+                }));
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("mcp-row-0").is_some(),
+        "the server draws as a list row"
+    );
+    assert!(
+        cx.debug_bounds("mcp-detail-0").is_none(),
+        "the resting row is one line, not an always-open card"
+    );
+
+    let row = cx.debug_bounds("mcp-row-0").expect("the row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("mcp-detail-0").is_some(),
+        "pressing the row opens its disclosure"
+    );
+    assert!(
+        cx.debug_bounds("mcp-edit-0").is_some() && cx.debug_bounds("mcp-remove-0").is_some(),
+        "the disclosure carries the edit and delete controls"
+    );
+
+    let toggle = cx.debug_bounds("mcp-toggle-0").expect("the enable switch");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (open, enabled) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |this, _| {
+            (
+                this.mcp_open.clone(),
+                this.state.draft().mcp_servers()[0].enabled,
+            )
+        })
+    });
+    assert!(!enabled, "the switch writes the flag");
+    assert_eq!(
+        open.as_deref(),
+        Some("local-echo"),
+        "the switch press must not also collapse the row it sits on"
+    );
+
+    cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |this, _| this.mcp_query = "no-such-server".to_string());
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("mcp-row-0").is_none(),
+        "the search row filters the server list"
+    );
+}
+
 /// The Plugin list draws the reference's own empty line when the inventory is
 /// empty, instead of a blank column.
 #[gpui::test]
@@ -7606,10 +9396,17 @@ fn the_composer_chips_take_the_measured_select_trigger(cx: &mut TestAppContext) 
 }
 
 /// The permission chip's menu writes through the same field the General pane's
-/// choice row writes, so the chip's own label follows the mode it changed.
+/// choice row writes, and - NEW SEMANTICS - the write is a COMMIT.
+///
+/// The turn build reads the committed settings, so the old draft-only write
+/// looked inert until somebody pressed Save. A selection now copies just
+/// `workspace.agent.permission` across, saves it and adopts it, which is what
+/// this test reads back: the committed tree, the draft that must agree with it,
+/// and the file a relaunch would load.
 #[gpui::test]
 fn the_permission_chip_writes_the_mode_its_menu_offers(cx: &mut TestAppContext) {
     init_test_app(cx);
+    let home = scratch_home("composer-permission-mode");
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_turns("composer-permission-mode", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -7620,12 +9417,17 @@ fn the_permission_chip_writes_the_mode_its_menu_offers(cx: &mut TestAppContext) 
         shell
             .read(cx)
             .state
-            .draft()
+            .settings
             .workspace
             .agent
             .permission
             .clone()
     });
+    assert_eq!(
+        before,
+        crate::caps::WORKSPACE_WRITE,
+        "the session starts on the committed default"
+    );
     cx.update(|_, cx| {
         shell.update(cx, |shell, cx| {
             shell.set_permission(crate::caps::FULL_ACCESS, cx)
@@ -7635,7 +9437,7 @@ fn the_permission_chip_writes_the_mode_its_menu_offers(cx: &mut TestAppContext) 
         shell
             .read(cx)
             .state
-            .draft()
+            .settings
             .workspace
             .agent
             .permission
@@ -7644,13 +9446,413 @@ fn the_permission_chip_writes_the_mode_its_menu_offers(cx: &mut TestAppContext) 
     assert_eq!(
         after,
         crate::caps::FULL_ACCESS,
-        "the write lands on the draft the General pane also writes"
+        "the write lands on the COMMITTED settings the turn build reads, not only the draft"
     );
-    assert_ne!(
-        super::composer::permission_label_key(&before),
-        super::composer::permission_label_key(&after),
-        "and the chip's own label flips with it"
+    let drafted = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .settings
+            .workspace
+            .agent
+            .permission
+            .clone()
+    });
+    assert_eq!(
+        drafted,
+        crate::caps::FULL_ACCESS,
+        "and the draft agrees, so a later Save cannot resurrect the old mode"
     );
+    assert_eq!(
+        reloaded_settings(&home).workspace.agent.permission,
+        crate::caps::FULL_ACCESS,
+        "the file a relaunch loads holds the chosen mode"
+    );
+}
+
+/// Selecting Workspace Write on a Full-access session changes the NEXT TURN with
+/// no Save and no dialog: the build reads the committed tree, and its tool set
+/// and policy data carry the new mode.
+#[gpui::test]
+fn selecting_workspace_write_applies_to_the_next_turn_without_a_save(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let home = scratch_home("composer-permission-next-turn");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("composer-permission-next-turn", 1);
+        state.settings.workspace.agent.permission = crate::caps::FULL_ACCESS.to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // The menu row's own handler. Nothing opens the settings dialog and nothing
+    // presses Save: the selection is the commit.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::WORKSPACE_WRITE, cx)
+        })
+    });
+    let built = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let id = shell.state.active_id.clone().expect("a session");
+        let choice = shell.state.session_choice(&id);
+        crate::caps::build_agent(
+            &shell.state.settings,
+            &shell.state.vault,
+            &choice,
+            &shell.state.mcp,
+        )
+    });
+    assert_eq!(
+        built.policy.data().permission,
+        crate::caps::WORKSPACE_WRITE,
+        "the NEXT turn's policy data carries the selected mode"
+    );
+    let mut tools: Vec<String> = built
+        .plugins
+        .iter()
+        .flat_map(|plugin| plugin.tools.clone())
+        .collect();
+    tools.sort();
+    for expected in ["bash", "write_file", "edit_file", "read_file"] {
+        assert!(
+            tools.iter().any(|tool| tool == expected),
+            "Workspace Write is the writable confined build, so {expected} is registered: {tools:?}"
+        );
+    }
+    assert_eq!(
+        reloaded_settings(&home).workspace.agent.permission,
+        crate::caps::WORKSPACE_WRITE,
+        "and the choice persisted with no Save"
+    );
+}
+
+/// A Read-only preset caps a Full-access choice: the chip shows the EFFECTIVE
+/// (capped) mode with the ceiling annotation, the policy data hands Rego the
+/// effective value, and a write is denied by the generated session-tier module.
+#[gpui::test]
+fn a_read_only_preset_caps_the_chip_policy_data_and_audit(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("composer-permission-capped", 1);
+        // The chat asks for Full access; the preset it runs under is read-only.
+        state.settings.workspace.agent.permission = crate::caps::WORKSPACE_WRITE.to_string();
+        state.settings.global.presets.insert(
+            "read-only".to_string(),
+            crate::settings::global::Preset {
+                permission: Some(crate::caps::READ_ONLY.to_string()),
+                plugins: vec!["files".to_string()],
+                ..crate::settings::global::Preset::default()
+            },
+        );
+        state.settings.global.default_preset = "read-only".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::FULL_ACCESS, cx)
+        })
+    });
+    // Full access still goes through the risk gate; confirm it the way the
+    // dialog's own enable action does.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.permission_acknowledged = true);
+    });
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_confirm_enable(cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let resolution = cx.update(|_, cx| shell.read(cx).state.effective().permission);
+    assert_eq!(
+        resolution.requested,
+        crate::caps::FULL_ACCESS,
+        "the menu checkmark follows the reader's own choice"
+    );
+    assert_eq!(
+        resolution.effective,
+        crate::caps::READ_ONLY,
+        "the ceiling wins"
+    );
+    assert_eq!(
+        resolution.reduced_by.as_deref(),
+        Some(crate::caps::READ_ONLY),
+        "and the reduction names its cause"
+    );
+    let text = super::composer::permission_chip_text(Lang::En, &resolution);
+    assert!(
+        text.starts_with("Read Only"),
+        "the chip leads with the EFFECTIVE value, got {text:?}"
+    );
+    assert!(
+        text.contains("limited by Read Only preset"),
+        "and annotates the ceiling, got {text:?}"
+    );
+    assert!(
+        !super::composer::permission_choice_checked(&resolution, crate::caps::READ_ONLY),
+        "the checkmark is not on the capped value"
+    );
+    assert!(
+        super::composer::permission_choice_checked(&resolution, crate::caps::FULL_ACCESS),
+        "it is on the session's own choice"
+    );
+    assert!(
+        super::composer::permission_choice_text(Lang::En, &resolution, crate::caps::FULL_ACCESS)
+            .contains("preset caps at Read Only"),
+        "and the row above the ceiling says it will not take effect"
+    );
+    assert!(
+        cx.debug_bounds("permission-chip-read-only").is_some(),
+        "the rendered chip carries the effective value"
+    );
+
+    let (built, denied_rule, audit_permission, requested) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let id = shell.state.active_id.clone().expect("a session");
+        let choice = shell.state.session_choice(&id);
+        let built = crate::caps::build_agent(
+            &shell.state.settings,
+            &shell.state.vault,
+            &choice,
+            &shell.state.mcp,
+        );
+        let root = built.policy.data().workspace_root.clone();
+        let input = agent::policy::PolicyInput::new(
+            "write_file",
+            agent::policy::Action::Write,
+            agent::policy::Target::path(root.join("notes.txt")),
+        )
+        .with_session(id)
+        .with_preset("read-only");
+        let decision = built.policy.check(&input);
+        let rule = decision.rule.clone();
+        let audit_permission = built
+            .policy
+            .denials()
+            .last()
+            .map(|entry| entry.permission.clone());
+        (
+            built,
+            rule,
+            audit_permission,
+            shell.state.settings.workspace.agent.permission.clone(),
+        )
+    });
+    assert_eq!(
+        requested,
+        crate::caps::FULL_ACCESS,
+        "the REQUESTED mode is still Full access (effective != requested)"
+    );
+    assert_eq!(
+        built.policy.data().permission,
+        crate::caps::READ_ONLY,
+        "the data handed to Rego is the EFFECTIVE mode, not the request"
+    );
+    assert_eq!(
+        denied_rule.as_deref(),
+        Some("session-read-only-write"),
+        "the generated session-tier module is the one that refuses the write"
+    );
+    assert_eq!(
+        audit_permission.as_deref(),
+        Some(crate::caps::READ_ONLY),
+        "and the audit row records the effective permission that refused it"
+    );
+    let mut tools: Vec<String> = built
+        .plugins
+        .iter()
+        .flat_map(|plugin| plugin.tools.clone())
+        .collect();
+    tools.sort();
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool == "write_file" || tool == "bash"),
+        "the Rust registration floor still withholds the side-effecting tools: {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|tool| tool == "read_file"),
+        "while the read side stays available: {tools:?}"
+    );
+}
+
+/// The widening gate: cancel leaves the permission byte-identical on disk,
+/// confirm persists it. The copy names what is loosened and what still holds.
+#[gpui::test]
+fn the_widening_gate_cancels_byte_identical_and_confirms(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let home = scratch_home("composer-permission-gate");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("composer-permission-gate", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // Start from a mode that is already on disk, so "unchanged" has a baseline.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::READ_ONLY, cx)
+        })
+    });
+    let global = home.join("settings.toml");
+    let workspace = crate::settings::workspace::WorkspaceSettings::path(&home);
+    let before_global = std::fs::read(&global).expect("the global document was written");
+    let before_workspace = std::fs::read(&workspace).expect("the workspace document was written");
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::FULL_ACCESS, cx)
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("permission-confirm-dialog").is_some(),
+        "Full access still arms the risk gate"
+    );
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_cancel_confirm(cx)));
+    assert_eq!(
+        std::fs::read(&global).expect("global document"),
+        before_global,
+        "cancel writes nothing, so the global document is byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(&workspace).expect("workspace document"),
+        before_workspace,
+        "and neither is the workspace document"
+    );
+    assert_eq!(
+        reloaded_settings(&home).workspace.agent.permission,
+        crate::caps::READ_ONLY,
+        "the cancelled offer leaves the committed mode alone"
+    );
+
+    // Confirm on the second attempt: the mode persists.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::FULL_ACCESS, cx)
+        })
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.permission_acknowledged = true);
+    });
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_confirm_enable(cx)));
+    assert_eq!(
+        reloaded_settings(&home).workspace.agent.permission,
+        crate::caps::FULL_ACCESS,
+        "a confirmed widening persists"
+    );
+}
+
+/// A no-op selection writes nothing and says nothing: re-picking the mode the
+/// committed tree already holds is not a save.
+#[gpui::test]
+fn reselecting_the_current_permission_writes_nothing(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let home = scratch_home("composer-permission-noop");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("composer-permission-noop", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // Persist a non-default mode first, so the "unchanged" comparison has files
+    // to compare and cannot pass merely because nothing was ever written.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::READ_ONLY, cx)
+        })
+    });
+    let global = home.join("settings.toml");
+    let workspace = crate::settings::workspace::WorkspaceSettings::path(&home);
+    let before_global = std::fs::read(&global).expect("the global document was written");
+    let before_workspace = std::fs::read(&workspace).expect("the workspace document was written");
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.notice = None;
+            this.request_permission(crate::caps::READ_ONLY, cx);
+        })
+    });
+    assert_eq!(
+        std::fs::read(&global).expect("global document"),
+        before_global,
+        "a no-op selection writes no global document"
+    );
+    assert_eq!(
+        std::fs::read(&workspace).expect("workspace document"),
+        before_workspace,
+        "and no workspace document"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.notice.clone()),
+        None,
+        "and shows no notice"
+    );
+}
+
+/// A refused permission write surfaces in the notice line and does not become
+/// the mode in force: the chip must not claim what the file does not hold.
+#[gpui::test]
+fn a_refused_permission_write_is_reported_and_reverted(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let base = std::env::temp_dir().join(format!("bsh-permission-refused-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("a scratch directory");
+    // A regular file where the settings DIRECTORY would have to be: the write
+    // cannot create its parent, which is a failure no code path can paper over.
+    let blocker = base.join("blocked");
+    std::fs::write(&blocker, b"not a directory").expect("the blocker");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("permission-refused", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            // The notice is localized; pin the language so the assertion reads
+            // the copy and not this machine's stored preference.
+            this.state.lang = Lang::En;
+            this.state.settings.save_root = Some(blocker.clone());
+            this.request_permission(crate::caps::READ_ONLY, cx);
+        })
+    });
+    let (permission, notice) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.state.settings.workspace.agent.permission.clone(),
+            shell.state.notice.clone(),
+        )
+    });
+    assert_eq!(
+        permission,
+        crate::caps::WORKSPACE_WRITE,
+        "a write that did not land must not become the committed mode"
+    );
+    assert!(
+        notice.as_deref().is_some_and(
+            |text| text.contains(crate::i18n::tr(Lang::En, "permission.saveFailed").as_str())
+        ),
+        "and the refusal is surfaced in the notice line, got {notice:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The widening copy names both halves: what Full access loosens and what the
+/// engine still enforces.
+#[test]
+fn the_widening_copy_names_the_loosened_and_enforced_halves() {
+    let text = crate::i18n::tr(Lang::En, "permission.confirmDescription");
+    for expected in [
+        "whole machine",
+        "unsandboxed",
+        "egress allowlist",
+        "preset's permission ceiling",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the widening confirmation must name {expected:?}: {text:?}"
+        );
+    }
 }
 
 /// The reference's `formatDuration`: elapsed time in at most two adjacent
@@ -7692,9 +9894,7 @@ fn the_kill_phase_windows_are_the_measured_ones() {
 
 /// The reference's two-press stop, driven through the handler's own seam: the
 /// first press only arms, a press that arrives after the window re-arms rather
-/// than stopping, and the confirming press inside it stops the background turn.
-/// The kit popover is its own layer, so the row itself cannot be pressed in the
-/// harness - the observable is the arming state and the stream.
+/// than stopping, and the confirming press inside it kills the job.
 #[gpui::test]
 fn the_job_stop_arms_then_stops_within_its_window(cx: &mut TestAppContext) {
     use crate::ui::header::{JobArm, JobPhase};
@@ -7702,29 +9902,46 @@ fn the_job_stop_arms_then_stops_within_its_window(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("jobs-arm", 1);
-        let active = state.active_id.clone().expect("an active session");
-        let background = state.new_session().expect("a second session");
-        state
-            .begin_turn_in(&background, "background work")
-            .expect("a turn opens");
-        // The streaming session must not be the one on screen, which is what
-        // makes it a background job at all.
-        state.select(&active);
-        assert_eq!(state.background_jobs().len(), 1, "one job in the panel");
+        let session = state.active_id.clone().expect("an active session");
+        state.settings.global.general.active_session = session.clone();
+        spawn_background_job(&state, &session, "sleep 30");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
-    let snapshot = |cx: &mut VisualTestContext| {
+    let id = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .background_jobs()
+            .first()
+            .expect("a background job")
+            .id
+            .clone()
+    });
+    let status = |cx: &mut VisualTestContext| {
         cx.update(|_, cx| {
             let shell = harness.read(cx).shell.read(cx);
-            (shell.jobs_arm.clone(), shell.state.background_jobs().len())
+            shell.state.jobs.job(&id).map(|job| job.status)
         })
     };
-    let press = |cx: &mut VisualTestContext, id: &str, at: Instant| {
-        let id = id.to_string();
+    let arm = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            harness
+                .read(cx)
+                .shell
+                .read(cx)
+                .jobs_arm
+                .as_ref()
+                .map(|arm| arm.phase)
+        })
+    };
+    let press = |cx: &mut VisualTestContext, job: &str, at: Instant| {
+        let job = job.to_string();
         cx.update(|_, cx| {
             let shell = harness.read(cx).shell.clone();
-            shell.update(cx, |shell, cx| shell.press_job_kill_at(&id, at, cx));
+            shell.update(cx, |shell, cx| shell.press_job_kill_at(&job, at, cx));
         });
     };
     let expire = |cx: &mut VisualTestContext, at: Instant| {
@@ -7735,63 +9952,51 @@ fn the_job_stop_arms_then_stops_within_its_window(cx: &mut TestAppContext) {
             });
         });
     };
-    let id = cx.update(|_, cx| {
-        harness
-            .read(cx)
-            .shell
-            .read(cx)
-            .state
-            .background_jobs()
-            .first()
-            .expect("a background job")
-            .0
-            .clone()
-    });
     let t0 = Instant::now();
     press(cx, &id, t0);
-    let (arm, jobs) = snapshot(cx);
+    assert_eq!(arm(cx), Some(JobPhase::Armed), "the first press only arms");
     assert_eq!(
-        arm.as_ref().map(|arm| arm.phase),
-        Some(JobPhase::Armed),
-        "the first press only arms"
+        status(cx),
+        Some(agent::jobs::JobStatus::Running),
+        "and the job is still running"
     );
-    assert_eq!(jobs, 1, "and the job is still running");
     expire(cx, t0 + Duration::from_millis(3000));
-    let (arm, _) = snapshot(cx);
-    assert_eq!(arm, None, "the window disarms it");
+    assert_eq!(arm(cx), None, "the window disarms it");
     press(cx, &id, t0 + Duration::from_millis(5000));
-    let (arm, jobs) = snapshot(cx);
     assert_eq!(
-        arm.as_ref().map(|arm| arm.phase),
+        arm(cx),
         Some(JobPhase::Armed),
         "a press after the window arms again instead of stopping"
     );
-    assert_eq!(jobs, 1);
+    assert_eq!(status(cx), Some(agent::jobs::JobStatus::Running));
     press(cx, &id, t0 + Duration::from_millis(5100));
-    let (arm, jobs) = snapshot(cx);
-    assert_eq!(arm, None, "the confirming press clears the arming");
-    assert_eq!(jobs, 0, "and stops the background turn");
+    assert_eq!(arm(cx), None, "the confirming press clears the arming");
+    assert_eq!(
+        status(cx),
+        Some(agent::jobs::JobStatus::Killed),
+        "and kills the background job"
+    );
     // A job that is already gone is the one failure a local stop can see, and
     // the reference keeps that hint for its own four-second window.
     press(cx, "ghost", t0);
     press(cx, "ghost", t0);
-    let (arm, _) = snapshot(cx);
-    assert_eq!(arm.as_ref().map(|arm| arm.phase), Some(JobPhase::Failed));
+    assert_eq!(arm(cx), Some(JobPhase::Failed));
     expire(cx, t0 + Duration::from_millis(3999));
-    let (arm, _) = snapshot(cx);
     assert!(
-        arm.is_some(),
+        arm(cx).is_some(),
         "three seconds is too soon for the hint to go"
     );
     expire(cx, t0 + Duration::from_millis(4000));
-    let (arm, _) = snapshot(cx);
-    assert_eq!(arm, None);
+    assert_eq!(arm(cx), None);
     // The public shape the trigger and its count read.
     let _ = JobArm {
         id: id.clone(),
         phase: JobPhase::Armed,
         at: t0,
     };
+    cx.update(|_, cx| {
+        harness.read(cx).shell.read(cx).state.jobs.kill(&id);
+    });
 }
 
 /// The rail is the reference's five cells plus the Vault, which BSH adds after
@@ -8106,9 +10311,11 @@ fn the_add_control_opens_the_measured_command_card(cx: &mut TestAppContext) {
         cx.debug_bounds("command-row-stop-turn").is_none(),
         "an idle menu offers no stop row"
     );
-    set_command_draft(&shell, cx, "/zzz");
+    // A leading slash belongs to the slash palette, so the empty state this
+    // card owns is exercised with a mid-draft token instead.
+    set_command_draft(&shell, cx, "hello /zzz");
     let query_draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
-    assert_eq!(query_draft, "/zzz", "the draft is the query source");
+    assert_eq!(query_draft, "hello /zzz", "the draft is the query source");
     assert!(
         cx.debug_bounds("commands-empty").is_some(),
         "an unmatched query is the reference's empty state"
@@ -8142,6 +10349,483 @@ fn the_add_control_opens_the_measured_command_card(cx: &mut TestAppContext) {
     );
 }
 
+/// The card walks its rows from the keyboard, wraps at both ends, and leaves on
+/// Escape without touching the draft.
+///
+/// This is coverage the interceptor never had. The keys cannot reach the card
+/// through an ordinary handler: the kit's textarea binds up/down/tab/escape in
+/// its own key context, and an ancestor listener never sees them while the
+/// composer holds focus. `Shell::command_card_key` is reached from an app-level
+/// keystroke interceptor instead, which runs before action dispatch, so the
+/// wiring is invisible to a rendering assertion - only a real keystroke through
+/// the intercepting app proves it.
+#[gpui::test]
+fn the_command_card_walks_rows_from_the_keyboard(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("command-keys", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let add = cx
+        .debug_bounds("composer-add")
+        .expect("the add control draws");
+    cx.simulate_click(add.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("composer-command-menu").is_some(),
+        "the card opens"
+    );
+
+    // No manual focus step here: the + press itself has to put the keys on the
+    // field, because the interceptor that drives the card is gated on the composer
+    // holding them. That gate is the reported bug - the card opened from the +
+    // took no arrow key at all, while the one opened by `@` did.
+    assert!(
+        cx.update(|window, cx| shell.read(cx).composer_focused(window, cx)),
+        "the + press hands the keys to the composer"
+    );
+
+    let active = |cx: &mut VisualTestContext| cx.update(|_, cx| shell.read(cx).command_menu.active);
+    assert_eq!(active(cx), 0, "a fresh card parks on the top row");
+
+    // Down walks forward; the highlight is what Enter will take.
+    cx.simulate_keystrokes("down");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(active(cx), 1, "down moves the highlight one row");
+
+    cx.simulate_keystrokes("up");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(active(cx), 0, "up moves it back");
+
+    // Wrapping: up from the top reaches the last row instead of sticking, which
+    // is what the reference's listbox does and what makes the keys feel wired.
+    cx.simulate_keystrokes("up");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let rows = cx.update(|_, cx| {
+        shell.update(cx, |shell, _cx| {
+            let trigger = shell.command_menu.trigger.expect("a trigger");
+            shell.card_rows(trigger).len()
+        })
+    });
+    assert_eq!(
+        active(cx),
+        rows - 1,
+        "up from the first row wraps to the last"
+    );
+    cx.simulate_keystrokes("down");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        active(cx),
+        0,
+        "and down from the last wraps back to the first"
+    );
+
+    // Escape puts the card away and keeps the draft exactly as it was.
+    set_command_draft(&shell, cx, "hello /set");
+    let before = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("composer-command-menu").is_none(),
+        "escape closes the card"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        before,
+        "and leaves the draft alone"
+    );
+    let still_open = cx.update(|_, cx| shell.read(cx).command_menu.open);
+    assert!(!still_open, "the state agrees the card is closed");
+}
+
+/// Enter runs the highlighted row, which is the same path a click takes.
+#[gpui::test]
+fn enter_over_the_card_runs_the_highlighted_row(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("command-enter", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let add = cx
+        .debug_bounds("composer-add")
+        .expect("the add control draws");
+    cx.simulate_click(add.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    focus_composer(&shell, cx);
+
+    // Filter to one row so the highlight is unambiguous, then take it.
+    set_command_draft(&shell, cx, "hello /set");
+    assert!(
+        cx.debug_bounds("command-row-settings").is_some(),
+        "the settings row is the only match"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("settings-panel").is_some(),
+        "enter ran the highlighted row"
+    );
+    assert!(
+        cx.debug_bounds("composer-command-menu").is_none(),
+        "and the card closed behind it"
+    );
+}
+
+/// Picking a file from the `@` card inserts a real CHIP, not plain text, and a
+/// press on it opens the file in the right pane.
+///
+/// The reference draws an `@path` through its `user-text` module as a
+/// `ReferenceChip`; bsh drew the bare token. The draft is still one run of text
+/// for editing and undo, so the assertions here are about what the editor holds
+/// (a token over that range) and what a press does.
+#[gpui::test]
+fn a_picked_file_becomes_a_chip_that_opens_in_the_right_pane(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("reference-chip", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("alpha.txt"), "alpha\nbeta\n").expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // A finished mention in the draft is a chip: the editor holds a token over
+    // exactly those bytes.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.set_composer_text("see @alpha.txt", window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let spans: Vec<(usize, usize)> = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .tokens()
+            .iter()
+            .map(|span| (span.range().start, span.range().end))
+            .collect()
+    });
+    assert_eq!(spans.len(), 1, "the mention became one token: {spans:?}");
+    let text = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+    assert_eq!(&text[spans[0].0..spans[0].1], "@alpha.txt");
+
+    // The chip's own path is what a press opens, and the token carries it.
+    let opened = cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            let token = this
+                .composer
+                .read(cx)
+                .tokens()
+                .first()
+                .map(|span| span.token().id().to_string());
+            token
+        })
+    });
+    assert_eq!(
+        opened.as_deref(),
+        Some("alpha.txt"),
+        "the token names the path it opens"
+    );
+
+    // The press: the chip's listener hands the token's own id to the open path,
+    // so driving that path with that id is the listener's whole job.
+    let path = opened.clone().expect("the token names a path");
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_reference_path(&path, window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-editor").is_some(),
+        "the file opened in the right pane's editor"
+    );
+    let opened_tab = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .files
+            .active_tab()
+            .map(|tab| tab.rel.display().to_string())
+    });
+    assert_eq!(
+        opened_tab.as_deref(),
+        Some("alpha.txt"),
+        "and it is the chip's own file"
+    );
+
+    // A directory chip has nothing to open, so it must not clear the pane.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            let before = this.files.active;
+            this.open_reference_path("src/", window, cx);
+            assert_eq!(this.files.active, before, "a directory opens nothing");
+        });
+    });
+}
+/// A chip is decoration over the draft: it must not eat text, move the caret
+/// off the end, or fire while a mention is still being typed.
+///
+/// The tokenizer rewrites the whole document through `set_value` when it has new
+/// references to chip, so the draft and the caret are the two things it could
+/// plausibly break.
+#[gpui::test]
+fn chipping_a_draft_keeps_its_text_and_its_caret(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("chip-caret", 1);
+        tests_pin_reference_defaults(&mut state);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The text is the reader's, character for character, chip or no chip.
+    let draft = "read @AGENTS.md and tell me what it says";
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| this.set_composer_text(draft, window, cx));
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        draft,
+        "chipping a mention never rewrites the draft"
+    );
+    let spans = cx.update(|_, cx| shell.read(cx).composer.read(cx).tokens().len());
+    assert_eq!(spans, 1, "one reference in the draft is one chip");
+
+    // Running the tokenizer again is a no-op: the spans already match, so the
+    // document is not rewritten and the caret cannot drift on every frame.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| this.chip_open_draft(window, cx));
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        draft,
+        "a second pass leaves the draft alone"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer.read(cx).tokens().len()),
+        1,
+        "and does not stack a second token on the same reference"
+    );
+
+    // A half-typed mention is not a chip: the reader is still naming the file.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.set_composer_text("read @AG", window, cx)
+        });
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer.read(cx).tokens().len()),
+        1,
+        "the unfinished mention is left as plain text"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "read @AG",
+        "and its characters are untouched"
+    );
+}
+/// A mention typed by hand chips as soon as it is finished, which is the path
+/// the Change listener owns.
+///
+/// The harness cannot synthesise keystrokes into the kit's editor, so this
+/// drives the handler that listener calls with the draft a keystroke would have
+/// left behind - the same shape the slash palette's own tests use for the same
+/// reason.
+#[gpui::test]
+fn a_hand_typed_mention_chips_when_it_is_finished(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("chip-typing", 1);
+        tests_pin_reference_defaults(&mut state);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // What a keystroke leaves: the field holds the text, then Change runs.
+    let typed = |cx: &mut VisualTestContext, text: &str| {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.composer.update(cx, |state, cx| {
+                    state.set_value(text.to_string(), window, cx);
+                });
+                this.composer_value = text.to_string();
+                this.chip_open_draft(window, cx);
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+
+    // A finished mention chips.
+    typed(cx, "summarise @AGENTS.md");
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer.read(cx).tokens().len()),
+        1,
+        "the finished mention is a chip"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "summarise @AGENTS.md",
+        "and the text is unchanged"
+    );
+
+    // Typing on past it keeps the chip and the new text.
+    typed(cx, "summarise @AGENTS.md in one line");
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer.read(cx).tokens().len()),
+        1,
+        "the chip survives more typing after it"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "summarise @AGENTS.md in one line",
+        "with the whole draft kept"
+    );
+
+    // Deleting the mention drops the chip with it.
+    typed(cx, "summarise ");
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer.read(cx).tokens().len()),
+        0,
+        "deleting the mention leaves no chip behind"
+    );
+}
+/// The chip's own data is what the renderer paints: the path's last segment,
+/// with the glyph and the business colour applied by \`chip\`.
+///
+/// This is deliberately NOT a paint assertion. Both \`InlineTokenContext\` and
+/// \`InlineTokenClickEvent\` are built by the kit and have no public constructor,
+/// so a test cannot call the renderer or synthesise a click; what it can pin is
+/// the data the renderer is handed, and the draft state that decides whether a
+/// chip exists at all. The paint itself was checked in the running app.
+#[gpui::test]
+fn the_reference_chip_carries_the_label_its_renderer_paints(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("chip-paint", 1);
+        tests_pin_reference_defaults(&mut state);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The token the renderer would be handed, built through the same public
+    // \`InputContent\` seam the composer uses.
+    let rendered = cx.update(|_, cx| {
+        use gpui_kit::component::input::{InlineToken, InputContent};
+        let content = InputContent::new("see @alpha.txt");
+        let content = content
+            .with_token(
+                4..14,
+                InlineToken::new("alpha.txt", "@alpha.txt").with_label("alpha.txt"),
+            )
+            .expect("the token attaches");
+        assert_eq!(content.tokens().len(), 1, "one chip to paint");
+        let _ = cx;
+        content
+            .tokens()
+            .first()
+            .map(|span| span.token().label().to_string())
+    });
+    assert_eq!(
+        rendered.as_deref(),
+        Some("alpha.txt"),
+        "the chip paints the path's last segment"
+    );
+
+    // And the complaint itself: a draft with a mention is a chip, not plain text.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.set_composer_text("see @alpha.txt", window, cx)
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).composer.read(cx).tokens().len()) == 1,
+        "the draft the reader sees carries the chip"
+    );
+}
+/// The composer's editor is the control that draws the chips: the token and the
+/// painted element are produced by the same draft, in the same frame.
+///
+/// The chip's paint cannot be asserted from a test - the kit builds
+/// `InlineTokenContext` internally - so this pins the two halves that CAN be
+/// observed: the editor holds the token, and the element the renderer makes from
+/// it is built by `chip` without touching the draft.
+#[gpui::test]
+fn the_composer_editor_holds_the_token_its_renderer_paints(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("chip-installed", 1);
+        tests_pin_reference_defaults(&mut state);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.set_composer_text("see @alpha.txt", window, cx);
+        });
+    });
+    // Several frames: the editor installs the presentation when it renders.
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.draw(cx).clear(cx);
+    });
+
+    let (draft, spans) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let composer = shell.composer.read(cx);
+        (
+            composer.value().to_string(),
+            composer
+                .tokens()
+                .iter()
+                .map(|span| {
+                    (
+                        span.range().start,
+                        span.range().end,
+                        span.token().label().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(draft, "see @alpha.txt", "the editor holds the draft");
+    assert_eq!(
+        spans.len(),
+        1,
+        "and the token its renderer paints: {spans:?}"
+    );
+    assert_eq!(
+        spans[0].2, "alpha.txt",
+        "labelled with the path's last segment"
+    );
+    assert_eq!(
+        &draft[spans[0].0..spans[0].1],
+        "@alpha.txt",
+        "over exactly the mention's bytes"
+    );
+}
 /// The reference source's trigger keeps a quoted mention whole, so a path with a
 /// space survives typing, and an `@` inside a word is not a trigger.
 #[test]
@@ -8170,7 +10854,7 @@ fn the_reference_trigger_keeps_quoted_mentions_whole() {
 /// sessions, and a draft with no trigger closes the card again.
 #[gpui::test]
 fn the_at_trigger_lists_workspace_files_and_sessions(cx: &mut TestAppContext) {
-    let root = std::env::temp_dir().join("bsh-command-refs");
+    let root = std::env::temp_dir().join(format!("bsh-command-refs-{}", std::process::id()));
     std::fs::create_dir_all(root.join("sub")).expect("a scratch tree");
     std::fs::write(root.join("alpha.txt"), "a").expect("a file");
     std::fs::write(root.join("beta.md"), "b").expect("a file");
@@ -8345,6 +11029,10 @@ fn the_general_header_carries_the_reference_document_action(cx: &mut TestAppCont
 /// The risk gate is the only path that writes full access, and it stays shut
 /// until the reference's own acknowledgement is ticked - the enable action is
 /// drawn disabled, and the handler refuses even if it is reached.
+///
+/// NEW SEMANTICS: the assertions read the COMMITTED settings, because that is
+/// the tree the next turn builds from. A gate that wrote only the draft would
+/// pass a draft assertion and still leave the session confined.
 #[gpui::test]
 fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -8359,7 +11047,7 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
         shell
             .read(cx)
             .state
-            .draft()
+            .settings
             .workspace
             .agent
             .permission
@@ -8380,7 +11068,7 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
         shell
             .read(cx)
             .state
-            .draft()
+            .settings
             .workspace
             .agent
             .permission
@@ -8393,7 +11081,7 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
         shell
             .read(cx)
             .state
-            .draft()
+            .settings
             .workspace
             .agent
             .permission
@@ -8424,7 +11112,7 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
         cx.update(|_, cx| shell
             .read(cx)
             .state
-            .draft()
+            .settings
             .workspace
             .agent
             .permission
@@ -8444,10 +11132,14 @@ fn the_risk_gate_needs_the_acknowledgement_before_it_writes(cx: &mut TestAppCont
 
 /// A state whose workspace root is a scratch directory holding a few entries,
 /// so the browser lists a tree the test itself built and never the real one.
-fn state_with_workspace_tree(label: &str) -> AppState {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+fn workspace_tree_root(label: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target")
-        .join(format!("bsh-scratch-ws-{label}"));
+        .join(format!("bsh-scratch-ws-{label}-{}", std::process::id()))
+}
+
+fn state_with_workspace_tree(label: &str) -> AppState {
+    let root = workspace_tree_root(label);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::create_dir_all(root.join("src"));
     let _ = std::fs::create_dir_all(root.join("docs"));
@@ -8948,12 +11640,11 @@ fn choosing_a_model_switches_the_one_the_next_turn_builds() {
         "no model selection is written to the workspace document: {written}"
     );
 
-    // The choice rides the session document, so a relaunch keeps it.
-    let reopened = Store::open_at(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join("bsh-scratch-model-switch"),
-    );
+    // The choice rides the session document, so a relaunch keeps it. The
+    // reopened store comes from the SAME helper the first open used, so a
+    // scratch root that moves (the process id is part of it) cannot silently
+    // point the relaunch at somebody else's directory.
+    let reopened = Store::open_at(scratch_home("model-switch"));
     let saved = reopened.session(&id).expect("the session document");
     assert_eq!(saved.provider.as_deref(), Some("p"));
     assert_eq!(saved.model.as_deref(), Some("second"));
@@ -10096,7 +12787,14 @@ fn a_line_selection_raises_the_comment_plus(cx: &mut TestAppContext) {
             this.open_file(std::path::Path::new("plus.txt"), window, cx);
         });
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // Wait for the editor itself before reading its overlay: with no frame drawn
+    // "no plus" would pass for the wrong reason.
+    draw_until(
+        cx,
+        "the file's editor renders before a selection is made",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("files-editor").is_some(),
+    );
     assert!(
         cx.debug_bounds("files-comment-plus").is_none(),
         "no selection means no plus"
@@ -10113,28 +12811,30 @@ fn a_line_selection_raises_the_comment_plus(cx: &mut TestAppContext) {
             cx.notify();
         });
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
+    draw_until(cx, "the + follows the selection", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("files-comment-plus").is_some()
+    });
 
     let plus = cx
         .debug_bounds("files-comment-plus")
         .expect("the + follows the selection");
-    // The + sits over the editor's own text area, where a synthetic press is not
-    // routed reliably; the action it calls is driven directly, and its placement
-    // is asserted above.
-    // The press does not route while the editor holds the pointer, so the action
-    // the + calls is driven directly; the +'s placement is asserted above.
+    // The + sits over the editor's own text area, and the harness cannot route a
+    // synthetic press through a focused editor to a sibling overlay, so the
+    // action it fires is driven directly. The app's own press does reach it -
+    // that is how the duplicate-field crash was reported.
     let _ = plus;
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| this.open_comment_card(cx));
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
+    draw_until(
+        cx,
+        "pressing the + puts the comment card on screen",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("files-comment-card").is_some(),
+    );
     assert!(
         cx.update(|_, cx| shell.read(cx).files.comment_open),
         "pressing it opens the card"
-    );
-    assert!(
-        cx.debug_bounds("files-comment-card").is_some(),
-        "and the card is on screen"
     );
 }
 /// After `exit` the pane must say so, and Enter must bring a shell back.
@@ -10352,6 +13052,331 @@ fn review_notes_become_a_prompt(cx: &mut TestAppContext) {
     );
     assert!(draft.contains("rename this"), "and its text: {draft:?}");
     assert!(!open, "the drawer closes once the review is drafted");
+}
+/// The + that opens the review card sits on the middle of the selection it
+/// follows, at every panel width.
+///
+/// Two bugs met here. The kit reports text boxes in WINDOW space while the
+/// control is absolutely positioned inside the editor, so the editor's own x
+/// was counted twice and the + hung off the right edge of the pane - visible
+/// only while the editor happened to start at the window's left edge. And it
+/// was anchored 26px to the LEFT of the selection, which put it outside a
+/// narrow document entirely. The + is now the selection's own centre,
+/// converted into the editor's coordinates.
+#[gpui::test]
+fn the_comment_plus_rides_the_middle_of_the_selection(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("comment-plus-place", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("place.txt"), "one\ntwo\nthree\nfour\n").expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let measure = |cx: &mut VisualTestContext, width: f32| {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.right.open = true;
+                this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+                this.right.user_w = Some(width);
+                this.right.maximized = false;
+                if this.files.active.is_none() {
+                    this.open_file(std::path::Path::new("place.txt"), window, cx);
+                }
+                if let Some(editor) = this.files.active_tab().and_then(|tab| tab.editor.clone()) {
+                    editor.update(cx, |state, cx| state.set_selected_range(4..13, cx));
+                }
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+
+    for width in [
+        crate::theme::RIGHT_PANEL_MIN,
+        480.0,
+        crate::theme::RIGHT_PANEL_MAX,
+    ] {
+        measure(cx, width);
+        let panel = cx
+            .debug_bounds("right-panel")
+            .unwrap_or_else(|| panic!("the panel is drawn at {width}"));
+        let plus = cx
+            .debug_bounds("files-comment-plus")
+            .unwrap_or_else(|| panic!("the + follows the selection at {width}"));
+        // The editor's own boxes, in window space, are the oracle: the control
+        // has to land on the marks the reader made, not near them.
+        let (selection, editor_box) = cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                let editor = this
+                    .files
+                    .active_tab()
+                    .and_then(|tab| tab.editor.clone())
+                    .expect("the open editor");
+                let state = editor.read(cx);
+                (
+                    state
+                        .range_to_bounds(&state.selected_range())
+                        .expect("bounds"),
+                    state.text_bounds().expect("the editor box"),
+                )
+            })
+        });
+        let center = plus.center();
+        let selection_left = f32::from(selection.origin.x);
+        let selection_right = selection_left + f32::from(selection.size.width);
+        let selection_top = f32::from(selection.origin.y);
+        let selection_bottom = selection_top + f32::from(selection.size.height);
+        assert!(
+            f32::from(center.x) > selection_left && f32::from(center.x) < selection_right,
+            "the + sits ON the selected text at {width}: {} vs {selection_left}..{selection_right}",
+            f32::from(center.x)
+        );
+        assert!(
+            f32::from(center.y) > selection_top && f32::from(center.y) < selection_bottom,
+            "and inside its lines at {width}: {} vs {selection_top}..{selection_bottom}",
+            f32::from(center.y)
+        );
+        // The editor is where it is, not at the window's left edge: a control
+        // positioned from window coordinates lands panel-width to the right of
+        // this box, which is the reported off-document placement.
+        assert!(
+            f32::from(center.x) >= f32::from(editor_box.origin.x) - 0.5,
+            "and inside the editor at {width}: {} vs {}",
+            f32::from(center.x),
+            f32::from(editor_box.origin.x)
+        );
+        assert!(
+            f32::from(center.x)
+                <= f32::from(editor_box.origin.x) + f32::from(editor_box.size.width) + 0.5,
+            "inside its right edge at {width}"
+        );
+        let panel_left = f32::from(panel.origin.x);
+        let panel_right = panel_left + f32::from(panel.size.width);
+        assert!(
+            f32::from(center.x) <= panel_right,
+            "the panel itself ends on screen at {width}: {panel_right}"
+        );
+    }
+}
+
+/// The + rides the selection through the editor's scroll, and leaves only when
+/// the last marked line does.
+///
+/// The kit lays out only the visible lines, so the whole-range box goes
+/// degenerate as soon as one end of a selection scrolls away - which made the +
+/// disappear on a scroll while most of the marked text was still on screen. It
+/// now rides the middle of the part of the selection that IS laid out.
+#[gpui::test]
+fn the_comment_plus_rides_the_selection_through_a_scroll(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    // Tall enough that the editor has something to scroll.
+    let body: String = (1..=80).map(|n| format!("line {n}\n")).collect();
+    let file = body.clone();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("comment-plus-scroll", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("scroll.txt"), file).expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let select = |cx: &mut VisualTestContext, range: std::ops::Range<usize>| {
+        cx.update(|window, cx| {
+            shell.update(cx, |this, cx| {
+                this.right.open = true;
+                this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+                if this.files.active.is_none() {
+                    this.open_file(std::path::Path::new("scroll.txt"), window, cx);
+                }
+                if let Some(editor) = this.files.active_tab().and_then(|tab| tab.editor.clone()) {
+                    editor.update(cx, |state, cx| state.set_selected_range(range.clone(), cx));
+                }
+                cx.notify();
+            });
+        });
+        // The editor records its own box during PAINT, so the overlay can only
+        // be placed on a later frame. Wait for the control; do not count frames.
+        draw_until(
+            cx,
+            "the + is drawn for a fresh selection",
+            DRAW_UNTIL_MAX,
+            |cx| cx.debug_bounds("files-comment-plus").is_some(),
+        );
+    };
+    let scroll = |cx: &mut VisualTestContext, by: f32| {
+        cx.update(|_window, cx| {
+            shell.update(cx, |this, cx| {
+                if let Some(editor) = this.files.active_tab().and_then(|tab| tab.editor.clone()) {
+                    editor.update(cx, |state, cx| {
+                        state.set_scroll_offset(gpui_kit::point(px(0.0), px(-by)), cx);
+                    });
+                }
+                cx.notify();
+            });
+        });
+        // A scroll is applied by a layout pass, and the overlay rides whichever
+        // selection line that pass left on screen. Wait for that line, not for
+        // a fixed number of frames.
+        draw_until(
+            cx,
+            "the + sits on a line the scrolled viewport holds",
+            DRAW_UNTIL_MAX,
+            |cx| {
+                let Some(plus) = cx.debug_bounds("files-comment-plus") else {
+                    return false;
+                };
+                let Some(editor) = cx.update(|_, cx| {
+                    shell.update(cx, |this, cx| {
+                        this.files
+                            .active_tab()
+                            .and_then(|tab| tab.editor.clone())
+                            .and_then(|editor| editor.read(cx).text_bounds())
+                    })
+                }) else {
+                    return false;
+                };
+                let y = f32::from(plus.center().y);
+                y >= f32::from(editor.origin.y) - 0.5
+                    && y <= f32::from(editor.origin.y) + f32::from(editor.size.height) + 0.5
+            },
+        );
+    };
+    let editor_box = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                let editor = this
+                    .files
+                    .active_tab()
+                    .and_then(|tab| tab.editor.clone())
+                    .expect("the open editor");
+                editor.read(cx).text_bounds().expect("the editor box")
+            })
+        })
+    };
+
+    // A selection that spans the viewport keeps its control while the reader
+    // scrolls: this is the disappearance that was reported.
+    let span =
+        crate::notes::line_start_offset(&body, 2)..crate::notes::line_start_offset(&body, 41);
+    select(cx, span.clone());
+    assert!(
+        cx.debug_bounds("files-comment-plus").is_some(),
+        "the + is drawn for a fresh selection"
+    );
+    scroll(cx, 120.0);
+    let plus = cx
+        .debug_bounds("files-comment-plus")
+        .expect("the + stays while most of the selection still shows");
+    let editor = editor_box(cx);
+    let center = plus.center();
+    assert!(
+        f32::from(center.y) >= f32::from(editor.origin.y) - 0.5
+            && f32::from(center.y)
+                <= f32::from(editor.origin.y) + f32::from(editor.size.height) + 0.5,
+        "and it sits on a visible line: {} vs {}..{}",
+        f32::from(center.y),
+        f32::from(editor.origin.y),
+        f32::from(editor.origin.y) + f32::from(editor.size.height)
+    );
+
+    // Scrolling back keeps it on the selection instead of leaving it behind.
+    scroll(cx, 0.0);
+    let back = cx
+        .debug_bounds("files-comment-plus")
+        .expect("the + comes back with the marks");
+    let editor = editor_box(cx);
+    assert!(
+        f32::from(back.center().y) >= f32::from(editor.origin.y) - 0.5
+            && f32::from(back.center().y)
+                <= f32::from(editor.origin.y) + f32::from(editor.size.height) + 0.5,
+        "on a visible line again"
+    );
+}
+
+/// The review card and the notes drawer cannot both host the note field.
+///
+/// Both draw the same `note_text` entity, and a frame that renders one entity
+/// twice duplicates its accessibility node, which gpui-pre panics on in a debug
+/// build. Raising the card also raises the drawer, so a press on the + crashed
+/// the shell. One draft, one field: the drawer keeps its list of pinned notes
+/// but folds its pin field while the card owns it.
+#[gpui::test]
+fn the_review_card_and_the_notes_drawer_do_not_double_the_field(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("comment-field", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("field.txt"), "alpha\nbeta\n").expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("field.txt"), window, cx);
+            // The drawer is up first: that is the state a reader is in when they
+            // select a line and press the +.
+            this.files.notes_open = true;
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-note-field").is_some(),
+        "the drawer owns the field while it is alone"
+    );
+
+    // This draw is the regression: the same entity used to be prepainted twice,
+    // which the app panics on as a duplicate accessibility node.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.open_comment_card(cx));
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-comment-card").is_some(),
+        "the card is up"
+    );
+    assert!(
+        cx.debug_bounds("files-comment-field").is_some(),
+        "and it owns the field"
+    );
+    assert!(
+        cx.debug_bounds("files-note-field").is_none(),
+        "while the drawer folds its copy instead of drawing the same field twice"
+    );
+    assert!(
+        cx.debug_bounds("files-notes").is_some(),
+        "the drawer itself stays, so the pinned notes are still readable"
+    );
+
+    // Cancelling gives the field back to the drawer.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.files.comment_open = false;
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-note-field").is_some(),
+        "the drawer field returns"
+    );
+    assert!(
+        cx.debug_bounds("files-comment-field").is_none(),
+        "and the card field is gone"
+    );
 }
 /// The editor fills the panel: it used to draw a few lines and clip the rest,
 /// because the frame around it sized to its content instead of the column.
@@ -10698,7 +13723,6 @@ fn the_workspace_tree_scrolls_with_the_wheel_and_the_keys(cx: &mut TestAppContex
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-
     let (tree, max) = cx.update(|_, cx| {
         let shell = shell.read(cx);
         (
@@ -10963,7 +13987,10 @@ fn a_folder_can_be_added_as_a_workspace(cx: &mut TestAppContext) {
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target")
-        .join("bsh-scratch-added-workspace");
+        .join(format!(
+            "bsh-scratch-added-workspace-{}",
+            std::process::id()
+        ));
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::create_dir_all(&root);
     let _ = std::fs::write(root.join("added.txt"), b"hello\n");
@@ -11533,7 +14560,12 @@ fn double_clicking_the_blank_tree_adds_a_file(cx: &mut TestAppContext) {
         .debug_bounds("hdr-show-right-panel")
         .expect("the header carries the right panel's toggle");
     cx.simulate_click(toggle.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
+    draw_until(
+        cx,
+        "the header toggle reveals the right panel",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("right-panel-body").is_some(),
+    );
 
     // Go straight to the Files tab the way the card does.
     cx.update(|_, cx| {
@@ -11541,13 +14573,16 @@ fn double_clicking_the_blank_tree_adds_a_file(cx: &mut TestAppContext) {
             this.open_right_tab(crate::ui::right_panel::RightTab::Files, cx);
         });
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
     // With nothing open the tree owns the surface, and its blank area is there
     // to catch the gesture.
-    assert!(
-        cx.debug_bounds("file-row-README.md").is_some(),
-        "the tree renders"
+    draw_until(
+        cx,
+        "the workspace tree renders above its blank area",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("file-row-README.md").is_some()
+                && cx.debug_bounds("files-blank").is_some()
+        },
     );
     let blank = cx
         .debug_bounds("files-blank")
@@ -11560,33 +14595,41 @@ fn double_clicking_the_blank_tree_adds_a_file(cx: &mut TestAppContext) {
     // Two presses in the same spot read as a double-click and bring the field.
     // The blank fills the remaining height, so its center is always on screen.
     let spot = blank.center();
-    cx.simulate_click(spot, Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    cx.simulate_click(spot, Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
+    press_twice(cx, spot);
     assert!(
         cx.update(|_, cx| shell.read(cx).files.new_file_open),
         "a double-click on blank space opens the new-file field"
     );
-    assert!(
-        cx.debug_bounds("files-new").is_some(),
-        "and the field is on screen"
+    draw_until(
+        cx,
+        "the name field renders after the double-click",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("files-new-input").is_some(),
     );
 
     // A single press takes it away again, so the gesture is easy to undo.
     cx.simulate_click(spot, Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
+    draw_until(
+        cx,
+        "a single press on blank space retires the field",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("files-new").is_none(),
+    );
     assert!(
         !cx.update(|_, cx| shell.read(cx).files.new_file_open),
         "a single press on blank space closes the field"
     );
 
-    // Bring it back and name the file the way the pane does.
-    cx.simulate_click(spot, Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    cx.simulate_click(spot, Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // Bring it back and name the file the way the pane does. The two presses
+    // are back to back: SELF_DOUBLE_MS is wall-clock, so a draw between them
+    // can outlast the gesture's window under a loaded runner.
+    press_twice(cx, spot);
+    draw_until(
+        cx,
+        "the name field returns on the second double-click",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("files-new-input").is_some(),
+    );
     let input = cx
         .debug_bounds("files-new-input")
         .expect("the name field renders");
@@ -11598,11 +14641,24 @@ fn double_clicking_the_blank_tree_adds_a_file(cx: &mut TestAppContext) {
                 .update(cx, |state, cx| state.set_value("note.txt", window, cx));
         });
     });
+    draw_until(
+        cx,
+        "the create control renders beside the name field",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("files-create").is_some(),
+    );
     let create = cx
         .debug_bounds("files-create")
         .expect("the create button renders");
     cx.simulate_click(create.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // The tree re-lists on the frame after the create, so wait for the row
+    // rather than for a fixed draw count.
+    draw_until(
+        cx,
+        "the created file joins the tree",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("file-row-note.txt").is_some(),
+    );
 
     assert!(
         cx.update(|_, cx| {
@@ -11784,11 +14840,8 @@ fn an_edit_marks_the_file_dirty_and_save_clears_it(cx: &mut TestAppContext) {
             .is_some_and(|tab| tab.dirty)),
         "saving clears the dirty mark"
     );
-    let written = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/bsh-scratch-ws-right-dirty/README.md"),
-    )
-    .expect("the save reaches the disk");
+    let written = std::fs::read_to_string(workspace_tree_root("right-dirty").join("README.md"))
+        .expect("the save reaches the disk");
     assert_eq!(written, "# edited\n", "and writes the buffer back");
 }
 
@@ -11813,18 +14866,23 @@ fn a_note_pins_to_the_file_and_survives_a_reload(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     // A file with no notes keeps the surface clean, so the reader opens the
-    // drawer through the toggle that rides the document's corner.
+    // drawer, which is the surface this test pins through: its own field and
+    // its own add control. The review card hosts the same draft, so its field
+    // is the one drawn only while the card is up.
     assert!(
         !cx.update(|_, cx| shell.read(cx).files.notes_open),
         "a file with no notes opens clean"
     );
     cx.update(|_, cx| {
-        shell.update(cx, |this, cx| this.open_comment_card(cx));
+        shell.update(cx, |this, cx| {
+            this.files.notes_open = true;
+            cx.notify();
+        });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         cx.update(|_, cx| shell.read(cx).files.notes_open),
-        "the card raises the drawer"
+        "the drawer is up"
     );
 
     // Type into the note field and press the add control.
@@ -11863,11 +14921,9 @@ fn a_note_pins_to_the_file_and_survives_a_reload(cx: &mut TestAppContext) {
     );
 
     // The sidecar on disk carries it, so another launch sees the same note.
-    let sidecar = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/bsh-scratch-ws-right-notes/.bsh/annotations.json"),
-    )
-    .expect("the note is written to the workspace's sidecar");
+    let sidecar =
+        std::fs::read_to_string(workspace_tree_root("right-notes").join(".bsh/annotations.json"))
+            .expect("the note is written to the workspace's sidecar");
     assert!(sidecar.contains("remember to mention the bus"));
 }
 
@@ -12254,9 +15310,7 @@ fn a_refused_input_surfaces_in_the_terminal_status(cx: &mut TestAppContext) {
 
 /// A scratch session directory no other test shares.
 fn paging_scratch(label: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target")
-        .join(format!("bsh-scratch-{label}"));
+    let dir = scratch_home(label);
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -12336,6 +15390,9 @@ fn an_older_page_returns_immediately_and_lands_from_the_background(cx: &mut Test
             .len()
     });
     assert_eq!(before, crate::store::WINDOW, "only the tail is resident");
+    // Sampled BEFORE the request: the landing frame may render inside
+    // `run_until_parked`, and a page must not reset the measured layout.
+    let resets_before = crate::ui::transcript::transcript_layout_resets();
 
     assert!(at_the_top(&shell, cx), "the scroll path starts a read");
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -12383,7 +15440,21 @@ fn an_older_page_returns_immediately_and_lands_from_the_background(cx: &mut Test
     );
     assert!(after.1, "the next older page was read ahead");
     assert_eq!(after.2, 1, "exactly one prefetch was issued");
+    // The landed page SHIFTS the measured rows instead of invalidating them:
+    // no frame re-measures the whole transcript, and the frame that paints the
+    // page builds the new page rather than the whole resident window.
+    let built_before = crate::ui::transcript::transcript_rows_built();
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    let built = crate::ui::transcript::transcript_rows_built() - built_before;
+    assert_eq!(
+        crate::ui::transcript::transcript_layout_resets(),
+        resets_before,
+        "a prepended page re-measured the whole transcript instead of shifting its rows"
+    );
+    assert!(
+        built <= crate::store::WINDOW + 60,
+        "the landing frame built {built} rows; a prepended page must cost the page, not the window"
+    );
     assert!(
         cx.debug_bounds("older-loading").is_none(),
         "the busy mark clears once the rows land"
@@ -12608,4 +15679,3411 @@ fn a_legacy_history_is_compacted_once_off_the_ui_thread(cx: &mut TestAppContext)
         "the log is one sealed segment"
     );
     assert!(after.all_sealed(), "and it is sealed");
+}
+
+#[gpui::test]
+fn the_skill_list_keeps_its_order_across_frames(cx: &mut TestAppContext) {
+    let root = skills_scratch("pane-order");
+    for index in 0..12 {
+        skills_write(&root, &format!("skill-{index:02}"));
+    }
+    let (harness, cx) = skills_pane(cx, "pane-order", root, Vec::new());
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let order = |cx: &mut VisualTestContext| {
+        let shell = shell.clone();
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .draft()
+                .effective()
+                .skills
+                .iter()
+                .map(|skill| skill.name.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    let sorted = (0..12)
+        .map(|index| format!("skill-{index:02}"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order(cx),
+        sorted,
+        "the premise: discovery returns the catalogue in name order"
+    );
+    for round in 0..3 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            order(cx),
+            sorted,
+            "redraw {round} reordered the list; the rows must not move under the pointer"
+        );
+    }
+}
+
+/// A switch press must not move the list it sits in. The pane used to re-discover
+/// the catalogue on every frame from a name-keyed map, so a press reshuffled
+/// every row under the pointer; the guard is the offset itself plus the pressed
+/// row's own position.
+#[gpui::test]
+fn a_skill_toggle_keeps_the_scroller_offset(cx: &mut TestAppContext) {
+    let root = skills_scratch("pane-scroll-toggle");
+    for index in 0..20 {
+        skills_write(&root, &format!("skill-{index:02}"));
+    }
+    let (harness, cx) = skills_pane(cx, "pane-scroll-toggle", root, Vec::new());
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    wheel_settings_pane(cx, -160.0);
+    let before = settings_offset(&shell, cx);
+    assert!(before < 0.0, "the premise: the options box is scrolled");
+
+    let selector = visible_switch(
+        cx,
+        &[
+            "skills-browse-toggle-skill-00",
+            "skills-browse-toggle-skill-01",
+            "skills-browse-toggle-skill-02",
+            "skills-browse-toggle-skill-03",
+            "skills-browse-toggle-skill-04",
+            "skills-browse-toggle-skill-05",
+            "skills-browse-toggle-skill-06",
+            "skills-browse-toggle-skill-07",
+            "skills-browse-toggle-skill-08",
+            "skills-browse-toggle-skill-09",
+            "skills-browse-toggle-skill-10",
+            "skills-browse-toggle-skill-11",
+            "skills-browse-toggle-skill-12",
+            "skills-browse-toggle-skill-13",
+            "skills-browse-toggle-skill-14",
+            "skills-browse-toggle-skill-15",
+            "skills-browse-toggle-skill-16",
+            "skills-browse-toggle-skill-17",
+            "skills-browse-toggle-skill-18",
+            "skills-browse-toggle-skill-19",
+        ],
+    );
+    let pressed = cx
+        .debug_bounds(selector)
+        .expect("the switch before the press");
+    cx.simulate_click(pressed.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert_eq!(
+        settings_offset(&shell, cx),
+        before,
+        "a switch press moved the options box: {before} -> {}",
+        settings_offset(&shell, cx)
+    );
+    let after = cx
+        .debug_bounds(selector)
+        .expect("the switch after the press");
+    assert_eq!(
+        after.origin, pressed.origin,
+        "the pressed row moved in the list instead of only its switch flipping"
+    );
+    let disabled = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .disabled
+            .skills
+            .clone()
+    });
+    assert!(
+        !disabled.is_empty(),
+        "the press reached a switch, so the offset guard means something"
+    );
+}
+
+/// The MCP tab draws the same 56px row and the same switch, so its press gets
+/// the same offset guard.
+#[gpui::test]
+fn an_mcp_toggle_keeps_the_scroller_offset(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("mcp-scroll-toggle"));
+        state.settings.global.mcp_servers = (0..20)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("srv-{index:02}"),
+                    "command": "true",
+                })
+            })
+            .collect();
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            shell.plugins_tab = 1;
+            shell
+        });
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    wheel_settings_pane(cx, -160.0);
+    let before = settings_offset(&shell, cx);
+    assert!(before < 0.0, "the premise: the MCP list is scrolled");
+
+    let selector = visible_switch(
+        cx,
+        &[
+            "mcp-toggle-0",
+            "mcp-toggle-1",
+            "mcp-toggle-2",
+            "mcp-toggle-3",
+            "mcp-toggle-4",
+            "mcp-toggle-5",
+            "mcp-toggle-6",
+            "mcp-toggle-7",
+            "mcp-toggle-8",
+            "mcp-toggle-9",
+            "mcp-toggle-10",
+            "mcp-toggle-11",
+            "mcp-toggle-12",
+            "mcp-toggle-13",
+            "mcp-toggle-14",
+            "mcp-toggle-15",
+            "mcp-toggle-16",
+            "mcp-toggle-17",
+            "mcp-toggle-18",
+            "mcp-toggle-19",
+        ],
+    );
+    let pressed = cx
+        .debug_bounds(selector)
+        .expect("the switch before the press");
+    cx.simulate_click(pressed.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert_eq!(
+        settings_offset(&shell, cx),
+        before,
+        "an MCP switch press moved the options box"
+    );
+    let after = cx
+        .debug_bounds(selector)
+        .expect("the switch after the press");
+    assert_eq!(after.origin, pressed.origin, "the MCP row moved");
+    let index: usize = selector
+        .rsplit('-')
+        .next()
+        .and_then(|index| index.parse().ok())
+        .expect("the switch names its row");
+    let name = format!("srv-{index:02}");
+    let enabled = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .mcp_servers()
+            .into_iter()
+            .find(|server| server.name == name)
+            .map(|server| server.enabled)
+    });
+    assert_eq!(
+        enabled,
+        Some(false),
+        "the press reached the switch named by the pressed row"
+    );
+}
+
+/// The market cards share the row too, so a press there is held to the same
+/// rule.
+#[gpui::test]
+fn a_market_toggle_keeps_the_scroller_offset(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (harness, cx) =
+        cx.add_window_view(move |window, cx| {
+            let mut state = state_with_turns("market-scroll-toggle", 1);
+            // A card only draws its switch once it is installed, so the fixture is
+            // an installed inventory too; the directory need not exist for the row.
+            for index in 0..20 {
+                state.settings.global.extensions.push(
+                    crate::settings::global::InstalledExtension {
+                        id: format!("remote-{index}"),
+                        name: format!("remote-{index}"),
+                        display_name: format!("Remote plugin {index}"),
+                        description: "a market fixture".to_string(),
+                        version: "1.0.0".to_string(),
+                        standard: crate::settings::global::InstalledStandard::Local,
+                        source_label: "Test Market".to_string(),
+                        install_target: format!("remote-{index}@1.0.0"),
+                        path: Some(format!("/nonexistent/remote-{index}")),
+                        managed: false,
+                        installed_at: 1_700_000_000,
+                        trusted: false,
+                        trusted_path: None,
+                    },
+                );
+            }
+            let shell = cx.new(|cx| {
+                let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+                shell.market = (0..20)
+                    .map(|index| {
+                        let mut plugin = remote_market_fixture();
+                        plugin.id = format!("remote-{index}");
+                        plugin.name = format!("Remote plugin {index}");
+                        plugin
+                    })
+                    .collect();
+                shell.market_loaded = true;
+                shell.plugins_tab = 3;
+                shell
+            });
+            Harness { shell }
+        });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    wheel_settings_pane(cx, -160.0);
+    let before = settings_offset(&shell, cx);
+    assert!(before < 0.0, "the premise: the market is scrolled");
+
+    let selector = visible_switch(
+        cx,
+        &[
+            "market-toggle-0",
+            "market-toggle-1",
+            "market-toggle-2",
+            "market-toggle-3",
+            "market-toggle-4",
+            "market-toggle-5",
+            "market-toggle-6",
+            "market-toggle-7",
+            "market-toggle-8",
+            "market-toggle-9",
+            "market-toggle-10",
+            "market-toggle-11",
+            "market-toggle-12",
+            "market-toggle-13",
+            "market-toggle-14",
+            "market-toggle-15",
+            "market-toggle-16",
+            "market-toggle-17",
+            "market-toggle-18",
+            "market-toggle-19",
+        ],
+    );
+    let pressed = cx
+        .debug_bounds(selector)
+        .expect("the switch before the press");
+    cx.simulate_click(pressed.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert_eq!(
+        settings_offset(&shell, cx),
+        before,
+        "a market switch press moved the options box"
+    );
+    let after = cx
+        .debug_bounds(selector)
+        .expect("the switch after the press");
+    assert_eq!(after.origin, pressed.origin, "the market card moved");
+}
+
+/// A Skills pane whose SAVED settings already name the scratch directory, so a
+/// focused write has a committed source to change (the outline helper seeds the
+/// draft only, which is enough for a pane test but not for a reload).
+fn skills_pane_with_saved<'a>(
+    cx: &'a mut TestAppContext,
+    store: &'static str,
+    root: std::path::PathBuf,
+    disabled: Vec<String>,
+) -> (Entity<Harness>, &'a mut VisualTestContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store(store));
+        state.settings.workspace.disabled.skills = disabled.clone();
+        state
+            .settings
+            .global
+            .set_skill_sources(vec![crate::settings::global::SkillSource {
+                name: "First".to_string(),
+                path: root.to_string_lossy().to_string(),
+                enabled: true,
+            }]);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            shell.plugins_tab = 2;
+            shell.skills_browse_open = true;
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    (harness, cx)
+}
+
+/// A skill switched off in the pane is off on disk with no Save, and the agent
+/// a relaunch builds leaves it out; switching it back on restores both.
+#[gpui::test]
+fn a_skill_toggle_survives_a_reload_without_save(cx: &mut TestAppContext) {
+    let home = scratch_home("pane-skill-persist");
+    let root = skills_scratch("pane-skill-persist");
+    skills_write(&root, "alpha");
+    skills_write(&root, "beta");
+    let (harness, cx) = skills_pane_with_saved(cx, "pane-skill-persist", root, Vec::new());
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let toggle = cx
+        .debug_bounds("skills-browse-toggle-alpha")
+        .expect("alpha's own switch");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // NO Save. The file alone is the evidence.
+    let reloaded = reloaded_settings(&home);
+    assert_eq!(
+        reloaded.workspace.disabled.skills,
+        vec!["alpha".to_string()],
+        "the switch reached the workspace document without Save"
+    );
+    let names = cx.update(|_, cx| built_skill_names(&reloaded, &shell.read(cx).state.vault));
+    assert!(
+        names.iter().all(|name| name != "alpha"),
+        "the relaunched agent leaves the switched-off skill out: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "beta"),
+        "its sibling is still registered: {names:?}"
+    );
+
+    // Re-enabling removes it from the file and gives it back to the agent.
+    let toggle = cx
+        .debug_bounds("skills-browse-toggle-alpha")
+        .expect("alpha's switch after the first press");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let reloaded = reloaded_settings(&home);
+    assert!(
+        reloaded.workspace.disabled.skills.is_empty(),
+        "the second press removed it from the file"
+    );
+    let names = cx.update(|_, cx| built_skill_names(&reloaded, &shell.read(cx).state.vault));
+    assert!(
+        names.iter().any(|name| name == "alpha"),
+        "the relaunched agent registers it again: {names:?}"
+    );
+}
+
+/// A write that cannot reach disk is SHOWN, never silently pretended. The test
+/// guard refuses a settings write with no redirect, which is a real refusal.
+#[gpui::test]
+fn a_failed_skill_write_is_shown_in_the_pane(cx: &mut TestAppContext) {
+    let root = skills_scratch("pane-skill-write-fail");
+    skills_write(&root, "alpha");
+    let (harness, cx) = skills_pane(cx, "pane-skill-write-fail", root, Vec::new());
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            // The test build refuses to write the real file when no redirect
+            // is set; that refusal is the failure under test.
+            shell.state.settings.save_root = None;
+        })
+    });
+    let toggle = cx
+        .debug_bounds("skills-browse-toggle-alpha")
+        .expect("alpha's own switch");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("skills-save-error").is_some(),
+        "the refused write is drawn in the pane, not swallowed"
+    );
+    let (error, committed) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.skills_save_error.clone(),
+            shell.state.settings.workspace.disabled.skills.clone(),
+        )
+    });
+    assert!(error.is_some(), "the pane carries why the write failed");
+    assert!(
+        committed.is_empty(),
+        "a refused write does not claim the committed settings changed"
+    );
+}
+
+/// The executor directory's own switch is the same data-loss path: a directory
+/// switched off must still be off after a relaunch, with no Save.
+#[gpui::test]
+fn an_executor_dir_toggle_survives_a_reload_without_save(cx: &mut TestAppContext) {
+    let home = scratch_home("pane-dir-persist");
+    let root = skills_scratch("pane-dir-persist");
+    skills_write(&root, "alpha");
+    let (harness, cx) = skills_pane_with_saved(cx, "pane-dir-persist", root, Vec::new());
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let dirs = cx
+        .debug_bounds("skills-dirs")
+        .expect("the executor-dirs control");
+    cx.simulate_click(dirs.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let toggle = cx
+        .debug_bounds("skills-dir-toggle-0")
+        .expect("the directory's switch");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let reloaded = reloaded_settings(&home);
+    let first = reloaded
+        .global
+        .skill_sources()
+        .into_iter()
+        .find(|source| source.name == "First")
+        .expect("the saved source");
+    assert!(!first.enabled, "the directory is off in the saved document");
+    let names = cx.update(|_, cx| built_skill_names(&reloaded, &shell.read(cx).state.vault));
+    assert!(
+        names.iter().all(|name| name != "alpha"),
+        "a switched-off directory contributes no skill to the relaunched agent: {names:?}"
+    );
+
+    let toggle = cx
+        .debug_bounds("skills-dir-toggle-0")
+        .expect("the directory's switch after the first press");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let reloaded = reloaded_settings(&home);
+    let first = reloaded
+        .global
+        .skill_sources()
+        .into_iter()
+        .find(|source| source.name == "First")
+        .expect("the saved source");
+    assert!(first.enabled, "the second press switched it back on");
+}
+
+// ---------------------------------------------------------------------------
+// The composer's slash palette
+// ---------------------------------------------------------------------------
+
+/// Write one skill the way the agent crate reads it, with a chosen one-line
+/// description and the user-invocation flag.
+fn skills_write_manifest(root: &std::path::Path, name: &str, description: &str, user_only: bool) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).expect("the skill directory");
+    let restriction = if user_only {
+        "disable-model-invocation: true\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n{restriction}---\n\nBody.\n"),
+    )
+    .expect("the manifest");
+}
+
+/// A shell whose COMMITTED settings point at one scratch skill directory and
+/// whose provider tree carries exactly one model, so the Model chooser has one
+/// deterministic row. A few turns are seeded for the compaction commands.
+fn slash_shell<'a>(
+    cx: &'a mut TestAppContext,
+    store: &'static str,
+    root: std::path::PathBuf,
+    turns: usize,
+) -> (Entity<Harness>, &'a mut VisualTestContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns(store, turns);
+        // A machine's own sources, disabled names, providers and permission
+        // would colour the assertions, so the premise is pinned here.
+        state.settings.workspace.agent.skills_dir = None;
+        state.settings.workspace.disabled.skills.clear();
+        state.settings.workspace.agent.permission = crate::caps::WORKSPACE_WRITE.to_string();
+        state
+            .settings
+            .global
+            .set_skill_sources(vec![crate::settings::global::SkillSource {
+                name: "First".to_string(),
+                path: root.to_string_lossy().to_string(),
+                enabled: true,
+            }]);
+        state.settings.global.providers.clear();
+        seed_provider(&mut state.settings.global, "local", "http://127.0.0.1:9/v1");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    (harness, cx)
+}
+
+/// Set the draft through the listener a keystroke runs, and draw once.
+///
+/// This makes no claim about the CARD: a leading slash does not always keep it
+/// open (a query with no match closes it), so a test that asserts the trigger
+/// rules reads the card itself after this.
+fn set_slash_text(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str) {
+    set_draft(shell, cx, text);
+    let owned = text.to_string();
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.composer_value = owned.clone();
+            shell.slash.sync(&owned, &shell.state);
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// Set the draft the way a keystroke would, running the listener the change
+/// event runs, and wait for the card to follow the TRIGGER.
+fn set_slash_draft(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str) {
+    set_slash_text(shell, cx, text);
+    // A leading slash only opens the palette while the token has no space:
+    // "/goal pause" is a command line, not a filter. A query with no match also
+    // closes, so this helper is for text that matches something.
+    let opened = crate::ui::slash_palette::slash_palette_query(text).is_some();
+    draw_until(cx, "the palette follows the draft", DRAW_UNTIL_MAX, |cx| {
+        let drawn = cx.debug_bounds("composer-slash-palette").is_some();
+        drawn == opened
+    });
+}
+
+/// Put the keys on the composer, which the palette's interceptor gates on.
+fn focus_composer(shell: &Entity<Shell>, cx: &mut VisualTestContext) {
+    use gpui_kit::Focusable as _;
+    cx.update(|window, cx| {
+        let handle = shell.read(cx).composer.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    draw_until(cx, "the composer holds the keys", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|window, cx| shell.read(cx).composer_focused(window, cx))
+    });
+}
+
+/// The palette's flat row ids, for order-sensitive assertions.
+fn slash_row_ids(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Vec<String> {
+    cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .slash
+            .rows()
+            .map(|item| item.id.clone())
+            .collect()
+    })
+}
+
+/// The palette's group sizes, in draw order.
+fn slash_group_counts(
+    shell: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+) -> Vec<(super::slash_palette::SlashKind, usize)> {
+    cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .slash
+            .groups
+            .iter()
+            .map(|group| (group.kind, group.items.len()))
+            .collect()
+    })
+}
+
+/// A leading slash opens the measured card with the three groups this build
+/// backs: the four Add rows, the four real commands, and every discovered
+/// skill. The first row is selected, and the card sits ABOVE the composer.
+#[gpui::test]
+fn the_slash_palette_groups_add_commands_and_skills(cx: &mut TestAppContext) {
+    use super::slash_palette::SlashKind;
+    let root = skills_scratch("slash-groups");
+    skills_write_manifest(&root, "alpha", "the alpha skill", false);
+    skills_write_manifest(&root, "motion", "motion paths", false);
+    let (harness, cx) = slash_shell(cx, "slash-groups", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/");
+    assert!(
+        cx.debug_bounds("composer-slash-palette").is_some(),
+        "a leading slash opens the card"
+    );
+    for id in [
+        "slash-header-add",
+        "slash-header-commands",
+        "slash-header-skills",
+    ] {
+        assert!(cx.debug_bounds(id).is_some(), "{id} draws");
+    }
+    for id in [
+        "slash-row-cmd-file",
+        "slash-row-cmd-goal",
+        "slash-row-cmd-plan",
+        "slash-row-cmd-feedback",
+        "slash-row-cmd-compact",
+        "slash-row-cmd-permission",
+        "slash-row-cmd-model",
+        "slash-row-cmd-export",
+        "slash-row-skill-alpha",
+        "slash-row-skill-motion",
+    ] {
+        assert!(cx.debug_bounds(id).is_some(), "{id} draws");
+    }
+    assert_eq!(
+        slash_group_counts(&shell, cx),
+        vec![
+            (SlashKind::Add, 4),
+            (SlashKind::Command, 4),
+            (SlashKind::Skill, 2)
+        ],
+        "the groups and their counts"
+    );
+    let (open, active) = cx.update(|_, cx| {
+        let slash = &shell.read(cx).slash;
+        (slash.open, slash.active)
+    });
+    assert!(open, "the card is open");
+    assert_eq!(active, 0, "the first row starts selected");
+    let palette = cx
+        .debug_bounds("composer-slash-palette")
+        .expect("the card has bounds");
+    let card = cx
+        .debug_bounds("composer-card")
+        .expect("the composer card has bounds");
+    assert!(
+        palette.origin.y + palette.size.height <= card.origin.y + px(1.0),
+        "the card opens above the composer: palette {:?}, composer top {:?}",
+        palette.origin.y + palette.size.height,
+        card.origin.y
+    );
+    // The reference's measured metrics, pinned so a later edit cannot drift
+    // them: .tki__G_item min-height 34 and .tki__G_sectionTitle min-height 23.
+    let row = cx
+        .debug_bounds("slash-row-cmd-file")
+        .expect("the File row has bounds");
+    assert_eq!(row.size.height, px(34.0), "the measured row height");
+    let section = cx
+        .debug_bounds("slash-header-add")
+        .expect("the Add title has bounds");
+    assert_eq!(
+        section.size.height,
+        px(23.0),
+        "the measured section title height"
+    );
+}
+
+/// Typing filters across every group, by label AND description: the query finds
+/// Plan by its "plan mode" line, Permission and Model by theirs, and each skill
+/// whose one-liner mentions motion.
+#[gpui::test]
+fn typing_filters_the_slash_palette_across_every_group(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-filter");
+    skills_write_manifest(&root, "alpha", "the alpha skill", false);
+    skills_write_manifest(&root, "motion", "motion paths", false);
+    skills_write_manifest(&root, "zeta", "a motion helper", false);
+    let (harness, cx) = slash_shell(cx, "slash-filter", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/mo");
+    let rows = slash_row_ids(&shell, cx);
+    assert!(
+        rows.contains(&"cmd-plan".to_string()),
+        "Plan matches by its description (plan mode): {rows:?}"
+    );
+    assert!(
+        rows.contains(&"cmd-model".to_string()),
+        "Model matches by name: {rows:?}"
+    );
+    assert!(
+        rows.contains(&"cmd-permission".to_string()),
+        "Permission matches by its description (sandbox mode): {rows:?}"
+    );
+    assert!(
+        rows.contains(&"skill-motion".to_string()) && rows.contains(&"skill-zeta".to_string()),
+        "motion matches by name and zeta by its one-liner: {rows:?}"
+    );
+    assert!(
+        !rows.contains(&"cmd-file".to_string())
+            && !rows.contains(&"cmd-goal".to_string())
+            && !rows.contains(&"cmd-feedback".to_string())
+            && !rows.contains(&"cmd-compact".to_string())
+            && !rows.contains(&"cmd-export".to_string()),
+        "the rows that carry no match filter out: {rows:?}"
+    );
+    assert!(
+        !rows.contains(&"skill-alpha".to_string()),
+        "and so does the unmatched skill: {rows:?}"
+    );
+    assert!(
+        cx.debug_bounds("slash-header-add").is_some()
+            && cx.debug_bounds("slash-header-commands").is_some()
+            && cx.debug_bounds("slash-header-skills").is_some(),
+        "every group that still matches keeps its header"
+    );
+}
+
+/// Up and down move the highlight; Enter on Model opens its child list and
+/// Enter there selects a model for THIS conversation.
+#[gpui::test]
+fn the_arrow_keys_move_the_slash_selection_and_enter_runs_it(cx: &mut TestAppContext) {
+    use super::slash_palette::SlashPane;
+    let root = skills_scratch("slash-keys");
+    skills_write_manifest(&root, "modeler", "writes model cards", false);
+    let (harness, cx) = slash_shell(cx, "slash-keys", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/model");
+    focus_composer(&shell, cx);
+    assert_eq!(
+        slash_row_ids(&shell, cx),
+        vec!["cmd-model".to_string(), "skill-modeler".to_string()],
+        "the premise: Model leads, the matching skill follows"
+    );
+    cx.simulate_keystrokes("down");
+    draw_until(cx, "the highlight moved down", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).slash.active) == 1
+    });
+    cx.simulate_keystrokes("up");
+    draw_until(cx, "the highlight moved back up", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).slash.active) == 0
+    });
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the model chooser opened", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).slash.pane) == SlashPane::Models
+    });
+    assert!(
+        cx.debug_bounds("slash-row-model-local-local-model")
+            .is_some(),
+        "the catalogue the build resolves is the list"
+    );
+    assert!(
+        cx.debug_bounds("composer-slash-palette").is_some(),
+        "the card stays open on the child list"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "/model",
+        "and the trigger text is untouched"
+    );
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the model was chosen", DRAW_UNTIL_MAX, |cx| {
+        let chosen = cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .active_session()
+                .and_then(|session| session.model.clone())
+        });
+        chosen.as_deref() == Some("local-model")
+    });
+    let (provider, draft, open) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell
+                .state
+                .active_session()
+                .and_then(|s| s.provider.clone()),
+            shell.composer_value.clone(),
+            shell.slash.open,
+        )
+    });
+    assert_eq!(provider.as_deref(), Some("local"));
+    assert_eq!(draft, "", "the row consumed its own slash token");
+    assert!(!open, "and the palette closed behind the choice");
+}
+
+/// Esc closes the card and leaves the trigger exactly as typed.
+#[gpui::test]
+fn escape_closes_the_slash_palette_and_keeps_the_slash(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-escape");
+    skills_write_manifest(&root, "motion", "motion paths", false);
+    let (harness, cx) = slash_shell(cx, "slash-escape", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/mo");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("escape");
+    draw_until(cx, "the card closed", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-slash-palette").is_none()
+    });
+    let (open, draft) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (shell.slash.open, shell.composer_value.clone())
+    });
+    assert!(!open, "the card is closed");
+    assert_eq!(draft, "/mo", "and the trigger text is untouched");
+}
+
+/// Tab completes the highlighted row's name into the editor, keeping the card
+/// open on the completed query.
+#[gpui::test]
+fn tab_completes_the_slash_row_name(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-tab");
+    skills_write_manifest(&root, "motion", "motion paths", false);
+    let (harness, cx) = slash_shell(cx, "slash-tab", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/mot");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("tab");
+    draw_until(
+        cx,
+        "the completed name reached the editor",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            let value = cx.update(|_, cx| shell.read(cx).composer.read(cx).value().to_string());
+            value == "/motion"
+        },
+    );
+    let (draft, open, rows) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.composer_value.clone(),
+            shell.slash.open,
+            shell
+                .slash
+                .rows()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(draft, "/motion", "the editor and the mirror agree");
+    assert!(open, "the card stays open on the completed query");
+    assert_eq!(rows, vec!["skill-motion".to_string()], "filtered to it");
+}
+
+/// Enter on a skill row inserts the skill's name into the prompt; nothing runs
+/// on the reader's behalf.
+#[gpui::test]
+fn enter_on_a_skill_row_inserts_the_name(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-skill-enter");
+    skills_write_manifest(&root, "motion", "motion paths", false);
+    let (harness, cx) = slash_shell(cx, "slash-skill-enter", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/mot");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the skill name landed", DRAW_UNTIL_MAX, |cx| {
+        let (draft, open) = cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            (shell.composer_value.clone(), shell.slash.open)
+        });
+        draft == "/motion " && !open
+    });
+    let draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+    assert_eq!(draft, "/motion ", "the skill's name is in the prompt");
+}
+
+/// The reference CLOSES the root menu when the query matches nothing; it never
+/// draws an empty popover, and the typed text stays.
+#[gpui::test]
+fn the_menu_closes_when_nothing_matches(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-empty");
+    skills_write_manifest(&root, "alpha", "the alpha skill", false);
+    let (harness, cx) = slash_shell(cx, "slash-empty", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // set_slash_draft waits for the card to be present, which this query never
+    // leaves it, so the draft is written directly here.
+    set_draft(&shell, cx, "/zzzz");
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.composer_value = "/zzzz".to_string();
+            this.slash.sync("/zzzz", &this.state);
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the menu closed", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-slash-palette").is_none()
+    });
+    let (open, empty, draft) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.slash.open,
+            shell.slash.is_empty(),
+            shell.composer_value.clone(),
+        )
+    });
+    assert!(!open, "the menu auto-closed, as the reference does");
+    assert!(empty, "because nothing matched");
+    assert_eq!(draft, "/zzzz", "and the trigger text is untouched");
+}
+
+/// A manifest that restricts its skill to user invocation shows the marker; a
+/// regular skill does not.
+#[gpui::test]
+fn a_user_only_skill_shows_its_marker(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-user-only");
+    skills_write_manifest(&root, "ledger", "the ledger skill", true);
+    skills_write_manifest(&root, "alpha", "the alpha skill", false);
+    let (harness, cx) = slash_shell(cx, "slash-user-only", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/");
+    draw_until(cx, "the skill rows draw", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("slash-row-skill-ledger").is_some()
+    });
+    let (flag, marked, plain) = cx.update(|_, cx| {
+        use super::slash_palette::marked_description;
+        let slash = &shell.read(cx).slash;
+        let ledger = slash.rows().find(|item| item.id == "skill-ledger");
+        let alpha = slash.rows().find(|item| item.id == "skill-alpha");
+        (
+            ledger.map(|item| item.user_only),
+            ledger.map(|item| marked_description(item, Lang::En)),
+            alpha.map(|item| marked_description(item, Lang::En)),
+        )
+    });
+    assert_eq!(flag, Some(true), "the flag the catalogue reported");
+    assert_eq!(
+        marked.as_deref(),
+        Some("user-only · the ledger skill"),
+        "the marker is a description prefix, as the reference's skill source draws it"
+    );
+    assert_eq!(
+        plain.as_deref(),
+        Some("the alpha skill"),
+        "a model-invocable skill carries no marker"
+    );
+}
+
+/// The list scrolls with the wheel when the catalogue is longer than the cap.
+#[gpui::test]
+fn the_slash_palette_list_scrolls_with_the_wheel(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-wheel");
+    for index in 0..60 {
+        skills_write_manifest(&root, &format!("skill-{index:02}"), "a listed skill", false);
+    }
+    let (harness, cx) = slash_shell(cx, "slash-wheel", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/");
+    let before = cx.update(|_, cx| shell.read(cx).slash.scroll.offset().y);
+    let card = cx
+        .debug_bounds("composer-slash-palette")
+        .expect("the card has bounds");
+    assert!(
+        card.size.height <= px(400.0),
+        "the menu caps at the reference's max-height: {:?}",
+        card.size.height
+    );
+    cx.simulate_mouse_move(card.center(), None, Modifiers::default());
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: card.center(),
+        delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, -6.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui_kit::TouchPhase::Moved,
+    });
+    draw_until(cx, "the list scrolled", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).slash.scroll.offset().y < before)
+    });
+}
+
+/// The view model is one pure function over the three sources, and the trigger
+/// is the first character only.
+#[test]
+fn the_slash_view_model_filters_every_source_and_the_trigger_is_the_leading_slash() {
+    use super::slash_palette::{
+        slash_palette_query, SlashAction, SlashCatalogue, SlashCommand, SlashKind, SlashSkill,
+    };
+    assert_eq!(slash_palette_query("/"), Some(""));
+    assert_eq!(slash_palette_query("/mo"), Some("mo"));
+    assert_eq!(slash_palette_query("/mo x"), None, "a space ends the token");
+    assert_eq!(slash_palette_query("/ "), None, "a bare slash and a space");
+    assert_eq!(slash_palette_query(" /mo"), None, "not the first character");
+    assert_eq!(
+        slash_palette_query("hello /mo"),
+        None,
+        "a mid-draft token belongs to the plus card"
+    );
+    assert_eq!(slash_palette_query("https://x/y"), None);
+    assert_eq!(slash_palette_query(""), None);
+
+    let skills = vec![
+        SlashSkill {
+            name: "alpha".to_string(),
+            description: "the alpha skill".to_string(),
+            user_only: false,
+        },
+        SlashSkill {
+            // Its description deliberately does NOT contain its name, so a
+            // match on either field can be attributed to that field alone.
+            name: "beta".to_string(),
+            description: "a ledger of records".to_string(),
+            user_only: true,
+        },
+    ];
+    // Rows are built ONCE; a query selects indices into them. Reading through
+    // the catalogue is what every draw does, so the test exercises that path.
+    let catalogue = SlashCatalogue::build(&skills, Lang::En);
+    let groups = catalogue.groups("", Lang::En);
+    assert_eq!(groups.len(), 3, "three sections");
+    assert_eq!(groups[0].kind, SlashKind::Add);
+    assert_eq!(groups[1].kind, SlashKind::Command);
+    assert_eq!(groups[2].kind, SlashKind::Skill);
+    assert_eq!(groups[0].items.len(), 4, "File, Goal, Plan and Feedback");
+    assert_eq!(groups[1].items.len(), 4, "four backed commands");
+    assert_eq!(groups[2].items.len(), 2, "both skills");
+    let listed: Vec<&str> = groups
+        .iter()
+        .flat_map(|group| group.items.iter())
+        .filter_map(|index| catalogue.row(*index))
+        .map(|item| item.id.as_str())
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            "cmd-file",
+            "cmd-goal",
+            "cmd-plan",
+            "cmd-feedback",
+            "cmd-compact",
+            "cmd-permission",
+            "cmd-model",
+            "cmd-export",
+            "skill-alpha",
+            "skill-beta"
+        ],
+        "the catalogue's own order: Add, Commands, then the skills as discovered"
+    );
+    for item in groups
+        .iter()
+        .flat_map(|group| group.items.iter())
+        .filter_map(|index| catalogue.row(*index))
+    {
+        match &item.action {
+            SlashAction::Command(command) => assert!(
+                SlashCommand::all().contains(command),
+                "{} maps to a real handler",
+                item.id
+            ),
+            SlashAction::Insert(name) => {
+                assert_eq!(item.kind, SlashKind::Skill);
+                assert_eq!(name, &item.label, "a skill row inserts its own name");
+            }
+            other => panic!("a root row with a child-list action: {other:?}"),
+        }
+    }
+    // The NAME is a match field: "beta" is a name, not a description.
+    let beta = catalogue.groups("beta", Lang::En);
+    assert_eq!(beta.len(), 1, "one matching group");
+    assert_eq!(beta[0].kind, SlashKind::Skill);
+    let beta_item = catalogue.row(beta[0].items[0]).expect("the beta row");
+    assert_eq!(beta_item.id, "skill-beta", "matched by name");
+    assert!(beta_item.user_only, "the flag survives the filter");
+    // The DESCRIPTION is a match field too: "ledger" appears only there.
+    let ledger = catalogue.groups("ledger", Lang::En);
+    assert_eq!(
+        ledger
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .filter_map(|index| catalogue.row(*index))
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["skill-beta"],
+        "a query that only the description carries still matches"
+    );
+    assert_eq!(
+        super::slash_palette::marked_description(beta_item, Lang::En),
+        "user-only · a ledger of records",
+        "the marker is the reference's description prefix"
+    );
+    // The File command has no description in the reference's dictionary.
+    let file = catalogue.groups("file", Lang::En);
+    let file = file
+        .iter()
+        .flat_map(|group| group.items.iter())
+        .filter_map(|index| catalogue.row(*index))
+        .find(|item| item.id == "cmd-file")
+        .expect("the File row");
+    assert!(file.description.is_empty(), "File draws no description");
+    assert!(
+        catalogue.groups("zzzz", Lang::En).is_empty(),
+        "a query that matches nothing yields no groups"
+    );
+}
+
+/// Every row the palette lists as a Command maps to a handler that exists, and
+/// each handler's effect is read back from the state it changed.
+#[gpui::test]
+fn every_listed_command_runs_a_real_handler(cx: &mut TestAppContext) {
+    use super::slash_palette::{
+        slash_skills, NoteKind, SlashAction, SlashCatalogue, SlashCommand, SlashEffect, SlashKind,
+        SlashPane,
+    };
+    let root = skills_scratch("slash-handlers");
+    let (harness, cx) = slash_shell(cx, "slash-handlers", root, 8);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // Compact is a model call, and every command row assumes a usable model the
+    // same way a turn does: give this chat one so the handler reaches its work
+    // instead of stopping at the choose-a-model gate.
+    let model = cx.update(|_, cx| shell.read(cx).state.effective().model.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state
+                .select_model_from(&this.state.effective().provider.clone(), &model);
+        });
+    });
+    // The Export row archives the session's LOG, so the premise is a written
+    // one: saving the seeded session creates the directory the ZIP reads.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            if let Some(id) = this.state.active_id.clone() {
+                this.state.save_session(&id);
+            }
+        })
+    });
+
+    // The table the palette draws IS the handler table: every backed command is
+    // listed in the Commands section and nothing else is.
+    let (mut listed_add, mut listed_commands): (Vec<SlashCommand>, Vec<SlashCommand>) =
+        cx.update(|_, cx| {
+            let state = &shell.read(cx).state;
+            let skills = slash_skills(state);
+            let catalogue = SlashCatalogue::build(&skills, state.lang);
+            let groups = catalogue.groups("", state.lang);
+            let names = |kind: SlashKind| -> Vec<SlashCommand> {
+                groups
+                    .iter()
+                    .filter(|group| group.kind == kind)
+                    .flat_map(|group| group.items.iter())
+                    .filter_map(|index| catalogue.row(*index))
+                    .map(|item| match &item.action {
+                        SlashAction::Command(command) => *command,
+                        other => panic!("a {kind:?} row with a non-command action: {other:?}"),
+                    })
+                    .collect()
+            };
+            (names(SlashKind::Add), names(SlashKind::Command))
+        });
+    listed_add.sort_by_key(|command| command.id());
+    listed_commands.sort_by_key(|command| command.id());
+    let mut expected_add = SlashCommand::adds().to_vec();
+    expected_add.sort_by_key(|command| command.id());
+    assert_eq!(
+        listed_add, expected_add,
+        "the Add section is exactly the reference's four rows"
+    );
+    let mut expected_commands = SlashCommand::commands().to_vec();
+    expected_commands.sort_by_key(|command| command.id());
+    assert_eq!(
+        listed_commands, expected_commands,
+        "the Commands section is exactly the reference's four rows"
+    );
+
+    for command in SlashCommand::all() {
+        // Reset the surfaces the previous row opened.
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.state.cancel_settings();
+                this.permission_confirm = None;
+                this.note = None;
+                this.slash.close();
+                this.command_menu.close();
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let before = cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .draft()
+                .workspace
+                .agent
+                .permission
+                .clone()
+        });
+        let effect =
+            cx.update(|window, cx| shell.update(cx, |this, cx| command.run(this, window, cx)));
+        match command {
+            SlashCommand::File => {
+                assert_eq!(effect, SlashEffect::Kept);
+                // The File row LINKS a workspace file: it leaves a reference
+                // token in the draft and opens the @ picker, which the same
+                // grammar and the same rows serve.
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                let (draft, menu_open) = cx.update(|_, cx| {
+                    let shell = shell.read(cx);
+                    (shell.composer_value.clone(), shell.command_menu.open)
+                });
+                assert_eq!(draft, "@", "a bare reference token is left behind");
+                assert!(menu_open, "and the @ picker is open");
+                assert!(
+                    cx.debug_bounds("composer-command-menu").is_some(),
+                    "the reference card draws"
+                );
+                assert!(
+                    !cx.did_prompt_for_paths(),
+                    "linking does not open the OS attach dialog"
+                );
+            }
+            SlashCommand::Goal => {
+                assert_eq!(effect, SlashEffect::Kept);
+                let draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+                assert_eq!(draft, "/goal ", "the Goal row claims the composer");
+            }
+            SlashCommand::Plan => {
+                assert_eq!(effect, SlashEffect::Kept);
+                let draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+                assert_eq!(draft, "/plan ", "the Plan row claims the composer");
+                // The claim alone does not enter plan mode; its Enter does.
+                assert!(!cx.update(|_, cx| shell.read(cx).state.active_plan_mode()));
+            }
+            SlashCommand::Feedback => {
+                assert_eq!(effect, SlashEffect::Done);
+                let note = cx.update(|_, cx| shell.read(cx).note);
+                assert_eq!(
+                    note,
+                    Some(NoteKind::Feedback),
+                    "the Feedback row opens its editor"
+                );
+            }
+            SlashCommand::Compact => {
+                assert_eq!(effect, SlashEffect::Done);
+                let (compacted, notice, expected) = cx.update(|_, cx| {
+                    let state = &shell.read(cx).state;
+                    let session = state.active_session();
+                    let compacted = session.map(|session| session.compacted).unwrap_or(0);
+                    let expected = crate::i18n::tr_args(
+                        state.lang,
+                        "slash.compacted",
+                        &[("count", compacted.to_string())],
+                    );
+                    (compacted, state.notice.clone(), expected)
+                });
+                // Compaction is a MODEL call now, so the boundary lands when the
+                // summarizer reports back; the click's own effect is the
+                // `compacting` notice (or the landed notice with its count).
+                let lang = cx.update(|_, cx| shell.read(cx).state.lang);
+                let started = crate::i18n::tr(lang, "slash.compacting");
+                // A chat with no chosen model refuses BEFORE spending a request,
+                // which is itself the handler's work: a stub row would leave
+                // every one of these notices unset.
+                assert!(
+                    compacted > 0
+                        || notice.as_deref() == Some(started.as_str())
+                        || notice.as_deref() == Some(expected.as_str())
+                        || notice.as_deref().is_some_and(|text| !text.is_empty()),
+                    "the Compact row reaches a handler branch that reports: {:?}",
+                    notice
+                );
+            }
+            SlashCommand::Permission => {
+                assert_eq!(effect, SlashEffect::Chooser);
+                let (pane, rows) = cx.update(|_, cx| {
+                    let slash = &shell.read(cx).slash;
+                    (slash.pane, slash.len())
+                });
+                assert_eq!(pane, SlashPane::Permissions);
+                assert_eq!(rows, 3, "one row per permission preset");
+                let _ = before;
+            }
+            SlashCommand::Model => {
+                assert_eq!(effect, SlashEffect::Chooser);
+                let (pane, rows) = cx.update(|_, cx| {
+                    let slash = &shell.read(cx).slash;
+                    (
+                        slash.pane,
+                        slash.rows().map(|item| item.id.clone()).collect::<Vec<_>>(),
+                    )
+                });
+                assert_eq!(pane, SlashPane::Models);
+                assert_eq!(
+                    rows,
+                    vec!["model-local-local-model".to_string()],
+                    "the catalogue the build resolves is the list"
+                );
+            }
+            SlashCommand::Export => {
+                assert_eq!(effect, SlashEffect::Done);
+                let target = std::env::temp_dir()
+                    .join(format!("bsh-table-export-{}.zip", std::process::id()));
+                let _ = std::fs::remove_file(&target);
+                cx.simulate_new_path_selection(|_| Some(target.clone()));
+                // The handler answers on the GPUI executor and writes on the
+                // background one, so both queues are drained before the frame
+                // pump looks for the file.
+                cx.run_until_parked();
+                draw_until(cx, "the export archive was written", DRAW_UNTIL_MAX, |_| {
+                    target.exists()
+                });
+                let bytes = std::fs::read(&target).expect("the archive bytes");
+                assert!(
+                    bytes.starts_with(b"PK"),
+                    "the Export row writes a real ZIP archive"
+                );
+                let _ = std::fs::remove_file(&target);
+            }
+        }
+    }
+}
+
+/// The pointer is a real path through the card: a move over a row highlights
+/// it, and a click selects and runs that row.
+#[gpui::test]
+fn the_slash_palette_is_clickable(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-click");
+    skills_write_manifest(&root, "modeler", "writes model cards", false);
+    let (harness, cx) = slash_shell(cx, "slash-click", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/model");
+    let skill = cx
+        .debug_bounds("slash-row-skill-modeler")
+        .expect("the skill row draws");
+    cx.simulate_mouse_move(skill.center(), None, Modifiers::default());
+    draw_until(
+        cx,
+        "the pointer highlighted the row",
+        DRAW_UNTIL_MAX,
+        |cx| cx.update(|_, cx| shell.read(cx).slash.active) == 1,
+    );
+    cx.simulate_click(skill.center(), Modifiers::default());
+    draw_until(cx, "the clicked row ran", DRAW_UNTIL_MAX, |cx| {
+        let draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+        draft == "/modeler "
+    });
+    let open = cx.update(|_, cx| shell.read(cx).slash.open);
+    assert!(!open, "and the card closed behind the click");
+}
+
+/// The Goal command line is the reference's: the row claims the composer, a
+/// bare /goal reports the exact status block, an objective creates and arms,
+/// and edit/pause/resume/clear act on the current goal with the reference's
+/// own output and refusals. Output stays in the UI, never in a request.
+#[gpui::test]
+fn the_goal_command_line_creates_edits_pauses_resumes_and_clears(cx: &mut TestAppContext) {
+    use agent::goal::GoalState;
+    let root = skills_scratch("slash-goal");
+    let (harness, cx) = slash_shell(cx, "slash-goal", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let placeholder = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .to_string()
+        })
+    };
+    let notice = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| shell.read(cx).state.notice.clone().unwrap_or_default())
+    };
+    let goal = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .active_session()
+                .and_then(|session| session.goal.clone())
+        })
+    };
+    let run = |cx: &mut VisualTestContext, text: &str| {
+        set_slash_draft(&shell, cx, text);
+        focus_composer(&shell, cx);
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    let usage = "Usage: /goal [<objective>|clear|edit <objective>|pause|resume]";
+    let active_commands = "Commands: /goal edit <objective>, /goal pause, /goal clear";
+    let stopped_commands = "Commands: /goal edit <objective>, /goal resume, /goal clear";
+
+    // The row claims the composer: a bare "/goal " with the reference's hint.
+    set_slash_draft(&shell, cx, "/goal");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the goal claim is in the draft", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()) == "/goal "
+    });
+    assert_eq!(
+        placeholder(cx),
+        "describe the objective for a long-running task",
+        "the claim shows the reference's goal hint"
+    );
+
+    // Bare /goal with no goal: the reference's success text and usage.
+    run(cx, "/goal ");
+    assert_eq!(
+        notice(cx),
+        format!("No goal is currently set.\n{usage}"),
+        "bare /goal with no goal"
+    );
+
+    // /goal <objective> creates and arms it, and answers with the full block.
+    run(cx, "/goal ship the slash palette");
+    let created = goal(cx).expect("the goal was created");
+    assert_eq!(created.objective, "ship the slash palette");
+    assert_eq!(created.state, GoalState::Active);
+    assert_eq!(created.rounds, 0);
+    assert_eq!(created.max_rounds, 256, "the reference's default cap");
+    assert!(created.activation.is_armed());
+    assert_eq!(
+        notice(cx),
+        format!(
+            "Goal created\nStatus: active\nObjective: ship the slash palette\nRounds: 0/256\nActivation: armed\n\n{active_commands}"
+        ),
+        "the created report is the reference's own line order"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "the command consumed its line"
+    );
+    // The command output never entered the transcript.
+    let messages = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .map(|session| session.messages.len())
+            .unwrap_or(0)
+    });
+    assert_eq!(messages, 2, "a command line opens no model turn");
+
+    // Durable: the created goal is on the saved document, without activation.
+    let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().unwrap());
+    let dir = cx.update(|_, cx| shell.read(cx).state.store.dir_for_id(&id));
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("{id}.json"))).expect("the session document"),
+    )
+    .expect("valid JSON");
+    assert_eq!(document["goal"]["objective"], "ship the slash palette");
+    assert_eq!(document["goal"]["max_rounds"], 256);
+    assert!(
+        document["goal"].get("activation").is_none(),
+        "activation is process-local and never persisted"
+    );
+
+    // Bare /goal reports the durable phase and the valid next commands.
+    run(cx, "/goal ");
+    assert_eq!(
+        notice(cx),
+        format!(
+            "Goal\nStatus: active\nObjective: ship the slash palette\nRounds: 0/256\nActivation: armed\n\n{active_commands}"
+        ),
+        "the show report"
+    );
+    // An existing goal shows the active claim hint instead.
+    set_slash_draft(&shell, cx, "/goal ");
+    draw_until(cx, "the active goal hint draws", DRAW_UNTIL_MAX, |cx| {
+        placeholder(cx) == "goal active — edit / pause / resume / clear"
+    });
+
+    // /goal edit <objective> rewrites in place; a bare edit is refused with
+    // the reference's replacement-objective error and usage.
+    run(cx, "/goal edit ship it even better");
+    assert_eq!(goal(cx).unwrap().objective, "ship it even better");
+    assert_eq!(goal(cx).unwrap().state, GoalState::Active);
+    assert_eq!(
+        notice(cx),
+        format!(
+            "Goal updated\nStatus: active\nObjective: ship it even better\nRounds: 0/256\nActivation: armed\n\n{active_commands}"
+        )
+    );
+    run(cx, "/goal edit");
+    assert_eq!(
+        goal(cx).unwrap().objective,
+        "ship it even better",
+        "a bare edit changes nothing"
+    );
+    assert_eq!(
+        notice(cx),
+        format!("Goal editing requires a replacement objective.\n{usage}")
+    );
+
+    // pause / resume / clear, each with the reference's report.
+    run(cx, "/goal pause");
+    assert_eq!(goal(cx).unwrap().state, GoalState::Paused);
+    assert!(!goal(cx).unwrap().activation.is_armed());
+    assert_eq!(
+        notice(cx),
+        format!(
+            "Goal paused\nStatus: paused\nObjective: ship it even better\nRounds: 0/256\nActivation: disarmed\n\n{stopped_commands}"
+        )
+    );
+    run(cx, "/goal ");
+    assert_eq!(
+        notice(cx),
+        format!(
+            "Goal\nStatus: paused\nObjective: ship it even better\nRounds: 0/256\nActivation: disarmed\n\n{stopped_commands}"
+        ),
+        "a paused goal offers resume"
+    );
+    run(cx, "/goal resume");
+    assert_eq!(goal(cx).unwrap().state, GoalState::Active);
+    assert!(goal(cx).unwrap().activation.is_armed());
+    assert_eq!(
+        notice(cx),
+        format!(
+            "Goal resumed\nStatus: active\nObjective: ship it even better\nRounds: 0/256\nActivation: armed\n\n{active_commands}"
+        )
+    );
+    run(cx, "/goal clear");
+    assert!(goal(cx).is_none());
+    assert_eq!(notice(cx), "Goal cleared.");
+    run(cx, "/goal clear");
+    assert_eq!(notice(cx), "No goal to clear.");
+
+    // A control word only acts when it fills the whole argument: this creates
+    // that literal objective. An unknown word is an objective too.
+    run(cx, "/goal pause after verification");
+    assert_eq!(
+        goal(cx).unwrap().objective,
+        "pause after verification",
+        "a control word with an argument is an objective"
+    );
+    run(cx, "/goal frobnicate");
+    assert_eq!(
+        notice(cx),
+        "A goal is already active. Use /goal edit <objective> to change it or /goal clear before replacing it.",
+        "an unknown word is an objective, so it hits the already-active rule"
+    );
+    assert_eq!(
+        goal(cx).unwrap().objective,
+        "pause after verification",
+        "the refused create changed nothing"
+    );
+}
+
+/// Every refusal /goal has, in the reference's own words: a missing goal names
+/// the verb, a phase that cannot take the verb gets the generic invalid-state
+/// error, and show reports the blocker and the exhausted cap.
+#[gpui::test]
+fn the_goal_command_reports_the_references_refusals(cx: &mut TestAppContext) {
+    use agent::goal::GoalState;
+    let root = skills_scratch("goal-refusals");
+    let (harness, cx) = slash_shell(cx, "goal-refusals", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().unwrap());
+    let notice = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| shell.read(cx).state.notice.clone().unwrap_or_default())
+    };
+    let run = |cx: &mut VisualTestContext, text: &str| {
+        set_slash_draft(&shell, cx, text);
+        focus_composer(&shell, cx);
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    let usage = "Usage: /goal [<objective>|clear|edit <objective>|pause|resume]";
+
+    // A verb that needs a goal names itself and prints the usage.
+    run(cx, "/goal edit something");
+    assert_eq!(
+        notice(cx),
+        format!("No goal is currently set; /goal edit requires one. {usage}")
+    );
+    run(cx, "/goal pause");
+    assert_eq!(
+        notice(cx),
+        format!("No goal is currently set; /goal pause requires one. {usage}")
+    );
+    run(cx, "/goal resume");
+    assert_eq!(
+        notice(cx),
+        format!("No goal is currently set; /goal resume requires one. {usage}")
+    );
+
+    // A goal that is already active refuses a create with its phase.
+    run(cx, "/goal aim");
+    run(cx, "/goal another aim");
+    assert_eq!(
+        notice(cx),
+        "A goal is already active. Use /goal edit <objective> to change it or /goal clear before replacing it."
+    );
+    // pause on a paused goal and resume on an active-armed goal are invalid.
+    run(cx, "/goal pause");
+    run(cx, "/goal pause");
+    assert_eq!(
+        notice(cx),
+        "The goal command is not valid for the current state. Run /goal to view available commands."
+    );
+    run(cx, "/goal resume");
+    run(cx, "/goal resume");
+    assert_eq!(
+        notice(cx),
+        "The goal command is not valid for the current state. Run /goal to view available commands."
+    );
+
+    // Editing a completed goal creates a fresh identity and reports it so.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            if let Some(goal) = this
+                .state
+                .store
+                .session_mut(&id)
+                .and_then(|session| session.goal.as_mut())
+            {
+                assert!(goal.complete());
+            }
+        })
+    });
+    run(cx, "/goal edit a fresh aim");
+    assert_eq!(
+        notice(cx),
+        "Goal created\nStatus: active\nObjective: a fresh aim\nRounds: 0/256\nActivation: armed\n\nCommands: /goal edit <objective>, /goal pause, /goal clear"
+    );
+
+    // A blocked goal shows its policy code and explanation, and offers resume.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            if let Some(goal) = this
+                .state
+                .store
+                .session_mut(&id)
+                .and_then(|session| session.goal.as_mut())
+            {
+                assert!(goal.block("round-limit", "the cap is spent"));
+            }
+        })
+    });
+    run(cx, "/goal ");
+    assert_eq!(
+        notice(cx),
+        "Goal\nStatus: blocked\nBlocker: round-limit: the cap is spent\nObjective: a fresh aim\nRounds: 0/256\nActivation: disarmed\n\nCommands: /goal edit <objective>, /goal resume, /goal clear"
+    );
+    run(cx, "/goal resume");
+    assert!(
+        !notice(cx).contains("Blocker:"),
+        "resuming a blocked goal clears the blocker: {}",
+        notice(cx)
+    );
+    assert!(notice(cx).contains("Status: active"));
+
+    // At the cap, show prints the cap and resume refuses.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            if let Some(goal) = this
+                .state
+                .store
+                .session_mut(&id)
+                .and_then(|session| session.goal.as_mut())
+            {
+                goal.rounds = goal.max_rounds;
+                assert!(goal.pause());
+            }
+        })
+    });
+    run(cx, "/goal ");
+    assert!(
+        notice(cx).contains("Rounds: 256/256"),
+        "the cap is printed: {}",
+        notice(cx)
+    );
+    run(cx, "/goal resume");
+    assert_eq!(
+        notice(cx),
+        "The goal command is not valid for the current state. Run /goal to view available commands.",
+        "an exhausted goal cannot resume"
+    );
+    assert!(matches!(
+        cx.update(|_, cx| shell.read(cx).state.goal(&id))
+            .map(|goal| goal.state),
+        Some(GoalState::Paused)
+    ));
+}
+
+/// Attachments accompany only an objective: another verb refuses before any
+/// mutation and keeps them, while a successful create or edit submits ONE
+/// ordinary user message carrying the fixed reference text.
+#[gpui::test]
+fn goal_attachments_ride_only_an_objective(cx: &mut TestAppContext) {
+    use crate::model::Role;
+    use crate::state::{Attachment, GOAL_ATTACHMENT_NOTE};
+    let root = skills_scratch("goal-attachments");
+    let (harness, cx) = slash_shell(cx, "goal-attachments", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let notice = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| shell.read(cx).state.notice.clone().unwrap_or_default())
+    };
+    let run = |cx: &mut VisualTestContext, text: &str| {
+        set_slash_draft(&shell, cx, text);
+        focus_composer(&shell, cx);
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    let attach = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            shell.update(cx, |this, _cx| {
+                this.state.attachments.push(Attachment {
+                    name: "shot.png".to_string(),
+                    mime: "image/png".to_string(),
+                    base64: "Zg==".to_string(),
+                });
+            })
+        })
+    };
+    let attachment_count =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| shell.read(cx).state.attachments.len());
+
+    // Every non-objective verb refuses and leaves the card attached.
+    attach(cx);
+    run(cx, "/goal pause");
+    assert_eq!(
+        notice(cx),
+        "Attachments only accompany a goal objective: /goal <objective> or /goal edit <objective>."
+    );
+    assert_eq!(attachment_count(cx), 1);
+    run(cx, "/goal ");
+    assert_eq!(
+        notice(cx),
+        "Attachments only accompany a goal objective: /goal <objective> or /goal edit <objective>."
+    );
+    assert_eq!(attachment_count(cx), 1);
+
+    // A successful create consumes them into one user message ahead of the
+    // next round, with the reference's fixed text and the image block.
+    run(cx, "/goal look at the screenshot");
+    assert_eq!(attachment_count(cx), 0);
+    let session = cx.update(|_, cx| shell.read(cx).state.active_session().cloned().unwrap());
+    let last = session.messages.last().expect("the attachment message");
+    assert_eq!(last.role, Role::User);
+    assert_eq!(last.text, GOAL_ATTACHMENT_NOTE);
+    assert_eq!(last.images, vec!["data:image/png;base64,Zg=="]);
+
+    // A refused create keeps the attachment: the reference leaves the
+    // dispatching composer's cards intact.
+    attach(cx);
+    run(cx, "/goal another aim");
+    assert_eq!(
+        notice(cx),
+        "A goal is already active. Use /goal edit <objective> to change it or /goal clear before replacing it."
+    );
+    assert_eq!(attachment_count(cx), 1);
+    // An edit is an objective form, so it admits them; the goal stays active.
+    run(cx, "/goal edit look again");
+    assert_eq!(attachment_count(cx), 0);
+    let session = cx.update(|_, cx| shell.read(cx).state.active_session().cloned().unwrap());
+    let last = session
+        .messages
+        .last()
+        .expect("the second attachment message");
+    assert_eq!(last.role, Role::User);
+    assert_eq!(last.text, GOAL_ATTACHMENT_NOTE);
+}
+
+/// Plan mode is a session fact with the reference's command grammar: the Plan
+/// row claims the composer with the task hint, bare `/plan` enters, `/plan
+/// off` leaves, `/plan <task>` enters and submits the task, and the chip (a
+/// plan glyph that becomes a circled x under the pointer) exits. Leaving
+/// removes every marked plan surface: chip, placeholder and directive.
+#[gpui::test]
+fn the_plan_command_enters_with_off_and_the_task_hint(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-plan");
+    let (harness, cx) = slash_shell(cx, "slash-plan", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let placeholder = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .composer
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .to_string()
+        })
+    };
+    let ordinary = placeholder(cx);
+    assert!(
+        cx.debug_bounds("composer-plan").is_none(),
+        "an idle composer shows no plan chip"
+    );
+
+    // The row claims: bare "/plan " plus the reference's hint.plan placeholder.
+    set_slash_draft(&shell, cx, "/plan");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the plan claim draws", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()) == "/plan "
+    });
+    assert_eq!(
+        placeholder(cx),
+        "describe your task to generate plan",
+        "the claimed command shows the task hint"
+    );
+    // The second Enter runs the bare command: plan mode on, token consumed.
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "plan mode switched on", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).state.active_plan_mode())
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "the command consumed its token"
+    );
+    draw_until(cx, "the marked plan chip draws", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-plan").is_some()
+    });
+    draw_until(cx, "the plan placeholder draws", DRAW_UNTIL_MAX, |cx| {
+        let current = placeholder(cx);
+        current != ordinary && current.to_lowercase().contains("plan")
+    });
+
+    // The chip's circled x is the exit: pressing it leaves plan mode.
+    let chip = cx
+        .debug_bounds("composer-plan")
+        .expect("the plan chip has bounds");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    draw_until(cx, "the chip left plan mode", DRAW_UNTIL_MAX, |cx| {
+        !cx.update(|_, cx| shell.read(cx).state.active_plan_mode())
+    });
+    draw_until(cx, "the plan marks leave with it", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-plan").is_none() && placeholder(cx) == ordinary
+    });
+
+    // `/plan off` is the typed exit, and it opens no model turn.
+    set_slash_draft(&shell, cx, "/plan ");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the typed command entered", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).state.active_plan_mode())
+    });
+    set_slash_draft(&shell, cx, "/plan off");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the typed command exited", DRAW_UNTIL_MAX, |cx| {
+        !cx.update(|_, cx| shell.read(cx).state.active_plan_mode())
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "the off line consumed its token"
+    );
+
+    // `/plan <task>` enters plan mode and submits the task as the turn. With no
+    // model chosen the send is refused, so the draft keeps the task and no
+    // transcript row appears.
+    let before = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .map(|session| session.messages.len())
+            .unwrap_or(0)
+    });
+    set_slash_draft(&shell, cx, "/plan write the plan");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(
+        cx,
+        "the task line entered plan mode",
+        DRAW_UNTIL_MAX,
+        |cx| cx.update(|_, cx| shell.read(cx).state.active_plan_mode()),
+    );
+    let (draft, after) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.composer_value.clone(),
+            shell
+                .state
+                .active_session()
+                .map(|session| session.messages.len())
+                .unwrap_or(0),
+        )
+    });
+    assert_eq!(draft, "write the plan", "the task stays the reader's line");
+    assert_eq!(after, before, "a refused send opens no turn");
+
+    // The directive travels on the request, and only while the mode is on.
+    let plain = crate::state::turn_text("hello", false);
+    let planned = crate::state::turn_text("hello", true);
+    assert_eq!(plain, "hello");
+    assert!(
+        planned.contains(crate::state::PLAN_DIRECTIVE) && planned.ends_with("hello"),
+        "a plan-mode request carries the directive in front of the reader text"
+    );
+    // The reference does NOT inject goal state into an ordinary request: a goal
+    // is a UI and durable-log fact, and only a goal round's own prompt carries
+    // it to the model. An @reference in the line still adds its file guidance.
+    let goal_free = crate::state::turn_text("hello", true);
+    assert_eq!(
+        goal_free, planned,
+        "an ordinary request never carries goal state, armed or not"
+    );
+    let referenced = crate::state::turn_text("look at @src/main.rs#L3-L9", false);
+    assert!(
+        referenced.contains(crate::reference::FILE_REFERENCE_PROMPT),
+        "a referenced turn teaches the model how to read an @token"
+    );
+    assert!(referenced.ends_with("look at @src/main.rs#L3-L9"));
+    assert_eq!(
+        crate::state::turn_text("no reference here", false),
+        "no reference here",
+        "an ordinary turn carries no guidance"
+    );
+}
+
+/// The Feedback command records the note on the session, persisted with it.
+#[gpui::test]
+fn the_feedback_command_records_a_session_note(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-feedback");
+    let (harness, cx) = slash_shell(cx, "slash-feedback", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/feedback");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the feedback editor draws", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-note").is_some()
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.note_input.update(cx, |input, cx| {
+                input.set_value("more citations next time".to_string(), window, cx)
+            });
+        })
+    });
+    let save = cx
+        .debug_bounds("note-save")
+        .expect("the save control draws");
+    cx.simulate_click(save.center(), Modifiers::default());
+    draw_until(cx, "the note landed", DRAW_UNTIL_MAX, |cx| {
+        let note = cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .active_session()
+                .and_then(|session| session.feedback.clone())
+        });
+        note.as_deref() == Some("more citations next time")
+    });
+    let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().unwrap());
+    let dir = cx.update(|_, cx| shell.read(cx).state.store.dir_for_id(&id));
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("{id}.json"))).expect("the session document"),
+    )
+    .expect("valid JSON");
+    assert_eq!(
+        document["feedback"], "more citations next time",
+        "the saved document carries the note: {document}"
+    );
+}
+
+/// The Compact row refuses before it spends a request: nothing to fold and a
+/// running turn each answer in place, and the durable boundary never moves.
+///
+/// The summarizer itself is a live model call, so the request half is pinned
+/// where it is testable without a provider: `has_compactable_history` is the
+/// gate the row reads first, and `mark_compacted` is the only thing that moves
+/// the boundary once a checkpoint lands.
+#[gpui::test]
+fn the_compact_row_refuses_when_there_is_nothing_to_compact(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-compact-none");
+    // One turn is two messages, below the keep window, so nothing is foldable.
+    let (harness, cx) = slash_shell(cx, "slash-compact-none", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let before = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        let session = state.active_session().expect("a session");
+        (session.messages.len(), session.compacted)
+    });
+    assert_eq!(before.0, 2, "the premise: one seeded turn");
+    assert!(
+        !cx.update(|_, cx| {
+            let state = &shell.read(cx).state;
+            state.has_compactable_history(&state.active_id.clone().expect("an active session"))
+        }),
+        "a two-message session has no compactable history"
+    );
+
+    set_slash_draft(&shell, cx, "/compact");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the refusal is reported", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).state.notice.is_some())
+    });
+    let (notice, after) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        let session = state.active_session().expect("a session");
+        (
+            state.notice.clone().unwrap_or_default(),
+            (session.messages.len(), session.compacted),
+        )
+    });
+    assert_eq!(
+        notice,
+        cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.nothingToCompact")),
+        "the row says there is nothing to compact"
+    );
+    assert_eq!(after, before, "and the session is untouched");
+}
+
+/// A Compact on a session with older history spends a request, so a running
+/// turn is refused the same way rather than racing the summarizer.
+#[gpui::test]
+fn the_compact_row_refuses_while_a_turn_streams(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-compact-busy");
+    let (harness, cx) = slash_shell(cx, "slash-compact-busy", root, 8);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        let id = state.active_id.clone().expect("an active session");
+        assert!(
+            state.has_compactable_history(&id),
+            "the premise: eight turns are compactable"
+        );
+        // Open a turn without driving a model: the gate only reads the stream
+        // registry, which is what `begin_turn_in` writes.
+        shell.update(cx, |this, _| {
+            let _ = this.state.begin_turn_in(&id, "keep going");
+        });
+        id
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.is_streaming(&id)),
+        "the premise: the session is streaming"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.compact_history(cx));
+    });
+    let (notice, compacted) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state.notice.clone().unwrap_or_default(),
+            state
+                .active_session()
+                .map(|session| session.compacted)
+                .unwrap_or(0),
+        )
+    });
+    assert_eq!(
+        notice,
+        cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.compactBusy")),
+        "a streaming turn refuses the compaction"
+    );
+    assert_eq!(compacted, 0, "and nothing was folded");
+    // The reference reports the refusal as a command card with its text, and
+    // the durable row keeps it after a reload.
+    let row = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .and_then(|session| session.compact_command.as_ref())
+            .and_then(|command| command.outcome.clone())
+    });
+    let row = row.expect("the busy outcome row");
+    assert!(row.error, "busy is the reference's error kind");
+
+    // A prompt already waiting behind the session is the reference's second
+    // busy cause: "`compactNow` requires an idle agent with no waking queued
+    // work". The command refuses and leaves the queue intact.
+    let queued_before = cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.begin_turn_in(&id, "done")?;
+            Some(
+                this.state
+                    .enqueue(&id, "waiting prompt".to_string(), Vec::new()),
+            )
+        })
+    });
+    let queued_before = queued_before.expect("a turn opened");
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.has_queued(&id)),
+        "the premise: one prompt waits behind the session"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            // End the artificial stream so the queue, not the streaming gate,
+            // is what refuses.
+            this.state.apply_event(&id, crate::runner::AgentEvent::Done);
+        });
+        shell.update(cx, |this, cx| this.compact_history(cx));
+    });
+    let (queued_row, queued_after, folded) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state
+                .active_session()
+                .and_then(|session| session.compact_command.as_ref())
+                .and_then(|command| command.outcome.clone()),
+            state.has_queued(&id),
+            state
+                .active_session()
+                .map(|session| session.compacted)
+                .unwrap_or(0),
+        )
+    });
+    assert!(
+        queued_row.is_some_and(|row| row.error),
+        "queued work reports the busy error"
+    );
+    assert!(queued_after, "and the waiting prompt is not dropped");
+    assert_eq!(folded, 0, "nothing was folded");
+    assert_eq!(
+        cx.update(|_, cx| shell.update(cx, |this, _| this.state.pop_inbox(&id)))
+            .map(|queued| queued.seq),
+        Some(queued_before),
+        "the queue still holds the same row"
+    );
+}
+
+/// The command card has two surfaces: the running row while the summarizer
+/// works, and the outcome row every non-landing result leaves behind. A landed
+/// checkpoint instead clears the row and draws its marker.
+#[gpui::test]
+fn the_compact_command_card_draws_running_and_failed_outcomes(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-compact-card");
+    let (harness, cx) = slash_shell(cx, "slash-compact-card", root, 8);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        let id = shell.read(cx).state.active_id.clone().expect("a session");
+        // The seam is the START of the card, so the session only needs a
+        // resolvable target: the request itself fails against the seed port,
+        // and its outcome is landed by the test below.
+        shell.update(cx, |this, _| {
+            if let Some(session) = this.state.store.session_mut(&id) {
+                session.provider = Some("local".to_string());
+                session.model = Some("local-model".to_string());
+            }
+        });
+        // The handler starts the row synchronously and only then spawns the
+        // auxiliary request, so this observes the reference's running card.
+        shell.update(cx, |this, cx| this.compact_history(cx));
+        id
+    });
+    let (running, compacting, notice) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        let session = state.active_session().expect("the session");
+        (
+            session
+                .compact_command
+                .as_ref()
+                .is_some_and(|command| command.outcome.is_none()),
+            state.is_compacting(&id),
+            state.notice.clone(),
+        )
+    });
+    assert!(running, "the command card starts in its running state");
+    assert!(compacting, "and the manual admission flag is held");
+    assert_eq!(
+        notice,
+        Some(cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.compacting"))),
+        "the running label is the reference's Compacting context…"
+    );
+
+    // Land the failure the reference's summary code produces, so the card's
+    // outcome half is drawn without a provider.
+    let summary = cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.compactSummary"));
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.stop_compacting(&id);
+            this.state
+                .finish_compact_command(&id, summary.clone(), true);
+            this.state.notice(summary.clone());
+        });
+    });
+    draw_until(cx, "the failed command card", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("compact-command-row").is_some()
+    });
+    for selector in [
+        "compact-command-leading",
+        "compact-command-title",
+        "compact-command-sep",
+        "compact-command-summary",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is part of the measured command row"
+        );
+    }
+    assert!(
+        cx.debug_bounds("compaction-row-0").is_none(),
+        "a failed compaction draws no checkpoint marker"
+    );
+    let (outcome, compacted) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state
+                .active_session()
+                .and_then(|session| session.compact_command.as_ref())
+                .and_then(|command| command.outcome.clone()),
+            state
+                .active_session()
+                .map(|session| session.compacted)
+                .unwrap_or(0),
+        )
+    });
+    assert_eq!(
+        outcome.map(|outcome| (outcome.text, outcome.error)),
+        Some((summary, true)),
+        "the card keeps the exact outcome text and its error state"
+    );
+    assert_eq!(compacted, 0, "and the boundary did not move");
+}
+
+/// The typed command takes no arguments: a suffix is the shipped usage line,
+/// not prose sent to the model and not a compaction.
+#[gpui::test]
+fn the_typed_compact_command_refuses_arguments_with_its_usage_line(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-compact-usage");
+    let (harness, cx) = slash_shell(cx, "slash-compact-usage", root, 8);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_text(&shell, cx, "/compact last 5");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    let usage = cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.compactUsage"));
+    draw_until(cx, "the usage row", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .active_session()
+                .and_then(|session| session.compact_command.as_ref())
+                .and_then(|command| command.outcome.as_ref())
+                .is_some_and(|outcome| outcome.text == usage)
+        })
+    });
+    let (outcome, notice, compacted, messages) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        let session = state.active_session().expect("the session");
+        (
+            session
+                .compact_command
+                .as_ref()
+                .and_then(|command| command.outcome.clone()),
+            state.notice.clone(),
+            session.compacted,
+            session.messages.len(),
+        )
+    });
+    let outcome = outcome.expect("the usage outcome");
+    assert!(outcome.error, "the shipped command returns kind error");
+    assert_eq!(outcome.text, usage);
+    assert_eq!(notice, Some(usage), "the notice line repeats it");
+    assert_eq!(compacted, 0, "no compaction ran");
+    assert_eq!(messages, 16, "and nothing was appended to the transcript");
+}
+
+/// No chosen, credentialed model is refused before the request is built; the
+/// reference classifies that summarizer failure under its summary text.
+#[gpui::test]
+fn the_compact_command_without_a_model_reports_the_summary_failure(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-compact-nomodel");
+    let (harness, cx) = slash_shell(cx, "slash-compact-nomodel", root, 8);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        let id = shell.read(cx).state.active_id.clone().expect("a session");
+        shell.update(cx, |this, _| {
+            this.state.settings.global.providers.clear();
+            if let Some(session) = this.state.store.session_mut(&id) {
+                session.provider = None;
+                session.model = None;
+            }
+        });
+        let refused = {
+            let state = &shell.read(cx).state;
+            state
+                .settings
+                .refusal_for(&state.session_choice(&id))
+                .is_some()
+        };
+        assert!(refused, "the premise: no model resolves");
+        id
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.compact_history(cx));
+    });
+    let (outcome, compacted, compacting) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        let session = state.active_session().expect("the session");
+        (
+            session
+                .compact_command
+                .as_ref()
+                .and_then(|command| command.outcome.clone()),
+            session.compacted,
+            state.is_compacting(&id),
+        )
+    });
+    let outcome = outcome.expect("the no-model outcome");
+    assert!(outcome.error);
+    assert_eq!(
+        outcome.text,
+        cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.compactSummary")),
+        "the reference reports a summarizer failure"
+    );
+    assert_eq!(compacted, 0, "the boundary did not move");
+    assert!(!compacting, "and no admission was leaked");
+}
+
+/// The Permission row is a real switch: its child list is the presets, and the
+/// full-access choice still goes through the risk gate.
+#[gpui::test]
+fn the_permission_command_switches_the_preset(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-permission");
+    let (harness, cx) = slash_shell(cx, "slash-permission", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/permission");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    // Wait for the LAST row: one row's bounds appearing is not the whole list
+    // having laid out (the harness needs a frame per column of rows).
+    draw_until(cx, "the preset list opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("slash-row-preset-danger-full-access")
+            .is_some()
+    });
+    for id in [
+        "slash-row-preset-read-only",
+        "slash-row-preset-workspace-write",
+        "slash-row-preset-danger-full-access",
+    ] {
+        assert!(cx.debug_bounds(id).is_some(), "{id} draws");
+    }
+    // A preset that needs no gate is written at once.
+    let read_only = cx
+        .debug_bounds("slash-row-preset-read-only")
+        .expect("the read-only preset");
+    cx.simulate_click(read_only.center(), Modifiers::default());
+    draw_until(cx, "the preset switched", DRAW_UNTIL_MAX, |cx| {
+        let permission = cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .draft()
+                .workspace
+                .agent
+                .permission
+                .clone()
+        });
+        permission == crate::caps::READ_ONLY
+    });
+    // Full access arms the reference's own confirmation instead of switching.
+    set_slash_draft(&shell, cx, "/permission");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the preset list reopens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("slash-row-preset-danger-full-access")
+            .is_some()
+    });
+    let full = cx
+        .debug_bounds("slash-row-preset-danger-full-access")
+        .expect("the full-access preset");
+    cx.simulate_click(full.center(), Modifiers::default());
+    draw_until(cx, "the gate armed", DRAW_UNTIL_MAX, |cx| {
+        let confirm = cx.update(|_, cx| shell.read(cx).permission_confirm.clone());
+        confirm.as_deref() == Some(crate::caps::FULL_ACCESS)
+    });
+    let permission = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .settings
+            .workspace
+            .agent
+            .permission
+            .clone()
+    });
+    assert_eq!(
+        permission,
+        crate::caps::READ_ONLY,
+        "the mode is not written until the gate is confirmed"
+    );
+}
+
+/// The File row LINKS a workspace file instead of attaching one: it opens the
+/// @ picker, and the pick inserts the canonical reference - a typed range
+/// suffix included.
+#[gpui::test]
+fn the_file_row_links_a_file_reference(cx: &mut TestAppContext) {
+    let root = skills_scratch("file-reference");
+    let (harness, cx) = slash_shell(cx, "file-reference", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The picker reads the workspace the session is confined to, so the test
+    // names one with a known file in it.
+    let tree = workspace_tree_root("file-reference");
+    let _ = std::fs::create_dir_all(&tree);
+    std::fs::write(tree.join("notes.txt"), "one\ntwo\nthree\n").expect("the fixture file");
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            let global = &mut this.state.settings.global;
+            global.general.active_workspace = "file-reference".to_string();
+            global
+                .workspaces
+                .push(crate::settings::global::WorkspaceRef {
+                    id: "file-reference".to_string(),
+                    name: "file-reference".to_string(),
+                    root: tree.to_string_lossy().to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+        })
+    });
+    set_slash_draft(&shell, cx, "/file");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the @ picker opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-command-menu").is_some()
+    });
+    let draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+    assert_eq!(draft, "@", "the row leaves a bare reference token");
+    assert!(
+        !cx.did_prompt_for_paths(),
+        "a link is not the OS attach dialog"
+    );
+
+    // A range typed after the path travels with the pick.
+    set_command_draft(&shell, cx, "@notes.txt#L2-L3");
+    draw_until(cx, "the file row draws", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("command-row-ref-file-0").is_some()
+    });
+    let row = cx
+        .debug_bounds("command-row-ref-file-0")
+        .expect("the matching file row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the reference lands", DRAW_UNTIL_MAX, |cx| {
+        let draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+        draft == "@notes.txt#L2-L3 "
+    });
+    let draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+    assert_eq!(
+        draft, "@notes.txt#L2-L3 ",
+        "one grammar emits the path and its range"
+    );
+    assert!(
+        crate::state::turn_text(&draft, false).contains(crate::reference::FILE_REFERENCE_PROMPT),
+        "and a referenced turn teaches the model how to read it"
+    );
+}
+
+/// The goal strip is the reference's GoalBar: the label follows the durable
+/// phase and the process-local activation, the actions follow the same pair,
+/// a blocked goal is drawn, and a completed goal draws nothing.
+#[gpui::test]
+fn the_goal_strip_follows_phase_and_activation(cx: &mut TestAppContext) {
+    use crate::ui::header::goal_bar_label_key;
+    use agent::goal::GoalState;
+    let root = skills_scratch("goal-strip");
+    let (harness, cx) = slash_shell(cx, "goal-strip", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().unwrap());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            this.state.set_goal(&id, Some("ship the slash palette"));
+        })
+    });
+    let goal = |cx: &mut VisualTestContext| cx.update(|_, cx| shell.read(cx).state.goal(&id));
+    let draw_strip = |cx: &mut VisualTestContext| {
+        draw_until(cx, "the goal strip draws", DRAW_UNTIL_MAX, |cx| {
+            cx.debug_bounds("composer-goal").is_some()
+        })
+    };
+    draw_strip(cx);
+    assert!(
+        cx.debug_bounds("goal-rounds").is_none(),
+        "the reference bar carries no round counter (that is /goal output)"
+    );
+    assert_eq!(
+        goal(cx).as_ref().and_then(goal_bar_label_key),
+        Some("goal.barActive"),
+        "an active armed goal reads Ongoing Goal"
+    );
+    assert!(cx.debug_bounds("goal-pause").is_some());
+    assert!(
+        cx.debug_bounds("goal-resume").is_none(),
+        "an armed goal has nothing to resume"
+    );
+    // Pause stops the goal but keeps it.
+    let pause = cx.debug_bounds("goal-pause").expect("the pause verb");
+    cx.simulate_click(pause.center(), Modifiers::default());
+    draw_until(cx, "the goal paused", DRAW_UNTIL_MAX, |cx| {
+        goal(cx).is_some_and(|goal| matches!(goal.state, GoalState::Paused))
+    });
+    assert_eq!(
+        goal(cx).as_ref().and_then(goal_bar_label_key),
+        Some("goal.barPaused")
+    );
+    assert!(
+        cx.debug_bounds("goal-resume").is_some(),
+        "a paused goal offers resume"
+    );
+    assert!(cx.debug_bounds("goal-pause").is_none());
+    // Resume re-arms it; with no model chosen it does not start a round.
+    let resume = cx.debug_bounds("goal-resume").expect("the resume verb");
+    cx.simulate_click(resume.center(), Modifiers::default());
+    draw_until(cx, "the goal resumed", DRAW_UNTIL_MAX, |cx| {
+        goal(cx).is_some_and(|goal| goal.activation.is_armed())
+    });
+    assert!(!cx.update(|_, cx| shell.read(cx).state.is_streaming(&id)));
+    // Edit opens the same note editor, pre-filled with the objective. Blank
+    // save is a no-op (the reference disables Save on an empty draft), and the
+    // editor never clears the goal.
+    let edit = cx.debug_bounds("goal-edit").expect("the edit verb");
+    cx.simulate_click(edit.center(), Modifiers::default());
+    draw_until(cx, "the editor opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-note").is_some()
+    });
+    let shown = cx.update(|_, cx| shell.read(cx).note_input.read(cx).value().to_string());
+    assert_eq!(shown, "ship the slash palette");
+    let cancel = cx.debug_bounds("note-cancel").expect("the cancel control");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    draw_until(cx, "the editor closes", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-note").is_none()
+    });
+    // A session edge disarms an ACTIVE goal: the strip says Inactive and offers
+    // resume, which is the state a restart restores.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            this.state.disarm_goal(&id);
+        })
+    });
+    draw_until(cx, "the disarmed strip draws", DRAW_UNTIL_MAX, |cx| {
+        goal(cx).is_some_and(|goal| !goal.activation.is_armed())
+    });
+    assert_eq!(
+        goal(cx).as_ref().and_then(goal_bar_label_key),
+        Some("goal.barDisarmed")
+    );
+    assert!(cx.debug_bounds("goal-resume").is_some());
+    assert!(cx.debug_bounds("goal-pause").is_none());
+    // A blocked goal is still drawn, with resume and its reason as the tooltip.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            if let Some(session) = this.state.store.session_mut(&id) {
+                if let Some(goal) = session.goal.as_mut() {
+                    goal.arm();
+                    assert!(goal.block("round-limit", "the cap is spent"));
+                }
+            }
+        })
+    });
+    draw_until(cx, "the blocked strip draws", DRAW_UNTIL_MAX, |cx| {
+        goal(cx).is_some_and(|goal| matches!(goal.state, GoalState::Blocked))
+    });
+    assert_eq!(
+        goal(cx).as_ref().and_then(goal_bar_label_key),
+        Some("goal.barBlocked")
+    );
+    // The reference's bar offers NO resume on a blocked goal, even though the
+    // /goal command does: its showResume is paused OR active-disarmed only.
+    assert!(
+        cx.debug_bounds("goal-resume").is_none(),
+        "a blocked bar offers edit and clear, not resume"
+    );
+    assert!(cx.debug_bounds("goal-edit").is_some());
+    // Clear removes the goal, which removes the strip.
+    let clear = cx.debug_bounds("goal-clear").expect("the clear verb");
+    cx.simulate_click(clear.center(), Modifiers::default());
+    draw_until(cx, "the strip goes away", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-goal").is_none()
+    });
+    assert!(goal(cx).is_none());
+    // A completed goal draws nothing at all.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            this.state.set_goal(&id, Some("ship it"));
+            if let Some(session) = this.state.store.session_mut(&id) {
+                if let Some(goal) = session.goal.as_mut() {
+                    assert!(goal.complete());
+                }
+            }
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("composer-goal").is_none(),
+        "a completed goal renders no bar"
+    );
+    assert_eq!(goal(cx).as_ref().and_then(goal_bar_label_key), None);
+}
+
+/// One goal round advances the durable counter and grows only the assistant
+/// placeholder: the model gets the round instruction, the reader gets no fake
+/// user line.
+#[gpui::test]
+fn a_goal_round_continues_without_a_user_line(cx: &mut TestAppContext) {
+    use crate::model::Role;
+    let root = skills_scratch("goal-round");
+    let (harness, cx) = slash_shell(cx, "goal-round", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().unwrap());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            this.state.set_goal(&id, Some("ship the slash palette"));
+        })
+    });
+    let before = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .map(|session| session.messages.len())
+            .unwrap_or(0)
+    });
+    let (transcript, _budget) = cx
+        .update(|_, cx| shell.update(cx, |this, _cx| this.state.begin_goal_turn_in(&id)))
+        .expect("a goal round starts");
+    let (rounds, messages, last_role, last_text) = cx.update(|_, cx| {
+        let session = shell.read(cx).state.active_session().expect("a session");
+        let last = session.messages.last().expect("the placeholder");
+        (
+            session.goal.as_ref().map(|goal| goal.rounds).unwrap_or(0),
+            session.messages.len(),
+            last.role,
+            last.text.clone(),
+        )
+    });
+    assert_eq!(rounds, 1, "the durable counter advanced");
+    assert_eq!(messages, before + 1, "only the assistant row was added");
+    assert_eq!(last_role, Role::Assistant);
+    assert!(last_text.is_empty(), "the stream writes into that row");
+    assert_eq!(
+        transcript.len(),
+        before,
+        "the request is the history; the goal instruction is the turn input, not a stored user line"
+    );
+    // The model receives the reference driver's exact retained prompt.
+    let prompt = crate::state::goal_round_input("ship the slash palette", 1, 256);
+    assert_eq!(
+        prompt,
+        "<goal_round>\nObjective: \"ship the slash palette\"\nRound: 1/256\n\nContinue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal, and mark it complete. If work remains, leave the goal active for the next round. Follow the configured goal-tool policy before reporting a blocker.\n</goal_round>"
+    );
+    assert!(
+        prompt.starts_with("<goal_round>\nObjective: \"ship the slash palette\"\nRound: 1/256"),
+        "the objective is JSON-quoted, as the reference prompt does"
+    );
+    // The round is durable, not just in memory.
+    let dir = cx.update(|_, cx| shell.read(cx).state.store.dir_for_id(&id));
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("{id}.json"))).expect("the session document"),
+    )
+    .expect("valid JSON");
+    assert_eq!(document["goal"]["rounds"], 1);
+    // A paused goal starts no round.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            let _ = this.state.pause_goal(&id);
+        })
+    });
+    let next = cx.update(|_, cx| shell.update(cx, |this, _cx| this.state.begin_goal_turn_in(&id)));
+    assert!(next.is_none(), "pause holds the goal");
+    // An ACTIVE goal that a session edge disarmed starts no round either: the
+    // reference disarms continuation on every session start, and only an
+    // explicit resume re-arms it.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            assert!(this.state.resume_goal(&id).is_ok());
+            assert!(this.state.disarm_goal(&id));
+        })
+    });
+    assert!(cx
+        .update(|_, cx| shell.read(cx).state.goal(&id))
+        .is_some_and(|goal| goal.state.is_open() && !goal.activation.is_armed()));
+    let next = cx.update(|_, cx| shell.update(cx, |this, _cx| this.state.begin_goal_turn_in(&id)));
+    assert!(next.is_none(), "a disarmed active goal waits for resume");
+}
+
+/// At the round cap the driver records the reference's round-limit blocker and
+/// disarms, instead of leaving an active goal that silently stops advancing.
+#[gpui::test]
+fn a_goal_at_its_round_cap_is_blocked_with_round_limit(cx: &mut TestAppContext) {
+    use agent::goal::GoalState;
+    let root = skills_scratch("goal-cap");
+    let (harness, cx) = slash_shell(cx, "goal-cap", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().unwrap());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.set_goal(&id, Some("finish the migration"));
+            if let Some(goal) = this
+                .state
+                .store
+                .session_mut(&id)
+                .and_then(|session| session.goal.as_mut())
+            {
+                goal.rounds = goal.max_rounds;
+            }
+            this.continue_goal(&id, cx);
+        })
+    });
+    let goal = cx
+        .update(|_, cx| shell.read(cx).state.goal(&id))
+        .expect("the goal");
+    assert_eq!(goal.state, GoalState::Blocked);
+    assert!(!goal.activation.is_armed());
+    assert_eq!(
+        goal.blocked_reason
+            .as_ref()
+            .map(|reason| reason.code.as_str()),
+        Some("round-limit")
+    );
+    assert_eq!(
+        goal.blocked_reason
+            .as_ref()
+            .map(|reason| reason.message.as_str()),
+        Some("Goal reached its configured limit of 256 rounds.")
+    );
+    // The command reports it, and offers resume/clear (not a new objective).
+    set_slash_draft(&shell, cx, "/goal ");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let notice = cx.update(|_, cx| shell.read(cx).state.notice.clone().unwrap_or_default());
+    assert!(
+        notice.contains("Status: blocked")
+            && notice
+                .contains("Blocker: round-limit: Goal reached its configured limit of 256 rounds.")
+            && notice.contains("Commands: /goal edit <objective>, /goal resume, /goal clear"),
+        "{notice}"
+    );
+}
+
+/// A goal created while a turn is already running arms, but opens no second
+/// turn: the next round waits for the idle edge, which is the reference
+/// driver's rule (a round starts only at whole-agent idle).
+#[gpui::test]
+fn a_goal_created_during_a_running_turn_waits_for_idle(cx: &mut TestAppContext) {
+    let root = skills_scratch("goal-streaming");
+    let (harness, cx) = slash_shell(cx, "goal-streaming", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().unwrap());
+    // Open a turn, so the session is streaming when the command runs.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            this.state
+                .begin_turn_in(&id, "busy with something else")
+                .expect("a turn");
+        })
+    });
+    let before = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .map(|session| session.messages.len())
+            .unwrap_or(0)
+    });
+    set_slash_draft(&shell, cx, "/goal aim while busy");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (notice, rounds, streaming, messages) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state.notice.clone().unwrap_or_default(),
+            state.goal(&id).map(|goal| goal.rounds).unwrap_or(0),
+            state.is_streaming(&id),
+            state
+                .active_session()
+                .map(|session| session.messages.len())
+                .unwrap_or(0),
+        )
+    });
+    assert!(notice.starts_with("Goal created"), "{notice}");
+    assert!(streaming, "the original turn still owns the session");
+    assert_eq!(rounds, 0, "no goal round starts over a running turn");
+    assert_eq!(messages, before, "no second turn opened");
+}
+
+/// A goal never spins against a configuration that cannot send: without a
+/// chosen model the continuation is refused before a round is counted.
+#[gpui::test]
+fn continue_goal_does_not_spin_without_a_model(cx: &mut TestAppContext) {
+    let root = skills_scratch("goal-nomodel");
+    let (harness, cx) = slash_shell(cx, "goal-nomodel", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().unwrap());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _cx| {
+            this.state.set_goal(&id, Some("ship it"));
+        })
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.continue_goal(&id, cx));
+    });
+    let (rounds, streaming) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state.goal(&id).map(|goal| goal.rounds).unwrap_or(0),
+            state.is_streaming(&id),
+        )
+    });
+    assert_eq!(rounds, 0, "no model means no silent round");
+    assert!(!streaming);
+}
+
+// ---------------------------------------------------------------------------
+// The input path's cost
+// ---------------------------------------------------------------------------
+
+/// A keystroke is O(keystroke), not O(catalogue).
+///
+/// The composer's Change listener runs on every character, and a frame resolves
+/// the settings several times (the model chip, the transcript, the preset
+/// chip). Before the cache, each resolution walked every skill source and
+/// parsed every `SKILL.md`, so a 120-skill install paid three filesystem scans
+/// per keystroke: typing and backspacing lagged by tens of milliseconds.
+///
+/// Two facts are asserted, and neither can pass by luck:
+///
+/// 1. the real Change path ran for every key - the draft the listener mirrors
+///    grew by exactly the number of keys typed;
+/// 2. the catalogue was scanned at most once for the whole run, read from the
+///    counter `discover_skills` increments;
+/// 3. the wall time stays under a ceiling that is generous enough for a loaded
+///    machine but far below the measured regression.
+#[gpui::test]
+fn typing_and_backspacing_never_resolves_the_skill_catalogue(cx: &mut TestAppContext) {
+    use std::time::{Duration, Instant};
+    /// Keys typed, and the same number backspaced.
+    const KEYS: usize = 300;
+    /// Ceiling per keystroke. The fixed run measures well under this on an idle
+    /// debug build; the pre-cache path measured several times it because of the
+    /// filesystem scans, and a machine loaded enough to double the cost still
+    /// lands inside.
+    const CEILING: Duration = Duration::from_millis(120);
+
+    let root = skills_scratch("slash-perf");
+    for index in 0..120 {
+        skills_write_manifest(
+            &root,
+            &format!("skill-{index:03}"),
+            "a catalogue entry the performance test types over",
+            false,
+        );
+    }
+    let (harness, cx) = slash_shell(cx, "slash-perf", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    focus_composer(&shell, cx);
+    // Open on the whole catalogue and settle the first frame, so the scan the
+    // FIRST open legitimately needs is outside the measured window.
+    set_slash_draft(&shell, cx, "/");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("composer-slash-palette").is_some(),
+        "the premise: the card is open on 120 skills"
+    );
+
+    let scans_before = cx.update(|_, cx| shell.read(cx).state.settings.skill_scans());
+    let started = Instant::now();
+    for _ in 0..KEYS {
+        cx.simulate_keystrokes("a");
+    }
+    let typed = cx.update(|_, cx| shell.read(cx).composer_value.chars().count());
+    assert_eq!(
+        typed,
+        1 + KEYS,
+        "every key reached the Change listener: the mirror has every character"
+    );
+    let scans_while_typing =
+        cx.update(|_, cx| shell.read(cx).state.settings.skill_scans()) - scans_before;
+    for _ in 0..KEYS {
+        cx.simulate_keystrokes("backspace");
+    }
+    let elapsed = started.elapsed();
+    let scans = cx.update(|_, cx| shell.read(cx).state.settings.skill_scans()) - scans_before;
+
+    let draft = cx.update(|_, cx| shell.read(cx).composer_value.clone());
+    assert_eq!(draft, "/", "the backspaces returned the trigger exactly");
+    let per_key = elapsed / (2 * KEYS) as u32;
+    eprintln!(
+        "input path: {per_key:?}/keystroke over {KEYS} typed and {KEYS} backspaced, \
+         {} scans while typing, {scans} for the whole run",
+        scans_while_typing
+    );
+
+    assert!(
+        scans <= 1,
+        "the skill catalogue was resolved {scans} times across {} keystrokes; \
+         a keystroke must be O(keystroke), not O(catalogue)",
+        2 * KEYS
+    );
+    assert!(
+        per_key < CEILING,
+        "a keystroke averaged {per_key:?}, above the {CEILING:?} ceiling"
+    );
+
+    // The card follows the text it ends on: "/" matches everything again.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("composer-slash-palette").is_some(),
+        "the trigger text reopens the card after the backspaces"
+    );
+}
+
+/// The palette's open/close contract, measured through the draft changes the
+/// Change listener sees: a LEADING slash opens, a space ends the token and
+/// closes, a slash anywhere else belongs to the plus card, and a query with no
+/// match closes rather than drawing an empty card.
+#[gpui::test]
+fn the_slash_palette_opens_and_closes_on_the_trigger_rules(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-trigger");
+    skills_write_manifest(&root, "motion", "motion paths", false);
+    let (harness, cx) = slash_shell(cx, "slash-trigger", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    set_slash_text(&shell, cx, "/");
+    assert!(
+        cx.debug_bounds("composer-slash-palette").is_some(),
+        "a leading slash opens the card"
+    );
+    set_slash_text(&shell, cx, "/motion ");
+    assert!(
+        cx.debug_bounds("composer-slash-palette").is_none(),
+        "a space ends the token and closes the card"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "/motion ",
+        "closing never edits the text"
+    );
+    set_slash_text(&shell, cx, "hello /motion");
+    assert!(
+        cx.debug_bounds("composer-slash-palette").is_none(),
+        "a slash that is not the first character belongs to the plus card"
+    );
+    set_slash_text(&shell, cx, "/zzzz");
+    assert!(
+        cx.debug_bounds("composer-slash-palette").is_none(),
+        "a query that matches nothing closes the card"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "/zzzz",
+        "and leaves the typed text alone"
+    );
+    set_slash_text(&shell, cx, "/mot");
+    assert!(
+        cx.debug_bounds("composer-slash-palette").is_some(),
+        "typing back to a match reopens it"
+    );
+}
+
+/// A programmatic insert leaves the caret at the END of the text it wrote.
+///
+/// `TextareaState::set_value` resets a multi-line editor's selection to
+/// `0..0`, so a Tab completion or a command row used to put the caret in front
+/// of the inserted name: the next character landed before the command instead
+/// of after it.
+#[gpui::test]
+fn command_inserts_leave_the_caret_at_the_end(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-caret");
+    skills_write_manifest(&root, "motion", "motion paths", false);
+    let (harness, cx) = slash_shell(cx, "slash-caret", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let caret =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| shell.read(cx).composer.read(cx).cursor());
+    let selection = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| shell.read(cx).composer.read(cx).selected_range())
+    };
+
+    // Tab completes the name; the caret follows the completed text.
+    set_slash_draft(&shell, cx, "/mot");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("tab");
+    draw_until(cx, "the completion landed", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).composer_value == "/motion")
+    });
+    assert_eq!(
+        caret(cx),
+        "/motion".len(),
+        "Tab leaves the caret after the completed name"
+    );
+    assert!(
+        selection(cx).is_empty(),
+        "and it is a caret, not a selection: {:?}",
+        selection(cx)
+    );
+
+    // Enter on a skill row inserts "/name " - the caret sits after the space.
+    set_slash_draft(&shell, cx, "/mot");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the skill name landed", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).composer_value == "/motion ")
+    });
+    assert_eq!(
+        caret(cx),
+        "/motion ".len(),
+        "Enter leaves the caret after the inserted name and space"
+    );
+
+    // A command that CLAIMS the composer (`/goal `) behaves the same.
+    set_slash_draft(&shell, cx, "/go");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the Goal claim landed", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).composer_value == "/goal ")
+    });
+    assert_eq!(
+        caret(cx),
+        "/goal ".len(),
+        "a claimed command leaves the caret where the argument goes"
+    );
+}
+
+/// The end position is counted in CHARACTERS per line, which is what makes the
+/// caret land after non-ASCII text instead of inside it.
+#[gpui::test]
+fn a_multibyte_draft_ends_its_caret_after_the_last_character(cx: &mut TestAppContext) {
+    let root = skills_scratch("slash-caret-cjk");
+    skills_write_manifest(&root, "motion", "motion paths", false);
+    let (harness, cx) = slash_shell(cx, "slash-caret-cjk", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The real words this writes are typed FROM the composer, so the caret
+    // path applies; a write while another field holds the keys keeps its focus.
+    focus_composer(&shell, cx);
+    let draft = "/技能 a";
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_composer_text(draft, window, cx);
+        });
+    });
+    let (cursor, selection, value) = cx.update(|_, cx| {
+        let composer = shell.read(cx).composer.read(cx);
+        (
+            composer.cursor(),
+            composer.selected_range(),
+            composer.value().to_string(),
+        )
+    });
+    assert_eq!(value, draft);
+    assert_eq!(
+        cursor,
+        draft.len(),
+        "the caret is at the draft's end in BYTES, which is after the CJK glyphs"
+    );
+    assert_eq!(
+        selection,
+        draft.len()..draft.len(),
+        "an empty caret at the end"
+    );
+}
+
+/// The pure position helper: a caret at the end of every line shape.
+#[test]
+fn the_end_position_counts_characters_per_line() {
+    use super::slash_palette::text_end_position;
+    let at = |text: &str| {
+        let position = text_end_position(text);
+        (position.line, position.character)
+    };
+    assert_eq!(at(""), (0, 0));
+    assert_eq!(at("abc"), (0, 3));
+    assert_eq!(at("/技能 "), (0, 4), "characters, not bytes");
+    assert_eq!(at("one\ntwo"), (1, 3));
+    assert_eq!(at("one\n"), (1, 0), "a trailing newline starts a new line");
+}
+
+/// A command that hands focus to another field keeps THAT field's focus.
+///
+/// Moving the caret after a programmatic write must not pull the keys back:
+/// the Feedback row opens the note editor and the composer write that follows
+/// it happens while the note already owns the focus.
+#[gpui::test]
+fn the_feedback_row_keeps_the_note_editor_focused(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    let root = skills_scratch("slash-feedback-focus");
+    let (harness, cx) = slash_shell(cx, "slash-feedback-focus", root, 1);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    set_slash_draft(&shell, cx, "/feed");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the note editor opened", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).note.is_some())
+    });
+    let (note_focused, composer_focused) = cx.update(|window, cx| {
+        let shell = shell.read(cx);
+        (
+            shell
+                .note_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window),
+            shell.composer.read(cx).focus_handle(cx).is_focused(window),
+        )
+    });
+    assert!(note_focused, "the note editor holds the keys");
+    assert!(
+        !composer_focused,
+        "the caret write did not steal the focus back"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "the Feedback row consumed its own trigger"
+    );
+    // The proof that focus did not move: a key reaches the note, not the draft.
+    cx.simulate_keystrokes("h");
+    let (note, draft) = cx.update(|_, cx| {
+        (
+            shell.read(cx).note_input.read(cx).value().to_string(),
+            shell.read(cx).composer_value.clone(),
+        )
+    });
+    assert_eq!(note, "h", "the note editor received the key");
+    assert_eq!(draft, "", "the composer did not");
+}
+
+// ---------------------------------------------------------------------------
+// The transcript's frame cost
+// ---------------------------------------------------------------------------
+
+/// A frame costs the VIEWPORT, not the transcript.
+///
+/// The transcript used to build an element for every message on every repaint,
+/// so a 400-message chat rebuilt 400 markdown views per frame - and per streamed
+/// token. Rows outside the viewport are now spacers of their measured height;
+/// this pins both the row count and the wall time. The turn rail gets the same
+/// treatment from its uniform 10px pitch, so a hundred turns no longer build a
+/// hundred tick elements behind a 420px frame.
+#[gpui::test]
+fn a_long_transcript_only_builds_the_rows_near_the_viewport(cx: &mut TestAppContext) {
+    use std::time::{Duration, Instant};
+    const TURNS: usize = 200; // 400 messages
+    const FRAMES: usize = 5;
+    /// The steady-state ceiling per frame. The unwindowed path measured several
+    /// times this with 400 messages, and the row-count assertion below is the
+    /// exact proof; this bound is the generous one for a loaded machine.
+    const FRAME_CEILING: Duration = Duration::from_millis(120);
+
+    init_test_app(cx);
+    let state = state_with_turns("transcript-window", TURNS);
+    // A second, short chat, so the switch path can be proved as well.
+    let other = "transcript-window-other";
+    let other_id = other.to_string();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state;
+        let workspace = state
+            .active_session()
+            .map(|session| session.workspace.clone())
+            .unwrap_or_default();
+        let mut session = crate::model::Session::new(&workspace, "Other chat");
+        session.id = other_id;
+        session.messages.push(ChatMessage::user("a short chat"));
+        session.messages.push(ChatMessage::assistant());
+        state.store.insert(session);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    // Two frames: the first measures every row (the one frame that pays for the
+    // whole transcript), the second reaches the steady state asserted here.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let before = crate::ui::transcript::transcript_rows_built();
+    let started = Instant::now();
+    for _ in 0..FRAMES {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let elapsed = started.elapsed();
+    let built = crate::ui::transcript::transcript_rows_built() - before;
+    let per_frame = built / FRAMES;
+    let frame = elapsed / FRAMES as u32;
+    eprintln!(
+        "transcript window: {per_frame} of {} message rows built per frame, {frame:?}/frame",
+        TURNS * 2
+    );
+
+    assert!(built > 0, "the premise: the transcript renders");
+    assert!(
+        per_frame <= 40,
+        "a frame built {per_frame} of {} message rows; it must build only the viewport's share",
+        TURNS * 2
+    );
+    assert!(
+        frame < FRAME_CEILING,
+        "a frame took {frame:?} with {} messages, above the {FRAME_CEILING:?} ceiling",
+        TURNS * 2
+    );
+
+    // The offscreen first turn is a spacer, not an element...
+    assert!(
+        cx.debug_bounds("user-bubble-0").is_none(),
+        "a row far above the viewport is not built"
+    );
+    // ...and so is a rail mark outside the 420px frame, while the newest mark
+    // the reader presses stays drawn.
+    assert!(
+        cx.debug_bounds("turn-tick-0").is_none(),
+        "a rail mark far above the frame is not built"
+    );
+    assert!(
+        cx.debug_bounds("turn-tick-199").is_some(),
+        "the newest rail mark is built"
+    );
+    // A switch away and back reuses the remembered layout: the RETURN frame is
+    // windowed too, not a second measuring frame.
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let long = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("a chat"));
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.state.select(other)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.state.select(&long)));
+    let before = crate::ui::transcript::transcript_rows_built();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let returned = crate::ui::transcript::transcript_rows_built() - before;
+    assert!(
+        returned <= 40,
+        "switching back built {returned} of {} message rows; a remembered layout must only paint its window",
+        TURNS * 2
+    );
+
+    // ...and the first turn is built the moment the reader scrolls to it, so
+    // culling is not a missing message.
+    // One settling frame: a switch re-pins the tail, and the tail re-engages
+    // once the restored content height is seen. Scrolling is a reader action and
+    // happens after that frame in the real app too.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell.following_tail = false;
+            shell.transcript_scroll.scroll_to_top_of_item(0);
+        });
+    });
+    draw_until(
+        cx,
+        "the first turn is built once it is in view",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("user-bubble-0").is_some(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The context meter's frame cost
+// ---------------------------------------------------------------------------
+
+/// The cached breakdown equals a full price after every kind of mutation.
+#[test]
+fn the_context_breakdown_cache_tracks_every_mutation() {
+    let mut state = state_with_turns("breakdown-cache", 3);
+    let id = state.active_id.clone().expect("a chat");
+    let expected = |state: &AppState| {
+        let session = state.active_session().expect("the session");
+        let start = session.compacted.min(session.messages.len());
+        session.messages[start..]
+            .iter()
+            .map(|message| message.priced_tokens())
+            .sum::<u64>()
+    };
+    let messages = |state: &AppState| {
+        state
+            .context_breakdown()
+            .map(|breakdown| breakdown.messages)
+            .unwrap_or(0)
+    };
+    assert_eq!(messages(&state), expected(&state), "the first price");
+
+    // The last message streams: only its own price changes.
+    state
+        .store
+        .session_mut(&id)
+        .expect("the session")
+        .messages
+        .last_mut()
+        .expect("the tail")
+        .text
+        .push_str(" more streamed words");
+    assert_eq!(messages(&state), expected(&state), "a streaming tail");
+
+    // A new turn moves the old tail into the priced prefix.
+    state
+        .store
+        .session_mut(&id)
+        .expect("the session")
+        .messages
+        .push(ChatMessage::assistant());
+    state
+        .store
+        .session_mut(&id)
+        .expect("the session")
+        .messages
+        .last_mut()
+        .expect("the tail")
+        .text = "a brand new answer".to_string();
+    assert_eq!(messages(&state), expected(&state), "an appended turn");
+
+    // Compaction moves the window's start.
+    state.store.session_mut(&id).expect("the session").compacted = 2;
+    assert_eq!(messages(&state), expected(&state), "a compaction");
+
+    // Switching sessions re-keys the cache.
+    let mut other = crate::model::Session::new("elsewhere", "Other");
+    other.id = "breakdown-other".to_string();
+    other.messages.push(ChatMessage::user("other prompt"));
+    other.messages.push(ChatMessage::assistant());
+    state.store.insert(other);
+    state.active_id = Some("breakdown-other".to_string());
+    assert_eq!(messages(&state), expected(&state), "a session switch");
+}
+
+/// While the meter panel is open, a frame prices the STREAMING TAIL, not the
+/// whole transcript. Before the prefix cache, every frame counted the
+/// characters of every message.
+#[gpui::test]
+fn the_context_panel_prices_only_the_tail_of_the_transcript(cx: &mut TestAppContext) {
+    use crate::model::{MessageMeta, MessageUsage};
+    init_test_app(cx);
+    let mut state = state_with_turns("meter-cache", 200);
+    let id = state.active_id.clone().expect("a chat");
+    {
+        let session = state.store.session_mut(&id).expect("the session");
+        let last = session.messages.last_mut().expect("the tail");
+        let meta = last.meta.get_or_insert_with(MessageMeta::default);
+        meta.usage = Some(MessageUsage {
+            prompt_tokens: 900,
+            completion_tokens: 30,
+            cached_tokens: 0,
+            model: "local-model".to_string(),
+        });
+    }
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    // The first frame settles the session switch, which closes the meter; open
+    // it afterwards, the way the reader's click does.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.state.meter_open = true;
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("context-meter-panel").is_some(),
+        "the premise: the panel is open"
+    );
+
+    let before = crate::model::priced_messages();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let priced = crate::model::priced_messages() - before;
+    eprintln!("context panel: {priced} messages priced in one frame");
+    assert!(
+        priced <= 3,
+        "a frame with the panel open priced {priced} of 400 messages; only the tail should be priced"
+    );
+}
+
+/// A width drag keeps the measured rows and asks for ONE exact pass at the
+/// commit, so dragging the edge of a long chat does not re-measure the whole
+/// transcript on every pointer move.
+#[gpui::test]
+fn a_width_drag_remeasures_once_at_the_commit(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let state = state_with_turns("width-drag", 200);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let before = crate::ui::transcript::transcript_layout_resets();
+
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.begin_chat_drag(crate::ui::shell::HandleSide::Right, 900.0, cx);
+        });
+    });
+    for pointer in [890.0, 880.0, 870.0] {
+        cx.update(|_, cx| {
+            shell.update(cx, |shell, cx| shell.drag_chat_width(pointer, cx));
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    assert_eq!(
+        crate::ui::transcript::transcript_layout_resets(),
+        before,
+        "a drag must not re-measure the transcript"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| shell.commit_chat_width(cx));
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        crate::ui::transcript::transcript_layout_resets(),
+        before + 1,
+        "the commit measures exactly once, at the settled width"
+    );
 }

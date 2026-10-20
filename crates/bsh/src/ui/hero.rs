@@ -228,7 +228,8 @@ impl Shell {
                     div()
                         .debug_selector(|| String::from("hero-workspace"))
                         .child(chip),
-                ),
+                )
+                .child(self.agent_preset_chip(self.state.lang, cx)),
         )
     }
 

@@ -11,7 +11,7 @@ tree carries `size` and `offset` **relative to that base**.
 | path | what it holds |
 |---|---|
 | `extract-asar.py` | list/read asar entries; `--list` prints `size path` per line |
-| `pkgs/` | the 72 sha256-verified `dsh-*.js` client bundles (12 MB) |
+| `pkgs/` | the `dsh-*` bundles extracted so far (sha256-verified by the asar header); `dsh-compact.md` lists the compaction/command/chat subset re-extracted this round |
 | `dsh-css-inline/` | 146 CSS modules inlined in those bundles, with `INDEX.md` |
 | `dsh-css-files/` | 41 CSS modules shipped as real files, with `INDEX.md` |
 | `dsh-settings-chrome.md` | settings panel/nav/header/footer sheets + token map |
@@ -22,6 +22,7 @@ tree carries `size` and `offset` **relative to that base**.
 | `dsh-transcript-chrome.md` | transcript/turn sheets |
 | `dsh-type-scale.md` | measured type scale |
 | `dsh-slot-map.md` | slot registrations |
+| `dsh-compact.md` | /compact, the automatic trigger, the marker, and bsh parity |
 
 Extraction recipe for both CSS trees:
 

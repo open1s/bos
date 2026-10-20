@@ -1300,3 +1300,135 @@ fn build_vendor_keeps_openai_as_the_unprefixed_default() {
     assert_eq!(name, "openai");
     assert_eq!(vendor.provider_name(), "openai");
 }
+
+/// The summarizer seam both the manual command and the automatic pressure
+/// trigger drive: one model call whose returned TEXT alone becomes the
+/// checkpoint, replacing the older span and keeping the newest message.
+#[tokio::test]
+async fn compact_now_installs_a_model_written_checkpoint() {
+    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    {
+        let mut session = agent.session();
+        // Long enough that the framed checkpoint (the preamble alone is ~75
+        // tokens) is genuinely smaller than the span it replaces.
+        session.add_user(format!("old one {}", "x".repeat(400)));
+        session.add_assistant(format!("reply one {}", "y".repeat(400)));
+        session.add_user(format!("old two {}", "x".repeat(400)));
+        session.add_assistant(format!("reply two {}", "y".repeat(400)));
+    }
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let outcome = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("the compaction request")
+        .expect("a checkpoint");
+    assert_eq!(outcome.replaced, 3, "all but the last message");
+    assert_eq!(outcome.summary, "mock response");
+    let session = agent.session();
+    assert_eq!(
+        session.messages().len(),
+        2,
+        "the framed checkpoint plus the kept reply"
+    );
+    match session.messages().first() {
+        Some(react::LlmMessage::User { content }) => match content {
+            react::llm::Content::Text(text) => {
+                assert!(text.contains("<compacted-summary>"));
+                assert!(text.contains("mock response"));
+                assert!(text.ends_with("</compacted-summary>"));
+            }
+            _ => panic!("the checkpoint is text"),
+        },
+        other => panic!("the checkpoint is a user message: {other:?}"),
+    }
+    assert!(
+        matches!(
+            session.messages().last(),
+            Some(react::LlmMessage::Assistant { content }) if content.starts_with("reply two")
+        ),
+        "the newest message is kept verbatim"
+    );
+}
+
+/// A vendor that always answers the summarizer with one fixed text.
+struct FixedSummaryMock(String);
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for FixedSummaryMock {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        Ok(make_text_response(self.0.clone()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        Ok(Box::pin(futures::stream::iter(vec![Ok(StreamToken::Done)])))
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "fixed-summary-mock"
+    }
+}
+
+fn agent_with_summary(summary: &str) -> Agent {
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(FixedSummaryMock(summary.to_string())),
+    );
+    Agent::new(AgentConfig::default(), Arc::new(provider))
+}
+
+fn four_messages(agent: &Agent) {
+    let mut session = agent.session();
+    session.add_user("old one".to_string());
+    session.add_assistant("reply one".to_string());
+    session.add_user("old two".to_string());
+    session.add_assistant("reply two".to_string());
+}
+
+#[tokio::test]
+async fn compact_now_refuses_an_empty_summary() {
+    let agent = agent_with_summary("");
+    four_messages(&agent);
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("an empty answer is a summary failure");
+    assert!(error.to_string().contains("no text summary content"));
+    assert_eq!(
+        agent.session().messages().len(),
+        4,
+        "a failed summary leaves the history untouched"
+    );
+}
+
+#[tokio::test]
+async fn compact_now_refuses_a_summary_that_does_not_shrink_the_context() {
+    let agent = agent_with_summary(&"x".repeat(50_000));
+    four_messages(&agent);
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("a summary larger than its span is refused");
+    assert!(error
+        .to_string()
+        .contains("not smaller than the shadowed content"));
+    assert_eq!(
+        agent.session().messages().len(),
+        4,
+        "a refused summary leaves the history untouched"
+    );
+}

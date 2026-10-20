@@ -7,7 +7,10 @@ pub mod hooks;
 pub mod plugin;
 
 pub use self::agentic::{Agent, AgentConfig, FallbackProvider};
-pub use context::{AgentReActApp, AgentReactContext, AgentSession, MessageContext};
+pub use context::{
+    AgentReActApp, AgentReactContext, AgentSession, CompactionOutcome, MessageContext,
+    CHECKPOINT_PREAMBLE, COMPACTION_INSTRUCTION,
+};
 pub use hooks::external::{EventMatcher, ExternalHook, HookDispatcher, HookOutcome};
 pub use hooks::{AgentHook, HookContext, HookEvent, HookRegistry};
 pub use plugin::{

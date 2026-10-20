@@ -132,12 +132,25 @@ impl McpClient {
         })
     }
 
+    /// An egress slot with no gate installed.
+    fn empty_egress_slot() -> super::http_transport::EgressSlot {
+        std::sync::Arc::new(std::sync::Mutex::new(None))
+    }
+
     /// Create a client that talks to `base_url` over HTTP.
     pub fn connect_http(base_url: impl Into<String>) -> Self {
+        Self::connect_http_with_egress(base_url, Self::empty_egress_slot())
+    }
+
+    /// Create an HTTP client whose requests share `egress` with its pool.
+    pub fn connect_http_with_egress(
+        base_url: impl Into<String>,
+        egress: super::http_transport::EgressSlot,
+    ) -> Self {
         Self {
-            transport: Arc::new(Mutex::new(TransportBackend::Http(HttpTransport::new(
-                base_url,
-            )))),
+            transport: Arc::new(Mutex::new(TransportBackend::Http(
+                HttpTransport::with_egress(base_url, egress),
+            ))),
             request_id: std::sync::atomic::AtomicU64::new(1),
             capabilities: std::sync::Mutex::new(None),
             initialized: std::sync::atomic::AtomicBool::new(false),

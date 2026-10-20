@@ -115,10 +115,13 @@ Refinement (round 76): that "zero" is pattern-dependent. Re-run with a looser sh
 
 ## Theming: the gpui-kit Theme (done 2026-10-14)
 
-BSH's colours come from the active gpui-kit theme. `theme.rs` holds 16
-`static AtomicU32` tokens (page, sidebar_bg, selected_row, new_session_fill,
-hover, text, muted, faint, border_soft, border, border_strong, accent, error,
-success, warn, user_bubble) exposed as accessors. `sync(cx)` copies the kit's
+BSH's colours come from the active gpui-kit theme. `theme.rs` holds the 16
+colour tokens (page, sidebar_bg, selected_row, new_session_fill, hover, text,
+muted, faint, border_soft, border, border_strong, accent, error, success, warn,
+user_bubble) in one per-thread `Palette` cell, exposed as accessors. Per-thread
+rather than per-process because a GPUI App paints on one thread: a process
+global let one test case's `theme::apply` repaint a frame another case was
+asserting on. `sync(cx)` copies the kit's
 `ThemeColor` into them (`background`, `sidebar`, `sidebar_accent`, `secondary`,
 `secondary_hover`, `foreground`, `muted_foreground`, `border`, `primary`,
 `danger`, `success`, `warning`); `mix()` derives `faint` and the two mid greys,
@@ -372,9 +375,19 @@ cost, so the next test is cheap:
   debug assertions, so release pays nothing.
 - The store is swapped, not `HOME`: `Store::open_at(dir)`, `AppState::with_store(store)`
   and the test-only `Shell::build_for_test(window, open_settings, state, cx)` let a test
-  point the store at `target/bsh-scratch-home`, so a click that saves a session never
-  writes under the user home. Other tests assert the `settings::dir()` string, so
-  overriding `HOME` or a `BSH_HOME` process-wide would make them race.
+  point the store at `target/bsh-scratch-<label>-<pid>`, so a click that saves a session
+  never writes under the user home. Other tests assert the `settings::dir()` string, so
+  overriding `HOME` or a `BSH_HOME` process-wide would make them race. The pid is part
+  of the root because `scratch_store` removes the directory on the way in: without it
+  two runs sharing `target/` delete each other's stores mid-test.
+- **A test may not depend on a single draw after a state change.** A click schedules
+  work (focus lands on the next dispatch, a text run lays out on the next frame, an
+  editor records its box during PAINT), so `click; draw once; assert` is green on an
+  idle machine and loses the frame under the suite's real load. Use
+  `draw_until(cx, what, max_frames, predicate)`: it pumps bounded frames and panics
+  naming the predicate. The tree's double-click is wall-clock bounded
+  (`SELF_DOUBLE_MS`), so synthesise it with `press_twice` - a draw between the two
+  presses can outlast the window.
 - Interaction tests are discrimination-checked, not just run: the pin test pins an
   inactive row, then clicks that same row body and asserts it *did* open, so the
   negative assertion cannot pass by accident; deleting one `stop_propagation` from

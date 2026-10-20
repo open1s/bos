@@ -63,6 +63,9 @@ rand = { workspace = true }
 # The same package the kit aliases as gpui, with GPUI test hooks enabled: the
 # shell is booted headlessly and its controls are clicked by debug selector.
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
+# The runner's automatic-compaction test drives a local `LlmClient` mock; the
+# react trait is async-trait-transformed, so implementations need the macro.
+async-trait = { workspace = true }
 
 # A bare `bsh` binary has no bundle, so macOS would draw a generic Dock tile;
 # assets::install_dock_icon hands AppKit the .icns compiled into the binary

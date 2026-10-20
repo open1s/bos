@@ -63,6 +63,7 @@ fn create_agent_with_resilience() -> Agent {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_react_basic() {
     let agent = create_test_agent();
     let result = agent.react("Hello").await;
@@ -71,6 +72,7 @@ async fn test_react_basic() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_react_with_empty_task() {
     let agent = create_test_agent();
     let result = agent.react("").await;
@@ -79,6 +81,7 @@ async fn test_react_with_empty_task() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_react_with_long_task() {
     let agent = create_test_agent();
     let long_task = "Explain quantum computing in detail: ".repeat(10);
@@ -87,6 +90,7 @@ async fn test_react_with_long_task() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_react_with_resilience() {
     let agent = create_agent_with_resilience();
     let result = agent.react("Test with resilience").await;
@@ -94,6 +98,7 @@ async fn test_react_with_resilience() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_react_without_resilience() {
     let agent = create_test_agent();
     let result = agent.react("Test without resilience").await;
@@ -105,6 +110,7 @@ async fn test_react_without_resilience() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_run_simple_basic() {
     let agent = create_test_agent();
     let result = agent.run_simple("Hi").await;
@@ -112,6 +118,7 @@ async fn test_run_simple_basic() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_run_simple_empty_task() {
     let agent = create_test_agent();
     let result = agent.run_simple("").await;
@@ -119,6 +126,7 @@ async fn test_run_simple_empty_task() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_run_simple_with_resilience() {
     let agent = create_agent_with_resilience();
     let result = agent.run_simple("Test").await;
@@ -126,6 +134,7 @@ async fn test_run_simple_with_resilience() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_run_simple_without_resilience() {
     let agent = create_test_agent();
     let result = agent.run_simple("Test").await;
@@ -137,6 +146,7 @@ async fn test_run_simple_without_resilience() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_stream_basic() {
     use futures::StreamExt;
 
@@ -153,6 +163,7 @@ async fn test_stream_basic() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_stream_with_resilience() {
     use futures::StreamExt;
 
@@ -166,6 +177,7 @@ async fn test_stream_with_resilience() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_stream_without_resilience() {
     use futures::StreamExt;
 
@@ -179,6 +191,7 @@ async fn test_stream_without_resilience() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_stream_empty_task() {
     use futures::StreamExt;
 
@@ -247,6 +260,7 @@ async fn test_agent_config_access() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_react_records_metrics() {
     let agent = create_test_agent();
     let before = agent.metrics();
@@ -260,6 +274,7 @@ async fn test_react_records_metrics() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_run_simple_records_metrics() {
     let agent = create_test_agent();
     let before = agent.metrics();
@@ -271,6 +286,7 @@ async fn test_run_simple_records_metrics() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_stream_records_metrics() {
     use futures::StreamExt;
 
@@ -290,6 +306,7 @@ async fn test_stream_records_metrics() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_metrics_accumulate_across_multiple_calls() {
     use futures::StreamExt;
 

@@ -35,6 +35,55 @@ pub(crate) fn tree_key_delta(key: &str, page: Pixels) -> Option<f32> {
 /// the 18px wordmark.
 const BRAND_MARK: f32 = 24.0;
 
+/// How many rows the sidebar's scroller actually paints.
+///
+/// The tree's row heights are fixed (a 28px workspace header, a 44px session
+/// row, a 38px archive header, the 32px tail), so visibility is arithmetic -
+/// no measurement cache is needed. A row outside the tree's viewport paints as
+/// a same-sized blank, which keeps the scroll height, the wheel and the keys
+/// exact while a 400-session install no longer builds 400 rows (menus, icons,
+/// hover groups) on every frame.
+struct TreeWindow {
+    /// The top of the next row, in content coordinates.
+    top: f32,
+    /// The scroller's viewport in the same coordinates.
+    view_top: f32,
+    view_h: f32,
+}
+
+/// Rows this close to the viewport are built too.
+const TREE_WINDOW_OVERDRAW: f32 = 300.0;
+/// A tree header (workspace, archived section) is a 28px row.
+const TREE_HEADER_H: f32 = 28.0;
+/// The archived header adds its 10px separation above the 28px row.
+const TREE_ARCHIVED_HEADER_H: f32 = TREE_HEADER_H + 10.0;
+
+impl TreeWindow {
+    fn new(scroll: &ScrollHandle, fallback_h: f32) -> Self {
+        let height = f32::from(scroll.bounds().size.height);
+        Self {
+            top: 0.0,
+            // Before the first layout the scroller has no height; the window's
+            // own height is a safe over-estimate for that one frame.
+            view_h: if height > 0.0 { height } else { fallback_h },
+            view_top: -f32::from(scroll.offset().y),
+        }
+    }
+
+    /// Advance past one row, returning whether it must be built.
+    fn take(&mut self, height: f32) -> bool {
+        let visible = self.top + height > self.view_top - TREE_WINDOW_OVERDRAW
+            && self.top < self.view_top + self.view_h + TREE_WINDOW_OVERDRAW;
+        self.top += height;
+        visible
+    }
+}
+
+/// A row kept at its known height without building its contents.
+fn tree_spacer(height: f32) -> AnyElement {
+    div().flex_none().w_full().h(px(height)).into_any_element()
+}
+
 impl Shell {
     /// The reference's own DragHandle for the sidebar: an 8px col-resize strip
     /// straddling the seam (margin-left:-4px) at left: cols.sidebar, drawn only
@@ -257,6 +306,7 @@ impl Shell {
             )
             .flex()
             .flex_col();
+        let mut window = TreeWindow::new(&self.side_scroll, self.viewport_h);
 
         for workspace in &self.state.settings.global.workspaces {
             let folded = self.state.collapsed.contains(&workspace.id);
@@ -270,131 +320,138 @@ impl Shell {
             let row_shell = cx.entity();
             let ws_lang = self.state.lang;
             let renaming = self.renaming_workspace.as_deref() == Some(ws_id.as_str());
-            tree = tree.child(
-                div()
-                    .id(SharedString::from(format!("ws-{}", ws_id)))
-                    .debug_selector(|| format!("ws-{}", ws_id))
-                    .group(row_group.clone())
-                    .h(px(28.0))
-                    .px(px(12.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(icon(
-                        if folded {
-                            IconName::ChevronRight
+            // A row being renamed keeps its field: it is on screen by definition.
+            let show = window.take(TREE_HEADER_H) || renaming;
+            if !show {
+                tree = tree.child(tree_spacer(TREE_HEADER_H));
+            } else {
+                tree = tree.child(
+                    div()
+                        .id(SharedString::from(format!("ws-{}", ws_id)))
+                        .debug_selector(|| format!("ws-{}", ws_id))
+                        .group(row_group.clone())
+                        .h(px(28.0))
+                        .flex_shrink_0()
+                        .px(px(12.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .child(icon(
+                            if folded {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            },
+                            13.0,
+                            theme::muted(),
+                        ))
+                        .child(icon(IconName::Folder, 14.0, theme::muted()))
+                        .child(if renaming {
+                            // The rename happens in place, and the wrapper takes its
+                            // own id so a press inside the field does not collapse
+                            // the workspace under it.
+                            div()
+                                .id("workspace-rename")
+                                .debug_selector(|| String::from("workspace-rename"))
+                                .flex_1()
+                                .min_w_0()
+                                .on_click(|_event, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    Input::new(&self.workspace_rename)
+                                        .id("workspace-rename-field")
+                                        .appearance(false)
+                                        .h(px(22.0)),
+                                )
+                                .into_any_element()
                         } else {
-                            IconName::ChevronDown
-                        },
-                        13.0,
-                        theme::muted(),
-                    ))
-                    .child(icon(IconName::Folder, 14.0, theme::muted()))
-                    .child(if renaming {
-                        // The rename happens in place, and the wrapper takes its
-                        // own id so a press inside the field does not collapse
-                        // the workspace under it.
-                        div()
-                            .id("workspace-rename")
-                            .debug_selector(|| String::from("workspace-rename"))
-                            .flex_1()
-                            .min_w_0()
-                            .on_click(|_event, _window, cx| {
-                                cx.stop_propagation();
-                            })
-                            .child(
-                                Input::new(&self.workspace_rename)
-                                    .id("workspace-rename-field")
-                                    .appearance(false)
-                                    .h(px(22.0)),
-                            )
-                            .into_any_element()
-                    } else {
-                        txt(name, theme::CHIP_SIZE, theme::muted())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .truncate()
-                            .flex_1()
-                            .into_any_element()
-                    })
-                    // The row's own controls: a chat in this workspace, and the
-                    // menu the reference hangs off the ellipsis. They overlay the
-                    // right edge and fade in under the pointer, exactly like the
-                    // session rows' actions.
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(8.0))
-                            .top(px(0.0))
-                            .h(px(28.0))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("ws-new-{}", add_id)))
-                                    .debug_selector(|| format!("ws-new-{}", add_id))
-                                    .px(px(3.0))
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .opacity(0.0)
-                                    .group_hover(row_group.clone(), |s| s.opacity(1.0))
-                                    .hover(|s| s.bg(rgb(theme::hover())))
-                                    .child(icon(IconName::CirclePlus, 14.0, theme::faint()))
-                                    .on_click({
-                                        let action_shell = row_shell.clone();
-                                        move |_event, _window, cx| {
+                            txt(name, theme::CHIP_SIZE, theme::muted())
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .truncate()
+                                .flex_1()
+                                .into_any_element()
+                        })
+                        // The row's own controls: a chat in this workspace, and the
+                        // menu the reference hangs off the ellipsis. They overlay the
+                        // right edge and fade in under the pointer, exactly like the
+                        // session rows' actions.
+                        .child(
+                            div()
+                                .absolute()
+                                .right(px(8.0))
+                                .top(px(0.0))
+                                .h(px(28.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("ws-new-{}", add_id)))
+                                        .debug_selector(|| format!("ws-new-{}", add_id))
+                                        .px(px(3.0))
+                                        .rounded(px(4.0))
+                                        .cursor_pointer()
+                                        .opacity(0.0)
+                                        .group_hover(row_group.clone(), |s| s.opacity(1.0))
+                                        .hover(|s| s.bg(rgb(theme::hover())))
+                                        .child(icon(IconName::CirclePlus, 14.0, theme::faint()))
+                                        .on_click({
+                                            let action_shell = row_shell.clone();
+                                            move |_event, _window, cx| {
+                                                cx.stop_propagation();
+                                                action_shell.update(cx, |this, cx| {
+                                                    this.new_session_in_workspace(&add_id, cx);
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("ws-more-{}", more_id)))
+                                        .debug_selector(|| format!("ws-more-{}", more_id))
+                                        .opacity(0.0)
+                                        .group_hover(row_group, |s| s.opacity(1.0))
+                                        .on_click(|_event, _window, cx| {
                                             cx.stop_propagation();
-                                            action_shell.update(cx, |this, cx| {
-                                                this.new_session_in_workspace(&add_id, cx);
-                                            });
-                                        }
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("ws-more-{}", more_id)))
-                                    .debug_selector(|| format!("ws-more-{}", more_id))
-                                    .opacity(0.0)
-                                    .group_hover(row_group, |s| s.opacity(1.0))
-                                    .on_click(|_event, _window, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "workspace-menu-{}",
-                                            more_id
-                                        )))
-                                        .ghost()
-                                        .compact()
-                                        .icon(IconName::Ellipsis)
-                                        .dropdown_menu_with_anchor(
-                                            Anchor::TopLeft,
-                                            move |menu, _, _| {
-                                                let mut menu = menu;
-                                                for item in
-                                                    crate::ui::workspace_menu::workspace_items(
-                                                        &menu_items_id,
-                                                        ws_lang,
-                                                        &row_shell,
-                                                    )
-                                                {
-                                                    menu = menu.item(item);
-                                                }
-                                                menu
-                                            },
+                                        })
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "workspace-menu-{}",
+                                                more_id
+                                            )))
+                                            .ghost()
+                                            .compact()
+                                            .icon(IconName::Ellipsis)
+                                            .dropdown_menu_with_anchor(
+                                                Anchor::TopLeft,
+                                                move |menu, _, _| {
+                                                    let mut menu = menu;
+                                                    for item in
+                                                        crate::ui::workspace_menu::workspace_items(
+                                                            &menu_items_id,
+                                                            ws_lang,
+                                                            &row_shell,
+                                                        )
+                                                    {
+                                                        menu = menu.item(item);
+                                                    }
+                                                    menu
+                                                },
+                                            ),
                                         ),
-                                    ),
-                            ),
-                    )
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.toggle_collapse(&click_id);
-                        cx.notify();
-                    })),
-            );
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.state.toggle_collapse(&click_id);
+                            cx.notify();
+                        })),
+                );
+            }
 
             if folded {
                 continue;
@@ -412,6 +469,14 @@ impl Shell {
             }
             for session in rows {
                 let id = session.id.clone();
+                // A control the reader is working (an inline rename) is never
+                // culled; a list row far outside the tree is.
+                let show = window.take(theme::ROW_H)
+                    || self.renaming_session.as_deref() == Some(id.as_str());
+                if !show {
+                    tree = tree.child(tree_spacer(theme::ROW_H));
+                    continue;
+                }
                 let selected = self.state.active_id.as_deref() == Some(id.as_str());
                 let streaming = self.state.is_streaming(&id);
                 let title = session.title.clone();
@@ -432,6 +497,7 @@ impl Shell {
                         .id(row_id)
                         .group(row_group.clone())
                         .h(px(theme::ROW_H))
+                        .flex_shrink_0()
                         .px(px(12.0))
                         .flex()
                         .flex_row()
@@ -643,40 +709,49 @@ impl Shell {
             .collect();
         if !archived.is_empty() {
             let folded = self.state.collapsed.contains("archived");
-            tree = tree.child(
-                div()
-                    .id("ws-archived")
-                    .debug_selector(|| String::from("ws-archived"))
-                    .mt(px(10.0))
-                    .h(px(28.0))
-                    .px(px(12.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(icon(
-                        if folded {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        },
-                        13.0,
-                        theme::muted(),
-                    ))
-                    .child(
-                        txt(lang.tr("side.archived"), theme::CHIP_SIZE, theme::muted())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .flex_1(),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.state.toggle_collapse("archived");
-                        cx.notify();
-                    })),
-            );
+            if !window.take(TREE_ARCHIVED_HEADER_H) {
+                tree = tree.child(tree_spacer(TREE_ARCHIVED_HEADER_H));
+            } else {
+                tree = tree.child(
+                    div()
+                        .id("ws-archived")
+                        .debug_selector(|| String::from("ws-archived"))
+                        .mt(px(10.0))
+                        .h(px(28.0))
+                        .flex_shrink_0()
+                        .px(px(12.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .child(icon(
+                            if folded {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            },
+                            13.0,
+                            theme::muted(),
+                        ))
+                        .child(
+                            txt(lang.tr("side.archived"), theme::CHIP_SIZE, theme::muted())
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .flex_1(),
+                        )
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.state.toggle_collapse("archived");
+                            cx.notify();
+                        })),
+                );
+            }
             if !folded {
                 for (id, title, when) in archived {
+                    if !window.take(theme::ROW_H) {
+                        tree = tree.child(tree_spacer(theme::ROW_H));
+                        continue;
+                    }
                     let restore_id = id.clone();
                     // An archived row offers the same menu a live one does, from the
                     // same hover-revealed ellipsis. Its archive cell reads "Unarchive",
@@ -692,6 +767,7 @@ impl Shell {
                             .debug_selector(|| format!("archived-{}", id))
                             .group(row_group.clone())
                             .h(px(theme::ROW_H))
+                            .flex_shrink_0()
                             .px(px(12.0))
                             .flex()
                             .flex_row()

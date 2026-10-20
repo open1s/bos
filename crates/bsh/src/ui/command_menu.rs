@@ -228,15 +228,27 @@ fn trigger_start(text: &str) -> usize {
 /// the name carries a space (its own `@"..."` form), with a trailing separator
 /// for a directory so the next query lists inside it.
 pub(crate) fn mention(name: &str, directory: bool) -> String {
-    let mut text = if name.contains(char::is_whitespace) {
-        format!("@\"{name}\"")
-    } else {
-        format!("@{name}")
-    };
-    if directory {
-        text.push('/');
-    }
-    text
+    mention_with_range(name, directory, None)
+}
+
+/// The canonical session mention: a labelled reference whose hidden target is
+/// the session id, like the reference's `@[label](dsh-session:...)` form.
+pub(crate) fn session_mention(title: &str, id: &str) -> String {
+    let label: String = title
+        .chars()
+        .map(|character| match character {
+            '[' | ']' => ' ',
+            other => other,
+        })
+        .collect();
+    format!("@[{}](dsh-session:{id})", label.trim())
+}
+
+/// The same mention with an optional `#L<start>-L<end>` reference range, so a
+/// reader can link an excerpt of a file rather than its whole body.
+pub(crate) fn mention_with_range(name: &str, directory: bool, range: Option<(u32, u32)>) -> String {
+    // One grammar for picks and for the text the model is told how to read.
+    crate::reference::format_mention(name, directory, range, false).unwrap_or_default()
 }
 
 /// The menu's own state: the reference's controller keeps `open`, the live
@@ -270,7 +282,15 @@ impl CommandMenu {
     /// active token carries, and closes when there is none. The reference's
     /// trigger component opens on the character and closes with the token, so a
     /// `+`-opened card also closes once ordinary text is typed.
+    ///
+    /// A slash as the FIRST character belongs to the slash palette instead, so
+    /// the plus card stands down there rather than stacking underneath it. A
+    /// mid-draft slash token (`hello /set`) is still this card's trigger.
     pub(crate) fn sync(&mut self, text: &str) {
+        if super::slash_palette::slash_palette_query(text).is_some() {
+            self.close();
+            return;
+        }
         let command = slash_query(text).is_some();
         let reference = at_query(text)
             .is_some_and(|query| query.starts_with('"') || !query.contains(char::is_whitespace));
@@ -305,8 +325,20 @@ impl CommandMenu {
 }
 
 /// The add control's action: open or close the menu.
-pub(crate) fn toggle_action(shell: &mut Shell, _window: &mut Window, cx: &mut Context<Shell>) {
+pub(crate) fn toggle_action(shell: &mut Shell, window: &mut Window, cx: &mut Context<Shell>) {
+    // One overlay at a time: pressing plus while the slash palette is open
+    // closes it, so the two cards can never be on screen together.
+    shell.slash.close();
     shell.command_menu.toggle();
+    // The card's keys are intercepted only while the composer holds them, so the
+    // press has to put them there. A click on the + control focuses the BUTTON,
+    // which left the arrows doing nothing at all on this path - the card opened
+    // by the + could only be driven by pointer, while the one opened by `@` was
+    // already keyboard-driven because that path focuses the field itself.
+    if shell.command_menu.open {
+        let handle = shell.composer.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    }
     cx.notify();
 }
 
@@ -447,6 +479,23 @@ impl Shell {
         cx.notify();
     }
 
+    /// The File row's action: link a workspace file (or a line range of one).
+    ///
+    /// It opens the SAME `@` reference card the reader gets by typing `@`,
+    /// with a bare `@` token in the draft, so one picker and one grammar own
+    /// every file reference. The card's pick then replaces the `@` with the
+    /// canonical mention; a range typed after the path (`#L12-L20`) travels
+    /// with it.
+    pub(crate) fn begin_file_reference(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_composer_text("@", window, cx);
+        self.command_menu.open = true;
+        self.command_menu.trigger = Some(Trigger::Reference);
+        self.command_menu.active = 0;
+        let handle = self.composer.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
     /// Replace the draft's active trigger token with `append`, keeping what
     /// preceded it. A draft whose active token is not a trigger is left alone.
     fn cut_command_token(&mut self, append: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -456,13 +505,13 @@ impl Shell {
             return;
         }
         let next = format!("{}{append}", &text[..start]);
-        self.composer_value = next.clone();
-        self.composer
-            .update(cx, |state, cx| state.set_value(next, window, cx));
+        // The same write the slash rows use, so the caret follows the inserted
+        // mention instead of landing in front of it.
+        self.set_composer_text(&next, window, cx);
     }
 
     /// The rows the active source produces for the draft's own query.
-    fn card_rows(&self, trigger: Trigger) -> Vec<CardRow> {
+    pub(crate) fn card_rows(&self, trigger: Trigger) -> Vec<CardRow> {
         match trigger {
             Trigger::Command => {
                 let entries = entries(self.state.any_streaming());
@@ -490,18 +539,28 @@ impl Shell {
     fn reference_rows(&self, query: &str) -> Vec<CardRow> {
         let quoted = query.starts_with('"');
         let raw = query.trim_start_matches('"');
-        let needle = raw.to_lowercase();
+        // A `#L<start>-L<end>` suffix is part of the reference, not part of the
+        // path it matches: the query lists files by their path and the pick
+        // inserts the range back.
+        let (path_query, range) = crate::reference::split_range(raw);
+        let needle = path_query.to_lowercase();
         let mut rows: Vec<CardRow> = Vec::new();
-        for (index, (path, directory)) in self.reference_files(raw).into_iter().enumerate() {
+        for (index, (path, directory)) in self.reference_files(path_query).into_iter().enumerate() {
             let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            let detail = match range {
+                Some((start, end)) if !directory => {
+                    format!("{path} · L{start}-{end}")
+                }
+                _ => path.clone(),
+            };
             rows.push(CardRow {
                 id: format!("ref-file-{index}"),
                 label: if directory { format!("{name}/") } else { name },
-                detail: path.clone(),
+                detail,
                 action: if directory {
                     CardAction::Drill(mention(&path, true))
                 } else {
-                    CardAction::Insert(mention(&path, false))
+                    CardAction::Insert(mention_with_range(&path, false, range))
                 },
             });
         }
@@ -521,7 +580,10 @@ impl Shell {
                 id: format!("ref-session-{index}"),
                 label: session.title.clone(),
                 detail: self.workspace_name(&session.workspace),
-                action: CardAction::Insert(mention(&session.title, false)),
+                // A session is NOT a path: the reference serializes it as a
+                // labelled mention, which the file guidance excludes from the
+                // `@path` rule.
+                action: CardAction::Insert(session_mention(&session.title, &session.id)),
             });
         }
         rows

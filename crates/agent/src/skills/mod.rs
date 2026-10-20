@@ -100,6 +100,15 @@ pub struct SkillMetadata {
     pub version: SkillVersion,
     /// Free-form tags.
     pub tags: Vec<String>,
+    /// Whether the manifest restricts this skill to user invocation.
+    ///
+    /// The key is `disable-model-invocation: true` in the `SKILL.md`
+    /// frontmatter - the same field Claude Code and Codex skills use to keep a
+    /// skill out of model-driven selection. A host that offers a skill list
+    /// reads this flag to label the entry; the reader is the only one who may
+    /// choose it.
+    #[serde(default)]
+    pub user_only: bool,
 }
 
 impl SkillMetadata {
@@ -112,6 +121,7 @@ impl SkillMetadata {
             category: SkillCategory::Other,
             version: SkillVersion::new(1, 0, 0),
             tags: Vec::new(),
+            user_only: false,
         }
     }
 }
@@ -144,7 +154,14 @@ impl SkillLoader {
         }
     }
 
-    /// Discover skills in the skills directory
+    /// Discover skills in the skills directory.
+    ///
+    /// The catalogue is NAME-ORDERED, not hash-ordered. `discovered` is a map
+    /// keyed by skill name, so iterating it directly returns whatever order the
+    /// map's hash seed happens to produce - a different order for every loader,
+    /// and therefore for every call. A caller that draws these rows or registers
+    /// them per frame would reorder its list under the pointer on each redraw, so
+    /// the order is pinned here once rather than left to the map.
     pub fn discover(&mut self) -> std::io::Result<Vec<SkillMetadata>> {
         if !self.skills_dir.exists() {
             return Ok(Vec::new());
@@ -165,7 +182,9 @@ impl SkillLoader {
             }
         }
 
-        Ok(self.discovered.values().cloned().collect())
+        let mut discovered: Vec<SkillMetadata> = self.discovered.values().cloned().collect();
+        discovered.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(discovered)
     }
 
     /// Load a skill by name
@@ -181,9 +200,11 @@ impl SkillLoader {
         })
     }
 
-    /// List all discovered skills
+    /// List all discovered skills, in the same name order as [`Self::discover`].
     pub fn list(&self) -> Vec<&SkillMetadata> {
-        self.discovered.values().collect()
+        let mut discovered: Vec<&SkillMetadata> = self.discovered.values().collect();
+        discovered.sort_by(|left, right| left.name.cmp(&right.name));
+        discovered
     }
 
     fn parse_metadata(path: &Path) -> Option<SkillMetadata> {
@@ -203,6 +224,15 @@ impl SkillLoader {
             .map(SkillCategory::from_name)
             .unwrap_or(SkillCategory::Other);
 
+        // `disable-model-invocation` is the frontmatter key the skill
+        // standards use to keep a skill out of model-driven selection. Only a
+        // literal true counts: a missing, false or unparsable value leaves the
+        // skill model-invocable, which is the convention's own default.
+        let user_only = frontmatter
+            .get("disable-model-invocation")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         Some(SkillMetadata {
             name,
             description,
@@ -210,6 +240,7 @@ impl SkillLoader {
             category,
             version: SkillVersion::new(1, 0, 0),
             tags: Vec::new(),
+            user_only,
         })
     }
 

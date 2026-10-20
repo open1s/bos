@@ -102,15 +102,28 @@ impl InstalledPlugin {
             .unwrap_or_else(|| "?".to_string())
     }
 
-    /// Whether the row carries the Problem pill.
+    /// Whether the row carries the support pill.
     ///
-    /// A refused part counts, and so does a package that cannot be read at all;
-    /// both are a state the reader can act on by opening the row. MCP servers
-    /// are filtered out at resolve time, because this crate starts them itself
-    /// and the shim's refusal of them is not a user-visible gap - an MCP
-    /// package that is not trusted gets its own Needs trust state instead.
+    /// A refused part is `Partial`; a package that cannot be read at all is
+    /// `Problem`. Both are states the reader can act on by opening the row.
+    /// MCP servers are filtered out at resolve time, because this crate starts
+    /// them itself and the shim's refusal of them is not a user-visible gap -
+    /// an MCP package that is not trusted gets its own Needs trust state.
     pub(crate) fn problem(&self) -> bool {
         self.load_error.is_some() || self.refusal_count() > 0
+    }
+
+    /// The pill's locale key: `Problem` only when the package cannot be read.
+    ///
+    /// A readable package that declares one unsupported part is `Partial`: the
+    /// rest of it loads, and a Canva-style app connector does not make its MCP
+    /// server a broken plugin.
+    pub(crate) fn problem_label_key(&self) -> &'static str {
+        if self.load_error.is_some() {
+            "settings.pluginsProblem"
+        } else {
+            "settings.pluginsPartial"
+        }
     }
 
     /// Whether the package declares MCP servers the reader has not approved.
@@ -388,12 +401,14 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_makes_the_problem_pill_and_names_the_kind() {
+    fn a_readable_package_with_a_refusal_is_partial_and_names_the_kind() {
         let mut cache = InstalledCache::default();
         let plugin = cache.resolve(&record("deploy", &fixture("codex-deploy")), true);
-        assert!(
-            plugin.problem(),
-            "a refused part is a problem the row shows"
+        assert!(plugin.problem(), "a refused part is a state the row shows");
+        assert_eq!(
+            plugin.problem_label_key(),
+            "settings.pluginsPartial",
+            "a readable package with one refused part is Partial, not Problem"
         );
         assert!(plugin.refusal_count() > 0);
         assert!(
@@ -423,6 +438,11 @@ mod tests {
         let mut cache = InstalledCache::default();
         let plugin = cache.resolve(&record("gone", Path::new("/tmp/bsh-no-such-package")), true);
         assert!(plugin.problem());
+        assert_eq!(
+            plugin.problem_label_key(),
+            "settings.pluginsProblem",
+            "a package that cannot be read is a real Problem"
+        );
         assert!(plugin.load_error.is_some());
         assert_eq!(plugin.version, "0.0.1", "the record's cache still shows");
         assert_eq!(plugin.refusals, Vec::new());

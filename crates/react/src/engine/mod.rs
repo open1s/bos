@@ -348,6 +348,7 @@ skill_dir: {}
                             }
                         }
 
+                        let mut recorded = false;
                         if !found_tool_call {
                             if let Some(content) = &message.content {
                                 if !content.is_empty() {
@@ -358,14 +359,20 @@ skill_dir: {}
                                             .to_string();
                                     }
                                     self.react_app.on_thought(&thought, session, context).await;
+                                    // Record the text now, so a pre-tool-call
+                                    // message is not lost; the final branches
+                                    // below only push when this did not.
                                     session.push(LlmMessage::assistant(content.clone()));
+                                    recorded = true;
                                 }
                             }
                         }
 
                         let finish = choice.finish_reason.as_deref();
                         if finish.is_some() && finish != Some("tool_calls") {
-                            session.push(LlmMessage::assistant(thought.clone()));
+                            if !recorded {
+                                session.push(LlmMessage::assistant(thought.clone()));
+                            }
                             self.react_app
                                 .on_final_answer(&thought, session, context)
                                 .await;
@@ -375,7 +382,9 @@ skill_dir: {}
                             return Ok(thought);
                         }
                         if !found_tool_call {
-                            session.push(LlmMessage::assistant(thought.clone()));
+                            if !recorded {
+                                session.push(LlmMessage::assistant(thought.clone()));
+                            }
                             self.react_app
                                 .on_final_answer(&thought, session, context)
                                 .await;

@@ -10,11 +10,13 @@ pub(crate) mod hero;
 pub(crate) mod meter;
 pub(crate) mod paging;
 mod session_menu;
+mod slash_palette;
 pub(crate) mod smooth;
 pub(crate) mod trash;
 pub(crate) mod workspace_menu;
 
 pub(crate) mod queue_dock;
+pub(crate) mod reference_chip;
 pub(crate) mod right_panel;
 pub(crate) mod settings;
 pub(crate) mod shell;

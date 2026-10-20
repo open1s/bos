@@ -157,6 +157,36 @@ async fn test_react_engine_basic() {
     assert!(result.is_ok());
 }
 
+/// An OpenAI-compatible final answer must land in the session once; the
+/// engine used to record the content and then the final answer a second time,
+/// which surfaced as two assistant rows in a subagent transcript.
+#[tokio::test]
+async fn a_final_answer_is_recorded_once() {
+    let llm = MockLlm::new(vec!["Why did the chicken cross the road?".to_string()]);
+
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
+        .llm(Box::new(llm))
+        .max_steps(1)
+        .build()
+        .unwrap();
+
+    let mut session = LlmSession::default();
+    let mut context = LlmContext::default();
+    let mut request = LlmRequest::new("joke");
+    request.input = react::llm::Content::text("Tell one joke");
+    let answer = engine
+        .react(None, request, &mut session, &mut context)
+        .await
+        .expect("the turn completes");
+    assert_eq!(answer, "Why did the chicken cross the road?");
+    let assistants = session
+        .history
+        .iter()
+        .filter(|message| matches!(message, react::llm::LlmMessage::Assistant { .. }))
+        .count();
+    assert_eq!(assistants, 1, "the final answer is recorded once");
+}
+
 #[tokio::test]
 async fn test_react_engine_no_tool() {
     let llm = MockLlm::new(vec!["Final Answer: 42".to_string()]);

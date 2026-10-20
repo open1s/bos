@@ -20,8 +20,8 @@ use std::sync::Arc;
 use super::shell::Shell;
 use super::todo_panel::spinner;
 use super::{glyph, icon, txt, DivExt, IconName};
-use crate::i18n::tr;
-use crate::model::{ChatMessage, PlanStatus, Role, ToolEvent};
+use crate::i18n::{tr, Lang};
+use crate::model::{ChatMessage, PlanStatus, Role, Session, ToolEvent};
 use crate::settings::TranscriptPolicy;
 use crate::theme;
 
@@ -427,6 +427,299 @@ pub(crate) fn traj_wheel(
     cx.stop_propagation();
 }
 
+/// One transcript row's measured height, kept between frames.
+///
+/// The transcript is a flex column inside a `ScrollHandle` scroller whose child
+/// indices ARE the rows (child 0 is the timestamp, then one per message), so a
+/// row the viewport does not need is replaced by a spacer of its measured
+/// height. Every consumer that addresses a child - the rail's
+/// `scroll_to_top_of_item`, the paging probe, the tests - keeps working, while a
+/// frame BUILDS only the rows near the viewport instead of the whole
+/// conversation. A 400-message chat therefore costs its viewport, not the
+/// transcript, on every repaint.
+#[derive(Default)]
+pub(crate) struct TranscriptLayout {
+    /// The session shape the cached heights belong to.
+    shape: Option<TranscriptShape>,
+    /// Where `heights[1]` (the first loaded message) sits in the session.
+    loaded_from: usize,
+    /// One measured height per row, in scroller-child order.
+    heights: Vec<Option<f32>>,
+    /// Recently laid-out sessions, so switching back is a paint, not a
+    /// measure. Newest first, capped at `SAVED_LAYOUTS`.
+    saved: Vec<(TranscriptShape, usize, Vec<Option<f32>>)>,
+    /// A one-shot request to re-measure every row exactly, raised when a width
+    /// drag ENDS (during the drag the old heights are kept, so dragging a long
+    /// chat does not re-measure it on every pointer move).
+    remeasure: bool,
+}
+
+/// What a cached height is keyed on: the facts that decide whether the cached
+/// row layout is still the one the height was measured for.
+///
+/// The session's `loaded_from` is deliberately NOT part of this: paging shifts
+/// the rows by a known amount, so the measured heights stay valid and only the
+/// prepended rows need measuring.
+#[derive(Clone, PartialEq)]
+struct TranscriptShape {
+    session: String,
+    /// The content width in bits: every wrapped line depends on it.
+    width: u32,
+    content_size: u32,
+    lang: Lang,
+    /// The whole transcript policy: fold, step grouping and the live-process
+    /// rules all change how tall a turn draws.
+    policy: TranscriptPolicy,
+    compact: bool,
+}
+
+impl TranscriptShape {
+    /// Whether two sessions' rows would lay out the same way.
+    fn same_geometry(&self, other: &Self) -> bool {
+        self.width == other.width && self.same_geometry_except_width(other)
+    }
+
+    /// The same question without the width: a drag changes the width every
+    /// pointer move, and re-measuring the transcript on each of those frames is
+    /// exactly what the window is meant to avoid.
+    fn same_geometry_except_width(&self, other: &Self) -> bool {
+        self.content_size == other.content_size
+            && self.lang == other.lang
+            && self.policy == other.policy
+            && self.compact == other.compact
+    }
+}
+
+/// What the cache could reuse this frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Prepared {
+    /// Every cached height is valid; the last frame's painted bounds are too.
+    Exact,
+    /// The heights are valid but the ROWS MOVED (a paged window was prepended
+    /// or trimmed, or the session changed to a remembered layout), so last
+    /// frame's child bounds address different rows. Decide visibility from the
+    /// heights instead.
+    Stale,
+    /// Nothing was reusable: every row must be built to be measured. This is
+    /// the one frame a new session (or a new width or font) costs.
+    MeasureAll,
+}
+
+impl TranscriptLayout {
+    /// Ask for one exact re-measure on the next frame (a width drag ended).
+    pub(crate) fn request_remeasure(&mut self) {
+        self.remeasure = true;
+    }
+
+    /// Reconcile the cache with the session about to be drawn.
+    ///
+    /// Three transitions are cheap and one is not. A plain append (a new turn)
+    /// extends the table. A paged window prepended at the front SHIFTS the
+    /// measured heights, so only the new page needs building. A session switch
+    /// restores that session's last layout when its geometry still matches.
+    /// Only a genuinely new session or geometry re-measures every row once.
+    fn prepare(
+        &mut self,
+        shape: TranscriptShape,
+        loaded_from: usize,
+        rows: usize,
+        freeze_width: bool,
+    ) -> Prepared {
+        if std::mem::take(&mut self.remeasure) {
+            self.shape = Some(shape);
+            self.loaded_from = loaded_from;
+            self.heights = vec![None; rows];
+            #[cfg(test)]
+            LAYOUT_RESETS.with(|resets| resets.set(resets.get() + 1));
+            return Prepared::MeasureAll;
+        }
+        let mut stale = false;
+        // A resize drag changes the width every frame; the heights measured at
+        // the PREVIOUS width are kept for the duration, and the rows on screen
+        // re-measure themselves as they rebuild. The commit asks for the exact
+        // pass.
+        let frozen = freeze_width
+            && self.shape.as_ref().is_some_and(|current| {
+                current.session == shape.session && current.same_geometry_except_width(&shape)
+            });
+        if self.shape.as_ref() != Some(&shape) && !frozen {
+            if let Some(old) = self.shape.take() {
+                self.saved
+                    .retain(|(saved, _, _)| saved.session != old.session);
+                self.saved.insert(
+                    0,
+                    (old, self.loaded_from, std::mem::take(&mut self.heights)),
+                );
+                self.saved.truncate(SAVED_LAYOUTS);
+            }
+            let restored = self.saved.iter().position(|(saved, _, _)| {
+                saved.session == shape.session && saved.same_geometry(&shape)
+            });
+            match restored {
+                Some(index) => {
+                    let (saved_shape, saved_from, heights) = self.saved.remove(index);
+                    self.shape = Some(TranscriptShape {
+                        session: shape.session,
+                        ..saved_shape
+                    });
+                    self.loaded_from = saved_from;
+                    self.heights = heights;
+                    stale = true;
+                }
+                None => {
+                    self.shape = Some(shape);
+                    self.loaded_from = loaded_from;
+                    self.heights = vec![None; rows];
+                    #[cfg(test)]
+                    LAYOUT_RESETS.with(|resets| resets.set(resets.get() + 1));
+                    return Prepared::MeasureAll;
+                }
+            }
+        }
+        // A paged read moves the window's front: the rows that were measured are
+        // the SAME rows, shifted by a known number, so their heights carry over.
+        let delta = self.loaded_from as isize - loaded_from as isize;
+        if delta != 0 {
+            let timestamp = self.heights.first().copied().flatten();
+            let mut messages: Vec<Option<f32>> = if self.heights.is_empty() {
+                Vec::new()
+            } else {
+                self.heights.split_off(1)
+            };
+            if delta > 0 {
+                let added = (delta as usize).min(rows.saturating_sub(1));
+                messages.splice(0..0, std::iter::repeat_n(None, added));
+            } else {
+                let dropped = (-delta) as usize;
+                messages.drain(0..dropped.min(messages.len()));
+            }
+            self.heights = Vec::with_capacity(rows);
+            self.heights.push(timestamp);
+            self.heights.extend(messages);
+            self.loaded_from = loaded_from;
+            stale = true;
+        }
+        match rows.cmp(&self.heights.len()) {
+            std::cmp::Ordering::Less => self.heights.truncate(rows),
+            std::cmp::Ordering::Greater => self.heights.resize(rows, None),
+            std::cmp::Ordering::Equal => {}
+        }
+        if stale {
+            Prepared::Stale
+        } else {
+            Prepared::Exact
+        }
+    }
+
+    /// Take the heights the last painted frame measured.
+    ///
+    /// Every child is a row, and a spacer is only ever given a height that was
+    /// already MEASURED (an unmeasured row is built instead), so reading the
+    /// spacers back is a no-op and reading the built rows is the new
+    /// measurement.
+    fn observe(&mut self, scroll: &ScrollHandle) {
+        for (index, height) in self.heights.iter_mut().enumerate() {
+            if let Some(bounds) = scroll.bounds_for_item(index) {
+                *height = Some(bounds.size.height.as_f32());
+            }
+        }
+    }
+
+    /// A row height to use before a row has ever been painted.
+    ///
+    /// The average of what HAS been measured is a far better placeholder than a
+    /// constant for the scrollbar, and it is only ever used to place rows a
+    /// frame has chosen not to build.
+    fn estimate(&self) -> f32 {
+        let mut total = 0.0;
+        let mut count = 0usize;
+        for height in self.heights.iter().flatten() {
+            total += height;
+            count += 1;
+        }
+        if count == 0 {
+            64.0
+        } else {
+            (total / count as f32).clamp(24.0, 240.0)
+        }
+    }
+
+    /// The cached height of one row.
+    fn height(&self, index: usize) -> Option<f32> {
+        self.heights.get(index).copied().flatten()
+    }
+
+    /// Whether a row's last painted box meets the viewport plus overdraw.
+    ///
+    /// `None` means the row has never been painted, so it must be built to be
+    /// measured - the one frame that pays for the whole transcript.
+    fn is_visible(scroll: &ScrollHandle, index: usize, overdraw: Pixels) -> Option<bool> {
+        let bounds = scroll.bounds_for_item(index)?;
+        let view = scroll.bounds();
+        let offset = scroll.offset().y;
+        Some(
+            bounds.bottom() + offset > view.top() - overdraw
+                && bounds.top() + offset < view.bottom() + overdraw,
+        )
+    }
+}
+
+/// Whether a message row carries images.
+///
+/// An image gallery can change a row's height AFTER it was measured, when a
+/// data URL finishes decoding, so such a row is never culled.
+fn has_images(session: &Session, index: usize) -> bool {
+    index > 0
+        && session
+            .messages
+            .get(index - 1)
+            .is_some_and(|message| !message.images.is_empty())
+}
+
+/// A row kept at its measured height without building its contents.
+fn transcript_spacer(height: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .w_full()
+        .h(px(height.max(0.0)))
+        .into_any_element()
+}
+
+/// Rows this close to the viewport are built too, so a small scroll never
+/// reveals an empty frame.
+const TRANSCRIPT_OVERDRAW: f32 = 480.0;
+/// The scroller's top padding and the gap between rows, in one definition:
+/// the window's geometry maths and the element tree must agree.
+const TRANSCRIPT_PAD_Y: f32 = 24.0;
+const TRANSCRIPT_GAP: f32 = 22.0;
+/// How many sessions keep their measured layout for a fast switch back.
+const SAVED_LAYOUTS: usize = 8;
+/// The newest rows are always built: a stream writes into them and a turn's
+/// fold state changes at the tail.
+const TRANSCRIPT_TAIL_BUILT: usize = 4;
+
+// How many message rows the last frame actually built, for the performance
+// test. Per-thread, because tests run in parallel inside one process.
+#[cfg(test)]
+thread_local! {
+    static ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Frames that had to re-measure the whole transcript. A paged read or a
+    /// switch back must not add one.
+    static LAYOUT_RESETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The message rows built so far on this thread.
+#[cfg(test)]
+pub(crate) fn transcript_rows_built() -> usize {
+    ROWS_BUILT.with(|built| built.get())
+}
+
+/// How many frames re-measured the whole transcript on this thread.
+#[cfg(test)]
+pub(crate) fn transcript_layout_resets() -> usize {
+    LAYOUT_RESETS.with(|resets| resets.get())
+}
+
 /// The presentation facts every row of one frame shares.
 ///
 /// A transcript resolves its settings once per frame: the policy, whether the
@@ -487,6 +780,93 @@ impl Shell {
             },
             is_dark: dark,
             ..TextViewStyle::default()
+        }
+    }
+
+    /// Which message rows this frame must build.
+    ///
+    /// `Some(height)` culls the row to a same-sized spacer; `None` builds it.
+    /// The last few rows, row 0, and anything near the viewport are built; a row
+    /// whose height was never measured must be built too, which is the one
+    /// frame that pays for the whole transcript.
+    fn transcript_plan(
+        &self,
+        session: &Session,
+        rows: usize,
+        content_size: u32,
+        compact: bool,
+        policy: TranscriptPolicy,
+    ) -> Vec<Option<f32>> {
+        let mut layout = self.transcript_layout.borrow_mut();
+        let prepared = layout.prepare(
+            TranscriptShape {
+                session: session.id.clone(),
+                width: self.chat_w().to_bits(),
+                content_size,
+                lang: self.state.lang,
+                policy,
+                compact,
+            },
+            session.loaded_from,
+            rows,
+            self.chat_drag.is_some() || self.sidebar_drag.is_some(),
+        );
+        match prepared {
+            // Nothing reusable: every row is built once, which is what measures
+            // the transcript. A new session, width, font or policy costs this
+            // one frame; a paged read or a switch back does not.
+            Prepared::MeasureAll => vec![None; rows],
+            Prepared::Exact => {
+                layout.observe(&self.transcript_scroll);
+                let overdraw = px(TRANSCRIPT_OVERDRAW);
+                (0..rows)
+                    .map(|index| {
+                        if index == 0 || index + TRANSCRIPT_TAIL_BUILT >= rows {
+                            return None;
+                        }
+                        // A zero-height measurement cannot be trusted as a
+                        // spacer: the row would occupy no space and never be
+                        // scrolled to again. An image row keeps building too,
+                        // because its gallery can grow when the data URL
+                        // finishes decoding.
+                        if has_images(session, index) {
+                            return None;
+                        }
+                        let height = layout.height(index).filter(|height| *height >= 8.0)?;
+                        match TranscriptLayout::is_visible(&self.transcript_scroll, index, overdraw)
+                        {
+                            Some(false) => Some(height),
+                            _ => None,
+                        }
+                    })
+                    .collect()
+            }
+            // The rows moved under last frame's bounds (paging shifted them, or
+            // the session changed to a remembered layout), so visibility is
+            // read from the heights instead. Every measured row keeps its exact
+            // spacer; an unmeasured row is built, which for a page is the
+            // page's own rows.
+            Prepared::Stale => {
+                let view = self.transcript_scroll.bounds();
+                let view_h = f32::from(view.size.height);
+                let view_top = -f32::from(self.transcript_scroll.offset().y);
+                let estimate = layout.estimate();
+                let mut plans = Vec::with_capacity(rows);
+                let mut top = TRANSCRIPT_PAD_Y;
+                for index in 0..rows {
+                    let measured = layout.height(index).filter(|height| *height >= 8.0);
+                    let row_h = measured.unwrap_or(estimate);
+                    let forced = index == 0 || index + TRANSCRIPT_TAIL_BUILT >= rows;
+                    let visible = view_h > 0.0
+                        && top + row_h > view_top - TRANSCRIPT_OVERDRAW
+                        && top < view_top + view_h + TRANSCRIPT_OVERDRAW;
+                    let build =
+                        forced || measured.is_none() || has_images(session, index) || visible;
+                    plans.push(if build { None } else { measured });
+                    top += row_h + TRANSCRIPT_GAP;
+                }
+                plans
+            }
         }
     }
 
@@ -564,11 +944,83 @@ impl Shell {
             .active_id
             .as_deref()
             .is_some_and(|id| self.state.is_streaming(id));
+        // The frame's window: rows near the viewport and the newest ones are
+        // built; every other row paints as a spacer of its measured height, so
+        // the cost of a repaint follows the viewport, not the transcript.
+        let rows_len = 1 + session.messages.len();
+        let plans = self.transcript_plan(
+            session,
+            rows_len,
+            chrome.content_size,
+            chrome.compact_usage,
+            chrome.policy,
+        );
+        rows.reserve(
+            rows_len + session.compactions.len() + usize::from(session.compact_command.is_some()),
+        );
         let last = session.messages.len().saturating_sub(1);
+        // Where the reference anchors a compaction marker: at the checkpoint
+        // EVENT's sequence, which is appended after the shadowed span and the
+        // retained tail, and BEFORE anything the reader adds later. bsh records
+        // the transcript length at commit (`record.after`), so the marker is
+        // drawn after that many messages. A legacy record (`after == 0`) draws
+        // at the end, which is still the slot the reader looks at right after
+        // the command; a boundary-based placement would hide it above a tail
+        // they are not looking at.
+        let mut markers: Vec<(usize, usize, &crate::model::CompactionRecord)> = session
+            .compactions
+            .iter()
+            .enumerate()
+            .map(|(marker, record)| {
+                (
+                    crate::state::compaction_marker_position(
+                        record,
+                        session.messages.len(),
+                        session.loaded_from,
+                    ),
+                    marker,
+                    record,
+                )
+            })
+            .collect();
+        markers.sort_by_key(|(position, _, _)| *position);
+        let mut pending = markers.into_iter().peekable();
         for (index, message) in session.messages.iter().enumerate() {
+            while pending
+                .peek()
+                .is_some_and(|(position, _, _)| *position <= index)
+            {
+                let (_, marker, record) = pending.next().expect("the marker just peeked");
+                rows.push(
+                    self.compaction_row(record, marker, &chrome, cx)
+                        .into_any_element(),
+                );
+            }
+            if let Some(height) = plans.get(index + 1).copied().flatten() {
+                rows.push(transcript_spacer(height));
+                continue;
+            }
             let settled = folded && !(live && index == last);
             rows.push(
                 self.message_row(index, message, settled, &chrome, cx)
+                    .into_any_element(),
+            );
+        }
+        // Markers committed at (or beyond) the current end, and legacy records,
+        // still read after the last message.
+        for (_, marker, record) in pending {
+            rows.push(
+                self.compaction_row(record, marker, &chrome, cx)
+                    .into_any_element(),
+            );
+        }
+        // The `/compact` command card is the reference's own row while it runs
+        // and after any outcome that produced no checkpoint: title "compact",
+        // the running label, or the outcome text. A landed checkpoint clears
+        // it and the marker above takes its place.
+        if let Some(command) = &session.compact_command {
+            rows.push(
+                self.compact_command_row(command, &chrome)
                     .into_any_element(),
             );
         }
@@ -595,6 +1047,22 @@ impl Shell {
         // clicked. The height is computed here because the scroller needs it now.
         let marks_h = theme::TURN_RAIL_INSET * 2.0 + theme::TURN_PITCH * turns.len() as f32;
         let frame_h = marks_h.min(theme::TURN_RAIL_MAX_H);
+        // The marks are a uniform 10px pitch, so the visible band is arithmetic
+        // rather than a measurement. A mark outside it paints as a same-sized
+        // blank: a hundred-turn conversation used to build a hundred tick
+        // elements (hover groups, ids, click handlers) on every frame although
+        // the 420px frame could only ever show forty-two of them.
+        let rail_overflow = marks_h > theme::TURN_RAIL_MAX_H;
+        let rail_view_h = f32::from(self.rail_scroll.bounds().size.height);
+        let rail_top = -f32::from(self.rail_scroll.offset().y);
+        let rail_window = |turn: usize| -> bool {
+            if !rail_overflow || rail_view_h <= 0.0 {
+                return true;
+            }
+            let y = theme::TURN_RAIL_INSET + theme::TURN_PITCH * turn as f32;
+            y + theme::TURN_PITCH > rail_top - theme::TURN_PITCH * 3.0
+                && y < rail_top + rail_view_h + theme::TURN_PITCH * 3.0
+        };
         let track = div()
             .debug_selector(|| "turn-rail-track".to_string())
             .id("turn-rail-track")
@@ -608,6 +1076,16 @@ impl Shell {
             .flex_col()
             .items_end()
             .children(turns.iter().enumerate().map(|(turn, index)| {
+                if !rail_window(turn) {
+                    // A same-sized blank keeps the track's scroll height and
+                    // every child index, so a jump and the tail bias still
+                    // address the mark they mean.
+                    return div()
+                        .flex_shrink_0()
+                        .w(px(theme::TURN_RAIL_W))
+                        .h(px(theme::TURN_PITCH))
+                        .into_any_element();
+                }
                 let child = 1 + index; // child 0 is the timestamp and copy row
                 let on = active == Some(turn);
                 let group = SharedString::from(format!("turn-{turn}"));
@@ -655,6 +1133,7 @@ impl Shell {
                         this.jump_to_turn(child, is_last);
                         cx.notify();
                     }))
+                    .into_any_element()
             }));
         // Measured: the navigator overlays the column at `right: 12px`, so the
         // transcript keeps its full width underneath it. The frame is the
@@ -725,10 +1204,10 @@ impl Shell {
                     .on_scroll_wheel(cx.listener(chat_wheel))
                     .on_scroll_wheel(cx.listener(|_this, _event, _window, cx| cx.notify()))
                     .px(px(theme::INSET))
-                    .py(px(24.0))
+                    .py(px(TRANSCRIPT_PAD_Y))
                     .flex()
                     .flex_col()
-                    .gap(px(22.0))
+                    .gap(px(TRANSCRIPT_GAP))
                     .children(rows),
             )
             .children(rail)
@@ -1019,6 +1498,8 @@ impl Shell {
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        #[cfg(test)]
+        ROWS_BUILT.with(|built| built.set(built.get() + 1));
         if message.role == Role::User {
             let size = theme::body_size_at(chrome.content_size);
             let line = theme::bubble_line_at(chrome.content_size);
@@ -1114,6 +1595,234 @@ impl Shell {
     /// `20px + secondary delta`. Open, the complete reasoning renders in a body
     /// indented `22px + delta`. The row colour is label-tertiary, label-secondary
     /// under the pointer.
+    /// The compaction marker: one line that says a span was condensed, and the
+    /// summary the model was given in its place when expanded.
+    ///
+    /// Measured (MessageItem.module.css): the row is `2px 0` around a
+    /// `24px + delta` button at radius-sm in label-tertiary, holding a
+    /// `16px + delta` leading box with a 14px glyph, the title at the secondary
+    /// size, a 2x2 caption-grey separator with 8px margins, and an ellipsised
+    /// summary that takes the rest. The leading box swaps the context glyph for
+    /// a chevron on hover, so the row reads as a control only when the pointer
+    /// is on it.
+    fn compaction_row(
+        &self,
+        record: &crate::model::CompactionRecord,
+        index: usize,
+        chrome: &RowChrome,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let content = chrome.content_size;
+        let row_h = 24.0 + theme::delta_at(content);
+        let small = theme::small_size_at(content);
+        let quiet = theme::faint();
+        let hover = theme::muted();
+        let open = self.compaction_open.contains(&index);
+        let group = SharedString::from(format!("compact-{index}"));
+        let summary = crate::i18n::tr_args(
+            self.state.lang,
+            "msg.compaction.completed",
+            &[
+                ("items", record.items.to_string()),
+                ("tokens", record.tokens.to_string()),
+            ],
+        );
+        let title = if record.manual {
+            self.state.lang.tr("msg.compaction.commandTitle")
+        } else {
+            self.state.lang.tr("msg.compaction")
+        };
+        let row = div()
+            .debug_selector(move || format!("compaction-row-{index}"))
+            .id(SharedString::from(format!("compaction-row-{index}")))
+            .group(group.clone())
+            .flex_shrink_0()
+            .h(px(row_h))
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w_0()
+            .cursor_pointer()
+            .child(
+                div()
+                    .debug_selector(move || format!("compaction-leading-{index}"))
+                    .relative()
+                    .flex_none()
+                    .w(px(theme::DISCLOSURE_LEADING))
+                    .h(px(theme::DISCLOSURE_LEADING))
+                    .mr(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        icon(IconName::CircleDashed, theme::DISCLOSURE_GLYPH, quiet)
+                            .group_hover(group.clone(), |style| style.opacity(0.0)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(theme::DISCLOSURE_LEADING))
+                            .h(px(theme::DISCLOSURE_LEADING))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .opacity(0.0)
+                            .group_hover(group.clone(), |style| style.opacity(1.0))
+                            .child(icon(
+                                if open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                },
+                                theme::DISCLOSURE_GLYPH,
+                                hover,
+                            )),
+                    ),
+            )
+            .child(
+                txt(title, small, quiet)
+                    .debug_selector(move || format!("compaction-title-{index}"))
+                    .flex_none()
+                    .line_height(px(row_h))
+                    .group_hover(group.clone(), |style| style.text_color(rgb(hover))),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("compaction-sep-{index}"))
+                    .flex_none()
+                    .w(px(2.0))
+                    .h(px(2.0))
+                    .mx(px(8.0))
+                    .rounded(px(1.0))
+                    .bg(rgb(quiet)),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("compaction-summary-{index}"))
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .group_hover(group.clone(), |style| style.text_color(rgb(hover)))
+                    .child(txt(summary, small, quiet).line_height(px(row_h))),
+            );
+        let mut root = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(row.on_click(cx.listener(move |this, _event, _window, cx| {
+                if !this.compaction_open.remove(&index) {
+                    this.compaction_open.insert(index);
+                }
+                cx.notify();
+            })));
+        if open {
+            root = root.child(
+                div()
+                    .debug_selector(move || format!("compaction-body-{index}"))
+                    .w_full()
+                    .min_w_0()
+                    .pl(px(22.0 + theme::delta_at(content)))
+                    .py(px(4.0))
+                    .child(
+                        markdown(record.summary.clone())
+                            .style(chrome.style.clone())
+                            .line_height(px(row_h))
+                            .text_size(px(small))
+                            .text_color(rgb(quiet)),
+                    ),
+            );
+        }
+        root
+    }
+
+    /// The `/compact` command card: the reference's `GenericCommandCard`.
+    ///
+    /// Measured from `GenericCommandCard.module.css` over the shared
+    /// `DisclosureRow`: the same `24px + delta` row the checkpoint marker
+    /// draws, the command name in the secondary size, the 2x2 caption separator
+    /// with 8px margins, and a nowrap ellipsised summary. `data-error` paints
+    /// that summary in the failure colour, which is exactly what the reference
+    /// does for a `kind: "error"` result. The one difference the row carries is
+    /// its glyph: the reference's `IconApiOutlineRegular` has no bsh equivalent,
+    /// so the context mark the checkpoint row uses stands in.
+    fn compact_command_row(
+        &self,
+        command: &crate::model::CompactCommand,
+        chrome: &RowChrome<'_>,
+    ) -> impl IntoElement {
+        let content = chrome.content_size;
+        let row_h = 24.0 + theme::delta_at(content);
+        let small = theme::small_size_at(content);
+        let quiet = theme::faint();
+        let (summary, error) = match &command.outcome {
+            Some(outcome) => (outcome.text.clone(), outcome.error),
+            None => (self.state.lang.tr("msg.compaction.running"), false),
+        };
+        let title = self.state.lang.tr("msg.compaction.commandTitle");
+        div()
+            .debug_selector(|| String::from("compact-command-row"))
+            .id("compact-command-row")
+            .w_full()
+            .min_w_0()
+            .py(px(2.0))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(row_h))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .debug_selector(|| String::from("compact-command-leading"))
+                            .flex_none()
+                            .w(px(theme::DISCLOSURE_LEADING))
+                            .h(px(theme::DISCLOSURE_LEADING))
+                            .mr(px(6.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon(IconName::CircleDashed, theme::DISCLOSURE_GLYPH, quiet)),
+                    )
+                    .child(
+                        txt(title, small, quiet)
+                            .debug_selector(|| String::from("compact-command-title"))
+                            .flex_none()
+                            .line_height(px(row_h)),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| String::from("compact-command-sep"))
+                            .flex_none()
+                            .w(px(2.0))
+                            .h(px(2.0))
+                            .mx(px(8.0))
+                            .rounded(px(1.0))
+                            .bg(rgb(quiet)),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| String::from("compact-command-summary"))
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(
+                                txt(summary, small, if error { theme::error() } else { quiet })
+                                    .line_height(px(row_h)),
+                            ),
+                    ),
+            )
+    }
+
     fn think_row(
         &self,
         index: usize,

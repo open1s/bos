@@ -19,6 +19,7 @@ async fn test_agent_builds_with_vendor() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live LLM endpoint; run with --ignored"]
 async fn test_agent_run_simple() {
     let vendor = OpenAiVendorBuilder::new()
         .model("gpt-4o-mini".to_string())

@@ -148,13 +148,16 @@ pub(crate) fn discover_in(home: &Path) -> MarketScan {
     scan
 }
 
-/// Order market rows: remote-index rows first, then local rows, each group by
-/// source label and display name.
+/// Order market rows: LOCAL packages first, then remote-index rows, each group
+/// by source label and display name.
+///
+/// The old order put remote rows first, which made a local package unreachable
+/// once the remote catalogs were loaded: the pane renders a window of rows, and
+/// thousands of remote entries sat ahead of the package already on disk.
 pub(crate) fn sort_market(plugins: &mut [MarketPlugin]) {
     plugins.sort_by(|left, right| {
-        right
-            .is_remote()
-            .cmp(&left.is_remote())
+        left.is_remote()
+            .cmp(&right.is_remote())
             .then_with(|| left.source_label.cmp(&right.source_label))
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
             .then_with(|| left.id.cmp(&right.id))
@@ -1315,6 +1318,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("a scratch home");
         directory
+    }
+
+    /// A local package must be reachable even when thousands of remote rows
+    /// are loaded: the pane windows the list, so order decides what is seen.
+    #[test]
+    fn local_market_rows_sort_before_remote_rows() {
+        use crate::market::{MarketInstall, MarketOrigin, MarketPlugin};
+        let local = MarketPlugin {
+            id: "local-one".to_string(),
+            name: "Local One".to_string(),
+            version: "1.0.0".to_string(),
+            standard: ExtensionStandard::DeepSeekHarness,
+            origin: MarketOrigin::Local,
+            install: MarketInstall::Local(PathBuf::from("/tmp/local-one")),
+            description: String::new(),
+            keywords: Vec::new(),
+            capabilities: Vec::new(),
+            refusals: 0,
+            source_label: "Codex cache".to_string(),
+        };
+        let remote = MarketPlugin {
+            id: "remote-one".to_string(),
+            name: "Remote One".to_string(),
+            version: "1.0.0".to_string(),
+            standard: ExtensionStandard::DeepSeekHarness,
+            origin: MarketOrigin::Remote {
+                index_url: "https://market.example/plugins.json".to_string(),
+                market: "Test".to_string(),
+            },
+            install: MarketInstall::Remote {
+                spec: "remote-one@1.0.0".to_string(),
+                registry: None,
+            },
+            description: String::new(),
+            keywords: Vec::new(),
+            capabilities: Vec::new(),
+            refusals: 0,
+            source_label: "Test Market".to_string(),
+        };
+        let mut rows = vec![remote, local];
+        sort_market(&mut rows);
+        assert!(
+            !rows[0].is_remote(),
+            "the local package sorts first, ahead of the remote catalog"
+        );
     }
 
     fn copy_directory(from: &Path, to: &Path) {

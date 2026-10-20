@@ -4,6 +4,8 @@
 pub mod bash;
 /// Adapters that turn plain functions into tools.
 pub mod function;
+/// The tools that read and stop background jobs.
+pub mod jobs;
 /// The `update_plan` tool and its shared working-plan store.
 pub mod plan;
 /// Registry that stores and executes tools by name.
@@ -15,6 +17,7 @@ pub mod validator;
 
 pub use bash::BashTool;
 pub use function::{AsyncFunctionTool, FunctionTool};
+pub use jobs::JobTool;
 pub use plan::{PlanItem, PlanStatus, PlanStore, PlanTool};
 pub use registry::ToolRegistry;
 pub use translator::describe_schema;

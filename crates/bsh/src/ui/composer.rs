@@ -108,35 +108,161 @@ fn chip_label(label: impl Into<SharedString>, weight: FontWeight) -> Div {
         .whitespace_nowrap()
 }
 
+/// The chip's text: the EFFECTIVE permission, annotated with the ceiling when
+/// the preset lowered the request.
+///
+/// The effective value leads because that is the mode the tools obey; the
+/// annotation names the request and the ceiling, which is the fact the reader
+/// needs to understand why their choice did not take the session further.
+pub(crate) fn permission_chip_text(
+    lang: crate::i18n::Lang,
+    permission: &crate::settings::resolve::PermissionResolution,
+) -> String {
+    let effective = lang.tr(permission_label_key(&permission.effective));
+    match &permission.reduced_by {
+        Some(ceiling) => format!(
+            "{effective} · {}",
+            crate::i18n::tr_args(
+                lang,
+                "permission.limitedBy",
+                &[
+                    (
+                        "requested",
+                        lang.tr(permission_label_key(&permission.requested)),
+                    ),
+                    ("ceiling", lang.tr(permission_label_key(ceiling))),
+                ],
+            )
+        ),
+        None => effective,
+    }
+}
+
+/// Whether one menu row carries the checkmark: the session's OWN request, not
+/// the effective value, so a capped chat still shows what the reader chose.
+pub(crate) fn permission_choice_checked(
+    permission: &crate::settings::resolve::PermissionResolution,
+    value: &str,
+) -> bool {
+    value == permission.requested
+}
+
+/// One menu row's text. A row above the ceiling stays selectable but says the
+/// preset will cap it, so the menu explains the chip's annotation in place.
+pub(crate) fn permission_choice_text(
+    lang: crate::i18n::Lang,
+    permission: &crate::settings::resolve::PermissionResolution,
+    value: &str,
+) -> String {
+    let label = lang.tr(permission_label_key(value));
+    if crate::settings::resolve::permission_rank(value)
+        > crate::settings::resolve::permission_rank(&permission.effective)
+    {
+        let ceiling = permission
+            .reduced_by
+            .as_deref()
+            .unwrap_or(&permission.effective);
+        format!(
+            "{label} · {}",
+            crate::i18n::tr_args(
+                lang,
+                "permission.menuCapped",
+                &[("ceiling", lang.tr(permission_label_key(ceiling)))],
+            )
+        )
+    } else {
+        label
+    }
+}
+
 impl Shell {
-    /// Write the permission mode the composer chip offers.
+    /// Write the permission mode the composer chip offers, and persist it now.
     ///
-    /// It is the same field the General pane's choice row writes, so the chip
-    /// and that row can never disagree about what the tools are allowed to do.
-    /// Full access goes through the reference's own gate rather than landing
-    /// here: `request_permission` is the one entry point both controls call,
-    /// and it is what keeps the confirmation from being a pane-only ritual.
+    /// The turn build reads the COMMITTED settings, so writing only the draft
+    /// made the chip look inert: the label changed and the next request did
+    /// not. This commits exactly `workspace.agent.permission` (never any other
+    /// unsaved draft field), saves it, and rebakes the cached policy so the
+    /// next turn - and the policy pane - see the new mode without a Save.
+    ///
+    /// A failed write is reported in the notice line and the in-memory value is
+    /// put back: the UI must not claim a mode the file does not hold.
     pub(crate) fn set_permission(&mut self, permission: &str, cx: &mut Context<Self>) {
-        self.state.draft_mut().workspace.agent.permission = permission.to_string();
+        let lang = self.state.lang;
+        match self.state.commit_permission(permission) {
+            Ok(()) => {
+                self.rebake_after_permission(cx);
+                // The ceiling is a refusal the reader has to see: annotate the
+                // chip (it reads the same resolution) and say it in the notice
+                // line, instead of silently landing on the lower mode.
+                let resolution = self.state.effective().permission;
+                if let Some(ceiling) = resolution.reduced_by.as_deref() {
+                    self.state.notice(crate::i18n::tr_args(
+                        lang,
+                        "permission.ceilingNotice",
+                        &[
+                            ("requested", lang.tr(permission_label_key(permission))),
+                            ("ceiling", lang.tr(permission_label_key(ceiling))),
+                            (
+                                "effective",
+                                lang.tr(permission_label_key(&resolution.effective)),
+                            ),
+                        ],
+                    ));
+                }
+            }
+            Err(error) => {
+                self.state.notice(format!(
+                    "{} {error}",
+                    crate::i18n::tr(lang, "permission.saveFailed")
+                ));
+            }
+        }
         cx.notify();
     }
 
     /// Select a permission mode, opening the risk gate when the mode needs one.
     ///
-    /// The reference's `choose` returns early on the current value and routes
-    /// `danger-full-access` to `RiskConfirmation` instead of writing it, so
-    /// the gate cannot be skipped by choosing it from a different control.
+    /// The gate is kept for Full access only. The no-op guard compares BOTH
+    /// trees: a draft that already holds the value while the committed tree does
+    /// not is the old bug's state, where an early return would skip the very
+    /// write that makes the mode real.
     pub(crate) fn request_permission(&mut self, permission: &str, cx: &mut Context<Self>) {
-        if self.state.draft().workspace.agent.permission == permission {
+        let committed = self.state.settings.workspace.agent.permission == permission;
+        let drafted = self.state.draft().workspace.agent.permission == permission;
+        if committed && drafted {
             return;
         }
-        if permission == crate::caps::FULL_ACCESS {
+        if permission == crate::caps::FULL_ACCESS && !committed {
+            // The gate is the only route that widens a session to Full access,
+            // and it cannot be skipped by picking the mode from another control.
             self.permission_acknowledged = false;
             self.permission_confirm = Some(permission.to_string());
             cx.notify();
             return;
         }
         self.set_permission(permission, cx);
+    }
+
+    /// Rebuild the capability list and the cached policy from the committed
+    /// settings, so the next turn and the panes read the mode just chosen.
+    fn rebake_after_permission(&mut self, cx: &mut Context<Self>) {
+        self.caps.clear();
+        self.plugins.clear();
+        let choice = self
+            .state
+            .active_id
+            .as_deref()
+            .map(|id| self.state.session_choice(id))
+            .unwrap_or_default();
+        let built = crate::caps::build_agent(
+            &self.state.settings,
+            &self.state.vault,
+            &choice,
+            &self.state.mcp,
+        );
+        self.state.set_tools_schema(built.tools_schema_chars);
+        self.state.set_policy(built.policy.clone());
+        cx.notify();
     }
 }
 
@@ -194,21 +320,20 @@ pub(crate) fn model_choices(models: &[String], current: &str) -> Vec<(String, bo
 ///
 /// The same value the General pane's choice row writes, and the reference's own
 /// `PRESET_LABEL_KEYS` fallback for a value it does not know: an unrecognised
-/// mode names the confined one, because that is the mode the build falls back
-/// to and the chip must not claim more access than the tools have.
+/// mode names READ ONLY, because that is the tier
+/// `PermissionResolution::resolve` normalises it to and the chip must not
+/// claim more access than the tools have.
 pub(crate) fn permission_label_key(permission: &str) -> &'static str {
     match permission {
-        crate::caps::READ_ONLY => "permission.presetReadOnly",
+        crate::caps::WORKSPACE_WRITE => "permission.presetWorkspaceWrite",
         crate::caps::FULL_ACCESS => "permission.presetFullAccess",
-        _ => "permission.presetWorkspaceWrite",
+        _ => "permission.presetReadOnly",
     }
 }
 
 impl Shell {
     /// The composer card under the conversation.
     pub(crate) fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // The chip names the mode the tools obey, not a fixed label.
-        let permission = self.state.draft().workspace.agent.permission.clone();
         let lang = self.state.lang;
         let streaming = self.state.any_streaming();
         let can_send = !self.composer_value.trim().is_empty();
@@ -218,6 +343,10 @@ impl Shell {
         // checks and what the next turn builds; a chat that chose nothing shows
         // the reference's own "Select model" fallback.
         let effective = self.state.effective();
+        // The chip names the mode the tools OBEY: the session's request capped
+        // by the preset ceiling, resolved once above and annotated when the
+        // ceiling lowered it.
+        let permission = effective.permission.clone();
         let label = effective.model_name;
         // The menu rows are nicknames, so the checked row compares against the
         // nickname rather than the API id the wire carries.
@@ -232,83 +361,109 @@ impl Shell {
         // draft is the tree the pane edits, so a provider added but not yet
         // saved is still offered.
         let groups = self.state.draft().catalogs_by_provider(&effective.provider);
-        let column = div().pb(px(4.0)).flex().flex_col().child({
-            // Measured: radius-panel 28 over the input-major fill (white in light,
-            // the same as the page) lifted by `elevation-soft` - a stroke plus two
-            // very soft blurs - with a 12px column gap and an 8px top pad. GPUI's
-            // shadow carries no ring, so the stroke is drawn as a `.5px` hairline.
-            let card = div()
-                .debug_selector(|| "composer-card".to_string())
-                .relative()
-                .w_full()
-                .rounded(px(28.0))
-                .bg(rgb(theme::page()))
-                .shadow_sm()
-                .pt(px(8.0))
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .children(self.attachment_row(cx))
-                .child(
-                    // Measured: the input sits in a `.scroll` wrapper that gives
-                    // up 4px on the right and clips at
-                    // `--dsh-composer-text-max-height`, over the input's own
-                    // 4/8/0/14 padding and its 36px floor. The kit's field draws
-                    // 8px a side of that padding itself, so the wrapper carries
-                    // the difference and the floor.
-                    div()
-                        .debug_selector(|| "composer-editor".to_string())
-                        .id("composer-editor")
-                        .mr(px(theme::COMPOSER_INPUT_MR))
-                        .pl(px(theme::COMPOSER_INPUT_PAD_L - theme::FIELD_INTERIOR_PAD))
-                        .pr(px(theme::COMPOSER_INPUT_PAD_R - theme::FIELD_INTERIOR_PAD))
-                        .pt(px(0.0))
-                        .min_h(px(theme::COMPOSER_INPUT_MIN_H))
-                        .text_size(px(theme::body_size_at(
-                            self.state.draft().global.general.content_font_size,
-                        )))
-                        .max_h(px(theme::COMPOSER_INPUT_MAX_H))
-                        .overflow_y_scroll()
-                        .child(Textarea::new(&self.composer).appearance(false)),
-                )
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .pt(px(2.0))
-                        .pb(px(6.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(12.0))
-                        .child(self.add_button(
-                            lang.tr("input.commands"),
-                            super::command_menu::toggle_action,
-                            cx,
-                        ))
-                        .child(self.permission_chip(permission, streaming, lang, cx))
-                        .child(div().flex_1())
-                        .child(self.model_chip(
-                            ModelChipData {
-                                label: model_label(&label, lang),
-                                effort: effort.clone(),
-                                effort_level: effort,
-                                current,
-                                // Moved, not cloned: the menu owns the list,
-                                // and the chip does not read it again.
-                                groups,
-                                streaming,
-                            },
-                            lang,
-                            cx,
-                        ))
-                        .child(self.send_button(streaming, can_send, lang, cx)),
-                )
-                // Measured `.card{position:absolute;bottom:calc(100% + 4px);
-                // left:0;right:0}`: the menu is out of the card's flow and
-                // spans the input it belongs to.
-                .when_some(self.command_menu(cx), |card, menu| card.child(menu));
-            hairline_all(card).border_color(rgb(theme::border_soft()))
-        });
+        // The inline note editor sits ABOVE the card, so the composer keeps its
+        // shape while a goal or a feedback note is being written.
+        let column = div()
+            .pb(px(4.0))
+            .flex()
+            .flex_col()
+            .children(self.note_row(cx))
+            .child({
+                // Measured: radius-panel 28 over the input-major fill (white in light,
+                // the same as the page) lifted by `elevation-soft` - a stroke plus two
+                // very soft blurs - with a 12px column gap and an 8px top pad. GPUI's
+                // shadow carries no ring, so the stroke is drawn as a `.5px` hairline.
+                let card = div()
+                    .debug_selector(|| "composer-card".to_string())
+                    .relative()
+                    .w_full()
+                    .rounded(px(28.0))
+                    .bg(rgb(theme::page()))
+                    .shadow_sm()
+                    .pt(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .children(self.attachment_row(cx))
+                    .child(
+                        // Measured: the input sits in a `.scroll` wrapper that gives
+                        // up 4px on the right and clips at
+                        // `--dsh-composer-text-max-height`, over the input's own
+                        // 4/8/0/14 padding and its 36px floor. The kit's field draws
+                        // 8px a side of that padding itself, so the wrapper carries
+                        // the difference and the floor.
+                        div()
+                            .debug_selector(|| "composer-editor".to_string())
+                            .id("composer-editor")
+                            .mr(px(theme::COMPOSER_INPUT_MR))
+                            .pl(px(theme::COMPOSER_INPUT_PAD_L - theme::FIELD_INTERIOR_PAD))
+                            .pr(px(theme::COMPOSER_INPUT_PAD_R - theme::FIELD_INTERIOR_PAD))
+                            .pt(px(0.0))
+                            .min_h(px(theme::COMPOSER_INPUT_MIN_H))
+                            .text_size(px(theme::body_size_at(
+                                self.state.draft().global.general.content_font_size,
+                            )))
+                            .max_h(px(theme::COMPOSER_INPUT_MAX_H))
+                            .overflow_y_scroll()
+                            .child(
+                                // The reference draws an `@path` as a chip, not as
+                                // plain text: the token stays one run for editing and
+                                // undo, and only its paint is ours. A press opens the
+                                // file in the right pane, the way the reference's
+                                // `FileReference` opens it.
+                                Textarea::new(&self.composer)
+                                    .appearance(false)
+                                    .token(|context, _window, _cx| {
+                                        super::reference_chip::chip(context)
+                                    })
+                                    .on_token_click(cx.listener(|this, event, window, cx| {
+                                        this.open_reference_chip(event, window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .pt(px(2.0))
+                            .pb(px(6.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(12.0))
+                            .child(self.add_button(
+                                lang.tr("input.commands"),
+                                super::command_menu::toggle_action,
+                                cx,
+                            ))
+                            .child(self.permission_chip(permission, streaming, lang, cx))
+                            // The reference's plan slot sits beside the mode
+                            // chips, and only while the mode is on.
+                            .when_some(self.plan_chip(lang, cx), |row, chip| row.child(chip))
+                            .child(div().flex_1())
+                            .child(self.model_chip(
+                                ModelChipData {
+                                    label: model_label(&label, lang),
+                                    effort: effort.clone(),
+                                    effort_level: effort,
+                                    current,
+                                    // Moved, not cloned: the menu owns the list,
+                                    // and the chip does not read it again.
+                                    groups,
+                                    streaming,
+                                },
+                                lang,
+                                cx,
+                            ))
+                            .child(self.send_button(streaming, can_send, lang, cx)),
+                    )
+                    // Measured `.card{position:absolute;bottom:calc(100% + 4px);
+                    // left:0;right:0}`: the overlay is out of the card's flow and
+                    // spans the input it belongs to. One overlay at a time: the
+                    // slash palette while a leading slash is being typed, otherwise
+                    // the plus card.
+                    .when_some(self.composer_overlay(cx), |card, menu| card.child(menu));
+                hairline_all(card).border_color(rgb(theme::border_soft()))
+            });
         // The context meter moved into the status row, at its left end, so the
         // reading sits with the other figures about the same turn instead of on
         // a line of its own under the card.
@@ -522,14 +677,114 @@ impl Shell {
     /// the Auto badge (`sup`, 8px/600, `EXP`), because bsh's two modes are not
     /// the reference's presets, and `label-dimmed` (the kit's own disabled tint
     /// stands in).
+    /// DSH enables an agent preset for one conversation, not only globally.
+    ///
+    /// The chip shows the session's own preset - or "Default" when it inherits
+    /// the global one - and its menu writes Session::agent_preset, which the
+    /// next turn's build reads through Session::choice. A running turn stays
+    /// enabled: the pick applies to the next turn, like the model chip.
+    pub(crate) fn agent_preset_chip(
+        &self,
+        lang: crate::i18n::Lang,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let explicit = self.state.active_session_preset();
+        // Show the preset the turn ACTUALLY runs, not only the one this chat
+        // named: a chat that inherits the global default displays that preset,
+        // and the menu's "Default" row still records the inheritance.
+        let effective = self
+            .state
+            .active_id
+            .as_deref()
+            .map(|id| self.state.effective_in(id).preset_id)
+            .unwrap_or_else(|| self.state.effective().preset_id);
+        let label = if effective.trim().is_empty() {
+            lang.tr("input.defaultPreset").to_string()
+        } else {
+            effective
+        };
+        let listed = self.state.settings.global.preset_ids();
+        let session = self.state.active_id.clone().unwrap_or_default();
+        let shell = cx.entity();
+        let chip = trigger_chrome(
+            Button::new("hero-preset")
+                .ghost()
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgb(theme::border())),
+            CHIP_CAP,
+        )
+        .child(icon(IconName::Bot, 14.0, theme::muted()))
+        .child(chip_label(label, FontWeight::MEDIUM))
+        .child(
+            icon(IconName::ChevronDown, CHIP_CHEVRON, theme::caption())
+                .debug_selector(|| "agent-preset-chevron".to_string()),
+        );
+        div()
+            .debug_selector(|| "agent-preset".to_string())
+            .child(
+                chip.dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                    let mut menu = menu;
+                    let pick_default = shell.clone();
+                    let session_default = session.clone();
+                    let current = explicit.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(lang.tr("input.defaultPreset"))
+                            .checked(current.is_none())
+                            .on_click(move |_, _window, cx| {
+                                pick_default.update(cx, |this, cx| {
+                                    this.state.select_session_preset(&session_default, "");
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                    for name in listed.iter() {
+                        let pick = shell.clone();
+                        let sid = session.clone();
+                        let picked = name.clone();
+                        let chosen = explicit.as_deref() == Some(name.as_str());
+                        menu =
+                            menu.item(PopupMenuItem::new(name.clone()).checked(chosen).on_click(
+                                move |_, _window, cx| {
+                                    pick.update(cx, |this, cx| {
+                                        this.state.select_session_preset(&sid, &picked);
+                                        cx.notify();
+                                    });
+                                },
+                            ));
+                    }
+                    menu
+                }),
+            )
+    }
+
     fn permission_chip(
         &self,
-        permission: String,
+        permission: crate::settings::resolve::PermissionResolution,
         streaming: bool,
         lang: crate::i18n::Lang,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let shell = cx.entity();
+        // The text is computed once, outside the menu builder: the kit's
+        // builder is `Fn`, so every capture is cloned into it anyway.
+        let text = permission_chip_text(lang, &permission);
+        let effective = permission.effective.clone();
+        // The checkmark is the session's OWN choice, not the effective value: a
+        // capped chat still records the mode the reader picked (see
+        // `permission_choice_checked`).
+        let choices: Vec<(&'static str, String, bool)> = permission_modes()
+            .iter()
+            .map(|(value, _key)| {
+                (
+                    *value,
+                    permission_choice_text(lang, &permission, value),
+                    permission_choice_checked(&permission, value),
+                )
+            })
+            .collect();
         let chip = trigger_chrome(
             Button::new("composer-permission")
                 .ghost()
@@ -538,10 +793,10 @@ impl Shell {
                 .cursor_pointer(),
             CHIP_CAP,
         )
-        .child(chip_label(
-            lang.tr(permission_label_key(&permission)),
-            FontWeight::MEDIUM,
-        ))
+        .child(
+            chip_label(text, FontWeight::MEDIUM)
+                .debug_selector(move || format!("permission-chip-{effective}")),
+        )
         .child(
             icon(IconName::ChevronDown, CHIP_CHEVRON, theme::caption())
                 .debug_selector(|| "composer-permission-chevron".to_string()),
@@ -552,15 +807,13 @@ impl Shell {
                 Anchor::TopLeft,
                 move |menu, _, _| {
                     let mut menu = menu;
-                    for (value, key) in permission_modes() {
+                    for (value, label, checked) in choices.clone() {
                         let pick = shell.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(lang.tr(key))
-                                .checked(value == permission)
-                                .on_click(move |_, _window, cx| {
-                                    pick.update(cx, |this, cx| this.request_permission(value, cx));
-                                }),
-                        );
+                        menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
+                            move |_, _window, cx| {
+                                pick.update(cx, |this, cx| this.request_permission(value, cx));
+                            },
+                        ));
                     }
                     menu
                 },

@@ -63,6 +63,10 @@ pub(crate) struct DiscoveredSkill {
     /// an earlier source is not listed at all, so this is only ever the shadowing
     /// copy's flag.
     pub(crate) enabled: bool,
+    /// Whether the manifest restricts the skill to user invocation
+    /// (`disable-model-invocation: true`). The agent crate's own frontmatter
+    /// reader sets it, so the palette and the build cannot disagree.
+    pub(crate) user_only: bool,
 }
 
 /// The connection and model facts one request needs.
@@ -104,6 +108,81 @@ pub(crate) struct SessionChoice {
     pub(crate) model: Option<ModelRef>,
     /// The preset id the session recorded, if any.
     pub(crate) preset: Option<String>,
+}
+
+/// The session's permission, capped by the selected preset's ceiling.
+///
+/// This is the ONE place the minimum is computed. The composer chip shows
+/// `effective`, the policy data hands `effective` to Rego as `data.permission`,
+/// and every audit row records it, so a reducer cannot be left out of one
+/// consumer while another disagrees.
+///
+/// A preset can narrow `read-only < workspace-write < danger-full-access` but
+/// can never widen the session's own permission. An unknown value ranks as
+/// read-only and is normalised to it, so a typo fails closed instead of
+/// reaching a mode whose Rust arm treats a stray string as writable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PermissionResolution {
+    /// The mode the workspace agent section asks for, as stored.
+    pub(crate) requested: String,
+    /// The ceiling the selected preset declares, when it declares one.
+    pub(crate) preset_ceiling: Option<String>,
+    /// The mode in force: the lower of the request and the ceiling.
+    pub(crate) effective: String,
+    /// The ceiling that lowered the request, when one did.
+    ///
+    /// The chip annotates with this and the menu explains rows above it; no
+    /// reader re-derives the comparison.
+    pub(crate) reduced_by: Option<String>,
+}
+
+impl PermissionResolution {
+    /// Resolve one requested mode against one preset ceiling.
+    ///
+    /// The ceiling wins only when it ranks strictly below the request; a
+    /// ceiling that ranks above it is not a grant and changes nothing.
+    pub(crate) fn resolve(requested: &str, preset_ceiling: Option<&str>) -> Self {
+        let request = normalize_permission(requested);
+        let ceiling = preset_ceiling
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(normalize_permission);
+        let reduced_by = ceiling.filter(|value| permission_rank(value) < permission_rank(&request));
+        let effective = reduced_by.clone().unwrap_or_else(|| request.clone());
+        Self {
+            requested: requested.to_string(),
+            preset_ceiling: preset_ceiling
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            effective,
+            reduced_by,
+        }
+    }
+}
+
+/// Rank one permission string for the preset ceiling.
+///
+/// Unknown values rank as read-only, which is the fail-closed arm.
+pub(crate) fn permission_rank(value: &str) -> u8 {
+    match value.trim() {
+        "danger-full-access" => 2,
+        "workspace-write" => 1,
+        _ => 0,
+    }
+}
+
+/// Map a stored permission string onto one of the three known tiers.
+///
+/// Anything unrecognised becomes read-only: the stored string is preserved in
+/// `requested` so a reader can see the typo, but the value in force is a tier
+/// the build, the policy and the chip all understand.
+fn normalize_permission(value: &str) -> String {
+    match value.trim() {
+        "danger-full-access" => "danger-full-access".to_string(),
+        "workspace-write" => "workspace-write".to_string(),
+        _ => "read-only".to_string(),
+    }
 }
 
 /// The model a build will use, or why it cannot.
@@ -165,6 +244,40 @@ pub(crate) struct Resolution {
     pub(crate) preset_id: Option<String>,
     /// The preset it resolved to, once found.
     pub(crate) preset: Option<Preset>,
+    /// Permission ceiling, or none to inherit the session's permission.
+    pub(crate) preset_permission: Option<String>,
+    /// Read roots; none inherits the workspace, empty allows nothing.
+    pub(crate) preset_read: Option<Vec<String>>,
+    /// Write roots; none inherits the workspace, empty allows nothing.
+    pub(crate) preset_write: Option<Vec<String>>,
+    /// Denied path roots, always unioned.
+    pub(crate) preset_deny: Vec<String>,
+    /// Egress allowlist; none inherits, empty denies, entries intersect.
+    pub(crate) preset_egress: Option<Vec<String>>,
+    /// Hosted web-search override.
+    pub(crate) preset_web_search: Option<bool>,
+    /// Parallel tool-call override.
+    pub(crate) preset_parallel_tool_calls: Option<bool>,
+    /// MCP tool allowlist, or none for every tool of the allowed servers.
+    pub(crate) preset_mcp_tools: Option<Vec<String>>,
+    /// Binary-shipped Rego module ids.
+    pub(crate) preset_builtin_policy: Vec<String>,
+    /// required or advisory custom-policy mode.
+    pub(crate) preset_policy_mode: Option<String>,
+    /// Explicit tool allowlist, or none for all bundle tools.
+    pub(crate) preset_tools: Option<Vec<String>>,
+    /// Explicit skill allowlist, or none for every enabled skill.
+    pub(crate) preset_skills: Option<Vec<String>>,
+    /// Explicit MCP server allowlist, or none for every connected server.
+    pub(crate) preset_mcps: Option<Vec<String>>,
+    /// Explicit installed-extension allowlist, or none for every enabled one.
+    pub(crate) preset_extensions: Option<Vec<String>>,
+    /// The preset's LLM persona, or none for the workspace prompt.
+    pub(crate) preset_system_prompt: Option<String>,
+    /// The Rego module the resolved preset contributes.
+    pub(crate) preset_policy: Option<String>,
+    /// Whether the resolved preset's policy is trusted to apply.
+    pub(crate) preset_trusted: bool,
     /// A preset id nothing defines.
     pub(crate) preset_missing: Option<String>,
     /// The plugins the preset mounts. The complete set, not a delta.
@@ -181,8 +294,9 @@ pub(crate) struct Resolution {
     pub(crate) max_steps: usize,
     /// Run one turn's tool calls concurrently.
     pub(crate) parallel_tool_calls: bool,
-    /// The permission mode for new sessions.
-    pub(crate) permission: String,
+    /// The session's permission and the preset ceiling folded into the mode in
+    /// force. The one resolution every consumer reads.
+    pub(crate) permission: PermissionResolution,
     /// Register the shell tool.
     pub(crate) bash_enabled: bool,
     /// Register the filesystem tools.
@@ -205,7 +319,12 @@ pub(crate) struct Resolution {
     ///
     /// This is the catalogue the pane lists and the build registers from, so the
     /// count the pane shows and the skills the agent receives come from one scan.
-    pub(crate) skills: Vec<DiscoveredSkill>,
+    ///
+    /// Shared rather than owned: a frame resolves the settings several times
+    /// (the composer chip, the transcript, the preset chip), and cloning the
+    /// whole catalogue on each of those was O(catalogue) per keystroke. An
+    /// `Arc` makes every reader after the first scan O(1).
+    pub(crate) skills: std::sync::Arc<Vec<DiscoveredSkill>>,
     /// Send-side token ceiling; 0 disables compaction.
     pub(crate) context_budget: usize,
     /// Seconds one shell command may run before it is killed.
@@ -240,12 +359,40 @@ pub(crate) struct Resolution {
     pub(crate) session_sort: String,
 }
 
-/// Fold the three levels into the values a build uses.
+/// Fold the three levels into the values a build uses, scanning the catalogue.
+///
+/// This is the TEST seam: it has no cache, so it always walks the sources.
+/// `Settings::effective_for` goes through `SkillCatalogueCache` instead, which
+/// is what keeps a keystroke away from `discover_skills`.
+#[cfg(test)]
 pub(crate) fn resolve(
     global: &GlobalSettings,
     workspace: &WorkspaceSettings,
     entry: Option<&WorkspaceRef>,
     session: &SessionChoice,
+) -> Resolution {
+    let (skill_sources, skills) = discover_skills(global, workspace, &workspace.disabled.skills);
+    resolve_with_catalogue(
+        global,
+        workspace,
+        entry,
+        session,
+        skill_sources,
+        std::sync::Arc::new(skills),
+    )
+}
+
+/// Fold the three levels with an already-scanned catalogue.
+///
+/// The scan is the only O(catalogue), disk-touching part of a resolution, so
+/// this is the seam a cache hands its answer to.
+pub(crate) fn resolve_with_catalogue(
+    global: &GlobalSettings,
+    workspace: &WorkspaceSettings,
+    entry: Option<&WorkspaceRef>,
+    session: &SessionChoice,
+    skill_sources: Vec<ResolvedSource>,
+    skills: std::sync::Arc<Vec<DiscoveredSkill>>,
 ) -> Resolution {
     let model = choose_model(global, session.model.as_ref());
 
@@ -284,17 +431,52 @@ pub(crate) fn resolve(
         _ => None,
     };
 
-    // The sources: the workspace's own directory first, then the global list.
-    // The workspace's is ADDRESSED as its own kind of source rather than
-    // replacing the list, so a project that adds a directory keeps the shared
-    // ones and simply outranks them.
-    let (skill_sources, skills) = discover_skills(global, workspace, &workspace.disabled.skills);
+    // One permission resolution for this fold. The chip, the policy data and
+    // the audit all read this value; nothing else computes the minimum.
+    let permission = PermissionResolution::resolve(
+        &workspace.agent.permission,
+        preset
+            .as_ref()
+            .and_then(|preset| preset.permission.as_deref()),
+    );
 
     Resolution {
         model,
         name: entry.map(|e| e.name.clone()).unwrap_or_default(),
         root: entry.map(|e| e.root.clone()).unwrap_or_default(),
         preset_id,
+        preset_permission: preset.as_ref().and_then(|preset| preset.permission.clone()),
+        preset_read: preset.as_ref().and_then(|preset| preset.read.clone()),
+        preset_write: preset.as_ref().and_then(|preset| preset.write.clone()),
+        preset_deny: preset
+            .as_ref()
+            .map(|preset| preset.deny.clone())
+            .unwrap_or_default(),
+        preset_egress: preset.as_ref().and_then(|preset| preset.egress.clone()),
+        preset_web_search: preset.as_ref().and_then(|preset| preset.web_search),
+        preset_parallel_tool_calls: preset
+            .as_ref()
+            .and_then(|preset| preset.parallel_tool_calls),
+        preset_mcp_tools: preset.as_ref().and_then(|preset| preset.mcp_tools.clone()),
+        preset_builtin_policy: preset
+            .as_ref()
+            .map(|preset| preset.builtin_policy.clone())
+            .unwrap_or_default(),
+        preset_policy_mode: preset
+            .as_ref()
+            .and_then(|preset| preset.policy_mode.clone()),
+        preset_tools: preset.as_ref().and_then(|preset| preset.tools.clone()),
+        preset_skills: preset.as_ref().and_then(|preset| preset.skills.clone()),
+        preset_mcps: preset.as_ref().and_then(|preset| preset.mcps.clone()),
+        preset_extensions: preset.as_ref().and_then(|preset| preset.extensions.clone()),
+        preset_system_prompt: preset
+            .as_ref()
+            .and_then(|preset| preset.system_prompt.clone()),
+        preset_policy: preset.as_ref().and_then(|preset| preset.policy.clone()),
+        preset_trusted: preset
+            .as_ref()
+            .map(|preset| preset.trusted)
+            .unwrap_or(false),
         preset,
         preset_missing,
         plugins,
@@ -304,7 +486,7 @@ pub(crate) fn resolve(
         max_tokens: workspace.agent.max_tokens,
         max_steps: workspace.agent.max_steps,
         parallel_tool_calls: workspace.agent.parallel_tool_calls,
-        permission: workspace.agent.permission.clone(),
+        permission,
         bash_enabled: workspace.agent.bash_enabled,
         file_tools_enabled: workspace.agent.file_tools_enabled,
         web_tools_enabled: workspace.agent.web_tools_enabled,
@@ -413,10 +595,157 @@ pub(crate) fn discover_skills(
                 manifest: meta.manifest,
                 source: source.name.clone(),
                 enabled,
+                user_only: meta.user_only,
             });
         }
     }
     (sources, skills)
+}
+
+/// One scanned catalogue and the fingerprint of the settings that produced it.
+#[derive(Debug, Clone)]
+struct CatalogueEntry {
+    fingerprint: u64,
+    sources: Vec<ResolvedSource>,
+    skills: std::sync::Arc<Vec<DiscoveredSkill>>,
+}
+
+/// A fingerprint of every input a catalogue scan reads.
+///
+/// Hashed rather than stored as a clone of the key: this runs on every
+/// resolution, so it must not allocate. `discover_skills` reads exactly these
+/// four facts, and each is hashed in a form that is stable across a frame.
+fn catalogue_fingerprint(global: &GlobalSettings, workspace: &WorkspaceSettings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    global.skills_dir.hash(&mut hasher);
+    for source in &global.skill_sources {
+        source.name.hash(&mut hasher);
+        source.path.hash(&mut hasher);
+        source.enabled.hash(&mut hasher);
+    }
+    // The list boundary: without it ("ab", "c") and ("a", "bc") would hash the
+    // same, which is harmless here only because the fields are read positionally
+    // - separating the lists keeps that true even if a field is added later.
+    0xffu8.hash(&mut hasher);
+    workspace.agent.skills_dir.hash(&mut hasher);
+    0xfeu8.hash(&mut hasher);
+    workspace.disabled.skills.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The skill catalogue, cached until the settings that name it move.
+///
+/// `discover_skills` walks every source directory and parses each `SKILL.md`;
+/// on a real catalogue that is milliseconds of filesystem work. Resolution runs
+/// several times per frame (the composer chip, the transcript, the preset
+/// chip), so without this cache the input path paid that scan three times per
+/// keystroke. The cache is what makes a resolution O(settings), never
+/// O(catalogue) and never a disk read.
+///
+/// The key is a fingerprint of the exact inputs a scan reads, so a settings
+/// edit invalidates itself with no version plumbing to forget. The one change
+/// the fingerprint cannot see is the DISK moving under an unchanged
+/// configuration (a skill directory added, removed or edited in place), so
+/// `invalidate` is called from the places that do that behind the settings'
+/// back: a save, and a package install or uninstall.
+#[derive(Debug, Default)]
+pub(crate) struct SkillCatalogueCache {
+    entry: std::sync::Mutex<Option<CatalogueEntry>>,
+    generation: std::sync::atomic::AtomicU64,
+    /// How many times this cache actually walked the sources.
+    ///
+    /// A scan is the one O(catalogue), disk-touching stage of a resolution, so
+    /// this counter is the performance test's observable: a run of typing that
+    /// resolved the catalogue again would move it. Per-cache rather than
+    /// process-global so tests running in parallel cannot read each other's
+    /// scans.
+    scans: std::sync::atomic::AtomicUsize,
+}
+
+impl SkillCatalogueCache {
+    /// The catalogue for these settings, scanning only when an input moved.
+    ///
+    /// The returned `Arc` is shared with the cache, so a frame that resolves
+    /// the settings three times clones three pointers rather than the catalogue.
+    pub(crate) fn resolve(
+        &self,
+        global: &GlobalSettings,
+        workspace: &WorkspaceSettings,
+    ) -> (Vec<ResolvedSource>, std::sync::Arc<Vec<DiscoveredSkill>>) {
+        let fingerprint = catalogue_fingerprint(global, workspace);
+        if let Some(entry) = self.lock().as_ref() {
+            if entry.fingerprint == fingerprint {
+                return (entry.sources.clone(), entry.skills.clone());
+            }
+        }
+        let (sources, skills) = discover_skills(global, workspace, &workspace.disabled.skills);
+        self.scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let skills = std::sync::Arc::new(skills);
+        *self.lock() = Some(CatalogueEntry {
+            fingerprint,
+            sources: sources.clone(),
+            skills: skills.clone(),
+        });
+        // A NEW catalogue is a new generation, which is what the palette keys
+        // its own cached rows on.
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (sources, skills)
+    }
+
+    /// How many times the sources have actually been walked.
+    pub(crate) fn scans(&self) -> usize {
+        self.scans.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many catalogues this cache has produced (or been told to forget).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Forget the cached scan.
+    ///
+    /// Called where the catalogue can change without any settings field moving:
+    /// a settings save (the documents on disk may now name different
+    /// directories) and a package install/uninstall (a directory appeared or
+    /// went away). A settings EDIT does not need this - the fingerprint covers
+    /// every field a scan reads.
+    pub(crate) fn invalidate(&self) {
+        *self.lock() = None;
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The entry, recovering from a poisoned lock.
+    ///
+    /// A panic inside a scan would otherwise turn every later resolution into a
+    /// second panic; the cache is derived data, so taking the inner value is
+    /// always sound.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<CatalogueEntry>> {
+        self.entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Clone for SkillCatalogueCache {
+    fn clone(&self) -> Self {
+        Self {
+            entry: std::sync::Mutex::new(self.lock().clone()),
+            generation: std::sync::atomic::AtomicU64::new(self.generation()),
+            scans: std::sync::atomic::AtomicUsize::new(self.scans()),
+        }
+    }
+}
+
+impl PartialEq for SkillCatalogueCache {
+    /// The cache is DERIVED state: two settings trees with the same fields are
+    /// the same settings whether or not one of them has scanned yet.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 /// One stored source, with its directory expanded and tested for existence.
@@ -459,6 +788,7 @@ fn scan_dir(dir: &std::path::Path) -> Vec<ScannedSkill> {
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| dir.to_path_buf()),
             manifest: meta.path,
+            user_only: meta.user_only,
         })
         .collect()
 }
@@ -469,6 +799,7 @@ struct ScannedSkill {
     description: String,
     dir: PathBuf,
     manifest: PathBuf,
+    user_only: bool,
 }
 
 /// Pick the model: the session's own choice, else none.
@@ -1075,12 +1406,12 @@ mcp_servers = [
         ids.sort();
         assert_eq!(
             ids,
-            vec!["minimal", "standard", "tight"],
+            vec!["creator", "ptc", "read-only", "standard", "tight"],
             "the roster carries what the binary ships plus what was declared"
         );
         assert!(
-            !ids.iter().any(|id| id == "ptc" || id == "cordis"),
-            "a shipped preset with no backing here is not a roster row"
+            !ids.iter().any(|id| id == "cordis"),
+            "Cordis has no backing here and is not a roster row"
         );
     }
 
@@ -1112,5 +1443,34 @@ mcp_servers = [
         let r = bare();
         assert_eq!(r.lang, "zh");
         assert_eq!(r.transcript_view, TranscriptPolicy::resolve("standard"));
+    }
+
+    /// The one minimum: a ceiling below the request wins, a ceiling at or above
+    /// it does not, and the reduction names its cause.
+    #[test]
+    fn the_permission_resolution_is_the_minimum() {
+        let none = PermissionResolution::resolve("workspace-write", None);
+        assert_eq!(none.effective, "workspace-write");
+        assert!(none.reduced_by.is_none(), "no ceiling reduces nothing");
+
+        let capped = PermissionResolution::resolve("danger-full-access", Some("read-only"));
+        assert_eq!(capped.requested, "danger-full-access");
+        assert_eq!(capped.preset_ceiling.as_deref(), Some("read-only"));
+        assert_eq!(capped.effective, "read-only");
+        assert_eq!(capped.reduced_by.as_deref(), Some("read-only"));
+
+        let slack = PermissionResolution::resolve("read-only", Some("danger-full-access"));
+        assert_eq!(
+            slack.effective, "read-only",
+            "a higher ceiling cannot widen the session"
+        );
+        assert!(slack.reduced_by.is_none());
+
+        let typo = PermissionResolution::resolve("typo", None);
+        assert_eq!(
+            typo.effective, "read-only",
+            "an unknown mode fails closed instead of reaching a writable arm"
+        );
+        assert_eq!(typo.requested, "typo", "while the stored value is visible");
     }
 }

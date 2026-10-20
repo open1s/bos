@@ -144,6 +144,7 @@ struct SessionMeta {
     provider: Option<String>,
     model: Option<String>,
     agent_preset: Option<String>,
+    subagent: Option<crate::model::SubagentMeta>,
     pinned: bool,
     archived_at: Option<u64>,
 }
@@ -294,12 +295,18 @@ impl Store {
                     provider: meta.provider,
                     model: meta.model,
                     agent_preset: meta.agent_preset,
+                    subagent: meta.subagent,
                     messages: Vec::new(),
                     plan: Vec::new(),
                     goal: None,
+                    plan_mode: false,
+                    compacted: 0,
+                    feedback: None,
                     pinned: meta.pinned,
                     archived_at: meta.archived_at,
                     archived: Vec::new(),
+                    compactions: Vec::new(),
+                    compact_command: None,
                     loaded_from: 0,
                     paged_from: None,
                     loaded: false,
@@ -495,11 +502,17 @@ impl Store {
         session.provider = document.provider;
         session.model = document.model;
         session.agent_preset = document.agent_preset;
+        session.subagent = document.subagent;
         session.pinned = document.pinned;
         session.archived_at = document.archived_at;
         session.plan = document.plan;
         session.goal = document.goal;
+        session.plan_mode = document.plan_mode;
+        session.compacted = document.compacted;
+        session.feedback = document.feedback;
         session.archived = document.archived;
+        session.compactions = document.compactions;
+        session.compact_command = document.compact_command;
         // A document written before the Parquet log still carries its
         // transcript inline; keep it so the first save migrates it into the log.
         if session.messages.is_empty() && !document.messages.is_empty() {
@@ -557,7 +570,12 @@ impl Store {
             if let Some(full) = self.read_document(session) {
                 normalized.plan = full.plan;
                 normalized.goal = full.goal;
+                normalized.plan_mode = full.plan_mode;
+                normalized.compacted = full.compacted;
+                normalized.feedback = full.feedback;
                 normalized.archived = full.archived;
+                normalized.compactions = full.compactions;
+                normalized.compact_command = full.compact_command;
                 if normalized.messages.is_empty() {
                     normalized.messages = full.messages;
                 }
@@ -769,6 +787,8 @@ impl Store {
             (from, window)
         };
         let session = &mut self.sessions[at];
+        // `compacted` is a GLOBAL index, so a window that starts at a different
+        // global row needs no adjustment here; request_start maps it.
         session.loaded_from = from;
         session.paged_from = Some(from);
         session.messages = window;
@@ -815,11 +835,20 @@ impl Store {
     }
 
     /// Sessions belonging to a workspace, newest first.
+    /// Child sessions, oldest first, for restoring the subagent menu.
+    pub(crate) fn subagent_sessions(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|session| session.subagent.is_some())
+            .map(|session| session.id.clone())
+            .collect()
+    }
+
     pub(crate) fn in_workspace(&self, workspace: &str) -> Vec<&Session> {
         let mut rows: Vec<&Session> = self
             .sessions
             .iter()
-            .filter(|s| s.workspace == workspace && s.archived_at.is_none())
+            .filter(|s| s.workspace == workspace && s.archived_at.is_none() && s.subagent.is_none())
             .collect();
         rows.sort_by(|a, b| {
             b.pinned
@@ -834,7 +863,7 @@ impl Store {
         let mut rows: Vec<&Session> = self
             .sessions
             .iter()
-            .filter(|s| s.archived_at.is_some())
+            .filter(|s| s.archived_at.is_some() && s.subagent.is_none())
             .collect();
         rows.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         rows
@@ -910,12 +939,18 @@ mod tests {
             provider: None,
             model: None,
             agent_preset: None,
+            subagent: None,
             messages: Vec::new(),
             plan: Vec::new(),
             goal: None,
+            plan_mode: false,
+            compacted: 0,
+            feedback: None,
             pinned: false,
             archived_at: None,
             archived: Vec::new(),
+            compactions: Vec::new(),
+            compact_command: None,
             loaded_from: 0,
             paged_from: None,
             loaded: true,

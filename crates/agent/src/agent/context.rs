@@ -14,6 +14,170 @@ use serde_json::Value as JsonValue;
 use std::future::Future;
 use std::sync::Arc;
 
+/// Whether every tool call opened before `cut` is answered before it.
+///
+/// Compaction must never cut between an assistant tool call and its result: a
+/// request whose history opens on an unanswered call is rejected by the
+/// provider, and one that ends on a call whose result was folded away asks for
+/// work it can never see the answer to. A cut is balanced when the calls opened
+/// strictly before it are exactly the results seen strictly before it, which is
+/// what the id-linked form below decides.
+///
+/// An orphan result - one whose call is not in the history - is treated as
+/// balanced rather than corrupt: the transport may be reading a window that
+/// starts mid-turn, and refusing to compact would be worse than a cut that
+/// keeps the window consistent.
+pub fn cut_is_balanced(messages: &[Message], cut: usize) -> bool {
+    let cut = cut.min(messages.len());
+    let mut open: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for message in &messages[..cut] {
+        match message {
+            Message::AssistantToolCall { tool_call_id, .. } => {
+                open.insert(tool_call_id.as_str());
+            }
+            Message::ToolResult { tool_call_id, .. } => {
+                open.remove(tool_call_id.as_str());
+            }
+            _ => {}
+        }
+    }
+    open.is_empty()
+}
+
+/// The surface position the model cannot lose: a system prompt leading the
+/// history.
+///
+/// The contract never shadows a `system/message` at surface node 0, because
+/// folding the system prompt into a summary would drop the instructions the
+/// whole session runs under. A later system message is ordinary history and may
+/// be folded like anything else.
+pub fn system_head_len(messages: &[Message]) -> usize {
+    usize::from(matches!(messages.first(), Some(Message::System { .. })))
+}
+
+/// What one on-demand compaction did.
+///
+/// The counts are what the command reports, so the reader sees the same shape
+/// the compaction contract describes: how many history items the checkpoint
+/// replaced and how many tokens the session shed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionOutcome {
+    /// Messages the checkpoint replaced.
+    pub replaced: usize,
+    /// Estimated tokens in the replaced span.
+    pub before_tokens: usize,
+    /// Estimated tokens in the session after the checkpoint was installed.
+    pub after_tokens: usize,
+    /// The model-written checkpoint text, unframed.
+    pub summary: String,
+}
+
+impl CompactionOutcome {
+    /// Tokens this compaction freed, saturating at zero.
+    pub fn freed_tokens(&self) -> usize {
+        self.before_tokens.saturating_sub(self.after_tokens)
+    }
+}
+
+/// Estimated tokens for one message, using the same heuristic as
+/// [`ContextBudget`].
+pub fn estimate_message_tokens(message: &Message) -> usize {
+    match message {
+        Message::System { content } | Message::Assistant { content } => estimate_tokens(content),
+        Message::User { content } => estimate_tokens(&content_to_summary_string(content)),
+        Message::AssistantToolCall { name, args, .. } => {
+            estimate_tokens(name) + estimate_tokens(&args.to_string())
+        }
+        Message::ToolResult { content, .. } => estimate_tokens(content),
+    }
+}
+
+/// The checkpoint output of an LLM response, provider-agnostic.
+pub fn response_text(response: &ReactLlmResponse) -> String {
+    match response {
+        ReactLlmResponse::OpenAI(rsp) => rsp
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.clone())
+            .unwrap_or_default(),
+        ReactLlmResponse::Responses(rsp) => rsp.output_text(),
+    }
+}
+
+/// The preamble the compaction contract puts above a checkpoint.
+///
+/// Mirrors the shipped backend's own copy: the reader is told this is an
+/// automatically generated checkpoint, to treat it as background, and not to
+/// acknowledge it.
+pub const CHECKPOINT_PREAMBLE: &str = "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.";
+
+/// The instruction the summarizer call carries as its final user message.
+///
+/// The section list is fixed, so the checkpoint shape does not drift between
+/// runs, and the rules pin the things a resume actually needs: exact paths,
+/// commands, error strings and identifiers survive verbatim.
+pub const COMPACTION_INSTRUCTION: &str = "You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.
+
+Output EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write \"(none)\" for an empty section \u{2014} never drop a section.
+
+## Primary Request and Intent
+- [the user's original and evolving goals; quote verbatim where the exact wording matters]
+
+## Key Technical Concepts
+- [technologies, frameworks, patterns, and conventions in play]
+
+## Files and Code
+- [exact path: why it matters, key changes or snippets]
+
+## Errors and Fixes
+- [error: how it was resolved, plus any related user feedback]
+
+## Pending Jobs
+- [explicitly requested work not yet completed]
+
+## Current Work
+- [precisely what was in progress at this checkpoint]
+
+## Next Step
+- [the single next action, directly in line with the most recent request, or \"(none)\"]
+
+## Critical Context
+- [decisions and their rationale, constraints, user preferences, open questions, data needed to continue]
+
+Rules:
+- Write concise English engineering prose. Preserve exact file paths, commands, error strings, identifiers, numeric values, function signatures, and syntax fragments.
+- Capture user feedback and explicit instructions faithfully, especially corrections.
+- Do NOT mention this summarization request or that the context was compacted.
+- Output only the checkpoint text: do not call any tool or take any other action.
+- If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint. Do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure.";
+
+/// Frame one summary as the checkpoint message the model reads.
+pub fn render_checkpoint(summary: &str) -> String {
+    // The shipped backend frames the replacement user message as three text
+    // blocks - preamble + open tag, the summary blocks, the close tag - and the
+    // adapter concatenates them with no separator. Keep the tags flush against
+    // the body so the bytes match what DSH persisted.
+    format!("{CHECKPOINT_PREAMBLE}\n\n<compacted-summary>{summary}</compacted-summary>")
+}
+
+/// Render one message the way the summarizer reads it.
+///
+/// The summarizer replays the shadowed span as plain text, so a tool call and
+/// its result stay legible instead of collapsing into an opaque structure.
+pub fn render_for_summary(message: &Message) -> String {
+    match message {
+        Message::System { content } => format!("[system] {content}"),
+        Message::User { content } => {
+            format!("[user] {}", content_to_summary_string(content))
+        }
+        Message::Assistant { content } => format!("[assistant] {content}"),
+        Message::AssistantToolCall { name, args, .. } => {
+            format!("[assistant tool call] {name}: {args}")
+        }
+        Message::ToolResult { content, .. } => format!("[tool result] {content}"),
+    }
+}
+
 fn content_to_summary_string(content: &Content) -> String {
     match content {
         Content::Text(s) => s.clone(),
@@ -179,15 +343,188 @@ impl AgentSession {
         self.metadata.updated_at = current_timestamp();
     }
 
-    /// Summarize all but the most recent `keep_recent` messages and prepend a summary.
-    pub fn compact(&mut self, keep_recent: usize, max_summary_chars: usize) {
-        if self.messages.len() <= keep_recent {
-            return;
+    /// Split the history for a compaction that retains a priced recent tail.
+    ///
+    /// This is the contract scheme: walk back from the newest message
+    /// accumulating prices until `retain_tokens` is reached, then walk that
+    /// boundary FORWARD until it sits on a tool-pairing balanced cut, so a cut
+    /// never lands between a call and its result. A system prompt at the head is
+    /// never folded, because the instructions the session runs under are not
+    /// history.
+    ///
+    /// `retain_tokens` of zero means "condense everything safe", which is what
+    /// the manual command asks for: it prices the tail anyway and then keeps
+    /// walking the boundary back to the head.
+    ///
+    /// Returns the older span and the tail, or `None` when nothing can be
+    /// folded: an empty history, everything already needed, or a boundary that
+    /// would reach the head.
+    pub fn split_for_compaction_at(
+        &self,
+        retain_tokens: usize,
+    ) -> Option<(Vec<Message>, Vec<Message>)> {
+        let len = self.messages.len();
+        if len == 0 {
+            return None;
         }
+        let first = system_head_len(&self.messages);
+        // Walk back from the newest end, pricing as we go, until the tail is
+        // worth `retain_tokens`. At zero this settles on the last message, so
+        // the boundary then walks forward from there under the pairing rule.
+        let mut accumulated = 0usize;
+        let mut keep_from = len;
+        for index in (0..len).rev() {
+            accumulated += estimate_message_tokens(&self.messages[index]);
+            keep_from = index;
+            if accumulated >= retain_tokens {
+                break;
+            }
+        }
+        if keep_from <= first {
+            return None;
+        }
+        // Never split a call from its result: move the boundary forward (toward
+        // the newest end) until the cut is balanced.
+        while keep_from > first && !cut_is_balanced(&self.messages, keep_from) {
+            keep_from -= 1;
+        }
+        if keep_from <= first {
+            return None;
+        }
+        Some((
+            self.messages[first..keep_from].to_vec(),
+            self.messages[keep_from..].to_vec(),
+        ))
+    }
 
-        let split_at = self.messages.len().saturating_sub(keep_recent);
-        let removed = &self.messages[..split_at];
-        let recent = self.messages[split_at..].to_vec();
+    /// Split the history keeping the newest `keep_recent` messages verbatim.
+    ///
+    /// The message-count form of [`Self::split_for_compaction_at`], for callers
+    /// with no price for the tail. The same head protection and pairing rule
+    /// apply, so a boundary chosen this way is as safe as a priced one.
+    pub fn split_for_compaction(&self, keep_recent: usize) -> Option<(Vec<Message>, Vec<Message>)> {
+        let len = self.messages.len();
+        if len <= keep_recent {
+            return None;
+        }
+        let first = system_head_len(&self.messages);
+        let mut keep_from = len.saturating_sub(keep_recent);
+        if keep_from <= first {
+            return None;
+        }
+        while keep_from > first && !cut_is_balanced(&self.messages, keep_from) {
+            keep_from -= 1;
+        }
+        if keep_from <= first {
+            return None;
+        }
+        Some((
+            self.messages[first..keep_from].to_vec(),
+            self.messages[keep_from..].to_vec(),
+        ))
+    }
+
+    /// Install a model-written checkpoint over the older span, keeping the
+    /// recent tail verbatim.
+    ///
+    /// This is the real condensation the `/compact` command performs: the
+    /// caller serializes the returned older span, asks the model for a
+    /// structured summary, and hands the text back here. The checkpoint
+    /// replaces that span as one user-role message framed in
+    /// `<compacted-summary>` tags, which is the shape the compaction contract
+    /// specifies, and the recent tail follows it untouched.
+    ///
+    /// Returns the number of messages the checkpoint replaced. Zero means the
+    /// history was not compactable and nothing was written.
+    ///
+    /// The system prompt at the head, when there is one, stays ahead of the
+    /// checkpoint: it is the session instructions, not history, and folding it
+    /// away would drop the rules the conversation runs under.
+    pub fn install_checkpoint(&mut self, keep_recent: usize, summary: &str) -> usize {
+        self.install_checkpoint_at(keep_recent, summary)
+    }
+
+    /// Install a checkpoint selected by message count, keeping `keep_recent`.
+    ///
+    /// The priced form is [`Self::install_priced_checkpoint`], for callers that
+    /// measure the tail in tokens rather than messages.
+    pub fn install_checkpoint_at(&mut self, keep_recent: usize, summary: &str) -> usize {
+        let Some((removed, recent)) = self.split_for_compaction(keep_recent) else {
+            return 0;
+        };
+        self.replace_span_with_checkpoint(removed, recent, summary)
+    }
+
+    /// Install a checkpoint over a token-priced span.
+    ///
+    /// Prefer this when the caller prices the tail: `retain_tokens` is the same
+    /// budget [`Self::split_for_compaction_at`] selected with, so the span the
+    /// model was asked about is exactly the span this replaces.
+    pub fn install_priced_checkpoint(&mut self, retain_tokens: usize, summary: &str) -> usize {
+        let Some((removed, recent)) = self.split_for_compaction_at(retain_tokens) else {
+            return 0;
+        };
+        self.replace_span_with_checkpoint(removed, recent, summary)
+    }
+
+    /// Put one checkpoint, framed in tags, in place of `removed` and ahead of
+    /// the retained tail.
+    fn replace_span_with_checkpoint(
+        &mut self,
+        removed: Vec<Message>,
+        recent: Vec<Message>,
+        summary: &str,
+    ) -> usize {
+        let checkpoint = Message::User {
+            content: Content::Text(render_checkpoint(summary)),
+        };
+        // Any leading system prompt is instructions, not history: it is kept in
+        // front of the checkpoint rather than folded into it.
+        let head = system_head_len(&self.messages);
+        let mut compacted: Vec<Message> = self.messages[..head].to_vec();
+        compacted.push(checkpoint);
+        compacted.extend(recent);
+        self.messages = compacted;
+
+        match &mut self.context {
+            JsonValue::Object(map) => {
+                map.insert(
+                    "compacted_summary".to_string(),
+                    JsonValue::String(summary.to_string()),
+                );
+            }
+            ctx if !ctx.is_null() => {
+                self.context = serde_json::json!({
+                    "compacted_summary": summary,
+                    "previous_context": ctx.clone(),
+                });
+            }
+            _ => {
+                self.context = serde_json::json!({"compacted_summary": summary});
+            }
+        }
+        self.update_metadata();
+        removed.len()
+    }
+
+    /// Summarize all but the most recent `keep_recent` messages and prepend a summary.
+    ///
+    /// This is the MECHANICAL path: the summary is the dropped messages
+    /// truncated, not a model-written checkpoint, and it prepends a system
+    /// message rather than replacing the span with a user one. It backs the
+    /// automatic pre-send trim, where a request must be made to fit without a
+    /// second model call.
+    ///
+    /// The split is the same safe selection the checkpoint path uses: a leading
+    /// system prompt is never folded, and the cut never lands between an
+    /// assistant tool call and its result.
+    pub fn compact(&mut self, keep_recent: usize, max_summary_chars: usize) {
+        let Some((removed, recent)) = self.split_for_compaction(keep_recent) else {
+            return;
+        };
+        // The system prompt at the head stays where it is; the mechanical
+        // summary follows it.
+        let head = system_head_len(&self.messages);
 
         let summary_input: String = removed
             .iter()
@@ -214,7 +551,8 @@ impl AgentSession {
         };
 
         let summary_message = Message::system(summary.clone());
-        let mut compacted = vec![summary_message];
+        let mut compacted: Vec<Message> = self.messages[..head].to_vec();
+        compacted.push(summary_message);
         compacted.extend(recent);
         self.messages = compacted;
 
@@ -862,6 +1200,207 @@ mod budget_tests {
             }
         }
         session
+    }
+
+    /// Build a history whose middle holds one complete tool call and result.
+    fn chat_with_tool_traffic() -> AgentSession {
+        let mut session = AgentSession::new();
+        session.add_user("u0 first".to_string());
+        session.add_assistant("a0 reply".to_string());
+        session.add_user("u1 run a tool".to_string());
+        session.add_assistant("a1 calling".to_string());
+        session.push(Message::AssistantToolCall {
+            tool_call_id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            args: serde_json::json!({"path": "src/main.rs"}),
+        });
+        session.push(Message::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            content: "file body".to_string(),
+        });
+        session.add_assistant("a2 summarized the file".to_string());
+        session.add_user("u2 next ask".to_string());
+        session.add_assistant("a3 final".to_string());
+        session
+    }
+
+    /// A cut landing on a call/result pair is refused; the boundary walks
+    /// forward until the pair is whole. Without this, a request opens on a
+    /// result whose call was folded away, or ends on a call the model can
+    /// never see answered.
+    #[test]
+    fn a_cut_never_splits_a_tool_call_from_its_result() {
+        let session = chat_with_tool_traffic();
+        let messages = session.messages();
+        // Index 4 is the AssistantToolCall, 5 its result.
+        assert!(
+            !cut_is_balanced(messages, 5),
+            "a cut between call and result is unbalanced"
+        );
+        assert!(
+            cut_is_balanced(messages, 4),
+            "a cut before the call is balanced"
+        );
+        assert!(
+            cut_is_balanced(messages, 6),
+            "a cut after the result is balanced"
+        );
+
+        // Every boundary the selection returns is balanced, whatever the
+        // budget, and the retained tail is never empty.
+        for retain in [0usize, 1, 8, 40, 400] {
+            if let Some((_, tail)) = session.split_for_compaction_at(retain) {
+                assert!(cut_is_balanced(messages, messages.len() - tail.len()));
+                assert!(!tail.is_empty());
+            }
+        }
+    }
+
+    /// The selection keeps a priced tail: a larger budget keeps more, and the
+    /// boundary never reaches into the retained tail.
+    #[test]
+    fn a_larger_retain_budget_keeps_a_longer_tail() {
+        // Each message is ~40 ascii chars, so ~10 tokens. A 20-message
+        // history is about 200 tokens, and these budgets sit inside it.
+        let session = chat(20, 40);
+        let small = session.split_for_compaction_at(1).expect("a span");
+        let large = session.split_for_compaction_at(80).expect("a span");
+        assert!(
+            small.0.len() > large.0.len(),
+            "a bigger retain budget folds less: {} vs {}",
+            small.0.len(),
+            large.0.len()
+        );
+        assert!(small.1.len() < large.1.len(), "and it keeps a longer tail");
+        // A budget larger than the whole history folds nothing.
+        assert!(session.split_for_compaction_at(100_000).is_none());
+    }
+
+    /// A zero budget is the manual command: fold everything safely foldable,
+    /// which is what makes `/compact` condense below the pressure threshold.
+    #[test]
+    fn a_zero_budget_folds_everything_safe() {
+        let session = chat(12, 16);
+        let (removed, kept) = session.split_for_compaction_at(0).expect("a span");
+        assert_eq!(removed.len(), 11, "all but the last message folds");
+        assert_eq!(kept.len(), 1);
+    }
+
+    /// A leading system prompt is the session instructions, not history: it
+    /// stays in front of the checkpoint.
+    #[test]
+    fn a_leading_system_prompt_is_never_folded() {
+        let mut session = AgentSession::new();
+        session.push(Message::system("you are the session rules"));
+        for i in 0..8 {
+            session.add_user(format!("u{i}"));
+            session.add_assistant(format!("a{i}"));
+        }
+        let before = session.messages().len();
+        let replaced = session.install_priced_checkpoint(0, "checkpoint body");
+        assert!(replaced > 0, "history was folded");
+        // The head, the checkpoint, and whatever zero-budget retained: the
+        // last message, which is all a balanced cut can leave.
+        assert_eq!(
+            session.messages().len(),
+            3,
+            "the system head plus the checkpoint and one tail message"
+        );
+        assert!(
+            matches!(session.messages()[1], Message::User { .. }),
+            "the checkpoint follows the system head"
+        );
+        let Message::System { content } = &session.messages()[0] else {
+            panic!("the system prompt stays first");
+        };
+        assert_eq!(content, "you are the session rules");
+        assert!(before > session.messages().len());
+    }
+
+    /// A history that is nothing but a system prompt has no compactable span.
+    #[test]
+    fn a_system_only_history_has_nothing_to_fold() {
+        let mut session = AgentSession::new();
+        session.push(Message::system("rules"));
+        assert!(session.split_for_compaction_at(0).is_none());
+        assert!(session.split_for_compaction(0).is_none());
+    }
+
+    #[test]
+    fn a_checkpoint_replaces_the_older_span_and_keeps_the_tail() {
+        let mut session = chat(8, 16);
+        let before = session.messages().len();
+        let (removed, kept) = session.split_for_compaction(2).expect("an older span");
+        assert_eq!(removed.len(), 6);
+        assert_eq!(kept.len(), 2);
+
+        let replaced = session.install_checkpoint(2, "## Current Work\n- the checkpoint");
+        assert_eq!(replaced, 6, "the checkpoint reports the span it replaced");
+        // One checkpoint message plus the verbatim tail.
+        assert_eq!(session.messages().len(), 3);
+        assert!(before > session.messages().len(), "the session shrank");
+
+        let first = &session.messages()[0];
+        let Message::User { content } = first else {
+            panic!("the checkpoint is a user message, got {first:?}");
+        };
+        let Content::Text(text) = content else {
+            panic!("the checkpoint is plain text");
+        };
+        assert!(text.starts_with(CHECKPOINT_PREAMBLE));
+        assert!(text.contains("<compacted-summary>"));
+        assert!(text.contains("</compacted-summary>"));
+        assert!(text.contains("the checkpoint"));
+        // The retained tail is byte-for-byte what it was.
+        assert_eq!(session.messages()[1..].len(), 2);
+    }
+
+    #[test]
+    fn a_history_inside_the_keep_window_has_nothing_to_fold() {
+        let session = chat(4, 16);
+        assert!(session.split_for_compaction(4).is_none());
+        let mut session = chat(4, 16);
+        assert_eq!(session.install_checkpoint(4, "unused"), 0);
+        assert_eq!(session.messages().len(), 4, "and it is left alone");
+    }
+
+    /// The summarizer reads a span as text, so a tool call and its result stay
+    /// legible instead of collapsing into an opaque structure.
+    #[test]
+    fn the_span_renders_tool_traffic_as_text() {
+        let call = Message::AssistantToolCall {
+            name: "read_file".to_string(),
+            args: serde_json::json!({"path": "src/main.rs"}),
+            tool_call_id: String::new(),
+        };
+        let rendered = render_for_summary(&call);
+        assert!(rendered.contains("read_file"));
+        assert!(rendered.contains("src/main.rs"));
+        assert!(render_for_summary(&Message::user("hello")).contains("hello"));
+    }
+
+    /// The checkpoint text the model wrote is what a later request carries, so
+    /// it must survive a session round-trip: a restart may not lose it.
+    #[test]
+    fn a_checkpoint_survives_a_serialization_round_trip() {
+        let mut session = chat(6, 16);
+        session.install_checkpoint(2, "summary body");
+        let json = session.to_json_string().expect("serializes");
+        let mut back = AgentSession::new();
+        back.restore_from_json(&json).expect("restores");
+        assert_eq!(back.messages().len(), session.messages().len());
+        assert!(format!("{:?}", back.messages()[0]).contains("summary body"));
+    }
+
+    /// More history than the keep window means the command spends a request;
+    /// the gate must agree with what the summarizer would be handed.
+    #[test]
+    fn the_split_is_the_boundary_the_request_starts_at() {
+        let session = chat(16, 16);
+        let (removed, kept) = session.split_for_compaction(10).expect("an older span");
+        assert_eq!(removed.len(), 6);
+        assert_eq!(kept.len(), 10);
+        assert_eq!(removed.len() + kept.len(), session.messages().len());
     }
 
     #[test]

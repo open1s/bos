@@ -507,6 +507,26 @@ impl Agent {
         &self.config
     }
 
+    /// Append a section to the system prompt sent on every turn.
+    ///
+    /// The shell uses this to add capability guidance (for example, when the
+    /// subagent tool is installed) without rebuilding the agent or dropping the
+    /// persona and skill instructions already in the prompt.
+    pub fn append_system_prompt(&mut self, section: &str) {
+        let section = section.trim();
+        if section.is_empty() {
+            return;
+        }
+        if !self.config.system_prompt.is_empty() {
+            self.config.system_prompt.push_str(
+                "
+
+",
+            );
+        }
+        self.config.system_prompt.push_str(section);
+    }
+
     /// Get tool registry.
     pub fn registry(&self) -> Option<&Arc<ToolRegistry>> {
         self.registry.as_ref()

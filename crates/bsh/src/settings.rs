@@ -60,6 +60,16 @@ pub(crate) struct Settings {
     /// temporary directory a test made.
     #[serde(skip)]
     pub(crate) save_root: Option<PathBuf>,
+    /// The last scanned skill catalogue, keyed by the settings that name it.
+    ///
+    /// Derivation, not storage: the scan's inputs are the two skill-directory
+    /// lists and the workspace's switched-off names, and the cache compares a
+    /// fingerprint of exactly those on every read. It exists because a
+    /// resolution runs several times per frame and each one used to walk every
+    /// skill directory and parse every `SKILL.md` - the synchronous disk read
+    /// that made a keystroke lag.
+    #[serde(skip)]
+    pub(crate) skill_cache: resolve::SkillCatalogueCache,
 }
 
 /// How a completed turn's process steps group, from the reference's own
@@ -180,8 +190,12 @@ pub(crate) struct Effective {
     pub(crate) file_tools_enabled: bool,
     /// Offer the model a hosted web-search tool.
     pub(crate) web_tools_enabled: bool,
-    /// The default permission mode for new sessions.
-    pub(crate) permission: String,
+    /// The session's permission capped by the preset ceiling.
+    ///
+    /// The one resolution the chip, the policy data and the audit read. The
+    /// requested value is kept beside the effective one so the chip can explain
+    /// a ceiling and the menu can check the reader's own choice.
+    pub(crate) permission: resolve::PermissionResolution,
     /// Every skill source in precedence order, with its count and existence.
     ///
     /// Switched-OFF sources are kept here so the pane can draw them and switch
@@ -189,7 +203,10 @@ pub(crate) struct Effective {
     pub(crate) skill_sources: Vec<resolve::ResolvedSource>,
     /// The discovered, deduplicated catalogue: every skill, with its source and
     /// its own on/off flag. The pane lists this and the build registers from it.
-    pub(crate) skills: Vec<resolve::DiscoveredSkill>,
+    ///
+    /// Shared with the cache, so a frame's several resolutions clone a pointer
+    /// instead of the catalogue.
+    pub(crate) skills: std::sync::Arc<Vec<resolve::DiscoveredSkill>>,
     /// Send-side token ceiling.
     pub(crate) context_budget: usize,
     /// Shell command timeout in seconds.
@@ -206,9 +223,65 @@ pub(crate) struct Effective {
     pub(crate) disabled_tools: Vec<String>,
     /// The plugin ids the preset mounts. The complete set, not a delta.
     pub(crate) preset_plugins: Vec<String>,
+    /// The preset id in effect (empty when no preset is selected). This is the
+    /// authority half of a policy principal: a preset may narrow what a turn
+    /// may touch, and the policy input has to carry which preset was active.
+    pub(crate) preset_id: String,
+    /// Permission ceiling, or none to inherit the session's permission.
+    pub(crate) preset_permission: Option<String>,
+    /// Read roots; none inherits the workspace, empty allows nothing.
+    pub(crate) preset_read: Option<Vec<String>>,
+    /// Write roots; none inherits the workspace, empty allows nothing.
+    pub(crate) preset_write: Option<Vec<String>>,
+    /// Denied path roots, always unioned.
+    pub(crate) preset_deny: Vec<String>,
+    /// Egress allowlist; none inherits, empty denies, entries intersect.
+    pub(crate) preset_egress: Option<Vec<String>>,
+    /// Hosted web-search override.
+    pub(crate) preset_web_search: Option<bool>,
+    /// Parallel tool-call override.
+    pub(crate) preset_parallel_tool_calls: Option<bool>,
+    /// MCP tool allowlist, or none for every tool of the allowed servers.
+    pub(crate) preset_mcp_tools: Option<Vec<String>>,
+    /// Binary-shipped Rego module ids.
+    pub(crate) preset_builtin_policy: Vec<String>,
+    /// required or advisory custom-policy mode.
+    pub(crate) preset_policy_mode: Option<String>,
+    /// Explicit tool allowlist, or none for all bundle tools.
+    pub(crate) preset_tools: Option<Vec<String>>,
+    /// Explicit skill allowlist, or none for every enabled skill.
+    pub(crate) preset_skills: Option<Vec<String>>,
+    /// Explicit MCP server allowlist, or none for every connected server.
+    pub(crate) preset_mcps: Option<Vec<String>>,
+    /// Explicit installed-extension allowlist, or none for every enabled one.
+    pub(crate) preset_extensions: Option<Vec<String>>,
+    /// The preset's LLM persona, or none for the workspace prompt.
+    pub(crate) preset_system_prompt: Option<String>,
+    /// The Rego module the active preset contributes, when it has one.
+    pub(crate) preset_policy: Option<String>,
+    /// Whether the active preset's policy is trusted to apply.
+    pub(crate) preset_trusted: bool,
 }
 
 impl Effective {
+    /// A required custom policy that the reader has not trusted: the preset
+    /// cannot be applied, because applying it without the policy would be
+    /// wider than the preset declares.
+    pub(crate) fn preset_policy_required_untrusted(&self) -> bool {
+        self.preset_policy_mode.as_deref() == Some("required")
+            && self.preset_policy.is_some()
+            && !self.preset_trusted
+    }
+
+    /// The prompt the LLM call receives: the selected preset's persona when it
+    /// has one, otherwise the workspace prompt. The build and the context meter
+    /// read this one value so they cannot disagree.
+    pub(crate) fn llm_system_prompt(&self) -> &str {
+        self.preset_system_prompt
+            .as_deref()
+            .unwrap_or(&self.system_prompt)
+    }
+
     /// The skills a build should register: the discovered catalogue with the
     /// switched-off ones removed.
     ///
@@ -217,7 +290,11 @@ impl Effective {
     /// on its own is dropped here, so the agent can only receive a directory that
     /// survived both flags.
     pub(crate) fn enabled_skills(&self) -> impl Iterator<Item = &resolve::DiscoveredSkill> {
-        self.skills.iter().filter(|skill| skill.enabled)
+        let allowed = self.preset_skills.as_deref();
+        self.skills.iter().filter(move |skill| {
+            skill.enabled
+                && allowed.is_none_or(|names| names.iter().any(|name| name == &skill.name))
+        })
     }
 }
 
@@ -322,6 +399,8 @@ impl Settings {
             // The settings were read from their own location, so that is where
             // they are written back to.
             save_root: None,
+            // Nothing has been scanned yet; the first resolution fills it.
+            skill_cache: resolve::SkillCatalogueCache::default(),
         };
         read.adopt_legacy_session();
         read.ensure_workspace();
@@ -353,6 +432,10 @@ impl Settings {
     /// guard that keeps a redesign from silently eating a configuration it
     /// cannot read.
     pub(crate) fn save(&self) -> std::io::Result<()> {
+        // The documents may now name directories the cached catalogue was not
+        // scanned from, and a skill install may have moved files under an
+        // unchanged list, so the next resolution re-reads the catalogue.
+        self.invalidate_skills();
         let global_path = self.writable_global_path()?;
         let root = self.active_workspace_root();
         let workspace = self.workspace.clone();
@@ -383,6 +466,7 @@ impl Settings {
     /// the workspace document no longer carries session identity, so there is no
     /// reason to rewrite that file every time the reader switches chats.
     pub(crate) fn save_global(&self) -> std::io::Result<()> {
+        self.invalidate_skills();
         let global_path = self.writable_global_path()?;
         self.global.validate().map_err(as_io)?;
         self.global.save(&global_path).map_err(as_io)
@@ -510,7 +594,21 @@ impl Settings {
             .workspaces
             .iter()
             .find(|w| w.id == self.global.general.active_workspace);
-        let resolution = resolve::resolve(&self.global, &self.workspace, entry, session);
+        let (skill_sources, skills) = self.skill_cache.resolve(&self.global, &self.workspace);
+        let resolution = resolve::resolve_with_catalogue(
+            &self.global,
+            &self.workspace,
+            entry,
+            session,
+            skill_sources,
+            skills,
+        );
+        if resolution.preset_policy_mode.as_deref() == Some("required")
+            && resolution.preset_policy.is_some()
+            && !resolution.preset_trusted
+        {
+            return Some("composer.presetPolicyUntrusted");
+        }
         resolution.refusal().map(|refusal| match refusal {
             resolve::Refusal::NoModel => "composer.chooseModel",
             resolve::Refusal::UnknownModel(_) => "composer.modelUnavailable",
@@ -566,6 +664,35 @@ impl Settings {
         self.effective_for(&resolve::SessionChoice::default())
     }
 
+    /// The generation of the skill catalogue this tree resolves to.
+    ///
+    /// It moves whenever a scan produced a new catalogue or the cache was
+    /// invalidated, so a view that caches rows derived from the catalogue (the
+    /// composer's slash palette) can tell whether its rows are still the ones
+    /// these settings describe.
+    pub(crate) fn skill_generation(&self) -> u64 {
+        self.skill_cache.generation()
+    }
+
+    /// How many filesystem scans this tree's catalogue has needed.
+    ///
+    /// The performance test's observable: a keystroke that re-resolved the
+    /// catalogue would move it. It counts SCANS, not resolutions, because a
+    /// resolution served from the cache does no disk work and copies no rows.
+    #[cfg(test)]
+    pub(crate) fn skill_scans(&self) -> usize {
+        self.skill_cache.scans()
+    }
+
+    /// Forget the scanned skill catalogue.
+    ///
+    /// A settings EDIT needs no call: the cache's fingerprint covers every
+    /// field a scan reads. This is for the changes the settings cannot see -
+    /// the directories on disk moving under an unchanged configuration.
+    pub(crate) fn invalidate_skills(&self) {
+        self.skill_cache.invalidate();
+    }
+
     /// Fold the two documents with one session's own model choice folded in.
     ///
     /// The session names the model and the global tree defines what the name
@@ -577,7 +704,17 @@ impl Settings {
             .workspaces
             .iter()
             .find(|w| w.id == self.global.general.active_workspace);
-        let resolution = resolve::resolve(&self.global, &self.workspace, entry, session);
+        // The catalogue comes from the cache, keyed by the settings that name
+        // it: a frame resolves several times, and only the first may touch disk.
+        let (skill_sources, skills) = self.skill_cache.resolve(&self.global, &self.workspace);
+        let resolution = resolve::resolve_with_catalogue(
+            &self.global,
+            &self.workspace,
+            entry,
+            session,
+            skill_sources,
+            skills,
+        );
         let connection = resolution.model.connection();
         let provider_id = resolution
             .model
@@ -611,7 +748,7 @@ impl Settings {
             bash_enabled: resolution.bash_enabled,
             file_tools_enabled: resolution.file_tools_enabled,
             web_tools_enabled: resolution.web_tools_enabled,
-            permission: resolution.permission,
+            permission: resolution.permission.clone(),
             skill_sources: resolution.skill_sources.clone(),
             skills: resolution.skills.clone(),
             context_budget: resolution.context_budget,
@@ -622,10 +759,35 @@ impl Settings {
             performance_usage: general.performance_usage.clone(),
             disabled_tools: resolution.disabled_tools,
             preset_plugins: resolution.plugins,
+            preset_id: resolution.preset_id.unwrap_or_default(),
+            preset_permission: resolution.preset_permission,
+            preset_read: resolution.preset_read,
+            preset_write: resolution.preset_write,
+            preset_deny: resolution.preset_deny,
+            preset_egress: resolution.preset_egress,
+            preset_web_search: resolution.preset_web_search,
+            preset_parallel_tool_calls: resolution.preset_parallel_tool_calls,
+            preset_mcp_tools: resolution.preset_mcp_tools,
+            preset_builtin_policy: resolution.preset_builtin_policy,
+            preset_policy_mode: resolution.preset_policy_mode,
+            preset_tools: resolution.preset_tools,
+            preset_skills: resolution.preset_skills,
+            preset_mcps: resolution.preset_mcps,
+            preset_extensions: resolution.preset_extensions,
+            preset_system_prompt: resolution.preset_system_prompt,
+            preset_policy: resolution.preset_policy,
+            preset_trusted: resolution.preset_trusted,
         }
     }
 
     /// The memory file in effect.
+    ///
+    /// An explicit workspace path wins. Otherwise the file sits beside the
+    /// settings document this configuration writes - `save_root` for a test or
+    /// a redirected install, the bsh data directory for the app - exactly like
+    /// the vault and the recycle bin. Recomputing it from `$HOME` made every
+    /// test build read (and, on a remember, rewrite) the reader's real memory
+    /// file, which is shared state no test owns.
     pub(crate) fn memory_file(&self) -> PathBuf {
         let raw = self
             .workspace
@@ -634,12 +796,13 @@ impl Settings {
             .as_deref()
             .unwrap_or("")
             .trim();
-        let path = if raw.is_empty() {
-            dir().join("memory.jsonl")
-        } else {
-            PathBuf::from(shellexpand::tilde(raw).into_owned())
-        };
-        path
+        if !raw.is_empty() {
+            return PathBuf::from(shellexpand::tilde(raw).into_owned());
+        }
+        match &self.save_root {
+            Some(root) => root.join("memory.jsonl"),
+            None => dir().join("memory.jsonl"),
+        }
     }
 
     /// Every effective MCP server: the global entries in file order, with a
@@ -1364,6 +1527,9 @@ mod tests {
                 plugins: vec!["shell".to_string()],
                 description: None,
                 order: None,
+                policy: None,
+                trusted: false,
+                ..Default::default()
             },
         );
         assert!(settings.global.preset_ids().contains(&"tight".to_string()));
@@ -1573,6 +1739,7 @@ mod tests {
             global: GlobalSettings::load(&global_path).expect("global back"),
             workspace: WorkspaceSettings::load(&workspace_path).expect("workspace back"),
             save_root: None,
+            ..Settings::default()
         };
         assert_eq!(read_back.global.general.lang, "zh");
         assert_eq!(read_back.workspace.agent.permission, crate::caps::READ_ONLY);

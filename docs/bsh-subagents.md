@@ -1,0 +1,147 @@
+# Subagents in bsh
+
+## Behaviour
+
+A parent turn can delegate a self-contained task to a child agent with its own
+context. The model calls the async tool named subagent with:
+
+    { "description": "short title", "prompt": "complete task" }
+
+The child receives:
+
+- the parent turn's LLM config (model, endpoint, key, effort);
+- a copy of the parent's tool registry at build time;
+- a focused-subagent system instruction prepended to the parent persona;
+- a fresh Agent session and context;
+- max_steps capped at 12.
+
+A child at depth 0 or 1 receives the subagent tool again, giving the bounded DSH
+lineage tree: session root, children, and grandchildren. Depth 2 is the leaf.
+At most three children run at once across the tree; each has a 600-second
+timeout. The result returned to the parent is bounded to 16,000 characters; the
+full result and the child transcript are kept in the run registry.
+
+The child's tools still carry the parent session and policy principal, so the
+same workspace policy, permission ceiling, path scopes and builtin Rego modules
+apply to a child.
+
+## Model guidance
+
+Every parent turn that carries the subagent tool also gets a standing system
+prompt section and a split-first tool description, so the model knows the
+intended way to handle a large job:
+
+- if the work has two or more independent workstreams, split it;
+- state a short plan naming those parts;
+- call subagent once per part with a complete prompt (goal, paths/context,
+  constraints, expected output format, what to report);
+- run at most three children at once, then later waves;
+- reconcile the results and do final verification in the parent.
+
+The guidance explicitly excludes trivial single steps and tightly coupled
+sequential work. A leaf child does not inherit the delegation instruction,
+because it has no subagent tool.
+
+The child agent is retained in the registry after it settles. Selecting it opens
+its transcript, but the composer stays available: a follow-up prompt is sent into
+the SAME child agent, appended to its transcript, and the run returns to Running
+until the answer settles. A running child refuses a second follow-up.
+
+## Registry
+
+crates/bsh/src/subagent.rs holds the shared registry. Each run records:
+
+- id, root session, direct parent, depth, title, prompt;
+- Running/Done/Failed;
+- start/finish time;
+- prompt and completion tokens from the child's last usage report;
+- result or error;
+- the child's full flattened transcript (user, assistant and tool rows).
+  Adjacent identical assistant rows are collapsed defensively; the engine also
+  records exactly one assistant row per final answer.
+
+The header reads only the runs belonging to the active session. A run remains in
+the registry after its parent switches away.
+
+## Persistence
+
+A child is saved exactly like a parent conversation: a Session JSON document and
+the same Parquet transcript log under the workspace's session directory. The
+document carries a SubagentMeta block (root, direct parent, depth, status,
+prompt, token counts, timestamps, result or error); the log carries the full
+transcript and the tool rows the trajectory reads.
+
+Child Sessions are hidden from the left pane; the subagent selector is their
+only entry point. On startup the store is read normally, each child Session is
+rehydrated, its
+transcript is flattened back into the menu registry, and the menu is restored
+with the same titles, counts, statuses and transcripts. Run ids are UUIDs, so a
+restart cannot collide with an earlier child's file.
+
+A follow-up needs the live child Agent; after a restart the transcript and
+trajectory are read-only until a new run is started. The registry no longer
+evicts settled runs, so live children stay continuable for the life of the
+process.
+
+## UI (DSH mirror)
+
+The header carries the SubagentHeaderLineage trigger:
+
+- 14x14 activity slot (spinner while running, dot when settled);
+- the selected child's title when a child is open;
+- a count label such as "25 subagents" (or "1 subagent") while the parent is
+  showing;
+- 12px chevron, min-height 28, radius 8, gap 4, title capped at 244px.
+
+The trigger is a selector over the session's child runs, not a run itself. It
+never renders a synthetic "Subagents" run name and never the root conversation.
+The selected child also appears in the title breadcrumb and as the 600-weight
+menu row.
+
+Its menu is 336px wide (max 400, max height 560) and lists only child runs:
+top-level children start flush left, grandchildren indent by 16px. Each child
+row is min-height 44 with:
+
+- activity state;
+- title (weight 600 for the current run);
+- prompt summary at 10px;
+- a right-aligned metrics column: tokens on row one, duration on row two.
+
+Clicking a child selects it. The title row's parent/child breadcrumb returns to
+the conversation.
+
+The main column is data-driven: selecting a child materializes its transcript as
+a transient Session (the same model a normal conversation uses) and that Session
+becomes the active view model. Chat and Trajectory are the existing renderers,
+unchanged: the child gets the same user bubbles, markdown, reasoning blocks, tool
+cards, turn rail and trajectory rows as the parent.
+
+There is no subagent-specific transcript component. SubagentView holds the run
+id, the parent title and the Session; active_session returns that Session, and
+the title row adds a parent/child breadcrumb. The normal composer is kept, so the
+reader can continue the child. Send routes the draft to the selected child, not
+to the parent; the child's answer is appended and the view stays on the child.
+Switching sessions clears the child view.
+
+The child react call runs on the Runner's Tokio runtime, never on GPUI's
+executor: the engine awaits a Tokio timeout for the LLM call, and GPUI's
+executor has no Tokio reactor. The UI task only awaits the runner JoinHandle.
+
+The child react call runs on the Runner's Tokio runtime, never on GPUI's
+executor: the engine awaits a Tokio timeout for the LLM call, and GPUI's
+executor has no Tokio reactor. The UI task only awaits the runner JoinHandle.
+
+## Limits
+
+- The child transcript is streamed live (text, tool calls, tool results and
+  usage) and the settled Agent session is the authority; reasoning chunks are
+  not part of the persisted ChatMessage model.
+- Child sessions are not listed in the left pane, by design. The child runs
+  inside the parent turn; a follow-up is a new child react call, not a steer
+  into a running parent turn.
+- A child can be continued while its live Agent exists: for the life of the
+  process; after a restart the restored transcript is read-only.
+- Token figures update from stream Usage events; while none has arrived the
+  header shows a rough estimate (~prompt/4 + 2k).
+- A run is painted by a 100ms child clock, not the 1s jobs clock. Settled runs
+  are not evicted.

@@ -39,6 +39,84 @@ pub(crate) struct ToolEvent {
     pub(crate) at: Option<u64>,
 }
 
+/// What one compaction did, as the command reports it.
+///
+/// The counts are the commit figures the shipped contract reports: how many
+/// history items the checkpoint replaced and how many tokens it freed.
+#[derive(Debug, Clone)]
+pub(crate) struct CompactionReport {
+    /// Transcript rows the checkpoint replaced.
+    pub(crate) items: usize,
+    /// Estimated tokens in the replaced span, the reference's
+    /// `shadowedTokenCount` - not the net difference after the summary lands.
+    pub(crate) tokens: usize,
+    /// The model-written checkpoint text, unframed.
+    pub(crate) summary: String,
+    /// Whether a human ran the command rather than the automatic path.
+    pub(crate) manual: bool,
+}
+
+/// One compaction the session has been through, as a dated record.
+///
+/// The transcript keeps every row it folded - the checkpoint only replaces the
+/// MODEL's view - so this is what lets the reader see that a compaction
+/// happened, how much history it condensed, and what the model was told in its
+/// place. The reference draws exactly this marker at the checkpoint event -
+/// after the retained tail - and expands to the same summary text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CompactionRecord {
+    /// Unix seconds when the compaction finished.
+    pub(crate) at: u64,
+    /// How many transcript rows the checkpoint replaced.
+    pub(crate) items: usize,
+    /// Estimated tokens in the replaced span, the reference's
+    /// `shadowedTokenCount` the marker reports.
+    pub(crate) tokens: usize,
+    /// The model-written checkpoint text, unframed, as markdown.
+    pub(crate) summary: String,
+    /// Whether a human ran `/compact` rather than the automatic pressure path.
+    #[serde(default)]
+    pub(crate) manual: bool,
+    /// The GLOBAL transcript slot the checkpoint event occupied at commit.
+    ///
+    /// The reference anchors the marker at the checkpoint event's sequence, so
+    /// it sits AFTER the retained tail and before any message added later. bsh
+    /// persists `loaded_from + messages.len()`-style global slot at commit so a
+    /// restart that loads only the tail can still place it; a record written
+    /// before this field existed defaults to zero, which draws it at the end
+    /// rather than hiding it above a boundary the reader may not be looking at.
+    #[serde(default)]
+    pub(crate) after: usize,
+}
+
+/// One `/compact` command as the transcript draws it.
+///
+/// The reference logs `command/run` and `command/done`, so its command card is
+/// rebuilt after a reload; this is the one command row bsh keeps, with the same
+/// lifecycle. A landed compaction clears it, because the checkpoint marker
+/// takes its place - exactly the reference's `CompactionCommandCard` rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CompactCommand {
+    /// Unix seconds when the command started.
+    pub(crate) started_at: u64,
+    /// The outcome once one exists; absent while the summarizer runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) outcome: Option<CompactOutcome>,
+}
+
+/// The text one `/compact` command ended with.
+///
+/// The wording is the command package's own, resolved through the locale at the
+/// moment the result lands. `error` is the reference's command state: a
+/// `kind: "error"` result draws its summary in the error colour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CompactOutcome {
+    /// The outcome line the transcript shows.
+    pub(crate) text: String,
+    /// Whether the reference draws this as a failed command.
+    pub(crate) error: bool,
+}
+
 /// A goal transition recorded above a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LogMarker {
@@ -311,6 +389,8 @@ impl ChatMessage {
     /// `tool-call` block, and each finished call's output stands for the tool
     /// result the next request would carry. The role field is priced once.
     pub(crate) fn priced_tokens(&self) -> u64 {
+        #[cfg(test)]
+        PRICED_MESSAGES.with(|priced| priced.set(priced.get() + 1));
         let mut tokens = ROLE_OVERHEAD;
         if !self.text.is_empty() {
             tokens += price_block(self.text.chars().count());
@@ -329,6 +409,47 @@ impl ChatMessage {
         }
         tokens
     }
+}
+
+// How many messages this thread has priced, for the context-meter test.
+#[cfg(test)]
+thread_local! {
+    static PRICED_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The messages priced so far on this thread.
+#[cfg(test)]
+pub(crate) fn priced_messages() -> usize {
+    PRICED_MESSAGES.with(|priced| priced.get())
+}
+
+/// Persisted metadata for a child session spawned by a subagent run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SubagentMeta {
+    /// Root conversation this run belongs to.
+    pub(crate) root_id: String,
+    /// Direct parent run id, or the root id for a top-level child.
+    pub(crate) parent_id: String,
+    /// How deep below the root this run sits.
+    pub(crate) depth: usize,
+    /// Running, done or failed.
+    pub(crate) status: String,
+    /// The task handed to the child.
+    pub(crate) prompt: String,
+    /// Token estimate while usage is unavailable.
+    pub(crate) estimated_tokens: u64,
+    /// Prompt tokens the child reported.
+    pub(crate) prompt_tokens: u64,
+    /// Completion tokens the child reported.
+    pub(crate) completion_tokens: u64,
+    /// Epoch milliseconds when the run started.
+    pub(crate) started_at: u64,
+    /// Epoch milliseconds when it settled.
+    pub(crate) finished_at: Option<u64>,
+    /// Final answer, when done.
+    pub(crate) result: Option<String>,
+    /// Failure text, when failed.
+    pub(crate) error: Option<String>,
 }
 
 /// One chat session.
@@ -369,6 +490,9 @@ pub(crate) struct Session {
     /// reconstructible from the session alone. `None` takes the user's default.
     #[serde(default)]
     pub(crate) agent_preset: Option<String>,
+    /// Child-run metadata; absent on a normal conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subagent: Option<SubagentMeta>,
     /// The transcript.
     #[serde(default)]
     pub(crate) messages: Vec<ChatMessage>,
@@ -378,6 +502,26 @@ pub(crate) struct Session {
     /// The session goal.
     #[serde(default)]
     pub(crate) goal: Option<Goal>,
+    /// Whether this conversation is in plan mode.
+    ///
+    /// A SESSION fact, not a global preference: it changes what the next turn
+    /// asks the model to do - inspect and plan first, act only after approval -
+    /// and it travels with the session the way the model choice does.
+    #[serde(default)]
+    pub(crate) plan_mode: bool,
+    /// The GLOBAL transcript index where the last compaction cut the context.
+    ///
+    /// Counted from the start of the session's log, not from the loaded window:
+    /// a restart loads only the tail (`loaded_from`) and paging moves the
+    /// window, so a local index would point at a different message after
+    /// either. `request_transcript` maps this into the window. Zero means
+    /// nothing has been elided. The rows stay on screen; only the request
+    /// leaves them out and carries the checkpoint summary in their place.
+    #[serde(default)]
+    pub(crate) compacted: usize,
+    /// The reader's note about this session, recorded by the Feedback command.
+    #[serde(default)]
+    pub(crate) feedback: Option<String>,
     /// Pinned to the top of its workspace.
     #[serde(default)]
     pub(crate) pinned: bool,
@@ -387,6 +531,22 @@ pub(crate) struct Session {
     /// Messages moved out by compaction.
     #[serde(default)]
     pub(crate) archived: Vec<serde_json::Value>,
+    /// Every compaction this session has been through, oldest first.
+    ///
+    /// The transcript keeps the folded rows, so this is the record of what
+    /// replaced them: the marker row the reader expands, and the trail the
+    /// Trajectory tab lists. Empty means the session has never been compacted.
+    #[serde(default)]
+    pub(crate) compactions: Vec<CompactionRecord>,
+    /// The `/compact` command whose progress or outcome the transcript still
+    /// shows.
+    ///
+    /// The reference persists `command/run` and `command/done` in the session
+    /// log and replays the command card after a reload; bsh keeps the one card
+    /// this crate draws. A landed compaction clears it, because the checkpoint
+    /// marker replaces it. Absent on sessions that never ran the command.
+    #[serde(default)]
+    pub(crate) compact_command: Option<CompactCommand>,
     /// The global index of messages[0] in the session's Parquet history.
     ///
     /// A paged session holds a WINDOW of its transcript in memory, so the
@@ -427,12 +587,18 @@ impl Session {
             provider: None,
             model: None,
             agent_preset: None,
+            subagent: None,
             messages: Vec::new(),
             plan: Vec::new(),
             goal: None,
+            plan_mode: false,
+            compacted: 0,
+            feedback: None,
             pinned: false,
             archived_at: None,
             archived: Vec::new(),
+            compactions: Vec::new(),
+            compact_command: None,
             loaded_from: 0,
             paged_from: None,
             loaded: true,

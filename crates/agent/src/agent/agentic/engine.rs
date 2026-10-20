@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::agent::context::CompactionOutcome;
+
 /// Owns the session history for one run and puts it back when the run ends.
 ///
 /// Both [`Agent::react`] and [`Agent::stream`] take the message log out of the
@@ -423,6 +425,145 @@ impl Agent {
     /// Run the agent (delegates to react with session + hooks via AgentReActApp).
     pub async fn run_simple(&self, task: impl Into<Content>) -> Result<String, AgentError> {
         self.react(task).await
+    }
+
+    /// Condense the session's older history into a model-written checkpoint.
+    ///
+    /// This is the seam the `/compact` command drives: it is **not** a turn.
+    /// The ReAct loop is never entered, no tool is offered or executed, and
+    /// nothing is appended to the session by the conversation path. One
+    /// auxiliary completion is made, and its text — and only its text — becomes
+    /// the checkpoint that replaces the older span.
+    ///
+    /// `retain_tokens` is the recent tail kept verbatim, priced the way the
+    /// compaction contract prices it. Zero — what the manual command asks for —
+    /// means "condense everything safe", so the boundary walks back to the head
+    /// and then forward to the nearest tool-pairing balanced cut. A system
+    /// prompt at the head is never folded.
+    ///
+    /// Returns `None` when the history holds nothing safe to fold, which is the
+    /// `No compactable history yet.` outcome rather than an error. An empty or
+    /// whitespace-only summary is refused the same way, so a model that answers
+    /// with nothing cannot silently erase history.
+    ///
+    /// `signal` is the caller's cancellation: dropping the future (a stopped
+    /// command) aborts the request, and an aborted call leaves the session
+    /// untouched because the checkpoint is installed only after the response
+    /// resolves.
+    pub async fn compact_now(
+        &self,
+        retain_tokens: usize,
+        signal: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<CompactionOutcome>, AgentError> {
+        use std::sync::atomic::Ordering;
+
+        // Selection first, before any request: nothing safe to fold means no
+        // model call at all.
+        let (span, before_tokens) = {
+            let session = self.session.lock().unwrap();
+            let Some((removed, _)) = session.split_for_compaction_at(retain_tokens) else {
+                return Ok(None);
+            };
+            let priced: usize = removed
+                .iter()
+                .map(crate::agent::context::estimate_message_tokens)
+                .sum();
+            (removed, priced)
+        };
+
+        // The summarizer reads the shadowed span as plain text and answers with
+        // the checkpoint. Tools are withheld: the instruction forbids acting,
+        // and a tool schema would only invite a call the backend must discard.
+        let mut replayed = String::new();
+        for message in &span {
+            replayed.push_str(&crate::agent::context::render_for_summary(message));
+            replayed.push('\n');
+        }
+        let prompt = format!(
+            "{replayed}\n\n---\n\n{}",
+            crate::agent::context::COMPACTION_INSTRUCTION
+        );
+
+        if signal.load(Ordering::SeqCst) {
+            return Err(AgentError::Stopped);
+        }
+
+        let request = LlmRequest {
+            model: self.config.model.clone(),
+            input: Content::Text(prompt),
+            // A checkpoint is extraction, not writing: the summary should be as
+            // faithful as the reader can make it.
+            temperature: Some(0.0),
+            max_tokens: self.config.max_tokens,
+            reasoning_effort: self
+                .config
+                .reasoning_effort
+                .as_deref()
+                .map(react::llm::ReasoningEffort::from_name),
+            api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
+            ..Default::default()
+        };
+
+        let response = self
+            .llm
+            .complete(
+                Some(self.config.system_prompt.clone()),
+                request,
+                &mut AgentSession::new(),
+                &mut self.prepare_context(),
+            )
+            .await
+            .map_err(|err| AgentError::Session(format!("compaction request failed: {err}")))?;
+
+        if signal.load(Ordering::SeqCst) {
+            return Err(AgentError::Stopped);
+        }
+
+        let summary = crate::agent::context::response_text(&response);
+        // The shipped backend distinguishes "nothing safe to fold" (null) from
+        // a summarizer that produced no usable text (a summary failure). Keep
+        // that split: an empty answer is an error, not a silent no-op.
+        if summary.trim().is_empty() {
+            return Err(AgentError::Session(
+                "summarization produced no text summary content".to_string(),
+            ));
+        }
+        // The checkpoint must buy context back. The shipped backend rejects a
+        // framed summary whose priced replacement is not smaller than the span
+        // it shadows; without this gate a verbose summary grows the context it
+        // was supposed to shrink.
+        let framed = crate::agent::context::render_checkpoint(&summary);
+        let framed_tokens = crate::agent::context::estimate_message_tokens(&LlmMessage::User {
+            content: Content::Text(framed),
+        });
+        if framed_tokens >= before_tokens {
+            return Err(AgentError::Session(format!(
+                "summary is not smaller than the shadowed content ({framed_tokens} >= {before_tokens})"
+            )));
+        }
+
+        // Install only now: a failed or cancelled request must leave the
+        // session exactly as it was.
+        let after_tokens;
+        let replaced;
+        {
+            let mut session = self.session.lock().unwrap();
+            replaced = session.install_priced_checkpoint(retain_tokens, &summary);
+            after_tokens = session
+                .messages()
+                .iter()
+                .map(crate::agent::context::estimate_message_tokens)
+                .sum();
+        }
+        if replaced == 0 {
+            return Ok(None);
+        }
+        Ok(Some(crate::agent::context::CompactionOutcome {
+            replaced,
+            before_tokens,
+            after_tokens,
+            summary,
+        }))
     }
 
     /// Stream the agent response using ReAct-style loop.
