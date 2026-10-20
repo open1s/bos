@@ -13,6 +13,7 @@ use std::sync::Arc;
 use agent::memory::{FileMemory, MemoryStore};
 use agent::tools::{BashTool, FunctionTool, PlanTool};
 use agent::{Agent, AgentConfig, ToolError};
+use log::warn;
 
 use crate::plugins::{self, PluginInfo};
 use crate::settings::{Effective, Settings};
@@ -207,7 +208,8 @@ pub(crate) fn build_agent(
 
     // The registry is the source of the agent's tools: install the bundles,
     // then hand every tool they contributed to the agent.
-    let (registry, plugins) = plugins::install(bundles, &settings.workspace.disabled.extentions);
+    let (mut registry, mut plugins) =
+        plugins::install(bundles, &settings.workspace.disabled.extensions);
     for name in registry.tool_names() {
         if let Some(tool) = registry.tool(&name) {
             agent.add_tool(tool);
@@ -229,6 +231,71 @@ pub(crate) fn build_agent(
     // agree by luck.
     for skill in eff.enabled_skills() {
         let _ = agent.register_skill_manifest(skill.manifest.clone());
+    }
+
+    // Installed extension packages named by a path in the global inventory.
+    // Both standards lower onto one registry: their tools and hooks go onto the
+    // same agent this turn runs, while their commands and panels land in the
+    // host plugin registry. A refusal (a DSH JavaScript entry, a Codex app
+    // connector) is reported with the package id rather than silently dropped;
+    // declared MCP servers are handled by the MCP pool below.
+    let mut extensions = agent::extensions::ExtensionRegistry::new();
+    let mut installed_extensions: Vec<(String, String)> = Vec::new();
+    for entry in &settings.global.extensions {
+        if settings
+            .workspace
+            .disabled
+            .extensions
+            .iter()
+            .any(|disabled| disabled == &entry.id)
+        {
+            continue;
+        }
+        let Some(raw) = entry
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        match agent::extensions::ExtensionRegistry::load(&expand_path(raw)) {
+            Ok(package) => {
+                for refusal in &package.refusals {
+                    // The shim declines to own MCP processes; the MCP pool
+                    // starts them from the package's config instead.
+                    if refusal.feature == agent::extensions::RefusedFeature::McpServer {
+                        continue;
+                    }
+                    warn!("extension refused a part: {refusal}");
+                }
+                let package_id = package.extension.id.clone();
+                if let Err(error) = extensions.install(package) {
+                    warn!("extension '{}' was not installed: {error}", entry.id);
+                } else {
+                    // The inventory row keeps the settings id the disable list
+                    // and the pane toggle use; the package id is the registry
+                    // key and the source of the contributed tool names.
+                    installed_extensions.push((entry.id.clone(), package_id));
+                }
+            }
+            Err(error) => warn!("extension '{}' could not be loaded: {error}", entry.id),
+        }
+    }
+    if !extensions.is_empty() {
+        if let Err(error) = extensions.apply_to_agent(&mut agent) {
+            warn!("extensions could not be applied to the agent: {error}");
+        }
+        for (settings_id, package_id) in &installed_extensions {
+            plugins.push(PluginInfo {
+                name: settings_id.clone(),
+                tools: extensions.tool_names_of(package_id),
+                enabled: true,
+            });
+        }
+        if let Err(error) = extensions.install_host_items(&mut registry) {
+            warn!("extension commands and panels could not be installed: {error}");
+        }
     }
 
     if eff.memory_enabled {
@@ -568,6 +635,48 @@ mod tests {
         )
     }
 
+    /// An installed extension named by a path reaches the very agent the turn
+    /// runs: its tool is in the tool registry, its skill is in the prompt set,
+    /// and the settings inventory lists the package.
+    #[test]
+    fn an_installed_extension_reaches_the_turn() {
+        let mut settings = bare();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent/tests/fixtures/extensions/dsh-echo");
+        settings
+            .global
+            .extensions
+            .push(crate::settings::global::InstalledExtension {
+                id: "dsh-echo".to_string(),
+                path: Some(fixture.to_string_lossy().to_string()),
+                ..Default::default()
+            });
+
+        let built = build(&settings);
+        let tool = built
+            .agent
+            .registry()
+            .expect("tool registry")
+            .get("dsh_echo")
+            .expect("the extension tool");
+        let output = tool
+            .run(&serde_json::json!({ "value": "hi" }))
+            .expect("the tool runs");
+        assert_eq!(output["value"], "hi");
+        assert!(
+            built
+                .agent
+                .get_skills_content()
+                .iter()
+                .any(|(name, _)| *name == "greet"),
+            "the extension skill is registered on the agent"
+        );
+        assert!(
+            built.plugins.iter().any(|plugin| plugin.name == "dsh-echo"),
+            "the settings inventory lists the extension under the id its toggle writes"
+        );
+    }
+
     /// The choice the credential fixtures name: the `work` provider's leaf.
     fn work_choice() -> SessionChoice {
         SessionChoice {
@@ -857,7 +966,7 @@ mod tests {
             .any(|plugin| plugin.enabled && plugin.tools.iter().any(|tool| tool == "bash")));
 
         let mut off_tree = bare();
-        off_tree.workspace.disabled.extentions = vec!["shell".to_string()];
+        off_tree.workspace.disabled.extensions = vec!["shell".to_string()];
         let off = build(&off_tree);
         let shell = off
             .plugins

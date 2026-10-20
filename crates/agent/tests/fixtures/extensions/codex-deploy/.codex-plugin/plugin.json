@@ -1,0 +1,25 @@
+{
+  "name": "codex-deploy",
+  "version": "0.4.0",
+  "description": "Fixture Codex plugin used by the extension tests.",
+  "author": { "name": "BOS tests" },
+  "homepage": "https://example.invalid/",
+  "repository": "https://example.invalid/",
+  "license": "MIT",
+  "keywords": ["fixture"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "apps": "./.app.json",
+  "interface": {
+    "displayName": "Codex Deploy Fixture",
+    "shortDescription": "Deploys things in tests.",
+    "longDescription": "A fixture package.",
+    "developerName": "BOS tests",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read"],
+    "defaultPrompt": ["Deploy the app"],
+    "brandColor": "#000000",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg"
+  }
+}

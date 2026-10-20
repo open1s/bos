@@ -680,6 +680,19 @@ impl Agent {
         self.plugins.register_blocking(plugin);
     }
 
+    /// Install every contribution a loaded extension registry declares.
+    ///
+    /// Tools go to the agent's own tool registry, hooks to the existing
+    /// [`AgentPlugin`] registry, and skills through the agent's `SKILL.md`
+    /// reader. This is the seam a host uses so an extension's tools and hooks
+    /// are actually in the next turn rather than only in a side table.
+    pub fn apply_extensions(
+        &mut self,
+        extensions: &crate::extensions::ExtensionRegistry,
+    ) -> Result<crate::extensions::AppliedExtensions, crate::extensions::ExtensionError> {
+        extensions.apply_to_agent(self)
+    }
+
     /// Register a hook for `event`.
     pub fn add_hook(&mut self, event: HookEvent, hook: Arc<dyn AgentHook>) {
         self.hooks.register_blocking(event, hook);

@@ -4,7 +4,7 @@ use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::*;
 
 use super::paging::{PageFlow, PageKey};
-use super::settings::{SettingsInputs, VaultInputs};
+use super::settings::{SettingsInputs, TrustConfirm, VaultInputs};
 use super::DivExt;
 use crate::runner::AgentEvent;
 use crate::settings::mcp::McpScope;
@@ -76,6 +76,10 @@ pub(crate) struct Shell {
     pub(crate) task_delete: Option<String>,
     /// The permission mode awaiting the full-access risk gate, if any.
     pub(crate) permission_confirm: Option<String>,
+    /// The installed package awaiting the trust confirmation, if any.
+    pub(crate) trust_confirm: Option<TrustConfirm>,
+    /// Why the last trust decision could not be saved, shown in that dialog.
+    pub(crate) trust_error: Option<String>,
     /// Whether the risk gate's acknowledgement box is ticked. The gate's own
     /// confirm stays disabled until it is, like the reference's.
     pub(crate) permission_acknowledged: bool,
@@ -208,13 +212,46 @@ pub(crate) struct Shell {
     pub(crate) renaming_workspace: Option<String>,
     /// Whether the recycle bin is open, and what it listed when it opened.
     pub(crate) trash_open: bool,
-    /// Whether the Extensions pane's two groups are expanded.
-    pub(crate) plugins_session_open: bool,
-    pub(crate) plugins_global_open: bool,
+    /// The installed-plugin disclosures that are open, by settings id.
+    pub(crate) installed_open: std::collections::BTreeSet<String>,
+    /// The resolved installed-package view, cached by (path, mtime).
+    ///
+    /// The list asks it for metadata every frame; the first ask parses the
+    /// package and later frames compare mtimes, so a render never re-reads a
+    /// manifest it already holds. Cleared on save and on install/uninstall.
+    pub(crate) installed_cache: crate::installed::InstalledCache,
     /// Which tab of the Extensions pane is showing: 0 = Plugin list,
-    /// 1 = MCP, 2 = Skills. The MCP and Skills management live IN that pane,
-    /// beside the list.
+    /// 1 = MCP, 2 = Skills, 3 = Plugin Market. The management surfaces live IN
+    /// that pane, beside the list.
     pub(crate) plugins_tab: usize,
+    /// The local market's discovered rows, empty until the tab is first opened.
+    ///
+    /// Discovery walks the Codex plugin caches and the DSH profile manifests, so
+    /// it runs from the tab click (and the refresh control), never from render.
+    pub(crate) market: Vec<crate::market::MarketPlugin>,
+    /// Whether a discovery pass has run, so a tab switch does not rescan.
+    pub(crate) market_loaded: bool,
+    /// Why some market sources could not be read, if any.
+    pub(crate) market_error: Option<String>,
+    /// The market's name filter.
+    pub(crate) market_search: Entity<InputState>,
+    /// What that field holds, kept beside the entity so the list can filter.
+    pub(crate) market_query: String,
+    /// The "add a remote index source" field.
+    pub(crate) market_url: Entity<InputState>,
+    /// How many remote index fetches are in flight. A count, not a flag:
+    /// the built-in catalogs answer at different times, and the spinner must
+    /// survive the first one finishing.
+    pub(crate) market_fetching: usize,
+    /// Why a remote index fetch failed, if one did.
+    pub(crate) market_fetch_error: Option<String>,
+    /// The remote plugin currently downloading, by package id.
+    pub(crate) market_installing: Option<String>,
+    /// Why the last remote install failed, if it did.
+    pub(crate) market_install_error: Option<String>,
+    /// Whether the market's source editor is expanded. Collapsed by default so
+    /// the catalog gets the pane; the header still names the built-in count.
+    pub(crate) market_sources_open: bool,
     /// The Skills pane's own sub-view: whether the browse-all list and the
     /// executor-dirs list are open. Both are disclosures over the card grid, so
     /// they are pane state rather than settings.
@@ -468,6 +505,12 @@ impl Shell {
         let plugin_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.searchPlugins"))
         });
+        let market_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.marketSearch"))
+        });
+        let market_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.marketUrlHint"))
+        });
         let skill_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.skillsSearch"))
         });
@@ -557,6 +600,20 @@ impl Shell {
                  cx: &mut Context<Shell>| {
                     if matches!(event, InputEvent::Change) {
                         this.state.plugin_query = this.plugin_search.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &market_search,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        this.market_query = this.market_search.read(cx).value().to_string();
                         cx.notify();
                     }
                 },
@@ -695,6 +752,17 @@ impl Shell {
             queue_open: false,
             search,
             plugin_search,
+            market: Vec::new(),
+            market_loaded: false,
+            market_error: None,
+            market_search,
+            market_query: String::new(),
+            market_url,
+            market_fetching: 0,
+            market_fetch_error: None,
+            market_installing: None,
+            market_install_error: None,
+            market_sources_open: false,
             skill_search,
             skill_query: String::new(),
             skill_add_open: false,
@@ -713,6 +781,8 @@ impl Shell {
             task_filter: 0,
             task_delete: None,
             permission_confirm: None,
+            trust_confirm: None,
+            trust_error: None,
             permission_acknowledged: false,
             developer_tools_failed: false,
             shortcuts_open: false,
@@ -778,7 +848,8 @@ impl Shell {
             renaming_workspace: None,
             workspace_rename,
             trash_open: false,
-            plugins_session_open: true,
+            installed_open: std::collections::BTreeSet::new(),
+            installed_cache: crate::installed::InstalledCache::default(),
             trace_rows: Vec::new(),
             trace_session: None,
             trace_pages: 0,
@@ -787,7 +858,6 @@ impl Shell {
             older_anchor: None,
             older: PageFlow::default(),
             compaction_checked: std::collections::HashSet::new(),
-            plugins_global_open: true,
             plugins_tab: 0,
             skills_browse_open: false,
             skills_dirs_open: false,
@@ -1104,6 +1174,10 @@ impl Shell {
     /// Open the settings dialog, loading the fields from the saved settings.
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.open_settings();
+        // The dialog opens on a fresh read of the installed packages: a package
+        // may have been installed, removed or upgraded by another process since
+        // the cache was filled, and this is a user action, not a render.
+        self.installed_cache.clear();
         let draft = self.state.draft().clone();
         self.settings_inputs.sync(&draft, window, cx);
         cx.notify();
@@ -1135,6 +1209,9 @@ impl Shell {
             Ok(()) => {
                 self.caps.clear();
                 self.plugins.clear();
+                // A save can change the inventory (an installed package added
+                // or removed in the draft), so the next list re-reads packages.
+                self.installed_cache.clear();
                 self.developer_tools_failed = false;
                 self.state
                     .notice(crate::i18n::tr(self.state.lang, "settings.saved").to_string());
@@ -2414,6 +2491,14 @@ impl Render for Shell {
             } else {
                 None
             };
+        // The trust confirmation: an installed package's commands are shown
+        // and approved here, over the panel that listed them.
+        let confirm_trust =
+            if self.state.overlay == Overlay::Settings && self.trust_confirm.is_some() {
+                Some(self.render_trust_confirm(cx))
+            } else {
+                None
+            };
         // The vault's own delete confirmation, drawn over the same panel.
         let confirm_vault_delete =
             if self.state.overlay == Overlay::Settings && self.vault_confirm_delete.is_some() {
@@ -2486,6 +2571,7 @@ impl Render for Shell {
             .when_some(confirm_delete, |root, confirm| root.child(confirm))
             .when_some(confirm_permission, |root, confirm| root.child(confirm))
             .when_some(confirm_provider_delete, |root, confirm| root.child(confirm))
+            .when_some(confirm_trust, |root, confirm| root.child(confirm))
             .when_some(confirm_vault_delete, |root, confirm| root.child(confirm))
             .when_some(trash, |root, panel| root.child(panel))
     }

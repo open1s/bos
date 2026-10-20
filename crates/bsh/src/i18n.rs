@@ -88,6 +88,39 @@ mod tests {
         assert_ne!(zh, en, "zh fell back to english");
     }
 
+    /// The two locale files carry exactly the same keys.
+    ///
+    /// `tr` renders a missing key as itself, so a key added to one file and
+    /// forgotten in the other is invisible to the compiler and visible only to
+    /// the reader in whichever language did not get the line. This reads the
+    /// source files, not the compiled tables, because rust-i18n offers no key
+    /// enumeration.
+    #[test]
+    fn the_two_locale_files_carry_the_same_keys() {
+        fn keys(text: &str) -> std::collections::BTreeSet<String> {
+            text.lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    let rest = line.strip_prefix('"')?;
+                    let (key, tail) = rest.split_once('"')?;
+                    tail.trim_start().starts_with(':').then(|| key.to_string())
+                })
+                .collect()
+        }
+        let en = keys(include_str!("../locales/en.yml"));
+        let zh = keys(include_str!("../locales/zh.yml"));
+        assert_eq!(
+            en.difference(&zh).collect::<Vec<_>>(),
+            Vec::<&String>::new(),
+            "keys missing from zh"
+        );
+        assert_eq!(
+            zh.difference(&en).collect::<Vec<_>>(),
+            Vec::<&String>::new(),
+            "keys missing from en"
+        );
+    }
+
     #[test]
     fn navigation_keys_resolve_in_both_locales() {
         for key in [

@@ -87,6 +87,29 @@ pub(crate) fn age(then: u64) -> String {
     }
 }
 
+/// How many trust decisions the audit ring keeps.
+pub(crate) const TRUST_AUDIT_LIMIT: usize = 64;
+
+/// One recorded trust decision about an installed extension's commands.
+///
+/// The record names the package, the directory it was trusted at, the exact
+/// command line(s) the decision covers, when it was made and whether it was an
+/// approval. Environment VALUES never enter it: a command is the executable and
+/// its arguments, never the child's environment.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TrustDecision {
+    /// The settings id of the package.
+    pub(crate) extension_id: String,
+    /// The package directory at the time of the decision.
+    pub(crate) path: String,
+    /// The exact command line(s) the decision covers.
+    pub(crate) commands: Vec<String>,
+    /// Unix seconds the decision was made.
+    pub(crate) at: u64,
+    /// Whether the reader approved the commands.
+    pub(crate) allow: bool,
+}
+
 /// A full-window surface layered over the shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Overlay {
@@ -172,6 +195,12 @@ pub(crate) struct AppState {
     /// A server is a process or an endpoint, so connecting is expensive and
     /// must survive across turns; the pool reconciles when the settings change.
     pub(crate) mcp: crate::mcp::McpPool,
+    /// The bounded ring of trust decisions, oldest first.
+    ///
+    /// This crate has no extension-wide audit surface, so the trust gate keeps
+    /// its own small record beside the state it guards. Env values never enter
+    /// it: only the command line, the package and its path.
+    trust_audit: std::collections::VecDeque<TrustDecision>,
     /// A transient line of feedback.
     pub(crate) notice: Option<String>,
     /// Whether the usage pill's dialog is open.
@@ -266,6 +295,7 @@ impl AppState {
             attachments: Vec::new(),
             runner: Runner::new(),
             mcp: crate::mcp::McpPool::default(),
+            trust_audit: std::collections::VecDeque::new(),
             notice: None,
             stat_open: false,
             meter_open: false,
@@ -496,7 +526,8 @@ impl AppState {
     /// configuration is unchanged keep their live connection.
     pub(crate) fn refresh_mcp(&mut self) {
         let servers = self.settings.mcp_servers();
-        let failed = self.mcp.sync(self.runner.rt(), &servers);
+        let extensions = crate::mcp::extension_servers(&self.settings);
+        let failed = self.mcp.sync_all(self.runner.rt(), &servers, &extensions);
         if !failed.is_empty() {
             self.notice(crate::i18n::tr_args(
                 self.lang,
@@ -1786,15 +1817,315 @@ impl AppState {
         match draft
             .workspace
             .disabled
-            .extentions
+            .extensions
             .iter()
             .position(|plugin| plugin == name)
         {
             Some(index) => {
-                draft.workspace.disabled.extentions.remove(index);
+                draft.workspace.disabled.extensions.remove(index);
             }
-            None => draft.workspace.disabled.extentions.push(name.to_string()),
+            None => draft.workspace.disabled.extensions.push(name.to_string()),
         }
+    }
+
+    /// The trust decisions recorded this run, oldest first.
+    ///
+    /// The pane shows the state, not the log; this is the test-facing copy of
+    /// the ring. Bounded by [`TRUST_AUDIT_LIMIT`].
+    #[cfg(test)]
+    pub(crate) fn trust_audit(&self) -> Vec<TrustDecision> {
+        self.trust_audit.iter().cloned().collect()
+    }
+
+    /// Append one trust decision, trimming the oldest so the ring stays bounded.
+    fn record_trust(
+        &mut self,
+        allow: bool,
+        id: &str,
+        path: &str,
+        launches: &[crate::mcp::McpLaunch],
+    ) {
+        while self.trust_audit.len() >= TRUST_AUDIT_LIMIT {
+            self.trust_audit.pop_front();
+        }
+        self.trust_audit.push_back(TrustDecision {
+            extension_id: id.to_string(),
+            path: path.to_string(),
+            commands: launches
+                .iter()
+                .map(|launch| launch.command.clone())
+                .collect(),
+            at: now(),
+            allow,
+        });
+    }
+
+    /// The declared MCP launches of one installed package, with its stored path.
+    ///
+    /// `None` when the package is not installed, has no path, or declares no
+    /// MCP server - the three cases where a trust decision has nothing to
+    /// approve. Env values are absent from the launches by construction.
+    fn declared_launches(&self, id: &str) -> Option<(String, Vec<crate::mcp::McpLaunch>)> {
+        let record = self
+            .draft()
+            .global
+            .extensions
+            .iter()
+            .find(|record| record.id == id)?;
+        let path = record
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())?
+            .to_string();
+        let root = record.path_root()?;
+        let launches = crate::mcp::declared_servers(&root, &record.id)
+            .iter()
+            .map(crate::mcp::ExtensionMcp::launch)
+            .collect::<Vec<_>>();
+        (!launches.is_empty()).then_some((path, launches))
+    }
+
+    /// Approve one installed package's declared commands, enable it and persist.
+    ///
+    /// This is the handler the pane's Trust and enable button calls: the store
+    /// marks the package trusted AT THE PATH it is installed at, the workspace
+    /// disabled list drops it, and the decision is written immediately - a
+    /// package's commands are concrete state on disk, not a preference waiting
+    /// for the dialog's Save.
+    ///
+    /// The audit row is appended BEFORE the pool reconciles, so the approval is
+    /// recorded even if the child then fails to start. If the record cannot be
+    /// saved, the in-memory flag is reverted and no pool reconcile runs: a
+    /// decision that did not reach disk must not start a process for this
+    /// session either.
+    pub(crate) fn trust_extension(&mut self, id: &str) -> bool {
+        let Some((path, launches)) = self.declared_launches(id) else {
+            return false;
+        };
+        let was_disabled = self
+            .draft()
+            .workspace
+            .disabled
+            .extensions
+            .iter()
+            .any(|disabled| disabled == id);
+        {
+            let draft = self.draft_mut();
+            let Some(record) = draft
+                .global
+                .extensions
+                .iter_mut()
+                .find(|record| record.id == id)
+            else {
+                return false;
+            };
+            record.trusted = true;
+            record.trusted_path = Some(path.clone());
+            draft
+                .workspace
+                .disabled
+                .extensions
+                .retain(|disabled| disabled != id);
+        }
+        self.record_trust(true, id, &path, &launches);
+        if let Err(error) = self.persist_extension_state() {
+            log::warn!("trust decision for extension '{id}' was not saved: {error}");
+            let draft = self.draft_mut();
+            if let Some(record) = draft
+                .global
+                .extensions
+                .iter_mut()
+                .find(|record| record.id == id)
+            {
+                record.trusted = false;
+                record.trusted_path = None;
+            }
+            if was_disabled
+                && !draft
+                    .workspace
+                    .disabled
+                    .extensions
+                    .iter()
+                    .any(|disabled| disabled == id)
+            {
+                draft.workspace.disabled.extensions.push(id.to_string());
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Record that the reader DECLINED one package's declared commands.
+    ///
+    /// Nothing is written to the setting: the package stays untrusted, which is
+    /// already the state. The audit ring keeps the refusal, because a gate that
+    /// only records approvals cannot answer "was this package ever offered?".
+    pub(crate) fn decline_trust(&mut self, id: &str) -> bool {
+        let Some((path, launches)) = self.declared_launches(id) else {
+            return false;
+        };
+        self.record_trust(false, id, &path, &launches);
+        true
+    }
+
+    /// Register one market plugin in the draft extension inventory.
+    ///
+    /// Ownership: the MARKET row is what installs, so the record carries the
+    /// metadata the row already read (name, display name, description, version,
+    /// standard, source label, install target) plus the package directory and
+    /// whether that directory is BOS's managed copy. The path is authoritative:
+    /// the pane re-reads the manifest from it, so a stale cached field can never
+    /// make a package loadable or not.
+    ///
+    /// Installing is a draft write, like every other pane edit, but the caller
+    /// persists it immediately through `persist_extension_state` - an installed
+    /// package is concrete state already on disk, not a preference waiting for
+    /// Save. A package whose id is already installed is left alone, so a
+    /// repeated press cannot create a duplicate the settings validation would
+    /// reject on Save.
+    pub(crate) fn install_extension(
+        &mut self,
+        plugin: &crate::market::MarketPlugin,
+        path: &std::path::Path,
+        managed: bool,
+        install_target: &str,
+    ) -> bool {
+        let draft = self.draft_mut();
+        if draft
+            .global
+            .extensions
+            .iter()
+            .any(|extension| extension.id == plugin.id)
+        {
+            return false;
+        }
+        draft
+            .global
+            .extensions
+            .push(crate::settings::global::InstalledExtension {
+                id: plugin.id.clone(),
+                // The manifest's package name is the id for both standards;
+                // the display name is the market row's own title.
+                name: plugin.id.clone(),
+                display_name: plugin.name.clone(),
+                description: plugin.description.clone(),
+                version: plugin.version.clone(),
+                standard: crate::settings::global::InstalledStandard::from(plugin.standard),
+                source_label: plugin.source_label.clone(),
+                install_target: install_target.to_string(),
+                path: Some(path.to_string_lossy().to_string()),
+                managed,
+                installed_at: crate::settings::unix_now(),
+                // A fresh package starts untrusted: its declared commands (MCP
+                // servers) do not run until the reader approves the directory.
+                trusted: false,
+                trusted_path: None,
+            });
+        draft
+            .workspace
+            .disabled
+            .extensions
+            .retain(|disabled| disabled != &plugin.id);
+        true
+    }
+
+    /// Add one remote market index URL to the draft.
+    ///
+    /// The URL is validated and normalized first; a duplicate or malformed URL
+    /// is refused with a sentence the pane can show. Save remains the commit.
+    pub(crate) fn add_market_index(&mut self, raw: &str) -> Result<String, String> {
+        let url = crate::market::validate_index_url(raw)?;
+        let draft = self.draft_mut();
+        if draft
+            .global
+            .market_indexes
+            .iter()
+            .any(|existing| existing == &url)
+        {
+            return Err("that market index is already configured".to_string());
+        }
+        draft.global.market_indexes.push(url.clone());
+        Ok(url)
+    }
+
+    /// Remove one remote market index URL from the draft.
+    pub(crate) fn remove_market_index(&mut self, url: &str) -> bool {
+        let draft = self.draft_mut();
+        let before = draft.global.market_indexes.len();
+        draft
+            .global
+            .market_indexes
+            .retain(|existing| existing != url);
+        draft.global.market_indexes.len() != before
+    }
+
+    /// Remove one installed market plugin from the draft inventory.
+    ///
+    /// Only an entry that carries a package path can be uninstalled: the
+    /// built-in bundles have no directory to remove, so a stray call cannot
+    /// hide one from the pane. The workspace's disabled entry goes with it.
+    ///
+    /// Ownership: a MANAGED package (one the market downloaded into
+    /// `~/.bos/bsh/extensions`) has its directory deleted; a local package
+    /// registered in place is the reader's own directory and is never deleted.
+    /// `remove_managed` also refuses a path outside the managed root, so a
+    /// hand-edited record cannot turn `managed = true` into an arbitrary
+    /// directory delete.
+    pub(crate) fn uninstall_extension(&mut self, id: &str) -> bool {
+        self.uninstall_extension_in(&crate::settings::dir().join("extensions"), id)
+    }
+
+    /// Uninstall against an explicit managed root, for tests and for a
+    /// sandboxed home. The production path supplies `~/.bos/bsh/extensions`.
+    pub(crate) fn uninstall_extension_in(
+        &mut self,
+        managed_root: &std::path::Path,
+        id: &str,
+    ) -> bool {
+        let draft = self.draft_mut();
+        let Some(index) = draft
+            .global
+            .extensions
+            .iter()
+            .position(|extension| extension.id == id && extension.path.is_some())
+        else {
+            return false;
+        };
+        let record = draft.global.extensions.remove(index);
+        draft
+            .workspace
+            .disabled
+            .extensions
+            .retain(|disabled| disabled != id);
+        if record.managed {
+            if let Some(raw) = record.path {
+                let path = crate::caps::expand_path(&raw);
+                crate::market::remove_managed(managed_root, &path);
+            }
+        }
+        true
+    }
+
+    /// Commit the extension inventory and its per-workspace disabled list
+    /// without committing unrelated draft settings.
+    ///
+    /// Installing, uninstalling, enabling and disabling are concrete package
+    /// actions, not preferences the reader expects to have to Save: the files
+    /// are already on disk, and a restart must find the same inventory. Only
+    /// these two fields are copied out of the draft; a provider or theme edit
+    /// still waits for the dialog's Save.
+    pub(crate) fn persist_extension_state(&mut self) -> std::io::Result<()> {
+        let mut next = self.settings.clone();
+        next.global.extensions = self.draft().global.extensions.clone();
+        next.workspace.disabled.extensions = self.draft().workspace.disabled.extensions.clone();
+        next.save()?;
+        self.settings = next;
+        // The pool is configuration-derived: a newly enabled MCP plugin must
+        // connect now, and a disabled one must drop its child before the next
+        // turn. Centralized here so every persistence caller gets the same pool.
+        self.refresh_mcp();
+        Ok(())
     }
 
     /// Switch one skill on or off in the draft.
@@ -2508,5 +2839,76 @@ mod tests {
         state.settings.workspace.general.legacy_model = "gamma".to_string();
         assert!(!state.adopt_legacy_model(), "an existing choice wins");
         assert_eq!(state.effective_in(&first).model, "beta");
+    }
+
+    /// Uninstall drops the inventory record in both cases, but deletes a
+    /// directory ONLY for a managed copy. A local package is the user's own
+    /// directory and is left exactly where it was.
+    #[test]
+    fn uninstall_deletes_only_a_managed_directory() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-uninstall-{}", uuid::Uuid::new_v4()));
+        let managed_root = base.join("managed");
+        let managed = managed_root
+            .join("plugin-a")
+            .join("node_modules")
+            .join("plugin-a");
+        let local = base.join("local-plugin");
+        std::fs::create_dir_all(&managed).expect("the managed fixture");
+        std::fs::create_dir_all(&local).expect("the local fixture");
+
+        let mut state =
+            super::AppState::with_store(crate::store::Store::open_at(base.join("store")));
+        let record = |id: &str, path: &std::path::Path, managed: bool| {
+            crate::settings::global::InstalledExtension {
+                id: id.to_string(),
+                path: Some(path.to_string_lossy().to_string()),
+                managed,
+                ..Default::default()
+            }
+        };
+        state.settings.global.extensions = vec![
+            record("plugin-a", &managed, true),
+            record("local-plugin", &local, false),
+        ];
+        state.settings.workspace.disabled.extensions =
+            vec!["plugin-a".to_string(), "local-plugin".to_string()];
+
+        assert!(state.uninstall_extension_in(&managed_root, "local-plugin"));
+        assert!(
+            local.is_dir(),
+            "a local package is never deleted by an uninstall"
+        );
+        assert!(
+            !state
+                .draft()
+                .workspace
+                .disabled
+                .extensions
+                .contains(&"local-plugin".to_string()),
+            "its disabled entry goes with the record"
+        );
+
+        assert!(state.uninstall_extension_in(&managed_root, "plugin-a"));
+        assert!(
+            !managed_root.join("plugin-a").exists(),
+            "the managed directory is removed"
+        );
+        assert!(
+            state.draft().global.extensions.is_empty(),
+            "both records are gone"
+        );
+        assert!(
+            !state
+                .draft()
+                .workspace
+                .disabled
+                .extensions
+                .iter()
+                .any(|id| id == "plugin-a"),
+            "and both disabled entries with them"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

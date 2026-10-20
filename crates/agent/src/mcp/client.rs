@@ -108,7 +108,17 @@ enum TransportBackend {
 impl McpClient {
     /// Spawn an MCP server process and connect over stdio.
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self, McpError> {
-        let transport = StdioTransport::spawn(command, args).await?;
+        Self::spawn_with(command, args, &[], None).await
+    }
+
+    /// Spawn an MCP server with its own environment and working directory.
+    pub async fn spawn_with(
+        command: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Self, McpError> {
+        let transport = StdioTransport::spawn_with(command, args, env, cwd).await?;
         Ok(Self {
             transport: Arc::new(Mutex::new(TransportBackend::Stdio(transport))),
             request_id: std::sync::atomic::AtomicU64::new(1),

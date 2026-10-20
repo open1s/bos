@@ -1414,7 +1414,7 @@ fn plugin_switch_writes_the_disabled_plugin(cx: &mut TestAppContext) {
             .draft()
             .workspace
             .disabled
-            .extentions
+            .extensions
             .clone()
     });
     assert_eq!(
@@ -4264,8 +4264,9 @@ fn the_builtin_plugins_pane_reads_the_draft(cx: &mut TestAppContext) {
     assert!(enabled(cx, "files"), "another plugin is unaffected");
 }
 
-/// The Extensions pane has the reference shape: a tab strip, a search
-/// field, and the two collapsible groups the reference draws.
+/// The Extensions pane has the reference shape: a tab strip, the page
+/// header's Refresh/Add controls, a search field, and the three vertical
+/// sections (built-in settings, experimental, installed) drawn as rows.
 #[gpui::test]
 fn the_plugins_pane_has_the_reference_shape(cx: &mut TestAppContext) {
     init_test_app(cx);
@@ -4278,10 +4279,21 @@ fn the_plugins_pane_has_the_reference_shape(cx: &mut TestAppContext) {
 
     for selector in [
         "plugins-tabs",
-        "plugins-session",
-        "plugins-global",
+        "plugins-tab-list",
         "plugins-tab-mcp",
         "plugins-tab-market",
+        "plugins-refresh",
+        "plugins-add",
+        "plugins-page-info",
+        "builtin-settings-header",
+        "builtin-setting-web-search",
+        "builtin-setting-agent-loop",
+        "builtin-setting-shell",
+        "experimental-plugins-header",
+        "experimental-developer-tools-row",
+        "installed-plugins-header",
+        "installed-empty",
+        "installed-empty-market",
     ] {
         assert!(
             cx.debug_bounds(selector).is_some(),
@@ -4292,52 +4304,502 @@ fn the_plugins_pane_has_the_reference_shape(cx: &mut TestAppContext) {
         cx.debug_bounds("plugin-none").is_none(),
         "the old bare list is gone"
     );
+    assert!(
+        cx.debug_bounds("plugins-session").is_none() && cx.debug_bounds("plugins-global").is_none(),
+        "the reference's collapsible groups are gone"
+    );
 }
 
-/// Both groups collapse, and the session group lists what the active preset
-/// composes - the shipped `standard` preset mounts shell, files and plan.
+/// A built-in settings row navigates to the pane that owns the setting, with
+/// the same write the rail's cells make.
 #[gpui::test]
-fn the_plugins_pane_groups_collapse_and_list_the_preset(cx: &mut TestAppContext) {
+fn a_builtin_plugin_setting_row_navigates_to_its_pane(cx: &mut TestAppContext) {
     init_test_app(cx);
-    let (_harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("plugins-groups", 1);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-nav", 1);
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("plugins"), state, cx));
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
-    assert!(
-        cx.debug_bounds("builtin-plugin-0").is_some(),
-        "the global group lists its plugin cards"
-    );
-    let header = cx
-        .debug_bounds("plugins-global")
-        .expect("the global header");
-    cx.simulate_click(header.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("builtin-plugin-0").is_none(),
-        "a collapsed group drops its cards"
-    );
-    assert!(
-        cx.debug_bounds("plugins-global").is_some(),
-        "while its header stays"
-    );
+    for (selector, pane) in [
+        ("builtin-setting-web-search", "tools"),
+        ("builtin-setting-agent-loop", "agent-loop"),
+        ("builtin-setting-shell", "shell"),
+    ] {
+        let row = cx.debug_bounds(selector).expect("the built-in row");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let section = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.settings_section);
+        assert_eq!(
+            section,
+            section_index(pane).expect("the target pane"),
+            "{selector} navigates to {pane}"
+        );
+        // The nav write leaves the row's own pane; go back for the next row.
+        let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+        cx.update(|_, cx| {
+            shell.update(cx, |this, _| {
+                this.state.settings_section =
+                    section_index("plugins").expect("the Extensions pane");
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
 
     assert!(
-        cx.debug_bounds("plugins-composed-shell").is_some(),
-        "the session group shows the preset bundles"
-    );
-    let session = cx
-        .debug_bounds("plugins-session")
-        .expect("the session header");
-    cx.simulate_click(session.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("plugins-composed-shell").is_none(),
-        "and collapses"
+        cx.debug_bounds("builtin-setting-subagent").is_none(),
+        "Subagent has no pane here, so no row links nowhere"
     );
 }
+/// The installed list renders one row per inventory record and reads the
+/// package manifest for the title, description and version - not the record's
+/// stale cache.
+#[gpui::test]
+fn the_plugin_list_draws_a_row_per_installed_extension(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-installed-rows", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            // Seed the DRAFT, not the committed settings: an extension in the
+            // committed tree would make `assemble` derive and start its MCP
+            // servers, which this list test does not exercise.
+            shell.state.draft_mut().global.extensions = vec![
+                installed_fixture("dsh-echo", true),
+                installed_fixture("codex-deploy", false),
+            ];
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    for selector in [
+        "installed-row-@local/dsh-echo",
+        "installed-row-codex-deploy",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "an installed extension draws its row: {selector}"
+        );
+    }
+    assert!(
+        cx.debug_bounds("installed-empty").is_none(),
+        "a populated list is not the empty state"
+    );
+    let resolved = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |this, _| this.installed_plugins())
+    });
+    let echo = resolved
+        .iter()
+        .find(|plugin| plugin.id == "@local/dsh-echo")
+        .expect("the dsh fixture resolves");
+    assert_eq!(echo.display_name, "Fixture DSH Echo", "the manifest title");
+    assert_eq!(
+        echo.description, "A fixture DeepSeek Harness package for the extension substrate.",
+        "the manifest description is the row's subtitle"
+    );
+    assert_eq!(echo.version, "1.2.3");
+    assert_eq!(echo.name, "@local/dsh-echo", "the package id is the name");
+}
+
+/// A package whose shim refusals are non-empty carries the Problem pill, and
+/// pressing the row opens the read-only disclosure that names the refused
+/// kinds.
+#[gpui::test]
+fn a_refusal_carrying_extension_shows_the_problem_pill_and_disclosure(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-problem", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            // Draft-only so the codex fixture's MCP server is not spawned.
+            shell.state.draft_mut().global.extensions =
+                vec![installed_fixture("codex-deploy", false)];
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("installed-problem-codex-deploy").is_some(),
+        "the refused package carries the Problem pill"
+    );
+    let resolved = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |this, _| this.installed_plugins())
+    });
+    let plugin = &resolved[0];
+    assert!(plugin.problem());
+    assert!(plugin.refusal_count() > 0);
+    assert!(
+        plugin
+            .refusals
+            .iter()
+            .any(|refusal| refusal.feature == "external app connector"),
+        "the refused kind is recorded: {:?}",
+        plugin.refusals
+    );
+    assert!(
+        !plugin
+            .refusals
+            .iter()
+            .any(|refusal| refusal.feature == "MCP server"),
+        "MCP is started by this crate, so it is not a problem"
+    );
+
+    let row = cx
+        .debug_bounds("installed-row-codex-deploy")
+        .expect("the installed row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("installed-detail-codex-deploy").is_some(),
+        "pressing the row opens the disclosure"
+    );
+    assert!(
+        cx.debug_bounds("installed-refusal-codex-deploy-0")
+            .is_some(),
+        "the disclosure lists the refused kinds"
+    );
+}
+
+/// An installed package that declares MCP servers shows Needs trust, and its
+/// disclosure names the exact command line and the env KEYS - never a value.
+#[gpui::test]
+fn an_untrusted_mcp_plugin_shows_needs_trust_and_its_commands(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-needs-trust", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            // Draft-only AND untrusted: the package's command must not start.
+            shell.state.draft_mut().global.extensions =
+                vec![installed_fixture("codex-deploy", false)];
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("installed-needs-trust-codex-deploy")
+            .is_some(),
+        "an untrusted MCP package carries the Needs trust pill"
+    );
+    let row = cx
+        .debug_bounds("installed-row-codex-deploy")
+        .expect("the installed row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("installed-mcp-codex-deploy-0").is_some(),
+        "the disclosure draws the declared command"
+    );
+    assert!(
+        cx.debug_bounds("installed-trust-codex-deploy").is_some(),
+        "and the control that would approve it"
+    );
+
+    // The detail draws exactly these three fields; joining them is the text a
+    // reader can see, so an env value could only appear by appearing here.
+    let shown = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |this, _| {
+            let plugin = this
+                .installed_plugins()
+                .into_iter()
+                .find(|plugin| plugin.id == "codex-deploy")
+                .expect("the fixture resolves");
+            plugin
+                .mcp_launches
+                .iter()
+                .map(|launch| {
+                    format!(
+                        "{} {} {}",
+                        launch.command,
+                        launch.cwd.clone().unwrap_or_default(),
+                        launch.env_keys.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    });
+    assert!(
+        shown.contains("./server.js"),
+        "the exact command line is disclosed: {shown}"
+    );
+    assert!(
+        shown.contains("FIXTURE_TOKEN"),
+        "the environment is summarised by key: {shown}"
+    );
+    assert!(
+        !shown.contains("sk-fixture-secret"),
+        "the fixture's env VALUE never reaches the UI output: {shown}"
+    );
+}
+
+/// The trust button opens the confirmation, a cancel records a refusal, and the
+/// confirm is the one press that trusts and enables the package.
+#[gpui::test]
+fn the_trust_confirmation_names_the_commands_and_is_the_only_approval(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (root, record) = trust_package_fixture("trust-dialog");
+    let cleanup = root.clone();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-trust-confirm", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            shell.state.draft_mut().global.extensions = vec![record];
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let row = cx
+        .debug_bounds("installed-row-trust-dialog")
+        .expect("the installed row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let trust = cx
+        .debug_bounds("installed-trust-trust-dialog")
+        .expect("the approve control");
+    cx.simulate_click(trust.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("trust-confirm-dialog").is_some(),
+        "the press opens the confirmation, it does not trust on its own"
+    );
+    assert!(
+        cx.debug_bounds("trust-confirm-command-0").is_some(),
+        "the dialog names the command line"
+    );
+    assert!(cx.debug_bounds("trust-confirm-cancel").is_some());
+    assert!(cx.debug_bounds("trust-confirm-apply").is_some());
+
+    // Cancelling is a refusal: nothing is trusted, and the ring keeps it.
+    let cancel = cx
+        .debug_bounds("trust-confirm-cancel")
+        .expect("the cancel control");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (trusted, audit, dialog) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |this, _| {
+            let trusted = this.state.draft().global.extensions[0].trusted;
+            (
+                trusted,
+                this.state.trust_audit(),
+                this.trust_confirm.is_some(),
+            )
+        })
+    });
+    assert!(!trusted, "cancel leaves the package untrusted");
+    assert_eq!(audit.len(), 1, "the refusal is recorded");
+    assert!(!audit[0].allow);
+    assert!(!dialog, "cancel closes the dialog");
+    assert!(
+        cx.debug_bounds("installed-needs-trust-trust-dialog")
+            .is_some(),
+        "the row still asks for trust"
+    );
+    // Reopen and approve: the confirm press is the decision.
+    let trust = cx
+        .debug_bounds("installed-trust-trust-dialog")
+        .expect("the approve control is still there");
+    cx.simulate_click(trust.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let apply = cx
+        .debug_bounds("trust-confirm-apply")
+        .expect("the confirm control");
+    cx.simulate_click(apply.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (trusted, is_trusted, enabled, audit, dialog) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |this, _| {
+            let record = &this.state.draft().global.extensions[0];
+            (
+                record.trusted,
+                record.is_trusted(),
+                !this
+                    .state
+                    .draft()
+                    .workspace
+                    .disabled
+                    .extensions
+                    .contains(&"trust-dialog".to_string()),
+                this.state.trust_audit(),
+                this.trust_confirm.is_some(),
+            )
+        })
+    });
+    assert!(trusted && is_trusted, "confirm writes the approval");
+    assert!(enabled, "Trust and enable also enables the package");
+    assert_eq!(audit.len(), 2, "the approval is a second decision");
+    assert!(audit[1].allow);
+    assert!(!dialog, "confirm closes the dialog");
+    assert!(
+        cx.debug_bounds("installed-needs-trust-trust-dialog")
+            .is_none(),
+        "the trusted row no longer asks for trust"
+    );
+    let _ = std::fs::remove_dir_all(&cleanup);
+}
+
+/// The installed switch is the market card's write: the workspace disabled
+/// list, persisted immediately rather than waiting for the dialog's Save.
+#[gpui::test]
+fn the_installed_toggle_persists_immediately(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("plugins-toggle-persist", 1);
+        state.settings.global.extensions = vec![installed_fixture("dsh-echo", true)];
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("plugins"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("installed-empty").is_none(),
+        "the seeded inventory draws a row"
+    );
+
+    let toggle = cx
+        .debug_bounds("installed-toggle-@local/dsh-echo")
+        .expect("the installed switch");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (disabled, root) = cx.update(|_, cx| {
+        let this = harness.read(cx).shell.read(cx);
+        (
+            this.state
+                .draft()
+                .workspace
+                .disabled
+                .extensions
+                .contains(&"@local/dsh-echo".to_string()),
+            this.state
+                .settings
+                .save_root
+                .clone()
+                .expect("a scratch root"),
+        )
+    });
+    assert!(disabled, "the switch writes the draft disabled list");
+    assert!(
+        cx.debug_bounds("installed-detail-@local/dsh-echo")
+            .is_none(),
+        "the toggle press does not also open the row disclosure"
+    );
+
+    // Reload from disk: the write did not wait for Save.
+    let saved_global = crate::settings::global::GlobalSettings::load(&root.join("settings.toml"))
+        .expect("the persisted global document");
+    let saved = saved_global
+        .extensions
+        .iter()
+        .find(|extension| extension.id == "@local/dsh-echo")
+        .expect("the inventory record persisted");
+    assert_eq!(saved.version, "1.2.3", "install metadata persisted");
+    assert_eq!(
+        saved.description,
+        "A fixture DeepSeek Harness package for the extension substrate."
+    );
+    assert!(saved.managed, "the managed flag persisted");
+    let workspace_path = crate::settings::workspace::WorkspaceSettings::path(&root);
+    let saved_workspace = crate::settings::workspace::WorkspaceSettings::load(&workspace_path)
+        .expect("the persisted workspace document");
+    assert!(
+        saved_workspace
+            .disabled
+            .extensions
+            .contains(&"@local/dsh-echo".to_string()),
+        "the disabled list is on disk immediately, not draft-only"
+    );
+}
+
+/// An empty inventory still draws the Installed section, with a sentence and
+/// the action that opens the Plugin Market tab.
+#[gpui::test]
+fn the_empty_installed_list_offers_the_market(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-empty", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            // No network in a test: the action only needs to switch the tab.
+            shell.market_loaded = true;
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("installed-plugins-header").is_some(),
+        "the empty section still has its heading"
+    );
+    assert!(
+        cx.debug_bounds("installed-empty").is_some(),
+        "and a real empty state"
+    );
+    let action = cx
+        .debug_bounds("installed-empty-market")
+        .expect("the market action");
+    cx.simulate_click(action.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let tab = cx.update(|_, cx| harness.read(cx).shell.read(cx).plugins_tab);
+    assert_eq!(tab, 3, "the action switches to the Plugin Market tab");
+    assert!(
+        cx.debug_bounds("market-refresh").is_some(),
+        "and the market body is what draws"
+    );
+}
+
+/// A section whose rows are all filtered away is not drawn; the search's own
+/// sentence replaces it rather than an empty heading.
+#[gpui::test]
+fn a_section_with_no_rows_is_not_drawn(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("plugins-no-rows", 1);
+        state.settings.global.extensions = vec![installed_fixture("dsh-echo", true)];
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("plugins"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("installed-plugins-header").is_some(),
+        "the premise: the section has a row"
+    );
+
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.state.plugin_query = "no-such-plugin".to_string();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("installed-plugins-header").is_none(),
+        "a filtered-away section draws no heading"
+    );
+    assert!(
+        cx.debug_bounds("installed-row-@local/dsh-echo").is_none(),
+        "and no row"
+    );
+    assert!(
+        cx.debug_bounds("builtin-settings-header").is_some(),
+        "the sections that still have rows stay"
+    );
+}
+
 /// Every label the plugin panes draw resolves in both locales; a typo would
 /// otherwise render the key itself.
 #[test]
@@ -4345,10 +4807,72 @@ fn the_plugin_keys_resolve_in_both_locales() {
     for key in [
         "settings.plugins",
         "settings.builtinPluginsHint",
+        "settings.pluginsPageTitle",
+        "settings.pluginsPageHint",
+        "settings.pluginsBuiltinSettings",
+        "settings.pluginsExperimental",
+        "settings.pluginsExperimentalPill",
+        "settings.pluginsInstalled",
+        "settings.pluginsProblem",
+        "settings.pluginsProblemTooltip",
+        "settings.pluginsLoadErrorTooltip",
+        "settings.pluginsNeedsTrust",
+        "settings.pluginsNeedsTrustTooltip",
+        "settings.pluginsTrustEnable",
+        "settings.pluginsTrustCommands",
+        "settings.pluginsTrustCwd",
+        "settings.pluginsTrustEnv",
+        "settings.pluginsTrustTitle",
+        "settings.pluginsTrustDescription",
+        "settings.pluginsTrustCancel",
+        "settings.pluginsTrustConfirm",
+        "settings.pluginsTrustFailed",
+        "settings.pluginsRefresh",
+        "settings.pluginsAdd",
+        "settings.pluginsInstalledEmpty",
+        "settings.pluginsBrowseMarket",
+        "settings.pluginsDeveloperTools",
+        "settings.pluginsDetailStandard",
+        "settings.pluginsDetailVersion",
+        "settings.pluginsDetailSource",
+        "settings.pluginsDetailInstallTarget",
+        "settings.pluginsDetailPath",
+        "settings.pluginsDetailCapabilities",
+        "settings.pluginsNoCapabilities",
+        "settings.pluginsNoPath",
         "settings.pluginEnabled",
         "settings.pluginDisabled",
         "settings.plugin-inventory",
         "settings.pluginListHint",
+        "settings.marketIntro",
+        "settings.marketLocalOnly",
+        "settings.marketApplyHint",
+        "settings.marketRefresh",
+        "settings.marketSearch",
+        "settings.marketEmpty",
+        "settings.marketCounts",
+        "settings.marketSources",
+        "settings.marketSourcesSummary",
+        "settings.marketBuiltin",
+        "settings.marketInstalled",
+        "settings.marketNoSources",
+        "settings.marketEmptyHint",
+        "settings.marketCountCodex",
+        "settings.marketCountDsh",
+        "settings.marketCountRemote",
+        "settings.marketUrlHint",
+        "settings.marketAddSource",
+        "settings.marketRemoveSource",
+        "settings.marketFetching",
+        "settings.marketInstalling",
+        "settings.marketError",
+        "settings.marketInstallError",
+        "settings.marketLimited",
+        "settings.marketInstall",
+        "settings.marketUninstall",
+        "settings.marketEnabled",
+        "settings.marketDisabled",
+        "settings.marketRefused",
     ] {
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             assert_ne!(crate::i18n::tr(lang, key), key, "missing locale value");
@@ -4421,6 +4945,142 @@ fn skills_write(root: &std::path::Path, name: &str) {
 fn seed_sources(shell: &mut Shell, sources: Vec<crate::settings::global::SkillSource>) {
     shell.plugins_tab = 2;
     shell.state.draft_mut().global.set_skill_sources(sources);
+}
+
+/// One market row from a repository fixture, so the pane test does not depend on
+/// the machine's Codex cache or DSH profile.
+fn market_fixture(name: &str) -> crate::market::MarketPlugin {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../agent/tests/fixtures/extensions")
+        .join(name);
+    let package = agent::extensions::ExtensionRegistry::load(&source)
+        .unwrap_or_else(|error| panic!("{name} loads: {error}"));
+    let refusals = package.refusals.len();
+    let extension = package.extension;
+    let description = extension
+        .description
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| extension.name.clone());
+    crate::market::MarketPlugin {
+        id: extension.id,
+        name: extension.name,
+        version: extension.version,
+        standard: extension.standard,
+        origin: crate::market::MarketOrigin::Local,
+        install: crate::market::MarketInstall::Local(source),
+        description,
+        keywords: Vec::new(),
+        capabilities: extension.capabilities,
+        refusals,
+        source_label: "test fixture".to_string(),
+    }
+}
+
+/// One inventory record pointing at a fixture package, so the installed list
+/// draws the same metadata the market row would have written at install time.
+fn installed_fixture(name: &str, managed: bool) -> crate::settings::global::InstalledExtension {
+    let plugin = market_fixture(name);
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../agent/tests/fixtures/extensions")
+        .join(name);
+    crate::settings::global::InstalledExtension {
+        id: plugin.id.clone(),
+        name: plugin.id.clone(),
+        display_name: plugin.name.clone(),
+        description: plugin.description.clone(),
+        version: plugin.version.clone(),
+        standard: crate::settings::global::InstalledStandard::from(plugin.standard),
+        source_label: plugin.source_label.clone(),
+        install_target: source.display().to_string(),
+        path: Some(source.to_string_lossy().to_string()),
+        managed,
+        installed_at: 1_700_000_000,
+        trusted: false,
+        trusted_path: None,
+    }
+}
+
+/// A scratch Codex package that declares an MCP server with an env secret.
+///
+/// The trust dialog test uses this instead of a fixture that runs a real
+/// service: the command exits immediately, so approving it cannot leave a
+/// process behind, while the declaration is still fully MCP-bearing.
+fn trust_package_fixture(
+    label: &str,
+) -> (
+    std::path::PathBuf,
+    crate::settings::global::InstalledExtension,
+) {
+    let root = std::env::temp_dir().join(format!("bsh-ui-trust-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(".codex-plugin")).expect("the manifest directory");
+    std::fs::write(
+        root.join(".codex-plugin/plugin.json"),
+        serde_json::json!({
+            "name": label,
+            "version": "1.0.0",
+            "description": "An MCP package the trust dialog names.",
+            "interface": { "displayName": "Trust Fixture" },
+            "mcpServers": "./.mcp.json"
+        })
+        .to_string(),
+    )
+    .expect("the manifest");
+    std::fs::write(
+        root.join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "echo": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "exit 0"],
+                    "env": { "FIXTURE_TOKEN": "sk-fixture-secret" }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("the MCP config");
+    let record = crate::settings::global::InstalledExtension {
+        id: label.to_string(),
+        name: label.to_string(),
+        display_name: "Trust Fixture".to_string(),
+        description: "An MCP package the trust dialog names.".to_string(),
+        version: "1.0.0".to_string(),
+        standard: crate::settings::global::InstalledStandard::Codex,
+        source_label: "test fixture".to_string(),
+        install_target: root.display().to_string(),
+        path: Some(root.to_string_lossy().to_string()),
+        managed: false,
+        installed_at: 1_700_000_000,
+        trusted: false,
+        trusted_path: None,
+    };
+    (root, record)
+}
+
+/// One remote-index row, so the source editor and remote card can be drawn
+/// without any network request.
+fn remote_market_fixture() -> crate::market::MarketPlugin {
+    crate::market::MarketPlugin {
+        id: "remote-fixture".to_string(),
+        name: "Remote Fixture".to_string(),
+        version: "1.0.0".to_string(),
+        standard: agent::extensions::ExtensionStandard::DeepSeekHarness,
+        origin: crate::market::MarketOrigin::Remote {
+            index_url: "https://market.example/plugins.json".to_string(),
+            market: "Test Market".to_string(),
+        },
+        install: crate::market::MarketInstall::Remote {
+            spec: "remote-fixture@1.0.0".to_string(),
+            registry: None,
+        },
+        description: "A plugin from a remote index.".to_string(),
+        keywords: vec!["remote".to_string()],
+        capabilities: Vec::new(),
+        refusals: 0,
+        source_label: "Remote · Test Market".to_string(),
+    }
 }
 
 /// The pane lists one card per source, with the count each contributed.
@@ -5024,7 +5684,7 @@ fn the_plugins_pane_tabs_switch_the_body_in_place(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
-        cx.debug_bounds("plugins-session").is_some(),
+        cx.debug_bounds("builtin-settings-header").is_some(),
         "the plugin list is the first tab"
     );
     assert!(
@@ -5053,7 +5713,7 @@ fn the_plugins_pane_tabs_switch_the_body_in_place(cx: &mut TestAppContext) {
         "the MCP body draws inside the pane"
     );
     assert!(
-        cx.debug_bounds("plugins-session").is_none(),
+        cx.debug_bounds("builtin-settings-header").is_none(),
         "the plugin list is replaced, not stacked under it"
     );
 
@@ -5065,10 +5725,553 @@ fn the_plugins_pane_tabs_switch_the_body_in_place(cx: &mut TestAppContext) {
     let plugins_tab = cx.update(|_, cx| harness.read(cx).shell.read(cx).plugins_tab);
     assert_eq!(plugins_tab, 0, "the list tab comes back");
     assert!(
-        cx.debug_bounds("plugins-session").is_some(),
+        cx.debug_bounds("builtin-settings-header").is_some(),
         "with the plugin list body"
     );
     assert!(cx.debug_bounds("mcp-add").is_none());
+}
+
+/// The Plugin Market tab is a real tab: selecting it shows local Codex and DSH
+/// rows in the same pane, without leaving Extensions.
+#[gpui::test]
+fn the_market_tab_lists_both_standards_in_place(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-market-tab", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            shell.market = vec![market_fixture("codex-deploy"), market_fixture("dsh-echo")];
+            shell.market_loaded = true;
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("market-card-0").is_none(),
+        "the market body is not drawn until its tab is chosen"
+    );
+
+    let tab = cx
+        .debug_bounds("plugins-tab-market")
+        .expect("the Plugin Market tab");
+    cx.simulate_click(tab.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (section, plugins_tab, loaded) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        (
+            shell.state.settings_section,
+            shell.plugins_tab,
+            shell.market_loaded,
+        )
+    });
+    assert_eq!(
+        section,
+        section_index("plugins").expect("the plugins section"),
+        "the market keeps the dialog on Extensions"
+    );
+    assert_eq!(plugins_tab, 3, "the market tab is the active one");
+    assert!(loaded, "the tab has a loaded catalog");
+    assert!(
+        cx.debug_bounds("market-card-0").is_some(),
+        "the Codex row draws"
+    );
+    assert!(
+        cx.debug_bounds("market-card-1").is_some(),
+        "the DSH row draws beside it"
+    );
+    assert!(
+        cx.debug_bounds("market-sources-toggle").is_some(),
+        "the source disclosure is available"
+    );
+    assert!(
+        cx.debug_bounds("market-source-builtin-0").is_none(),
+        "the source editor starts collapsed"
+    );
+    let toggle = cx
+        .debug_bounds("market-sources-toggle")
+        .expect("the source disclosure");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("market-source-builtin-0").is_some(),
+        "opening the disclosure reveals the built-in providers"
+    );
+}
+/// The Extensions tab strip is the pane's, not the scroller's: a wheel over
+/// the market body moves cards and leaves the tabs where they were.
+#[gpui::test]
+fn the_plugin_tabs_stay_pinned_while_the_market_scrolls(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-market-pinned-tabs", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            let mut rows = Vec::new();
+            for index in 0..20 {
+                let mut plugin = remote_market_fixture();
+                plugin.id = format!("remote-{index}");
+                plugin.name = format!("Remote plugin {index}");
+                rows.push(plugin);
+            }
+            shell.market = rows;
+            shell.market_loaded = true;
+            shell.plugins_tab = 3;
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let pane = cx.debug_bounds("settings-pane").expect("the options box");
+    let tabs = cx.debug_bounds("plugins-tabs").expect("the tab strip");
+    let card = cx.debug_bounds("market-card-0").expect("the first card");
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            gpui_kit::PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
+                position: pane.center(),
+                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(-240.0))),
+                modifiers: Modifiers::default(),
+                touch_phase: gpui_kit::TouchPhase::Moved,
+            }),
+            cx,
+        );
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let tabs_after = cx
+        .debug_bounds("plugins-tabs")
+        .expect("the pinned tab strip");
+    let card_after = cx
+        .debug_bounds("market-card-0")
+        .expect("the first card after the wheel");
+    assert_eq!(
+        tabs_after.origin.y, tabs.origin.y,
+        "the tab strip stays pinned while the market body scrolls"
+    );
+    assert!(
+        card_after.origin.y < card.origin.y,
+        "the wheel actually moves the market body ({} -> {})",
+        card.origin.y,
+        card_after.origin.y
+    );
+}
+
+/// Install, uninstall and enable/disable all write the draft the dialog saves:
+/// the inventory entry carries the package path, and the workspace disabled list
+/// carries the switch.
+#[gpui::test]
+fn the_market_card_installs_uninstalls_and_toggles_the_draft(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-market-actions", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            shell
+                .state
+                .draft_mut()
+                .workspace
+                .disabled
+                .extensions
+                .clear();
+            shell.market = vec![market_fixture("dsh-echo")];
+            shell.market_loaded = true;
+            shell.plugins_tab = 3;
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("market-install-0").is_some(),
+        "an uninstalled row offers Install"
+    );
+    let install = cx
+        .debug_bounds("market-install-0")
+        .expect("the Install control");
+    cx.simulate_click(install.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (installed, has_path) = cx.update(|_, cx| {
+        let draft = harness.read(cx).shell.read(cx).state.draft();
+        match draft
+            .global
+            .extensions
+            .iter()
+            .find(|extension| extension.id == "@local/dsh-echo")
+        {
+            Some(extension) => (true, extension.path.is_some()),
+            None => (false, false),
+        }
+    });
+    assert!(installed, "Install writes the draft inventory");
+    assert!(has_path, "the inventory entry carries the package path");
+    assert!(
+        cx.debug_bounds("market-uninstall-0").is_some(),
+        "an installed row offers Uninstall"
+    );
+    assert!(
+        cx.debug_bounds("market-status-installed-0").is_some(),
+        "an installed row is marked Installed"
+    );
+    assert!(
+        cx.debug_bounds("market-status-enabled-0").is_some(),
+        "an installed, enabled row is marked Enabled"
+    );
+    assert!(
+        cx.debug_bounds("market-status-disabled-0").is_none(),
+        "the disabled marker is not drawn while enabled"
+    );
+
+    let toggle = cx
+        .debug_bounds("market-toggle-0")
+        .expect("the enable switch");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let disabled = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .disabled
+            .extensions
+            .contains(&"@local/dsh-echo".to_string())
+    });
+    assert!(disabled, "the switch writes the workspace disabled list");
+    assert!(
+        cx.debug_bounds("market-status-disabled-0").is_some(),
+        "the card changes its marker to Disabled"
+    );
+    assert!(
+        cx.debug_bounds("market-status-enabled-0").is_none(),
+        "the enabled marker is gone while disabled"
+    );
+
+    let toggle = cx
+        .debug_bounds("market-toggle-0")
+        .expect("the enable switch again");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let disabled = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .disabled
+            .extensions
+            .contains(&"@local/dsh-echo".to_string())
+    });
+    assert!(!disabled, "a second press switches it back on");
+    assert!(
+        cx.debug_bounds("market-status-enabled-0").is_some(),
+        "the card returns to the Enabled marker"
+    );
+
+    let uninstall = cx
+        .debug_bounds("market-uninstall-0")
+        .expect("the Uninstall control");
+    cx.simulate_click(uninstall.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let installed = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .extensions
+            .iter()
+            .any(|extension| extension.id == "@local/dsh-echo")
+    });
+    assert!(!installed, "Uninstall removes the draft inventory entry");
+    assert!(
+        cx.debug_bounds("market-install-0").is_some(),
+        "the row returns to Install"
+    );
+    assert!(
+        cx.debug_bounds("market-status-installed-0").is_none()
+            && cx.debug_bounds("market-status-enabled-0").is_none()
+            && cx.debug_bounds("market-toggle-0").is_none(),
+        "an uninstalled row has no installed/enabled marker and no switch"
+    );
+    cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, cx| {
+            shell.toggle_market_plugin("@local/dsh-echo", cx);
+        });
+    });
+    let disabled = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .disabled
+            .extensions
+            .contains(&"@local/dsh-echo".to_string())
+    });
+    assert!(
+        !disabled,
+        "the enable handler refuses a package that is not installed"
+    );
+}
+/// An installed, enabled market plugin reaches the agent the turn runs, and
+/// disabling it removes the tool from the request schema. This is the whole
+/// chain the reader cares about: card -> draft inventory -> Save -> build.
+#[gpui::test]
+fn an_installed_enabled_market_plugin_reaches_the_turn(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-market-agent", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            shell
+                .state
+                .draft_mut()
+                .workspace
+                .disabled
+                .extensions
+                .clear();
+            shell.market = vec![market_fixture("dsh-echo")];
+            shell.market_loaded = true;
+            shell.plugins_tab = 3;
+            shell
+        });
+        Harness { shell }
+    });
+    let before = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        crate::caps::build_agent(
+            &shell.state.settings,
+            &shell.state.vault,
+            &crate::settings::resolve::SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+        )
+        .tools_schema_chars
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let install = cx
+        .debug_bounds("market-install-0")
+        .expect("the Install control");
+    cx.simulate_click(install.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (global_installed, saved_disabled) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        let root = shell
+            .state
+            .settings
+            .save_root
+            .as_ref()
+            .expect("the test settings root");
+        let global = crate::settings::global::GlobalSettings::load(&root.join("settings.toml"))
+            .expect("the saved global document");
+        let workspace_path = crate::settings::workspace::WorkspaceSettings::path(
+            std::path::Path::new(&shell.state.settings.active_workspace_root()),
+        );
+        let workspace = crate::settings::workspace::WorkspaceSettings::load(&workspace_path)
+            .expect("the saved workspace document");
+        (
+            global
+                .extensions
+                .iter()
+                .any(|extension| extension.id == "@local/dsh-echo" && extension.path.is_some()),
+            workspace
+                .disabled
+                .extensions
+                .contains(&"@local/dsh-echo".to_string()),
+        )
+    });
+    assert!(
+        global_installed,
+        "Install reaches the global document without a Save press"
+    );
+    assert!(
+        !saved_disabled,
+        "a fresh install is enabled in the saved workspace document"
+    );
+
+    let (has_tool, has_skill, after) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        let built = crate::caps::build_agent(
+            &shell.state.settings,
+            &shell.state.vault,
+            &crate::settings::resolve::SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+        );
+        (
+            built
+                .agent
+                .registry()
+                .expect("the tool registry")
+                .get("dsh_echo")
+                .is_some(),
+            built
+                .agent
+                .get_skills_content()
+                .iter()
+                .any(|(name, _)| *name == "greet"),
+            built.tools_schema_chars,
+        )
+    });
+    assert!(
+        has_tool,
+        "the plugin's tool is registered on the turn's agent"
+    );
+    assert!(has_skill, "the plugin's skill is in the turn's prompt set");
+    assert!(
+        after > before,
+        "the plugin's tool definition reaches the request schema ({before} -> {after})"
+    );
+
+    cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.clone();
+        shell.update(cx, |shell, cx| {
+            shell.toggle_market_plugin("@local/dsh-echo", cx);
+        });
+    });
+    let saved_disabled = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        let workspace_path = crate::settings::workspace::WorkspaceSettings::path(
+            std::path::Path::new(&shell.state.settings.active_workspace_root()),
+        );
+        crate::settings::workspace::WorkspaceSettings::load(&workspace_path)
+            .expect("the saved workspace document")
+            .disabled
+            .extensions
+            .contains(&"@local/dsh-echo".to_string())
+    });
+    assert!(
+        saved_disabled,
+        "Disable reaches the workspace document without a Save press"
+    );
+    let (has_tool, after_off) = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        let built = crate::caps::build_agent(
+            &shell.state.settings,
+            &shell.state.vault,
+            &crate::settings::resolve::SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+        );
+        (
+            built
+                .agent
+                .registry()
+                .expect("the tool registry")
+                .get("dsh_echo")
+                .is_some(),
+            built.tools_schema_chars,
+        )
+    });
+    assert!(!has_tool, "disabling the plugin removes its tool");
+    assert_eq!(
+        after_off, before,
+        "the request schema returns to its pre-plugin size"
+    );
+}
+
+/// A configured index source is drawn, removable, and removing it drops the
+/// remote row it contributed. No fetch is started by either action.
+#[gpui::test]
+fn the_market_source_editor_lists_and_removes_a_configured_index(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("plugins-market-sources", 1);
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, section_index("plugins"), state, cx);
+            shell
+                .state
+                .draft_mut()
+                .global
+                .market_indexes
+                .push("https://market.example/plugins.json".to_string());
+            let mut codex_remote = remote_market_fixture();
+            codex_remote.id = "remote-codex".to_string();
+            codex_remote.name = "Remote Codex".to_string();
+            codex_remote.standard = agent::extensions::ExtensionStandard::Codex;
+            shell.market = vec![remote_market_fixture(), codex_remote];
+            shell.market_loaded = true;
+            shell.market_sources_open = true;
+            shell.plugins_tab = 3;
+            shell
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "market-source-add",
+        "market-source-builtin-0",
+        "market-source-builtin-1",
+        "market-source-remove-0",
+        "market-card-0",
+        "market-install-0",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the market draws {selector}"
+        );
+    }
+
+    let remove = cx
+        .debug_bounds("market-source-remove-0")
+        .expect("the source remove control");
+    cx.simulate_click(remove.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let indexes = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .market_indexes
+            .clone()
+    });
+    assert!(indexes.is_empty(), "the draft source is gone");
+    assert!(
+        cx.debug_bounds("market-source-remove-0").is_none(),
+        "the source row is gone"
+    );
+    assert!(
+        cx.debug_bounds("market-card-0").is_none(),
+        "the rows that index contributed are gone"
+    );
+}
+
+/// The URL is validated and deduplicated before it reaches the draft.
+#[test]
+fn market_indexes_are_validated_and_deduplicated_in_the_draft() {
+    let mut state = AppState::with_store(scratch_store("market-index-validation"));
+    let url = state
+        .add_market_index("https://market.example/plugins.json")
+        .expect("a valid index URL");
+    assert!(
+        state.add_market_index(&url).is_err(),
+        "a duplicate is refused"
+    );
+    assert!(
+        state
+            .add_market_index("ftp://market.example/plugins.json")
+            .is_err(),
+        "a non-http scheme is refused"
+    );
+    assert_eq!(state.draft().global.market_indexes, vec![url.clone()]);
+    assert!(state.remove_market_index(&url));
+    assert!(state.draft().global.market_indexes.is_empty());
 }
 
 /// The MCP pane manages servers: add, edit, disable, move between documents

@@ -219,7 +219,7 @@ pub(crate) struct Resolution {
     /// Skill names switched off.
     pub(crate) disabled_skills: Vec<String>,
     /// Installed extensions switched off here.
-    pub(crate) disabled_extentions: Vec<String>,
+    pub(crate) disabled_extensions: Vec<String>,
     /// How much of a turn the conversation renders.
     pub(crate) transcript_view: TranscriptPolicy,
     /// The interface language.
@@ -321,7 +321,7 @@ pub(crate) fn resolve(
         mcp_servers: merge_mcp(&global.mcp_servers, &workspace.agent.mcp_servers),
         disabled_tools: workspace.disabled.tools.clone(),
         disabled_skills: workspace.disabled.skills.clone(),
-        disabled_extentions: workspace.disabled.extentions.clone(),
+        disabled_extensions: workspace.disabled.extensions.clone(),
         transcript_view: TranscriptPolicy::resolve(&global.general.transcript_view),
         lang: global.general.lang.clone(),
         theme_mode: global.general.theme_mode.clone(),

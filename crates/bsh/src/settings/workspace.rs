@@ -164,7 +164,7 @@ pub(crate) struct Disabled {
     pub(crate) skills: Vec<String>,
     /// Installed extensions switched off here. The global inventory decides
     /// what is installed; this only subtracts.
-    pub(crate) extentions: Vec<String>,
+    pub(crate) extensions: Vec<String>,
 }
 
 impl WorkspaceSettings {
@@ -223,7 +223,7 @@ temperature = 0.0
 permission = "read-only"
 
 [disabled]
-extentions = ["plan"]
+extensions = ["plan"]
 "#;
 
     #[test]

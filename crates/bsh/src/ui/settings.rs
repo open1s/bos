@@ -11,6 +11,8 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
+use agent::extensions::ExtensionStandard;
+
 use super::shell::{ModelRowEditor, ModelsAddRoute, Shell};
 use super::{hairline_all, hairline_bottom, hairline_top, icon, txt, DivExt, IconName};
 use crate::i18n::{tr, tr_args, Lang};
@@ -596,6 +598,42 @@ struct SelectRow {
     action: fn(&mut Shell, &str, &mut Context<Shell>),
 }
 
+/// The package whose trust confirmation is open.
+///
+/// Captured when the button is pressed so the dialog names exactly what the
+/// row showed: the package, its source and the command lines that would run.
+/// The launches are [`crate::mcp::McpLaunch`], which carries env KEYS and
+/// never values.
+#[derive(Clone)]
+pub(crate) struct TrustConfirm {
+    /// The settings id, which the confirm handler trusts.
+    pub(crate) id: String,
+    /// The row title the reader pressed.
+    pub(crate) title: String,
+    /// The source label, or an em dash when the record knew none.
+    pub(crate) source: String,
+    /// What the package declares, in the only shape the dialog may draw.
+    pub(crate) launches: Vec<crate::mcp::McpLaunch>,
+}
+
+/// The content of one 56px plugin list row.
+struct PluginListRow {
+    /// The stable debug selector and element id.
+    selector: String,
+    /// The 24px tinted leading square.
+    icon: AnyElement,
+    /// The 14px/500 title.
+    title: String,
+    /// An optional pill after the title (Problem, Experimental).
+    title_pill: Option<AnyElement>,
+    /// The 12px tertiary one-line description.
+    description: String,
+    /// The muted version/source suffix on the description line.
+    meta: String,
+    /// The far-right control (a toggle, or nothing).
+    trailing: AnyElement,
+}
+
 impl Shell {
     /// The modal card.
     pub(crate) fn render_settings(
@@ -704,6 +742,11 @@ impl Shell {
         // padding, an 8px gap and ONE 13px Save on the label-primary fill; the
         // reference has no modal-wide Cancel, because the close control is what
         // discards the draft.
+        // The Plugins page carries Refresh and a filled Add plugin in the
+        // header's top-right, before the config and close controls. They belong
+        // to the list tab only: the other tabs have their own toolbars.
+        let header_actions =
+            (section == 13 && self.plugins_tab == 0).then(|| self.plugins_page_actions(cx));
         let header = div()
             .debug_selector(|| "settings-header".to_string())
             .flex_none()
@@ -723,6 +766,7 @@ impl Shell {
                     .flex_1()
                     .min_w_0(),
             )
+            .children(header_actions)
             .child(self.document_action(cx))
             .child(
                 div()
@@ -765,12 +809,14 @@ impl Shell {
                     })),
             );
 
-        let pane = div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .child(header)
+        // The Extensions tab strip belongs to the pane, not to the scrolling
+        // options box: pinned here, it stays reachable at any scroll offset.
+        let tab_strip = (section == 13).then(|| self.plugin_tabs(cx));
+        let mut pane = div().flex_1().min_w_0().flex().flex_col().child(header);
+        if let Some(tabs) = tab_strip {
+            pane = pane.child(div().flex_none().px(px(24.0)).child(tabs));
+        }
+        pane = pane
             .child(
                 div()
                     .id("settings-pane")
@@ -783,7 +829,31 @@ impl Shell {
                     .pb(px(24.0))
                     .flex()
                     .flex_col()
-                    .child(txt(tr(lang, hint), 12.0, theme::faint()).mb(px(12.0)))
+                    .child(
+                        div()
+                            .mb(px(12.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(txt(tr(lang, hint), 12.0, theme::faint()))
+                            // The reference puts a small info glyph beside the
+                            // Plugins page subtitle; its tooltip is the same
+                            // sentence, which is the only help copy here.
+                            .when(section == 13 && self.plugins_tab == 0, |row| {
+                                row.child(
+                                    div()
+                                        .id("plugins-page-info")
+                                        .debug_selector(|| "plugins-page-info".to_string())
+                                        .flex()
+                                        .items_center()
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(tr(lang, hint)).build(window, cx)
+                                        })
+                                        .child(icon(IconName::Info, 12.0, theme::faint())),
+                                )
+                            }),
+                    )
                     .children(content),
             )
             // The save bar is pinned under the scrolling box, not carried in it.
@@ -1263,22 +1333,27 @@ impl Shell {
     /// filled with brand-primary while checked and bordered in border-l3 while
     /// not. gpui-kit ships no Switch, so this is a hand-built `role="switch"`
     /// equivalent with the reference's own click rule (toggle on press).
-    fn switch(
+    fn switch<F>(
         &self,
-        id: &'static str,
+        id: impl Into<SharedString>,
         checked: bool,
         enabled: bool,
-        action: fn(&mut Shell, bool, &mut Context<Shell>),
+        action: F,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> AnyElement
+    where
+        F: Fn(&mut Shell, bool, &mut Context<Shell>) + 'static,
+    {
         let fill = if checked {
             theme::accent()
         } else {
             theme::border_strong()
         };
+        let label: SharedString = id.into();
+        let selector = label.to_string();
         div()
-            .id(id)
-            .debug_selector(move || id.to_string())
+            .id(label)
+            .debug_selector(move || selector.clone())
             .flex_none()
             .w(px(36.0))
             .h(px(20.0))
@@ -1296,6 +1371,10 @@ impl Shell {
                     .when(checked, |thumb| thumb.ml(px(16.0))),
             )
             .on_click(cx.listener(move |this, _event, _window, cx| {
+                // A switch can sit inside a row that has its own click (the
+                // installed row opens its disclosure); the toggle is the
+                // control the press meant, so it must not also toggle the row.
+                cx.stop_propagation();
                 if enabled {
                     action(this, !checked, cx);
                 }
@@ -4380,6 +4459,164 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The trust confirmation, drawn over the settings dialog.
+    ///
+    /// It names the package, its source label and the exact command line(s) the
+    /// package declares, then asks for approval. The environment is listed by
+    /// KEY only: the loader never puts a value on this surface.
+    pub(crate) fn render_trust_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let Some(confirm) = self.trust_confirm.as_ref() else {
+            return div().into_any_element();
+        };
+        let title = tr(lang, "settings.pluginsTrustTitle");
+        let description = tr_args(
+            lang,
+            "settings.pluginsTrustDescription",
+            &[
+                ("name", confirm.title.clone()),
+                ("source", confirm.source.clone()),
+            ],
+        );
+        let mut body = div().flex().flex_col().gap(px(6.0)).child(
+            txt(
+                tr(lang, "settings.pluginsTrustCommands"),
+                11.0,
+                theme::faint(),
+            )
+            .font_weight(FontWeight::MEDIUM),
+        );
+        for (index, launch) in confirm.launches.iter().enumerate() {
+            let mut block = div()
+                .id(SharedString::from(format!("trust-confirm-command-{index}")))
+                .debug_selector(move || format!("trust-confirm-command-{index}"))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .p(px(8.0))
+                .rounded(px(6.0))
+                .bg(rgb(theme::new_session_fill()))
+                .child(txt(launch.command.clone(), 12.0, theme::text()).line_height(px(16.0)));
+            if let Some(cwd) = &launch.cwd {
+                block = block.child(
+                    txt(
+                        tr_args(lang, "settings.pluginsTrustCwd", &[("path", cwd.clone())]),
+                        11.0,
+                        theme::faint(),
+                    )
+                    .line_height(px(15.0)),
+                );
+            }
+            if !launch.env_keys.is_empty() {
+                block = block.child(
+                    txt(
+                        tr_args(
+                            lang,
+                            "settings.pluginsTrustEnv",
+                            &[("keys", launch.env_keys.join(", "))],
+                        ),
+                        11.0,
+                        theme::faint(),
+                    )
+                    .line_height(px(15.0)),
+                );
+            }
+            body = body.child(block);
+        }
+        if let Some(error) = &self.trust_error {
+            body = body.child(txt(error.clone(), 11.0, theme::error()));
+        }
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .id("trust-confirm-cancel")
+                        .debug_selector(|| String::from("trust-confirm-cancel"))
+                        .px(px(16.0))
+                        .h(px(30.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(rgb(theme::border()))
+                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .child(txt(
+                            tr(lang, "settings.pluginsTrustCancel"),
+                            13.0,
+                            theme::text(),
+                        ))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.cancel_trust_extension(cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id("trust-confirm-apply")
+                        .debug_selector(|| String::from("trust-confirm-apply"))
+                        .px(px(16.0))
+                        .h(px(30.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(rgb(theme::accent()))
+                        .bg(rgb(theme::accent()))
+                        .hover(|s| s.opacity(0.9))
+                        .child(txt(
+                            tr(lang, "settings.pluginsTrustConfirm"),
+                            13.0,
+                            theme::page(),
+                        ))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.confirm_trust_extension(cx);
+                        })),
+                ),
+        );
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(rgba(0x0F1115CC))
+            // A modal must swallow the press: without this a click on the
+            // dialog can also reach the row underneath and collapse the
+            // disclosure the dialog is guarding.
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .debug_selector(|| String::from("trust-confirm-dialog"))
+                    // The dialog floats over the list, so it must take the pointer
+                    // ahead of the rows: without this a press on Cancel fell
+                    // through to the row underneath and closed the disclosure.
+                    .occlude()
+                    .w(px(520.0))
+                    .p(px(18.0))
+                    .rounded(px(12.0))
+                    .bg(rgb(theme::page()))
+                    .border_1()
+                    .border_color(rgb(theme::border_strong()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(txt(title, 15.0, theme::text()))
+                    .child(txt(description, 12.5, theme::muted()))
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
     /// One button of the confirmation, carrying its own click.
     fn delete_button(
         &self,
@@ -4438,28 +4675,37 @@ impl Shell {
     ///
     /// Measured from `dsh-client-ui-plugins`: a tab strip (Plugin list / MCP /
     /// Plugin Market), then the ACTIVE tab's body. The Plugin list tab is a
-    /// full-width search field over two collapsible groups - the SESSION plugins
-    /// an agent preset composes, and the GLOBAL plugins the system and every
-    /// session share - drawn as cards two per row. The MCP tab is this crate's
-    /// server management (`mcp_rows`), drawn in the same pane rather than on a
-    /// page of its own.
+    /// full-width search over a vertical settings list: Built-in plugin settings
+    /// (navigation rows into the panes that own each built-in), Experimental
+    /// plugins (the real developer-tools toggle), and Installed plugins (the
+    /// global inventory joined with each package's manifest metadata). Rows are
+    /// 56px with a tinted 24px square, no card borders and an 8px gap.
+    ///
+    /// The MCP tab is this crate's server management (`mcp_rows`), drawn in the
+    /// same pane rather than on a page of its own.
     fn section_builtin_plugins(
         &mut self,
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let lang = self.state.lang;
-        let mut rows: Vec<AnyElement> = vec![self.plugin_tabs(cx)];
+        // The tab strip is drawn by render_settings above the scroller, so it
+        // stays pinned while the active tab's body scrolls.
+        let mut rows: Vec<AnyElement> = Vec::new();
         if self.plugins_tab == 1 {
             rows.extend(self.mcp_rows(cx));
-            return ("settings.plugins", "settings.mcpIntro", rows);
+            return ("settings.pluginsPageTitle", "settings.mcpIntro", rows);
         }
         if self.plugins_tab == 2 {
             rows.extend(self.skills_rows(cx));
-            return ("settings.plugins", "settings.skillsIntro", rows);
+            return ("settings.pluginsPageTitle", "settings.skillsIntro", rows);
+        }
+        if self.plugins_tab == 3 {
+            rows.extend(self.market_rows(cx));
+            return ("settings.pluginsPageTitle", "settings.marketIntro", rows);
         }
         rows.push(
             div()
-                .mb(px(10.0))
+                .mb(px(16.0))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -4467,154 +4713,1881 @@ impl Shell {
                 .h(px(34.0))
                 .px(px(10.0))
                 .rounded(px(10.0))
-                .border_1()
-                .border_color(rgb(theme::border()))
+                .bg(rgb(theme::new_session_fill()))
                 .child(icon(IconName::Search, 14.0, theme::faint()))
                 .child(Input::new(&self.plugin_search).appearance(false))
                 .into_any_element(),
         );
 
-        // ---- Session plugins: what the active preset composes. ----
-        let draft = self.state.draft();
-        let preset_id = draft.global.default_preset.clone();
-        let preset_label = if preset_id.is_empty() {
-            tr(lang, "settings.presetDefault")
-        } else {
-            preset_id.clone()
-        };
-        let composed: Vec<String> = draft
-            .global
-            .preset(&preset_id)
-            .map(|preset| preset.plugins)
-            .unwrap_or_default();
-        let preset_ids = draft.global.preset_ids();
-        let session_open = self.plugins_session_open;
-        let global_open = self.plugins_global_open;
+        // ---- Built-in plugin settings: navigation into the panes that own
+        // each one. A pane this deployment does not have (Subagent) is omitted
+        // rather than drawn as a row that links nowhere.
+        let builtin = self.builtin_setting_rows(cx);
+        if !builtin.is_empty() {
+            rows.push(self.plugins_section_header(
+                "builtin-settings-header",
+                "settings.pluginsBuiltinSettings",
+            ));
+            rows.extend(builtin);
+            rows.push(div().mb(px(18.0)).into_any_element());
+        }
 
-        rows.push(
-            self.plugin_group_header(
-                "plugins-session",
-                tr(lang, "settings.pluginsSession"),
-                self.preset_pill(preset_label, preset_ids, cx),
-                !session_open,
-                true,
-                cx,
+        // ---- Experimental plugins: only a toggle that really exists. The
+        // Show coding view preference is the one experimental switch this
+        // deployment carries; no voice-input package exists here.
+        rows.push(self.plugins_section_header(
+            "experimental-plugins-header",
+            "settings.pluginsExperimental",
+        ));
+        rows.push(self.experimental_setting_row(cx));
+        rows.push(div().mb(px(18.0)).into_any_element());
+
+        // ---- Installed plugins: the global inventory joined with the package
+        // metadata read from each directory. The section is omitted when a
+        // search excludes every installed row; an EMPTY inventory still draws
+        // its header and the empty state, because that is the state the reader
+        // can act on by opening the market.
+        let query = self.state.plugin_query.clone();
+        let all = self.installed_plugins();
+        let inventory_nonempty = !all.is_empty();
+        let listed: Vec<crate::installed::InstalledPlugin> = all
+            .into_iter()
+            .filter(|plugin| {
+                query.trim().is_empty()
+                    || crate::state::matches(&query, &plugin.id)
+                    || crate::state::matches(&query, &plugin.name)
+                    || crate::state::matches(&query, &plugin.display_name)
+                    || crate::state::matches(&query, &plugin.description)
+            })
+            .collect();
+        if inventory_nonempty && listed.is_empty() {
+            rows.push(
+                txt(tr(lang, "settings.noMatchingPlugins"), 12.0, theme::faint())
+                    .pb(px(10.0))
+                    .into_any_element(),
+            );
+        } else {
+            rows.push(
+                self.plugins_section_header(
+                    "installed-plugins-header",
+                    "settings.pluginsInstalled",
+                ),
+            );
+            if listed.is_empty() {
+                rows.push(self.installed_empty_state(cx));
+            } else {
+                for plugin in listed {
+                    rows.push(self.installed_plugin_row(plugin, cx));
+                }
+            }
+        }
+
+        (
+            "settings.pluginsPageTitle",
+            "settings.pluginsPageHint",
+            rows,
+        )
+    }
+
+    /// The page header's two controls: Refresh and the filled Add plugin.
+    fn plugins_page_actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .id("plugins-refresh")
+                    .debug_selector(|| "plugins-refresh".to_string())
+                    .h(px(32.0))
+                    .px(px(10.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(10.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(icon(IconName::RefreshCw, 13.0, theme::muted()))
+                    .child(txt(
+                        tr(lang, "settings.pluginsRefresh"),
+                        12.0,
+                        theme::text(),
+                    ))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.refresh_installed(cx);
+                    })),
             )
-            .into_any_element(),
+            .child(
+                div()
+                    .id("plugins-add")
+                    .debug_selector(|| "plugins-add".to_string())
+                    .h(px(32.0))
+                    .px(px(14.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(999.0))
+                    .bg(rgb(theme::accent()))
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.9))
+                    .child(icon(IconName::Plus, 12.0, theme::page()))
+                    .child(txt(tr(lang, "settings.pluginsAdd"), 12.0, theme::page()))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.open_market_tab(cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// A section heading: 14px semibold in the tertiary colour, no rule.
+    fn plugins_section_header(&self, id: &'static str, title: &'static str) -> AnyElement {
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_string())
+            .h(px(20.0))
+            .mb(px(6.0))
+            .flex()
+            .items_center()
+            .child(
+                txt(tr(self.state.lang, title), 14.0, theme::faint())
+                    .font_weight(FontWeight::SEMIBOLD),
+            )
+            .into_any_element()
+    }
+
+    /// The reference's 24px tinted rounded square, holding an initial or an icon.
+    fn plugin_icon(
+        &self,
+        glyph: Option<IconName>,
+        initial: Option<String>,
+        color: u32,
+    ) -> AnyElement {
+        let tint = (color << 8) | 0x1A;
+        let mark = match initial {
+            Some(initial) => txt(initial, 12.0, color).font_weight(FontWeight::SEMIBOLD),
+            None => icon(glyph.unwrap_or(IconName::Puzzle), 14.0, color),
+        };
+        div()
+            .w(px(24.0))
+            .h(px(24.0))
+            .flex_none()
+            .rounded(px(7.0))
+            .bg(rgba(tint))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(mark)
+            .into_any_element()
+    }
+
+    /// One 56px list row: icon, a title (with an optional pill), a one-line
+    /// description, an optional muted metadata suffix, and a trailing control.
+    ///
+    /// No card border: rows are separated by whitespace and the hover fill is
+    /// the row surface, exactly the reference's vertical list.
+    fn plugin_list_row(&self, row: PluginListRow) -> Stateful<Div> {
+        let PluginListRow {
+            selector,
+            icon,
+            title,
+            title_pill,
+            description,
+            meta,
+            trailing,
+        } = row;
+        let debug = selector.clone();
+        let title_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .min_w_0()
+            .child(
+                txt(title, 14.0, theme::text())
+                    .font_weight(FontWeight::MEDIUM)
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .whitespace_nowrap(),
+            )
+            .children(title_pill);
+        let mut description_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .min_w_0()
+            .child(
+                txt(description, 12.0, theme::faint())
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .whitespace_nowrap(),
+            );
+        if !meta.is_empty() {
+            description_row = description_row.child(
+                txt(meta, 11.0, theme::faint())
+                    .flex_none()
+                    .text_ellipsis()
+                    .whitespace_nowrap(),
+            );
+        }
+        div()
+            .id(SharedString::from(selector))
+            .debug_selector(move || debug.clone())
+            .h(px(56.0))
+            .px(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .rounded(px(8.0))
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(icon)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.0))
+                    .child(title_row)
+                    .child(description_row),
+            )
+            .child(trailing)
+    }
+
+    /// A small soft pill: the Problem and Experimental markers.
+    fn plugin_pill(
+        &self,
+        selector: String,
+        label: String,
+        color: u32,
+        tooltip: Option<String>,
+    ) -> AnyElement {
+        let debug = selector.clone();
+        let tint = (color << 8) | 0x1A;
+        let mut pill = div()
+            .id(SharedString::from(selector))
+            .debug_selector(move || debug.clone())
+            .h(px(18.0))
+            .px(px(6.0))
+            .flex()
+            .items_center()
+            .rounded(px(5.0))
+            .bg(rgba(tint))
+            .child(txt(label, 10.0, color));
+        if let Some(tip) = tooltip {
+            pill = pill.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
+        }
+        pill.into_any_element()
+    }
+
+    /// The built-in settings rows, mapped onto the panes that actually exist.
+    ///
+    /// The reference names Subagent, Web search, Agent loop and Shell. Web
+    /// search lives in the Tools pane here (it is the hosted web-tool switch),
+    /// Agent loop and Shell have their own panes, and Subagent has no pane in
+    /// this deployment, so that row is omitted rather than linked nowhere.
+    fn builtin_setting_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let lang = self.state.lang;
+        let mut rows = Vec::new();
+        for (id, title, description, pane, glyph, color) in [
+            (
+                "web-search",
+                "settings.webToolsTitle",
+                "settings.webToolsDescription",
+                "tools",
+                IconName::Globe,
+                theme::accent(),
+            ),
+            (
+                "agent-loop",
+                "settings.agent-loop",
+                "settings.agentLoopHint",
+                "agent-loop",
+                IconName::RefreshCw,
+                theme::warn(),
+            ),
+            (
+                "shell",
+                "settings.shell",
+                "settings.shellHint",
+                "shell",
+                IconName::SquareTerminal,
+                theme::success(),
+            ),
+        ] {
+            let Some(section) = section_index(pane) else {
+                continue;
+            };
+            let row = self
+                .plugin_list_row(PluginListRow {
+                    selector: format!("builtin-setting-{id}"),
+                    icon: self.plugin_icon(Some(glyph), None, color),
+                    title: tr(lang, title),
+                    title_pill: None,
+                    description: tr(lang, description),
+                    meta: String::new(),
+                    trailing: div().into_any_element(),
+                })
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    // The same write the rail's own cells make, so the row and
+                    // the sidebar cannot disagree about where a pane lives.
+                    this.state.settings_section = section;
+                    cx.notify();
+                }))
+                .mb(px(8.0));
+            rows.push(row.into_any_element());
+        }
+        rows
+    }
+
+    /// The one real experimental toggle this deployment carries.
+    fn experimental_setting_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let on = self.state.draft().global.general.developer_tools;
+        let pill = self.plugin_pill(
+            "experimental-developer-tools-pill".to_string(),
+            tr(lang, "settings.pluginsExperimentalPill"),
+            theme::accent(),
+            None,
         );
-        if session_open {
+        let toggle = self.switch(
+            "experimental-developer-tools",
+            on,
+            true,
+            developer_tools_action,
+            cx,
+        );
+        self.plugin_list_row(PluginListRow {
+            selector: "experimental-developer-tools-row".to_string(),
+            icon: self.plugin_icon(Some(IconName::Beaker), None, theme::warn()),
+            title: tr(lang, "settings.pluginsDeveloperTools"),
+            title_pill: Some(pill),
+            description: tr(lang, "settings.developerToolsDescription"),
+            meta: String::new(),
+            trailing: toggle,
+        })
+        .mb(px(8.0))
+        .into_any_element()
+    }
+
+    /// One installed row: tinted initial, the display title with the optional
+    /// Problem pill, the manifest description and the muted version/source
+    /// suffix, then the toggle at the far right.
+    fn installed_plugin_row(
+        &self,
+        plugin: crate::installed::InstalledPlugin,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let id = plugin.id.clone();
+        let color = match plugin.standard {
+            crate::settings::global::InstalledStandard::Codex => theme::warn(),
+            crate::settings::global::InstalledStandard::Dsh => theme::accent(),
+            crate::settings::global::InstalledStandard::Local => theme::success(),
+        };
+        let mut pills: Vec<AnyElement> = Vec::new();
+        if plugin.problem() {
+            let kinds = plugin.refused_kinds();
+            let tip = if kinds.is_empty() {
+                // A package that could not be read is a problem too, but not a
+                // refusal, so it must not borrow the refusal sentence.
+                tr(lang, "settings.pluginsLoadErrorTooltip")
+            } else {
+                tr_args(lang, "settings.pluginsProblemTooltip", &[("kinds", kinds)])
+            };
+            pills.push(self.plugin_pill(
+                format!("installed-problem-{id}"),
+                tr(lang, "settings.pluginsProblem"),
+                theme::warn(),
+                Some(tip),
+            ));
+        }
+        if plugin.needs_trust() {
+            pills.push(self.plugin_pill(
+                format!("installed-needs-trust-{id}"),
+                tr(lang, "settings.pluginsNeedsTrust"),
+                theme::warn(),
+                Some(tr(lang, "settings.pluginsNeedsTrustTooltip")),
+            ));
+        }
+        let pill = (!pills.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .children(pills)
+                .into_any_element()
+        });
+        let mut meta_parts = Vec::new();
+        if !plugin.version.is_empty() {
+            meta_parts.push(format!("v{}", plugin.version));
+        }
+        // The package name is the reference's row title. Here the display name
+        // is the title (the newer directive), so the id rides the muted suffix
+        // and the row still says which package it is.
+        if !plugin.name.is_empty() && plugin.name != plugin.title() {
+            meta_parts.push(plugin.name.clone());
+        }
+        if !plugin.source_label.is_empty() {
+            meta_parts.push(plugin.source_label.clone());
+        }
+        let meta = meta_parts.join(" · ");
+        let toggle_id = id.clone();
+        let toggle = self.switch(
+            format!("installed-toggle-{id}"),
+            plugin.enabled,
+            true,
+            move |shell, _on, cx| shell.toggle_installed_extension(&toggle_id, cx),
+            cx,
+        );
+        let key = id.clone();
+        let open = self.installed_open.contains(&id);
+        let row = self
+            .plugin_list_row(PluginListRow {
+                selector: format!("installed-row-{id}"),
+                icon: self.plugin_icon(None, Some(plugin.initial()), color),
+                title: plugin.title().to_string(),
+                title_pill: pill,
+                description: plugin.description.clone(),
+                meta,
+                trailing: toggle,
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if !this.installed_open.remove(&key) {
+                    this.installed_open.insert(key.clone());
+                }
+                cx.notify();
+            }));
+        let mut block = div().flex().flex_col().mb(px(8.0)).child(row);
+        if open {
+            block = block.child(self.installed_plugin_detail(&plugin, cx));
+        }
+        block.into_any_element()
+    }
+
+    /// The disclosure under an installed row: what the package is, where it
+    /// came from, what it can do, which parts were refused, and - for an
+    /// untrusted package that declares MCP servers - the exact commands it
+    /// would run and the control that asks for approval.
+    fn installed_plugin_detail(
+        &self,
+        plugin: &crate::installed::InstalledPlugin,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let mut lines = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .p(px(10.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::new_session_fill()));
+        // The approval block comes first: an untrusted package's reason to open
+        // this disclosure is the decision, and the metadata below can run past
+        // the scroller's visible height on a long row.
+        if !plugin.mcp_launches.is_empty() {
+            lines = lines.child(self.installed_trust_section(plugin, cx));
+        }
+        lines = lines
+            .child(self.installed_detail_line(
+                "settings.pluginsDetailStandard",
+                plugin.standard.label().to_string(),
+            ))
+            .child(self.installed_detail_line(
+                "settings.pluginsDetailVersion",
+                if plugin.version.is_empty() {
+                    "—".to_string()
+                } else {
+                    plugin.version.clone()
+                },
+            ))
+            .child(self.installed_detail_line(
+                "settings.pluginsDetailSource",
+                if plugin.source_label.is_empty() {
+                    "—".to_string()
+                } else {
+                    plugin.source_label.clone()
+                },
+            ))
+            .child(self.installed_detail_line(
+                "settings.pluginsDetailInstallTarget",
+                if plugin.install_target.is_empty() {
+                    "—".to_string()
+                } else {
+                    plugin.install_target.clone()
+                },
+            ))
+            .child(
+                self.installed_detail_line(
+                    "settings.pluginsDetailPath",
+                    plugin
+                        .path
+                        .clone()
+                        .unwrap_or_else(|| tr(lang, "settings.pluginsNoPath")),
+                ),
+            )
+            .child(self.installed_detail_line(
+                "settings.pluginsDetailCapabilities",
+                if plugin.capabilities.is_empty() {
+                    tr(lang, "settings.pluginsNoCapabilities")
+                } else {
+                    plugin.capability_line()
+                },
+            ));
+        if plugin.load_error.is_some() || !plugin.refusals.is_empty() {
+            lines = lines.child(
+                txt(tr(lang, "settings.pluginsProblem"), 11.0, theme::faint())
+                    .font_weight(FontWeight::MEDIUM),
+            );
+        }
+        if let Some(error) = &plugin.load_error {
+            lines = lines.child(
+                div()
+                    .debug_selector(|| format!("installed-load-error-{}", plugin.id))
+                    .child(txt(error.clone(), 11.0, theme::error()).line_height(px(15.0))),
+            );
+        }
+        for (index, refusal) in plugin.refusals.iter().enumerate() {
+            lines = lines.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "installed-refusal-{}-{index}",
+                        plugin.id
+                    )))
+                    .debug_selector({
+                        let id = plugin.id.clone();
+                        move || format!("installed-refusal-{id}-{index}")
+                    })
+                    .child(
+                        txt(
+                            format!("{}: {}", refusal.feature, refusal.reason),
+                            11.0,
+                            theme::faint(),
+                        )
+                        .line_height(px(15.0)),
+                    ),
+            );
+        }
+        div()
+            .id(SharedString::from(format!(
+                "installed-detail-{}",
+                plugin.id
+            )))
+            .debug_selector({
+                let id = plugin.id.clone();
+                move || format!("installed-detail-{id}")
+            })
+            .mb(px(8.0))
+            .child(lines)
+            .into_any_element()
+    }
+
+    /// The MCP declaration of one package, with the approval control when the
+    /// package is not trusted yet.
+    ///
+    /// Only the command line, its working directory and the env KEYS are
+    /// drawn: the launches cannot carry an env value, so this block cannot
+    /// either.
+    fn installed_trust_section(
+        &self,
+        plugin: &crate::installed::InstalledPlugin,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let mut section = div().flex().flex_col().gap(px(4.0)).child(
+            txt(
+                tr(lang, "settings.pluginsTrustCommands"),
+                11.0,
+                theme::faint(),
+            )
+            .font_weight(FontWeight::MEDIUM),
+        );
+        for (index, launch) in plugin.mcp_launches.iter().enumerate() {
+            let id = plugin.id.clone();
+            let mut row = div()
+                .id(SharedString::from(format!("installed-mcp-{id}-{index}")))
+                .debug_selector(move || format!("installed-mcp-{id}-{index}"))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(txt(launch.command.clone(), 11.0, theme::text()).line_height(px(15.0)));
+            if let Some(cwd) = &launch.cwd {
+                row = row.child(
+                    txt(
+                        tr_args(lang, "settings.pluginsTrustCwd", &[("path", cwd.clone())]),
+                        11.0,
+                        theme::faint(),
+                    )
+                    .line_height(px(15.0)),
+                );
+            }
+            if !launch.env_keys.is_empty() {
+                row = row.child(
+                    txt(
+                        tr_args(
+                            lang,
+                            "settings.pluginsTrustEnv",
+                            &[("keys", launch.env_keys.join(", "))],
+                        ),
+                        11.0,
+                        theme::faint(),
+                    )
+                    .line_height(px(15.0)),
+                );
+            }
+            section = section.child(row);
+        }
+        if plugin.needs_trust() {
+            let confirm = TrustConfirm {
+                id: plugin.id.clone(),
+                title: plugin.title().to_string(),
+                source: if plugin.source_label.is_empty() {
+                    "—".to_string()
+                } else {
+                    plugin.source_label.clone()
+                },
+                launches: plugin.mcp_launches.clone(),
+            };
+            section = section.child(
+                div()
+                    .id(SharedString::from(format!("installed-trust-{}", plugin.id)))
+                    .debug_selector({
+                        let id = plugin.id.clone();
+                        move || format!("installed-trust-{id}")
+                    })
+                    .mt(px(4.0))
+                    .h(px(26.0))
+                    .px(px(12.0))
+                    .rounded(px(7.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(rgb(theme::warn()))
+                    .hover(|s| s.opacity(0.9))
+                    .child(txt(
+                        tr(lang, "settings.pluginsTrustEnable"),
+                        11.0,
+                        theme::page(),
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.begin_trust_extension(confirm.clone());
+                        cx.notify();
+                    })),
+            );
+        }
+        section.into_any_element()
+    }
+
+    /// One label/value line in the installed disclosure.
+    fn installed_detail_line(&self, label: &'static str, value: String) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(6.0))
+            .child(
+                txt(tr(self.state.lang, label), 11.0, theme::faint())
+                    .w(px(96.0))
+                    .flex_none(),
+            )
+            .child(
+                txt(value, 11.0, theme::muted())
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .whitespace_nowrap(),
+            )
+            .into_any_element()
+    }
+
+    /// The installed section's empty state: one sentence and the action that
+    /// opens the market tab, so the region is never a blank.
+    fn installed_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .id("installed-empty")
+            .debug_selector(|| "installed-empty".to_string())
+            .py(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .child(txt(
+                tr(lang, "settings.pluginsInstalledEmpty"),
+                12.0,
+                theme::faint(),
+            ))
+            .child(
+                div()
+                    .id("installed-empty-market")
+                    .debug_selector(|| "installed-empty-market".to_string())
+                    .h(px(22.0))
+                    .px(px(6.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(
+                        tr(lang, "settings.pluginsBrowseMarket"),
+                        12.0,
+                        theme::accent(),
+                    ))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.open_market_tab(cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The installed inventory joined with package metadata, in file order.
+    ///
+    /// Enablement comes from the workspace disabled list, the same list the
+    /// agent build reads, so the row switch and the running agent cannot
+    /// disagree. The cache behind the metadata is keyed by (path, mtime).
+    pub(crate) fn installed_plugins(&mut self) -> Vec<crate::installed::InstalledPlugin> {
+        let records = self.state.draft().global.extensions.clone();
+        let mut plugins = Vec::with_capacity(records.len());
+        for record in &records {
+            let enabled = self.plugin_enabled(&record.id);
+            plugins.push(self.installed_cache.resolve(record, enabled));
+        }
+        plugins
+    }
+
+    /// Switch one installed package on or off and persist immediately.
+    ///
+    /// This is the market card's own path: the draft disabled list is written
+    /// and `persist_extension_state` saves the inventory and that list without
+    /// waiting for the dialog's Save, so a restart finds the same answer.
+    ///
+    /// Toggling never grants trust: an untrusted package that declares MCP
+    /// servers stays unspawnable, because `mcp::extension_servers` requires the
+    /// record's own approval as well as this list.
+    pub(crate) fn toggle_installed_extension(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.state.toggle_plugin_off(id);
+        self.persist_market_change(cx);
+    }
+
+    /// Open the confirmation that approves one installed package's commands.
+    pub(crate) fn begin_trust_extension(&mut self, confirm: TrustConfirm) {
+        self.trust_confirm = Some(confirm);
+        self.trust_error = None;
+    }
+
+    /// Dismiss the confirmation without approving anything.
+    ///
+    /// The refusal is audited, because "offered and declined" is a different
+    /// fact from "never seen"; the setting is untouched.
+    pub(crate) fn cancel_trust_extension(&mut self, cx: &mut Context<Self>) {
+        if let Some(confirm) = self.trust_confirm.take() {
+            self.state.decline_trust(&confirm.id);
+        }
+        self.trust_error = None;
+        cx.notify();
+    }
+
+    /// Approve the package the dialog names: trust it, enable it and persist.
+    ///
+    /// This is the one path that turns the Needs trust state into a runnable
+    /// server: `AppState::trust_extension` writes the record and reconciles the
+    /// pool, so the press is the decision.
+    pub(crate) fn confirm_trust_extension(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.trust_confirm.clone() else {
+            return;
+        };
+        if self.state.trust_extension(&confirm.id) {
+            self.installed_cache.clear();
+            self.trust_confirm = None;
+            self.trust_error = None;
+        } else {
+            // The store refused or the write failed. The dialog stays open so
+            // the refusal is visible where the decision was made.
+            self.trust_error = Some(tr(self.state.lang, "settings.pluginsTrustFailed"));
+        }
+        cx.notify();
+    }
+
+    /// Re-read the installed packages, and the market too once it has loaded.
+    pub(crate) fn refresh_installed(&mut self, cx: &mut Context<Self>) {
+        self.installed_cache.clear();
+        if self.market_loaded {
+            self.refresh_market(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Leave the plugin list for the market tab that installs plugins.
+    pub(crate) fn open_market_tab(&mut self, cx: &mut Context<Self>) {
+        self.plugins_tab = 3;
+        if self.market_loaded {
+            cx.notify();
+        } else {
+            self.refresh_market(cx);
+        }
+    }
+
+    /// Reload the local packages and every configured remote index.
+    ///
+    /// Called from the tab's first selection and the refresh control, never from
+    /// render: local discovery walks package directories, and each remote URL is
+    /// fetched on the shell's tokio runtime and merged when it answers.
+    pub(crate) fn refresh_market(&mut self, cx: &mut Context<Self>) {
+        // A second press while a catalog is in flight would duplicate the
+        // same request; the in-flight chip already says work is happening.
+        if self.market_fetching > 0 {
+            return;
+        }
+        let scan = crate::market::discover();
+        self.market = scan.plugins;
+        self.market_error = (!scan.errors.is_empty()).then(|| scan.errors.join("; "));
+        self.market_loaded = true;
+        self.market_fetch_error = None;
+        self.market_install_error = None;
+        self.fetch_builtin_providers(cx);
+        let urls = self.state.draft().global.market_indexes.clone();
+        self.fetch_market_indexes(urls, cx);
+    }
+
+    /// Fetch the two catalogs BSH ships with.
+    fn fetch_builtin_providers(&mut self, cx: &mut Context<Self>) {
+        for provider in crate::market::BUILTIN_PROVIDERS {
+            let provider = *provider;
+            self.market_fetching += 1;
+            let (tx, rx) = async_channel::bounded(1);
+            self.state.runner.rt().spawn(async move {
+                let result = crate::market::fetch_builtin(&provider).await;
+                let _ = tx.send((provider, result)).await;
+            });
+            cx.spawn(async move |this, cx| {
+                let outcome = rx.recv().await;
+                let _ = this.update(cx, |this, cx| {
+                    this.market_fetching = this.market_fetching.saturating_sub(1);
+                    match outcome {
+                        Ok((provider, Ok(rows))) => {
+                            let url = provider.display_url.to_string();
+                            this.market.retain(|plugin| match &plugin.origin {
+                                crate::market::MarketOrigin::Remote { index_url, .. } => {
+                                    index_url != &url
+                                }
+                                crate::market::MarketOrigin::Local => true,
+                            });
+                            this.market.extend(rows);
+                            crate::market::sort_market(&mut this.market);
+                            this.market_fetch_error = None;
+                        }
+                        Ok((provider, Err(error))) => {
+                            this.market_fetch_error = Some(format!("{}: {error}", provider.title));
+                        }
+                        Err(_) => {
+                            this.market_fetch_error =
+                                Some("the market fetch channel closed".to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Fetch every URL, merging each index into the market when it answers.
+    fn fetch_market_indexes(&mut self, urls: Vec<String>, cx: &mut Context<Self>) {
+        if urls.is_empty() {
+            // The built-in fetches may still be in flight; their own count
+            // decides when the spinner goes away.
+            return;
+        }
+        self.market_fetching += urls.len();
+        for url in urls {
+            let requested = url.clone();
+            let (tx, rx) = async_channel::bounded(1);
+            self.state.runner.rt().spawn(async move {
+                let result = crate::market::fetch_index(&url).await;
+                let _ = tx.send(result).await;
+            });
+            cx.spawn(async move |this, cx| {
+                let outcome = rx.recv().await;
+                let _ = this.update(cx, |this, cx| {
+                    this.market_fetching = this.market_fetching.saturating_sub(1);
+                    // A source removed while its fetch was in flight must not
+                    // put its rows back.
+                    if !this
+                        .state
+                        .draft()
+                        .global
+                        .market_indexes
+                        .iter()
+                        .any(|configured| configured == &requested)
+                    {
+                        cx.notify();
+                        return;
+                    }
+                    match outcome {
+                        Ok(Ok(index)) => {
+                            let remote_url = index.url.clone();
+                            this.market.retain(|plugin| match &plugin.origin {
+                                crate::market::MarketOrigin::Remote { index_url, .. } => {
+                                    index_url != &remote_url
+                                }
+                                crate::market::MarketOrigin::Local => true,
+                            });
+                            this.market
+                                .extend(crate::market::remote_market_plugins(&index));
+                            crate::market::sort_market(&mut this.market);
+                            this.market_fetch_error = None;
+                        }
+                        Ok(Err(error)) => this.market_fetch_error = Some(error),
+                        Err(_) => {
+                            this.market_fetch_error =
+                                Some("the market fetch channel closed".to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Add the URL in the source field to the draft and fetch it.
+    pub(crate) fn add_market_source(&mut self, cx: &mut Context<Self>) {
+        let raw = self.market_url.read(cx).value().to_string();
+        match self.state.add_market_index(&raw) {
+            Ok(url) => {
+                self.market_fetch_error = None;
+                self.fetch_market_indexes(vec![url], cx);
+            }
+            Err(error) => {
+                self.market_fetch_error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Remove one configured index and the rows it contributed.
+    pub(crate) fn remove_market_source(&mut self, url: &str, cx: &mut Context<Self>) {
+        self.state.remove_market_index(url);
+        self.market.retain(|plugin| match &plugin.origin {
+            crate::market::MarketOrigin::Remote { index_url, .. } => index_url != url,
+            crate::market::MarketOrigin::Local => true,
+        });
+        cx.notify();
+    }
+
+    /// Persist the extension inventory and disabled list after a market
+    /// action, without closing the dialog or committing unrelated draft edits.
+    fn persist_market_change(&mut self, cx: &mut Context<Self>) {
+        // Install, uninstall and enable all change the record or its
+        // directory, so the next list re-reads the packages it draws.
+        self.installed_cache.clear();
+        match self.state.persist_extension_state() {
+            Ok(()) => {}
+            Err(error) => {
+                self.market_install_error = Some(format!("saving extension state: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Download and register one remote plugin.
+    ///
+    /// The package manager runs on a blocking task because it is a subprocess;
+    /// the UI stays live and the card switches to its installed state when the
+    /// answer arrives. A failed download is shown on the pane, never silently
+    /// treated as installed.
+    pub(crate) fn install_remote_market(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(plugin) = self.market.get(index).cloned() else {
+            return;
+        };
+        let id = plugin.id.clone();
+        let install = plugin.install.clone();
+        // The record the completion writes carries the metadata the row already
+        // read; the package directory stays the authoritative load source.
+        let record = plugin.clone();
+        let install_target = match &install {
+            crate::market::MarketInstall::Remote { spec, .. } => spec.clone(),
+            crate::market::MarketInstall::GitHub { repository, path } => {
+                format!("{repository}#{path}")
+            }
+            crate::market::MarketInstall::Local(path) => path.display().to_string(),
+        };
+        self.market_installing = Some(id.clone());
+        self.market_install_error = None;
+        let root = crate::settings::dir().join("extensions");
+        let result_id = id.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        match install {
+            crate::market::MarketInstall::Remote { spec, registry } => {
+                let install_id = id.clone();
+                self.state.runner.rt().spawn(async move {
+                    let installed = tokio::task::spawn_blocking(move || {
+                        crate::market::install_remote(
+                            &root,
+                            &install_id,
+                            &spec,
+                            registry.as_deref(),
+                        )
+                    })
+                    .await;
+                    let _ = tx.send((result_id, installed)).await;
+                });
+            }
+            crate::market::MarketInstall::GitHub { repository, path } => {
+                let install_id = id.clone();
+                self.state.runner.rt().spawn(async move {
+                    let installed = tokio::task::spawn_blocking(move || {
+                        crate::market::install_github(&root, &install_id, &repository, &path)
+                    })
+                    .await;
+                    let _ = tx.send((result_id, installed)).await;
+                });
+            }
+            crate::market::MarketInstall::Local(_) => return,
+        }
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                this.market_installing = None;
+                match outcome {
+                    Ok((_id, Ok(Ok(path)))) => {
+                        this.state
+                            .install_extension(&record, &path, true, &install_target);
+                        this.market_install_error = None;
+                        this.persist_market_change(cx);
+                    }
+                    Ok((_, Ok(Err(error)))) => this.market_install_error = Some(error),
+                    Ok((_, Err(error))) => {
+                        this.market_install_error = Some(format!("install task failed: {error}"));
+                    }
+                    Err(_) => {
+                        this.market_install_error = Some("the install channel closed".to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The remote-index source editor, as a compact disclosure.
+    ///
+    /// Closed by default: the built-in catalogs are always active, so the pane
+    /// spends its first screen on the catalog instead of configuration. Opening
+    /// it reveals the built-in providers (not removable), the custom URLs, and
+    /// the add field.
+    fn market_sources(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let lang = self.state.lang;
+        let sources = self.state.draft().global.market_indexes.clone();
+        let builtin = crate::market::BUILTIN_PROVIDERS.len();
+        let open = self.market_sources_open;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let summary = tr_args(
+            lang,
+            "settings.marketSourcesSummary",
+            &[
+                ("builtin", builtin.to_string()),
+                ("custom", sources.len().to_string()),
+            ],
+        );
+        rows.push(
+            div()
+                .id(SharedString::from("market-sources-toggle"))
+                .debug_selector(|| String::from("market-sources-toggle"))
+                .mb(px(6.0))
+                .h(px(30.0))
+                .px(px(4.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .child(icon(
+                    if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    },
+                    12.0,
+                    theme::muted(),
+                ))
+                .child(txt(tr(lang, "settings.marketSources"), 12.0, theme::text()))
+                .child(txt(summary, 11.0, theme::faint()).flex_1())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.market_sources_open = !this.market_sources_open;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        if !open {
+            return rows;
+        }
+        for (index, provider) in crate::market::BUILTIN_PROVIDERS.iter().enumerate() {
+            let selector = format!("market-source-builtin-{index}");
+            rows.push(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .mb(px(4.0))
+                    .h(px(26.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(icon(IconName::Globe, 12.0, theme::faint()))
+                    .child(
+                        txt(
+                            format!("{} · {}", provider.title, provider.display_url),
+                            11.0,
+                            theme::faint(),
+                        )
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden(),
+                    )
+                    .child(txt(tr(lang, "settings.marketBuiltin"), 9.0, theme::muted()))
+                    .into_any_element(),
+            );
+        }
+        for (index, url) in sources.iter().enumerate() {
+            let selector = format!("market-source-remove-{index}");
+            let remove_url = url.clone();
+            rows.push(
+                div()
+                    .mb(px(4.0))
+                    .h(px(26.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(icon(IconName::Globe, 12.0, theme::faint()))
+                    .child(
+                        txt(url.clone(), 11.0, theme::faint())
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden(),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector(move || selector.clone())
+                            .h(px(22.0))
+                            .px(px(8.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(999.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::hover())))
+                            .child(txt(
+                                tr(lang, "settings.marketRemoveSource"),
+                                10.0,
+                                theme::muted(),
+                            ))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.remove_market_source(&remove_url, cx);
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if sources.is_empty() {
+            rows.push(
+                txt(tr(lang, "settings.marketNoSources"), 11.0, theme::faint())
+                    .mb(px(6.0))
+                    .into_any_element(),
+            );
+        }
+        rows.push(
+            div()
+                .mb(px(8.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(34.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(10.0))
+                        .rounded(px(10.0))
+                        .bg(rgb(theme::new_session_fill()))
+                        .child(icon(IconName::Globe, 13.0, theme::faint()))
+                        .child(Input::new(&self.market_url).appearance(false)),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from("market-source-add"))
+                        .debug_selector(|| String::from("market-source-add"))
+                        .h(px(34.0))
+                        .px(px(14.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(999.0))
+                        .bg(rgb(theme::accent()))
+                        .cursor_pointer()
+                        .child(txt(
+                            tr(lang, "settings.marketAddSource"),
+                            12.0,
+                            theme::page(),
+                        ))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.add_market_source(cx);
+                        })),
+                )
+                .into_any_element(),
+        );
+        rows
+    }
+
+    /// The Plugin Market tab: local Codex and DSH packages plus remote indexes,
+    /// with their install state.
+    ///
+    /// Install and uninstall edit the draft inventory; enable/disable edits the
+    /// workspace's disabled list. All three are the same draft writes the plugin
+    /// list uses, so Save remains the one commit and Cancel discards them.
+    fn market_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let lang = self.state.lang;
+        let mut rows = self.market_sources(cx);
+        rows.push(
+            txt(tr(lang, "settings.marketLocalOnly"), 11.0, theme::faint())
+                .pb(px(4.0))
+                .into_any_element(),
+        );
+        rows.push(
+            txt(tr(lang, "settings.marketApplyHint"), 11.0, theme::faint())
+                .pb(px(8.0))
+                .into_any_element(),
+        );
+        rows.push(
+            div()
+                .mb(px(10.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(38.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(12.0))
+                        .rounded(px(12.0))
+                        .bg(rgb(theme::new_session_fill()))
+                        .child(icon(IconName::Search, 14.0, theme::faint()))
+                        .child(Input::new(&self.market_search).appearance(false)),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from("market-refresh"))
+                        .debug_selector(|| String::from("market-refresh"))
+                        .h(px(38.0))
+                        .px(px(12.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .rounded(px(12.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::hover())))
+                        .child(icon(IconName::RefreshCw, 13.0, theme::muted()))
+                        .child(txt(tr(lang, "settings.marketRefresh"), 12.0, theme::text()))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.refresh_market(cx);
+                        })),
+                )
+                .into_any_element(),
+        );
+        let codex = self
+            .market
+            .iter()
+            .filter(|plugin| !plugin.is_remote() && plugin.standard == ExtensionStandard::Codex)
+            .count();
+        let dsh = self
+            .market
+            .iter()
+            .filter(|plugin| {
+                !plugin.is_remote() && plugin.standard == ExtensionStandard::DeepSeekHarness
+            })
+            .count();
+        let remote = self
+            .market
+            .iter()
+            .filter(|plugin| plugin.is_remote())
+            .count();
+        let mut counts = div()
+            .mb(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0));
+        if codex > 0 {
+            counts = counts.child(self.market_count_chip(
+                tr_args(
+                    lang,
+                    "settings.marketCountCodex",
+                    &[("count", codex.to_string())],
+                ),
+                theme::warn(),
+            ));
+        }
+        if dsh > 0 {
+            counts = counts.child(self.market_count_chip(
+                tr_args(
+                    lang,
+                    "settings.marketCountDsh",
+                    &[("count", dsh.to_string())],
+                ),
+                theme::accent(),
+            ));
+        }
+        if remote > 0 {
+            counts = counts.child(self.market_count_chip(
+                tr_args(
+                    lang,
+                    "settings.marketCountRemote",
+                    &[("count", remote.to_string())],
+                ),
+                theme::success(),
+            ));
+        }
+        if self.market_fetching > 0 {
+            counts = counts
+                .child(self.market_count_chip(tr(lang, "settings.marketFetching"), theme::muted()));
+        }
+        rows.push(counts.into_any_element());
+        if let Some(error) = &self.market_error {
+            rows.push(self.market_banner(tr_args(
+                lang,
+                "settings.marketError",
+                &[("error", error.clone())],
+            )));
+        }
+        if let Some(error) = &self.market_fetch_error {
+            rows.push(self.market_banner(tr_args(
+                lang,
+                "settings.marketError",
+                &[("error", error.clone())],
+            )));
+        }
+        if let Some(error) = &self.market_install_error {
+            rows.push(self.market_banner(tr_args(
+                lang,
+                "settings.marketInstallError",
+                &[("error", error.clone())],
+            )));
+        }
+        let query = self.market_query.clone();
+        let installed: std::collections::HashSet<String> = self
+            .state
+            .draft()
+            .global
+            .extensions
+            .iter()
+            .filter(|extension| extension.path.is_some())
+            .map(|extension| extension.id.clone())
+            .collect();
+        let disabled: std::collections::HashSet<String> = self
+            .state
+            .draft()
+            .workspace
+            .disabled
+            .extensions
+            .iter()
+            .cloned()
+            .collect();
+        let listed: Vec<usize> = self
+            .market
+            .iter()
+            .enumerate()
+            .filter(|(_, plugin)| {
+                query.trim().is_empty()
+                    || crate::state::matches(&query, &plugin.name)
+                    || crate::state::matches(&query, &plugin.id)
+                    || crate::state::matches(&query, &plugin.description)
+                    || plugin
+                        .keywords
+                        .iter()
+                        .any(|keyword| crate::state::matches(&query, keyword))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if listed.is_empty() {
+            rows.push(
+                div()
+                    .py(px(30.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(icon(IconName::Search, 22.0, theme::faint()))
+                    .child(txt(
+                        tr(
+                            lang,
+                            if self.market.is_empty() {
+                                "settings.marketEmpty"
+                            } else {
+                                "settings.noMatchingPlugins"
+                            },
+                        ),
+                        13.0,
+                        theme::muted(),
+                    ))
+                    .child(txt(
+                        tr(lang, "settings.marketEmptyHint"),
+                        11.0,
+                        theme::faint(),
+                    ))
+                    .into_any_element(),
+            );
+        }
+        const MARKET_PAGE: usize = 60;
+        let shown = &listed[..listed.len().min(MARKET_PAGE)];
+        for pair in shown.chunks(2) {
+            let mut row = div().flex().flex_row().gap(px(10.0)).pb(px(10.0));
+            for index in pair {
+                let plugin = &self.market[*index];
+                row = row.child(self.market_card(
+                    *index,
+                    plugin,
+                    installed.contains(&plugin.id),
+                    !disabled.contains(&plugin.id),
+                    cx,
+                ));
+            }
+            if pair.len() == 1 {
+                row = row.child(div().flex_1());
+            }
+            rows.push(row.into_any_element());
+        }
+        if listed.len() > MARKET_PAGE {
             rows.push(
                 txt(
-                    tr(lang, "settings.pluginsSessionHint"),
-                    12.0,
+                    tr_args(
+                        lang,
+                        "settings.marketLimited",
+                        &[
+                            ("shown", MARKET_PAGE.to_string()),
+                            ("total", listed.len().to_string()),
+                        ],
+                    ),
+                    11.0,
                     theme::faint(),
                 )
                 .pb(px(8.0))
                 .into_any_element(),
             );
-            if composed.is_empty() {
-                rows.push(
-                    txt(tr(lang, "settings.pluginsEmpty"), 12.0, theme::faint())
-                        .pb(px(10.0))
-                        .into_any_element(),
-                );
-            }
-            for pair in composed.chunks(2) {
-                let mut row = div().flex().flex_row().gap(px(8.0)).pb(px(8.0));
-                for name in pair {
-                    let tools = self.plugin_tools(name);
-                    row = row.child(self.plugin_card(
-                        format!("plugins-composed-{name}"),
-                        name.clone(),
-                        tools,
-                        None,
-                        None,
-                        cx,
-                    ));
-                }
-                if pair.len() == 1 {
-                    row = row.child(div().flex_1());
-                }
-                rows.push(row.into_any_element());
-            }
         }
-
-        // ---- Global plugins: the installed inventory. ----
-        rows.push(
-            self.plugin_group_header(
-                "plugins-global",
-                tr(lang, "settings.pluginsGlobal"),
-                div().into_any_element(),
-                !global_open,
-                false,
-                cx,
-            )
-            .into_any_element(),
-        );
-        if global_open {
-            rows.push(
-                txt(tr(lang, "settings.pluginsGlobalHint"), 12.0, theme::faint())
-                    .pb(px(8.0))
-                    .into_any_element(),
-            );
-            let query = self.state.plugin_query.clone();
-            let listed: Vec<(usize, String, bool)> = self
-                .plugins
-                .iter()
-                .enumerate()
-                .filter(|(_, plugin)| crate::state::matches(&query, &plugin.name))
-                .map(|(index, plugin)| {
-                    (
-                        index,
-                        plugin.name.clone(),
-                        self.plugin_enabled(&plugin.name),
-                    )
-                })
-                .collect();
-            if listed.is_empty() {
-                rows.push(
-                    txt(tr(lang, "settings.noMatchingPlugins"), 12.0, theme::faint())
-                        .pb(px(10.0))
-                        .into_any_element(),
-                );
-            }
-            for pair in listed.chunks(2) {
-                let mut row = div().flex().flex_row().gap(px(8.0)).pb(px(8.0));
-                for (index, name, enabled) in pair {
-                    let tools = self.plugin_tools(name);
-                    row = row.child(self.plugin_card(
-                        format!("builtin-plugin-{index}"),
-                        name.clone(),
-                        tools,
-                        Some(*enabled),
-                        Some(name.clone()),
-                        cx,
-                    ));
-                }
-                if pair.len() == 1 {
-                    row = row.child(div().flex_1());
-                }
-                rows.push(row.into_any_element());
-            }
-        }
-
-        ("settings.plugins", "settings.builtinPluginsHint", rows)
+        rows
     }
 
-    /// The tools one plugin contributes, as the card's description.
-    fn plugin_tools(&self, name: &str) -> String {
-        self.plugins
-            .iter()
-            .find(|plugin| plugin.name == name)
-            .map(|plugin| plugin.tools.join(", "))
-            .filter(|tools| !tools.is_empty())
-            .unwrap_or_else(|| tr(self.state.lang, "settings.pluginsNoTools"))
+    /// One installed/enabled marker on a market card. It is only drawn for an
+    /// installed package, because an uninstalled row has no enable state.
+    fn market_status_pill(&self, label: String, color: u32, id: String) -> AnyElement {
+        div()
+            .id(SharedString::from(id.clone()))
+            .debug_selector(move || id.clone())
+            .px(px(7.0))
+            .h(px(18.0))
+            .flex()
+            .items_center()
+            .rounded(px(6.0))
+            .bg(rgb(color))
+            .child(txt(label, 9.0, theme::page()))
+            .into_any_element()
     }
 
-    /// Switch one source on or off in the DRAFT.
+    /// Enable or disable one INSTALLED market plugin in the draft.
     ///
-    /// The write goes to the draft and nowhere else: Save is the one door a
-    /// settings change goes through, so Cancel discards it like every other pane.
+    /// The switch is not drawn on an uninstalled row; this guard is the same
+    /// rule on the handler side so no stale click can write an enable state
+    /// for a package that is not in the inventory.
+    pub(crate) fn toggle_market_plugin(&mut self, id: &str, cx: &mut Context<Self>) {
+        let installed = self
+            .state
+            .draft()
+            .global
+            .extensions
+            .iter()
+            .any(|extension| extension.id == id && extension.path.is_some());
+        if !installed {
+            return;
+        }
+        self.state.toggle_plugin_off(id);
+        self.market_install_error = None;
+        self.persist_market_change(cx);
+    }
+
+    /// A small summary chip in the market toolbar.
+    fn market_count_chip(&self, label: String, color: u32) -> AnyElement {
+        div()
+            .h(px(22.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .rounded(px(999.0))
+            .bg(rgb(theme::new_session_fill()))
+            .child(
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded(px(999.0))
+                    .bg(rgb(color)),
+            )
+            .child(txt(label, 11.0, theme::muted()))
+            .into_any_element()
+    }
+
+    /// A soft error banner shared by discovery, fetch, and install failures.
+    fn market_banner(&self, message: String) -> AnyElement {
+        div()
+            .mb(px(8.0))
+            .p(px(10.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(rgb(theme::error()))
+            .bg(rgb(theme::page()))
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(8.0))
+            .child(icon(IconName::TriangleAlert, 14.0, theme::error()))
+            .child(
+                txt(message, 11.0, theme::error())
+                    .flex_1()
+                    .min_w_0()
+                    .line_height(px(16.0)),
+            )
+            .into_any_element()
+    }
+
+    /// One market card: standard badge, name, version, description, install
+    /// state and the control that changes it.
+    fn market_card(
+        &self,
+        index: usize,
+        plugin: &crate::market::MarketPlugin,
+        installed: bool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let (badge, badge_color) = match plugin.origin {
+            crate::market::MarketOrigin::Remote { .. } => ("Remote", theme::success()),
+            crate::market::MarketOrigin::Local => {
+                if plugin.standard == ExtensionStandard::Codex {
+                    ("Codex", theme::warn())
+                } else {
+                    ("DSH", theme::accent())
+                }
+            }
+        };
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .px(px(7.0))
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .bg(rgb(badge_color))
+                    .child(txt(badge, 9.0, theme::page())),
+            )
+            .child(
+                txt(plugin.name.clone(), 13.0, theme::text())
+                    .font_weight(FontWeight::MEDIUM)
+                    .line_height(px(17.0))
+                    .max_h(px(34.0))
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden(),
+            )
+            .when(!plugin.version.is_empty(), |row| {
+                row.child(
+                    div()
+                        .px(px(6.0))
+                        .h(px(18.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.0))
+                        .bg(rgb(theme::new_session_fill()))
+                        .child(txt(
+                            if plugin.version == "latest" {
+                                plugin.version.clone()
+                            } else {
+                                format!("v{}", plugin.version)
+                            },
+                            10.0,
+                            theme::faint(),
+                        )),
+                )
+            });
+        let mut body = div().flex().flex_col().gap(px(4.0)).child(
+            txt(plugin.description.clone(), 12.0, theme::muted())
+                .line_height(px(17.0))
+                .max_h(px(38.0))
+                .overflow_hidden(),
+        );
+        if installed {
+            let mut status =
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(self.market_status_pill(
+                        tr(lang, "settings.marketInstalled"),
+                        theme::accent(),
+                        format!("market-status-installed-{index}"),
+                    ));
+            status = if enabled {
+                status.child(self.market_status_pill(
+                    tr(lang, "settings.marketEnabled"),
+                    theme::success(),
+                    format!("market-status-enabled-{index}"),
+                ))
+            } else {
+                status.child(self.market_status_pill(
+                    tr(lang, "settings.marketDisabled"),
+                    theme::border_strong(),
+                    format!("market-status-disabled-{index}"),
+                ))
+            };
+            body = body.child(status);
+        }
+        if !plugin.capabilities.is_empty() {
+            body = body.child(txt(
+                plugin
+                    .capabilities
+                    .iter()
+                    .map(|capability| capability.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                10.0,
+                theme::faint(),
+            ));
+        }
+        if plugin.refusals > 0 {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(icon(IconName::TriangleAlert, 10.0, theme::warn()))
+                    .child(txt(
+                        tr_args(
+                            lang,
+                            "settings.marketRefused",
+                            &[("count", plugin.refusals.to_string())],
+                        ),
+                        10.0,
+                        theme::warn(),
+                    )),
+            );
+        }
+        let mut actions = div().flex().flex_row().items_center().gap(px(6.0));
+        if installed {
+            let toggle_selector = format!("market-toggle-{index}");
+            let toggle_id = plugin.id.clone();
+            actions = actions.child(
+                div()
+                    .id(SharedString::from(toggle_selector.clone()))
+                    .debug_selector(move || toggle_selector.clone())
+                    .h(px(26.0))
+                    .px(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .rounded(px(999.0))
+                    .bg(rgb(theme::new_session_fill()))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(22.0))
+                            .h(px(12.0))
+                            .rounded(px(999.0))
+                            .bg(rgb(if enabled {
+                                theme::accent()
+                            } else {
+                                theme::border_strong()
+                            }))
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(8.0))
+                                    .h(px(8.0))
+                                    .rounded(px(999.0))
+                                    .bg(rgb(theme::page()))
+                                    .ml(px(if enabled { 12.0 } else { 2.0 })),
+                            ),
+                    )
+                    .child(txt(
+                        tr(
+                            lang,
+                            if enabled {
+                                "settings.marketEnabled"
+                            } else {
+                                "settings.marketDisabled"
+                            },
+                        ),
+                        10.0,
+                        theme::muted(),
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.toggle_market_plugin(&toggle_id, cx);
+                    })),
+            );
+            let uninstall_selector = format!("market-uninstall-{index}");
+            let uninstall_id = plugin.id.clone();
+            actions = actions.child(
+                div()
+                    .id(SharedString::from(uninstall_selector.clone()))
+                    .debug_selector(move || uninstall_selector.clone())
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(999.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(
+                        tr(lang, "settings.marketUninstall"),
+                        10.0,
+                        theme::muted(),
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.uninstall_extension(&uninstall_id);
+                        this.market_install_error = None;
+                        this.persist_market_change(cx);
+                    })),
+            );
+        } else if self.market_installing.as_deref() == Some(plugin.id.as_str()) {
+            actions = actions.child(
+                div()
+                    .h(px(28.0))
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(999.0))
+                    .bg(rgb(theme::new_session_fill()))
+                    .child(txt(
+                        tr(lang, "settings.marketInstalling"),
+                        11.0,
+                        theme::muted(),
+                    )),
+            );
+        } else {
+            let install_selector = format!("market-install-{index}");
+            let record = plugin.clone();
+            let mut button = div()
+                .id(SharedString::from(install_selector.clone()))
+                .debug_selector(move || install_selector.clone())
+                .h(px(28.0))
+                .px(px(14.0))
+                .flex()
+                .items_center()
+                .rounded(px(999.0))
+                .bg(rgb(theme::accent()))
+                .cursor_pointer()
+                .child(txt(tr(lang, "settings.marketInstall"), 11.0, theme::page()));
+            button = match plugin.install.clone() {
+                crate::market::MarketInstall::Local(source) => {
+                    let target = source.display().to_string();
+                    button.on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state
+                            .install_extension(&record, &source, false, &target);
+                        this.market_install_error = None;
+                        this.persist_market_change(cx);
+                    }))
+                }
+                crate::market::MarketInstall::Remote { .. }
+                | crate::market::MarketInstall::GitHub { .. } => {
+                    button.on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.install_remote_market(index, cx);
+                    }))
+                }
+            };
+            actions = actions.child(button);
+        }
+        div()
+            .id(SharedString::from(format!("market-card-{index}")))
+            .debug_selector(move || format!("market-card-{index}"))
+            .flex_1()
+            .min_w_0()
+            .h(px(210.0))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .gap(px(8.0))
+            .p(px(14.0))
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::page()))
+            .overflow_hidden()
+            .hover(|style| {
+                style
+                    .bg(rgb(theme::hover()))
+                    .border_color(rgb(theme::border()))
+            })
+            .child(div().flex().flex_col().gap(px(6.0)).child(head).child(body))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(icon(IconName::Globe, 10.0, theme::faint()))
+                            .child(
+                                txt(plugin.source_label.clone(), 10.0, theme::faint())
+                                    .max_w(px(130.0))
+                                    .overflow_hidden(),
+                            ),
+                    )
+                    .child(actions),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn toggle_source(&mut self, name: &str, cx: &mut Context<Self>) {
         let mut sources = self.state.draft().global.skill_sources();
         for source in sources.iter_mut() {
@@ -5208,10 +7181,10 @@ impl Shell {
 
     /// The tab strip the Extensions pane opens with.
     ///
-    /// "Plugin list", "MCP" and "Skills" are REAL tabs: each sets the pane's
-    /// tab, and the same pane draws that tab's body under the strip. "Plugin
-    /// Market" is drawn DISABLED: this deployment ships no market, and a tab
-    /// that looks pressable but does nothing is what the standing rule forbids.
+    /// "Plugin list", "MCP", "Skills" and "Plugin Market" are REAL tabs: each
+    /// sets the pane's tab, and the same pane draws that tab's body under the
+    /// strip. The market opens against the local Codex/DSH sources (nothing is
+    /// fetched) and loads once on its first selection.
     fn plugin_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let pane = section_index("plugins");
@@ -5228,6 +7201,7 @@ impl Shell {
             (0, "settings.pluginsTabs", "plugins-tab-list"),
             (1, "settings.pluginsTabMcp", "plugins-tab-mcp"),
             (2, "settings.pluginsTabSkills", "plugins-tab-skills"),
+            (3, "settings.pluginsTabMarket", "plugins-tab-market"),
         ] {
             let selected = self.plugins_tab == tab;
             strip = strip.child(
@@ -5255,106 +7229,16 @@ impl Shell {
                         if let Some(index) = pane {
                             this.state.settings_section = index;
                         }
+                        // The market walks local package directories, so it is
+                        // read when the tab is first opened, never per frame.
+                        if tab == 3 && !this.market_loaded {
+                            this.refresh_market(cx);
+                        }
                         cx.notify();
                     })),
             );
         }
-        strip
-            .child(
-                div()
-                    .debug_selector(|| String::from("plugins-tab-market"))
-                    .pb(px(8.0))
-                    .child(txt(
-                        tr(lang, "settings.pluginsTabMarket"),
-                        13.0,
-                        theme::faint(),
-                    )),
-            )
-            .into_any_element()
-    }
-
-    /// One collapsible group header: a chevron, the title and a trailing control.
-    fn plugin_group_header(
-        &self,
-        id: &'static str,
-        title: String,
-        trailing: AnyElement,
-        folded: bool,
-        session: bool,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        div()
-            .id(SharedString::from(id))
-            .debug_selector(move || id.to_string())
-            .h(px(32.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .cursor_pointer()
-            .child(icon(
-                if folded {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                },
-                14.0,
-                theme::muted(),
-            ))
-            .child(
-                txt(title, 14.0, theme::text())
-                    .font_weight(FontWeight::MEDIUM)
-                    .flex_1(),
-            )
-            .child(trailing)
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                if session {
-                    this.plugins_session_open = !this.plugins_session_open;
-                } else {
-                    this.plugins_global_open = !this.plugins_global_open;
-                }
-                cx.notify();
-            }))
-    }
-
-    /// The Session plugins header's trailing control: the active preset.
-    ///
-    /// It writes the DRAFT, the same value the agent-presets pane writes, so Save
-    /// is the one door either control's change goes through.
-    fn preset_pill(&self, label: String, ids: Vec<String>, cx: &mut Context<Self>) -> AnyElement {
-        let lang = self.state.lang;
-        let shell = cx.entity();
-        Button::new("plugins-preset")
-            .ghost()
-            .compact()
-            .h(px(28.0))
-            .rounded(px(8.0))
-            .bg(rgb(theme::new_session_fill()))
-            .label(label)
-            .icon(IconName::ChevronDown)
-            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-                let mut menu = menu;
-                for id in ids.iter() {
-                    let pick = id.clone();
-                    let text = if id.is_empty() {
-                        tr(lang, "settings.presetDefault")
-                    } else {
-                        id.clone()
-                    };
-                    let pick_shell = shell.clone();
-                    menu = menu.item(PopupMenuItem::new(text).on_click(
-                        move |_event, _window, cx| {
-                            let picked = pick.clone();
-                            pick_shell.update(cx, |this, cx| {
-                                this.state.select_preset(&picked);
-                                cx.notify();
-                            });
-                        },
-                    ));
-                }
-                menu
-            })
-            .into_any_element()
+        strip.into_any_element()
     }
 
     /// Whether the DRAFT leaves a plugin installed.
@@ -5367,77 +7251,11 @@ impl Shell {
             .draft()
             .workspace
             .disabled
-            .extentions
+            .extensions
             .iter()
             .any(|plugin| plugin == name)
     }
 
-    /// One plugin card: an optional switch, the name, the description and a
-    /// chevron - the reference's `.card` inside the pane's own grid.
-    fn plugin_card(
-        &self,
-        id: String,
-        name: String,
-        description: String,
-        enabled: Option<bool>,
-        toggle: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selector = id.clone();
-        let mut head = div().flex().flex_row().items_center().gap(px(8.0));
-        if let Some(on) = enabled {
-            head = head.child(
-                div()
-                    .w(px(14.0))
-                    .h(px(14.0))
-                    .flex_none()
-                    .rounded(px(4.0))
-                    .border_1()
-                    .border_color(rgb(if on {
-                        theme::accent()
-                    } else {
-                        theme::border_strong()
-                    }))
-                    .bg(rgb(if on { theme::accent() } else { theme::page() }))
-                    .when(on, |boxed| {
-                        boxed.child(icon(IconName::Check, 10.0, theme::page()))
-                    }),
-            );
-        }
-        head = head
-            .child(txt(name, 13.0, theme::text()).flex_1().min_w_0())
-            .child(icon(IconName::ChevronDown, 12.0, theme::faint()));
-        let mut card = div()
-            .id(SharedString::from(id))
-            .debug_selector(move || selector.clone())
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .p(px(10.0))
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(rgb(theme::border()))
-            .bg(rgb(theme::page()))
-            .child(head)
-            .child(
-                txt(description, 12.0, theme::muted())
-                    .line_height(px(17.0))
-                    .max_h(px(38.0))
-                    .overflow_hidden(),
-            );
-        if let Some(plugin) = toggle {
-            card = card
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(theme::hover())));
-            card = card.on_click(cx.listener(move |this, _event, _window, cx| {
-                this.state.toggle_plugin_off(&plugin);
-                cx.notify();
-            }));
-        }
-        card.into_any_element()
-    }
     /// Load one entry into the MCP form, or blank it for a new one.
     fn mcp_fill_form(
         &mut self,

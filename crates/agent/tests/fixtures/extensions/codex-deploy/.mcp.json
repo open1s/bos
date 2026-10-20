@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "fixture-server": {
+      "command": "node",
+      "args": ["./server.js"],
+      "env": { "FIXTURE_TOKEN": "sk-fixture-secret" }
+    }
+  }
+}

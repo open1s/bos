@@ -182,12 +182,6 @@ impl McpServer {
         }
     }
 
-    /// The registry namespace: the name, which validation keeps to the
-    /// characters a tool name may carry.
-    pub(crate) fn namespace(&self) -> &str {
-        self.name.as_str()
-    }
-
     /// Identity of the CONNECTION, so an unchanged server is not respawned.
     pub(crate) fn signature(&self) -> String {
         match &self.transport {

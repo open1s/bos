@@ -274,7 +274,14 @@ pub(crate) struct GlobalSettings {
     /// The installed extension inventory. Order is the reader's, and the ids
     /// are checked for repetition because an array of tables does not make
     /// them unique the way a map key would.
-    pub(crate) extentions: Vec<Extension>,
+    #[serde(default, alias = "extentions")]
+    pub(crate) extensions: Vec<InstalledExtension>,
+    /// Remote plugin-market index URLs, in display order.
+    ///
+    /// The market fetches each URL on Refresh; nothing is written back into
+    /// this list except the reader's own add/remove actions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) market_indexes: Vec<String>,
     /// The automation tasks: a machine-level instruction and the session it
     /// runs in, on a cadence. A task names a session rather than belonging to
     /// one workspace, so the list is global.
@@ -299,7 +306,8 @@ impl Default for GlobalSettings {
             mcp_servers: Vec::new(),
             providers: BTreeMap::new(),
             presets: BTreeMap::new(),
-            extentions: Vec::new(),
+            extensions: Vec::new(),
+            market_indexes: Vec::new(),
             workspaces: Vec::new(),
             default_preset: default_preset(),
         }
@@ -614,13 +622,151 @@ pub(crate) fn ships_preset(id: &str) -> bool {
     BUILT_IN_PRESETS.iter().any(|(name, _)| *name == id)
 }
 
+/// The standard an installed package was read as.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum InstalledStandard {
+    /// A Codex plugin package.
+    Codex,
+    /// A DeepSeek Harness package.
+    Dsh,
+    /// A bare inventory entry, or a package whose markers had not been read
+    /// when the record was written. The resolved view replaces this with the
+    /// standard the manifest declares whenever the package loads.
+    #[default]
+    Local,
+}
+
+impl InstalledStandard {
+    /// The label the disclosure and the market card show.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Dsh => "DeepSeek Harness",
+            Self::Local => "Local",
+        }
+    }
+}
+
 /// One entry in the installed extension inventory.
+///
+/// `path` is authoritative. When it names a package directory, the manifest is
+/// re-read from that directory on every build and every list refresh, so a
+/// stale `name`, `version` or `description` here can never decide whether the
+/// package loads. The other fields are cached metadata: they make the plugin
+/// list readable without a parse per frame and keep a record readable after its
+/// package directory has gone missing.
+///
+/// Enablement is deliberately NOT a field here. It is the workspace's own
+/// `disabled.extensions` list: enabling is per workspace (a machine-wide flag
+/// would contradict a workspace that switched the package off) and that same
+/// list is what the agent build and the MCP derivation read. Installing,
+/// uninstalling and toggling all persist the inventory and that list together
+/// through `AppState::persist_extension_state`, so a reload sees the same
+/// state without Save.
+///
+/// An old file carrying only `{ id, path }` still parses: every other field is
+/// serde-defaulted, and the missing metadata is re-derived from the package on
+/// first use.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Extension {
-    /// The extension id. It must name something the build ships.
+pub(crate) struct InstalledExtension {
+    /// The extension id. It names a built-in bundle, or an installed package.
     pub(crate) id: String,
+    /// The package name from the manifest, when known (for example
+    /// `@scope/name`). For a DSH package this is also the id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) name: String,
+    /// The display name from the manifest, when known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) display_name: String,
+    /// The manifest description, when known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) description: String,
+    /// The manifest version, when known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) version: String,
+    /// The standard the package was installed as.
+    #[serde(default)]
+    pub(crate) standard: InstalledStandard,
+    /// The market source the row came from, for example `dshmarket`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) source_label: String,
+    /// The npm spec or `repository#path` the installer was given, for display.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) install_target: String,
+    /// The package directory of an installed DSH or Codex extension.
+    ///
+    /// The ONLY field that decides whether a package can load. A path is
+    /// tilde-expanded and read through `agent::extensions` on each build; the
+    /// standard is detected from the package markers, so the same inventory
+    /// entry serves both standards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
+    /// Whether the package directory was copied into BOS's managed extension
+    /// root. Only a managed directory is ever deleted on uninstall; a local
+    /// package registered in place is the user's and is never removed.
+    #[serde(default)]
+    pub(crate) managed: bool,
+    /// Unix seconds the record was written.
+    #[serde(default)]
+    pub(crate) installed_at: u64,
+    /// Whether the reader approved the third-party commands this package
+    /// declares (its MCP servers).
+    ///
+    /// Trust is the gate between installing a stranger's package and running
+    /// its child process: an untrusted package contributes no MCP server, so a
+    /// fresh install - and every record written before this field existed -
+    /// executes nothing. Serialized only when true, so a TOML document keeps
+    /// the old shape until someone actually trusts a package.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) trusted: bool,
+    /// The package directory the reader approved.
+    ///
+    /// Trust is per (id, path): keeping the approved path beside the flag means
+    /// a record whose directory was repointed - by a reinstall elsewhere, by an
+    /// update, or by hand - is untrusted again even if `trusted` survived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) trusted_path: Option<String>,
+}
+
+impl InstalledExtension {
+    /// Whether this package's declared commands may run.
+    ///
+    /// True only when the reader trusted the package AND the directory it is
+    /// installed at is the one they approved. A legacy record (no field), a
+    /// fresh install, and a moved directory are all untrusted.
+    pub(crate) fn is_trusted(&self) -> bool {
+        if !self.trusted {
+            return false;
+        }
+        let Some(path) = self.trusted_root() else {
+            return false;
+        };
+        let Some(current) = self.path_root() else {
+            return false;
+        };
+        path == current
+    }
+
+    /// The stored package directory, expanded, when it names one.
+    pub(crate) fn path_root(&self) -> Option<std::path::PathBuf> {
+        self.path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(crate::caps::expand_path)
+    }
+
+    /// The directory the reader approved, expanded, when one is recorded.
+    fn trusted_root(&self) -> Option<std::path::PathBuf> {
+        self.trusted_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(crate::caps::expand_path)
+    }
 }
 
 /// One workspace in the registry.
@@ -703,7 +849,7 @@ impl GlobalSettings {
             }
         }
         let mut installed = std::collections::BTreeSet::new();
-        for extension in &self.extentions {
+        for extension in &self.extensions {
             if extension.id.trim().is_empty() {
                 return Err(SettingsError::EmptyExtention);
             }
@@ -834,7 +980,7 @@ input_types = ["text", "image"]
 [providers.nvidia."kimi-k3"]
 model = "nvidia/moonshotai/kimi-k3"
 
-[[extentions]]
+[[extensions]]
 id = "shell"
 
 [[workspaces]]
@@ -1036,7 +1182,7 @@ name = "Tight"
 description = "as small as it gets"
 order = 3
 
-[[extentions]]
+[[extensions]]
 id = "shell"
 
 [[workspaces]]
@@ -1061,6 +1207,113 @@ updated_at = 2
             "but it does ship a preset default, so a session always has a composition"
         );
         assert!(!path.exists(), "reading must not create the file it read");
+    }
+
+    /// An installed market plugin keeps its package path through the file, so a
+    /// restart still knows what to load.
+    #[test]
+    fn an_installed_extension_path_round_trips() {
+        let mut settings = GlobalSettings::default();
+        settings.extensions.push(InstalledExtension {
+            id: "codex-deploy".to_string(),
+            name: "codex-deploy".to_string(),
+            display_name: "Codex Deploy".to_string(),
+            description: "Deploys things in tests.".to_string(),
+            version: "0.4.0".to_string(),
+            standard: InstalledStandard::Codex,
+            source_label: "Codex Marketplace".to_string(),
+            install_target: "github.example/codex-deploy#plugins/deploy".to_string(),
+            path: Some("/tmp/codex-deploy".to_string()),
+            managed: true,
+            installed_at: 1_700_000_000,
+            trusted: false,
+            trusted_path: None,
+        });
+        settings
+            .market_indexes
+            .push("https://market.example/plugins.json".to_string());
+        let text = settings.to_toml().expect("the document");
+        assert!(text.contains("[[extensions]]"), "{text}");
+        assert!(text.contains("path = \"/tmp/codex-deploy\""), "{text}");
+        assert!(
+            text.contains("https://market.example/plugins.json"),
+            "{text}"
+        );
+        let read = GlobalSettings::from_toml(&text).expect("it parses back");
+        assert_eq!(read.extensions, settings.extensions);
+        assert_eq!(read.market_indexes, settings.market_indexes);
+    }
+
+    /// An inventory written before the record carried metadata still parses.
+    /// The only authoritative field - the path - survives; everything else
+    /// defaults and is re-derived from the package on first use, and the
+    /// workspace disabled list (not the record) decides whether it is on.
+    #[test]
+    fn a_legacy_id_and_path_extension_still_loads() {
+        let text = "[[extensions]]\nid = \"shell\"\npath = \"/tmp/shell\"\n";
+        let settings = GlobalSettings::from_toml(text).expect("the old document parses");
+        let entry = &settings.extensions[0];
+        assert_eq!(entry.id, "shell");
+        assert_eq!(entry.path.as_deref(), Some("/tmp/shell"));
+        assert_eq!(entry.name, "");
+        assert_eq!(entry.version, "");
+        assert_eq!(entry.standard, InstalledStandard::Local);
+        assert!(!entry.managed, "an old entry is not assumed managed");
+        assert_eq!(entry.installed_at, 0);
+        assert!(!entry.is_trusted(), "an old record loads untrusted");
+    }
+
+    /// A fresh record is untrusted, and the flag is written only once someone
+    /// trusts a package: the document keeps the pre-trust shape until then.
+    #[test]
+    fn an_extension_is_untrusted_until_the_flag_is_written() {
+        let mut settings = GlobalSettings::default();
+        settings.extensions.push(InstalledExtension {
+            id: "mcp-fixture".to_string(),
+            path: Some("/tmp/mcp-fixture".to_string()),
+            ..InstalledExtension::default()
+        });
+        assert!(!settings.extensions[0].is_trusted());
+        let text = settings.to_toml().expect("the document");
+        assert!(
+            !text.contains("trusted"),
+            "an untrusted record does not write the field: {text}"
+        );
+
+        settings.extensions[0].trusted = true;
+        settings.extensions[0].trusted_path = Some("/tmp/mcp-fixture".to_string());
+        assert!(settings.extensions[0].is_trusted());
+        let text = settings.to_toml().expect("the document");
+        assert!(text.contains("trusted = true"), "{text}");
+        assert!(
+            text.contains("trusted_path = \"/tmp/mcp-fixture\""),
+            "{text}"
+        );
+        let read = GlobalSettings::from_toml(&text).expect("it parses back");
+        assert!(read.extensions[0].is_trusted());
+    }
+
+    /// Trust is bound to the approved directory: repointing the record at
+    /// another package makes it untrusted again, even if the flag survives.
+    #[test]
+    fn moving_an_extension_clears_its_trust() {
+        let mut entry = InstalledExtension {
+            id: "mcp-fixture".to_string(),
+            path: Some("/tmp/mcp-fixture-source".to_string()),
+            trusted: true,
+            trusted_path: Some("/tmp/mcp-fixture-source".to_string()),
+            ..InstalledExtension::default()
+        };
+        assert!(entry.is_trusted(), "the premise: trusted at its path");
+        entry.path = Some("/tmp/mcp-fixture-other".to_string());
+        assert!(
+            !entry.is_trusted(),
+            "a path change is a different package to approve"
+        );
+        entry.path = None;
+        assert!(!entry.is_trusted(), "a record with no path is untrusted");
+        entry.path = Some("/tmp/mcp-fixture-source".to_string());
+        assert!(entry.is_trusted(), "the original approval still holds");
     }
 
     #[test]

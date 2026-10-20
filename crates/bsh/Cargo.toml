@@ -27,6 +27,13 @@ agent = { path = "../agent" }
 react = { path = "../react" }
 logging = { path = "../logging" }
 config = { path = "../config" }
+# Extension packages can refuse a part they declare (a DSH JavaScript entry, a
+# Codex MCP server). `log` is already in the workspace graph through `logging`;
+# it is the shell's way to report that refusal instead of silently dropping it.
+log = "0.4.29"
+# Remote plugin-market index fetches run on the shell's tokio runtime; reqwest
+# is the workspace's HTTP client and already in the build through `agent`.
+reqwest = { workspace = true }
 
 tokio = { workspace = true }
 serde = { workspace = true }

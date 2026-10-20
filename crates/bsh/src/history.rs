@@ -657,8 +657,17 @@ impl History {
     /// this again is a no-op.
     pub(crate) fn compact(&mut self) -> Result<Compaction> {
         // A seal that died between archiving and committing leaves .old files
-        // nothing lists; they are debris either way.
-        sweep_archived(&self.dir);
+        // nothing lists; they are debris either way. The sweep removes
+        // `*.parquet.tmp` too, so it must run under the write lock: an append
+        // writes its segment to that exact temp name before renaming it, and
+        // sweeping without the lock deleted a save that was in flight.
+        {
+            let lock = Arc::clone(&self.lock);
+            let _guard = lock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sweep_archived(&self.dir);
+        }
         if !self.needs_compaction() {
             return Ok(Compaction::Noop);
         }

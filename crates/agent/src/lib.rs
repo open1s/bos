@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod bus;
 pub mod error;
+pub mod extensions;
 pub mod goal;
 pub mod mcp;
 pub mod memory;

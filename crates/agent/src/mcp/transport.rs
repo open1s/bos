@@ -96,11 +96,30 @@ impl From<TransportError> for AgentError {
 impl StdioTransport {
     /// Spawn `command` with `args` and connect to its stdio.
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self, TransportError> {
-        let mut child = tokio::process::Command::new(command)
+        Self::spawn_with(command, args, &[], None).await
+    }
+
+    /// Spawn a server with an environment and working directory.
+    ///
+    /// Plugin-declared MCP servers resolve relative commands and args against
+    /// their own package root and may carry plugin-specific environment.
+    pub async fn spawn_with(
+        command: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Self, TransportError> {
+        let mut process = tokio::process::Command::new(command);
+        process
             .args(args)
+            .envs(env.iter().map(|(key, value)| (*key, *value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        if let Some(cwd) = cwd {
+            process.current_dir(cwd);
+        }
+        let mut child = process
             .spawn()
             .map_err(|e| TransportError::Process(e.to_string()))?;
 
