@@ -1119,3 +1119,21 @@
 "subagents.busy": "This subagent is still running."
 "subagents.unavailable": "This subagent is no longer available."
 "subagents.select": "Select subagent"
+# The changed-files card a turn tail closes with, and the hover preview that
+# opens off one of its rows. Wording measured from the reference
+# (dsh-client-ui-deliverables): changes.title, singleTitle, added, deleted,
+# binary, oversized, all, collapse, openReview and viewDiff, plus the shared
+# presented.preview hint the header shows on hover.
+"changes.title": "Edited {count} files"
+"changes.singleTitle": "Edited {name}"
+"changes.added": "+{count}"
+"changes.deleted": "-{count}"
+"changes.binary": "binary"
+"changes.oversized": "too large"
+"changes.openReview": "Review this turn’s changes in the sidebar"
+"changes.all": "All {count} files"
+"changes.collapse": "Collapse"
+"changes.expandAria": "Show all {count} changed files"
+"changes.collapseAria": "Collapse changed files"
+"changes.viewDiff": "View changes to {name}"
+"presented.preview": "Preview in sidebar"

@@ -18,7 +18,7 @@ use super::shell::Shell;
 use super::todo_panel::spinner;
 use gpui_kit::component::input::Input;
 
-use super::lane::{equal_lane, time_lane, LaneRecord, TimeAxis};
+use super::lane::{block_box, equal_lane, fixed_box, time_lane, LaneRecord, TimeAxis};
 use super::{icon, txt, DivExt, IconName};
 use crate::i18n::Lang;
 use crate::model::{ChatMessage, MessageTiming, Session};
@@ -1020,10 +1020,15 @@ impl Shell {
         // border-l1, and 10px labels pinned at y 7 / 21 / 35 (a 14px pitch) and
         // right-aligned 3px in.
         div()
+            .debug_selector(|| "traj-strip".to_string())
             .flex()
             .flex_col()
             .h(px(50.0))
             .relative()
+            // Nothing in the strip may paint outside its own bounds: the
+            // lanes clamp their blocks, and this is the whole-strip backstop
+            // that also covers the earlier-history affordance.
+            .overflow_hidden()
             .border_b_1()
             .border_color(rgb(theme::border_soft()))
             .bg(rgb(theme::new_session_fill()))
@@ -1070,12 +1075,39 @@ impl Shell {
                     .enumerate()
                     .map(|(lane_index, (key, kind, lane_id))| {
                         let lane = &records[lane_index];
+                        // The last prepaint's track width, shared by all three
+                        // lanes. Each track sets it; they are the same width
+                        // because they are the same row minus the same label.
+                        let lane_width = self.traj_lane_w.clone();
                         let track = div()
                             .debug_selector(move || format!("traj-lane-{lane_id}"))
                             .flex_1()
                             .min_w_0()
                             .h(px(6.0))
-                            .ml(px(3.0));
+                            .ml(px(3.0))
+                            // The blocks are absolute children of this box, so
+                            // relative(1.0) resolves to THIS box's right edge.
+                            // No padding or border sits here on purpose: the
+                            // sentinel below measures 100% of the same box the
+                            // fractions resolve against, so a future inset would
+                            // still make 1.0 the track's own right edge.
+                            .relative()
+                            // The backstop. The measured geometry already clamps
+                            // every block, but the one frame that still carries a
+                            // pre-resize width (and any arithmetic slip) must not
+                            // paint past the lane either.
+                            .overflow_hidden()
+                            // The FIRST child is a full-size, out-of-flow
+                            // sentinel: its prepainted bounds ARE the track's
+                            // width, which is what the pixel floor and the
+                            // right-edge clamp are computed against. It paints
+                            // nothing and is not a hit target.
+                            .child(div().absolute().top_0().left_0().w_full().h_full())
+                            .on_children_prepainted(move |children, _window, _cx| {
+                                if let Some(bounds) = children.first() {
+                                    lane_width.set(Some(f32::from(bounds.size.width)));
+                                }
+                            });
                         let track = if real_time {
                             // One common axis, absolute fractions: x is the event's
                             // instant and width its duration, so a pause stays empty
@@ -1232,27 +1264,50 @@ impl Shell {
             .rounded(px(1.0))
             .bg(rgb(ink))
             .when(selected, |block| block.border_1().border_color(rgb(ring)));
+        // The track's measured width, from the last layout pass. Without it a
+        // block can only be a fraction: it is still clipped by the track, and
+        // the next frame places it in pixels. With it, the fraction is fitted
+        // to the real track so the pixel floor and the right-edge clamp are
+        // exact rather than guessed.
+        let lane_w = self.traj_lane_w.get();
         let cell = match width {
             BlockWidth::Fixed(w) => base.w(px(w)),
             BlockWidth::Share(share) => base.flex_grow(share.max(0.0001)),
             // Time-proportional: the left edge is the event's instant and the
             // width its span, both fractions of the common axis. The 2px floor
-            // keeps an instant (or untimed) event pressable without moving its
-            // left edge.
-            BlockWidth::Placed { x, width } => base
-                .absolute()
-                .top_0()
-                .left(relative(x.clamp(0.0, 1.0)))
-                .w(relative(width.clamp(0.0, 1.0)))
-                .min_w(px(MIN_BLOCK_W)),
+            // keeps an instant (or untimed) event pressable; when that floor
+            // would cross the axis end, block_box shifts the LEFT edge left by
+            // just enough to keep the block fully visible and fully inside.
+            BlockWidth::Placed { x, width } => match lane_w {
+                Some(track_w) => {
+                    let block = block_box(x, width, track_w, MIN_BLOCK_W);
+                    base.absolute().top_0().left(px(block.x)).w(px(block.width))
+                }
+                // First frame after the strip mounts: no measurement yet. The
+                // width is clamped to the room left on the axis (there is no
+                // track width to express the floor in) and the track clips it.
+                None => base
+                    .absolute()
+                    .top_0()
+                    .left(relative(x.clamp(0.0, 1.0)))
+                    .w(relative(width.clamp(0.0, 1.0).min(1.0 - x.clamp(0.0, 1.0)))),
+            },
             // Placed by time, sized by the equal-width rule. The width argument
             // is ignored on purpose: 8px is the whole point of the mode, and
             // taking it from the caller is how the two readings drift apart.
-            BlockWidth::PlacedFixed { x, .. } => base
-                .absolute()
-                .top_0()
-                .left(relative(x.clamp(0.0, 1.0)))
-                .w(px(EQUAL_BLOCK_W)),
+            // The fixed width still fits the track: at the axis end the block
+            // slides left by its own width instead of hanging over the edge.
+            BlockWidth::PlacedFixed { x, .. } => match lane_w {
+                Some(track_w) => {
+                    let block = fixed_box(x, EQUAL_BLOCK_W, track_w);
+                    base.absolute().top_0().left(px(block.x)).w(px(block.width))
+                }
+                None => base
+                    .absolute()
+                    .top_0()
+                    .left(relative(x.clamp(0.0, 1.0)))
+                    .w(px(EQUAL_BLOCK_W)),
+            },
         };
         cell.debug_selector(move || format!("traj-cell-hit-{}", index))
             .id(SharedString::from(format!("traj-cell-{}", index)))

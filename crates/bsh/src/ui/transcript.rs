@@ -361,6 +361,93 @@ pub(crate) fn tool_diff(name: &str, args: &str) -> Option<Vec<(char, String)>> {
         _ => None,
     }
 }
+/// The file-writing tools a turn's steps can carry.
+///
+/// The reference does not read this off the tool registry either: it asks the
+/// host for the turn's changed files so a write through any pluggable file tool
+/// or a shell command that touched a file, is the same fact. bsh has no such
+/// host record, so the honest source is the step's own request, exactly like
+/// `tool_diff`. The three names are what this crate's own tool switch already
+/// treats as a write.
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) fn is_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "edit_file" | "apply_patch" | "write" | "edit" | "patch" | "create_file"
+    )
+}
+
+/// One file a turn wrote, as the changed-files card reports it.
+///
+/// `added` and `deleted` count the LINES the request carried, and `diff` is the
+/// same shape a step row shows. Both come from the arguments, so a card here is
+/// a summary of what the turn ASKED for - never a claim about what the disk
+/// held, which bsh cannot know without a before-image.
+#[derive(Clone)]
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) struct ChangedFile {
+    /// The path exactly as the step named it.
+    pub(crate) path: String,
+    /// The FIRST step in the message that touched this file, so pressing a row
+    /// opens the file through the same seam a step's own path link uses.
+    pub(crate) tool: usize,
+    /// Lines the request added.
+    pub(crate) added: usize,
+    /// Lines the request removed.
+    pub(crate) deleted: usize,
+    /// The requested change, as `+` / `-` lines for the hover preview.
+    pub(crate) diff: Vec<(char, String)>,
+}
+
+/// The files one message's own steps wrote, in the order they were touched.
+///
+/// Two edits to one file are ONE file, the way the reference's turn summary
+/// groups them: the counts add up and the preview shows both changes in order.
+/// A step with no readable path or no readable change is skipped rather than
+/// shown as a nameless row.
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) fn turn_changes(tools: &[ToolEvent]) -> Vec<ChangedFile> {
+    let mut files: Vec<ChangedFile> = Vec::new();
+    for (index, tool) in tools.iter().enumerate() {
+        if !is_write_tool(&tool.name) {
+            continue;
+        }
+        let Some(diff) = tool_diff(&tool.name, &tool.args) else {
+            continue;
+        };
+        let Some(path) = tool_path(&tool.args) else {
+            continue;
+        };
+        let added = diff.iter().filter(|(mark, _)| *mark == '+').count();
+        let deleted = diff.iter().filter(|(mark, _)| *mark == '-').count();
+        match files.iter_mut().find(|file| file.path == path) {
+            Some(file) => {
+                file.added += added;
+                file.deleted += deleted;
+                file.diff.extend(diff);
+            }
+            None => files.push(ChangedFile {
+                path,
+                tool: index,
+                added,
+                deleted,
+                diff,
+            }),
+        }
+    }
+    files
+}
+
+/// The file name a single-file card titles itself with.
+///
+/// Measured: the reference's `changes.singleTitle` names the BASENAME, because
+/// the header's tile already carries the file's own kind icon and the full path
+/// would ellipsise the one word that identifies it.
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) fn base_name(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
 /// Collapse a value to one clipped line.
 fn clip_summary(text: &str) -> String {
     let one_line = text

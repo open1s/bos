@@ -898,6 +898,81 @@ pub(crate) fn diff_del() -> u32 {
     let rgb = error() & 0x00FF_FFFF;
     (rgb << 8) | 0x24
 }
+/// The changed-files card's header fill.
+///
+/// Measured: the card sets `--changes-fill: --dsw-static-neutral-50` and
+/// repaints it `-850` under the dark theme, so the header is a deliberately
+/// STATIC grey rather than a layered surface - it does not follow the
+/// translucent-layer ladder the way the card's own background does.
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) fn changes_fill() -> u32 {
+    if is_dark() {
+        0x2A2A2BFF
+    } else {
+        0xFAFAFAFF
+    }
+}
+
+/// The header's fill under the pointer: `--changes-hover`, measured as
+/// `--dsw-static-neutral-100` (light) / `-800` (dark).
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) fn changes_hover() -> u32 {
+    if is_dark() {
+        0x333334FF
+    } else {
+        0xF5F5F5FF
+    }
+}
+
+/// The 40x40 file tile's fill: the reference mixes the static neutral-00 -
+/// pure white in BOTH themes - half into the header, and 5% of it in dark.
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) fn changes_tile() -> u32 {
+    if is_dark() {
+        0xFFFFFF0D
+    } else {
+        0xFFFFFF80
+    }
+}
+
+/// The measured metrics of the changed-files card and its rows.
+///
+/// Every number is read off `ui-deliverables__ChangedFiles.module.css`: the
+/// header is a fixed 60 over `8px 10px`, the tile is 40 x 40 on a 10 radius,
+/// the title is 13px/20px at weight 500, the stat line is 10px/16px, a row is
+/// `min-height:24px` over `7px 18px 7px 14px` at 11px/18px, and the fold
+/// control is `10px 18px 10px 14px` at 12px/18px with a 14px chevron.
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_HEADER_H: f32 = 60.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_TILE: f32 = 40.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_TILE_RADIUS: f32 = 10.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_TITLE_SIZE: f32 = 13.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_TITLE_LINE: f32 = 20.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_STAT_SIZE: f32 = 10.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_STAT_LINE: f32 = 16.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_ROW_PAD_L: f32 = 14.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_ROW_PAD_R: f32 = 18.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_ROW_PAD_Y: f32 = 7.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_ROW_LINE: f32 = 18.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_ROW_SIZE: f32 = 11.0;
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_PATH_SIZE: f32 = 12.0;
+/// The rows the card shows before it folds, measured as the reference's
+/// `COLLAPSED_ROWS` - "the design's summary height for a closing message".
+#[allow(dead_code)] // wired by the changed-files panel that is landing next
+pub(crate) const CHANGES_COLLAPSED_ROWS: usize = 4;
+
 /// The measured bar: a 2px column, 72 tall, whose solid 16px band sits
 /// between two 28px fades - the reference's transparent calc(y - 36px) ->
 /// scrollbar-bg-l1 calc(y - 8px) -> scrollbar-bg-l1 calc(y + 8px) ->

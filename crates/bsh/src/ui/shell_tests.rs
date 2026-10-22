@@ -12698,6 +12698,314 @@ fn a_timeline_block_selects_its_record(cx: &mut TestAppContext) {
     );
 }
 
+/// The horizontal painted span of one debug-selected element, in window
+/// coordinates.
+fn painted_span(cx: &mut VisualTestContext, selector: &'static str) -> (f32, f32) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} renders"));
+    (
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.x + bounds.size.width),
+    )
+}
+
+/// Boot the shell on the Trajectory tab with these tool calls planted on the
+/// two assistant turns `state_with_turns` seeds (messages 1 and 3).
+///
+/// `calls` is `(message, started-at ms, duration ms)`; a timed tool also
+/// anchors its assistant row, which is why the model lane has blocks too.
+fn boot_trajectory<'a>(
+    cx: &'a mut TestAppContext,
+    label: &'static str,
+    calls: &[(usize, u64, Option<u64>)],
+    duration_mode: bool,
+) -> (Entity<Shell>, &'a mut VisualTestContext) {
+    init_test_app(cx);
+    let calls = calls.to_vec();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns(label, 2);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            for (message, at, ms) in calls {
+                session.messages[message].tools.push(ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms,
+                    at: Some(at),
+                });
+            }
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Trajectory;
+            this.traj_actual_duration = duration_mode;
+            this.traj_actual_time = true;
+            cx.notify();
+        })
+    });
+    (shell, cx)
+}
+
+/// Draw until the lane track has measured itself and the strip's blocks are on
+/// screen, then draw the one frame that APPLIES the measured width.
+///
+/// The measurement lands during prepaint, after the frame that will paint it
+/// was built, so a settled pixel assertion is always one frame behind the
+/// predicate.
+fn settle_lanes(cx: &mut VisualTestContext, shell: &Entity<Shell>) {
+    let shell = shell.clone();
+    draw_until(
+        cx,
+        "the lane track is measured and its blocks draw",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.update(|_, cx| shell.read(cx).traj_lane_w.get())
+                .is_some()
+                && cx.debug_bounds("traj-lane-tools").is_some()
+                && cx.debug_bounds("traj-strip").is_some()
+                && cx.debug_bounds("traj-cell-hit-2").is_some()
+        },
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// Assert every block the log projects into a lane is inside its lane's track
+/// and inside the strip's own bounds, on both axes.
+///
+/// The lane is derived from the event's own kind, so this covers Input, Model
+/// and Tools rather than whichever lane the test happened to seed.
+fn assert_blocks_inside(cx: &mut VisualTestContext, shell: &Entity<Shell>, tag: &str) {
+    let strip = cx.debug_bounds("traj-strip").expect("the strip renders");
+    let strip_left = f32::from(strip.origin.x);
+    let strip_right = strip_left + f32::from(strip.size.width);
+    let strip_top = f32::from(strip.origin.y);
+    let strip_bottom = strip_top + f32::from(strip.size.height);
+    let events = cx.update(|_, cx| crate::ui::trajectory::events(shell.read(cx)));
+    let mut checked = 0usize;
+    for (index, event) in events.iter().enumerate() {
+        let lane: &'static str = match event.kind {
+            crate::ui::trajectory::Kind::User => "traj-lane-input",
+            crate::ui::trajectory::Kind::Assistant => "traj-lane-model",
+            crate::ui::trajectory::Kind::Tool => "traj-lane-tools",
+            _ => continue,
+        };
+        let track = cx
+            .debug_bounds(lane)
+            .unwrap_or_else(|| panic!("{tag}: {lane} renders"));
+        let track_left = f32::from(track.origin.x);
+        let track_right = track_left + f32::from(track.size.width);
+        let selector: &'static str = Box::leak(format!("traj-cell-hit-{index}").into_boxed_str());
+        let cell = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{tag}: event {index} draws a block"));
+        let left = f32::from(cell.origin.x);
+        let right = left + f32::from(cell.size.width);
+        let top = f32::from(cell.origin.y);
+        let bottom = top + f32::from(cell.size.height);
+        assert!(
+            left >= track_left - 1.0,
+            "{tag}: event {index} stays off the lane's left edge: {left} vs {track_left}"
+        );
+        assert!(
+            right <= track_right + 1.0,
+            "{tag}: event {index} stays inside the lane: {right} vs {track_right}"
+        );
+        assert!(
+            left >= strip_left - 1.0
+                && right <= strip_right + 1.0
+                && top >= strip_top - 1.0
+                && bottom <= strip_bottom + 1.0,
+            "{tag}: event {index} is inside the strip's own bounds: cell {cell:?}, strip {strip:?}"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 6,
+        "{tag}: the sweep saw every lane's blocks, not none: {checked}"
+    );
+}
+
+/// A lane whose last event ends EXACTLY on the shared axis end paints its
+/// right edge on the track's own right edge.
+///
+/// The axis is 1s..6s: the second call starts at t=5s and takes 1s, so its
+/// fraction ends at 1.0 while its width is a real 20% of the axis. That block
+/// never needed the floor, and the clamp must not shift it: its right edge is
+/// within 1px of the track's right edge, and its width is still the duration's
+/// share. The overflow cases (the floor and the 8px equal width) are the two
+/// tests below.
+#[gpui::test]
+fn a_lane_ending_on_the_axis_end_paints_on_the_track_edge(cx: &mut TestAppContext) {
+    let (shell, cx) = boot_trajectory(
+        cx,
+        "traj-axis-end",
+        &[(1, 1_000, Some(4_000)), (3, 5_000, Some(1_000))],
+        true,
+    );
+    settle_lanes(cx, &shell);
+
+    let track = cx.debug_bounds("traj-lane-tools").expect("the tools lane");
+    let track_left = f32::from(track.origin.x);
+    let track_w = f32::from(track.size.width);
+    let track_right = track_left + track_w;
+    // The event log is [user0, assistant1, tool2, user3, assistant4, tool5].
+    let (left, right) = painted_span(cx, "traj-cell-hit-5");
+    assert!(
+        (right - track_right).abs() <= 1.0,
+        "the last block's right edge is the track's right edge: {right} vs {track_right}"
+    );
+    assert!(
+        right <= track_right + 1.0,
+        "never past it: {right} vs {track_right}"
+    );
+    assert!(
+        left >= track_left - 1.0,
+        "and its left edge is still inside: {left} vs {track_left}"
+    );
+    assert!(
+        ((right - left) - track_w * 0.2).abs() <= 2.0,
+        "the real duration still sets the width: {} vs {}",
+        right - left,
+        track_w * 0.2
+    );
+}
+
+/// A lane whose last event needs the 2px floor on the axis end stays fully
+/// inside AND fully visible: the floor shifts the LEFT edge left by just enough
+/// (the measured block is 2px wide with its right edge on the track's), rather
+/// than growing 2px over the edge.
+#[gpui::test]
+fn the_pixel_floor_at_the_axis_end_stays_visible_and_inside(cx: &mut TestAppContext) {
+    // The axis is 0..10s and the last call starts ON the axis end with a
+    // zero duration: its x is exactly 1.0, so only the floor can make it
+    // visible - and that floor is the width that used to paint past the track.
+    let (shell, cx) = boot_trajectory(
+        cx,
+        "traj-floor-end",
+        &[(1, 0, Some(10_000)), (3, 10_000, Some(0))],
+        true,
+    );
+    settle_lanes(cx, &shell);
+
+    let track = cx.debug_bounds("traj-lane-tools").expect("the tools lane");
+    let track_left = f32::from(track.origin.x);
+    let track_right = track_left + f32::from(track.size.width);
+    let (left, right) = painted_span(cx, "traj-cell-hit-5");
+    assert!(
+        right - left >= 1.5,
+        "the block is still visible at the very end: {}px wide",
+        right - left
+    );
+    assert!(
+        right <= track_right + 1.0,
+        "and fully inside the track: {right} vs {track_right}"
+    );
+    assert!(
+        (right - track_right).abs() <= 1.0,
+        "the shifted block ends on the track's right edge, not before it: {right} vs {track_right}"
+    );
+    assert!(
+        left >= track_left - 1.0,
+        "without leaving the left edge: {left} vs {track_left}"
+    );
+}
+
+/// EVERY block in EVERY lane obeys `left >= track_left` and
+/// `right <= track_right`, and every block is also inside the strip's own
+/// bounds.
+///
+/// The assertion sweeps the whole event log and derives each block's lane from
+/// the event's kind, so one passing block cannot hide an overflowing neighbour.
+/// It runs in both width readings: Duration keeps the real width and equal
+/// width overrides it to 8px, which is the mode where a last block hung 8px
+/// over the edge.
+#[gpui::test]
+fn every_lane_block_stays_inside_the_track_and_the_strip(cx: &mut TestAppContext) {
+    let (shell, cx) = boot_trajectory(
+        cx,
+        "traj-all-blocks",
+        &[
+            (1, 1_000, Some(3_000)),
+            (1, 5_000, Some(2_000)),
+            (3, 8_000, Some(1_000)),
+            // A zero-duration call ON the axis end: x = 1.0 in every reading.
+            // Duration draws it at the 2px floor, equal width at 8px; both
+            // used to hang past the track's right edge.
+            (3, 10_000, Some(0)),
+        ],
+        true,
+    );
+    settle_lanes(cx, &shell);
+    assert_blocks_inside(cx, &shell, "Duration");
+
+    // The equal-width reading: still placed by the clock, drawn 8px wide.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.traj_actual_duration = false;
+            cx.notify();
+        })
+    });
+    settle_lanes(cx, &shell);
+    let (left, right) = painted_span(cx, "traj-cell-hit-7");
+    assert!(
+        (right - left - 8.0).abs() <= 1.0,
+        "the equal-width block is the measured 8px: {}",
+        right - left
+    );
+    assert_blocks_inside(cx, &shell, "equal width");
+}
+
+/// At a 460px column the strip is short, and its right edge is close enough
+/// that a block placed by fraction plus its floor is pressed against it. Every
+/// block must still be inside its track and inside the strip's own bounds.
+#[gpui::test]
+fn the_strip_keeps_a_narrow_column_inside_its_own_bounds(cx: &mut TestAppContext) {
+    let (shell, cx) = boot_trajectory(
+        cx,
+        "traj-narrow-strip",
+        &[
+            (1, 1_000, Some(3_000)),
+            (1, 5_000, Some(2_000)),
+            (3, 8_000, Some(1_000)),
+            (3, 10_000, Some(0)),
+        ],
+        true,
+    );
+    settle_lanes(cx, &shell);
+    resize_viewport(cx, 460.0);
+    let narrow = shell.clone();
+    draw_until(
+        cx,
+        "the narrow strip measures its own short track",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            let track = cx
+                .debug_bounds("traj-lane-tools")
+                .map(|bounds| f32::from(bounds.size.width));
+            let measured = cx.update(|_, cx| narrow.read(cx).traj_lane_w.get());
+            matches!((track, measured), (Some(track), Some(measured)) if (track - measured).abs() <= 1.5)
+                && cx.debug_bounds("traj-cell-hit-7").is_some()
+        },
+    );
+    // The frame that first saw the short width renders it; one draw applies it.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let track = cx.debug_bounds("traj-lane-tools").expect("the tools lane");
+    let track_w = f32::from(track.size.width);
+    assert!(
+        track_w > 100.0 && track_w < 460.0,
+        "the harness really is on the short track, not the wide one: {track_w}"
+    );
+    assert_blocks_inside(cx, &shell, "460 column");
+}
+
 /// The chat's Inspect link opens the SAME call in the Trajectory tab: the tab
 /// The chat's Inspect link opens the SAME call in the Trajectory tab: the tab
 /// switches, the matching line is selected, and the detail panel shows it. Before

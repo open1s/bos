@@ -11,6 +11,13 @@
 //! known instant in its lane, and an event without a duration keeps the
 //! renderer's two-pixel floor. Those two fallbacks are the only cases where the
 //! geometry is an approximation, and they are marked where they are applied.
+//!
+//! A fraction alone cannot tell whether the pixel floor still fits before the
+//! end of the track, so the renderer measures the track once per layout pass and
+//! asks [`block_box`] for the final pixel box. That box obeys one invariant for
+//! every block: `x + width <= track_w`. A floor that would cross the end shifts
+//! the block left instead of growing past it, so a block on the very last
+//! instant is still visible and still inside.
 
 /// One event as the lane strip needs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +154,58 @@ pub(crate) fn time_lane(lane: &[LaneRecord], axis: TimeAxis) -> Vec<LaneBlock> {
         .collect()
 }
 
+/// One block's final pixel box inside a lane track.
+///
+/// Both fields are pixels from the track's content left edge. The renderer
+/// draws the block at this origin and width, so the box's own invariant is the
+/// painted one: `x + width <= track_w` for every block, in every mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BlockBox {
+    /// The block's left edge, in pixels from the track's content left edge.
+    pub(crate) x: f32,
+    /// The block's drawn width, in pixels. Never wider than the track.
+    pub(crate) width: f32,
+}
+
+/// Fit one block's pixel box inside a track of `track_w` pixels.
+///
+/// `x` and `width` are fractions of the track; `floor` is the minimum
+/// drawn width in pixels (the renderer's two-pixel floor). The width is first
+/// clamped to the room left before the axis end, then raised to the floor, so
+/// the only way it can still reach past the end is the floor itself. That last
+/// pixel is recovered by shifting the block LEFT, never by letting it paint
+/// over the track edge: a block standing on the very last instant stays fully
+/// visible. A width larger than the track (a floor on a track narrower than
+/// two pixels) is fitted to the track instead.
+pub(crate) fn block_box(x: f32, width: f32, track_w: f32, floor: f32) -> BlockBox {
+    let track_w = track_w.max(0.0);
+    let x = x.clamp(0.0, 1.0);
+    let room = (1.0 - x).max(0.0);
+    // The time width never reaches past the axis end; only the pixel floor can.
+    let width = (width.clamp(0.0, 1.0).min(room) * track_w).max(floor);
+    fit_box(x * track_w, width, track_w)
+}
+
+/// Fit a block that is PLACED by time but drawn at a fixed pixel width.
+///
+/// The equal-width readings keep the event's instant as the left edge and
+/// override only the width. The fixed width still has to fit: an 8px block on
+/// the last instant is shifted left by 8px rather than hanging over the track.
+pub(crate) fn fixed_box(x: f32, width: f32, track_w: f32) -> BlockBox {
+    let track_w = track_w.max(0.0);
+    fit_box(x.clamp(0.0, 1.0) * track_w, width, track_w)
+}
+
+/// The one clamp both placements share: the box's right edge never crosses the
+/// track's right edge, and its left edge never precedes the track's left one.
+fn fit_box(x: f32, width: f32, track_w: f32) -> BlockBox {
+    // A track narrower than the block still fits the block: the width shrinks
+    // to the track before the left edge is chosen.
+    let width = width.clamp(0.0, track_w);
+    let x = x.min((track_w - width).max(0.0)).max(0.0);
+    BlockBox { x, width }
+}
+
 /// Equal shares, one slot per record, for the modes that are not a clock.
 ///
 /// This is the fallback for a Duration strip whose session carries no start
@@ -171,7 +230,7 @@ pub(crate) fn equal_lane(lane: &[LaneRecord]) -> Vec<LaneBlock> {
 
 #[cfg(test)]
 mod tests {
-    use super::{equal_lane, time_lane, LaneRecord, TimeAxis};
+    use super::{block_box, equal_lane, fixed_box, time_lane, LaneRecord, TimeAxis};
 
     fn record(index: usize, start: Option<u64>, duration_ms: Option<u64>) -> LaneRecord {
         LaneRecord {
@@ -307,5 +366,98 @@ mod tests {
         assert_eq!(blocks[0].x, 0.0);
         assert_eq!(blocks[0].width, 0.5);
         assert_eq!(blocks[1].x, 0.5);
+    }
+
+    /// A block whose event ends exactly on the axis end paints its right edge
+    /// on the track's right edge, not two pixels past it. Measured at the tools
+    /// lane's real narrow width (a 460px window leaves a 368px track): the last
+    /// 1s of a 5s axis is 73.6px wide and ends at 368.0.
+    #[test]
+    fn a_block_that_ends_on_the_axis_end_stops_on_the_edge() {
+        let track = 368.0;
+        let block = block_box(0.8, 0.2, track, 2.0);
+        let right = block.x + block.width;
+        assert!(
+            (right - track).abs() < 0.01,
+            "the block ends on the track's right edge: {right} vs {track}"
+        );
+        assert!(
+            (block.width - 0.2 * track).abs() < 0.01,
+            "the duration still sets the width: {} vs {}",
+            block.width,
+            0.2 * track
+        );
+    }
+
+    /// The two-pixel floor is the only width that can cross the axis end. It is
+    /// paid for by shifting the LEFT edge left, so the block stays visible AND
+    /// inside: x 366 .. 368 on a 368px track, never 368 .. 370.
+    #[test]
+    fn the_pixel_floor_at_the_axis_end_shifts_the_block_inside() {
+        let track = 368.0;
+        // An instant, or a duration far too short for the track to resolve.
+        for (x, width) in [(1.0, 0.0), (0.9999, 0.0001), (0.0, 0.0)] {
+            let block = block_box(x, width, track, 2.0);
+            assert!(
+                block.width >= 1.5,
+                "the floor keeps the block visible: x {x} width {}",
+                block.width
+            );
+            assert!(
+                block.x + block.width <= track + 0.01,
+                "and inside the track: {} + {} > {track}",
+                block.x,
+                block.width
+            );
+            assert!(
+                block.x >= -0.01,
+                "without leaving the left edge: {}",
+                block.x
+            );
+        }
+        let last = block_box(1.0, 0.0, track, 2.0);
+        assert!((last.x - (track - 2.0)).abs() < 0.01, "x is {} ", last.x);
+        assert!((last.width - 2.0).abs() < 0.01, "width is {}", last.width);
+    }
+
+    /// Every block, across the whole axis and every width mode, keeps
+    /// `x + width <= track_w`; this is the invariant the renderer's assertion
+    /// is built on, exercised as a sweep rather than one case.
+    #[test]
+    fn no_block_ever_crosses_the_track_edge() {
+        let track = 368.0;
+        for step in 0..=100 {
+            let x = step as f32 / 100.0;
+            for width in [0.0, 0.001, 0.01, 0.1, 0.5, 1.0] {
+                let placed = block_box(x, width, track, 2.0);
+                assert!(
+                    placed.x >= -0.01 && placed.x + placed.width <= track + 0.01,
+                    "placed x {x} width {width}: {} + {} > {track}",
+                    placed.x,
+                    placed.width
+                );
+                let fixed = fixed_box(x, 8.0, track);
+                assert!(
+                    fixed.x >= -0.01 && fixed.x + fixed.width <= track + 0.01,
+                    "fixed x {x}: {} + {} > {track}",
+                    fixed.x,
+                    fixed.width
+                );
+            }
+        }
+        // A box placed on the equal shares' last slot ends on the edge too.
+        let count = 7usize;
+        let last_x = (count - 1) as f32 / count as f32;
+        let last = block_box(last_x, 1.0 / count as f32, track, 2.0);
+        assert!((last.x + last.width - track).abs() < 0.01);
+    }
+
+    /// A track narrower than the fixed 8px block fits the block to the track
+    /// instead of letting it hang off both sides.
+    #[test]
+    fn a_narrow_track_fits_a_fixed_block() {
+        let block = fixed_box(1.0, 8.0, 5.0);
+        assert_eq!(block.x, 0.0);
+        assert_eq!(block.width, 5.0);
     }
 }

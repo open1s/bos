@@ -105,6 +105,19 @@ pub(crate) struct Shell {
     /// What the trajectory search field holds, kept beside the entity so the
     /// view can filter without reading it per row.
     pub(crate) traj_query: String,
+    /// The trajectory lane track's width as of the last prepaint, in logical
+    /// pixels.
+    ///
+    /// The blocks are placed by fractions of the shared time axis, but their
+    /// two-pixel floor and the right-edge clamp need the track's real width:
+    /// `1.0` of the axis has to land on the track's own right edge, and a
+    /// floor at that edge must shift left rather than paint over it. The track
+    /// measures itself once per layout pass (its first child is a full-size
+    /// sentinel) and the next frame's render reads the width. `None` is the
+    /// first frame after the strip mounts; a block then falls back to the
+    /// relative box, which is still clipped by the track, and the measured
+    /// box lands on the next frame.
+    pub(crate) traj_lane_w: std::rc::Rc<std::cell::Cell<Option<f32>>>,
     /// The Audit tab's own search field.
     pub(crate) audit_search: Entity<InputState>,
     /// Which measure the audit toolbar shows: 0 duration, 1 turns, 2 calls.
@@ -249,6 +262,27 @@ pub(crate) struct Shell {
     pub(crate) settings_scroll: ScrollHandle,
     /// The turn whose mark the pointer is over, which opens its preview card.
     pub(crate) rail_hover: Option<usize>,
+    /// The changed-files cards whose fold the reader has opened, by message
+    /// index. Scoped like the other disclosures: a session switch closes them,
+    /// because the indices name rows in the transcript that just changed.
+    pub(crate) changes_open: std::collections::HashSet<usize>,
+    /// The changed-file row the pointer is over, with where and when it got
+    /// there. The reference's card previews on pointer move after a 500ms
+    /// delay, so the row that armed the timer and the moment it did are the
+    /// two facts the timer needs.
+    pub(crate) changes_hover: Option<ChangesHover>,
+    /// The changed file whose preview has cleared that delay, and the lines the
+    /// card draws for it. Held, not recomputed: the diff is read out of the
+    /// step's own arguments once, when the pointer arrives.
+    pub(crate) changes_preview: Option<(
+        usize,
+        usize,
+        std::rc::Rc<Vec<crate::ui::transcript::ChangedFile>>,
+    )>,
+    /// One changed-file summary per message, keyed on the steps it was built
+    /// from. Parsing every write's arguments on every frame is exactly the
+    /// per-frame work the crate's own rule forbids.
+    pub(crate) changes_cache: std::cell::RefCell<ChangesCache>,
     /// The conversation column's width as of the last frame, less the sidebar.
     /// The rail's container rule and its card breadth are measured against it.
     pub(crate) conversation_w: Pixels,
@@ -521,6 +555,61 @@ pub(crate) struct SideDrag {
     pub(crate) origin_x: f32,
     pub(crate) base: f32,
     pub(crate) moved: bool,
+}
+
+/// The changed-file row the pointer is over.
+///
+/// The reference's hover card opens after a 500ms delay on its anchor, so the
+/// row itself is not enough state: the card has to know WHEN the pointer
+/// arrived to know whether the delay has passed, and where the pointer is so the
+/// card can hang off it.
+#[allow(dead_code)] // scaffolding of the changed-files hover card being wired
+#[derive(Clone, Copy)]
+pub(crate) struct ChangesHover {
+    /// The message whose card the row belongs to.
+    pub(crate) message: usize,
+    /// The row's ordinal within that card's file list.
+    pub(crate) file: usize,
+    /// The pointer's window position when it arrived.
+    pub(crate) at: (f32, f32),
+}
+
+/// One message's changed-file summary, and the steps it was built from.
+///
+/// A turn appends steps while it streams, so the entry is keyed on how many
+/// steps the message has and how many argument bytes they carry together -
+/// cheap to compute and enough to notice a step arriving or filling in. Without
+/// it every frame re-parsed the arguments of every visible write.
+#[derive(Default)]
+pub(crate) struct ChangesCache {
+    entries: std::collections::HashMap<usize, (usize, Vec<super::transcript::ChangedFile>)>,
+}
+
+impl ChangesCache {
+    /// The summary for one message, rebuilt only when its steps changed.
+    #[allow(dead_code)] // read by the changed-files card once it is wired
+    pub(crate) fn get(
+        &mut self,
+        message: usize,
+        tools: &[crate::model::ToolEvent],
+    ) -> std::rc::Rc<Vec<super::transcript::ChangedFile>> {
+        let stamp = tools.len() * 4096 + tools.iter().map(|tool| tool.args.len()).sum::<usize>();
+        let fresh = match self.entries.get(&message) {
+            Some((cached, files)) if *cached == stamp => files.clone(),
+            _ => {
+                let files = super::transcript::turn_changes(tools);
+                self.entries.insert(message, (stamp, files.clone()));
+                files
+            }
+        };
+        std::rc::Rc::new(fresh)
+    }
+
+    /// Drop everything: the message indices name rows in a transcript that
+    /// just changed, so a session switch starts over.
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 impl Shell {
@@ -1027,6 +1116,7 @@ impl Shell {
             traj_select: None,
             traj_tab: 0,
             traj_query: String::new(),
+            traj_lane_w: std::rc::Rc::new(std::cell::Cell::new(None)),
             audit_search,
             audit_mode: 0,
             audit_query: String::new(),
@@ -1101,6 +1191,10 @@ impl Shell {
             rail_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             rail_hover: Some(58),
+            changes_open: std::collections::HashSet::new(),
+            changes_hover: None,
+            changes_preview: None,
+            changes_cache: std::cell::RefCell::new(ChangesCache::default()),
             rail_active: None,
             conversation_w: px(0.0),
             chat_user_w,
@@ -3316,6 +3410,10 @@ impl Render for Shell {
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.rail_hover = None;
             self.rail_active = None;
+            self.changes_open.clear();
+            self.changes_hover = None;
+            self.changes_preview = None;
+            self.changes_cache.borrow_mut().clear();
             self.state.stat_open = false;
             self.state.meter_open = false;
             // The jobs popover is scoped to the session it was opened in, so a
