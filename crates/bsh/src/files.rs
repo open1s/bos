@@ -161,46 +161,87 @@ pub(crate) fn kind_for(name: &str, size: u64) -> Kind {
 
 /// The tree-sitter language id a filename maps to, or none for plain text.
 ///
-/// The ids are the ones the kit's highlighter registry resolves; an alias the
-/// registry already normalises (`rs` for `rust`) is not repeated here, so this
-/// table stays a list of canonical names.
+/// The ids are exactly the ones the kit's registry registers - the same list
+/// `gpui-component`'s `Language` enum builds in - because a name the registry
+/// does not know resolves to a config with no grammar, which is a file that
+/// opens unhighlighted while looking like it should not. `tree-sitter-languages`
+/// is what makes the whole list real; see the dependency note in Cargo.toml.
+///
+/// A name is matched in three steps, in this order:
+/// 1. the bare file name, for the extensionless files a language owns
+///    (`Makefile`, `CMakeLists.txt`),
+/// 2. the extension after the last dot, case-blind,
+/// 3. nothing - an unknown extension is PLAIN TEXT, not a guess. The editor
+///    still opens it, edits it and saves it; it simply does not colour it.
 pub(crate) fn language_for(name: &str) -> Option<&'static str> {
+    if let Some(language) = language_for_name(name) {
+        return Some(language);
+    }
     let extension = Path::new(name)
         .file_name()
         .and_then(|file| file.to_str())
         .and_then(|file| file.rsplit_once('.').map(|(_, ext)| ext))?;
-    let language = match extension.to_ascii_lowercase().as_str() {
-        // The plain-text names: a file the reader expects to read as text but
-        // no grammar covers, so it opens unhighlighted rather than not at all.
-        "txt" | "text" | "log" | "ini" | "cfg" | "conf" | "env" | "gitignore" => return None,
+    language_for_extension(&extension.to_ascii_lowercase())
+}
+
+/// The languages a whole file name owns, for files that carry no extension.
+fn language_for_name(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    let language = match lower.as_str() {
+        "makefile" | "gnumakefile" | "bsdmakefile" => "make",
+        "cmakelists.txt" => "cmake",
+        // The kit has no Dockerfile, nginx, terraform or justfile grammar, so
+        // those names stay plain text rather than claiming a language that the
+        // registry would then fail to parse.
+        _ => return None,
+    };
+    Some(language)
+}
+
+/// The language an extension owns, in the registry's own spelling.
+fn language_for_extension(extension: &str) -> Option<&'static str> {
+    let language = match extension {
+        // The plain-text names: a file the reader expects to read as text but no
+        // grammar covers, so it opens unhighlighted rather than not at all.
+        "txt" | "text" | "log" | "ini" | "cfg" | "conf" | "env" | "gitignore" | "gitattributes"
+        | "editorconfig" | "csv" | "tsv" | "rtf" => return None,
         "rs" => "rust",
-        "py" | "pyi" => "python",
+        "py" | "pyi" | "pyw" => "python",
         "js" | "mjs" | "cjs" | "jsx" => "javascript",
         "ts" | "mts" | "cts" => "typescript",
         "tsx" => "tsx",
-        "json" | "jsonc" => "json",
+        "json" | "jsonc" | "json5" | "jsonl" | "ndjson" | "geojson" | "webmanifest" => "json",
         "toml" => "toml",
         "yaml" | "yml" => "yaml",
-        "md" | "mdx" | "markdown" => "markdown",
-        "html" | "htm" | "vue" | "svelte" => "html",
+        "md" | "mdx" | "markdown" | "mkd" => "markdown",
+        "html" | "htm" | "xhtml" | "vue" => "html",
+        "astro" => "astro",
+        "svelte" => "svelte",
+        "ejs" => "ejs",
+        "erb" => "erb",
         "css" | "scss" | "less" => "css",
+        "jsdoc" => "jsdoc",
         "go" => "go",
-        "sh" | "bash" | "zsh" => "bash",
+        "sh" | "bash" | "zsh" | "ksh" => "bash",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "cpp",
+        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ipp" | "tpp" => "cpp",
+        "cs" => "csharp",
         "java" => "java",
-        "kt" | "kts" => "kotlin",
+        "kt" | "kts" | "ktm" => "kotlin",
+        "scala" | "sc" | "sbt" => "scala",
         "swift" => "swift",
-        "rb" => "ruby",
-        "php" => "php",
+        "rb" | "rake" | "gemspec" | "ru" => "ruby",
+        "php" | "php3" | "php4" | "php5" | "phtml" => "php",
         "lua" => "lua",
+        "ex" | "exs" => "elixir",
         "sql" => "sql",
-        "zig" => "zig",
         "graphql" | "gql" => "graphql",
-        "proto" => "proto",
-        "makefile" => "make",
+        "proto" | "protobuf" => "proto",
+        "zig" => "zig",
+        "cmake" => "cmake",
+        "mk" => "make",
         "diff" | "patch" => "diff",
-        "xml" => "html",
+        "xml" | "svg" | "xsl" | "xslt" | "plist" | "rss" | "atom" => "html",
         _ => return None,
     };
     Some(language)
@@ -385,6 +426,7 @@ mod tests {
     fn extensions_map_to_languages() {
         assert_eq!(language_for("lib.rs"), Some("rust"));
         assert_eq!(language_for("Cargo.toml"), Some("toml"));
+        assert_eq!(language_for("Cargo.lock"), Some("toml"));
         assert_eq!(
             language_for("main.rs.bak"),
             None,
@@ -396,7 +438,6 @@ mod tests {
             None,
             "a dotfile has no extension"
         );
-        assert_eq!(language_for("Makefile"), None);
         for name in [
             "lib.rs", "app.py", "a.ts", "a.tsx", "d.json", "R.md", "i.html", "s.css",
         ] {
@@ -408,6 +449,47 @@ mod tests {
         for name in ["notes.txt", "server.conf", "setup.ini"] {
             assert_eq!(language_for(name), None, "{name} is plain text");
         }
+    }
+
+    /// Every grammar the kit COMPILED IN is reachable from a file name.
+    ///
+    /// This is the contract the panel needs and the one that was silently
+    /// missing: `tree-sitter-languages` can be off - the kit then registers the
+    /// same language NAMES with no grammar behind them - so a table that maps
+    /// extensions to ids proves nothing on its own. The list below is
+    /// `gpui-component`'s own `Language` enum; a name missing from it is a
+    /// language the editor cannot highlight at all, so the two have to be kept
+    /// in step by hand.
+    #[test]
+    fn every_bundled_grammar_has_an_extension() {
+        const GRAMMARS: [&str; 34] = [
+            "astro", "bash", "c", "cmake", "cpp", "csharp", "css", "diff", "ejs", "elixir",
+            "erb", "go", "graphql", "html", "java", "javascript", "jsdoc", "kotlin", "lua",
+            "make", "markdown", "php", "proto", "python", "ruby", "rust", "scala", "sql",
+            "svelte", "swift", "toml", "tsx", "typescript", "yaml",
+        ];
+        // json is always compiled in, and zig is registered by the bundle too.
+        let mut covered: Vec<&'static str> = vec!["json", "zig"];
+        for name in [
+            "a.astro", "a.sh", "a.c", "a.cmake", "a.cpp", "a.cs", "a.css", "a.diff", "a.ejs",
+            "a.ex", "a.erb", "a.go", "a.graphql", "a.html", "a.java", "a.js", "a.jsdoc",
+            "a.kt", "a.lua", "a.mk", "a.md", "a.php", "a.proto", "a.py", "a.rb", "a.rs",
+            "a.scala", "a.sql", "a.svelte", "a.swift", "a.toml", "a.tsx", "a.ts", "a.yaml",
+            "a.json", "a.zig",
+        ] {
+            if let Some(language) = language_for(name) {
+                covered.push(language);
+            }
+        }
+        for grammar in GRAMMARS {
+            assert!(
+                covered.contains(&grammar),
+                "no file name maps to the {grammar} grammar the editor ships"
+            );
+        }
+        // The three extensionless names that own a language.
+        assert_eq!(language_for("Makefile"), Some("make"));
+        assert_eq!(language_for("CMakeLists.txt"), Some("cmake"));
     }
 
     /// Images are recognised apart from the editor's text families.

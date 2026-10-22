@@ -20,7 +20,16 @@ arrow =  { version = "60.0.0"}
 parquet = { version = "60.0.0", features = ["arrow"] }
 # One UI dependency: gpui-kit re-exports gpui, gpui-base, gpui-component and the
 # default assets, and pins the matching GPUI release.
-gpui-kit = "=0.7.3"
+#
+# `tree-sitter-languages` is the kit's own bundle feature: it turns on every
+# grammar `gpui-component` ships (astro, bash, c, cmake, cpp, csharp, css, diff,
+# ejs, elixir, erb, go, graphql, html, java, javascript, jsdoc, kotlin, lua,
+# make, markdown, php, proto, python, ruby, rust, scala, sql, svelte, swift,
+# toml, tsx, typescript, yaml, zig - json is always on). Without it the editor
+# resolves a language name to a config with NO grammar, so every file opens as
+# plain text however its extension is named; the panel's file table is only half
+# of "the editor supports this type", the compiled grammar is the other half.
+gpui-kit = { version = "=0.7.3", features = ["tree-sitter-languages"] }
 
 # The BOS framework, used directly (no intermediate shell crate).
 agent = { path = "../agent" }
