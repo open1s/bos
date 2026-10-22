@@ -84,6 +84,52 @@ pub(crate) fn primary_stops(streaming: bool, can_send: bool) -> bool {
     streaming && !can_send
 }
 
+/// The composer's placeholder, fitted to the field's own content width.
+///
+/// The reference paints its placeholder as a nowrap span with
+/// `text-overflow:ellipsis` inset into the card, so a narrow field shortens the
+/// text instead of letting the card cut it. The kit's field paints its
+/// placeholder with no ellipsis hook, so the string handed to the state is
+/// fitted here: the full text while it fits, otherwise the longest prefix that
+/// leaves room for the reference's ellipsis.
+pub(crate) fn fit_placeholder(window: &Window, size: f32, text: &str, width: f32) -> String {
+    if width <= 0.0 || text.is_empty() {
+        return text.to_string();
+    }
+    let measure = |line: &str| -> f32 {
+        if line.is_empty() {
+            return 0.0;
+        }
+        let run = window.text_style().to_run(line.len());
+        f32::from(
+            window
+                .text_system()
+                .shape_line(line.to_string().into(), px(size), &[run], None)
+                .width(),
+        )
+    };
+    if measure(text) <= width {
+        return text.to_string();
+    }
+    // Binary search the character count: shaping is the measurement, and a
+    // placeholder is a few dozen characters, so this is at most seven shapes -
+    // and only when the field's width or the language changes, never a frame.
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate: String = chars[..mid].iter().collect::<String>() + "\u{2026}";
+        if measure(&candidate) <= width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut fitted: String = chars[..lo].iter().collect();
+    fitted.push('\u{2026}');
+    fitted
+}
+
 /// The measured trigger chrome the permission and model chips share.
 fn trigger_chrome<E: Styled>(element: E, cap: f32) -> E {
     element
@@ -361,6 +407,10 @@ impl Shell {
         // draft is the tree the pane edits, so a provider added but not yet
         // saved is still offered.
         let groups = self.state.draft().catalogs_by_provider(&effective.provider);
+        // The reference's composer row carries a container query: at 560 or
+        // less of card width its gaps tighten from 12 to 8, which is what lets
+        // the chips stay on one line a little longer before the row wraps.
+        let chip_gap = if self.composer_w() < 560.0 { 8.0 } else { 12.0 };
         // The inline note editor sits ABOVE the card, so the composer keeps its
         // shape while a goal or a feedback note is being written.
         let column = div()
@@ -422,39 +472,68 @@ impl Shell {
                             ),
                     )
                     .child(
+                        // The reference's row is flex-wrap: wrap with a
+                        // container query that tightens its gaps below 560, and
+                        // its trailing pair is pushed right by margin-left: auto.
+                        // A flat no-wrap row pushed the send control past the
+                        // card once the column got narrow; wrapping keeps every
+                        // control reachable instead of drawing it over the edge.
                         div()
+                            .debug_selector(|| "composer-row".to_string())
                             .px(px(8.0))
                             .pt(px(2.0))
                             .pb(px(6.0))
                             .flex()
                             .flex_row()
+                            .flex_wrap()
                             .items_center()
-                            .gap(px(12.0))
-                            .child(self.add_button(
-                                lang.tr("input.commands"),
-                                super::command_menu::toggle_action,
-                                cx,
-                            ))
-                            .child(self.permission_chip(permission, streaming, lang, cx))
-                            // The reference's plan slot sits beside the mode
-                            // chips, and only while the mode is on.
-                            .when_some(self.plan_chip(lang, cx), |row, chip| row.child(chip))
-                            .child(div().flex_1())
-                            .child(self.model_chip(
-                                ModelChipData {
-                                    label: model_label(&label, lang),
-                                    effort: effort.clone(),
-                                    effort_level: effort,
-                                    current,
-                                    // Moved, not cloned: the menu owns the list,
-                                    // and the chip does not read it again.
-                                    groups,
-                                    streaming,
-                                },
-                                lang,
-                                cx,
-                            ))
-                            .child(self.send_button(streaming, can_send, lang, cx)),
+                            .gap(px(chip_gap))
+                            .child(
+                                div()
+                                    .debug_selector(|| "composer-row-tools".to_string())
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .min_w_0()
+                                    .gap(px(chip_gap))
+                                    .child(self.add_button(
+                                        lang.tr("input.commands"),
+                                        super::command_menu::toggle_action,
+                                        cx,
+                                    ))
+                                    // The reference's plan slot sits beside the
+                                    // mode chips, and only while the mode is on.
+                                    .child(self.permission_chip(permission, streaming, lang, cx))
+                                    .when_some(self.plan_chip(lang, cx), |row, chip| {
+                                        row.child(chip)
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "composer-row-trailing".to_string())
+                                    .ml_auto()
+                                    .flex_none()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(chip_gap))
+                                    .child(self.model_chip(
+                                        ModelChipData {
+                                            label: model_label(&label, lang),
+                                            effort: effort.clone(),
+                                            effort_level: effort,
+                                            current,
+                                            // Moved, not cloned: the menu owns the
+                                            // list, and the chip does not read it
+                                            // again.
+                                            groups,
+                                            streaming,
+                                        },
+                                        lang,
+                                        cx,
+                                    ))
+                                    .child(self.send_button(streaming, can_send, lang, cx)),
+                            ),
                     )
                     // Measured `.card{position:absolute;bottom:calc(100% + 4px);
                     // left:0;right:0}`: the overlay is out of the card's flow and

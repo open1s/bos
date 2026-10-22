@@ -155,8 +155,6 @@ pub(crate) struct Effective {
     pub(crate) parallel_tool_calls: bool,
     /// API protocol, or empty to follow the model.
     pub(crate) api_mode: String,
-    /// Workspace display name.
-    pub(crate) name: String,
     /// Workspace root.
     pub(crate) root: String,
     /// The provider id the model came from, which is the wire prefix the
@@ -736,7 +734,6 @@ impl Settings {
             api_mode: connection
                 .and_then(|c| c.api_mode.clone())
                 .unwrap_or_default(),
-            name: resolution.name,
             root: resolution.root,
             model: connection.map(|c| c.model.clone()).unwrap_or_default(),
             base_url: connection.map(|c| c.base_url.clone()).unwrap_or_default(),

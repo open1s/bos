@@ -5,10 +5,12 @@
 //! field), a three-lane timeline strip, a dense list of typed events, and a
 //! detail panel for the selected one. bsh has the same raw material - the
 //! session's messages and their tool calls - so the view is built from that and
-//! nothing is invented: the lanes are step densities rather than a time axis
-//! because no event carries a timestamp, and the SUBTOOL / CONTEXT chips the
-//! reference also draws have no producer in this model (a nested call and an
-//! injected time-context message are both their harness's, not ours).
+//! nothing is invented: the lanes are drawn against one shared time axis built
+//! from each record's own start (`ToolEvent.at`, or the message timing), so a
+//! block's x is when its event started and its width is how long it took. The
+//! SUBTOOL / CONTEXT chips the reference also draws have no producer in this
+//! model (a nested call and an injected time-context message are both their
+//! harness's, not ours).
 
 use gpui_kit::*;
 
@@ -16,6 +18,7 @@ use super::shell::Shell;
 use super::todo_panel::spinner;
 use gpui_kit::component::input::Input;
 
+use super::lane::{equal_lane, time_lane, LaneRecord, TimeAxis};
 use super::{icon, txt, DivExt, IconName};
 use crate::i18n::Lang;
 use crate::model::{ChatMessage, MessageTiming, Session};
@@ -95,6 +98,13 @@ pub(crate) struct Event {
     pub(crate) tool: usize,
     /// When the event started, epoch milliseconds, when the record carries it.
     pub(crate) at: Option<u64>,
+    /// The path, host or command the policy was asked about.
+    ///
+    /// A tool row's `title` is a clipped DISPLAY string (`# read_file {"path":…}`),
+    /// so the policy tab cannot read the target back out of it. This field
+    /// carries the call's own argument, undipped, which is what the audit ring
+    /// records and therefore what a verdict can be matched against.
+    pub(crate) target: String,
 }
 
 fn first_line(text: &str) -> String {
@@ -134,6 +144,326 @@ fn clip(text: &str, max: usize) -> String {
     format!("{}...", cut.trim_end())
 }
 
+/// The width an equal-width block draws at, in CSS pixels.
+///
+/// The reference's `[data-equal-duration=true]` is a fixed `width: 8px`,
+/// and the toggle's whole point is that every block is the same size
+/// regardless of how long the work took.
+pub(crate) const EQUAL_BLOCK_W: f32 = 8.0;
+
+/// The narrowest a time-proportional block may be drawn, in CSS pixels.
+///
+/// The time axis carries the block's real width, but an event can be shorter
+/// than the lane can resolve (and an untimed one has no duration at all). The
+/// floor keeps every block a hit target without moving its left edge, so two
+/// events that started together still line up.
+pub(crate) const MIN_BLOCK_W: f32 = 2.0;
+
+/// The shortest a block may be drawn, in milliseconds.
+///
+/// A block is also a control, so it needs a hit area even when the call it
+/// stands for returned instantly.
+pub(crate) const MINIMUM_BLOCK_MS: u64 = 60;
+
+/// How wide one timeline block is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum BlockWidth {
+    /// A fixed pixel width, which is what equal-width mode draws.
+    Fixed(f32),
+    /// A flex share of the track, used by the equal-width timed reading.
+    Share(f32),
+    /// A time-proportional block: `x` and `width` are fractions of the lane.
+    ///
+    /// Relative geometry rather than flex weights is what makes the position
+    /// float-accurate: a flex weight competes with the 1px gaps, while a
+    /// fraction is the event's own instant on the shared axis.
+    Placed { x: f32, width: f32 },
+    /// A block placed by time but drawn at a FIXED pixel width.
+    ///
+    /// This is the reference's equal-width reading exactly: `left` is still the
+    /// event's instant on the axis (`--trajectory-span-left`), and only the CSS
+    /// `width` is overridden to 8px by `[data-equal-duration=true]`. Separating
+    /// the two is what keeps the idle gaps visible while every block is the
+    /// same size - packing them instead would draw a solid bar.
+    PlacedFixed { x: f32, width: f32 },
+}
+/// The timeline projection a reader has chosen.
+///
+/// The reference derives this from two independent flags
+/// (`timelineMode = actualDuration ? (actualTime ? "actual" : "duration")
+/// : (actualTime ? "time" : "sequence")`), so the four readings below are its
+/// own vocabulary rather than a rotation of one control.
+///
+/// This product's `Duration` mode is the reference's name with the user's
+/// meaning: the toolbar's Duration control selects a REAL-TIME strip, where a
+/// block starts at its event's recorded start and is as wide as the work took.
+/// `Actual` reads the same way, because the toolbar sets both switches
+/// together; the distinction is kept only so the stored pair keeps parsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Projection {
+    /// No recorded clock: one unit slot per record, end to end. Order without
+    /// time - the reference's `sequence`.
+    Sequence,
+    /// Real timestamps, every block a fixed equal width. Gaps are real.
+    Time,
+    /// Real timestamps and real widths, with the idle stretches left empty:
+    /// the gantt this strip draws in Duration mode.
+    Duration,
+    /// Real timestamps and real widths: the same gantt as `Duration`, named by
+    /// the reference's second switch.
+    Actual,
+}
+
+impl Projection {
+    /// The projection a pair of switches selects, exactly as the reference
+    /// composes its `timelineMode`.
+    ///
+    /// bsh exposes ONE control, so the pair a reader can reach is `(false, true)`
+    /// and `(true, true)`: equal width on a real clock, then the gantt. The two
+    /// clock-less readings stay reachable from a stored value and are what the
+    /// projection tests pin.
+    pub(crate) fn of(actual_duration: bool, actual_time: bool) -> Self {
+        match (actual_duration, actual_time) {
+            (true, true) => Self::Actual,
+            (true, false) => Self::Duration,
+            (false, true) => Self::Time,
+            (false, false) => Self::Sequence,
+        }
+    }
+
+    /// Whether a block is drawn at a fixed equal width rather than by duration.
+    ///
+    /// Only the two clock-less readings collapse the width; `Duration` and
+    /// `Actual` keep a real `end - start`.
+    pub(crate) fn equal_width(self) -> bool {
+        matches!(self, Self::Sequence | Self::Time)
+    }
+
+    /// Whether the axis is a real clock rather than record order.
+    pub(crate) fn is_timed(self) -> bool {
+        !matches!(self, Self::Sequence)
+    }
+}
+
+/// One block of a projected timeline, in the projection's own units.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ProjectedSpan {
+    /// The event this block stands for, as an index into the log.
+    pub(crate) index: usize,
+    /// Where the block starts, in projection units.
+    pub(crate) start: f32,
+    /// How wide the block is, in projection units.
+    pub(crate) width: f32,
+    /// The turn the record belongs to, for the boundary marks.
+    pub(crate) turn: usize,
+}
+
+/// Project one lane's events into the reference's own projection units.
+///
+/// This is the reference's `deriveTrajectoryTimeline`: `sequence` lays one unit
+/// slot per record end to end, and every timed projection places a block at its
+/// recorded start, sized by its duration unless the projection is equal-width.
+/// No projection removes idle time: a pause is visible on the axis, which is
+/// the whole point of reading a run against a clock.
+///
+/// Duration / Actual draw through the shared pixel geometry in `ui::lane`
+/// instead; this unit-space reading remains the model of the equal-width modes
+/// and the projection tests.
+///
+/// Returns `None` when no event in the lane can be placed, which is what tells
+/// the caller to draw the lane empty rather than invent an axis.
+pub(crate) fn project_lane(
+    lane: &[(usize, usize, Option<u64>, u64)],
+    projection: Projection,
+    minimum_ms: u64,
+) -> Option<(f32, Vec<ProjectedSpan>)> {
+    if lane.is_empty() {
+        return None;
+    }
+    if !projection.is_timed() {
+        // One slot per record, back to back; there is no clock to read.
+        let spans: Vec<ProjectedSpan> = lane
+            .iter()
+            .enumerate()
+            .map(|(slot, (index, turn, _, _))| ProjectedSpan {
+                index: *index,
+                start: slot as f32,
+                width: 1.0,
+                turn: *turn,
+            })
+            .collect();
+        return Some((lane.len() as f32, spans));
+    }
+    // The timed projections need a recorded start on every placed record.
+    let timed: Vec<(usize, usize, u64, u64)> = lane
+        .iter()
+        .filter_map(|(index, turn, at, ms)| at.map(|at| (*index, *turn, at, (*ms).max(minimum_ms))))
+        .collect();
+    if timed.is_empty() {
+        return None;
+    }
+    let mut sorted = timed;
+    sorted.sort_by_key(|(_, _, at, _)| *at);
+    let first = sorted.first().map(|(_, _, at, _)| *at).unwrap_or(0);
+    let mut ends: Vec<u64> = Vec::with_capacity(sorted.len());
+    let mut spans: Vec<ProjectedSpan> = Vec::with_capacity(sorted.len());
+    for (index, turn, at, ms) in &sorted {
+        let start = at.saturating_sub(first);
+        spans.push(ProjectedSpan {
+            index: *index,
+            start: start as f32,
+            width: if projection.equal_width() {
+                0.0
+            } else {
+                *ms as f32
+            },
+            turn: *turn,
+        });
+        ends.push(start + ms);
+    }
+    let domain = ends.iter().copied().max().unwrap_or(1).max(1) as f32;
+    Some((domain, spans))
+}
+/// The policy verdict behind one tool call.
+///
+/// bsh-only: the reference has no equivalent tab, because in DSH a policy
+/// question and the tool that asked it are separate records. Here every call
+/// is made THROUGH the policy seam, so a call has a decision attached even
+/// when it succeeded - which is the thing a reader actually wants to see.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PolicyVerdict {
+    /// The effective permission in force for this session's tier.
+    pub(crate) permission: String,
+    /// The agent preset in effect, as the policy recorded it.
+    ///
+    /// A refusal carries the preset recorded at its decision; a call with no
+    /// refusal takes the fallback the caller passes (the policy the turn was
+    /// built for), because a `ToolEvent` itself stores no preset.
+    pub(crate) preset: String,
+    /// The action the policy was asked about, or an empty string when the call
+    /// never reached the seam (a purely local read is still a `read` here).
+    pub(crate) action: String,
+    /// The path, host or command the action was about.
+    pub(crate) target: String,
+    /// Whether the policy allowed it.
+    pub(crate) allowed: bool,
+    /// The rule that refused it, when it was refused and the policy named one.
+    pub(crate) rule: Option<String>,
+    /// The policy's reason, when it refused and gave one.
+    pub(crate) reason: Option<String>,
+}
+
+/// What action a tool name asks the policy about.
+///
+/// This is the same classification the audit page uses to bucket a call, and
+/// it is deliberately a NAME rule rather than a per-tool table: a tool bsh has
+/// never heard of still gets a sensible action instead of a blank row.
+pub(crate) fn action_of(tool: &str) -> &'static str {
+    let name = tool.to_ascii_lowercase();
+    if name.contains("write") || name.contains("edit") || name.contains("patch") {
+        "write"
+    } else if name.contains("bash") || name.contains("shell") || name.contains("exec") {
+        "spawn"
+    } else if name.contains("fetch") || name.contains("http") || name.contains("curl") {
+        "egress"
+    } else {
+        "read"
+    }
+}
+
+/// The verdict for one call, given the ring of recorded refusals.
+///
+/// A call with no matching refusal was ALLOWED - the ring only stores denials,
+/// because a turn makes thousands of allows and none of them is individually
+/// interesting until one is missing. Matching is by tool AND target, so two
+/// calls to the same tool against different paths are not confused.
+pub(crate) fn verdict_for(
+    tool: &str,
+    target: &str,
+    permission: &str,
+    preset: &str,
+    refusals: &[PolicyVerdict],
+) -> PolicyVerdict {
+    // A refusal is recorded against the path or host verbatim, while the call
+    // carries its own arguments; a prefix match either way is what makes the
+    // join work without requiring both sides to be byte-identical.
+    let refusal = refusals.iter().find(|refusal| {
+        refusal.action == action_of(tool)
+            && (refusal.target == target
+                || target.starts_with(&refusal.target)
+                || refusal.target.starts_with(target))
+    });
+    match refusal {
+        Some(refusal) => PolicyVerdict {
+            permission: refusal.permission.clone(),
+            preset: refusal.preset.clone(),
+            action: refusal.action.clone(),
+            target: refusal.target.clone(),
+            allowed: false,
+            rule: refusal.rule.clone(),
+            reason: refusal.reason.clone(),
+        },
+        None => PolicyVerdict {
+            permission: permission.to_string(),
+            preset: preset.to_string(),
+            action: action_of(tool).to_string(),
+            target: target.to_string(),
+            allowed: true,
+            rule: None,
+            reason: None,
+        },
+    }
+}
+/// Fold each collapsed turn to its first content row plus a summary row.
+///
+/// The reference's `collapseTurnRecords`: within a collapsed turn the
+/// FIRST content record survives, every other content record is dropped,
+/// and one synthetic row follows carrying `…` and a summary of what was
+/// hidden. A request-only or system record always survives, because it is
+/// boundary scaffolding rather than content, and a turn with nothing but
+/// its first row is left alone - there would be nothing to summarize.
+///
+/// Returns the surviving (index, opens_turn, collapsed_summary) rows in log
+/// order, where `collapsed_summary` is `Some` on the synthetic row.
+pub(crate) fn collapse_turns(
+    visible: &[(usize, &Event)],
+    opens: &[bool],
+    lang: Lang,
+) -> Vec<(usize, bool, Option<String>)> {
+    // Group first, so a turn's size is known before any of it is dropped.
+    let mut per_turn: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for ((index, event), _) in visible.iter().zip(opens) {
+        per_turn.entry(event.turn).or_default().push(*index);
+    }
+    let mut out = Vec::with_capacity(visible.len());
+    for ((index, event), opens_turn) in visible.iter().zip(opens) {
+        let turn_rows = per_turn.get(&event.turn).map(Vec::as_slice).unwrap_or(&[]);
+        // A turn that holds only its own opening row has nothing to fold.
+        if turn_rows.len() <= 1 {
+            out.push((*index, *opens_turn, None));
+            continue;
+        }
+        if *opens_turn {
+            out.push((*index, true, None));
+            // The summary counts what the fold hides, which is every row
+            // after this one, and names the turn so the row is readable.
+            let hidden = turn_rows.len().saturating_sub(1);
+            out.push((
+                *index,
+                false,
+                Some(crate::i18n::tr_args(
+                    lang,
+                    "traj.turnCollapsed",
+                    &[("count", hidden.to_string())],
+                )),
+            ));
+        }
+        // Every other row of the turn is dropped: the first content row and
+        // the summary are the whole collapsed turn.
+    }
+    out
+}
 /// The event log for a session, oldest first.
 pub(crate) fn events(shell: &Shell) -> Vec<Event> {
     let Some(session) = shell.state.active_session() else {
@@ -198,6 +528,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 .messages
                 .iter()
                 .find_map(|m| m.tools.iter().find_map(|t| t.at)),
+            target: String::new(),
         });
     }
     // A compaction happens between turns, so its row sits where the boundary it
@@ -232,6 +563,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                     message: usize::MAX,
                     tool: usize::MAX,
                     at: None,
+                    target: String::new(),
                 });
             }
         }
@@ -258,6 +590,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 message: index,
                 tool: usize::MAX,
                 at: anchor,
+                target: String::new(),
             });
             continue;
         }
@@ -274,6 +607,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 message: index,
                 tool: usize::MAX,
                 at: anchor,
+                target: String::new(),
             });
         }
         if !message.text.trim().is_empty() {
@@ -289,6 +623,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 message: index,
                 tool: usize::MAX,
                 at: anchor,
+                target: String::new(),
             });
         } else if !message.tools.is_empty() {
             out.push(Event {
@@ -303,6 +638,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 message: index,
                 tool: usize::MAX,
                 at: anchor,
+                target: String::new(),
             });
         }
         for (tool_index, tool) in message.tools.iter().enumerate() {
@@ -338,6 +674,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 message: index,
                 tool: tool_index,
                 at: tool.at,
+                target: tool.args.clone(),
             });
             if tool.at.is_some() {
                 carry = tool.at;
@@ -452,10 +789,12 @@ impl Shell {
             .child(self.traj_tag(event))
     }
 
-    /// The tag itself: measured .kindTag, 19px tall at radius-xs, 0 5px padding,
-    /// 10px at weight 650.
-    fn traj_tag(&self, event: &Event) -> Div {
-        let ink = event.kind.ink();
+    /// The inline pill: measured .kindTag, 19px tall at radius-xs, 0 5px
+    /// padding, 10px at weight 650.
+    ///
+    /// The log's kind tag and the policy tab's preset value are the same
+    /// affordance, so they share one definition rather than drifting apart.
+    fn traj_badge(&self, label: String, ink: u32) -> Div {
         div()
             .h(px(19.0))
             .px(px(5.0))
@@ -466,23 +805,82 @@ impl Shell {
             .rounded(px(4.0))
             .bg(rgb(theme::hover()))
             .child(
-                txt(self.state.lang.tr(event.kind.key()), 10.0, ink)
+                txt(label, 10.0, ink)
                     .font_weight(FontWeight::BOLD)
                     .line_height(px(16.0)),
             )
     }
 
-    /// The filter toolbar: the segmented measure and the search field.
+    /// The kind tag a log row carries.
+    fn traj_tag(&self, event: &Event) -> Div {
+        self.traj_badge(self.state.lang.tr(event.kind.key()), event.kind.ink())
+    }
+
+    /// The filter toolbar: the duration toggle, the collapse actions and the
+    /// search field.
+    ///
+    /// Measured (TrajectoryToolbar + its CSS module): a 32px bar over a .5px
+    /// border-l2, inner padding 0 6px at gap 8. `Duration` is one `aria-pressed`
+    /// TOGGLE - 20px, 12px type, padding 0 7px, gap 4 - whose tooltip names the
+    /// OTHER state: `Use actual duration` while the strip is equal-width,
+    /// `Use equal-width operations` while it is real-time. `Turns` and
+    /// `Calls` are NOT measures: each collapses or expands every turn or call
+    /// in the table, and its glyph flips between the expand and collapse box.
+    /// They are left exactly as measured; the strip's own measure is the
+    /// Duration toggle.
     pub(crate) fn traj_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let modes = [
-            self.state.lang.tr("traj.duration"),
-            self.state.lang.tr("traj.turns"),
-            self.state.lang.tr("traj.calls"),
-        ];
-        // Measured (TrajectoryToolbar.module.css): a 32px bar over a .5px
-        // border-l2, inner padding 0 6px at gap 8, and the measures are plain
-        // 20px TOGGLES - 12px type, padding 0 7px, gap 4 - that read pressed as
-        // label-primary over interactive-bg-hover, with no pill and no border.
+        let lang = self.state.lang;
+        let actual = self.traj_actual_duration;
+        let duration_tip = if actual {
+            lang.tr("traj.useEqualWidth")
+        } else {
+            lang.tr("traj.useActualDuration")
+        };
+        let turns_tip = if self.traj_turns_collapsed {
+            lang.tr("traj.expandTurns")
+        } else {
+            lang.tr("traj.collapseTurns")
+        };
+        let calls_tip = if self.traj_calls_collapsed {
+            lang.tr("traj.expandCalls")
+        } else {
+            lang.tr("traj.collapseCalls")
+        };
+        let turns_glyph = if self.traj_turns_collapsed {
+            "\u{229e}"
+        } else {
+            "\u{229f}"
+        };
+        let calls_glyph = if self.traj_calls_collapsed {
+            "\u{229e}"
+        } else {
+            "\u{229f}"
+        };
+        let button = |id: &'static str, label: String, on: bool, glyph: &'static str| {
+            let tip = label.clone();
+            div()
+                .debug_selector(move || id.to_string())
+                .id(SharedString::from(id))
+                .h(px(20.0))
+                .px(px(7.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .flex_none()
+                .cursor_pointer()
+                .rounded(px(6.0))
+                .when(on, |cell| cell.bg(rgb(theme::hover())))
+                .child(if on {
+                    txt(label, 12.0, theme::text()).into_any_element()
+                } else {
+                    txt(label, 12.0, theme::faint()).into_any_element()
+                })
+                .child(txt(glyph, 10.0, theme::faint()))
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+        };
         div()
             .flex()
             .flex_row()
@@ -499,28 +897,54 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(2.0))
-                    .children(modes.into_iter().enumerate().map(|(index, label)| {
-                        let on = self.traj_mode == index;
-                        let other = label.clone();
-                        div()
-                            .debug_selector(|| format!("traj-mode-{index}"))
-                            .id(SharedString::from(format!("traj-mode-{index}")))
-                            .h(px(20.0))
-                            .px(px(7.0))
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .rounded(px(6.0))
-                            .when(on, |cell| {
-                                cell.bg(rgb(theme::hover()))
-                                    .child(txt(label, 12.0, theme::text()))
-                            })
-                            .when(!on, |cell| cell.child(txt(other, 12.0, theme::faint())))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.traj_mode = index;
+                    .child(
+                        button("traj-duration", duration_tip.clone(), actual, "\u{25f4}").on_click(
+                            cx.listener(|this, _event, _window, cx| {
+                                this.traj_actual_duration = !this.traj_actual_duration;
+                                // The axis is the CLOCK in both readings. The
+                                // toggle changes only how WIDE a block is drawn:
+                                // OFF is the reference's equal-width bar (8px,
+                                // still placed at the instant it happened), ON is
+                                // the gantt where a block is as wide as its work.
+                                //
+                                // Both flags move together because bsh exposes ONE
+                                // control, not the reference's two: leaving the
+                                // time flag false would select `sequence`, which
+                                // has no axis at all and packs a row into a solid
+                                // bar - the exact defect this pair fixes.
+                                this.traj_actual_time = true;
                                 cx.notify();
-                            }))
-                    })),
+                            }),
+                        ),
+                    )
+                    .child(
+                        button(
+                            "traj-turns",
+                            turns_tip.clone(),
+                            self.traj_turns_collapsed,
+                            turns_glyph,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.traj_turns_collapsed = !this.traj_turns_collapsed;
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        button(
+                            "traj-calls",
+                            calls_tip.clone(),
+                            self.traj_calls_collapsed,
+                            calls_glyph,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.traj_calls_collapsed = !this.traj_calls_collapsed;
+                                cx.notify();
+                            },
+                        )),
+                    ),
             )
             .child(div().flex_1())
             // The field is flex:0 164px tall 22, radius-sm, a .5px border-l4 over
@@ -551,31 +975,46 @@ impl Shell {
 
     /// The three-lane strip.
     ///
-    /// It IS a time axis now: a call records when it started, so a lane places
-    /// each event at its own instant and sizes it by how long it took, with the
-    /// gaps between calls left empty. A run recorded before that timestamp
-    /// existed has no positions to place, so the lanes fall back to step order -
-    /// one segment per turn - rather than inventing an axis.
+    /// In Duration mode it is a real time axis: every lane is drawn against ONE
+    /// domain, from the earliest event start to the latest event end, so a
+    /// block's left edge is its event's instant and its width is the work it
+    /// took. A pause is therefore empty space, and two events that started
+    /// together line up vertically across lanes. A run recorded before the
+    /// clock existed has no positions to place, so every lane falls back to
+    /// record order rather than inventing an axis.
     pub(crate) fn traj_lanes(&self, events: &[Event], cx: &mut Context<Self>) -> impl IntoElement {
-        // The shared domain: the earliest start to the latest end. Lanes align
-        // because every one of them divides this same span.
-        let starts: Vec<u64> = events.iter().filter_map(|e| e.at).collect();
-        let domain = match (starts.iter().min(), starts.iter().max()) {
-            (Some(first), Some(last)) if last > first => {
-                let end = events
-                    .iter()
-                    .filter_map(|e| e.at.map(|at| at + e.ms.unwrap_or(0)))
-                    .max()
-                    .unwrap_or(*last);
-                Some((*first, end))
-            }
-            _ => None,
-        };
+        // Build every lane before drawing any: the axis is the UNION of their
+        // events, so a block's x depends on lanes other than its own.
         let lanes = [
-            ("traj.laneInput", Kind::User),
-            ("traj.laneModel", Kind::Assistant),
-            ("traj.laneTools", Kind::Tool),
+            ("traj.laneInput", Kind::User, "input"),
+            ("traj.laneModel", Kind::Assistant, "model"),
+            ("traj.laneTools", Kind::Tool, "tools"),
         ];
+        let records: Vec<Vec<LaneRecord>> = lanes
+            .iter()
+            .map(|(_, kind, _)| {
+                events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| event.kind == *kind)
+                    .map(|(index, event)| LaneRecord {
+                        index,
+                        turn: event.turn,
+                        start: event.at,
+                        duration_ms: event.ms,
+                    })
+                    .collect()
+            })
+            .collect();
+        let axis = TimeAxis::across(&records.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        let projection = self.traj_projection();
+        // EVERY timed projection is placed on the shared clock, including the
+        // equal-width ones. A block's LEFT EDGE always comes from when its
+        // event happened; only its WIDTH changes with the equal-width switch.
+        // Routing equal width away from the axis is what packed a row into a
+        // solid bar and lost the idle gaps - the reference never does that, it
+        // overrides `width` to 8px and keeps `left` from the start time.
+        let real_time = projection.is_timed();
         // Measured (TrajectoryTimeline.module.css): a 50px plot on bg-layer-2
         // over a .5px border-l2, a 44px label column split off by a .5px
         // border-l1, and 10px labels pinned at y 7 / 21 / 35 (a 14px pitch) and
@@ -625,110 +1064,280 @@ impl Shell {
                         this.load_older_in_trajectory(cx);
                     })),
             )
-            .children(lanes.into_iter().map(|(key, kind)| {
-                // One segment per turn, weighted by the toolbar's measure: the
-                // turn's slowest tool while Duration is chosen, one equal share
-                // per turn while Turns is, and the turn's call count while Calls
-                // is. That is what makes the segmented control live - the strip
-                // is the measure, so switching it redraws the strip.
-                let mut cells: Vec<(usize, f32)> = Vec::new();
-                for event in events.iter().filter(|e| e.kind == kind) {
-                    let weight = match self.traj_mode {
-                        0 => event.ms.unwrap_or(0) as f32,
-                        2 => 1.0,
-                        _ => 1.0,
-                    };
-                    match cells.iter_mut().find(|(turn, _)| *turn == event.turn) {
-                        Some((_, total)) => *total += weight,
-                        None => cells.push((event.turn, weight)),
-                    }
-                }
-                cells.sort_by_key(|(turn, _)| *turn);
-                let tallest = cells.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+            .children(
+                lanes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(lane_index, (key, kind, lane_id))| {
+                        let lane = &records[lane_index];
+                        let track = div()
+                            .debug_selector(move || format!("traj-lane-{lane_id}"))
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(6.0))
+                            .ml(px(3.0));
+                        let track = if real_time {
+                            // One common axis, absolute fractions: x is the event's
+                            // instant and width its duration, so a pause stays empty
+                            // and lanes line up vertically.
+                            let blocks = match axis {
+                                Some(axis) => time_lane(lane, axis),
+                                // No clock anywhere: record order is the only honest
+                                // placement, and every event still draws.
+                                None => equal_lane(lane),
+                            };
+                            // Equal width keeps the real POSITION and drops the
+                            // real WIDTH; the other readings keep both.
+                            let equal_width = projection.equal_width();
+                            track.relative().children(blocks.into_iter().map(|block| {
+                                let width = if equal_width {
+                                    BlockWidth::PlacedFixed {
+                                        x: block.x,
+                                        width: block.width,
+                                    }
+                                } else {
+                                    BlockWidth::Placed {
+                                        x: block.x,
+                                        width: block.width,
+                                    }
+                                };
+                                self.timeline_cell(
+                                    kind,
+                                    block.index,
+                                    self.traj_select == Some(block.index),
+                                    width,
+                                    cx,
+                                )
+                            }))
+                        } else {
+                            // Unreachable for a timed projection, which always takes
+                            // the placed path above. This is the SEQUENCE reading: no
+                            // clock, so record order is the axis and every block keeps
+                            // the same share.
+                            let legacy: Vec<(usize, usize, Option<u64>, u64)> = lane
+                                .iter()
+                                .map(|record| {
+                                    (
+                                        record.index,
+                                        record.turn,
+                                        record.start,
+                                        record.duration_ms.unwrap_or(0),
+                                    )
+                                })
+                                .collect();
+                            let equal_width = projection.equal_width();
+                            let projected = project_lane(&legacy, projection, MINIMUM_BLOCK_MS);
+                            track.flex().flex_row().gap(px(1.0)).when_some(
+                                projected,
+                                |track, (domain, spans)| {
+                                    let domain = domain.max(1.0);
+                                    let mut cursor = 0.0f32;
+                                    let mut children: Vec<AnyElement> = Vec::new();
+                                    for span in spans {
+                                        // A gap is real idle time, and the equal-width
+                                        // timed reading keeps it as a spacer.
+                                        if span.start > cursor {
+                                            children.push(
+                                                div()
+                                                    .flex_grow((span.start - cursor) / domain)
+                                                    .h(px(1.0))
+                                                    .into_any_element(),
+                                            );
+                                        }
+                                        let on = self.traj_select == Some(span.index);
+                                        children.push(self.timeline_cell(
+                                            kind,
+                                            span.index,
+                                            on,
+                                            if equal_width {
+                                                BlockWidth::Fixed(EQUAL_BLOCK_W)
+                                            } else {
+                                                BlockWidth::Share(span.width / domain)
+                                            },
+                                            cx,
+                                        ));
+                                        cursor = cursor.max(span.start + span.width);
+                                    }
+                                    track.children(children)
+                                },
+                            )
+                        };
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .h(px(14.0))
+                            .child(
+                                // The label column: 44 wide, split by a hairline, text
+                                // right-aligned 3px in at 10px.
+                                div()
+                                    .w(px(44.0))
+                                    .h_full()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .pr(px(3.0))
+                                    .border_r_1()
+                                    .border_color(rgb(theme::border_soft()))
+                                    .child(txt(self.state.lang.tr(key), 10.0, theme::faint())),
+                            )
+                            .child(track)
+                    }),
+            )
+    }
+
+    /// One clickable block in a timeline lane.
+    ///
+    /// Measured (TrajectoryTimeline.module.css): 8px tall at radius 1, the lane
+    /// kind's own ink at full opacity, `data-selected=false` dimming to .2 when a
+    /// range excludes it, and the block under the pointer (or the selected one)
+    /// lifting to a 2px business-primary ring. The reference also carries
+    /// `data-timeline-record-index`, which is what makes a block a way BACK to
+    /// the record it stands for rather than a picture of it.
+    /// The projection the reader's two switches select.
+    ///
+    /// The Duration control sets BOTH switches, so the mode the reader names
+    /// Duration is a real-time gantt; either timed reading is laid out by the
+    /// shared `ui::lane` geometry.
+    pub(crate) fn traj_projection(&self) -> Projection {
+        Projection::of(self.traj_actual_duration, self.traj_actual_time)
+    }
+
+    /// One clickable block in a timeline lane.
+    ///
+    /// Measured (TrajectoryTimeline.module.css): 8px tall at radius 1, the lane
+    /// kind's own ink at full opacity, `data-selected=false` dimming to .2 when a
+    /// range excludes it, and the block under the pointer (or the selected one)
+    /// lifting to a 2px business-primary ring. The reference also carries
+    /// `data-timeline-record-index`, which is what makes a block a way BACK to
+    /// the record it stands for rather than a picture of it.
+    fn timeline_cell(
+        &self,
+        kind: Kind,
+        index: usize,
+        selected: bool,
+        width: BlockWidth,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ink = kind.ink();
+        let ring = theme::accent();
+        // A fixed width is a real pixel box; a share is a flex weight. Keeping
+        // the two apart is what makes equal width mean the SAME 8px on every
+        // lane regardless of how much of the track a lane owns.
+        let base = div()
+            .debug_selector(move || format!("traj-cell-{}-{}", kind.key(), index))
+            .h(px(6.0))
+            .flex_none()
+            .rounded(px(1.0))
+            .bg(rgb(ink))
+            .when(selected, |block| block.border_1().border_color(rgb(ring)));
+        let cell = match width {
+            BlockWidth::Fixed(w) => base.w(px(w)),
+            BlockWidth::Share(share) => base.flex_grow(share.max(0.0001)),
+            // Time-proportional: the left edge is the event's instant and the
+            // width its span, both fractions of the common axis. The 2px floor
+            // keeps an instant (or untimed) event pressable without moving its
+            // left edge.
+            BlockWidth::Placed { x, width } => base
+                .absolute()
+                .top_0()
+                .left(relative(x.clamp(0.0, 1.0)))
+                .w(relative(width.clamp(0.0, 1.0)))
+                .min_w(px(MIN_BLOCK_W)),
+            // Placed by time, sized by the equal-width rule. The width argument
+            // is ignored on purpose: 8px is the whole point of the mode, and
+            // taking it from the caller is how the two readings drift apart.
+            BlockWidth::PlacedFixed { x, .. } => base
+                .absolute()
+                .top_0()
+                .left(relative(x.clamp(0.0, 1.0)))
+                .w(px(EQUAL_BLOCK_W)),
+        };
+        cell.debug_selector(move || format!("traj-cell-hit-{}", index))
+            .id(SharedString::from(format!("traj-cell-{}", index)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                // The block IS the record: pressing it selects that row and
+                // opens its detail panel, which is the reference's own
+                // `onRecordSelect`.
+                this.traj_select = Some(index);
+                this.traj_tab = 0;
+                this.traj_scroll.scroll_to_top_of_item(index);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// The synthetic row that stands in for a collapsed turn's hidden steps.
+    ///
+    /// Measured (TrajectoryTable.module.css + its renderer): the row is 20px
+    /// tall rather than the usual 30, it is a pointer with the standard hover
+    /// fill, and its content is `…` in label-tertiary at weight 600 followed
+    /// by an ellipsised summary in label-secondary at 12/16. Pressing it
+    /// expands that turn again, which is what makes the row a control and not
+    /// a label.
+    fn traj_summary_row(
+        &self,
+        index: usize,
+        opens_turn: bool,
+        summary: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hover = theme::border_soft();
+        let row = div()
+            .debug_selector(move || format!("traj-collapsed-{index}"))
+            .id(SharedString::from(format!("traj-collapsed-{index}")));
+        let row = row
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .when(opens_turn, |row| row.pt(px(4.0)))
+            .h(px(20.0))
+            .pl(px(36.0))
+            .pr(px(4.0))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                // The reference's collapsed row takes the standard hover fill.
+                this.traj_summary_hover = *hovered;
+                cx.notify();
+            }))
+            .when(self.traj_summary_hover, |row| row.bg(rgb(hover)))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                // Pressing the summary expands the turn it hides.
+                this.traj_turns_collapsed = false;
+                this.traj_select = None;
+                this.traj_scroll.scroll_to_top_of_item(index);
+                cx.notify();
+            }))
+            .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .h(px(14.0))
+                    .min_w_0()
+                    .text_size(px(12.0))
+                    .line_height(px(16.0))
                     .child(
-                        // The label column: 44 wide, split by a hairline, text
-                        // right-aligned 3px in at 10px.
-                        div()
-                            .w(px(44.0))
-                            .h_full()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .pr(px(3.0))
-                            .border_r_1()
-                            .border_color(rgb(theme::border_soft()))
-                            .child(txt(self.state.lang.tr(key), 10.0, theme::faint())),
+                        txt("\u{2026}", 12.0, theme::faint())
+                            .mr(px(6.0))
+                            .font_weight(FontWeight::BOLD),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .h(px(6.0))
-                            .ml(px(3.0))
-                            .flex()
-                            .flex_row()
-                            .gap(px(1.0))
-                            .when_some(domain, |track, (first, last)| {
-                                // Real time: a spacer for the wait, then a bar
-                                // for the call. Both are the same unit (ms), so
-                                // the lane reads as a gantt of the run.
-                                let span = (last - first).max(1) as f32;
-                                let mut cursor = first;
-                                let mut children: Vec<Div> = Vec::new();
-                                let mut placed: Vec<&Event> = events
-                                    .iter()
-                                    .filter(|e| e.kind == kind && e.at.is_some())
-                                    .collect();
-                                placed.sort_by_key(|e| e.at.unwrap_or(first));
-                                for event in placed {
-                                    let at = event.at.unwrap_or(cursor);
-                                    if at > cursor {
-                                        children.push(
-                                            div().flex_grow((at - cursor) as f32 / span).h(px(1.0)),
-                                        );
-                                    }
-                                    let span_ms = event.ms.unwrap_or(0).max(60) as f32;
-                                    children.push(
-                                        div()
-                                            .debug_selector(|| {
-                                                format!("traj-cell-{}-{}", kind.key(), event.turn)
-                                            })
-                                            .flex_grow(span_ms / span)
-                                            .h(px(6.0))
-                                            .rounded(px(1.0))
-                                            .bg(rgb(kind.ink())),
-                                    );
-                                    cursor = cursor.max(at + event.ms.unwrap_or(0).max(60));
-                                }
-                                track.children(children)
-                            })
-                            .when(domain.is_none(), |track| {
-                                track.children(cells.into_iter().map(|(turn, weight)| {
-                                    let share = if tallest > 0.0 { weight / tallest } else { 1.0 };
-                                    div()
-                                        .debug_selector(|| {
-                                            format!("traj-cell-{}-{turn}", kind.key())
-                                        })
-                                        .flex_grow(share.max(0.15))
-                                        .h(px(if weight >= tallest && tallest > 0.0 {
-                                            6.0
-                                        } else {
-                                            4.0
-                                        }))
-                                        .rounded(px(1.0))
-                                        .bg(rgb(kind.ink()))
-                                }))
-                            }),
-                    )
-            }))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(txt(summary.to_string(), 12.0, theme::muted())),
+                    ),
+            );
+        super::hairline_bottom(row)
+            .border_color(rgb(theme::border_soft()))
+            .into_any_element()
     }
-
     /// One log line.
     fn traj_row(
         &self,
@@ -827,11 +1436,21 @@ impl Shell {
             self.state.lang.tr("traj.preview"),
             self.state.lang.tr("traj.raw"),
             self.state.lang.tr("traj.sourceTab"),
+            self.state.lang.tr("traj.policyTab"),
         ];
+        // The policy tab is bsh's own: the reference has no equivalent, because
+        // in DSH a policy question and the tool that asked it are separate
+        // records. Here every CALL is made through the policy seam, so the
+        // decision is a property of the call and can be shown beside it.
+        // The call's own argument, not its display title: the audit ring records
+        // the real path, so matching against a clipped `# tool {…}` string would
+        // never join.
+        let verdict = self.state.policy_verdict_for(&event.source, &event.target);
         let body: String = match self.traj_tab {
             1 => event.outcome.clone(),
             2 => event.raw.clone(),
             3 => event.source.clone(),
+            4 => String::new(),
             _ => {
                 if event.outcome.is_empty() {
                     event.raw.clone()
@@ -961,12 +1580,121 @@ impl Shell {
             )
             .child(
                 div()
+                    .debug_selector(|| "traj-detail-body".to_string())
                     .id("traj-detail-body")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .p(px(14.0))
-                    .child(txt(body, 12.0, theme::text()).line_height(px(20.0))),
+                    .when(self.traj_tab == 4, |panel| {
+                        panel.child(self.policy_body(&verdict, cx))
+                    })
+                    .when(self.traj_tab != 4, |panel| {
+                        panel.child(txt(body, 12.0, theme::text()).line_height(px(20.0)))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The Permission/Policy tab: the decision behind one call.
+    ///
+    /// bsh's own surface. It answers the three questions a reader actually has
+    /// about a call: WHICH permission was in force, WHAT the policy was asked,
+    /// and HOW it answered. A refusal adds the rule and the reason, because a
+    /// refusal without them is an unexplained wall.
+    fn policy_body(&self, verdict: &PolicyVerdict, _cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        // The preset comes from the state's one policy fact, not from the tool
+        // name: `applied_preset` reads the policy the turn was built for (a
+        // denial keeps the preset recorded at its decision), falling back to
+        // the session-level effective preset. The row resolves the id through
+        // the same catalogue the composer chip and the settings pane use, so a
+        // named preset reads by its display name.
+        let preset = self.state.preset_label(&verdict.preset);
+        let row = |label: String, value: String| {
+            div()
+                .debug_selector(|| format!("policy-row-{label}"))
+                .flex()
+                .flex_row()
+                .gap(px(12.0))
+                .child(txt(label, 12.0, theme::muted()).w(px(96.0)).flex_none())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(txt(value, 12.0, theme::text()).line_height(px(20.0))),
+                )
+        };
+        let verdict_ink = if verdict.allowed {
+            theme::success()
+        } else {
+            theme::error()
+        };
+        let verdict_label = if verdict.allowed {
+            lang.tr("traj.policyAllowed")
+        } else {
+            lang.tr("traj.policyDenied")
+        };
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(row(
+                lang.tr("traj.policyPermission"),
+                verdict.permission.clone(),
+            ))
+            .child(row(lang.tr("traj.policyAction"), verdict.action.clone()))
+            .child(row(lang.tr("traj.policyTarget"), verdict.target.clone()))
+            .child(
+                div()
+                    .debug_selector(|| "policy-verdict".to_string())
+                    .flex()
+                    .flex_row()
+                    .gap(px(12.0))
+                    .child(
+                        txt(lang.tr("traj.policyVerdict"), 12.0, theme::muted())
+                            .w(px(96.0))
+                            .flex_none(),
+                    )
+                    .child(txt(verdict_label, 12.0, verdict_ink).font_weight(FontWeight::BOLD)),
+            );
+        if let Some(rule) = &verdict.rule {
+            column = column.child(row(lang.tr("traj.policyRule"), rule.clone()));
+        }
+        if let Some(reason) = &verdict.reason {
+            column = column.child(row(lang.tr("traj.policyReason"), reason.clone()));
+        }
+        // The preset the call ran under, drawn as the drawer's own pill. It is
+        // the last fact row because it names the declaration behind every row
+        // above it, and the note below is explanation rather than data.
+        column = column.child(
+            div()
+                .debug_selector(|| "policy-preset".to_string())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    txt(lang.tr("traj.policyPreset"), 12.0, theme::muted())
+                        .w(px(96.0))
+                        .flex_none(),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| format!("policy-preset-{preset}"))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.traj_badge(preset.clone(), theme::text())),
+                ),
+        );
+        column
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .child(txt(lang.tr("traj.policyNote"), 11.0, theme::faint())),
             )
             .into_any_element()
     }
@@ -992,11 +1720,35 @@ impl Shell {
             opens.push(previous != Some(event.turn));
             previous = Some(event.turn);
         }
-        let rows: Vec<AnyElement> = visible
-            .iter()
-            .zip(opens)
-            .map(|((index, event), opens_turn)| self.traj_row(*index, event, opens_turn, cx))
-            .collect();
+        // The collapse actions fold ROWS, not the strip: the picture of the run
+        // never lies about what happened, which is the reference's own rule.
+        // `Calls` folds a turn to its prompt plus one summary row; `Turns`
+        // removes the steps inside a turn without adding a summary line.
+        let rows: Vec<AnyElement> = if self.traj_turns_collapsed {
+            collapse_turns(&visible, &opens, self.state.lang)
+                .into_iter()
+                .filter_map(|(index, opens_turn, summary)| {
+                    let event = events.get(index)?;
+                    Some(match summary {
+                        Some(text) => self.traj_summary_row(index, opens_turn, &text, cx),
+                        None => self.traj_row(index, event, opens_turn, cx),
+                    })
+                })
+                .collect()
+        } else if self.traj_calls_collapsed {
+            visible
+                .iter()
+                .zip(opens)
+                .filter(|((_, event), opens_turn)| *opens_turn || event.kind == Kind::Compaction)
+                .map(|((index, event), opens_turn)| self.traj_row(*index, event, opens_turn, cx))
+                .collect()
+        } else {
+            visible
+                .iter()
+                .zip(opens)
+                .map(|((index, event), opens_turn)| self.traj_row(*index, event, opens_turn, cx))
+                .collect()
+        };
         div()
             .debug_selector(|| "trajectory".to_string())
             .id("trajectory")
@@ -1039,7 +1791,10 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{duration_label, events_for, Kind};
+    use super::{
+        action_of, collapse_turns, duration_label, events_for, project_lane, verdict_for,
+        BlockWidth, Kind, PolicyVerdict, Projection, MINIMUM_BLOCK_MS,
+    };
     use crate::i18n::Lang;
     use crate::model::{ChatMessage, Session};
 
@@ -1049,6 +1804,277 @@ mod tests {
         session
     }
 
+    /// The two switches compose into four projections, exactly as the
+    /// reference's own ternary does.
+    #[test]
+    fn the_two_switches_compose_four_projections() {
+        assert_eq!(Projection::of(false, false), Projection::Sequence);
+        assert_eq!(Projection::of(false, true), Projection::Time);
+        assert_eq!(Projection::of(true, false), Projection::Duration);
+        assert_eq!(Projection::of(true, true), Projection::Actual);
+        // Both timed readings keep a real width; no reading removes idle time.
+        assert!(Projection::Sequence.equal_width());
+        assert!(Projection::Time.equal_width());
+        assert!(!Projection::Duration.equal_width());
+        assert!(!Projection::Actual.equal_width());
+        assert!(!Projection::Sequence.is_timed());
+        assert!(Projection::Time.is_timed());
+        assert!(Projection::Duration.is_timed());
+        assert!(Projection::Actual.is_timed());
+    }
+
+    /// The action a tool name asks the policy about, by NAME rule so an
+    /// unknown tool still gets a sensible answer.
+    #[test]
+    fn a_tool_name_resolves_to_the_action_the_policy_sees() {
+        assert_eq!(action_of("read_file"), "read");
+        assert_eq!(action_of("write_file"), "write");
+        assert_eq!(action_of("edit"), "write");
+        assert_eq!(action_of("bash"), "spawn");
+        assert_eq!(action_of("web_fetch"), "egress");
+        assert_eq!(
+            action_of("some_future_tool"),
+            "read",
+            "an unknown tool is read, not blank"
+        );
+    }
+
+    /// A call with no matching refusal was allowed, and carries the
+    /// permission that was in force when it ran.
+    #[test]
+    fn a_call_with_no_refusal_reads_as_allowed() {
+        let verdict = verdict_for("read_file", "/w/src/main.rs", "workspace-write", "ptc", &[]);
+        assert!(verdict.allowed);
+        assert_eq!(verdict.permission, "workspace-write");
+        assert_eq!(verdict.preset, "ptc");
+        assert_eq!(verdict.action, "read");
+        assert_eq!(verdict.target, "/w/src/main.rs");
+        assert!(verdict.rule.is_none() && verdict.reason.is_none());
+    }
+
+    /// A refusal joined to its call carries the rule and the reason, which is
+    /// what turns a wall into an explanation.
+    #[test]
+    fn a_refusal_joins_its_call_and_names_the_rule() {
+        let refusals = vec![PolicyVerdict {
+            permission: "read-only".to_string(),
+            preset: "strict".to_string(),
+            action: "write".to_string(),
+            target: "/w/src/main.rs".to_string(),
+            allowed: false,
+            rule: Some("deny-writes".to_string()),
+            reason: Some("the session is read-only".to_string()),
+        }];
+        let verdict = verdict_for(
+            "write_file",
+            "/w/src/main.rs",
+            "read-only",
+            "ptc",
+            &refusals,
+        );
+        assert!(!verdict.allowed);
+        assert_eq!(verdict.rule.as_deref(), Some("deny-writes"));
+        assert_eq!(verdict.reason.as_deref(), Some("the session is read-only"));
+        // The refusal's own permission wins: the ring records what was in
+        // force at the DECISION, which may differ from the current setting.
+        assert_eq!(verdict.permission, "read-only");
+        // The preset follows the same rule: the decision's own record wins.
+        assert_eq!(verdict.preset, "strict");
+    }
+
+    /// Two calls to the same tool against different paths are not confused,
+    /// because the join is by tool AND target.
+    #[test]
+    fn a_refusal_does_not_leak_to_a_different_target() {
+        let refusals = vec![PolicyVerdict {
+            permission: "read-only".to_string(),
+            preset: "strict".to_string(),
+            action: "write".to_string(),
+            target: "/w/secret.txt".to_string(),
+            allowed: false,
+            rule: Some("deny-path".to_string()),
+            reason: None,
+        }];
+        let other = verdict_for(
+            "write_file",
+            "/w/public.txt",
+            "workspace-write",
+            "ptc",
+            &refusals,
+        );
+        assert!(other.allowed, "another path is not this refusal");
+        assert_eq!(
+            other.preset, "ptc",
+            "an allowed call takes the caller's fallback"
+        );
+        let same = verdict_for("write_file", "/w/secret.txt", "read-only", "ptc", &refusals);
+        assert!(!same.allowed);
+    }
+
+    /// An action mismatch is not a match either: a refused spawn says nothing
+    /// about an allowed read of the same target.
+    #[test]
+    fn a_refusal_does_not_leak_across_actions() {
+        let refusals = vec![PolicyVerdict {
+            permission: "read-only".to_string(),
+            preset: "strict".to_string(),
+            action: "spawn".to_string(),
+            target: "/w".to_string(),
+            allowed: false,
+            rule: Some("deny-spawn".to_string()),
+            reason: None,
+        }];
+        let read = verdict_for("read_file", "/w/src/main.rs", "read-only", "ptc", &refusals);
+        assert!(read.allowed, "a spawn refusal is not a read refusal");
+    }
+    /// `Turns` folds a turn to its first content row plus one summary row
+    /// that counts what it hides, and leaves a one-row turn alone.
+    #[test]
+    fn collapsing_a_turn_emits_one_summary_row() {
+        let mut session = session_with(vec![
+            ChatMessage::user("one"),
+            ChatMessage::assistant(),
+            ChatMessage::user("two"),
+            ChatMessage::assistant(),
+        ]);
+        if let Some(reply) = session.messages.get_mut(1) {
+            reply.text = "a one".to_string();
+        }
+        if let Some(reply) = session.messages.get_mut(3) {
+            reply.text = "a two".to_string();
+        }
+        let log = events_for(&session, false, Lang::En);
+        let visible: Vec<(usize, &super::Event)> = log.iter().enumerate().collect();
+        // Every row opens its turn here, because the two turns alternate.
+        let opens: Vec<bool> = visible.iter().map(|(_, event)| event.turn != 1).collect();
+        let opens: Vec<bool> = std::iter::once(true)
+            .chain(opens.into_iter().skip(1))
+            .collect();
+        let rows = collapse_turns(&visible, &opens, Lang::En);
+        // Turn 1 keeps its prompt and gains a summary; turn 2 does the same.
+        let summaries: Vec<&String> = rows
+            .iter()
+            .filter_map(|(_, _, summary)| summary.as_ref())
+            .collect();
+        assert!(!summaries.is_empty(), "a collapsed turn carries a summary");
+        assert!(
+            summaries.iter().all(|text| text.contains('1')),
+            "the summary counts the hidden step: {summaries:?}"
+        );
+    }
+
+    /// A turn holding only its own opening row is left as it is: there is
+    /// nothing to hide, and a summary row would be a lie.
+    #[test]
+    fn a_one_row_turn_gets_no_summary() {
+        let session = session_with(vec![ChatMessage::user("only")]);
+        let log = events_for(&session, false, Lang::En);
+        let visible: Vec<(usize, &super::Event)> = log.iter().enumerate().collect();
+        let opens = vec![true; visible.len()];
+        let rows = collapse_turns(&visible, &opens, Lang::En);
+        assert_eq!(rows.len(), visible.len(), "nothing was folded");
+        assert!(rows.iter().all(|(_, _, summary)| summary.is_none()));
+    }
+    /// A lane with a recorded clock, as (index, turn, started-at, ms).
+    fn timed_lane() -> Vec<(usize, usize, Option<u64>, u64)> {
+        vec![
+            (0, 1, Some(0), 1_000),
+            (1, 1, Some(1_000), 1_000),
+            // A 60s pause, then work again.
+            (2, 2, Some(62_000), 1_000),
+        ]
+    }
+
+    /// `sequence` places one unit slot per record, back to back, and ignores
+    /// the clock entirely - that is how a run with no timestamps still reads.
+    #[test]
+    fn sequence_places_one_slot_per_record() {
+        let (domain, spans) = project_lane(&timed_lane(), Projection::Sequence, MINIMUM_BLOCK_MS)
+            .expect("a projection");
+        assert_eq!(domain, 3.0, "three records, three slots");
+        assert_eq!(spans.len(), 3);
+        for (slot, span) in spans.iter().enumerate() {
+            assert_eq!(span.start, slot as f32, "slots run end to end");
+            assert_eq!(span.width, 1.0);
+        }
+        // A lane with no clock at all still projects, because sequence needs
+        // no timestamps.
+        let untimed = vec![(0, 1, None, 0), (1, 1, None, 0)];
+        assert!(project_lane(&untimed, Projection::Sequence, MINIMUM_BLOCK_MS).is_some());
+        assert!(
+            project_lane(&untimed, Projection::Actual, MINIMUM_BLOCK_MS).is_none(),
+            "a timed projection has no axis without a clock"
+        );
+    }
+
+    /// `time` keeps the real axis and draws every block at zero width, which
+    /// is what the renderer turns into its fixed 8px box.
+    #[test]
+    fn time_keeps_real_gaps_but_equal_width() {
+        let (domain, spans) =
+            project_lane(&timed_lane(), Projection::Time, MINIMUM_BLOCK_MS).expect("a projection");
+        assert_eq!(domain, 63_000.0, "the whole span, pause included");
+        assert!(spans.iter().all(|span| span.width == 0.0));
+        // The pause is visible: the third block starts 62s in, not at 2s.
+        assert_eq!(spans[2].start, 62_000.0);
+    }
+
+    /// `duration` is the real-time reading: the pause stays on the axis and a
+    /// block is as wide as the work it stands for.
+    #[test]
+    fn duration_keeps_the_idle_gap_and_the_real_width() {
+        let (domain, spans) = project_lane(&timed_lane(), Projection::Duration, MINIMUM_BLOCK_MS)
+            .expect("a projection");
+        assert_eq!(domain, 63_000.0, "the whole span, the 60s pause included");
+        assert_eq!(
+            spans[2].start, 62_000.0,
+            "work resumes where it really started"
+        );
+        assert_eq!(
+            spans[0].width, 1_000.0,
+            "a one-second call is one second wide"
+        );
+        // The equal-width timed reading keeps the same axis but collapses the
+        // width to its fixed box, which is the mode the toggle switches away
+        // from rather than a difference in the axis.
+        let (_, equal) =
+            project_lane(&timed_lane(), Projection::Time, MINIMUM_BLOCK_MS).expect("a");
+        assert_eq!(equal[2].start, spans[2].start, "same axis, same instant");
+        assert!(equal.iter().all(|span| span.width == 0.0), "equal width");
+    }
+
+    /// `actual` is the gantt: real axis, and a block as wide as the work took.
+    #[test]
+    fn actual_keeps_real_widths_and_real_gaps() {
+        let (domain, spans) = project_lane(&timed_lane(), Projection::Actual, MINIMUM_BLOCK_MS)
+            .expect("a projection");
+        assert_eq!(domain, 63_000.0);
+        assert_eq!(
+            spans[0].width, 1_000.0,
+            "a one-second call is one second wide"
+        );
+        assert_eq!(spans[2].start, 62_000.0);
+    }
+
+    /// A block never collapses below the minimum, so an instant call is still
+    /// a control the reader can press.
+    #[test]
+    fn an_instant_call_still_gets_a_hit_area() {
+        let lane = vec![(0, 1, Some(0), 0)];
+        let (_, spans) = project_lane(&lane, Projection::Actual, MINIMUM_BLOCK_MS).expect("a");
+        assert_eq!(spans[0].width, MINIMUM_BLOCK_MS as f32);
+    }
+
+    /// The two block widths stay distinguishable at the type level, which is
+    /// what keeps equal-width a fixed pixel box rather than a track share.
+    #[test]
+    fn a_fixed_width_is_not_a_track_share() {
+        assert_ne!(BlockWidth::Fixed(8.0), BlockWidth::Share(0.8));
+        assert_ne!(
+            BlockWidth::Share(0.8),
+            BlockWidth::Placed { x: 0.0, width: 0.8 }
+        );
+    }
     /// The detail panel's formatter: milliseconds below a second, seconds
     /// above it, and an em dash when no clock recorded the row.
     #[test]

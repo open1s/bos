@@ -146,9 +146,7 @@ impl Shell {
         let expanded = self.todo_open;
         let panel = div()
             .debug_selector(|| "todo-panel".to_string())
-            .w(px(
-                self.chat_w() + theme::COMPOSER_WIDEN - 2.0 * theme::TODO_SIDE_INSET
-            ))
+            .w(px(self.composer_w() - 2.0 * theme::TODO_SIDE_INSET))
             .rounded(px(theme::TODO_RADIUS))
             .bg(rgb(theme::page()))
             .shadow_sm()

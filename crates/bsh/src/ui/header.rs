@@ -245,11 +245,13 @@ impl Shell {
         let body = match self.state.tab {
             Tab::Chat => self.render_transcript(cx).into_any_element(),
             Tab::Trajectory => self.render_trajectory(cx).into_any_element(),
+            Tab::Audit => self.render_audit(cx).into_any_element(),
         };
         let goal = match self.state.tab {
             Tab::Chat => self.goal_row(cx),
-            // The trajectory pane already shows the goal as a card.
-            Tab::Trajectory => None,
+            // The trajectory pane already shows the goal as a card, and the
+            // audit is about tool calls rather than the plan.
+            Tab::Trajectory | Tab::Audit => None,
         };
         let column = div()
             .debug_selector(|| String::from("main-column"))
@@ -320,7 +322,7 @@ impl Shell {
                         .child(
                             div()
                                 .debug_selector(|| "composer-stack".to_string())
-                                .w(px(self.chat_w() + theme::COMPOSER_WIDEN))
+                                .w(px(self.composer_w()))
                                 .flex_none()
                                 .flex()
                                 .flex_col()
@@ -1669,6 +1671,10 @@ impl Shell {
                     cx,
                 ))
             })
+            // The audit is not behind Show coding view: a refusal log is a
+            // safety surface, and hiding it behind a developer preference would
+            // make it unreachable exactly when a reader needs it.
+            .child(entry("tab-audit", "tab.audit", Tab::Audit, cx))
     }
 
     /// A small square icon button in the title row.

@@ -42,6 +42,12 @@ pub(crate) struct Shell {
     /// The placeholder key the composer currently carries, so the refresh only
     /// runs when the phase (hero, conversation, plan mode) actually flips.
     placeholder_key: &'static str,
+    /// The field width and language the placeholder was fitted to.
+    ///
+    /// Fitting shapes text, so it reruns only when the card or the locale
+    /// changes - `set_placeholder` always notifies, and a per-frame call would
+    /// put a repaint in every frame.
+    placeholder_fit: Option<(u32, crate::i18n::Lang)>,
     /// Whether the to-do panel's list is expanded. The reference starts it
     /// collapsed and keeps the state per mounted panel, not per session.
     pub(crate) todo_open: bool,
@@ -67,8 +73,31 @@ pub(crate) struct Shell {
     pub(crate) preset_editor_error: Option<String>,
     /// The Trajectory tab's own search field.
     pub(crate) traj_search: Entity<InputState>,
-    /// Which measure the trajectory toolbar shows: 0 duration, 1 turns, 2 calls.
-    pub(crate) traj_mode: usize,
+    /// Whether the timeline draws each block at its ACTUAL duration.
+    ///
+    /// The reference keeps this as an independent boolean, not as one value of
+    /// a measure rotation: off draws every block at a fixed equal width (the
+    /// `Duration` button reads `Use actual duration`), on draws it as wide as
+    /// the work took (`Use equal-width operations`). Persisted like the other
+    /// view preferences, because the reference stores it in localStorage.
+    pub(crate) traj_actual_duration: bool,
+    /// Whether the timeline places blocks at their REAL timestamps rather than
+    /// in sequence. The reference ships this switch hidden; bsh keeps the same
+    /// four projections the pair produces (sequence / time / duration / actual).
+    pub(crate) traj_actual_time: bool,
+    /// Whether every turn in the trajectory table is folded to its summary row.
+    ///
+    /// The reference's `Turns` toolbar action is a collapse-all switch, not a
+    /// strip measure: it folds each turn to one line and its glyph flips from
+    /// the collapse box to the expand box.
+    pub(crate) traj_turns_collapsed: bool,
+    /// Whether every assistant step in the trajectory table is folded.
+    pub(crate) traj_calls_collapsed: bool,
+    /// Whether the pointer is over a collapsed-turn summary row.
+    ///
+    /// The kit's hover is a listener rather than a style closure here, so the
+    /// state is recorded and the fill applied on the next frame.
+    pub(crate) traj_summary_hover: bool,
     /// The selected trajectory event (an index into the rendered log).
     pub(crate) traj_select: Option<usize>,
     /// The detail panel's tab: 0 summary, 1 preview, 2 raw, 3 source.
@@ -76,6 +105,19 @@ pub(crate) struct Shell {
     /// What the trajectory search field holds, kept beside the entity so the
     /// view can filter without reading it per row.
     pub(crate) traj_query: String,
+    /// The Audit tab's own search field.
+    pub(crate) audit_search: Entity<InputState>,
+    /// Which measure the audit toolbar shows: 0 duration, 1 turns, 2 calls.
+    pub(crate) audit_mode: usize,
+    /// What the audit search field holds, kept beside the entity so the view
+    /// can filter without reading it per row.
+    pub(crate) audit_query: String,
+    /// The turns the reader has opened, by 1-based turn number.
+    pub(crate) audit_turn_open: BTreeSet<usize>,
+    /// The calls the reader has opened, by (turn, call) position.
+    pub(crate) audit_open: BTreeSet<(usize, usize)>,
+    /// The calls whose full stored text is showing.
+    pub(crate) audit_full: BTreeSet<(usize, usize)>,
     /// The model-id filter on the fetched-model picker.
     pub(crate) picker_search: Entity<InputState>,
     /// The task-name filter on the Automation tasks pane.
@@ -162,6 +204,14 @@ pub(crate) struct Shell {
     /// Whether the newest message should stay in view. A rail jump clears it,
     /// and content growing while the reader is at the end sets it again.
     pub(crate) following_tail: bool,
+    /// A transcript child the audit's jump asked for, and the Chat frames left
+    /// to wait before asking.
+    ///
+    /// The request cannot be made while the Audit tab is mounted: it lands on a
+    /// scroller that is not in the tree and is dropped with the unmounted
+    /// element. It waits for one mounted Chat frame so the rows have bounds,
+    /// then the next frame's prepaint applies it.
+    pub(crate) audit_jump_to: Option<(usize, u8)>,
     /// The reasoning disclosures the reader has opened, by message index. A
     /// session switch closes them all, the way the reference resets a turn's
     /// disclosure state.
@@ -184,6 +234,8 @@ pub(crate) struct Shell {
     /// The trajectory tab's scroll position, so its wheel can be eased and a test
     /// can read it.
     pub(crate) traj_scroll: ScrollHandle,
+    /// The audit list's scroll position.
+    pub(crate) audit_scroll: ScrollHandle,
     /// The sidebar tree's scroll position, so the wheel, the keys and a test can
     /// all address the same offset.
     pub(crate) side_scroll: ScrollHandle,
@@ -600,6 +652,9 @@ impl Shell {
         let traj_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "traj.search"))
         });
+        let audit_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "audit.search"))
+        });
         let picker_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.fetchSearch"))
         });
@@ -746,6 +801,20 @@ impl Shell {
                  cx: &mut Context<Shell>| {
                     if matches!(event, InputEvent::Change) {
                         this.traj_query = this.traj_search.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &audit_search,
+                window,
+                |this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        this.audit_query = this.audit_search.read(cx).value().to_string();
                         cx.notify();
                     }
                 },
@@ -917,6 +986,7 @@ impl Shell {
             state,
             composer,
             placeholder_key,
+            placeholder_fit: None,
             todo_open: false,
             queue_edit,
             queue_edit_for: None,
@@ -946,10 +1016,23 @@ impl Shell {
             skill_add_path,
             skill_add_name,
             traj_search,
-            traj_mode: 0,
+            traj_actual_duration: false,
+            // ON the clock from the start: equal width is about how WIDE a
+            // block is drawn, never about whether it has a position. A false
+            // time flag selects `sequence`, which packs a lane into a solid bar.
+            traj_actual_time: true,
+            traj_turns_collapsed: false,
+            traj_calls_collapsed: false,
+            traj_summary_hover: false,
             traj_select: None,
             traj_tab: 0,
             traj_query: String::new(),
+            audit_search,
+            audit_mode: 0,
+            audit_query: String::new(),
+            audit_turn_open: BTreeSet::new(),
+            audit_open: BTreeSet::new(),
+            audit_full: BTreeSet::new(),
             picker_search,
             task_search,
             task_name,
@@ -1004,6 +1087,7 @@ impl Shell {
             tail_max: None,
             tail_session: None,
             following_tail: true,
+            audit_jump_to: None,
             think_open: std::collections::HashSet::new(),
             compaction_open: std::collections::HashSet::new(),
             chat_last_offset: 0.0,
@@ -1011,6 +1095,7 @@ impl Shell {
             chat_smooth: super::smooth::Smooth::default(),
             traj_smooth: super::smooth::Smooth::default(),
             traj_scroll: ScrollHandle::new(),
+            audit_scroll: ScrollHandle::new(),
             side_scroll: ScrollHandle::new(),
             side_focus: cx.focus_handle(),
             rail_scroll: ScrollHandle::new(),
@@ -2153,6 +2238,23 @@ impl Shell {
         crate::theme::resolve_content_width(self.conversation_w.as_f32(), self.chat_user_w)
     }
 
+    /// The composer card's width for this frame.
+    ///
+    /// The card is the chat width plus the measured 32, but never more than the
+    /// seat the conversation column actually has - the reference's
+    /// `width:100%;max-width:chat + 32` inside a 16px-a-side seat. Every
+    /// consumer of the card (the stack, the queue dock, the to-do panel, the
+    /// hero) derives from this, so they cannot disagree about the narrow case.
+    pub(crate) fn composer_w(&self) -> f32 {
+        crate::theme::composer_width_at(self.conversation_w.as_f32(), self.chat_w())
+    }
+
+    /// The hero stack's width: the card plus its clearance a side, capped at
+    /// the column the way the reference's `min(card + 2 * clearance, 100%)` is.
+    pub(crate) fn hero_w(&self) -> f32 {
+        crate::theme::hero_width_at(self.conversation_w.as_f32(), self.composer_w())
+    }
+
     /// Ask for the one-time legacy compaction, off the UI thread.
     ///
     /// A history is checked once per session selection: opening it is the cheap
@@ -3132,22 +3234,6 @@ impl Render for Shell {
         // instead of a 64 KiB copy.
         self.refresh_jobs_snapshot();
         self.refresh_job_output_cache();
-        // The composer's placeholder names the current mode: plan mode asks for
-        // a task to plan, a blank session asks what to build, a conversation
-        // asks for the next message. Updating it only on the flip keeps the
-        // notify out of the frame loop it would otherwise join.
-        let placeholder = match self.claim_hint() {
-            Some(claim) => claim,
-            None if self.state.active_plan_mode() => "composer.planPlaceholder",
-            None if self.state.hero_phase() => "composer.heroPlaceholder",
-            None => "composer.placeholder",
-        };
-        if placeholder != self.placeholder_key {
-            self.placeholder_key = placeholder;
-            let text = self.state.lang.tr(placeholder);
-            self.composer
-                .update(cx, |input, cx| input.set_placeholder(text, window, cx));
-        }
         // The rail's container is the conversation column, which is the window
         // less the sidebar (`@container (width <= 900px)` hides the frame).
         // The frame's width is what the reference's auto-collapse measures, so
@@ -3155,6 +3241,18 @@ impl Render for Shell {
         // palette's list, so it is recorded from the same measurement.
         self.viewport_w = window.viewport_size().width.as_f32();
         self.viewport_h = window.viewport_size().height.as_f32();
+        // The composer's placeholder names the current mode: plan mode asks for
+        // a task to plan, a blank session asks what to build, a conversation
+        // asks for the next message. It is fitted to the field's own width, so
+        // a narrow card ellipsises the text instead of cutting it; both the
+        // phase and the fitted width are cached, because `set_placeholder`
+        // always notifies and must not run per frame.
+        let placeholder = match self.claim_hint() {
+            Some(claim) => claim,
+            None if self.state.active_plan_mode() => "composer.planPlaceholder",
+            None if self.state.hero_phase() => "composer.heroPlaceholder",
+            None => "composer.placeholder",
+        };
         // The key interceptor has no window, so a Tab completion hands its text
         // here and the frame that owns a window writes it. This is the same
         // pattern the hero placeholder uses.
@@ -3177,6 +3275,22 @@ impl Render for Shell {
             px(0.0)
         };
         self.conversation_w = window.viewport_size().width - sidebar - panel;
+        // The fit is derived from THIS frame's column, so it lands after the
+        // measurement and before the first child reads `chat_w`. The phase, the
+        // field width and the language are one cache key: the text is shaped,
+        // and `set_placeholder` always notifies.
+        let field_w = crate::theme::composer_field_width(self.composer_w());
+        let fit = (field_w.to_bits(), self.state.lang);
+        if placeholder != self.placeholder_key || self.placeholder_fit != Some(fit) {
+            self.placeholder_key = placeholder;
+            self.placeholder_fit = Some(fit);
+            let size =
+                crate::theme::body_size_at(self.state.draft().global.general.content_font_size);
+            let text = self.state.lang.tr(placeholder);
+            let fitted = super::composer::fit_placeholder(window, size, &text, field_w);
+            self.composer
+                .update(cx, |input, cx| input.set_placeholder(fitted, window, cx));
+        }
         // The rail follows the active mark, unless the pointer is working it.
         self.follow_rail();
         // Follow the tail, the state the reference marks as data-chat-following-tail:
@@ -3190,6 +3304,16 @@ impl Render for Shell {
             self.following_tail = true;
             self.think_open.clear();
             self.compaction_open.clear();
+            // The audit's folds name turn and call positions in the transcript
+            // that just changed, so a switch closes them and starts the list at
+            // the top the way the reference resets a mounted pane.
+            self.audit_turn_open.clear();
+            self.audit_open.clear();
+            self.audit_full.clear();
+            self.audit_query.clear();
+            self.audit_jump_to = None;
+            self.audit_search
+                .update(cx, |input, cx| input.set_value("", window, cx));
             self.rail_hover = None;
             self.rail_active = None;
             self.state.stat_open = false;
@@ -3199,6 +3323,19 @@ impl Render for Shell {
             self.jobs_open = false;
             self.jobs_expanded.clear();
             self.jobs_output_cache.clear();
+        }
+        // A pending audit jump lands here, after the Chat scroller has mounted
+        // for one frame. Setting it from the Audit tab was lost with the
+        // unmounted element; asking on this frame gives prepaint real bounds.
+        if self.state.tab == crate::state::Tab::Chat {
+            match self.audit_jump_to {
+                Some((child, 0)) => {
+                    self.audit_jump_to = None;
+                    self.transcript_scroll.scroll_to_top_of_item(child);
+                }
+                Some((child, wait)) => self.audit_jump_to = Some((child, wait - 1)),
+                None => {}
+            }
         }
         let scroll = &self.transcript_scroll;
         let offset = scroll.offset().y;

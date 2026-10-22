@@ -11306,10 +11306,13 @@ fn a_scratch_store_never_writes_a_settings_document_into_the_checkout() {
 
 /// A narrow column clamps the chat down instead of hanging it over the panel.
 ///
-/// The reference's floor is 680, and an open right panel takes a laptop's column
-/// below that: the composer and the hero then overflowed the centre column and
-/// were clipped against the panel's edge. The floor makes the chat readable; it
-/// must not make it wider than the room it has.
+/// The reference's floor is 680, and an open right panel (or a narrow window)
+/// takes the column below that: the composer card, which is the chat width plus
+/// the measured 32, then overflowed the centre column and was clipped on both
+/// sides - its placeholder starting mid-word. The floor makes the chat
+/// readable; it must not make it wider than the room it has. The rule is
+/// theme::fit_chat_width: the column less the card's 32 and the 16px seat it
+/// keeps on each side.
 #[test]
 fn a_narrow_conversation_column_caps_the_chat_width() {
     // A 1280 window, a 280 sidebar and a 480 panel: the column the screenshot
@@ -11317,8 +11320,8 @@ fn a_narrow_conversation_column_caps_the_chat_width() {
     let narrow = 1280.0 - 280.0 - 480.0;
     let chat = crate::theme::chat_width_at(narrow);
     assert!(
-        chat + crate::theme::COMPOSER_WIDEN <= narrow,
-        "the composer card fits a {narrow} column: chat {chat} + 32"
+        chat + crate::theme::COMPOSER_WIDEN <= narrow - 2.0 * crate::theme::COMPOSER_CLEARANCE,
+        "the composer card and its seat fit a {narrow} column: chat {chat} + 32"
     );
     assert!(
         chat < crate::theme::CHAT_W,
@@ -11326,13 +11329,13 @@ fn a_narrow_conversation_column_caps_the_chat_width() {
     );
     assert!(chat > 0.0, "and the chat stays a positive width");
 
-    // Where the column is narrow enough to reach the floor but still wider
-    // than it, the clamp is untouched: 800 * .8 = 640, which the floor lifts
-    // to 680.
+    // 740 used to keep the 680 floor. It no longer can: the card is 712 and the
+    // seat would need 32, so the room (740 less 64) is 676 and that is the NEW
+    // rule - the floor never exceeds the column it is centred in.
     assert_eq!(
         crate::theme::chat_width_at(740.0),
-        crate::theme::CHAT_W,
-        "a narrow column keeps the floor"
+        676.0,
+        "the column's own room wins over the 680 floor"
     );
     assert_eq!(
         crate::theme::chat_width_at(1640.0),
@@ -12377,34 +12380,39 @@ fn an_overflowing_rail_draws_the_hover_preview(cx: &mut TestAppContext) {
         "and an overflowing rail previews it too"
     );
 }
-/// The toolbar's segmented control is live: the strip IS the measure, so
-/// switching to Calls re-weights the lanes by call count and Duration by the
-/// time each turn's tools took.
+/// The Duration toggle is the strip's measure: OFF draws every block at the
+/// reference's fixed equal width, ON lays the lanes out against ONE shared time
+/// axis, so x is when an event started and width is how long it took.
+///
+/// The numbers below are the user's own example, in geometry rather than in
+/// prose: turn 1's call runs 9s from t=1s, turn 2's runs 0.2s from t=11s, so the
+/// slow block must be 45x the quick one, start at the track's left edge, and
+/// leave the ten seconds before the second block empty.
 #[gpui::test]
-fn the_trajectory_measure_redraws_the_lanes(cx: &mut TestAppContext) {
+fn the_duration_lanes_are_time_proportional(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("traj-measure", 2);
+        let mut state = state_with_turns("traj-time-lanes", 2);
         tests_pin_reference_defaults(&mut state);
         let id = state.active_id.clone().expect("an active session");
         if let Some(session) = state.store.session_mut(&id) {
-            // Turn 1: one slow call. Turn 2: three quick ones.
+            // Turn 1: one 9s call starting at t=1s. Turn 2: one 0.2s call
+            // starting ten seconds later. Both carry a start, which is what
+            // makes the shared axis meaningful.
             session.messages[1].tools.push(crate::model::ToolEvent {
                 name: "bash".to_string(),
                 args: "{}".to_string(),
                 output: Some("slow".to_string()),
                 ms: Some(9_000),
-                at: None,
+                at: Some(1_000),
             });
-            for _ in 0..3 {
-                session.messages[3].tools.push(crate::model::ToolEvent {
-                    name: "bash".to_string(),
-                    args: "{}".to_string(),
-                    output: Some("quick".to_string()),
-                    ms: Some(10),
-                    at: None,
-                });
-            }
+            session.messages[3].tools.push(crate::model::ToolEvent {
+                name: "bash".to_string(),
+                args: "{}".to_string(),
+                output: Some("quick".to_string()),
+                ms: Some(200),
+                at: Some(11_000),
+            });
         }
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -12417,45 +12425,280 @@ fn the_trajectory_measure_redraws_the_lanes(cx: &mut TestAppContext) {
             cx.notify();
         });
     });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
+    draw_until(cx, "the lane blocks draw", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-cell-hit-2").is_some()
+            && cx.debug_bounds("traj-cell-hit-5").is_some()
+            && cx.debug_bounds("traj-lane-tools").is_some()
+    });
 
-    let wide = |cx: &mut VisualTestContext, turn: usize| {
-        let selector: &str = Box::leak(format!("traj-cell-traj.kindTool-{turn}").into_boxed_str());
-        cx.debug_bounds(selector).map(|b| f32::from(b.size.width))
+    // The event log is [user0, assistant1, tool2, user3, assistant4, tool5]:
+    // the two tool blocks are indices 2 and 5.
+    let cell = |cx: &mut VisualTestContext, index: usize| {
+        let selector: &'static str = Box::leak(format!("traj-cell-hit-{index}").into_boxed_str());
+        let bounds = cx.debug_bounds(selector).expect("a lane block");
+        (f32::from(bounds.origin.x), f32::from(bounds.size.width))
     };
 
-    // Duration: the 9 s turn is the wide one.
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| {
-            this.traj_mode = 0;
-            cx.notify();
-        })
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let (slow, quick) = (wide(cx, 1), wide(cx, 2));
+    // OFF is the reference's equal-width reading: 8px blocks, identical despite
+    // a 45x difference in duration - but still POSITIONED by when they happened.
+    let (slow_x0, slow_w) = cell(cx, 2);
+    let (quick_x0, quick_w) = cell(cx, 5);
     assert!(
-        slow.is_some() && quick.is_some(),
-        "both turns have a segment: {slow:?} {quick:?}"
+        (slow_w - 8.0).abs() <= 0.5 && (quick_w - 8.0).abs() <= 0.5,
+        "equal width draws the measured 8px blocks: {slow_w} {quick_w}"
+    );
+    assert!(!cx.update(|_, cx| shell.read(cx).traj_actual_duration));
+    // The two calls happened 10 seconds apart, so their blocks must not sit on
+    // top of each other: size is equal, POSITION is still the clock. This is the
+    // bug a reader saw as one solid bar per lane.
+    let track0 = cx.debug_bounds("traj-lane-tools").expect("the tools lane");
+    let track0_left = f32::from(track0.origin.x);
+    let track0_w = f32::from(track0.size.width);
+    assert!(
+        quick_x0 - slow_x0 > 1.0,
+        "equal-width blocks keep their real positions: {slow_x0} vs {quick_x0}"
     );
     assert!(
-        slow > quick,
-        "by duration the slow turn is wider: {slow:?} {quick:?}"
+        (slow_x0 - track0_left).abs() <= 1.0,
+        "the first block still opens at the axis start: {slow_x0} vs {track0_left}"
+    );
+    // 1_000 .. 11_200ms is the axis, so the quick call sits 10/10.2 of the
+    // way along it: equal width changes the SIZE, never the placement.
+    let span0 = 10_200.0f32;
+    assert!(
+        (quick_x0 - (track0_left + track0_w * (10_000.0 / span0))).abs() <= 2.0,
+        "and the second sits ten seconds along the axis: {quick_x0} vs {}",
+        track0_left + track0_w * (10_000.0 / span0)
     );
 
-    // Calls: the three-call turn is.
-    cx.update(|_, cx| {
-        shell.update(cx, |this, cx| {
-            this.traj_mode = 2;
-            cx.notify();
-        })
-    });
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let (slow, quick) = (wide(cx, 1), wide(cx, 2));
+    // Turning Duration ON must re-lay the strip in the frame the test observes.
+    let toggle = cx
+        .debug_bounds("traj-duration")
+        .expect("the Duration toggle");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "Duration mode becomes real-time",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.update(|_, cx| shell.read(cx).traj_actual_duration)
+                && cx
+                    .debug_bounds("traj-cell-hit-2")
+                    .is_some_and(|bounds| f32::from(bounds.size.width) > 100.0)
+        },
+    );
+
+    let track = cx.debug_bounds("traj-lane-tools").expect("the tools lane");
+    let track_left = f32::from(track.origin.x);
+    let track_w = f32::from(track.size.width);
+    let (slow_x, slow_w) = cell(cx, 2);
+    let (quick_x, quick_w) = cell(cx, 5);
+
+    // Axis: 1_000 .. 11_200ms (the slow call ends at 10_000, the quick one at
+    // 11_200), so 9_000ms and 200ms are 0.882 and 0.0196 of the lane.
+    let span = 10_200.0f32;
     assert!(
-        quick > slow,
-        "by call count the busy turn is wider: {slow:?} {quick:?}"
+        (slow_w / quick_w - 45.0).abs() < 0.5,
+        "the 9s block is 45x the 0.2s block: {slow_w} vs {quick_w}"
+    );
+    assert!(
+        (slow_x - track_left).abs() <= 1.0,
+        "the first block starts at the axis start: {slow_x} vs {track_left}"
+    );
+    assert!(
+        (slow_w - track_w * (9_000.0 / span)).abs() <= 2.0,
+        "width is duration over the common span: {slow_w} vs {}",
+        track_w * (9_000.0 / span)
+    );
+    assert!(
+        (quick_x - (track_left + track_w * (10_000.0 / span))).abs() <= 2.0,
+        "the second block sits ten seconds along the axis: {quick_x} vs {}",
+        track_left + track_w * (10_000.0 / span)
+    );
+
+    // The idle stretch between the calls is EMPTY: no block occupies it, and the
+    // next block starts where its own event started rather than where the
+    // previous one ended.
+    let gap = quick_x - (slow_x + slow_w);
+    assert!(
+        gap > 20.0,
+        "the ten-second wait is visible as empty space: {gap}"
+    );
+    assert!(
+        (gap - track_w * (1_000.0 / span)).abs() <= 2.0,
+        "the gap is the 1s between the calls: {gap} vs {}",
+        track_w * (1_000.0 / span)
+    );
+
+    // One common axis: events that start together share an x across lanes. The
+    // assistant row that opened turn 2 and its tool both start at t=11s; the
+    // turn-1 pair both start at t=1s.
+    let (model_x, _) = cell(cx, 4);
+    assert!(
+        (model_x - quick_x).abs() <= 1.0,
+        "the model and tool lanes share the axis: {model_x} vs {quick_x}"
+    );
+    let (first_model_x, _) = cell(cx, 1);
+    assert!(
+        (first_model_x - slow_x).abs() <= 1.0,
+        "both turn-1 rows start at the axis start: {first_model_x} vs {slow_x}"
+    );
+
+    // And switching back restores the equal-width reading, so the toggle is a
+    // real measure rather than a one-way flag.
+    let toggle = cx
+        .debug_bounds("traj-duration")
+        .expect("the Duration toggle");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "Duration mode becomes equal-width again",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            !cx.update(|_, cx| shell.read(cx).traj_actual_duration)
+                && cx
+                    .debug_bounds("traj-cell-hit-2")
+                    .is_some_and(|bounds| f32::from(bounds.size.width) <= 9.0)
+        },
+    );
+    let (_, slow_w) = cell(cx, 2);
+    let (_, quick_w) = cell(cx, 5);
+    assert!(
+        (slow_w - quick_w).abs() <= 1.5,
+        "equal width draws both the same again: {slow_w} {quick_w}"
     );
 }
+
+/// An event with no recorded start still draws in Duration mode: it is placed
+/// at the nearest known instant in its lane and keeps the two-pixel minimum
+/// width, rather than being dropped from the strip.
+#[gpui::test]
+fn an_untimed_event_still_draws_in_duration_mode(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("traj-untimed", 2);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            // A timed call, then a record written before the clock existed.
+            session.messages[1].tools.push(crate::model::ToolEvent {
+                name: "bash".to_string(),
+                args: "{}".to_string(),
+                output: Some("timed".to_string()),
+                ms: Some(1_000),
+                at: Some(1_000),
+            });
+            session.messages[1].tools.push(crate::model::ToolEvent {
+                name: "read_file".to_string(),
+                args: "{}".to_string(),
+                output: Some("no clock".to_string()),
+                ms: None,
+                at: None,
+            });
+            session.messages[3].tools.push(crate::model::ToolEvent {
+                name: "bash".to_string(),
+                args: "{}".to_string(),
+                output: Some("later".to_string()),
+                ms: Some(200),
+                at: Some(11_000),
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Trajectory;
+            this.traj_actual_duration = true;
+            this.traj_actual_time = true;
+            cx.notify();
+        });
+    });
+    // The log is [user0, assistant1, tool2, tool3, user4, assistant5, tool6]:
+    // tool3 is the untimed one.
+    draw_until(cx, "the untimed block draws", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-cell-hit-3").is_some()
+    });
+    let block = cx
+        .debug_bounds("traj-cell-hit-3")
+        .expect("the untimed block");
+    let width = f32::from(block.size.width);
+    let x = f32::from(block.origin.x);
+    assert!(
+        width >= 1.5,
+        "the untimed event keeps a minimum-width block: {width}"
+    );
+    let timed = cx
+        .debug_bounds("traj-cell-hit-2")
+        .expect("its timed neighbour");
+    assert!(
+        (x - f32::from(timed.origin.x)).abs() <= 1.0,
+        "it is placed at the nearest known time: {x} vs {}",
+        f32::from(timed.origin.x)
+    );
+    // Every lane event still draws: a fallback never silently drops a row.
+    for index in 0..7 {
+        let selector: &'static str = Box::leak(format!("traj-cell-hit-{index}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "event {index} is not omitted from the strip"
+        );
+    }
+}
+
+/// A timeline block is a way BACK to the record it stands for: pressing it
+/// selects that row and opens its detail panel, which is the reference's own
+/// `onRecordSelect`. Before this the strip was a picture with no handle.
+#[gpui::test]
+fn a_timeline_block_selects_its_record(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("traj-block-click", 2);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(crate::model::ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"ls\"}".to_string(),
+                output: Some("a.txt".to_string()),
+                ms: Some(1_000),
+                at: Some(1_000),
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Trajectory;
+            this.traj_select = None;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the bar renders a block", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-cell-hit-0").is_some()
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).traj_select.is_none()),
+        "the premise: nothing is selected yet"
+    );
+    let block = cx.debug_bounds("traj-cell-hit-0").expect("the block");
+    cx.simulate_click(block.center(), Modifiers::default());
+    draw_until(cx, "the record is selected", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).traj_select == Some(0))
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).traj_tab),
+        0,
+        "and the detail panel opens on its summary"
+    );
+}
+
+/// The chat's Inspect link opens the SAME call in the Trajectory tab: the tab
 /// The chat's Inspect link opens the SAME call in the Trajectory tab: the tab
 /// switches, the matching line is selected, and the detail panel shows it. Before
 /// this the two tabs were unaware of each other, so a reader who wanted the whole
@@ -13560,6 +13803,135 @@ fn the_trajectory_draws_its_log_and_opens_the_detail_panel(cx: &mut TestAppConte
         "closing the panel leaves the log"
     );
 }
+/// A shell on one seeded tool call whose turn runs under `preset`, for the
+/// policy-tab drawer tests.
+///
+/// `preset` is the id and optional display name written into the catalogue; the
+/// session names it explicitly, unless it is `None`, which leaves the session
+/// on the built-in default. `default_preset` is pinned so a developer's real
+/// settings file cannot decide the default case.
+fn state_with_preset_call(
+    label: &str,
+    preset: Option<(&str, Option<&str>)>,
+    default_preset: &str,
+) -> AppState {
+    let mut state = state_with_turns(label, 1);
+    tests_pin_reference_defaults(&mut state);
+    state.settings.global.default_preset = default_preset.to_string();
+    if let Some((id, name)) = preset {
+        state.settings.global.presets.insert(
+            id.to_string(),
+            crate::settings::global::Preset {
+                name: name.map(str::to_string),
+                ..crate::settings::global::Preset::default()
+            },
+        );
+    }
+    let id = state.active_id.clone().expect("an active session");
+    if let Some(session) = state.store.session_mut(&id) {
+        session.agent_preset = preset.map(|(id, _)| id.to_string());
+        session.messages[1].tools.push(crate::model::ToolEvent {
+            name: "bash".to_string(),
+            args: "{\"command\":\"ls\"}".to_string(),
+            output: Some("a.txt".to_string()),
+            ms: Some(12),
+            at: None,
+        });
+    }
+    state
+}
+
+/// Open the seeded call's Trajectory detail on the Permission/Policy tab.
+///
+/// The row and the tab are PRESSED rather than assigned, so the test proves the
+/// drawer a reader actually opens, and every step waits for its observable.
+fn open_call_policy_tab(cx: &mut VisualTestContext, shell: &Entity<Shell>) {
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Trajectory;
+            this.traj_select = None;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the trajectory log renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-row-1").is_some()
+    });
+    let row = cx.debug_bounds("traj-row-1").expect("the tool-call line");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the detail panel opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-detail").is_some()
+    });
+    let tab = cx.debug_bounds("traj-tab-4").expect("the policy tab");
+    cx.simulate_click(tab.center(), Modifiers::default());
+    draw_until(cx, "the policy tab is selected", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("policy-preset").is_some()
+    });
+}
+
+/// The policy tab names the preset the call ran under, by its display name.
+///
+/// The value is asserted through the debug selector on the chip, the drawer's
+/// own address for the row, rather than by reading state back.
+#[gpui::test]
+fn the_policy_tab_names_the_preset_that_ran_the_call(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_preset_call("traj-preset-named", Some(("ptc", Some("PTC"))), "");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    open_call_policy_tab(cx, &shell);
+    assert!(
+        cx.debug_bounds("policy-preset-PTC").is_some(),
+        "the drawer names the applied preset by its display name"
+    );
+    assert!(
+        cx.debug_bounds("policy-preset-ptc").is_none(),
+        "and not by the raw id once the preset declares a name"
+    );
+}
+
+/// A session on the built-in default names that default, not an empty cell.
+#[gpui::test]
+fn the_policy_tab_names_the_built_in_default_preset(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_preset_call("traj-preset-default", None, "");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    open_call_policy_tab(cx, &shell);
+    assert!(
+        cx.debug_bounds("policy-preset-Default").is_some(),
+        "the built-in default is named the way the composer chip names it"
+    );
+}
+
+/// A preset with only an id has no display name to show, so the id is the label.
+#[gpui::test]
+fn the_policy_tab_falls_back_to_an_unnamed_preset_id(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_preset_call("traj-preset-unnamed", Some(("lean", None)), "");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    open_call_policy_tab(cx, &shell);
+    assert!(
+        cx.debug_bounds("policy-preset-lean").is_some(),
+        "an unnamed preset is shown by its id"
+    );
+}
+
 /// The chat transcript scrolls with the wheel, smoothly, and stops chasing the
 /// tail while it does.
 ///
@@ -19086,4 +19458,716 @@ fn a_width_drag_remeasures_once_at_the_commit(cx: &mut TestAppContext) {
         before + 1,
         "the commit measures exactly once, at the settled width"
     );
+}
+
+/// The Audit tab sits beside Chat and Trajectory, and switching away and back
+/// keeps the reader's place in the chat. The tab's body is the deterministic
+/// page, not the transcript over again.
+#[gpui::test]
+fn the_audit_tab_sits_beside_chat_and_keeps_the_chat_position(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("audit-tab", 12);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"ls\"}".to_string(),
+                output: Some("a.md".to_string()),
+                ms: Some(7),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let chat = cx.debug_bounds("tab-chat").expect("the Chat tab");
+    let trajectory = cx
+        .debug_bounds("tab-trajectory")
+        .expect("the Trajectory tab");
+    let audit = cx.debug_bounds("tab-audit").expect("the Audit tab");
+    assert!(
+        chat.origin.x < trajectory.origin.x && trajectory.origin.x < audit.origin.x,
+        "the audit sits beside Chat and Trajectory"
+    );
+
+    // Leave the tail and park the chat on a measured row, so returning has a
+    // position worth preserving.
+    draw_until(
+        cx,
+        "the transcript is tall enough to scroll",
+        DRAW_UNTIL_MAX,
+        |cx| cx.update(|_, cx| f32::from(shell.read(cx).transcript_scroll.max_offset().y) > 0.0),
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.following_tail = false;
+            this.transcript_scroll.scroll_to_top_of_item(2);
+        });
+    });
+    draw_until(
+        cx,
+        "the chat parked away from the tail",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.update(|_, cx| {
+                let handle = &shell.read(cx).transcript_scroll;
+                let max = f32::from(handle.max_offset().y);
+                f32::from(handle.offset().y) > -max + 1.0
+            })
+        },
+    );
+    let before = cx.update(|_, cx| f32::from(shell.read(cx).transcript_scroll.offset().y));
+    assert!(before < 0.0, "the parked chat is not at the top: {before}");
+
+    cx.simulate_click(audit.center(), Modifiers::default());
+    draw_until(cx, "the audit page renders", DRAW_UNTIL_MAX, |cx| {
+        matches!(cx.update(|_, cx| shell.read(cx).state.tab), Tab::Audit)
+            && cx.debug_bounds("audit").is_some()
+            && cx.debug_bounds("audit-summary").is_some()
+            && cx.debug_bounds("audit-limits").is_some()
+    });
+
+    let chat = cx.debug_bounds("tab-chat").expect("the Chat tab again");
+    cx.simulate_click(chat.center(), Modifiers::default());
+    draw_until(cx, "the chat keeps its place", DRAW_UNTIL_MAX, |cx| {
+        matches!(cx.update(|_, cx| shell.read(cx).state.tab), Tab::Chat)
+            && (cx.update(|_, cx| f32::from(shell.read(cx).transcript_scroll.offset().y)) - before)
+                .abs()
+                < 2.0
+    });
+}
+
+/// A turn row's Jump control lands on that turn in Chat, and the click does not
+/// also expand the turn it sits on.
+#[gpui::test]
+fn an_audit_turn_jumps_to_its_turn_in_chat(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("audit-jump", 30);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[3].tools.push(ToolEvent {
+                name: "read_file".to_string(),
+                args: "{\"path\":\"notes/a.md\"}".to_string(),
+                output: Some("body".to_string()),
+                ms: Some(3),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Audit;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the audit lists turn 2", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-jump-2").is_some()
+    });
+
+    let jump = cx.debug_bounds("audit-jump-2").expect("the jump control");
+    cx.simulate_click(jump.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the jump lands on turn 2 in Chat",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.update(|_, cx| {
+                let shell = shell.read(cx);
+                if shell.state.tab != Tab::Chat {
+                    return false;
+                }
+                let turns = shell.turn_indices();
+                shell.visible_turn(&turns) == Some(1)
+            })
+        },
+    );
+    let expanded = cx.update(|_, cx| shell.read(cx).audit_turn_open.contains(&2));
+    assert!(
+        !expanded,
+        "the jump must not also toggle the turn it was pressed in"
+    );
+}
+
+/// A huge output is a bounded preview until the call is opened; the full text
+/// is read only when the reader asks for it.
+#[gpui::test]
+fn a_huge_output_is_a_preview_until_the_reader_opens_it(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("audit-huge", 1);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"cat big\"}".to_string(),
+                output: Some("x".repeat(200_000)),
+                ms: Some(9),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let preview_len = cx.update(|_, cx| {
+        let view = shell.read(cx).audit_view();
+        assert_eq!(view.totals.calls, 1, "the call is audited");
+        view.turns[0].calls[0].preview.chars().count()
+    });
+    assert!(
+        preview_len <= crate::audit::PREVIEW_LIMIT + 3,
+        "the view model never carries the whole output: {preview_len}"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Audit;
+            cx.notify();
+        });
+    });
+    draw_until(
+        cx,
+        "the audit page renders the policy block",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("audit-turn-1").is_some()
+                && cx.debug_bounds("audit-policy-applied").is_some()
+                && cx.debug_bounds("audit-policy-exec").is_some()
+                && cx.debug_bounds("audit-policy-allows").is_some()
+        },
+    );
+    let turn = cx.debug_bounds("audit-turn-1").expect("turn 1");
+    cx.simulate_click(turn.center(), Modifiers::default());
+    draw_until(cx, "the turn opens its call", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-call-1-0").is_some()
+    });
+    assert!(
+        cx.debug_bounds("audit-preview-1-0").is_none(),
+        "the preview waits for the call to be opened"
+    );
+    assert!(
+        cx.debug_bounds("audit-full-1-0").is_none(),
+        "the full text is not rendered for a closed call"
+    );
+
+    let call = cx.debug_bounds("audit-call-1-0").expect("the call row");
+    cx.simulate_click(call.center(), Modifiers::default());
+    draw_until(cx, "the preview opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-preview-1-0").is_some()
+    });
+    assert!(
+        cx.debug_bounds("audit-full-1-0").is_none(),
+        "the full text is still on demand"
+    );
+    // The three facts the call detail must carry: permission, applied policy,
+    // and the execution result.
+    for selector in [
+        "audit-call-permission-1-0",
+        "audit-call-policy-1-0",
+        "audit-call-exec-1-0",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the open call renders {selector}"
+        );
+    }
+
+    let full = cx
+        .debug_bounds("audit-show-full-1-0")
+        .expect("the full-text control");
+    cx.simulate_click(full.center(), Modifiers::default());
+    draw_until(cx, "the full text renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-full-1-0").is_some()
+    });
+}
+
+/// The audit's measure toggles are live: Duration widths the slow turn, Calls
+/// widths the busy one, exactly like the Trajectory lanes.
+#[gpui::test]
+fn the_audit_measure_follows_its_toolbar(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("audit-measure", 2);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            // The audit's Duration measure is the TURN's observed span, so the
+            // turns need clocks even though the calls carry their own ms.
+            session.messages[0].timing_mut().start = Some(1_000);
+            session.messages[1].timing_mut().start = Some(1_000);
+            session.messages[1].timing_mut().ms = Some(9_500);
+            session.messages[2].timing_mut().start = Some(11_000);
+            session.messages[3].timing_mut().start = Some(11_000);
+            session.messages[3].timing_mut().ms = Some(100);
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{}".to_string(),
+                output: Some("slow".to_string()),
+                ms: Some(9_000),
+                at: None,
+            });
+            for _ in 0..3 {
+                session.messages[3].tools.push(ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{}".to_string(),
+                    output: Some("quick".to_string()),
+                    ms: Some(10),
+                    at: None,
+                });
+            }
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Audit;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the audit measures render", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-measure-1").is_some() && cx.debug_bounds("audit-measure-2").is_some()
+    });
+    let width = |cx: &mut VisualTestContext, selector: &'static str| {
+        cx.debug_bounds(selector)
+            .map(|bounds| f32::from(bounds.size.width))
+    };
+    let (slow, quick) = (width(cx, "audit-measure-1"), width(cx, "audit-measure-2"));
+    assert!(
+        slow.is_some_and(|slow| quick.is_some_and(|quick| slow > quick)),
+        "by duration the slow turn is wider: {slow:?} {quick:?}"
+    );
+
+    let calls = cx.debug_bounds("audit-mode-2").expect("the Calls toggle");
+    cx.simulate_click(calls.center(), Modifiers::default());
+    draw_until(cx, "the Calls measure is chosen", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).audit_mode == 2)
+    });
+    let (slow, quick) = (width(cx, "audit-measure-1"), width(cx, "audit-measure-2"));
+    assert!(
+        quick.is_some_and(|quick| slow.is_some_and(|slow| quick > slow)),
+        "by call count the busy turn is wider: {slow:?} {quick:?}"
+    );
+}
+
+/// A refusal from the policy ring is drawn in the turn it happened in, states
+/// the rule, and says the operation did NOT happen.
+#[gpui::test]
+fn an_audit_refusal_is_drawn_at_its_turn(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("audit-refusal", 2);
+        tests_pin_reference_defaults(&mut state);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The turn timing comes from the seeded messages; place the denial inside
+    // the SECOND turn (the seeded transcript has no clocks, so give the turns
+    // one first).
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            let id = this.state.active_id.clone().expect("an active session");
+            if let Some(session) = this.state.store.session_mut(&id) {
+                session.messages[0].timing_mut().start = Some(1_000);
+                session.messages[1].timing_mut().start = Some(1_000);
+                session.messages[1].timing_mut().ms = Some(1_000);
+                session.messages[2].timing_mut().start = Some(5_000);
+                session.messages[3].timing_mut().start = Some(5_000);
+                session.messages[3].timing_mut().ms = Some(1_000);
+            }
+            this.state.policy_audit = Some(crate::state::PolicyAuditView {
+                denials: vec![agent::policy::PolicyAuditEntry {
+                    at_ms: 5_500,
+                    session: id,
+                    preset: "default".to_string(),
+                    tool: "write_file".to_string(),
+                    permission: "read-only".to_string(),
+                    action: agent::policy::Action::Write,
+                    target: "/etc/passwd".to_string(),
+                    rule: Some("deny-outside".to_string()),
+                    reason: Some("outside the workspace".to_string()),
+                }],
+                allows: agent::policy::AllowCounts {
+                    total: 3,
+                    reads: 2,
+                    writes: 0,
+                    egress: 1,
+                    spawns: 0,
+                    capabilities: 0,
+                },
+                denials_total: 1,
+                evaluator: "bytecode".to_string(),
+                permission: "read-only".to_string(),
+                preset: "read-only".to_string(),
+                error: None,
+            });
+            this.state.tab = Tab::Audit;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "turn 2 carries the refusal", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-turn-2").is_some()
+    });
+    let turn = cx.debug_bounds("audit-turn-2").expect("turn 2");
+    cx.simulate_click(turn.center(), Modifiers::default());
+    draw_until(cx, "the refusal row renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-refusal-2-0").is_some()
+    });
+    let merged = cx.update(|_, cx| {
+        let view = shell.read(cx).audit_view();
+        view.turns
+            .iter()
+            .find(|turn| turn.index == 2)
+            .map(|turn| turn.refusals.clone())
+            .unwrap_or_default()
+    });
+    assert_eq!(merged.len(), 1, "the refusal is in turn 2");
+    assert_eq!(
+        merged[0].rule.as_deref(),
+        Some("deny-outside"),
+        "with the rule that refused it"
+    );
+    assert_eq!(merged[0].action, "write", "and the action it asked about");
+    assert_eq!(
+        merged[0].permission, "read-only",
+        "under the permission in force"
+    );
+    assert!(
+        cx.debug_bounds("audit-policy").is_some(),
+        "the policy results are on the page"
+    );
+    for selector in ["audit-policy-applied", "audit-policy-exec"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the applied policy and exec result are on the page: {selector}"
+        );
+    }
+    let policy = cx.update(|_, cx| shell.read(cx).audit_policy());
+    assert_eq!(policy.permission, "read-only");
+    assert_eq!(policy.evaluator, "bytecode");
+    assert_eq!(policy.allows.total, 3);
+    assert_eq!(policy.allows.egress, 1);
+    assert_eq!(policy.denials_total, 1);
+    assert_eq!(policy.checks(), 4);
+}
+
+/// Put the harness window at a width and record the new viewport.
+///
+/// GPUI's Window::resize only resizes the platform window; the cached
+/// viewport_size (which the shell measures the conversation column from) stays
+/// at the old size until bounds_changed refreshes it.
+fn resize_viewport(cx: &mut VisualTestContext, width: f32) {
+    cx.update(|window, cx| {
+        window.resize(gpui_kit::size(px(width), px(900.0)));
+        window.bounds_changed(cx);
+    });
+}
+
+/// The placeholder's painted horizontal span, in window coordinates.
+///
+/// The kit's field paints the placeholder at its own text origin: the card's
+/// measured 14px left pad for the start, and the shaped width of the string the
+/// state carries for the end (already ellipsised when it did not fit).
+fn placeholder_span(
+    cx: &mut VisualTestContext,
+    shell: &Entity<Shell>,
+    card: &gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> (f32, f32, f32) {
+    let (text, size) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell
+                .composer
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .to_string(),
+            crate::theme::body_size_at(shell.state.draft().global.general.content_font_size),
+        )
+    });
+    let width = cx.update(|window, _| {
+        let run = window.text_style().to_run(text.len());
+        f32::from(
+            window
+                .text_system()
+                .shape_line(text.into(), px(size), &[run], None)
+                .width(),
+        )
+    });
+    let left = f32::from(card.origin.x) + crate::theme::COMPOSER_INPUT_PAD_L;
+    let field_right = f32::from(card.origin.x + card.size.width)
+        - crate::theme::COMPOSER_INPUT_PAD_R
+        - crate::theme::COMPOSER_INPUT_MR;
+    (left, left + width, field_right)
+}
+
+/// Everything the composer draws must stay inside the conversation column.
+///
+/// The card is the chat column plus the measured 32, so a chat column that was
+/// not fitted to the room hung the card over both edges: clipped on the left,
+/// past the column on the right, its placeholder starting mid-word. The
+/// container and its inner rows are checked together because fitting the card
+/// does not prove the chips fit it.
+fn assert_composer_fits(cx: &mut VisualTestContext, shell: &Entity<Shell>, tag: &str) {
+    let column = cx.debug_bounds("main-column").expect("the column renders");
+    let card = cx.debug_bounds("composer-card").expect("the card renders");
+    let tol = px(1.5);
+    assert!(
+        card.origin.x >= column.origin.x - tol,
+        "{tag}: the card's left edge is inside the column: card {card:?}, column {column:?}"
+    );
+    assert!(
+        card.origin.x + card.size.width <= column.origin.x + column.size.width + tol,
+        "{tag}: the card's right edge is inside the column: card {card:?}, column {column:?}"
+    );
+    for selector in [
+        "composer-editor",
+        "composer-add",
+        "composer-permission",
+        "composer-model",
+        "composer-send",
+    ] {
+        let control = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{tag}: {selector} renders"));
+        assert!(
+            control.origin.x >= card.origin.x - tol
+                && control.origin.x + control.size.width <= card.origin.x + card.size.width + tol,
+            "{tag}: {selector} is inside the card: {control:?} vs {card:?}"
+        );
+    }
+    let (left, end, field_right) = placeholder_span(cx, shell, &card);
+    assert!(
+        left >= f32::from(card.origin.x) - 1.5,
+        "{tag}: the placeholder starts inside the card: {left} vs {card:?}"
+    );
+    assert!(
+        end <= f32::from(card.origin.x + card.size.width) + 1.5,
+        "{tag}: the placeholder ends inside the card: {end} vs {card:?}"
+    );
+    assert!(
+        end <= field_right + 1.5,
+        "{tag}: the placeholder is fitted to the field, so the card never clips it: end {end} vs field right {field_right}"
+    );
+}
+
+/// The narrow bug, observed: the card and its rows fit a 460px column.
+///
+/// With history, so the transcript path (not the hero) is the one drawing the
+/// composer stack. The chat is 396: 460 less the card's 32 and the 16px seat it
+/// keeps on each side.
+#[gpui::test]
+fn a_narrow_composer_card_fits_a_conversation_with_history(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("narrow-composer-chat", 2);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    resize_viewport(cx, 460.0);
+    draw_until(cx, "the 460px column settles", DRAW_UNTIL_MAX, |cx| {
+        let measured = cx.update(|_, cx| shell.read(cx).conversation_w.as_f32());
+        measured == 460.0 && cx.debug_bounds("composer-send").is_some()
+    });
+    // The placeholder fit is written from the column measurement, so it lands
+    // on the frame after the resize; one more draw paints it.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let column = cx.debug_bounds("main-column").expect("the column renders");
+    assert_eq!(
+        column.size.width,
+        px(460.0),
+        "the harness is laid out at the narrow column, not the old viewport"
+    );
+    let chat = cx.update(|_, cx| shell.read(cx).chat_w());
+    assert_eq!(
+        chat, 396.0,
+        "the fitted chat column: 460 less the card's 32 and the seat's 2 x 16"
+    );
+    assert_composer_fits(cx, &shell, "460 with history");
+
+    // Growing the window must restore the full placeholder: the fit is cached
+    // on the field width, so a stale narrow string would stay truncated.
+    resize_viewport(cx, 1280.0);
+    draw_until(cx, "the column grows back", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).conversation_w.as_f32()) == 1000.0
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let restored = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .presentation()
+            .placeholder()
+            .to_string()
+    });
+    assert!(
+        !restored.ends_with('…'),
+        "a widened field restores the full placeholder: {restored:?}"
+    );
+    assert_composer_fits(cx, &shell, "460 grown to 1280");
+}
+
+/// The same on the hero phase: a blank session draws the stack, not the
+/// transcript, so it is a second consumer that must fit the same column.
+#[gpui::test]
+fn a_narrow_hero_composer_fits_the_conversation_column(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("narrow-composer-hero"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    resize_viewport(cx, 460.0);
+    draw_until(cx, "the 460px hero settles", DRAW_UNTIL_MAX, |cx| {
+        let measured = cx.update(|_, cx| shell.read(cx).conversation_w.as_f32());
+        measured == 460.0 && cx.debug_bounds("hero-group").is_some()
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let column = cx.debug_bounds("main-column").expect("the column renders");
+    let group = cx
+        .debug_bounds("hero-group")
+        .expect("the hero group renders");
+    let tol = px(1.5);
+    assert!(
+        group.origin.x >= column.origin.x - tol
+            && group.origin.x + group.size.width <= column.origin.x + column.size.width + tol,
+        "the hero stack is inside the column: group {group:?}, column {column:?}"
+    );
+    assert_composer_fits(cx, &shell, "460 hero");
+}
+
+/// A width dragged on a wide window is a preference, not an exemption.
+///
+/// The stored content_width used to bypass the narrow cap entirely: a stored
+/// 680 plus the card's 32 hung 56px over each edge of a 460 column. The same
+/// fit rule now bounds the stored path too.
+#[gpui::test]
+fn a_dragged_width_is_fitted_to_a_narrow_column(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("narrow-composer-drag", 2);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.chat_user_w = Some(680.0);
+            cx.notify();
+        })
+    });
+    resize_viewport(cx, 460.0);
+    draw_until(
+        cx,
+        "the dragged width settles at 460",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            let measured = cx.update(|_, cx| shell.read(cx).conversation_w.as_f32());
+            measured == 460.0 && cx.debug_bounds("composer-card").is_some()
+        },
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).chat_w()),
+        396.0,
+        "a stored preference is fitted like the default"
+    );
+    assert_composer_fits(cx, &shell, "460 with a stored drag");
+}
+
+/// The wide case is unchanged: 1280 gives a 1000 column, the 0.9 share is 900,
+/// and the card is that plus 32 - the reference geometry, untouched by the cap.
+#[gpui::test]
+fn a_wide_composer_card_keeps_the_measured_geometry(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("wide-composer", 2);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    resize_viewport(cx, 1280.0);
+    draw_until(cx, "the 1280px column settles", DRAW_UNTIL_MAX, |cx| {
+        let measured = cx.update(|_, cx| shell.read(cx).conversation_w.as_f32());
+        measured == 1000.0 && cx.debug_bounds("composer-card").is_some()
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let column = cx.debug_bounds("main-column").expect("the column renders");
+    let card = cx.debug_bounds("composer-card").expect("the card renders");
+    assert_eq!(column.size.width, px(1000.0), "1280 less the open sidebar");
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).chat_w()),
+        900.0,
+        "the 0.9 share of a 1000 column"
+    );
+    assert_eq!(
+        card.size.width,
+        px(932.0),
+        "the reference card stays chat + 32 on a wide window"
+    );
+    assert_eq!(
+        card.origin.x + card.size.width / 2.0,
+        column.origin.x + column.size.width / 2.0,
+        "and it stays centred on the column"
+    );
+    assert_composer_fits(cx, &shell, "1280");
+}
+
+/// At 400 the chips row wraps; before the fix the send control hung 30px past
+/// the card's right edge there. The row is the reference's flex-wrap row with
+/// the trailing pair on margin-left:auto, so wrapping moves it to a second line
+/// instead of drawing it over the card's edge.
+#[gpui::test]
+fn the_chips_row_wraps_instead_of_overflowing_a_narrow_card(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("wrap-composer", 2);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    resize_viewport(cx, 400.0);
+    draw_until(cx, "the 400px row settles", DRAW_UNTIL_MAX, |cx| {
+        let measured = cx.update(|_, cx| shell.read(cx).conversation_w.as_f32());
+        measured == 400.0 && cx.debug_bounds("composer-row-trailing").is_some()
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let tools = cx
+        .debug_bounds("composer-row-tools")
+        .expect("the tools group renders");
+    let trailing = cx
+        .debug_bounds("composer-row-trailing")
+        .expect("the trailing group renders");
+    assert!(
+        trailing.origin.y >= tools.origin.y + tools.size.height - px(1.5),
+        "the trailing pair wrapped below the tools: tools {tools:?}, trailing {trailing:?}"
+    );
+    assert_composer_fits(cx, &shell, "400 wrapped");
 }

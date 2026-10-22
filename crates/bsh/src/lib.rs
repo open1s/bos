@@ -10,6 +10,7 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 pub(crate) mod assets;
+pub(crate) mod audit;
 pub(crate) mod caps;
 mod editors;
 pub(crate) mod export;

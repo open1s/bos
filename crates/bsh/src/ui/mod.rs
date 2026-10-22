@@ -3,10 +3,12 @@
 //! One view (Shell) owns the state and renders five regions plus overlays;
 //! each region lives in its own module as an impl block on Shell.
 
+pub(crate) mod audit;
 mod command_menu;
 pub(crate) mod composer;
 pub(crate) mod header;
 pub(crate) mod hero;
+pub(crate) mod lane;
 pub(crate) mod meter;
 pub(crate) mod paging;
 mod session_menu;

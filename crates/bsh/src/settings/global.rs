@@ -406,6 +406,15 @@ pub(crate) struct General {
     pub(crate) sidebar_width: Option<f32>,
     /// How much of a turn the conversation renders.
     pub(crate) transcript_view: String,
+    /// Whether the Trajectory timeline draws each block at its actual duration.
+
+    /// The reference keeps this in localStorage (`dsh.trajectory.duration`),
+    /// so it is a preference about the reader rather than about a workspace;
+    /// bsh stores it in the settings tree, which is where its other view
+    /// preferences live.
+    pub(crate) traj_actual_duration: bool,
+    /// Whether the Trajectory timeline places blocks by real timestamp.
+    pub(crate) traj_actual_time: bool,
     /// Where a link in a message opens.
     pub(crate) link_opening: String,
     /// What Enter does while a turn streams.
@@ -436,6 +445,10 @@ impl Default for General {
             content_width: None,
             sidebar_width: None,
             transcript_view: super::DEFAULT_TRANSCRIPT_VIEW.to_string(),
+            traj_actual_duration: false,
+            // The clock is on by default: the equal-width reading still places
+            // every block at the instant it happened.
+            traj_actual_time: true,
             link_opening: "sidebar".to_string(),
             composer_enter: "queue".to_string(),
             performance_usage: "detailed".to_string(),

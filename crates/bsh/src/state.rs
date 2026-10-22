@@ -150,6 +150,8 @@ pub(crate) enum Tab {
     Chat,
     /// The plan and tool trajectory.
     Trajectory,
+    /// The deterministic tool-call and refusal audit.
+    Audit,
 }
 
 /// One message waiting for its session's running turn to finish.
@@ -182,6 +184,19 @@ pub(crate) struct PolicyAuditView {
     pub(crate) denials_total: u64,
     /// "bytecode" or "interpreter".
     pub(crate) evaluator: String,
+    /// The effective permission the policy applies, as its data carries it.
+    ///
+    /// The audit page shows this beside the decision counts: a refusal's own
+    /// row keeps the permission in force at that decision, while this is the
+    /// one currently applied to the workspace.
+    pub(crate) permission: String,
+    /// The agent preset the policy was built for, as its data carries it.
+    ///
+    /// `PolicyData.preset` is `Effective.preset_id`, so this is the same value
+    /// the composer's preset chip and the audit's applied line read. The
+    /// trajectory's policy tab takes it from here rather than inferring one
+    /// from a tool name, because a `ToolEvent` carries no preset field.
+    pub(crate) preset: String,
     /// Why the set is in its failure mode, when it is.
     pub(crate) error: Option<String>,
 }
@@ -2711,6 +2726,96 @@ impl AppState {
         self.refresh_policy_audit();
     }
 
+    /// The policy verdict behind one tool call of the active session.
+    ///
+    /// bsh-only: every call is made through the policy seam, so a call has a
+    /// decision attached even when it succeeded. The permission and the ring
+    /// are read together so a row cannot show one conversation's permission
+    /// beside another's refusal.
+    ///
+    /// `tool` and `target` name the call being explained, `event` the
+    /// trajectory row it belongs to is not needed here - the verdict is a
+    /// function of the call, not of where it is drawn.
+    pub(crate) fn policy_verdict_for(
+        &self,
+        tool: &str,
+        target: &str,
+    ) -> crate::ui::trajectory::PolicyVerdict {
+        let permission = self
+            .policy_audit
+            .as_ref()
+            .map(|audit| audit.permission.clone())
+            .unwrap_or_default();
+        // The preset follows the same rule as the permission: there is no
+        // preset on the per-call record, so the policy the turn built answers
+        // for it, and a denial keeps the preset recorded at its decision.
+        let preset = self.applied_preset();
+        // The ring is scoped to THIS session, so opening another chat cannot
+        // show its refusals as this one's.
+        let session = self.active_id.clone().unwrap_or_default();
+        let refusals: Vec<crate::ui::trajectory::PolicyVerdict> = self
+            .policy_audit
+            .as_ref()
+            .map(|audit| {
+                audit
+                    .denials
+                    .iter()
+                    .filter(|entry| entry.session == session)
+                    .map(|entry| crate::ui::trajectory::PolicyVerdict {
+                        permission: entry.permission.clone(),
+                        preset: entry.preset.clone(),
+                        action: entry.action.as_str().to_string(),
+                        target: entry.target.clone(),
+                        allowed: false,
+                        rule: entry.rule.clone(),
+                        reason: entry.reason.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::ui::trajectory::verdict_for(tool, target, &permission, &preset, &refusals)
+    }
+
+    /// The agent preset the active session's calls run under.
+    ///
+    /// A `ToolEvent` records the tool, its arguments and its result, and has no
+    /// preset field, so the applied preset is read from the policy the turn
+    /// built - `PolicyData.preset`, which `build_policy` fills from
+    /// `Effective.preset_id` - exactly as the permission beside it is. The
+    /// snapshot is preferred, then the live set, so the drawer and the audit tab
+    /// answer from the same fact. A session whose turn has not been built in
+    /// this process has neither, and then the session-level effective preset is
+    /// the honest answer rather than an empty cell or a guess from the tool.
+    pub(crate) fn applied_preset(&self) -> String {
+        if let Some(audit) = self.policy_audit.as_ref() {
+            return audit.preset.clone();
+        }
+        if let Some(policy) = self.policy.as_ref() {
+            return policy.data().preset.clone();
+        }
+        self.effective().preset_id
+    }
+
+    /// The label a preset id is shown under.
+    ///
+    /// One rule for every surface: the preset's declared display name when it
+    /// has one, else the id itself, so an unnamed custom preset stays
+    /// identifiable. An empty id is the built-in default, and it names that
+    /// default the way the composer's preset chip does instead of leaving the
+    /// cell blank.
+    pub(crate) fn preset_label(&self, id: &str) -> String {
+        let id = id.trim();
+        if id.is_empty() {
+            return crate::i18n::tr(self.lang, "input.defaultPreset");
+        }
+        self.settings
+            .global
+            .preset(id)
+            .and_then(|preset| preset.name)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| id.to_string())
+    }
     /// Re-read the denial ring and counters into the pane's snapshot.
     pub(crate) fn refresh_policy_audit(&mut self) {
         self.policy_audit = self.policy.as_ref().map(|policy| PolicyAuditView {
@@ -2718,6 +2823,8 @@ impl AppState {
             allows: policy.allows(),
             denials_total: policy.denials_total(),
             evaluator: policy.evaluator().to_string(),
+            permission: policy.data().permission.clone(),
+            preset: policy.data().preset.clone(),
             error: policy.error().map(ToString::to_string),
         });
     }

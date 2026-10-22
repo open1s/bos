@@ -42,7 +42,7 @@ impl Shell {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(self.chat_w() + theme::COMPOSER_WIDEN))
+                    .max_w(px(self.composer_w()))
                     .flex()
                     .flex_col()
                     // The reference's stack always holds its empty body as a
@@ -243,9 +243,7 @@ impl Shell {
     pub(crate) fn hero_group(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .debug_selector(|| String::from("hero-group"))
-            .w(px(self.chat_w()
-                + theme::COMPOSER_WIDEN
-                + 2.0 * theme::HERO_CLEARANCE))
+            .w(px(self.hero_w()))
             .flex()
             .flex_col()
             .items_center()
@@ -255,7 +253,7 @@ impl Shell {
             .when_some(self.hero_workspace_row(cx), |group, row| group.child(row))
             .child(
                 div()
-                    .w(px(self.chat_w() + theme::COMPOSER_WIDEN))
+                    .w(px(self.composer_w()))
                     .flex()
                     .flex_col()
                     .child(self.render_composer(cx)),

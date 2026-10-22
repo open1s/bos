@@ -1372,17 +1372,17 @@ impl Shell {
     }
 
     /// Account: identity, paths and the way to the configuration file.
+    ///
+    /// No Workspace row. bsh holds several workspaces at once - the sidebar
+    /// lists them and the General pane's own Workspaces group is where one is
+    /// chosen - so a single row here could only ever name whichever happened to
+    /// be active, which reads as a setting that is not one. The identity and the
+    /// two paths that really are this build's are all that stay.
     fn section_account(&self) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let draft = self.state.draft();
-        let effective = draft.effective();
         let rows = vec![
             self.settings_row(
                 "settings.identity",
                 self.state.lang.tr("side.local").to_string(),
-            ),
-            self.settings_row(
-                "settings.workspace",
-                format!("{}  {}", effective.name, effective.root),
             ),
             self.settings_row("settings.version", env!("CARGO_PKG_VERSION").to_string()),
             self.settings_row(

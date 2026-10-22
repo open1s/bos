@@ -701,28 +701,30 @@ pub(crate) const FILES_HEADER_H: f32 = 38.0;
 /// Measured: the column is `clamp(680px, conversation-column * 0.64, 920px)`
 /// where the conversation column is the viewport less the sidebar; 680 is its
 /// floor, the width bsh draws before a frame has been measured. The live width
-/// How far a step row sits in from the message it belongs to, and how tall its
-/// expanded body may get before it clips.
+/// is [`chat_width_at`], and [`fit_chat_width`] narrows it when the column
+/// itself cannot seat the floor.
 ///
-/// The trace nests: a message's steps hang off a rail one step in, and their
-/// bodies hang one more. 18 is that step at the secondary size.
-/// How close to the transcript's top a reader gets before the window above it
-/// is paged in. A screen's worth of distance, so the rows are there before the
-/// eye arrives.
 /// Windows of messages a paged session keeps resident.
 ///
 /// Four is a screen or two in each direction around the reader: enough that
 /// scrolling back finds what they just passed, far short of a whole chat.
 pub(crate) const WINDOWS_KEPT: usize = 4;
 
+/// How close to the transcript's top a reader gets before the window above it
+/// is paged in. A screen's worth of distance, so the rows are there before the
+/// eye arrives.
 pub(crate) const PAGE_TRIGGER: f32 = 400.0;
 
+/// How far a step row sits in from the message it belongs to.
+///
+/// The trace nests: a message's steps hang off a rail one step in, and their
+/// bodies hang one more. 18 is that step at the secondary size.
 pub(crate) const TOOL_INDENT: f32 = 18.0;
 /// The ceiling on an expanded step body, so one long output cannot own the
 /// transcript.
 pub(crate) const TOOL_BODY_MAX: f32 = 220.0;
 
-/// is `chat_width_at`.
+/// The reference's 680px floor, and the width an unmeasured frame draws.
 pub(crate) const CHAT_W: f32 = 680.0;
 /// The empty band the column keeps on each side of the transcript.
 ///
@@ -754,24 +756,85 @@ pub(crate) fn chat_left_inset(column: f32, chat: f32) -> f32 {
     (((column - chat) / 2.0).max(0.0) * CHAT_LEFT_SHARE).round()
 }
 
-/// How far the token readout sits left of centre, as a share of the half-width
-/// of the column it lives in.
+/// The chat column for a measured conversation column: the reference's clamp,
+/// fitted to the room the column actually has (`fit_chat_width`).
 pub(crate) fn chat_width_at(conversation_w: f32) -> f32 {
     // The share fills the column; the gutter is the only ceiling, so a wide
     // window cannot leave the bands the reference clamp leaves.
     let ceiling = (conversation_w - 2.0 * CHAT_GUTTER).max(CHAT_W);
     let ideal = (conversation_w * CHAT_SHARE).clamp(CHAT_W, ceiling);
-    // A column of zero is not a narrow column, it is a frame that has not been
-    // measured yet, and that keeps the floor it has always had.
-    if conversation_w <= 0.0 {
+    fit_chat_width(conversation_w, ideal)
+}
+
+/// The reference's `--dsh-composer-side-clearance`: the 16px the composer seat
+/// gives up on each side of the card. The hero stack keeps the same clearance.
+pub(crate) const COMPOSER_CLEARANCE: f32 = HERO_CLEARANCE;
+
+/// The narrowest a fitted chat column settles at.
+///
+/// The floor only binds while the column can seat it: below
+/// `CHAT_MIN_FIT + COMPOSER_WIDEN + 2 * COMPOSER_CLEARANCE` the column's own
+/// room wins, because overflowing the window is worse than a small column.
+pub(crate) const CHAT_MIN_FIT: f32 = 240.0;
+
+/// One rule for every consumer of the chat content width: the width that fits
+/// the room the column has left after its own horizontal chrome.
+///
+/// The reference is fluid where bsh is numeric. Its transcript column is
+/// `width:100%;max-width:var(--dsh-chat-content-width)` inside a 32px scroll
+/// pad, and its composer card is `width:100%;max-width:chat + 32` inside a
+/// 16px seat, so CSS clamps both to the column while the variable keeps the
+/// reference's 680..920 clamp. bsh derives one chat width for both, so the
+/// number itself has to fit the tighter room - the column less the card's 32
+/// and the seat's 2 x 16 - or the card and the hero hang over the edges, which
+/// is exactly what a narrow window showed: the card wider than the column,
+/// clipped on both sides and starting mid-word.
+///
+/// A column of zero is an unmeasured frame, not a narrow one: it keeps the
+/// resolved width so the first frame draws the floor instead of collapsing.
+pub(crate) fn fit_chat_width(column: f32, resolved: f32) -> f32 {
+    if column <= 0.0 {
+        return resolved;
+    }
+    let room = (column - COMPOSER_WIDEN - 2.0 * COMPOSER_CLEARANCE).max(0.0);
+    // The minimum still has to fit: a column narrower than it gives up every
+    // pixel it has rather than letting the floor overflow again.
+    let floor = room.min(CHAT_MIN_FIT);
+    resolved.min(room).max(floor)
+}
+
+/// The composer card for a chat column: the chat width plus its measured 32,
+/// capped to the seat the column actually has.
+///
+/// The reference's card is `width:100%;max-width:chat + 32` inside a seat
+/// padded 16 a side, so this is where that fluid cap lands in one number.
+pub(crate) fn composer_width_at(column: f32, chat: f32) -> f32 {
+    let ideal = chat + COMPOSER_WIDEN;
+    if column <= 0.0 {
         return ideal;
     }
-    // Otherwise the floor exists so the chat is READABLE, not so it overflows
-    // the column it sits in. An open right panel takes a laptop's column below
-    // 680, and the floor then hung the composer and the hero over the panel's
-    // edge - clipped, half their text unreadable. The composer card is this
-    // width plus the measured widen, so the cap leaves that much room.
-    ideal.min((conversation_w - COMPOSER_WIDEN).max(0.0))
+    ideal.min((column - 2.0 * COMPOSER_CLEARANCE).max(0.0))
+}
+
+/// The hero stack for a chat column: the card plus its clearance a side, capped
+/// at the column - the reference's `min(card + 2 * clearance, 100%)`.
+pub(crate) fn hero_width_at(column: f32, card: f32) -> f32 {
+    let ideal = card + 2.0 * COMPOSER_CLEARANCE;
+    if column <= 0.0 {
+        return ideal;
+    }
+    ideal.min(column)
+}
+
+/// The composer field's own text width: the card less the reference's editor
+/// padding (`4px 8px 0 14px`), its `.scroll` margin-right of 4, and the kit's
+/// interior padding is already part of that 14/8 because the wrapper carries
+/// the difference.
+///
+/// This is the width the placeholder is painted at, so the placeholder is
+/// fitted to it rather than to the card.
+pub(crate) fn composer_field_width(card: f32) -> f32 {
+    (card - COMPOSER_INPUT_PAD_L - COMPOSER_INPUT_PAD_R - COMPOSER_INPUT_MR).max(0.0)
 }
 
 /// The floor a DRAGGED content width takes, measured 640. The clamp's own floor
@@ -795,7 +858,10 @@ pub(crate) fn resolve_content_width(column: f32, preference: Option<f32>) -> f32
     // beside a .9 share did.
     let max = (column - 2.0 * CHAT_GUTTER).max(CONTENT_MIN_DRAG);
     match preference {
-        Some(preference) => preference.clamp(CONTENT_MIN_DRAG, max),
+        // A stored width is a drag preference, not an exemption: the same fit
+        // rule bounds it, or a pref dragged on a wide window would hang the
+        // composer over a narrow one.
+        Some(preference) => fit_chat_width(column, preference.clamp(CONTENT_MIN_DRAG, max)),
         None => chat_width_at(column),
     }
 }

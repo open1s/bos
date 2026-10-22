@@ -91,9 +91,7 @@ impl Shell {
         }
         let panel = div()
             .debug_selector(|| "queue-dock".to_string())
-            .w(px(
-                self.chat_w() + theme::COMPOSER_WIDEN - 2.0 * theme::QUEUE_SIDE_INSET
-            ))
+            .w(px(self.composer_w() - 2.0 * theme::QUEUE_SIDE_INSET))
             .rounded_t(px(theme::QUEUE_RADIUS))
             .bg(rgb(theme::page()))
             .py(px(theme::QUEUE_PAD_Y))
