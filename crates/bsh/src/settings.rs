@@ -110,6 +110,13 @@ pub(crate) struct TranscriptPolicy {
 /// desktop reading is the one this shell uses.
 pub(crate) const DEFAULT_TRANSCRIPT_VIEW: &str = "standard";
 
+/// The diff reading a fresh install starts on.
+///
+/// The reference ships the side-by-side view as its default and offers the
+/// unified one as the alternative, so a file-diff row opens split until the
+/// reader says otherwise.
+pub(crate) const DEFAULT_DIFF_MODE: &str = "split";
+
 impl TranscriptPolicy {
     /// The policy a stored mode resolves to, legacy spellings included.
     ///
@@ -894,11 +901,14 @@ impl Settings {
     /// model is session state now, so the caller passes the provider in rather
     /// than the workspace carrying a selection.
     pub(crate) fn catalogs_by_provider(&self, active: &str) -> Vec<(String, Vec<String>)> {
+        // `provider_ids` is the reader's tree first, then the contributed
+        // providers, so a plugin's models appear in the picker without ever
+        // displacing a provider the reader declared by hand.
         let mut groups: Vec<(String, Vec<String>)> = self
             .global
-            .providers
-            .keys()
-            .map(|provider| (provider.clone(), self.catalog(provider)))
+            .provider_ids()
+            .into_iter()
+            .map(|provider| (provider.clone(), self.catalog(&provider)))
             .filter(|(_, models)| !models.is_empty())
             .collect();
         groups.sort_by_key(|(provider, _)| provider != active);

@@ -2,6 +2,7 @@
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::text::{markdown, TextViewStyle};
+use gpui_kit::component::tooltip::Tooltip;
 
 /// What a click on a link in a message does.
 ///
@@ -712,6 +713,48 @@ impl TranscriptLayout {
         }
     }
 
+    /// Adopt one session's measured rows for another that renders the same.
+    ///
+    /// A branch holds the messages of the conversation it was cut from, at the
+    /// same width, content size and policy, so every height already measured for
+    /// the source is the height the branch's row will take. Without this the
+    /// branch is a genuinely NEW session: the first frame finds no cache, falls
+    /// back to `MeasureAll`, and builds every row of a long chat - the visible
+    /// stall right after the click.
+    pub(crate) fn adopt(&mut self, from: &str, to: &str) {
+        let source = if self
+            .shape
+            .as_ref()
+            .is_some_and(|shape| shape.session == from)
+        {
+            self.shape
+                .clone()
+                .map(|shape| (shape, self.loaded_from, self.heights.clone()))
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.saved
+                .iter()
+                .find(|(shape, _, _)| shape.session == from)
+                .cloned()
+        });
+        let Some((shape, loaded_from, heights)) = source else {
+            return;
+        };
+        if heights.is_empty() {
+            return;
+        }
+        let adopted = TranscriptShape {
+            session: to.to_string(),
+            ..shape
+        };
+        self.saved
+            .retain(|(saved, _, _)| saved.session != adopted.session);
+        self.saved.insert(0, (adopted, loaded_from, heights));
+        self.saved.truncate(SAVED_LAYOUTS);
+    }
+
     /// A row height to use before a row has ever been painted.
     ///
     /// The average of what HAS been measured is a far better placeholder than a
@@ -1072,6 +1115,12 @@ impl Shell {
             .collect();
         markers.sort_by_key(|(position, _, _)| *position);
         let mut pending = markers.into_iter().peekable();
+        // One scan for the newest prompt, so no row has to look ahead over the
+        // messages below it to decide whether its action row is revealed.
+        let last_user = session
+            .messages
+            .iter()
+            .rposition(|message| message.role == Role::User);
         for (index, message) in session.messages.iter().enumerate() {
             while pending
                 .peek()
@@ -1089,7 +1138,7 @@ impl Shell {
             }
             let settled = folded && !(live && index == last);
             rows.push(
-                self.message_row(index, message, settled, &chrome, cx)
+                self.message_row(index, message, settled, last_user, &chrome, cx)
                     .into_any_element(),
             );
         }
@@ -1290,6 +1339,32 @@ impl Shell {
                     // transcript back to the newest message.
                     .on_scroll_wheel(cx.listener(chat_wheel))
                     .on_scroll_wheel(cx.listener(|_this, _event, _window, cx| cx.notify()))
+                    // Copy on selection: the press records where it started, and
+                    // a release that travelled far enough takes the window's
+                    // selection to the clipboard. A click is not a selection, so
+                    // it writes nothing even when an older selection is on screen.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
+                            this.selection_start = Some(event.position);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            let Some(start) = this.selection_start.take() else {
+                                return;
+                            };
+                            let dx = event.position.x.as_f32() - start.x.as_f32();
+                            let dy = event.position.y.as_f32() - start.y.as_f32();
+                            if !super::shell::selection_drag(dx, dy) {
+                                return;
+                            }
+                            if this.copy_selection(window, cx) {
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .px(px(theme::INSET))
                     .py(px(TRANSCRIPT_PAD_Y))
                     .flex()
@@ -1582,6 +1657,10 @@ impl Shell {
         index: usize,
         message: &ChatMessage,
         folded: bool,
+        // The newest prompt in the transcript. A prompt that has a later one
+        // below it hides its action row until the pointer is on the turn, which
+        // is the reference's own reveal rule for user rows.
+        last_user: Option<usize>,
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1590,27 +1669,50 @@ impl Shell {
         if message.role == Role::User {
             let size = theme::body_size_at(chrome.content_size);
             let line = theme::bubble_line_at(chrome.content_size);
+            // Measured (MessageItem .userRow): a column aligned to the end, 6px
+            // between the bubble and its action row. The action row is the
+            // reference's clock="start" form - the time FIRST, then copy - and
+            // only its owner keeps it in view: a prompt with a later prompt
+            // below it hides the row until the pointer is on the turn.
+            let group = SharedString::from(format!("user-turn-{index}"));
+            let mut actions = self.user_actions(index, message, chrome, cx);
+            if last_user != Some(index) {
+                actions = actions
+                    .opacity(0.0)
+                    .group_hover(group.clone(), |style| style.opacity(1.0));
+            }
             return div()
                 .w_full()
                 .flex()
                 .flex_row()
                 .justify_end()
                 .child(
-                    // Measured (MessageItem): radius-xl 20 over `10px 16px`, the
-                    // bubble fill, `line-height: 22px + delta`, capped at 82% of
-                    // the row - and at `content * .702`, which only binds wider.
                     div()
-                        .debug_selector(move || format!("user-bubble-{index}"))
-                        // 82% of the transcript's content box. The reference
-                        // also caps at `content * .702`, which only binds wider.
-                        .max_w(px((self.chat_w() - 2.0 * theme::INSET) * 0.82))
-                        .px(px(16.0))
-                        .py(px(10.0))
-                        .rounded(px(20.0))
-                        .bg(rgb(theme::user_bubble()))
+                        .group(group)
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap(px(6.0))
                         .child(
-                            txt(message.text.clone(), size, theme::text()).line_height(px(line)),
-                        ),
+                            // Measured (MessageItem): radius-xl 20 over `10px 16px`,
+                            // the bubble fill, `line-height: 22px + delta`, capped at
+                            // 82% of the row - and at `content * .702`, which only
+                            // binds wider.
+                            div()
+                                .debug_selector(move || format!("user-bubble-{index}"))
+                                // 82% of the transcript's content box. The reference
+                                // also caps at `content * .702`, which only binds wider.
+                                .max_w(px((self.chat_w() - 2.0 * theme::INSET) * 0.82))
+                                .px(px(16.0))
+                                .py(px(10.0))
+                                .rounded(px(20.0))
+                                .bg(rgb(theme::user_bubble()))
+                                .child(
+                                    txt(message.text.clone(), size, theme::text())
+                                        .line_height(px(line)),
+                                ),
+                        )
+                        .child(actions),
                 )
                 .into_any_element();
         }
@@ -1644,6 +1746,11 @@ impl Shell {
             column = column.child(
                 markdown(message.text.clone())
                     .on_link_click(open_link)
+                    // Selectable, so the reader can quote a reply and so the
+                    // shell's copy-on-selection can take it from the clipboard
+                    // seam. The reference is a web page where every glyph is
+                    // selectable; a native text view has to say so.
+                    .selectable(true)
                     .style(chrome.style.clone())
                     .line_height(px(theme::body_line_at(chrome.content_size)))
                     .text_size(px(theme::body_size_at(chrome.content_size)))
@@ -2038,6 +2145,7 @@ impl Shell {
                     .child(
                         markdown(message.reasoning.clone())
                             .on_link_click(open_link)
+                            .selectable(true)
                             .style(chrome.style.clone())
                             .line_height(px(theme::summary_line_at(content)))
                             .text_size(px(small))
@@ -2048,7 +2156,109 @@ impl Shell {
         root
     }
 
-    /// Good / bad / rewind, plus usage.
+    /// A prompt's own action row: the time it was sent, then copy.
+    ///
+    /// Measured from `MessageIconActions` in its `clock="start"` form, which is
+    /// the one the reference gives user rows: the clock LEADS (`.timeStart`, the
+    /// secondary size, `padding-right: 12px`) and the copy control follows it at
+    /// the 15px glyph a leading-clock row carries. There is no branch and no
+    /// verdict here - a prompt is not something to branch from or rate.
+    fn user_actions(
+        &self,
+        index: usize,
+        message: &ChatMessage,
+        chrome: &RowChrome<'_>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let lang = self.state.lang;
+        let content = chrome.content_size;
+        let delta = theme::delta_at(content);
+        let side = 28.0 + delta;
+        let mark = 15.0 + delta;
+        let copied = self.copied_message == Some(index);
+        let text = message.text.clone();
+        // The submit instant stamps the prompt row, so the clock is the moment
+        // the reader sent it rather than the moment the reply settled.
+        let at = message
+            .timing()
+            .and_then(|timing| timing.start)
+            .map(|start| start / 1000);
+        let mut row = div()
+            .debug_selector(move || format!("user-actions-{index}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(side))
+            .gap(px(8.0));
+        if let Some(at) = at {
+            row = row.child(
+                txt(
+                    crate::state::clock_at(at, lang),
+                    theme::small_size_at(content),
+                    theme::faint(),
+                )
+                .line_height(px(24.0 + delta))
+                .pr(px(12.0)),
+            );
+        }
+        let copy = div()
+            .id(SharedString::from(format!("user-copy-{index}")))
+            .debug_selector(move || format!("user-copy-{index}"))
+            .flex_none()
+            .w(px(side))
+            .h(px(side))
+            .p(px(6.0))
+            .rounded(px(theme::RADIUS_SM))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(
+                icon(
+                    if copied {
+                        IconName::Check
+                    } else {
+                        IconName::Copy
+                    },
+                    mark,
+                    if copied {
+                        theme::success()
+                    } else {
+                        theme::faint()
+                    },
+                )
+                .into_any_element(),
+            )
+            .tooltip({
+                let label = if copied {
+                    lang.tr("chat.copied")
+                } else {
+                    lang.tr("msg.copyMessage")
+                };
+                move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+            })
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.copy_message(index, &text, cx);
+            }));
+        row.child(copy)
+    }
+
+    /// The assistant tail's action row, measured from MessageIconActions over
+    /// TurnTailNodeView.
+    ///
+    /// The row is `28px + delta` tall and 8px apart, 20px under the tail - its
+    /// own 16px column gap plus the measured 4px action margin - and pulled 6px
+    /// left so the first button's own 6px padding lines its glyph up with the
+    /// message text. Each action is a `28px + delta` square at radius-sm in
+    /// label-tertiary, hovering to the interactive fill. Reading left to right:
+    /// copy, good, bad, branch, rewind, then the turn's own figures - usage,
+    /// duration and the clock - in an end group 8px apart.
+    ///
+    /// The branch is offered only on the last message of a completed turn,
+    /// which is the reference's own rule (`branchUnavailable` when a later chat
+    /// node exists); a row that cannot branch says so in its tooltip rather than
+    /// hiding the control, so the reader learns the rule instead of missing it.
     fn message_footer(
         &self,
         index: usize,
@@ -2056,6 +2266,15 @@ impl Shell {
         compact_usage: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let lang = self.state.lang;
+        let content = self.state.draft().global.general.content_font_size;
+        let delta = theme::delta_at(content);
+        let side = 28.0 + delta;
+        // This is the assistant row, which is the reference's `[data-clock=end]`
+        // variant: its glyphs are 17px, two above the 15px a clock-leading row
+        // carries. The thumbs are text glyphs, not svgs, so they take the 13px
+        // the emoji family needs to sit level with a 17px line icon.
+        let mark = 17.0 + delta;
         let feedback = message
             .meta
             .as_ref()
@@ -2067,84 +2286,214 @@ impl Shell {
             .and_then(|meta| meta.usage.as_ref())
             .map(|usage| usage.total())
             .unwrap_or(0);
+        let duration = message.timing().and_then(|timing| timing.ms);
+        // The clock reads the turn's own opening instant, in seconds; a record
+        // written before timing existed carries none and draws no clock.
+        let at = message
+            .timing()
+            .and_then(|timing| timing.start)
+            .map(|start| start / 1000);
         let session_id = self.state.active_id.clone().unwrap_or_default();
+        let copied = self.copied_message == Some(index);
+        let branchable = self.state.can_branch_at(&session_id, index);
+        let text = message.text.clone();
+
+        let action = move |id: String, element: AnyElement, hot: bool| -> Stateful<Div> {
+            div()
+                .id(SharedString::from(id.clone()))
+                // The debug selector is the same name, so a click test can press
+                // the control it asserts on.
+                .debug_selector({
+                    let selector = id.clone();
+                    move || selector.clone()
+                })
+                .flex_none()
+                .w(px(side))
+                .h(px(side))
+                .p(px(6.0))
+                .rounded(px(theme::RADIUS_SM))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                // `[data-unavailable]:hover` keeps its own ink and no fill, so a
+                // control that cannot act does not light up like one that can.
+                .when(hot, |button| {
+                    button.hover(|style| style.bg(rgb(theme::hover())))
+                })
+                .child(element)
+        };
+
+        let copy = action(
+            format!("copy-message-{index}"),
+            icon(
+                if copied {
+                    IconName::Check
+                } else {
+                    IconName::Copy
+                },
+                mark,
+                if copied {
+                    theme::success()
+                } else {
+                    theme::faint()
+                },
+            )
+            .into_any_element(),
+            true,
+        )
+        .tooltip({
+            let label = if copied {
+                lang.tr("chat.copied")
+            } else {
+                lang.tr("msg.copyMessage")
+            };
+            move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+        })
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.copy_message(index, &text, cx);
+        }));
+
         let good_id = session_id.clone();
+        let good = action(
+            format!("good-{index}"),
+            glyph(
+                "👍",
+                13.0,
+                if feedback == "good" {
+                    theme::accent()
+                } else {
+                    theme::faint()
+                },
+            )
+            .into_any_element(),
+            true,
+        )
+        .tooltip({
+            let label = lang.tr("msg.good");
+            move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+        })
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.state.set_feedback(&good_id, index, "good");
+            cx.notify();
+        }));
+
         let bad_id = session_id.clone();
+        let bad = action(
+            format!("bad-{index}"),
+            glyph(
+                "👎",
+                13.0,
+                if feedback == "bad" {
+                    theme::error()
+                } else {
+                    theme::faint()
+                },
+            )
+            .into_any_element(),
+            true,
+        )
+        .tooltip({
+            let label = lang.tr("msg.bad");
+            move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+        })
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.state.set_feedback(&bad_id, index, "bad");
+            cx.notify();
+        }));
+
+        let branch_tip = if branchable {
+            lang.tr("msg.branchMessage")
+        } else {
+            lang.tr("msg.branchUnavailable")
+        };
+        let branch_mark = icon(
+            IconName::GitBranch,
+            mark,
+            if branchable {
+                theme::faint()
+            } else {
+                theme::border()
+            },
+        );
+        let mut branch = action(
+            format!("branch-{index}"),
+            branch_mark.into_any_element(),
+            branchable,
+        )
+        .tooltip(move |window, cx| Tooltip::new(branch_tip.clone()).build(window, cx));
+        if branchable {
+            let branch_id = session_id.clone();
+            branch = branch.on_click(cx.listener(move |this, _event, window, cx| {
+                this.branch_into_session(&branch_id, index, window, cx);
+            }));
+        } else {
+            // `[data-unavailable]`: the control keeps its slot so the row's
+            // order never moves, but it is not a target.
+            branch = branch.cursor_default().opacity(0.4);
+        }
+
         let cut_id = session_id;
-        div()
+        let cut = action(
+            format!("cut-{index}"),
+            icon(IconName::RefreshCw, mark, theme::faint()).into_any_element(),
+            true,
+        )
+        .tooltip({
+            let label = lang.tr("msg.truncate");
+            move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+        })
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.state.truncate_from(&cut_id, index);
+            cx.notify();
+        }));
+
+        let mut row = div()
+            .debug_selector(move || format!("message-footer-{index}"))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(4.0))
-            .child(
-                div()
-                    .id(SharedString::from(format!("good-{index}")))
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(glyph(
-                        "👍",
-                        11.0,
-                        if feedback == "good" {
-                            theme::accent()
-                        } else {
-                            theme::faint()
-                        },
-                    ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.set_feedback(&good_id, index, "good");
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("bad-{index}")))
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(glyph(
-                        "👎",
-                        11.0,
-                        if feedback == "bad" {
-                            theme::error()
-                        } else {
-                            theme::faint()
-                        },
-                    ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.set_feedback(&bad_id, index, "bad");
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("cut-{index}")))
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(icon(IconName::RefreshCw, 12.0, theme::faint()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.truncate_from(&cut_id, index);
-                        cx.notify();
-                    })),
-            )
-            .child(div().flex_1())
-            // Performance & usage: the reference's `Compact` mode keeps the
-            // per-turn usage reading to itself, so the footer's own token figure
-            // is the row the preference governs.
-            .when(usage > 0 && !compact_usage, |row| {
-                row.child(txt(
-                    format!("{usage} {}", self.state.lang.tr("turn.tokens")),
-                    theme::CHIP_SIZE,
-                    theme::faint(),
-                ))
-            })
+            .h(px(side))
+            .gap(px(8.0))
+            // The tail's own 16px column gap plus the measured 4px action margin
+            // is 20px; this row already sits inside an 8px column, so the extra
+            // 12 makes the whole space match.
+            .mt(px(12.0))
+            .ml(px(-6.0))
+            .child(copy)
+            .child(good)
+            .child(bad)
+            .child(branch)
+            .child(cut)
+            .child(div().flex_1());
+        // Performance & usage: the reference's Compact mode keeps the per-turn
+        // usage reading to itself, so the footer's own token figure is the row
+        // the preference governs.
+        if usage > 0 && !compact_usage {
+            row = row.child(txt(
+                format!("{usage} {}", lang.tr("turn.tokens")),
+                theme::small_size_at(content),
+                theme::faint(),
+            ));
+        }
+        // How long the turn took. The reference prints this in the turn's
+        // process summary; the footer carries it beside usage so the cost and
+        // the time of one turn read together.
+        if let Some(ms) = duration.filter(|ms| *ms > 0) {
+            row = row.child(txt(
+                super::header::job_duration(ms, lang),
+                theme::small_size_at(content) - 1.0,
+                theme::faint(),
+            ));
+        }
+        if let Some(at) = at {
+            row = row.child(txt(
+                crate::state::clock_at(at, lang),
+                theme::small_size_at(content) - 1.0,
+                theme::faint(),
+            ));
+        }
+        row
     }
 
     /// One collapsible step row, in the reference's trace shape.

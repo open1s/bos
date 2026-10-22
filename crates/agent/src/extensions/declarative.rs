@@ -30,7 +30,7 @@ use crate::tools::{Tool, ToolError};
 
 use super::{
     manifest_error, read_text, Contribution, ExtensionError, ExtensionStandard, PromptContribution,
-    SkillContribution,
+    ProviderContribution, ProviderModel, SkillContribution,
 };
 
 /// Replace every character of `raw` that is not ASCII alphanumeric with `_`.
@@ -409,6 +409,145 @@ pub(crate) fn read_skills(
             name,
             description,
             manifest,
+        }));
+    }
+    Ok(contributions)
+}
+
+/// What a `providers/*.json` descriptor may declare.
+///
+/// Every field is optional but the identity ones, so a package can ship a bare
+/// endpoint and let the host fill the rest, the same way a tool descriptor's
+/// optional fields work.
+#[derive(Debug, Deserialize)]
+struct ProviderDescriptor {
+    /// The provider id: registry key, router prefix, credential lookup key.
+    id: String,
+    /// Display name.
+    #[serde(default)]
+    name: Option<String>,
+    /// The API base URL.
+    #[serde(default, alias = "baseUrl")]
+    base_url: Option<String>,
+    /// The wire protocol; the host's default applies when absent.
+    #[serde(default, rename = "apiMode", alias = "api_mode")]
+    api_mode: Option<String>,
+    /// Whether the endpoint needs a credential. Absent means it does, which is
+    /// the safe reading: an endpoint that turns out to be keyless fails loudly
+    /// against the vault rather than sending a request with no Authorization.
+    #[serde(
+        default = "default_true",
+        rename = "requiresKey",
+        alias = "requires_key"
+    )]
+    requires_key: bool,
+    /// The models the provider offers.
+    #[serde(default)]
+    models: Vec<ProviderModelDescriptor>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// What one entry of a provider descriptor's `models` array may declare.
+#[derive(Debug, Deserialize)]
+struct ProviderModelDescriptor {
+    /// The id the API is called with.
+    id: String,
+    /// Display name.
+    #[serde(default)]
+    name: Option<String>,
+    /// Output cap for this model.
+    #[serde(default, rename = "maxTokens", alias = "max_tokens")]
+    max_tokens: Option<u32>,
+    /// Declared input types.
+    #[serde(default, rename = "inputTypes", alias = "input_types")]
+    input_types: Option<Vec<String>>,
+    /// Reasoning effort.
+    #[serde(default, rename = "reasoningEffort", alias = "reasoning_effort")]
+    reasoning_effort: Option<String>,
+}
+
+/// Read `providers/*.json` under `root`.
+///
+/// This is the declarative carrier for a package that contributes an LLM
+/// endpoint. The DeepSeek Harness reference registers one imperatively with
+/// `ctx.llm.registerAdapter([id], adapter)`; a package that ALSO ships this
+/// file gets a real provider here, and the imperative entry stays refused.
+///
+/// The base URL must be HTTP(S). A package cannot point the host's turns at a
+/// `file:` or `javascript:` endpoint through this surface.
+pub(crate) fn read_providers(
+    root: &Path,
+    standard: ExtensionStandard,
+) -> Result<Vec<Contribution>, ExtensionError> {
+    let dir = root.join("providers");
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut contributions = Vec::new();
+    for path in json_files(&dir)? {
+        let text = read_text(&path)?;
+        let descriptor: ProviderDescriptor = serde_json::from_str(&text)
+            .map_err(|error| manifest_error(standard, &path, error.to_string()))?;
+        if descriptor.id.trim().is_empty() {
+            return Err(manifest_error(
+                standard,
+                &path,
+                "a provider descriptor needs a non-empty `id`",
+            ));
+        }
+        let base_url = descriptor
+            .base_url
+            .clone()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                manifest_error(
+                    standard,
+                    &path,
+                    "a provider descriptor needs a non-empty `base_url`",
+                )
+            })?;
+        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            return Err(manifest_error(
+                standard,
+                &path,
+                format!("the base URL '{base_url}' must be an http or https address"),
+            ));
+        }
+        if descriptor.models.is_empty() {
+            return Err(manifest_error(
+                standard,
+                &path,
+                "a provider descriptor needs at least one entry in `models`",
+            ));
+        }
+        let mut models = Vec::with_capacity(descriptor.models.len());
+        for model in descriptor.models {
+            if model.id.trim().is_empty() {
+                return Err(manifest_error(
+                    standard,
+                    &path,
+                    "every provider model needs a non-empty `id`",
+                ));
+            }
+            models.push(ProviderModel {
+                id: model.id.trim().to_string(),
+                name: model.name,
+                max_tokens: model.max_tokens,
+                input_types: model.input_types,
+                reasoning_effort: model.reasoning_effort,
+            });
+        }
+        contributions.push(Contribution::Provider(ProviderContribution {
+            id: descriptor.id.trim().to_string(),
+            name: descriptor.name,
+            base_url,
+            api_mode: descriptor.api_mode,
+            requires_key: descriptor.requires_key,
+            models,
         }));
     }
     Ok(contributions)

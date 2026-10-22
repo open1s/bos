@@ -1,0 +1,35 @@
+{
+  "id": "zen",
+  "name": "OpenCode Zen",
+  "base_url": "https://opencode.ai/zen/v1",
+  "apiMode": "chat",
+  "requiresKey": false,
+  "models": [
+    {
+      "id": "deepseek-v4.1-flash-free",
+      "name": "DeepSeek V4.1 Flash (free)",
+      "maxTokens": 8192,
+      "inputTypes": [
+        "text"
+      ]
+    },
+    {
+      "id": "glm-5.3-flash-free",
+      "name": "GLM 5.3 Flash (free)",
+      "maxTokens": 8192,
+      "inputTypes": [
+        "text"
+      ]
+    },
+    {
+      "id": "nemotron-3.5-super-vl-free",
+      "name": "Nemotron 3.5 Super VL (free)",
+      "maxTokens": 8192,
+      "inputTypes": [
+        "text",
+        "image"
+      ],
+      "reasoningEffort": "medium"
+    }
+  ]
+}

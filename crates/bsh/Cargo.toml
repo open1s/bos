@@ -79,6 +79,12 @@ async-trait = { workspace = true }
 # A bare `bsh` binary has no bundle, so macOS would draw a generic Dock tile;
 # assets::install_dock_icon hands AppKit the .icns compiled into the binary
 # instead. Versions match what gpui-pre-macos already pulls in, so they unify.
+# The host's own calendar offset, for the message clock. Already in the build
+# through portable-pty, so this adds no crate; a date library would be a
+# dependency bought for one localtime_r call.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage", "NSResponder"] }

@@ -91,6 +91,90 @@ pub(crate) fn stamp(at: u64) -> String {
     )
 }
 
+/// The local calendar reading of a Unix instant: year, month, day, hour, minute.
+///
+/// LOCAL, not UTC. A message clock is read against the reader's own wall clock,
+/// while `stamp()`'s UTC reading answers a different question - when the record
+/// was written - and the two must not be confused.
+///
+/// `libc` rather than a date crate: the workspace already builds libc for its
+/// terminal, so this costs no dependency, and the only thing needed here is the
+/// host's own offset.
+#[cfg(unix)]
+fn local_parts(at: u64) -> (i32, u32, u32, u32, u32) {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let stamp = at as libc::time_t;
+    // SAFETY: `localtime_r` writes into the `tm` this frame owns and reads only
+    // the instant; a null return means it refused, which falls back to UTC.
+    let ok = unsafe { !libc::localtime_r(&stamp, &mut tm).is_null() };
+    if !ok {
+        return utc_parts(at);
+    }
+    (
+        tm.tm_year + 1900,
+        (tm.tm_mon + 1) as u32,
+        tm.tm_mday as u32,
+        tm.tm_hour as u32,
+        tm.tm_min as u32,
+    )
+}
+
+/// The UTC calendar reading, for a platform without a local clock.
+#[cfg(not(unix))]
+fn local_parts(at: u64) -> (i32, u32, u32, u32, u32) {
+    utc_parts(at)
+}
+
+/// The UTC calendar reading of a Unix instant.
+fn utc_parts(at: u64) -> (i32, u32, u32, u32, u32) {
+    let days = (at / 86_400) as i64;
+    let seconds = at % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (
+        y as i32,
+        m as u32,
+        d as u32,
+        (seconds / 3600) as u32,
+        ((seconds % 3600) / 60) as u32,
+    )
+}
+
+/// Format an instant as the reference's message clock.
+///
+/// Measured from `formatMessageClock`: `HH:MM` for today, `clock.md` plus that
+/// clock for another day in this year, and `clock.ymd` plus it otherwise. The
+/// reference keeps the day boundary in a hook that re-renders at local midnight;
+/// bsh reads the clock on each paint, so a session left open overnight moves to
+/// the dated form on its own next frame.
+pub(crate) fn clock_at(at: u64, lang: Lang) -> String {
+    let (year, month, day, hour, minute) = local_parts(at);
+    let (today_year, today_month, today_day, ..) = local_parts(now());
+    let clock = format!("{hour:02}:{minute:02}");
+    if (year, month, day) == (today_year, today_month, today_day) {
+        return clock;
+    }
+    let template = if year == today_year {
+        crate::i18n::tr(lang, "clock.md")
+    } else {
+        crate::i18n::tr(lang, "clock.ymd")
+    };
+    // The reference pads neither `m` nor `d`, so a March 9th reads `3/9`.
+    let dated = template
+        .replace("{y}", &year.to_string())
+        .replace("{m}", &month.to_string())
+        .replace("{d}", &day.to_string());
+    format!("{dated} {clock}")
+}
+
 /// Format a past instant as a short age.
 pub(crate) fn age(then: u64) -> String {
     let now = now();
@@ -639,6 +723,11 @@ impl AppState {
         // scratch store for a test and the bsh data directory for the app. It
         // starts LOCKED, whether or not the file exists.
         state.vault = crate::vault::Vault::new(state.settings.vault_path());
+        // Installed packages may contribute model providers. This is settled
+        // before anything reads the provider tree - the composer's model menu,
+        // the Models pane and every build - so a contributed endpoint is
+        // present from the first frame rather than appearing after a refresh.
+        crate::caps::refresh_plugin_providers(&mut state.settings);
         state.ensure_active();
         state.refresh_egress_allowlist();
         state
@@ -1259,12 +1348,118 @@ impl AppState {
         }
         crate::trash::purge(path)
     }
+    /// Whether a message can be the point a branch starts from.
+    ///
+    /// Measured from the reference: branchUnavailable is set when the tail has
+    /// any later chat node, so the branch is offered on the LAST message of a
+    /// completed turn and nowhere else. A turn still streaming has no terminal
+    /// record to branch from, so its row disables the control too.
+    ///
+    /// Completion is read from the STREAM, not from a timing record: a turn that
+    /// settled before bsh measured durations is still complete, and refusing to
+    /// branch it would tie the control to a measurement rather than to the state
+    /// of the conversation.
+    pub(crate) fn can_branch_at(&self, id: &str, index: usize) -> bool {
+        let Some(session) = self.store.session(id) else {
+            return false;
+        };
+        if self.is_streaming(id) {
+            return false;
+        }
+        let Some(message) = session.messages.get(index) else {
+            return false;
+        };
+        message.role == crate::model::Role::Assistant && index + 1 == session.messages.len()
+    }
+
+    /// Branch a session at one assistant message: a new conversation holding
+    /// the transcript up to and including that message.
+    ///
+    /// The reference calls this fork({ atSeq, increaseTitle: true }). The copy
+    /// is a NEW session - its own id and its own log - so pin, archive and
+    /// deletion of the original never reach it. Its title is the original's with
+    /// an incremented ordinal, which is what increaseTitle means: two branches
+    /// of one chat must not be indistinguishable in the sidebar.
+    pub(crate) fn branch_session_at(&mut self, id: &str, index: usize) -> Option<String> {
+        if !self.can_branch_at(id, index) {
+            return None;
+        }
+        let mut forked = self.store.session(id)?.clone();
+        let branch_len = index + 1;
+        forked.id = uuid::Uuid::new_v4().to_string();
+        forked.title = self.branch_title(&forked.title, &forked.workspace);
+        forked.created_at = now();
+        forked.updated_at = forked.created_at;
+        forked.pinned = false;
+        forked.archived_at = None;
+        // The cut is what makes it a branch: everything after the chosen
+        // message belongs to the original, not to this conversation.
+        forked.messages.truncate(branch_len);
+        forked
+            .compactions
+            .retain(|record| record.after <= branch_len);
+        forked.compacted = forked.compacted.min(branch_len);
+        // Folded-out rows describe the original's history above the cut.
+        forked.archived.clear();
+        forked.compact_command = None;
+        forked.feedback = None;
+        let forked_id = forked.id.clone();
+        // The log is copied first so the rows ABOVE the loaded window survive;
+        // the save then rewrites it down to the branch point.
+        self.store.copy_history(id, &forked_id);
+        let _ = self.store.save(&forked);
+        self.store.insert(forked);
+        self.store.sort();
+        Some(forked_id)
+    }
+
+    /// The title a branch of a chat takes: the base ordinal, incremented.
+    ///
+    /// Chat becomes Chat (2), and branching either again gives Chat (3): the
+    /// highest ordinal already used in the workspace wins, so two siblings never
+    /// collide and a branch of a branch keeps counting from the same base.
+    fn branch_title(&self, title: &str, workspace: &str) -> String {
+        let title = title.trim();
+        let base = match title.rfind(" (") {
+            Some(at) if title.ends_with(')') => {
+                let inside = &title[at + 2..title.len().saturating_sub(1)];
+                if !inside.is_empty() && inside.chars().all(|character| character.is_ascii_digit())
+                {
+                    &title[..at]
+                } else {
+                    title
+                }
+            }
+            _ => title,
+        };
+        let mut highest = 1u32;
+        for other in &self.store.sessions {
+            if other.workspace != workspace {
+                continue;
+            }
+            let candidate = other.title.trim();
+            if candidate == base {
+                continue;
+            }
+            let Some(rest) = candidate
+                .strip_prefix(base)
+                .and_then(|rest| rest.strip_prefix(" ("))
+                .and_then(|rest| rest.strip_suffix(')'))
+            else {
+                continue;
+            };
+            if let Ok(ordinal) = rest.parse::<u32>() {
+                highest = highest.max(ordinal);
+            }
+        }
+        format!("{base} ({})", highest + 1)
+    }
     /// Branch a session: a copy of its transcript as a new conversation.
     ///
-    /// The reference forks at the current point, which is the whole transcript
-    /// here - bsh keeps no per-message branch point yet. The copy is a NEW
-    /// session (its own id, its own file), laid out as a sibling: pin and
-    /// archive do not follow it, because those are decisions about the original.
+    /// This copies the WHOLE transcript; [`Self::branch_session_at`] is the same
+    /// operation cut at one message. The copy is a NEW session (its own id, its
+    /// own file), laid out as a sibling: pin and archive do not follow it,
+    /// because those are decisions about the original.
     pub(crate) fn fork_session(&mut self, id: &str) -> Option<String> {
         let mut forked = self.store.session(id)?.clone();
         forked.id = uuid::Uuid::new_v4().to_string();
@@ -5731,5 +5926,160 @@ mod tests {
             .get("strict")
             .is_some_and(|preset| preset.trusted));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A branch cuts the transcript at the chosen message and opens as a
+    /// sibling with an incremented title.
+    #[test]
+    fn a_branch_cuts_the_transcript_at_its_message() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-state-branch-at");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let mut state =
+            super::AppState::with_store(crate::store::Store::open_at(base.join("store")));
+        let id = state.active_id.clone().expect("a session");
+        for turn in 0..3 {
+            state
+                .begin_turn_in(&id, &format!("turn {turn}"))
+                .expect("a turn opens");
+            state.apply_event(&id, super::AgentEvent::Text(format!("reply {turn}")));
+            state.apply_event(&id, super::AgentEvent::Done);
+        }
+        let (title, len) = {
+            let session = state.store.session(&id).expect("the session");
+            (session.title.clone(), session.messages.len())
+        };
+        assert_eq!(len, 6, "three exchanges");
+        let last = len - 1;
+        assert!(
+            state.can_branch_at(&id, last),
+            "the newest settled reply can be branched"
+        );
+        assert!(
+            !state.can_branch_at(&id, 1),
+            "an earlier reply has later chat nodes, so it cannot"
+        );
+
+        let forked = state.branch_session_at(&id, last).expect("a branch opens");
+        assert_ne!(forked, id, "the branch is its own session");
+        let branched = state.store.session(&forked).expect("the branch");
+        assert_eq!(
+            branched.messages.len(),
+            len,
+            "branching at the last message keeps the whole transcript"
+        );
+        assert_eq!(
+            branched.title,
+            format!("{title} (2)"),
+            "the title counts up"
+        );
+        // The original is untouched: a branch is a copy, never a move.
+        assert_eq!(
+            state
+                .store
+                .session(&id)
+                .expect("the original")
+                .messages
+                .len(),
+            len
+        );
+        // A branch of the branch keeps counting from the same base.
+        let third = state
+            .branch_session_at(&forked, last)
+            .expect("a second branch");
+        assert_eq!(
+            state.store.session(&third).expect("the third").title,
+            format!("{title} (3)")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A branch point that is not the last message of a settled turn is refused,
+    /// and a turn still streaming has no point at all.
+    #[test]
+    fn a_branch_is_offered_only_on_the_last_message_of_a_settled_turn() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-state-branch-rule");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let mut state =
+            super::AppState::with_store(crate::store::Store::open_at(base.join("store")));
+        let id = state.active_id.clone().expect("a session");
+        for turn in 0..2 {
+            state
+                .begin_turn_in(&id, &format!("turn {turn}"))
+                .expect("a turn opens");
+            state.apply_event(&id, super::AgentEvent::Text("hi".to_string()));
+            state.apply_event(&id, super::AgentEvent::Done);
+        }
+        assert_eq!(
+            state
+                .store
+                .session(&id)
+                .expect("the session")
+                .messages
+                .len(),
+            4
+        );
+        assert!(state.can_branch_at(&id, 3), "the newest settled reply");
+        assert!(
+            !state.can_branch_at(&id, 1),
+            "an earlier reply has a successor"
+        );
+        assert!(
+            !state.can_branch_at(&id, 0),
+            "and a user row is not a branch point"
+        );
+        assert!(
+            state.branch_session_at(&id, 1).is_none(),
+            "the refusal is enforced by the same call, not only by the control"
+        );
+        // While a turn streams there is no settled reply to branch from.
+        state
+            .begin_turn_in(&id, "still going")
+            .expect("a turn opens");
+        let last = state
+            .store
+            .session(&id)
+            .expect("the session")
+            .messages
+            .len()
+            - 1;
+        assert!(
+            !state.can_branch_at(&id, last),
+            "a streaming turn is not a branch point"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The footer clock reads local wall time, and dates a message that is not
+    /// from today.
+    #[test]
+    fn the_message_clock_reads_local_time_and_dates_other_days() {
+        use super::{clock_at, local_parts, now};
+        let lang = crate::i18n::Lang::En;
+        let today = clock_at(now(), lang);
+        assert_eq!(today.len(), 5, "today is the bare HH:MM clock: {today}");
+        assert!(today.contains(':'), "and it is a clock: {today}");
+
+        // Yesterday is dated when its local day differs from today's; on the
+        // rare run whose 24 hours land on the same local day the assertion has
+        // nothing to prove, so it only checks the dated branch when it applies.
+        let earlier = now().saturating_sub(86_400);
+        let (ty, tm, td, ..) = local_parts(now());
+        let (ey, em, ed, ..) = local_parts(earlier);
+        let dated = clock_at(earlier, lang);
+        if (ty, tm, td) != (ey, em, ed) {
+            assert!(
+                dated.contains('/') || dated.contains('-'),
+                "another day carries its date: {dated}"
+            );
+            assert!(dated.contains(':'), "and still a clock: {dated}");
+            assert!(
+                dated.contains(&em.to_string()) && dated.contains(&ed.to_string()),
+                "the date names the local day: {dated}"
+            );
+        }
     }
 }

@@ -6,6 +6,7 @@
 pub(crate) mod audit;
 mod command_menu;
 pub(crate) mod composer;
+pub(crate) mod diff_pane;
 pub(crate) mod header;
 pub(crate) mod hero;
 pub(crate) mod lane;

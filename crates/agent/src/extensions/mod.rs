@@ -135,6 +135,8 @@ pub enum ContributionKind {
     Panel,
     /// A prompt template.
     Prompt,
+    /// A model provider the host routes turns through.
+    Provider,
 }
 
 impl fmt::Display for ContributionKind {
@@ -154,6 +156,7 @@ impl ContributionKind {
             ContributionKind::SkillDir => "skill directory",
             ContributionKind::Panel => "panel",
             ContributionKind::Prompt => "prompt",
+            ContributionKind::Provider => "provider",
         }
     }
 }
@@ -178,6 +181,8 @@ pub enum Capability {
     Prompts,
     /// UI panels.
     Panels,
+    /// Model providers (LLM endpoints and their models).
+    Models,
 }
 
 impl fmt::Display for Capability {
@@ -196,6 +201,7 @@ impl Capability {
             Capability::Skills => "skills",
             Capability::Prompts => "prompts",
             Capability::Panels => "panels",
+            Capability::Models => "models",
         }
     }
 }
@@ -376,6 +382,9 @@ pub enum Contribution {
     Panel(UiPanel),
     /// A prompt template.
     Prompt(PromptContribution),
+    /// A model provider, declared by the package instead of registered by an
+    /// imperative host entry. The host lowers it onto its own provider tree.
+    Provider(ProviderContribution),
 }
 
 impl Contribution {
@@ -389,6 +398,7 @@ impl Contribution {
             Contribution::SkillDir(_) => ContributionKind::SkillDir,
             Contribution::Panel(_) => ContributionKind::Panel,
             Contribution::Prompt(_) => ContributionKind::Prompt,
+            Contribution::Provider(_) => ContributionKind::Provider,
         }
     }
 
@@ -402,6 +412,7 @@ impl Contribution {
             Contribution::SkillDir(dir) => dir.path.display().to_string(),
             Contribution::Panel(panel) => panel.id.clone(),
             Contribution::Prompt(prompt) => prompt.name.clone(),
+            Contribution::Provider(provider) => provider.id.clone(),
         }
     }
 }
@@ -468,6 +479,81 @@ pub struct SkillContribution {
 pub struct SkillDirContribution {
     /// The directory the skill loader walks.
     pub path: PathBuf,
+}
+
+/// A model provider contributed by an extension.
+///
+/// This is the declarative carrier for what a DSH package registers
+/// imperatively with `ctx.llm.registerAdapter([id], adapter)` and what a Codex
+/// package has no field for at all: an LLM endpoint plus the models it offers.
+///
+/// The shape is deliberately the same one a host provider tree already holds -
+/// an id, a base URL, a protocol, and a set of model ids - so lowering it needs
+/// no reinterpretation. What the package CANNOT declare here is a credential:
+/// a key is the reader's, resolved from the vault against the id, never a value
+/// a package ships.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderContribution {
+    /// The provider id. This is the registry key, the router prefix, and the
+    /// id a credential is looked up under, so it is never a display label.
+    pub id: String,
+    /// Display name; absent shows the id.
+    pub name: Option<String>,
+    /// The API base URL.
+    pub base_url: String,
+    /// The wire protocol (`chat`, `responses`, `anthropic`); absent lets the
+    /// host's own default apply.
+    pub api_mode: Option<String>,
+    /// Whether the endpoint requires a credential. A package that serves an
+    /// open or anonymous lane declares `None` so the host does not demand a key
+    /// it does not have.
+    pub requires_key: bool,
+    /// The models the provider offers, in declaration order.
+    pub models: Vec<ProviderModel>,
+}
+
+/// One model a contributed provider offers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderModel {
+    /// The id the API is called with. Required.
+    pub id: String,
+    /// Display name; absent shows the id.
+    pub name: Option<String>,
+    /// Output cap for this model.
+    pub max_tokens: Option<u32>,
+    /// Declared input types, when the package classifies them.
+    pub input_types: Option<Vec<String>>,
+    /// Reasoning effort the model runs at; absent uses the engine's default.
+    pub reasoning_effort: Option<String>,
+}
+
+impl ProviderContribution {
+    /// Create a provider contribution.
+    pub fn new(id: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            base_url: base_url.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Set the display name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Set the wire protocol.
+    pub fn with_api_mode(mut self, api_mode: impl Into<String>) -> Self {
+        self.api_mode = Some(api_mode.into());
+        self
+    }
+
+    /// Add one model.
+    pub fn with_model(mut self, model: ProviderModel) -> Self {
+        self.models.push(model);
+        self
+    }
 }
 
 /// A prompt template contributed by an extension.

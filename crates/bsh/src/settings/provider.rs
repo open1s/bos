@@ -250,15 +250,14 @@ impl GlobalSettings {
     /// Reading a provider that is not declared gives an empty map rather than
     /// nothing, so a caller can ask for its models before it exists.
     pub(crate) fn models_of(&self, provider: &str) -> &BTreeMap<String, ModelEntry> {
-        self.providers
-            .get(provider)
+        self.provider(provider)
             .map(|entry| &entry.models)
             .unwrap_or(&NO_MODELS)
     }
 
     /// One model of one provider, by nickname.
     pub(crate) fn model_entry(&self, provider: &str, nickname: &str) -> Option<&ModelEntry> {
-        self.providers.get(provider)?.models.get(nickname)
+        self.provider(provider)?.models.get(nickname)
     }
 
     /// One model of one provider, by nickname, for writing.
@@ -276,7 +275,7 @@ impl GlobalSettings {
         provider: &str,
         nickname: &str,
     ) -> Option<(&Provider, &ModelEntry)> {
-        let entry = self.providers.get(provider)?;
+        let entry = self.provider(provider)?;
         Some((entry, entry.models.get(nickname)?))
     }
 
@@ -316,8 +315,7 @@ impl GlobalSettings {
     /// born with; so a protocol set on the provider reaches every model under
     /// it that names none of its own.
     pub(crate) fn family_protocol_of(&self, provider: &str) -> String {
-        self.providers
-            .get(provider)
+        self.provider(provider)
             .and_then(|node| node.api_mode.clone())
             .filter(|mode| !mode.trim().is_empty())
             .unwrap_or_else(|| family_protocol(provider).to_string())
@@ -339,7 +337,7 @@ impl GlobalSettings {
 
     /// The model id a provider declares text-only, if any.
     pub(crate) fn text_only_model(&self, provider: &str) -> Option<&str> {
-        self.providers.get(provider).and_then(text_only)
+        self.provider(provider).and_then(text_only)
     }
 
     /// Whether one model of one provider answers image input.

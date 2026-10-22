@@ -31,6 +31,11 @@ const HOST_MARKERS: &[(&str, Capability)] = &[
     ("ctx.skills.register", Capability::Skills),
     ("ctx.skills.registerProvider", Capability::Skills),
     ("ctx.on", Capability::Hooks),
+    // The LLM adapter seam: what a model-provider package registers its
+    // endpoint through. It is a host marker like the rest, so a package that
+    // calls it reports the models capability whether or not it also ships the
+    // declarative providers/*.json carrier.
+    ("ctx.llm.registerAdapter", Capability::Models),
 ];
 
 const CLIENT_MARKERS: &[(&str, Capability)] = &[
@@ -214,6 +219,11 @@ pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
     if !agents.is_empty() {
         capabilities.insert(Capability::Prompts);
         contributions.extend(agents);
+    }
+    let providers = declarative::read_providers(root, STANDARD)?;
+    if !providers.is_empty() {
+        capabilities.insert(Capability::Models);
+        contributions.extend(providers);
     }
 
     if let Some(entry) = host_entry(root, object, &manifest_path)? {
@@ -499,7 +509,16 @@ fn imperative_reason(kind: &str, found: &[Capability]) -> String {
                 .join(", ")
         )
     };
+    // The tail differs when the package ALSO ships a declarative carrier for
+    // the capability its script would have registered. Saying "refused" over a
+    // contribution that did load would be a false alarm the reader cannot act
+    // on, so the sentence names what actually arrived.
+    let landed = if found.contains(&Capability::Models) {
+        " Declarative contributions in this package were loaded, and the model providers it declares in providers/*.json are live."
+    } else {
+        " Declarative contributions in this package were loaded."
+    };
     format!(
-        "the {kind} is DeepSeek Harness JavaScript (`apply(ctx, config)`); {calls}. The reference registers tools, commands, skills, and hooks by executing script (`ctx.tools.register`, `ctx.commands.register`, `ctx.skills.register`, `ctx.on`), and this build has no JavaScript runtime, so the entry was refused. Declarative contributions in this package were loaded."
+        "the {kind} is DeepSeek Harness JavaScript (`apply(ctx, config)`); {calls}. The reference registers tools, commands, skills, hooks and LLM adapters by executing script (`ctx.tools.register`, `ctx.commands.register`, `ctx.skills.register`, `ctx.on`, `ctx.llm.registerAdapter`), and this build has no JavaScript runtime, so the entry was refused.{landed}"
     )
 }

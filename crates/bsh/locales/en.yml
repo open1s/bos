@@ -224,6 +224,16 @@
 "msg.compaction.expand": "View compaction summary"
 "msg.compaction.unavailable": "Compaction summary unavailable"
 
+# The message footer, measured from the reference: the branch action and the
+# reason it is unavailable, the usage reading, and the clock templates.
+"msg.branch": "Branch into a new conversation"
+"msg.truncate": "Delete this and every later message"
+"msg.branchUnavailable": "Available only on the last message of a completed turn"
+"msg.copyMessage": "Copy message"
+"msg.branchMessage": "Branch into a new conversation"
+"clock.md": "{m}/{d}"
+"clock.ymd": "{y}-{m}-{d}"
+
 "turn.running": "Running"
 "turn.completed": "Completed"
 "turn.stopped": "Stopped"
@@ -615,6 +625,9 @@
 "settings.resetModels": "Restore defaults"
 "settings.modelsCustomized": "Customized model catalog"
 "settings.modelsInherited": "Using the adapter defaults"
+"settings.pluginProviderTag": "Plugin"
+"settings.pluginProviderHint": "Provided by {plugin}. Its models are available in the model selector."
+"settings.pluginProviderHosted": "Hosted by the plugin"
 "settings.fetching": "Asking the provider…"
 "settings.addCustom": "Custom model API"
 "settings.addCatalogHint": "Pick OpenAI, Anthropic, Kimi, or another provider from the built-in catalog and enter its API key."

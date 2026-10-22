@@ -116,6 +116,14 @@ pub fn load(root: &Path) -> Result<LoadedPackage, ExtensionError> {
         capabilities.insert(Capability::Prompts);
         contributions.extend(agents);
     }
+    // The same declarative model-provider carrier the DSH shim reads. A Codex
+    // manifest has no provider field at all, so a package that reaches for one
+    // does it through this file; nothing about the file is standard-specific.
+    let providers = declarative::read_providers(root, STANDARD)?;
+    if !providers.is_empty() {
+        capabilities.insert(Capability::Models);
+        contributions.extend(providers);
+    }
 
     if let Some(mcp) = object.get("mcpServers") {
         let (mcp_path, servers) = mcp_servers(root, mcp, &manifest_path)?;

@@ -185,17 +185,26 @@ pub(crate) fn language_for(name: &str) -> Option<&'static str> {
 }
 
 /// The languages a whole file name owns, for files that carry no extension.
+///
+/// Compared with `eq_ignore_ascii_case` rather than against a lowercased copy:
+/// this runs once per visible row per frame through the row's glyph, and an
+/// allocation per row per frame is exactly the kind of cost a listing pays for
+/// without anyone seeing it.
 fn language_for_name(name: &str) -> Option<&'static str> {
-    let lower = name.to_ascii_lowercase();
-    let language = match lower.as_str() {
-        "makefile" | "gnumakefile" | "bsdmakefile" => "make",
-        "cmakelists.txt" => "cmake",
-        // The kit has no Dockerfile, nginx, terraform or justfile grammar, so
-        // those names stay plain text rather than claiming a language that the
-        // registry would then fail to parse.
-        _ => return None,
-    };
-    Some(language)
+    let same = |candidate: &str| name.eq_ignore_ascii_case(candidate);
+    if same("makefile") || same("gnumakefile") || same("bsdmakefile") {
+        return Some("make");
+    }
+    if same("cmakelists.txt") {
+        return Some("cmake");
+    }
+    if same("cargo.lock") {
+        return Some("toml");
+    }
+    // The kit has no Dockerfile, nginx, terraform or justfile grammar, so those
+    // names stay plain text rather than claiming a language the registry would
+    // then fail to parse.
+    None
 }
 
 /// The language an extension owns, in the registry's own spelling.
@@ -241,7 +250,7 @@ fn language_for_extension(extension: &str) -> Option<&'static str> {
         "cmake" => "cmake",
         "mk" => "make",
         "diff" | "patch" => "diff",
-        "xml" | "svg" | "xsl" | "xslt" | "plist" | "rss" | "atom" => "html",
+        "xml" => "html",
         _ => return None,
     };
     Some(language)
@@ -463,19 +472,80 @@ mod tests {
     #[test]
     fn every_bundled_grammar_has_an_extension() {
         const GRAMMARS: [&str; 34] = [
-            "astro", "bash", "c", "cmake", "cpp", "csharp", "css", "diff", "ejs", "elixir",
-            "erb", "go", "graphql", "html", "java", "javascript", "jsdoc", "kotlin", "lua",
-            "make", "markdown", "php", "proto", "python", "ruby", "rust", "scala", "sql",
-            "svelte", "swift", "toml", "tsx", "typescript", "yaml",
+            "astro",
+            "bash",
+            "c",
+            "cmake",
+            "cpp",
+            "csharp",
+            "css",
+            "diff",
+            "ejs",
+            "elixir",
+            "erb",
+            "go",
+            "graphql",
+            "html",
+            "java",
+            "javascript",
+            "jsdoc",
+            "kotlin",
+            "lua",
+            "make",
+            "markdown",
+            "php",
+            "proto",
+            "python",
+            "ruby",
+            "rust",
+            "scala",
+            "sql",
+            "svelte",
+            "swift",
+            "toml",
+            "tsx",
+            "typescript",
+            "yaml",
         ];
         // json is always compiled in, and zig is registered by the bundle too.
         let mut covered: Vec<&'static str> = vec!["json", "zig"];
         for name in [
-            "a.astro", "a.sh", "a.c", "a.cmake", "a.cpp", "a.cs", "a.css", "a.diff", "a.ejs",
-            "a.ex", "a.erb", "a.go", "a.graphql", "a.html", "a.java", "a.js", "a.jsdoc",
-            "a.kt", "a.lua", "a.mk", "a.md", "a.php", "a.proto", "a.py", "a.rb", "a.rs",
-            "a.scala", "a.sql", "a.svelte", "a.swift", "a.toml", "a.tsx", "a.ts", "a.yaml",
-            "a.json", "a.zig",
+            "a.astro",
+            "a.sh",
+            "a.c",
+            "a.cmake",
+            "a.cpp",
+            "a.cs",
+            "a.css",
+            "a.diff",
+            "a.ejs",
+            "a.ex",
+            "a.erb",
+            "a.go",
+            "a.graphql",
+            "a.html",
+            "a.java",
+            "a.js",
+            "a.jsdoc",
+            "a.kt",
+            "a.lua",
+            "a.mk",
+            "a.md",
+            "a.php",
+            "a.proto",
+            "a.py",
+            "a.rb",
+            "a.rs",
+            "a.scala",
+            "a.sql",
+            "a.svelte",
+            "a.swift",
+            "a.toml",
+            "a.tsx",
+            "a.ts",
+            "a.yaml",
+            "a.json",
+            "a.zig",
         ] {
             if let Some(language) = language_for(name) {
                 covered.push(language);

@@ -16,6 +16,30 @@ use crate::store::{OlderPage, TracePage};
 /// How close to the end still counts as following the tail, in pixels.
 const TAIL_EPSILON: f32 = 24.0;
 
+/// How long a message row shows the copy check before returning to the glyph.
+///
+/// Measured: the reference's `onCopy` sets `copied` for 1000ms
+/// (`window.setTimeout(() => setCopied(false), 1e3)`).
+const COPY_FLASH: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+/// How far a drag must travel before it counts as a selection rather than a click.
+///
+/// Below this the press was a click - on a control, on a link, on plain text -
+/// and copying whatever selection happened to be left on screen would be a
+/// surprise rather than a service.
+pub(crate) const SELECTION_DRAG_PX: f32 = 3.0;
+
+/// Whether a pointer gesture travelled far enough to be a SELECTION drag.
+///
+/// Copy-on-selection copies on the release of a drag, and a click must not: the
+/// transcript is full of controls, and re-copying a stale selection because the
+/// reader clicked a tool row would be a surprise. Split out from the handler so
+/// the threshold is testable without synthesising a text selection, which the
+/// headless harness cannot produce.
+pub(crate) fn selection_drag(dx: f32, dy: f32) -> bool {
+    (dx * dx + dy * dy).sqrt() >= SELECTION_DRAG_PX
+}
+
 /// The window's only view.
 /// The custom preset editor: one TOML buffer keyed by preset id.
 pub(crate) struct PresetEditor {
@@ -262,6 +286,18 @@ pub(crate) struct Shell {
     pub(crate) settings_scroll: ScrollHandle,
     /// The turn whose mark the pointer is over, which opens its preview card.
     pub(crate) rail_hover: Option<usize>,
+    /// The message whose copy control last copied, for the check mark.
+    ///
+    /// The reference swaps the copy glyph for a check for one second and then
+    /// back; this is that state, keyed by message index so the row that copied
+    /// is the one that says so.
+    pub(crate) copied_message: Option<usize>,
+    /// Where the pointer went down inside the transcript, for copy-on-selection.
+    ///
+    /// A drag that ends more than SELECTION_DRAG_PX away takes the window's
+    /// text selection to the clipboard; a plain click must not, or every click
+    /// would re-copy whatever selection was left over.
+    pub(crate) selection_start: Option<Point<Pixels>>,
     /// The changed-files cards whose fold the reader has opened, by message
     /// index. Scoped like the other disclosures: a session switch closes them,
     /// because the indices name rows in the transcript that just changed.
@@ -1191,6 +1227,8 @@ impl Shell {
             rail_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             rail_hover: Some(58),
+            copied_message: None,
+            selection_start: None,
             changes_open: std::collections::HashSet::new(),
             changes_hover: None,
             changes_preview: None,
@@ -3250,12 +3288,87 @@ impl Shell {
         let Some(forked) = self.state.fork_session(id) else {
             return;
         };
+        // The fork carries the same rows at the same geometry, so it inherits the
+        // source's measured heights instead of re-measuring a long chat.
+        self.transcript_layout.get_mut().adopt(id, &forked);
         self.state.select(&forked);
         self.maybe_compact_history(cx);
         self.renaming_session = None;
         cx.notify();
     }
 
+    /// Copy one message's text and mark that row as copied for a moment.
+    ///
+    /// The clipboard write is the whole action; the check mark is the
+    /// reference's one-second confirmation, and it is cleared by a timer rather
+    /// than by the next repaint so a still frame keeps showing it.
+    pub(crate) fn copy_message(&mut self, index: usize, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        self.copied_message = Some(index);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPY_FLASH).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied_message == Some(index) {
+                    this.copied_message = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Branch the conversation at one assistant message and open the branch.
+    ///
+    /// The new session holds the transcript up to that message, which is the
+    /// reference's `fork({ atSeq })`. The composer takes focus because a branch
+    /// exists to be continued from where it was cut.
+    pub(crate) fn branch_into_session(
+        &mut self,
+        id: &str,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(forked) = self.state.branch_session_at(id, index) else {
+            return;
+        };
+        // The branch renders the rows the reader is already looking at, so its
+        // measured heights are the source's. Adopting them here keeps the first
+        // frame after the click a PAINT: without it the new session is a cache
+        // miss and every row of a long chat is rebuilt, which is the stall this
+        // button used to pay.
+        self.transcript_layout.get_mut().adopt(id, &forked);
+        self.state.select(&forked);
+        self.composer
+            .update(cx, |input, cx| input.focus(window, cx));
+        self.maybe_compact_history(cx);
+        self.renaming_session = None;
+        self.rail_hover = None;
+        cx.notify();
+    }
+
+    /// Take the window's current text selection to the clipboard, if a drag
+    /// left one.
+    ///
+    /// This is copy-on-selection: the reference is a web page, where selecting a
+    /// reply and pressing the platform copy key is the reader's own gesture. A
+    /// native text view gets the same result by copying when the drag ends, so
+    /// the text is on the clipboard without a second keystroke. A selection that
+    /// is empty (a click on plain text, a click on a control) writes nothing.
+    pub(crate) fn copy_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let text = gpui_kit::base::TextSelection::selected_text(window, cx)
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
     /// Put a session's id on the clipboard, which is what a bug report needs.
     pub(crate) fn copy_session_id(&mut self, id: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
@@ -3587,7 +3700,13 @@ impl Render for Shell {
             .bg(rgb(crate::theme::page()))
             .text_color(rgb(crate::theme::text()))
             .when(!self.sidebar_folded(), |root| {
-                root.child(self.render_sidebar(cx))
+                let t = std::time::Instant::now();
+                let sidebar = self.render_sidebar(cx);
+                let took = t.elapsed();
+                if took.as_millis() >= 1 {
+                    eprintln!("BSHPROBE sidebar {took:?}");
+                }
+                root.child(sidebar)
             })
             // A maximised panel over a folded sidebar consumes the whole row:
             // the main column gets zero width and draws nothing, and at that
@@ -3597,9 +3716,26 @@ impl Render for Shell {
             // column, so it is not rendered at all; closing the panel brings it
             // back through the ordinary path and it owns the corner again.
             .when(!self.right_panel_owns_the_corner(), |root| {
-                root.child(self.render_main_column(cx))
+                let t = std::time::Instant::now();
+                let main = self.render_main_column(cx);
+                let took = t.elapsed();
+                if took.as_millis() >= 1 {
+                    eprintln!("BSHPROBE main {took:?}");
+                }
+                root.child(main)
             })
-            .when_some(self.render_right_panel(cx), |root, panel| root.child(panel))
+            .when_some(
+                {
+                    let t = std::time::Instant::now();
+                    let panel = self.render_right_panel(cx);
+                    let took = t.elapsed();
+                    if took.as_millis() >= 1 {
+                        eprintln!("BSHPROBE right {took:?}");
+                    }
+                    panel
+                },
+                |root, panel| root.child(panel),
+            )
             // The jobs popover is painted after every column so it can overlap
             // the transcript and the right panel; it is opened from the header
             // chip and closes on an outside press (below) or a session switch.
@@ -3616,5 +3752,22 @@ impl Render for Shell {
             .when_some(confirm_trust, |root, confirm| root.child(confirm))
             .when_some(confirm_vault_delete, |root, confirm| root.child(confirm))
             .when_some(trash, |root, panel| root.child(panel))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Named import: a glob would pull in gpui's re-export of the test attribute
+    // macro, which shadows the builtin one its own expansion emits.
+    use super::selection_drag;
+
+    /// Copy-on-selection copies on a DRAG and not on a click.
+    #[test]
+    fn a_click_is_not_a_selection_drag() {
+        assert!(!selection_drag(0.0, 0.0), "a still press is a click");
+        assert!(!selection_drag(1.0, 1.0), "and a wobbling one still is");
+        assert!(selection_drag(4.0, 0.0), "travelling sideways is a drag");
+        assert!(selection_drag(0.0, 4.0), "and so is travelling down");
+        assert!(selection_drag(300.0, 0.0), "a real selection always counts");
     }
 }

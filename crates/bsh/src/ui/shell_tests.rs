@@ -14843,6 +14843,259 @@ fn fork_copies_the_transcript_into_a_new_session(cx: &mut TestAppContext) {
     );
 }
 
+
+/// TEMPORARY: where a frame's BUILD time goes.
+#[gpui::test]
+fn probe_frame_cost(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("probe-frame", 30);
+        let id = state.active_id.clone().expect("a session");
+        let body = "## 五\n\n列车进站，车门打开。车厢里坐着一个女孩。\n".repeat(60);
+        if let Some(session) = state.store.session_mut(&id) {
+            for message in session.messages.iter_mut() {
+                if message.role == crate::model::Role::Assistant {
+                    message.text = body.clone();
+                }
+            }
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for _ in 0..3 {
+        eprintln!("--- frame ---");
+        let start = std::time::Instant::now();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        eprintln!("BSHPROBE frame {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+/// A branch opens a conversation that renders the rows the reader is already
+/// looking at, so the first frame after the click must be a PAINT: no full
+/// re-measure, and only the rows near the viewport built.
+///
+/// Measured before this: a 30-turn branch took 1.36s because the new session
+/// was a layout cache miss and every row was rebuilt.
+#[gpui::test]
+fn a_branch_adopts_the_layout_it_was_cut_from(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("branch-layout", 30);
+        let id = state.active_id.clone().expect("a session");
+        let body = "## 五\n\n列车进站，车门打开。车厢里坐着一个女孩。\n".repeat(60);
+        if let Some(session) = state.store.session_mut(&id) {
+            for message in session.messages.iter_mut() {
+                if message.role == crate::model::Role::Assistant {
+                    message.text = body.clone();
+                    message.timing_mut().start = Some(crate::state::now_ms());
+                    message.timing_mut().ms = Some(1_200);
+                }
+            }
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let resets_before = crate::ui::transcript::transcript_layout_resets();
+    let built_before = crate::ui::transcript::transcript_rows_built();
+
+    let last: &str = Box::leak(String::from("branch-59").into_boxed_str());
+    let bounds = cx
+        .debug_bounds(last)
+        .expect("the newest reply's branch control");
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    draw_until(cx, "the branch opens", DRAW_UNTIL_MAX, |_cx| {
+        shell.read_with(_cx, |this, _| {
+            this.state
+                .active_session()
+                .map(|session| session.title.contains("(2)"))
+                .unwrap_or(false)
+        })
+    });
+
+    assert_eq!(
+        crate::ui::transcript::transcript_layout_resets(),
+        resets_before,
+        "a branch re-measured the whole transcript instead of adopting its rows"
+    );
+    let built = crate::ui::transcript::transcript_rows_built() - built_before;
+    assert!(
+        built < 45,
+        "the first frame after a branch built {built} of 60 rows; it must build the viewport"
+    );
+}
+/// A prompt carries its own footer: the time it was sent, then copy - right
+/// under the bubble and aligned to its right edge.
+#[gpui::test]
+fn a_prompt_carries_its_time_and_a_copy_control(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("user-actions", 1);
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[0].text = "aa".to_string();
+            session.messages[0].timing_mut().start = Some(crate::state::now_ms());
+            session.messages[1].timing_mut().start = Some(crate::state::now_ms());
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let bubble = cx
+        .debug_bounds("user-bubble-0")
+        .expect("the bubble renders");
+    let actions = cx
+        .debug_bounds("user-actions-0")
+        .expect("the prompt's action row renders");
+    let copy = cx
+        .debug_bounds("user-copy-0")
+        .expect("its copy control renders");
+    assert!(
+        actions.origin.y >= bubble.origin.y + bubble.size.height,
+        "the row sits below the bubble, not beside it"
+    );
+    assert_eq!(
+        actions.origin.x + actions.size.width,
+        bubble.origin.x + bubble.size.width,
+        "and it ends at the bubble's right edge"
+    );
+    assert_eq!(copy.size.width, px(28.0), "a measured 28px square");
+
+    cx.simulate_click(copy.center(), Modifiers::default());
+    draw_until(cx, "the prompt records the copy", DRAW_UNTIL_MAX, |_cx| {
+        shell.read_with(_cx, |this, _| this.copied_message == Some(0))
+    });
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("aa".to_string()),
+        "the copy control writes the prompt, not the reply"
+    );
+}
+/// The copy control writes the message it belongs to and marks that row.
+///
+/// Discrimination: the text asserted is the REPLY's, not the transcript's, so a
+/// control wired to the transcript-wide copy would fail.
+#[gpui::test]
+fn the_message_copy_control_copies_its_own_text(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("copy-message", 2);
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[3].text = "the second reply".to_string();
+            session.messages[3].timing_mut().start = Some(crate::state::now_ms());
+            session.messages[3].timing_mut().ms = Some(1_200);
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let bounds = cx
+        .debug_bounds("copy-message-3")
+        .expect("the reply's copy control renders");
+    assert_eq!(bounds.size.width, px(28.0), "a measured 28px square");
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    draw_until(cx, "the row records the copy", DRAW_UNTIL_MAX, |_cx| {
+        shell.read_with(_cx, |this, _| this.copied_message == Some(3))
+    });
+    let copied = cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(copied.as_deref(), Some("the second reply"));
+}
+
+/// The branch control opens a new conversation holding the transcript up to the
+/// message it was pressed on.
+#[gpui::test]
+fn the_branch_control_opens_the_branch_at_its_message(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("branch-message", 3);
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            let last = session.messages.len() - 1;
+            session.messages[last].text = "the newest reply".to_string();
+            session.messages[last].timing_mut().start = Some(crate::state::now_ms());
+            session.messages[last].timing_mut().ms = Some(900);
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let original = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("a session"));
+
+    let bounds = cx
+        .debug_bounds("branch-5")
+        .expect("the newest reply's branch control renders");
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    draw_until(cx, "the branch opens", DRAW_UNTIL_MAX, |_cx| {
+        let active = shell.read_with(_cx, |this, _| this.state.active_id.clone());
+        active.as_deref() != Some(original.as_str())
+    });
+
+    let (branched, len, title) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        let branched = state.active_id.clone().expect("the branch opens");
+        let session = state.store.session(&branched).expect("the branch");
+        (branched, session.messages.len(), session.title.clone())
+    });
+    assert_ne!(branched, original, "the branch is its own conversation");
+    assert_eq!(len, 6, "it holds the transcript it branched from");
+    assert_eq!(title, "New chat (2)", "and its title counts up");
+    // The original keeps everything: branching copies, never moves.
+    assert_eq!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .store
+            .session(&original)
+            .expect("the original")
+            .messages
+            .len()),
+        6
+    );
+}
+
+/// A plain click on the transcript copies nothing: copy-on-selection is a
+/// DRAG, and a click must not re-copy whatever selection was left on screen.
+#[gpui::test]
+fn a_click_on_the_transcript_leaves_the_clipboard_alone(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("copy-on-selection-click", 2);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // A sentinel so "unchanged" is distinguishable from "never written".
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".to_string()));
+    });
+    let transcript = cx.debug_bounds("transcript").expect("the scroller renders");
+    // A click inside the transcript's own padding, away from any control.
+    cx.simulate_click(
+        gpui_kit::point(transcript.origin.x + px(2.0), transcript.origin.y + px(2.0)),
+        Modifiers::default(),
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("sentinel".to_string()),
+        "a click is not a selection"
+    );
+}
+
 /// Copy Session ID puts the id on the clipboard, which is what a bug report
 /// needs.
 #[gpui::test]

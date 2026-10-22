@@ -10,8 +10,8 @@ use crate::tools::Tool;
 
 use super::{
     codex, dsh, Capability, Contribution, ContributionKind, Extension, ExtensionError,
-    ExtensionStandard, HookContribution, PromptContribution, Refusal, SkillContribution,
-    SkillDirContribution,
+    ExtensionStandard, HookContribution, PromptContribution, ProviderContribution, Refusal,
+    SkillContribution, SkillDirContribution,
 };
 
 /// A parsed package: the extension plus every part the shim refused.
@@ -414,6 +414,26 @@ impl ExtensionRegistry {
             .collect()
     }
 
+    /// Every model provider an installed package declares, with its owner.
+    ///
+    /// This is the seam a host reads to lower a package's LLM endpoints onto
+    /// its own provider tree. It is deliberately separate from
+    /// [`Self::apply_to_agent`]: a provider is not a tool or a hook, and the
+    /// model layer is a host surface like commands and panels, so a caller that
+    /// has no provider tree simply does not read it.
+    pub fn providers(&self) -> Vec<(&Extension, &ProviderContribution)> {
+        self.contributions()
+            .into_iter()
+            .filter_map(|(owner, contribution)| match contribution {
+                Contribution::Provider(provider) => self
+                    .extensions
+                    .get(owner)
+                    .map(|extension| (extension, provider)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every refusal recorded by an installed package.
     pub fn refusals(&self) -> &[Refusal] {
         &self.refusals
@@ -488,7 +508,13 @@ impl ExtensionRegistry {
                         })?;
                     applied.skill_dirs.push(dir.path.display().to_string());
                 }
-                Contribution::Command(_) | Contribution::Panel(_) | Contribution::Prompt(_) => {}
+                // Host surfaces: commands, panels, prompts and model providers
+                // are installed by the host's own registries, not on the agent's
+                // tool registry.
+                Contribution::Command(_)
+                | Contribution::Panel(_)
+                | Contribution::Prompt(_)
+                | Contribution::Provider(_) => {}
             }
         }
         Ok(applied)

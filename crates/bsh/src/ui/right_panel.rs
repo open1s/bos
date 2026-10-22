@@ -19,12 +19,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use gpui_kit::component::diff::{Diff, DiffEvent, DiffMode, DiffState};
 use gpui_kit::component::input::{
     Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
 };
 use gpui_kit::Focusable;
 use gpui_kit::*;
 
+use super::diff_pane;
 use super::shell::{Shell, SideDrag};
 use super::{hairline_left, handle_bar, icon, txt, DivExt, IconName};
 use crate::files::{self, Kind};
@@ -400,6 +402,10 @@ pub(crate) enum RightTab {
     /// The managed terminal: a real interactive shell on a persistent PTY,
     /// drawn from its own cell grid.
     Terminal,
+    /// The comparison surface: a patch, a conflicted file, or a file on its
+    /// own, drawn in unified or split. It is the one pane whose VIEW the reader
+    /// switches from the strip, so its two controls sit in the top bar.
+    Diff,
     /// The builtin browser. Not built yet; see [`RightTab::Terminal`].
     Browser,
 }
@@ -410,6 +416,7 @@ impl RightTab {
         match self {
             RightTab::Files => "right.tab.files",
             RightTab::Terminal => "right.tab.terminal",
+            RightTab::Diff => "right.tab.diff",
             RightTab::Browser => "right.tab.browser",
         }
     }
@@ -419,12 +426,18 @@ impl RightTab {
         match self {
             RightTab::Files => IconName::FolderOpen,
             RightTab::Terminal => IconName::SquareTerminal,
+            RightTab::Diff => IconName::GitCompareArrows,
             RightTab::Browser => IconName::Globe,
         }
     }
 
     /// Every pane the Start screen offers, in the order it lists them.
-    const ALL: [RightTab; 3] = [RightTab::Files, RightTab::Terminal, RightTab::Browser];
+    const ALL: [RightTab; 4] = [
+        RightTab::Files,
+        RightTab::Diff,
+        RightTab::Terminal,
+        RightTab::Browser,
+    ];
 }
 
 /// The right panel's own state: whether it is open, which pane is up, and the
@@ -448,6 +461,8 @@ pub(crate) struct RightPanel {
     pub(crate) terminal_selection: Option<crate::terminal::Selection>,
     /// The cell a terminal press started on, while a drag is in flight.
     pub(crate) terminal_anchor: Option<(u64, usize)>,
+    /// The comparison surface's own state: what it is showing, and how.
+    pub(crate) diff: super::diff_pane::DiffView,
 }
 
 /// The workspace browser's place in the tree, and the files open beside it.
@@ -676,7 +691,15 @@ impl Shell {
             // The reference hangs the same `.5px` rule on this seam that it
             // hangs on the sidebar's, so the panel reads as a column of the
             // same family.
-            .child(self.right_panel_body(cx));
+            .child({
+                let started = std::time::Instant::now();
+                let body = self.right_panel_body(cx);
+                let took = started.elapsed();
+                if took.as_millis() >= 2 {
+                    eprintln!("BSHPROBE right_panel_body {:?} tab={:?}", took, self.right.tab);
+                }
+                body
+            });
         Some(
             div()
                 .debug_selector(|| String::from("right-panel-frame"))
@@ -978,6 +1001,7 @@ impl Shell {
 
     /// The panel body: the Start screen, or the chosen pane.
     fn right_panel_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let __all = std::time::Instant::now();
         let body = div()
             .debug_selector(|| String::from("right-panel-body"))
             .flex_1()
@@ -988,8 +1012,18 @@ impl Shell {
             .overflow_hidden();
         match self.right.tab {
             None => body.child(self.right_start(cx)),
-            Some(RightTab::Files) => body.child(self.files_pane(cx)),
+            Some(RightTab::Files) => {
+                let t = std::time::Instant::now();
+                let pane = body.child(self.files_pane(cx));
+                let took = t.elapsed();
+                if took.as_millis() >= 2 {
+                    eprintln!("BSHPROBE files_pane {:?}", took);
+                }
+                let _ = __all;
+                pane
+            }
             Some(RightTab::Terminal) => body.child(self.terminal_pane(cx)),
+            Some(RightTab::Diff) => body.child(self.diff_pane(cx)),
             Some(RightTab::Browser) => {
                 body.child(self.right_pane_placeholder(self.right.tab.expect("Some arm")))
             }
@@ -1377,10 +1411,14 @@ impl Shell {
     /// 26px icon. The whole card is the target.
     fn right_start_card(&self, tab: RightTab, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.state.lang;
+        // A pane with no key binding draws no hint: the shortcut is a fact
+        // about the shell, and printing one nothing dispatches would be the
+        // exact "control that only looks wired" this crate refuses.
         let hint = match tab {
-            RightTab::Files => "\u{2318}P",
-            RightTab::Terminal => "\u{2325}`",
-            RightTab::Browser => "\u{2318}T",
+            RightTab::Files => Some("\u{2318}P"),
+            RightTab::Diff => None,
+            RightTab::Terminal => Some("\u{2325}`"),
+            RightTab::Browser => Some("\u{2318}T"),
         };
         div()
             .id(SharedString::from(format!("right-card-{}", tab.key())))
@@ -1428,6 +1466,7 @@ impl Shell {
                         txt(
                             lang.tr(match tab {
                                 RightTab::Files => "right.files.hint",
+                                RightTab::Diff => "right.diff.hint",
                                 RightTab::Terminal => "right.terminal.hint",
                                 RightTab::Browser => "right.browser.hint",
                             }),
@@ -1440,11 +1479,13 @@ impl Shell {
                         .min_w_0(),
                     ),
             )
-            .child(
-                txt(hint, theme::RIGHT_HINT_SIZE, theme::faint())
-                    .font_family("monospace")
-                    .flex_none(),
-            )
+            .when_some(hint, |card, hint| {
+                card.child(
+                    txt(hint, theme::RIGHT_HINT_SIZE, theme::faint())
+                        .font_family("monospace")
+                        .flex_none(),
+                )
+            })
             .on_click(cx.listener(move |this, _event, window, cx| {
                 this.open_right_tab(tab, cx);
                 // A terminal is a text surface: opening it puts the cursor
@@ -3467,6 +3508,241 @@ fn size_label(size: u64, dir: bool) -> String {
         return format!("{size} {}", UNITS[unit]);
     }
     format!("{value:.1} {}", UNITS[unit])
+}
+
+/// The comparison surface's own chrome and controls, kept beside the pane they
+/// belong to rather than in the panel's general body.
+impl Shell {
+    /// Open a workspace file as a comparison.
+    ///
+    /// The pane is reached by OPENING A FILE, not by a separate "pick a file"
+    /// flow: a `.diff`/`.patch` opens as the patch it is, a conflicted file
+    /// opens as the merge it is, and any other file opens as itself so the pane
+    /// never shows a blank surface for a file the reader asked about.
+    pub(crate) fn open_diff(&mut self, rel: &Path, cx: &mut Context<Self>) {
+        let Some(root) = self.state.workspace_root() else {
+            self.right.diff.error = Some(self.state.lang.tr("right.files.noWorkspace"));
+            self.right.tab = Some(RightTab::Diff);
+            self.right.open = true;
+            cx.notify();
+            return;
+        };
+        let Some(path) = files::resolve(&root, rel) else {
+            self.right.diff.error = Some(self.state.lang.tr("right.files.outside"));
+            self.right.tab = Some(RightTab::Diff);
+            self.right.open = true;
+            cx.notify();
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.right.diff.error = Some(io_msg(&error));
+                self.right.tab = Some(RightTab::Diff);
+                self.right.open = true;
+                cx.notify();
+                return;
+            }
+        };
+        // The bound is the editor's own: a patch is a document like any other,
+        // and a 40MB one would be pasted into a row list.
+        if bytes.len() as u64 > files::MAX_OPEN_BYTES {
+            self.right.diff.error = Some(self.state.lang.tr("diff.oversized"));
+            self.right.tab = Some(RightTab::Diff);
+            self.right.open = true;
+            cx.notify();
+            return;
+        }
+        let label = rel.to_string_lossy().to_string();
+        let (mut parsed, source) = match diff_pane::load(&label, &bytes) {
+            Ok(loaded) => loaded,
+            Err(key) => {
+                self.right.diff.error = Some(self.state.lang.tr(key));
+                self.right.tab = Some(RightTab::Diff);
+                self.right.open = true;
+                cx.notify();
+                return;
+            }
+        };
+        // The file table is shared with the editor, so a patch of a `.tsx` is
+        // highlighted as one and the two surfaces cannot disagree.
+        if let Some(language) = diff_pane::language_for(rel) {
+            parsed = parsed
+                .into_iter()
+                .map(|file| file.with_language(language))
+                .collect();
+        }
+        let conflicts: usize = parsed.iter().map(|file| file.conflicts().len()).sum();
+        let mode = diff_pane::mode_of(&self.state.settings.global.general.diff_mode);
+        let files = parsed.clone();
+        let state = cx.new(|cx| {
+            let mut state = DiffState::new(files, cx);
+            state.set_mode(mode, cx);
+            state
+        });
+        // The pane has to know when a conflict is resolved, because the save
+        // control appears only once nothing is left unresolved.
+        // The pane has to know when a conflict is resolved, because the save
+        // control appears only once nothing is left unresolved. Reading it off
+        // the state is what keeps a resolution made by the kit's own commands
+        // indistinguishable from one made anywhere else.
+        cx.subscribe(&state, |this, state, event: &DiffEvent, cx| {
+            if matches!(event, DiffEvent::ConflictResolved(..)) {
+                let state = state.read(cx);
+                let outstanding: usize = state
+                    .files()
+                    .iter()
+                    .map(|document| {
+                        (0..document.conflicts().len())
+                            .filter(|ix| state.conflict_resolution(document.path(), *ix).is_none())
+                            .count()
+                    })
+                    .sum();
+                this.right.diff.resolved = outstanding == 0;
+                cx.notify();
+            }
+        })
+        .detach();
+        self.right.diff.state = Some(state);
+        self.right.diff.path = Some(rel.to_path_buf());
+        self.right.diff.source = Some(source);
+        self.right.diff.error = None;
+        self.right.diff.conflicts = conflicts;
+        // Nothing is resolved the moment a conflicted file opens; the flag is
+        // recomputed on every resolution rather than assumed.
+        self.right.diff.resolved = conflicts == 0;
+        self.right.tab = Some(RightTab::Diff);
+        self.right.open = true;
+        cx.notify();
+    }
+
+    /// Set the comparison's view mode, remembering it for the next file.
+    ///
+    /// The mode is a preference, not a per-file fact: the reference keeps one
+    /// choice for the reader, so opening the next patch shows the shape they
+    /// last asked for.
+    pub(crate) fn set_diff_mode(&mut self, mode: DiffMode, cx: &mut Context<Self>) {
+        if let Some(state) = self.right.diff.state.clone() {
+            state.update(cx, |state, cx| state.set_mode(mode, cx));
+        }
+        self.right.diff.mode = mode;
+        let key = diff_pane::mode_key(mode);
+        if self.state.settings.global.general.diff_mode != key {
+            self.state.settings.global.general.diff_mode = key.to_string();
+            self.save_settings(cx);
+        }
+        cx.notify();
+    }
+
+    /// Flip between the two views, which is what the strip's control does.
+    pub(crate) fn toggle_diff_mode(&mut self, cx: &mut Context<Self>) {
+        let mode = match self.right.diff.mode {
+            DiffMode::Split => DiffMode::Unified,
+            _ => DiffMode::Split,
+        };
+        self.set_diff_mode(mode, cx);
+    }
+
+    /// Whether long lines wrap, remembering it like the mode.
+    pub(crate) fn toggle_diff_wrap(&mut self, cx: &mut Context<Self>) {
+        let wrap = !self.state.settings.global.general.diff_wrap;
+        self.state.settings.global.general.diff_wrap = wrap;
+        self.save_settings(cx);
+        cx.notify();
+    }
+
+    /// Write the merged text back over the conflicted file.
+    ///
+    /// Every conflict must be resolved first: a partially merged file is not a
+    /// merge, and writing one would leave markers on disk with the pane saying
+    /// it was done.
+    pub(crate) fn save_merged(&mut self, cx: &mut Context<Self>) {
+        let (Some(state), Some(rel)) =
+            (self.right.diff.state.clone(), self.right.diff.path.clone())
+        else {
+            return;
+        };
+        let Some(root) = self.state.workspace_root() else {
+            return;
+        };
+        let label = rel.to_string_lossy().to_string();
+        let Some(text) = state.read(cx).resolved_text(&label) else {
+            self.right.diff.error = Some(self.state.lang.tr("diff.unresolved"));
+            cx.notify();
+            return;
+        };
+        match files::write(&root, &rel, &text) {
+            Ok(()) => {
+                // The editor may hold the same file with the markers still in
+                // its buffer, so the tab is replaced rather than left stale.
+                self.files.tabs.retain(|tab| tab.rel != rel);
+                self.right.diff.resolved = false;
+                self.right.diff.conflicts = 0;
+                self.right.diff.source = None;
+                self.right.diff.error = None;
+                // Re-read it: the merged file has no conflicts left, so it comes
+                // back as its own single column, which is the proof it landed.
+                self.open_diff(&rel, cx);
+            }
+            Err(error) => {
+                self.right.diff.error = Some(io_msg(&error));
+                cx.notify();
+            }
+        }
+    }
+
+    /// The comparison surface.
+    pub(crate) fn diff_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let pane = div()
+            .debug_selector(|| String::from("diff-pane"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden();
+        let Some(state) = self.right.diff.state.clone() else {
+            // No comparison yet: name the three ways one arrives rather than
+            // drawing an empty box.
+            return pane
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(6.0))
+                        .px(px(theme::RIGHT_PAD))
+                        .child(icon(IconName::GitCompareArrows, 22.0, theme::faint()))
+                        .child(txt(lang.tr("diff.empty"), theme::CHIP_SIZE, theme::muted())),
+                )
+                .children(self.right.diff.error.clone().map(|error| {
+                    txt(error, theme::CHIP_SIZE, theme::error())
+                        .debug_selector(|| String::from("diff-error"))
+                }))
+                .into_any_element();
+        };
+        let wrap = self.state.settings.global.general.diff_wrap;
+        let mut body = div()
+            .debug_selector(|| String::from("diff-body"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .px(px(theme::RIGHT_PAD))
+            .py(px(6.0))
+            .child(Diff::new(&state).soft_wrap(wrap).h_full().w_full());
+        if let Some(error) = self.right.diff.error.clone() {
+            body = body.child(txt(error, theme::CHIP_SIZE, theme::error()));
+        }
+        pane.child(body).into_any_element()
+    }
 }
 
 #[cfg(test)]

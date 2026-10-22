@@ -1,0 +1,26 @@
+{
+  "name": "@local/dsh-zen",
+  "version": "0.3.14",
+  "private": true,
+  "description": "A fixture model-provider package: an imperative LLM adapter with a declarative carrier.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "engines": {
+    "dsh": ">=0.1.7"
+  }
+}

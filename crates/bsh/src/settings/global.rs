@@ -267,7 +267,41 @@ pub(crate) struct GlobalSettings {
     /// MCP servers every workspace gets, merged with each workspace's own.
     pub(crate) mcp_servers: Vec<serde_json::Value>,
     /// The provider tree, keyed by a concrete provider id.
+    ///
+    /// This is the reader's own document. A provider a plugin contributes does
+    /// NOT live here - see `plugin_providers` - so a reload can rebuild that
+    /// set from the packages without ever rewriting what the user typed.
     pub(crate) providers: BTreeMap<String, Provider>,
+    /// Model providers contributed by installed extension packages, keyed by
+    /// provider id.
+    ///
+    /// Runtime state, never serialized: the packages on disk are the source of
+    /// truth, and this is the cache a build reads. It is rebuilt wholesale
+    /// whenever the extension inventory is loaded, so uninstalling a package
+    /// removes its providers without a migration.
+    ///
+    /// A plugin provider is looked up by every ``GlobalSettings`` read path
+    /// ([`GlobalSettings::lookup`], the protocol resolution, the model lists)
+    /// AFTER the reader's own tree, so a package can never shadow a provider the
+    /// reader declared by hand.
+    #[serde(skip)]
+    pub(crate) plugin_providers: BTreeMap<String, Provider>,
+    /// Whether a contributed provider needs a credential.
+    ///
+    /// A package that serves an open or anonymous lane declares
+    /// `requiresKey: false`, and this is where the host remembers it. Absent
+    /// ids read as key-bearing, which is the safe default: demanding a key that
+    /// turns out to be unnecessary is a visible refusal, while omitting one that
+    /// was needed is a request that fails at the endpoint.
+    #[serde(skip)]
+    pub(crate) plugin_provider_keys: BTreeMap<String, bool>,
+    /// The extension ids that contributed each plugin provider.
+    ///
+    /// The Models pane draws a provider's origin from this, so a reader can tell
+    /// a plugin's endpoint from their own at a glance, and a preset that allows
+    /// only some extensions can be honoured without a second scan.
+    #[serde(skip)]
+    pub(crate) plugin_provider_owners: BTreeMap<String, String>,
     /// Agent preset declarations, keyed by preset id. A declaration with the
     /// same id as a shipped preset replaces it outright.
     pub(crate) presets: BTreeMap<String, Preset>,
@@ -305,6 +339,9 @@ impl Default for GlobalSettings {
             schedules: Vec::new(),
             mcp_servers: Vec::new(),
             providers: BTreeMap::new(),
+            plugin_providers: BTreeMap::new(),
+            plugin_provider_keys: BTreeMap::new(),
+            plugin_provider_owners: BTreeMap::new(),
             presets: BTreeMap::new(),
             extensions: Vec::new(),
             market_indexes: Vec::new(),
@@ -423,6 +460,19 @@ pub(crate) struct General {
     pub(crate) performance_usage: String,
     /// Show the coding view: the trajectory tab and the Agent preset switch.
     pub(crate) developer_tools: bool,
+    /// How the Diff pane presents a comparison: "unified" or "split".
+    ///
+    /// The reference's review pane carries the same two-way choice
+    /// (`review.unified` / `review.split`) and keeps it for the reader rather
+    /// than per file, so it is one preference here too. Unknown values fall
+    /// back to unified, which is the reference's own default.
+    pub(crate) diff_mode: String,
+    /// Whether the Diff pane wraps long lines.
+    ///
+    /// The reference's third view control (`review.wrapAria`): a diff of a wide
+    /// file is unreadable without it, and a diff of a narrow one is noisier
+    /// with it, so the reader decides.
+    pub(crate) diff_wrap: bool,
     /// The session-list ordering a reader chose.
     pub(crate) session_sort: String,
     /// The workspace that was open; empty while none is registered.
@@ -453,6 +503,8 @@ impl Default for General {
             composer_enter: "queue".to_string(),
             performance_usage: "detailed".to_string(),
             developer_tools: true,
+            diff_mode: super::DEFAULT_DIFF_MODE.to_string(),
+            diff_wrap: false,
             session_sort: String::new(),
             active_workspace: String::new(),
             active_session: String::new(),
@@ -1338,12 +1390,82 @@ impl GlobalSettings {
 
     /// The provider a reference names, with the model entry it points at.
     ///
-    /// Resolves to none when either half is missing, which is the state a
+    /// The reader's own tree wins: a contributed provider is consulted only
+    /// when no hand-declared one carries the id, so a plugin can never shadow a
+    /// provider the reader wrote by hand. A half-made reference (a provider
+    /// with no such model) resolves to none either way, which is the state a
     /// session reports as unresolvable rather than silently replacing.
     pub(crate) fn lookup(&self, reference: &ModelRef) -> Option<(&Provider, &ModelEntry)> {
-        let provider = self.providers.get(&reference.provider)?;
+        let provider = self
+            .providers
+            .get(&reference.provider)
+            .or_else(|| self.plugin_providers.get(&reference.provider))?;
         let entry = provider.models.get(&reference.model)?;
         Some((provider, entry))
+    }
+
+    /// The provider node an id names, from the reader's tree or a plugin's.
+    ///
+    /// This is the one accessor a surface that only wants the node uses, so
+    /// "is this provider real" has a single answer that already accounts for
+    /// contributions.
+    pub(crate) fn provider(&self, id: &str) -> Option<&Provider> {
+        self.providers
+            .get(id)
+            .or_else(|| self.plugin_providers.get(id))
+    }
+
+    /// Whether an id names a provider a plugin contributed.
+    pub(crate) fn is_plugin_provider(&self, id: &str) -> bool {
+        !self.providers.contains_key(id) && self.plugin_providers.contains_key(id)
+    }
+
+    /// The extension id that contributed a provider, when one did.
+    pub(crate) fn plugin_provider_owner(&self, id: &str) -> Option<&str> {
+        self.plugin_provider_owners.get(id).map(String::as_str)
+    }
+
+    /// Whether a provider needs a credential.
+    ///
+    /// A contributed provider answers with what its package declared; every
+    /// other provider is key-bearing, because the reader's own tree is entered
+    /// through the form that requires one.
+    pub(crate) fn provider_requires_key(&self, id: &str) -> bool {
+        if self.is_plugin_provider(id) {
+            return self.plugin_provider_keys.get(id).copied().unwrap_or(true);
+        }
+        true
+    }
+
+    /// Replace the contributed provider set in one shot.
+    ///
+    /// Called once per extension-inventory load, never per frame: the three
+    /// maps are rebuilt together so a provider is never momentarily visible
+    /// without its owner or its key policy.
+    pub(crate) fn set_plugin_providers(
+        &mut self,
+        providers: BTreeMap<String, Provider>,
+        keys: BTreeMap<String, bool>,
+        owners: BTreeMap<String, String>,
+    ) {
+        self.plugin_providers = providers;
+        self.plugin_provider_keys = keys;
+        self.plugin_provider_owners = owners;
+    }
+
+    /// Every provider id, the reader's first then the contributed ones.
+    ///
+    /// Order is the contract: the panes and the composer draw this, and a
+    /// plugin's rows must not displace the reader's own.
+    pub(crate) fn provider_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.providers.keys().cloned().collect();
+        ids.extend(
+            self.plugin_providers
+                .keys()
+                .filter(|id| !self.providers.contains_key(*id))
+                .cloned(),
+        );
+        ids
     }
 }
 

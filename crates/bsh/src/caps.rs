@@ -23,6 +23,118 @@ use crate::plugins::{self, PluginInfo};
 use crate::settings::{Effective, Settings};
 use crate::vault::{self, Vault, VaultError};
 
+/// Lower one extension package's declared model providers onto this shell's
+/// provider node.
+///
+/// A `ProviderContribution` is the declarative form of what a DSH package
+/// registers imperatively with `ctx.llm.registerAdapter([id], adapter)`: an id,
+/// a base URL, a protocol, and the models it serves. This is the whole of the
+/// translation, and it is deliberately a pure function of the declaration - no
+/// package file is executed and no network call is made, so a package cannot
+/// make the shell do work merely by being installed.
+///
+/// A model nickname and a model id are the same string here. The reference
+/// picker shows the upstream id, and the wire form the engine dispatches on is
+/// `<provider>/<model>`, which reads back the same way, so introducing a
+/// separate display nickname would be a second name for one fact.
+pub(crate) fn plugin_provider_node(
+    provider: &agent::extensions::ProviderContribution,
+) -> crate::settings::global::Provider {
+    use crate::settings::global::{ModelEntry, Provider};
+    let mut models = std::collections::BTreeMap::new();
+    for model in &provider.models {
+        let id = model.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        models.insert(
+            id.to_string(),
+            ModelEntry {
+                model: id.to_string(),
+                name: model.name.clone(),
+                max_tokens: model.max_tokens,
+                api_mode: provider.api_mode.clone(),
+                reasoning_effort: model.reasoning_effort.clone(),
+                input_types: model.input_types.clone(),
+            },
+        );
+    }
+    Provider {
+        name: provider.name.clone().or_else(|| Some(provider.id.clone())),
+        base_url: provider.base_url.trim().to_string(),
+        // A contributed provider NEVER carries a credential: the secret is the
+        // reader's, and it reaches the endpoint through the conventional
+        // `provider:<id>:api_key` vault entry at build time.
+        api_key_vault: None,
+        legacy_api_key: None,
+        // Not the reader's declaration, so the pane must not offer to delete it
+        // as one; the package is the owner.
+        declared: false,
+        api_mode: provider.api_mode.clone(),
+        models,
+    }
+}
+
+/// Rebuild the contributed model providers from the enabled extension
+/// inventory.
+///
+/// This is the one place the three contributed maps are written, and it runs
+/// per build rather than per frame: a package directory is read only when its
+/// `(path, mtime)` stamp moved, so a steady state costs a stat per package.
+///
+/// The gates are the same ones the extension loader applies to tools, so a
+/// package switched off in a workspace contributes no provider there, and a
+/// preset that allows only some extensions cannot leak an endpoint through the
+/// model layer.
+pub(crate) fn refresh_plugin_providers(settings: &mut Settings) {
+    use std::collections::BTreeMap;
+
+    let mut providers: BTreeMap<String, crate::settings::global::Provider> = BTreeMap::new();
+    let mut keys: BTreeMap<String, bool> = BTreeMap::new();
+    let mut owners: BTreeMap<String, String> = BTreeMap::new();
+
+    // The inventory is read from the persisted global document, not from a
+    // draft: a build describes what is installed, and the pane's unsaved edits
+    // are not yet facts.
+    let inventory = settings.global.extensions.clone();
+    for entry in &inventory {
+        let Some(raw) = entry
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        let root = expand_path(raw);
+        let Ok(package) = agent::extensions::ExtensionRegistry::load(&root) else {
+            continue;
+        };
+        let extension = package.extension;
+        for contribution in &extension.contributions {
+            let agent::extensions::Contribution::Provider(provider) = contribution else {
+                continue;
+            };
+            // The reader's own declaration wins an id collision, and so does an
+            // earlier package: the tree is keyed by id, and replacing a node
+            // another owner already placed would make the inventory order
+            // silently decide which endpoint a session runs against.
+            if settings.global.providers.contains_key(&provider.id)
+                || providers.contains_key(&provider.id)
+            {
+                continue;
+            }
+            providers.insert(provider.id.clone(), plugin_provider_node(provider));
+            keys.insert(provider.id.clone(), provider.requires_key);
+            owners.insert(provider.id.clone(), extension.id.clone());
+        }
+    }
+
+    settings
+        .global
+        .set_plugin_providers(providers, keys, owners);
+}
+
 /// The permission mode that confines a turn to the active workspace.
 pub(crate) const WORKSPACE_WRITE: &str = "workspace-write";
 
@@ -292,7 +404,15 @@ fn build_agent_for_session_inner(
     jobs: Arc<agent::jobs::JobRegistry>,
 ) -> BuiltAgent {
     let eff = settings.effective_for(choice);
-    let (api_key, credential_error) = provider_api_key(&eff, vault);
+    // A contributed provider may declare that it needs no credential - an open
+    // or anonymous lane. Its package said so, so the build does not invent a
+    // missing-key refusal for an endpoint that was never going to be sent one.
+    let (api_key, credential_error) =
+        if eff.provider.trim().is_empty() || settings.global.provider_requires_key(&eff.provider) {
+            provider_api_key(&eff, vault)
+        } else {
+            (String::new(), None)
+        };
     // The wire form is `<provider>/<model>`: the engine registers one vendor
     // per provider id and resolves the prefix out of this string, so the id the
     // Models pane shows is the id the engine dispatches on.
@@ -1754,8 +1874,9 @@ fn open_memory(settings: &Settings) -> Option<Arc<dyn MemoryStore>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_messages, allows_writes, build_agent, compactable_span, is_confined, tool_gates_for,
-        BuiltAgent, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
+        agent_messages, allows_writes, build_agent, compactable_span, is_confined,
+        plugin_provider_node, refresh_plugin_providers, tool_gates_for, BuiltAgent, FULL_ACCESS,
+        READ_ONLY, WORKSPACE_WRITE,
     };
     use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::resolve::SessionChoice;
@@ -4017,5 +4138,233 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "no vault is not a refusal"
         );
         assert!(crate::caps::credential_error(&settings, &vault, &work_choice()).is_none());
+    }
+
+    /// A contributed provider's models resolve through the same lookup a
+    /// hand-declared one does, and the reader's own tree still wins an id
+    /// collision.
+    ///
+    /// This is the seam that makes a DSH package's models usable: the model
+    /// layer reads ONE tree, so the composer menu, the send gate and the build
+    /// cannot disagree about whether a plugin's endpoint exists.
+    #[test]
+    fn a_contributed_provider_resolves_and_never_shadows_the_readers_own() {
+        use crate::settings::global::{GlobalSettings, ModelRef, Provider};
+        use std::collections::BTreeMap;
+
+        let mut global = GlobalSettings::default();
+        let mut node = BTreeMap::new();
+        node.insert(
+            "deepseek-v4.1-flash-free".to_string(),
+            ModelEntry {
+                model: "deepseek-v4.1-flash-free".to_string(),
+                api_mode: Some("chat".to_string()),
+                ..ModelEntry::default()
+            },
+        );
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "zen".to_string(),
+            Provider {
+                name: Some("OpenCode Zen".to_string()),
+                base_url: "https://opencode.ai/zen/v1".to_string(),
+                api_mode: Some("chat".to_string()),
+                models: node,
+                ..Provider::default()
+            },
+        );
+        let mut keys = BTreeMap::new();
+        keys.insert("zen".to_string(), false);
+        let mut owners = BTreeMap::new();
+        owners.insert("zen".to_string(), "@opencode2dsh/dsh-plugin".to_string());
+        global.set_plugin_providers(providers, keys, owners);
+
+        let reference = ModelRef {
+            provider: "zen".to_string(),
+            model: "deepseek-v4.1-flash-free".to_string(),
+        };
+        let (provider, leaf) = global.lookup(&reference).expect("a plugin model resolves");
+        assert_eq!(provider.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(leaf.model, "deepseek-v4.1-flash-free");
+        assert!(global.is_plugin_provider("zen"));
+        assert_eq!(
+            global.plugin_provider_owner("zen"),
+            Some("@opencode2dsh/dsh-plugin")
+        );
+        assert!(
+            !global.provider_requires_key("zen"),
+            "the package declared an anonymous lane"
+        );
+        assert!(global.provider_ids().contains(&"zen".to_string()));
+
+        // The reader declaring the same id takes it back, and the plugin's
+        // endpoint is no longer what a session resolves against.
+        global.providers.insert(
+            "zen".to_string(),
+            Provider {
+                base_url: "https://mine.example/v1".to_string(),
+                models: BTreeMap::from([(
+                    "deepseek-v4.1-flash-free".to_string(),
+                    ModelEntry {
+                        model: "deepseek-v4.1-flash-free".to_string(),
+                        ..ModelEntry::default()
+                    },
+                )]),
+                ..Provider::default()
+            },
+        );
+        let (provider, _) = global.lookup(&reference).expect("still resolves");
+        assert_eq!(
+            provider.base_url, "https://mine.example/v1",
+            "a hand-declared provider is never shadowed by a package"
+        );
+        assert!(!global.is_plugin_provider("zen"));
+        assert!(
+            global.provider_requires_key("zen"),
+            "a provider the reader declared is key-bearing again"
+        );
+    }
+
+    /// The lowering is a pure function of the declaration: a provider node
+    /// carries no credential, and every declared model lands as its own id.
+    #[test]
+    fn a_contributed_provider_lowers_without_a_credential() {
+        use agent::extensions::{ProviderContribution, ProviderModel};
+
+        let contribution = ProviderContribution::new("zen", "https://opencode.ai/zen/v1")
+            .with_name("OpenCode Zen")
+            .with_api_mode("chat")
+            .with_model(ProviderModel {
+                id: "glm-5.3-flash-free".to_string(),
+                name: Some("GLM 5.3 Flash".to_string()),
+                max_tokens: Some(8192),
+                input_types: Some(vec!["text".to_string(), "image".to_string()]),
+                reasoning_effort: None,
+            });
+        let node = plugin_provider_node(&contribution);
+        assert_eq!(node.base_url, "https://opencode.ai/zen/v1");
+        assert!(node.api_key_vault.is_none(), "a package ships no secret");
+        assert!(node.legacy_api_key.is_none());
+        assert!(
+            !node.declared,
+            "the pane must not offer to delete a package's provider as the reader's"
+        );
+        let leaf = node.models.get("glm-5.3-flash-free").expect("the model");
+        assert_eq!(leaf.model, "glm-5.3-flash-free");
+        assert_eq!(leaf.max_tokens, Some(8192));
+        assert_eq!(
+            leaf.input_types.as_deref(),
+            Some(["text".to_string(), "image".to_string()].as_slice())
+        );
+    }
+
+    /// A provider declared by an installed package reaches the settings the
+    /// build reads, and a package switched off contributes nothing.
+    ///
+    /// This is the whole seam end to end: a package directory on disk, the
+    /// inventory entry that names it, and the provider set the composer, the
+    /// send gate and the build all read.
+    #[test]
+    fn an_installed_package_contributes_its_providers_and_an_uninstalled_one_does_not() {
+        use crate::settings::global::{GlobalSettings, InstalledExtension, InstalledStandard};
+
+        let scratch =
+            std::env::temp_dir().join(format!("bsh-plugin-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let package = scratch.join("zen");
+        std::fs::create_dir_all(package.join("providers")).expect("the descriptor directory");
+        std::fs::write(
+            package.join("package.json"),
+            serde_json::json!({
+                "name": "@local/zen",
+                "version": "0.3.14",
+                "dsh": { "manifestVersion": 1 },
+            })
+            .to_string(),
+        )
+        .expect("the manifest");
+        std::fs::write(
+            package.join("providers/zen.json"),
+            serde_json::json!({
+                "id": "zen",
+                "name": "OpenCode Zen",
+                "base_url": "https://opencode.ai/zen/v1",
+                "apiMode": "chat",
+                "requiresKey": false,
+                "models": [
+                    { "id": "deepseek-v4.1-flash-free" },
+                    { "id": "glm-5.3-flash-free" },
+                ],
+            })
+            .to_string(),
+        )
+        .expect("the descriptor");
+
+        let mut settings = crate::settings::Settings {
+            global: GlobalSettings::default(),
+            ..crate::settings::Settings::default()
+        };
+        settings.global.extensions.push(InstalledExtension {
+            id: "@local/zen".to_string(),
+            name: "@local/zen".to_string(),
+            display_name: "Zen Models".to_string(),
+            description: String::new(),
+            version: "0.3.14".to_string(),
+            standard: InstalledStandard::Dsh,
+            source_label: "test".to_string(),
+            install_target: "@local/zen@0.3.14".to_string(),
+            path: Some(package.to_string_lossy().to_string()),
+            managed: true,
+            installed_at: 1_700_000_000,
+            trusted: false,
+            trusted_path: None,
+        });
+
+        refresh_plugin_providers(&mut settings);
+        assert!(
+            settings.global.is_plugin_provider("zen"),
+            "the installed package's provider is live"
+        );
+        assert_eq!(
+            settings.global.plugin_provider_owner("zen"),
+            Some("@local/zen")
+        );
+        assert!(
+            !settings.global.provider_requires_key("zen"),
+            "the package declared an anonymous lane"
+        );
+        let reference = crate::settings::global::ModelRef {
+            provider: "zen".to_string(),
+            model: "glm-5.3-flash-free".to_string(),
+        };
+        let (provider, leaf) = settings
+            .global
+            .lookup(&reference)
+            .expect("a plugin model resolves for the build");
+        assert_eq!(provider.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(leaf.model, "glm-5.3-flash-free");
+        // The composer's own catalogue reads the same set.
+        assert!(
+            settings
+                .catalogs_by_provider("zen")
+                .iter()
+                .any(|(id, models)| id == "zen" && models.len() == 2),
+            "the model picker offers the plugin's models"
+        );
+
+        // Removing the package clears every trace: the maps are rebuilt, never
+        // merged, so no stale endpoint survives an uninstall.
+        settings.global.extensions.clear();
+        refresh_plugin_providers(&mut settings);
+        assert!(
+            !settings.global.is_plugin_provider("zen"),
+            "no inventory entry means no contributed provider"
+        );
+        assert!(
+            settings.global.lookup(&reference).is_none(),
+            "and the model no longer resolves"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

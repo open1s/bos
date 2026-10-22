@@ -3054,7 +3054,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let lang = self.state.lang;
-        let cards: Vec<AnyElement> = self
+        let mut cards: Vec<AnyElement> = self
             .state
             .draft()
             .global
@@ -3063,6 +3063,18 @@ impl Shell {
             .enumerate()
             .map(|(index, (id, provider))| self.provider_card(id, provider, index, cx))
             .collect();
+        // Contributed providers follow the reader's own, in their own read-only
+        // shape: the package owns the endpoint and its models, so offering Edit
+        // and Delete here would be two controls that cannot honour what they
+        // look like they do.
+        cards.extend(
+            self.state
+                .draft()
+                .global
+                .plugin_providers
+                .iter()
+                .map(|(id, provider)| self.plugin_provider_card(id, provider)),
+        );
         let listed = if cards.is_empty() {
             vec![self.model_empty_note(lang)]
         } else {
@@ -3205,6 +3217,122 @@ impl Shell {
         }
         card.into_any_element()
     }
+
+    /// One contributed provider, in the read-only shape the Models pane gives a
+    /// package's endpoint.
+    ///
+    /// The card mirrors the reader's own - same head, same model list - and
+    /// replaces the Edit/Delete pair with the two facts that are actually true
+    /// here: which package owns the route, and that the package manages it. An
+    /// endpoint a reload rebuilds from disk must not offer controls that would
+    /// write into a document it does not live in.
+    fn plugin_provider_card(
+        &self,
+        id: &str,
+        provider: &crate::settings::global::Provider,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let name = provider_label(id, provider.name.as_deref());
+        let owner = self
+            .state
+            .draft()
+            .global
+            .plugin_provider_owner(id)
+            .unwrap_or_default()
+            .to_string();
+        let mut identity = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .min_w_0()
+            .child(
+                txt(name, 16.0, theme::text())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .min_w_0()
+                    .text_ellipsis()
+                    .whitespace_nowrap(),
+            )
+            .child(
+                hairline_all(
+                    div()
+                        .px(px(6.0))
+                        .py(px(1.0))
+                        .rounded(px(3.0))
+                        .border_color(rgb(theme::border()))
+                        .child(txt(
+                            lang.tr("settings.pluginProviderTag"),
+                            11.0,
+                            theme::muted(),
+                        )),
+                )
+                .into_any_element(),
+            );
+        // The credential dot answers the same question it does on the reader's
+        // own card, from the provider's own declaration: a keyless lane is not
+        // a missing key.
+        if self.state.draft().global.provider_requires_key(id) {
+            let in_vault = self.state.vault.contains(&crate::vault::provider_key(id));
+            if in_vault {
+                identity = identity.child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded_full()
+                        .bg(rgb(theme::success()))
+                        .into_any_element(),
+                );
+            }
+        }
+        let head = identity.child(div().ml_auto().flex_none().child(txt(
+            lang.tr("settings.pluginProviderHosted"),
+            11.0,
+            theme::faint(),
+        )));
+        let mut body = div().flex().flex_col().gap(px(6.0));
+        body = body.child(txt(
+            crate::i18n::tr_with(lang, "settings.pluginProviderHint", &owner),
+            12.0,
+            theme::faint(),
+        ));
+        // The models the package serves. Read-only rows: they are the catalogue
+        // the selector draws, and the package is the only thing that can change
+        // it.
+        let mut models: Vec<String> = provider
+            .models
+            .values()
+            .map(|leaf| {
+                leaf.name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| leaf.model.clone())
+            })
+            .collect();
+        models.sort();
+        for model in models {
+            body = body.child(txt(model, 12.0, theme::muted()));
+        }
+        hairline_all(
+            div()
+                .id(SharedString::from(format!("plugin-provider-{id}")))
+                .debug_selector({
+                    let id = id.to_string();
+                    move || format!("plugin-provider-{id}")
+                })
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .p(px(16.0))
+                .mb(px(8.0))
+                .rounded(px(14.0))
+                .bg(rgb(theme::page()))
+                .border_color(rgb(theme::border_soft()))
+                .child(head)
+                .child(body),
+        )
+        .into_any_element()
+    }
+
     /// The provider editor: the measured card head and the model list under
     /// it. One text engine per model row, so a refusal repaints its own row.
     fn provider_editor(&self, id: &str, cx: &mut Context<Self>) -> AnyElement {

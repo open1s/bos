@@ -265,14 +265,19 @@ fn discovery_reads_both_standards_and_skips_other_directories() {
     installed.sort();
     assert_eq!(
         installed,
-        vec!["@local/dsh-echo".to_string(), "codex-deploy".to_string()]
+        vec![
+            "@local/dsh-echo".to_string(),
+            "@local/dsh-zen".to_string(),
+            "codex-deploy".to_string()
+        ]
     );
     assert_eq!(registry.by_standard(ExtensionStandard::Codex).len(), 1);
     assert_eq!(
         registry
             .by_standard(ExtensionStandard::DeepSeekHarness)
             .len(),
-        1
+        2,
+        "the echo fixture and the model-provider fixture"
     );
 }
 
@@ -372,4 +377,196 @@ async fn a_hook_contribution_reaches_the_agents_plugin_registry() {
         .await
         .expect("no veto");
     assert!(matches!(output, StreamTokenWrapper::Text(text) if text == "HI"));
+}
+
+/// A model-provider package declares its endpoint declaratively, and the
+/// imperative adapter it ALSO ships stays refused.
+///
+/// This is the shape the real `@opencode2dsh/dsh-plugin` has: an
+/// `apply(ctx, config)` that calls `ctx.llm.registerAdapter([id], adapter)`
+/// beside the declarative carrier. The capability is reported either way,
+/// because the package asked for models and the host must say so.
+#[test]
+fn a_model_provider_package_contributes_providers_and_still_refuses_its_script() {
+    let package = ExtensionRegistry::load(&fixture("dsh-provider")).expect("loads");
+    let extension = &package.extension;
+
+    assert!(
+        extension.has_capability(Capability::Models),
+        "the adapter call and the declarative carrier both declare models"
+    );
+
+    let providers: Vec<&agent::extensions::ProviderContribution> = extension
+        .contributions
+        .iter()
+        .filter_map(|contribution| match contribution {
+            Contribution::Provider(provider) => Some(provider),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(providers.len(), 1, "one declared provider");
+    let provider = providers[0];
+    assert_eq!(provider.id, "zen");
+    assert_eq!(provider.base_url, "https://opencode.ai/zen/v1");
+    assert_eq!(provider.api_mode.as_deref(), Some("chat"));
+    assert!(
+        !provider.requires_key,
+        "the package declared an anonymous lane"
+    );
+    let ids: Vec<&str> = provider
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "deepseek-v4.1-flash-free",
+            "glm-5.3-flash-free",
+            "nemotron-3.5-super-vl-free"
+        ],
+        "declaration order is preserved"
+    );
+    let vision = provider
+        .models
+        .iter()
+        .find(|model| model.id == "nemotron-3.5-super-vl-free")
+        .expect("the vision model");
+    assert_eq!(
+        vision.input_types.as_deref(),
+        Some(["text".to_string(), "image".to_string()].as_slice())
+    );
+
+    // The script is still refused, and the refusal says what DID land - a
+    // package whose models work must not read as wholly broken.
+    let refusal = package
+        .refusals
+        .iter()
+        .find(|refusal| refusal.feature == RefusedFeature::ImperativeHostEntry)
+        .expect("the host entry is refused");
+    assert!(
+        refusal.reason.contains("providers/*.json"),
+        "the refusal names the carrier that did load: {}",
+        refusal.reason
+    );
+    let client = package
+        .refusals
+        .iter()
+        .find(|refusal| refusal.feature == RefusedFeature::ImperativeClientEntry)
+        .expect("the client entry is refused");
+    assert!(
+        !client.reason.contains("providers/*.json"),
+        "the client refusal does not borrow the model sentence: {}",
+        client.reason
+    );
+}
+
+/// A package that declares a provider with no models, no base URL, or a
+/// non-HTTP base URL is refused by name rather than loading half an endpoint.
+#[test]
+fn a_provider_descriptor_is_validated_before_it_loads() {
+    let scratch = std::env::temp_dir().join(format!("dsh-provider-bad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    let write = |body: &str| {
+        std::fs::create_dir_all(scratch.join("providers")).expect("the descriptor directory");
+        std::fs::write(
+            scratch.join("package.json"),
+            json!({
+                "name": "@local/bad",
+                "version": "1.0.0",
+                "dsh": { "manifestVersion": 1 },
+            })
+            .to_string(),
+        )
+        .expect("the manifest");
+        std::fs::write(scratch.join("providers/one.json"), body).expect("the descriptor");
+    };
+
+    write(r#"{"id":"zen","base_url":"https://zen.example/v1","models":[]}"#);
+    let error = ExtensionRegistry::load(&scratch).expect_err("no models is refused");
+    assert!(
+        error.to_string().contains("at least one entry"),
+        "the message names the missing list: {error}"
+    );
+
+    write(r#"{"base_url":"https://zen.example/v1","models":[{"id":"a"}]}"#);
+    let error = ExtensionRegistry::load(&scratch).expect_err("no id is refused");
+    assert!(
+        error.to_string().contains("id"),
+        "the message names the missing id: {error}"
+    );
+
+    write(r#"{"id":"zen","base_url":"file:///etc/passwd","models":[{"id":"a"}]}"#);
+    let error = ExtensionRegistry::load(&scratch).expect_err("a non-HTTP URL is refused");
+    assert!(
+        error.to_string().contains("http"),
+        "the message names the scheme rule: {error}"
+    );
+
+    write(r#"{"id":"zen","models":[{"id":"a"}]}"#);
+    let error = ExtensionRegistry::load(&scratch).expect_err("no base URL is refused");
+    assert!(
+        error.to_string().contains("base_url"),
+        "the message names the missing URL: {error}"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// The registry hands a host every declared provider with its owner, and no
+/// provider is installed onto the AGENT: a model endpoint is a host surface,
+/// not a tool or a hook.
+#[test]
+fn declared_providers_are_readable_by_the_host_and_not_applied_to_the_agent() {
+    let registry = installed("dsh-provider");
+    let providers = registry.providers();
+    assert_eq!(providers.len(), 1, "one provider is reported");
+    assert_eq!(providers[0].0.id, "@local/dsh-zen", "with its owner");
+    assert_eq!(providers[0].1.id, "zen");
+
+    let mut agent = Agent::from_config(AgentConfig::default());
+    let applied = registry.apply_to_agent(&mut agent).expect("applies");
+    assert!(applied.tools.is_empty(), "a provider is not a tool");
+    assert!(applied.hooks.is_empty(), "a provider is not a hook");
+}
+
+/// A Codex package reads the same declarative carrier. A Codex manifest has no
+/// provider field at all, so a package that contributes one does it here, and
+/// nothing about the file is standard-specific.
+#[test]
+fn the_codex_shim_reads_the_same_provider_carrier() {
+    let scratch = std::env::temp_dir().join(format!("dsh-provider-codex-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(scratch.join(".codex-plugin")).expect("the manifest directory");
+    std::fs::create_dir_all(scratch.join("providers")).expect("the descriptor directory");
+    std::fs::write(
+        scratch.join(".codex-plugin/plugin.json"),
+        json!({ "name": "codex-zen", "version": "1.0.0" }).to_string(),
+    )
+    .expect("the manifest");
+    std::fs::write(
+        scratch.join("providers/zen.json"),
+        json!({
+            "id": "zen",
+            "base_url": "https://zen.example/v1",
+            "models": [{ "id": "a-free" }],
+        })
+        .to_string(),
+    )
+    .expect("the descriptor");
+
+    let package = ExtensionRegistry::load(&scratch).expect("loads");
+    assert_eq!(package.extension.standard, ExtensionStandard::Codex);
+    assert!(package.extension.has_capability(Capability::Models));
+    assert_eq!(
+        package
+            .extension
+            .contributions
+            .iter()
+            .filter(|contribution| matches!(contribution, Contribution::Provider(_)))
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
 }

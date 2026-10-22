@@ -1249,6 +1249,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "gpui-pre",
+ "libc",
  "log",
  "logging",
  "objc2 0.6.5",
