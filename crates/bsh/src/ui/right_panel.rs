@@ -580,12 +580,74 @@ impl FilesPane {
 }
 
 impl Shell {
+    /// Whether the panel is the column at the window's top-left corner.
+    ///
+    /// The panel is the LAST column of the row, so it only reaches x=0 when the
+    /// sidebar is folded AND the panel is wide enough to squeeze the main
+    /// column to nothing - a maximised panel asks for exactly the row's width,
+    /// which with no sidebar is the whole window. That is the state the band is
+    /// for: the panel's tab strip shares the traffic-light strip and starts
+    /// after the lights. A plain (non-maximised) panel is capped at half its
+    /// space, so it always has the main column beside it and never owns the
+    /// corner. The zero-width main column is not rendered in this state; see
+    /// `Shell::render`.
+    pub(crate) fn right_panel_owns_the_corner(&self) -> bool {
+        self.right.open
+            && self.sidebar_folded()
+            && self.viewport_w > 0.0
+            && self.right_panel_w() >= self.viewport_w
+    }
+
+    /// The titlebar band the panel owns when it is the window's corner column.
+    ///
+    /// The band IS the bar: the tab strip is drawn in the same 52px the
+    /// traffic lights sit in, so the panel reads as a titlebar rather than an
+    /// empty strip with the tabs pushed below it. The bar starts after the
+    /// lights; the stretch left over - exactly the inset's width - is the
+    /// drag region, so the corner still moves the window while the lights stay
+    /// uncovered and clickable (macOS draws them over the content, and this
+    /// strip only asks for the move). Only the column that owns the corner
+    /// draws it - see [`Shell::right_panel_owns_the_corner`] - which is why a
+    /// folded panel leaves no dead hole behind: the corner goes back to the
+    /// sidebar or the main column, which own it in their own right.
+    fn right_panel_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let zone = theme::traffic_light_inset();
+        div()
+            .debug_selector(|| String::from("titlebar-band"))
+            .w_full()
+            .h(px(zone.bottom))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .child(
+                div()
+                    .debug_selector(|| String::from("titlebar-drag"))
+                    .id("titlebar-drag")
+                    .w(px(zone.right))
+                    .h_full()
+                    .flex_none()
+                    .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
+                        // The same call AppKit's titlebar makes for a
+                        // system-dragged window: the band reads as the title
+                        // bar, not as a control.
+                        window.start_window_move();
+                    }),
+            )
+            .child(self.right_panel_bar(cx, true))
+    }
+
     /// The right panel column and its resize strip, absent while it is folded.
     pub(crate) fn render_right_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.right.open {
             return None;
         }
         let width = self.right_panel_w();
+        // The panel is the last column, so it normally sits beside the main
+        // column and away from the window's corner. The one state where it owns
+        // that corner is the maximised panel with the sidebar folded, and there
+        // its header takes the traffic-light band the sidebar gave up, through
+        // the one shared inset, like the header does with its folded left pad.
+        let owns_corner = self.right_panel_owns_the_corner();
         let column = div()
             .debug_selector(|| String::from("right-panel"))
             // The panel is a fixed column BESIDE a flex-1 main column, so a
@@ -601,10 +663,19 @@ impl Shell {
             .flex()
             .flex_col()
             .bg(rgb(theme::page()))
+            // One header, in one of its two placements: the band (bar and drag
+            // region sharing the traffic-light strip) when the panel owns the
+            // corner, or the plain 40px bar below it when it does not. They are
+            // alternatives, never both, so the strip is reserved exactly once.
+            .when(owns_corner, |column| {
+                column.child(self.right_panel_titlebar(cx))
+            })
+            .when(!owns_corner, |column| {
+                column.child(self.right_panel_bar(cx, false))
+            })
             // The reference hangs the same `.5px` rule on this seam that it
             // hangs on the sidebar's, so the panel reads as a column of the
             // same family.
-            .child(self.right_panel_bar(cx))
             .child(self.right_panel_body(cx));
         Some(
             div()
@@ -671,18 +742,46 @@ impl Shell {
 
     /// The panel's bar: the Start screen's title, or the tab strip and the
     /// controls the reference draws on every panel header.
-    fn right_panel_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    ///
+    /// `band` selects the placement, but both share ONE 28px content row, so a
+    /// 28px tab chip, a 26px file chip and a 26px control share one centre
+    /// line. The plain 40px header centres that row at y=6 (the open-sidebar
+    /// state); the traffic-light band starts it at
+    /// [`theme::RIGHT_BAR_BAND_PAD`] (10) so the row's centre is the window
+    /// buttons' own centre line (24), not the 52px strip's centre (26) - a
+    /// screenshot showed the row sitting high against the lights.
+    fn right_panel_bar(&self, cx: &mut Context<Self>, band: bool) -> impl IntoElement {
         let bar = div()
-            .debug_selector(|| String::from("right-panel-bar"))
-            .h(px(theme::RIGHT_BAR_H))
-            .flex_none()
+            // The header, not the seam's reveal bar: that one already carries
+            // "right-panel-bar", and two elements sharing a selector made the
+            // strip's bounds unreadable (debug_bounds returned the 2x72 bar).
+            .debug_selector(|| String::from("right-panel-header"))
+            .flex()
+            .flex_row()
+            .items_start()
             .px(px(theme::RIGHT_PAD))
+            .when(band, |bar| {
+                bar.h(px(theme::traffic_light_inset().bottom))
+                    .pt(px(theme::RIGHT_BAR_BAND_PAD))
+                    .flex_1()
+                    .min_w_0()
+            })
+            .when(!band, |bar| {
+                bar.h(px(theme::RIGHT_BAR_H))
+                    .pt(px(theme::RIGHT_BAR_TOP_PAD))
+                    .flex_none()
+            });
+        // The one row every placement uses: its 28px height is what gives the
+        // 28px and 26px chips the same vertical centre inside it.
+        let row = div()
+            .h(px(theme::RIGHT_TAB_H))
+            .w_full()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(4.0));
-        match self.right.tab {
-            None => bar
+        let content = match self.right.tab {
+            None => row
                 .child(icon(IconName::Compass, 15.0, theme::muted()))
                 .child(
                     txt(
@@ -704,55 +803,57 @@ impl Shell {
                 ))
                 .child(self.right_panel_close(cx)),
             Some(tab) => {
-                let mut row = bar.child(self.right_tab_chip(tab, cx));
+                let mut content = row.child(self.right_tab_chip(tab, cx));
                 // The files open out of the Files pane join the panel's own tab
                 // strip, right after its chip: the reference's dock carries
                 // every open pane and document in one strip, and a second strip
                 // inside the pane would read as two unrelated rows.
                 if tab == RightTab::Files {
                     for (index, file_tab) in self.files.tabs.iter().enumerate() {
-                        row = row.child(self.files_tab_chip(index, file_tab, cx));
+                        content = content.child(self.files_tab_chip(index, file_tab, cx));
                     }
                 }
-                row.child(
-                    div()
-                        .id("right-new-tab")
-                        .debug_selector(|| String::from("right-new-tab"))
-                        .w(px(26.0))
-                        .h(px(26.0))
-                        .rounded(px(theme::RADIUS_SM))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::hover())))
-                        .child(icon(IconName::Plus, 14.0, theme::faint()))
-                        // A new tab lands back on the Start screen, which is
-                        // the only place a pane can be picked from.
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.right.tab = None;
-                            cx.notify();
-                        })),
-                )
-                .child(div().flex_1())
-                // No strip control for the review drawer: the + that follows a
-                // selection is its door now, so the strip carries only the panel's
-                // own tabs and controls.
-                .child(self.right_panel_control(
-                    "right-maximize",
-                    if self.right.maximized {
-                        IconName::Minimize2
-                    } else {
-                        IconName::Maximize2
-                    },
-                    cx,
-                ))
-                // The rightmost control is the reference's own collapse
-                // control; a second panel-toggle before it would be the same
-                // action wearing two glyphs.
-                .child(self.right_panel_close(cx))
+                content
+                    .child(
+                        div()
+                            .id("right-new-tab")
+                            .debug_selector(|| String::from("right-new-tab"))
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(theme::RADIUS_SM))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::hover())))
+                            .child(icon(IconName::Plus, 14.0, theme::faint()))
+                            // A new tab lands back on the Start screen, which is
+                            // the only place a pane can be picked from.
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.right.tab = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
+                    // No strip control for the review drawer: the + that follows
+                    // a selection is its door now, so the strip carries only the
+                    // panel's own tabs and controls.
+                    .child(self.right_panel_control(
+                        "right-maximize",
+                        if self.right.maximized {
+                            IconName::Minimize2
+                        } else {
+                            IconName::Maximize2
+                        },
+                        cx,
+                    ))
+                    // The rightmost control is the reference's own collapse
+                    // control; a second panel-toggle before it would be the same
+                    // action wearing two glyphs.
+                    .child(self.right_panel_close(cx))
             }
-        }
+        };
+        bar.child(content)
     }
 
     /// The one open tab, with the close that drops the pane back to Start.
@@ -770,7 +871,7 @@ impl Shell {
         div()
             .id("right-tab")
             .debug_selector(|| String::from("right-tab"))
-            .h(px(28.0))
+            .h(px(theme::RIGHT_TAB_H))
             .px(px(8.0))
             .rounded(px(theme::RADIUS_SM))
             .when(selected, |chip| chip.bg(rgb(theme::selected_row())))

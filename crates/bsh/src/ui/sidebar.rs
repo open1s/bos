@@ -126,7 +126,7 @@ impl Shell {
             .flex()
             .flex_col()
             .pt(px(6.0))
-            .px(px(12.0))
+            .px(px(theme::SIDEBAR_PAD_X))
             .bg(rgb(theme::sidebar_bg()))
             .child(self.titlebar_row(cx))
             .child(self.brand_row())
@@ -139,16 +139,22 @@ impl Shell {
     }
 
     /// The strip the traffic lights sit in, with the sidebar's own fold control.
+    ///
+    /// The strip is the traffic-light zone itself: the sidebar owns the window's
+    /// top-left corner while it is open, so it reserves the measured 52px (see
+    /// [`crate::theme::traffic_light_inset`]) and the lights sit in the empty
+    /// left of the row, which AppKit keeps draggable as the window's titlebar.
     fn titlebar_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mark = if self.sidebar_folded() {
             IconName::PanelLeftOpen
         } else {
             IconName::PanelLeftClose
         };
+        let zone = crate::theme::traffic_light_inset();
         div()
-            .h(px(52.0))
+            .h(px(zone.bottom))
             .flex_none()
-            .pl(px(72.0))
+            .pl(px(zone.right - theme::SIDEBAR_PAD_X))
             .pb(px(2.0))
             .flex()
             .flex_row()

@@ -20479,3 +20479,431 @@ fn the_chips_row_wraps_instead_of_overflowing_a_narrow_card(cx: &mut TestAppCont
     );
     assert_composer_fits(cx, &shell, "400 wrapped");
 }
+
+/// The traffic-light zone's one rule: a control either starts past the lights or
+/// below them, so a pane that can own the window's top-left corner never has to
+/// invent a second number.
+fn assert_clear_of_traffic_lights(what: &str, rect: gpui_kit::Bounds<gpui_kit::Pixels>) {
+    let inset = crate::theme::traffic_light_inset();
+    let left = f32::from(rect.origin.x);
+    let top = f32::from(rect.origin.y);
+    let right = left + f32::from(rect.size.width);
+    let bottom = top + f32::from(rect.size.height);
+    assert!(
+        left >= inset.right || top >= inset.bottom,
+        "{what} must start past the lights (x >= {}) or below them (y >= {}): {rect:?}",
+        inset.right,
+        inset.bottom
+    );
+    assert!(
+        !(left < inset.right && right > 0.0 && top < inset.bottom && bottom > 0.0),
+        "{what} is drawn over the traffic-light zone {inset:?}: {rect:?}"
+    );
+}
+
+/// Whether two laid-out rectangles overlap. Touching edges do not count: the
+/// shell's seams are shared edges, not shared pixels.
+fn rects_overlap(
+    a: gpui_kit::Bounds<gpui_kit::Pixels>,
+    b: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> bool {
+    let (ax, ay) = (f32::from(a.origin.x), f32::from(a.origin.y));
+    let (bx, by) = (f32::from(b.origin.x), f32::from(b.origin.y));
+    ax < bx + f32::from(b.size.width)
+        && bx < ax + f32::from(a.size.width)
+        && ay < by + f32::from(b.size.height)
+        && by < ay + f32::from(a.size.height)
+}
+
+/// A rect the reader can see and press: wholly inside the window.
+fn assert_fully_on_screen(
+    what: &str,
+    rect: gpui_kit::Bounds<gpui_kit::Pixels>,
+    viewport_w: f32,
+    viewport_h: f32,
+) {
+    let left = f32::from(rect.origin.x);
+    let top = f32::from(rect.origin.y);
+    let right = left + f32::from(rect.size.width);
+    let bottom = top + f32::from(rect.size.height);
+    assert!(
+        left >= 0.0 && top >= 0.0,
+        "{what} starts off screen: {rect:?}"
+    );
+    assert!(
+        right <= viewport_w + 0.5 && bottom <= viewport_h + 0.5,
+        "{what} runs past the {viewport_w}x{viewport_h} window: {rect:?}"
+    );
+}
+
+/// The viewport the shell recorded on its last frame.
+fn recorded_viewport(cx: &mut VisualTestContext, shell: &Entity<Shell>) -> (f32, f32) {
+    cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (shell.viewport_w, shell.viewport_h)
+    })
+}
+
+/// With the sidebar folded, the maximised panel is the window's first column, so
+/// its tab strip occupies the traffic-light band itself and starts after the
+/// lights - not under them, and not on an empty strip above it.
+///
+/// The two screenshots this closes: first the Files chip at (12, 6), under the
+/// red/orange/green buttons at x=14..66, y=18..30; then a reserve drawn as an
+/// empty 52px strip with the tab strip pushed to y=52 and the body to y=92. The
+/// band is now the bar: top 0, height 52, with its 28px content row centred on
+/// the window buttons' own centre line (y=24, so the row starts at y=10), its
+/// content starting after the lights' 76px, and only the lights' own width
+/// carrying the window drag. The body starts at 52, so nothing is reserved
+/// twice.
+#[gpui::test]
+fn the_folded_shell_reserves_the_traffic_lights_for_the_maximised_panel(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_workspace_tree("corner-collapsed");
+        tests_pin_reference_defaults(&mut state);
+        state.sidebar_collapsed = true;
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The state the screenshot showed: no sidebar, and the panel asking for the
+    // whole row, which squeezes the main column to nothing.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Files, cx);
+            this.right.maximized = true;
+            cx.notify();
+        })
+    });
+    draw_until(
+        cx,
+        "the folded panel reserves the traffic-light corner",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("titlebar-drag").is_some(),
+    );
+
+    let (viewport_w, viewport_h) = recorded_viewport(cx, &shell);
+    let inset = crate::theme::traffic_light_inset();
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right_panel_owns_the_corner()),
+        "a maximised panel with no sidebar is the column at the window's top-left"
+    );
+
+    let panel = cx.debug_bounds("right-panel").expect("the panel renders");
+    assert_eq!(
+        panel.origin.x,
+        px(0.0),
+        "the maximised folded panel starts at the window's left edge: {panel:?}"
+    );
+    assert_eq!(
+        panel.size.width,
+        px(viewport_w),
+        "and takes the whole row: {panel:?}"
+    );
+
+    // The lights' zone, for the overlap checks below.
+    let lights = gpui_kit::Bounds::new(
+        gpui_kit::point(px(0.0), px(0.0)),
+        gpui_kit::size(px(inset.right), px(inset.bottom)),
+    );
+
+    // The drag region: the part of the band the bar does not use, i.e. exactly
+    // the lights' width at the window's left, at the band's full height. The
+    // native buttons draw over it, so it never paints over them; it only asks
+    // for the window move, which is how the titlebar still drags.
+    let strip = cx
+        .debug_bounds("titlebar-drag")
+        .expect("the band's drag region is drawn");
+    assert!(
+        f32::from(strip.origin.x) <= 0.5,
+        "the drag region starts at the window's left edge (the seam's .5px rule is inside it): {strip:?}"
+    );
+    assert_eq!(strip.origin.y, px(0.0), "and at the window's top");
+    assert_eq!(
+        strip.size.height,
+        px(inset.bottom),
+        "the drag region is the band's full height"
+    );
+    assert_eq!(
+        strip.size.width,
+        px(inset.right),
+        "and exactly as wide as the traffic lights, so the bar starts after them"
+    );
+
+    // The bar IS the band, not a row below it: top 0, the band's whole 52px.
+    let bar = cx
+        .debug_bounds("right-panel-header")
+        .expect("the panel's tab strip renders");
+    assert_eq!(
+        bar.origin.y,
+        px(0.0),
+        "the tab strip shares the traffic-light band: {bar:?}"
+    );
+    assert_eq!(
+        bar.size.height,
+        px(inset.bottom),
+        "the bar is the band's full 52px: {bar:?}"
+    );
+    assert!(
+        !rects_overlap(bar, lights),
+        "the bar starts after the lights rather than under them: {bar:?}"
+    );
+
+    // The first tab and every strip control clear the lights and stay inside
+    // the window, close and add included, at the right edge.
+    let tab = cx.debug_bounds("right-tab").expect("the Files tab renders");
+    assert!(
+        f32::from(tab.origin.x) >= inset.right,
+        "the first tab starts past the lights' right edge: {tab:?}"
+    );
+    assert!(
+        !rects_overlap(tab, lights),
+        "the first tab does not intersect the lights: {tab:?}"
+    );
+    assert_clear_of_traffic_lights("the Files tab", tab);
+    assert_fully_on_screen("the Files tab", tab, viewport_w, viewport_h);
+    assert_eq!(
+        tab.size.height,
+        px(28.0),
+        "the measured chip height is unchanged"
+    );
+    assert_eq!(
+        tab.origin.y,
+        px(crate::theme::RIGHT_BAR_BAND_PAD),
+        "the 28px row starts at the band pad that centres it on the buttons: {tab:?}"
+    );
+    let centre = f32::from(tab.origin.y) + f32::from(tab.size.height) / 2.0;
+    assert_eq!(
+        centre,
+        crate::theme::traffic_light_center_y(),
+        "the tab row is vertically centred on the system buttons, not on the 52px strip: {tab:?}"
+    );
+    assert!(
+        centre > 0.0 && centre < inset.bottom,
+        "the tab's vertical centre lies inside the 52px band: {centre}"
+    );
+    for id in ["right-new-tab", "right-maximize", "right-close"] {
+        let control = cx
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("{id} renders in the band"));
+        assert_clear_of_traffic_lights(id, control);
+        assert_fully_on_screen(id, control, viewport_w, viewport_h);
+        assert!(
+            f32::from(control.origin.y) >= 0.0
+                && f32::from(control.origin.y) + f32::from(control.size.height) <= inset.bottom,
+            "{id} sits inside the 52px band: {control:?}"
+        );
+        assert_eq!(control.size.height, px(26.0), "{id} keeps its size");
+        let control_centre = f32::from(control.origin.y) + f32::from(control.size.height) / 2.0;
+        assert_eq!(
+            control_centre,
+            crate::theme::traffic_light_center_y(),
+            "{id} shares the tab row's centre line with the buttons: {control:?}"
+        );
+        assert!(
+            !rects_overlap(control, lights),
+            "{id} stays to the right of the lights: {control:?}"
+        );
+    }
+
+    // The body starts where the band ends - 52, not 92: the strip is not
+    // reserved a second time under the bar.
+    let body = cx
+        .debug_bounds("right-panel-body")
+        .expect("the panel body renders");
+    assert_eq!(
+        body.origin.y,
+        px(inset.bottom),
+        "the body starts where the band ends: {body:?}"
+    );
+
+    // The panel's band and the main column's own header are separate surfaces:
+    // the collapsed state squeezes the main column away, but the two headers
+    // must not paint over one another.
+    let main_column = cx.debug_bounds("main-column");
+    assert!(
+        main_column.is_none(),
+        "the zero-width main column is not laid out at all, so it cannot spill a header under the band: {main_column:?}"
+    );
+    let main_header = cx.debug_bounds("hdr-header");
+    assert!(
+        main_header.is_none() || !rects_overlap(bar, main_header.expect("checked above")),
+        "the panel's bar and the main column's header must not overlap: bar {bar:?}, header {main_header:?}"
+    );
+
+    // Hit-testable for real, not only laid out: the add control takes a press.
+    let add = cx.debug_bounds("right-new-tab").expect("the add control");
+    cx.simulate_click(add.center(), Modifiers::default());
+    draw_until(cx, "the add control's press lands", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).right.tab.is_none())
+    });
+
+    // Fold the panel: the corner returns to the main column, so neither the
+    // strip nor an inert gap may survive it.
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, cx)));
+    draw_until(cx, "the Files pane is back", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-tab").is_some()
+    });
+    let close = cx.debug_bounds("right-close").expect("the close control");
+    cx.simulate_click(close.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the folded panel leaves no strip behind",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("right-panel").is_none() && cx.debug_bounds("titlebar-drag").is_none(),
+    );
+    let main = cx
+        .debug_bounds("main-column")
+        .expect("the main column takes the corner back");
+    assert_eq!(
+        main.origin.x,
+        px(0.0),
+        "with the panel away the main column starts at the window's edge: {main:?}"
+    );
+    assert_eq!(
+        main.size.width,
+        px(viewport_w),
+        "and it owns the whole row, so the inset leaves no dead hole: {main:?}"
+    );
+    let toggle = cx
+        .debug_bounds("hdr-show-sidebar")
+        .expect("the folded header's own controls");
+    assert!(
+        f32::from(toggle.origin.x) >= inset.right,
+        "the main column clears the lights to their right: {toggle:?}"
+    );
+    assert!(
+        cx.debug_bounds("titlebar-drag").is_none(),
+        "the strip belongs to the column that owns the corner, not to a hidden panel"
+    );
+}
+
+/// With the sidebar open the sidebar owns the window's top-left corner, so the
+/// right panel applies no reserve and keeps the tab numbers it shipped with.
+#[gpui::test]
+fn the_open_shell_keeps_the_panel_tab_strip_where_it_was(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_workspace_tree("corner-open");
+        tests_pin_reference_defaults(&mut state);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.open_right_tab(RightTab::Files, cx)));
+    draw_until(cx, "the Files tab renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-tab").is_some()
+    });
+
+    let (viewport_w, viewport_h) = recorded_viewport(cx, &shell);
+    let inset = crate::theme::traffic_light_inset();
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).right_panel_owns_the_corner()),
+        "the panel sits beside the main column while the sidebar is open"
+    );
+
+    // The sidebar is the column at the window's top-left, and it covers the zone.
+    let sidebar = cx.debug_bounds("sidebar").expect("the sidebar renders");
+    assert_eq!(sidebar.origin.x, px(0.0), "the sidebar owns the corner");
+    assert_eq!(sidebar.origin.y, px(0.0), "from the window's top");
+    assert!(
+        f32::from(sidebar.size.width) >= inset.right,
+        "and reaches past the lights: {sidebar:?}"
+    );
+    assert!(
+        f32::from(sidebar.size.height) >= inset.bottom,
+        "and below them: {sidebar:?}"
+    );
+
+    // The panel keeps the numbers it had before the reserve existed.
+    let panel = cx.debug_bounds("right-panel").expect("the panel renders");
+    assert_eq!(
+        panel.size.width,
+        px(crate::theme::RIGHT_PANEL_W),
+        "the default panel width is unchanged"
+    );
+    assert_eq!(
+        panel.origin.x,
+        px(viewport_w - crate::theme::RIGHT_PANEL_W),
+        "and it still ends at the window's right edge"
+    );
+    let bar = cx
+        .debug_bounds("right-panel-header")
+        .expect("the panel's tab strip renders");
+    assert_eq!(
+        bar.origin.y,
+        px(0.0),
+        "with the lights over the sidebar the panel's bar still starts at the top"
+    );
+    assert_eq!(bar.size.height, px(crate::theme::RIGHT_BAR_H));
+    let tab = cx.debug_bounds("right-tab").expect("the Files tab renders");
+    assert_eq!(
+        tab.origin.x,
+        panel.origin.x + px(12.5),
+        "the 12px bar padding over the seam's .5px rule: {tab:?}"
+    );
+    assert_eq!(
+        tab.origin.y,
+        px(6.0),
+        "the measured chip position is unchanged: {tab:?}"
+    );
+    assert_eq!(tab.size.height, px(28.0), "the measured chip height");
+    assert_clear_of_traffic_lights("the Files tab", tab);
+    assert_fully_on_screen("the Files tab", tab, viewport_w, viewport_h);
+    assert!(
+        cx.debug_bounds("titlebar-drag").is_none(),
+        "the sidebar owns the corner, so the panel adds no strip of its own"
+    );
+    for id in ["right-new-tab", "right-maximize", "right-close"] {
+        let control = cx
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("{id} renders in the strip"));
+        assert_clear_of_traffic_lights(id, control);
+        assert_fully_on_screen(id, control, viewport_w, viewport_h);
+        assert_eq!(control.size.height, px(26.0), "{id} keeps its size");
+        assert!(
+            f32::from(control.origin.y) >= 0.0,
+            "{id} is not clipped at the top: {control:?}"
+        );
+    }
+
+    // Even maximised, the sidebar keeps the corner: the panel moves right and
+    // its tabs stay exactly where they were.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.maximized = true;
+            cx.notify();
+        })
+    });
+    draw_until(
+        cx,
+        "the maximised panel settles beside the sidebar",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("right-panel")
+                .is_some_and(|panel| f32::from(panel.origin.x) > 280.0)
+        },
+    );
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).right_panel_owns_the_corner()),
+        "a maximised panel beside the sidebar still does not own the corner"
+    );
+    assert!(
+        cx.debug_bounds("titlebar-drag").is_none(),
+        "so it draws no reserve"
+    );
+    let tab = cx
+        .debug_bounds("right-tab")
+        .expect("the Files tab renders while maximised");
+    assert_eq!(
+        tab.origin.y,
+        px(6.0),
+        "maximising beside the sidebar moves no tab vertically: {tab:?}"
+    );
+    assert_clear_of_traffic_lights("the maximised Files tab", tab);
+    assert_fully_on_screen("the maximised strip", tab, viewport_w, viewport_h);
+}

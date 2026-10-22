@@ -597,11 +597,56 @@ pub(crate) const SIDEBAR_MAX: f32 = 420.0;
 /// margin-left:-4px, so it straddles the seam.
 pub(crate) const SIDEBAR_HANDLE_W: f32 = 8.0;
 
-/// The left pad the header needs while the sidebar is folded, so the folded
-/// state's two controls clear the window's traffic lights, which sit at x=14
-/// and run about 52px wide. The sidebar's own strip uses the same figure for
-/// the same reason.
-pub(crate) const SIDEBAR_LIGHT_PAD: f32 = 76.0;
+/// The sidebar root's own horizontal padding, measured `6px 12px`.
+///
+/// The column's children are inset by the root rather than each carrying its
+/// own copy, which is why a child that has to clear the traffic lights uses
+/// the inset less this figure.
+pub(crate) const SIDEBAR_PAD_X: f32 = 12.0;
+
+/// Where the window parks its three buttons, in window coordinates.
+///
+/// This is fed to TitlebarOptions::traffic_light_position, and the inset below
+/// is measured from it, so the reserve and the buttons cannot drift apart.
+pub(crate) const TRAFFIC_LIGHTS_ORIGIN: (f32, f32) = (14.0, 18.0);
+
+/// One standard window button's diameter, measured in the same pass as the
+/// origin above: three 12px buttons with two 8px gaps are the 52px span the
+/// inset's right edge rounds up from.
+pub(crate) const TRAFFIC_LIGHT_DIAMETER: f32 = 12.0;
+
+/// The vertical centre line of the window buttons: their measured 18px top plus
+/// half a button, i.e. y=24. This is what the corner column's tab row centres
+/// on; the 52px strip's own centre (26) is two pixels lower.
+pub(crate) const fn traffic_light_center_y() -> f32 {
+    TRAFFIC_LIGHTS_ORIGIN.1 + TRAFFIC_LIGHT_DIAMETER / 2.0
+}
+
+/// The zone the window's traffic lights occupy at the top-left corner.
+///
+/// BSH is frameless (see ui::run): macOS draws the three buttons over whatever
+/// the shell paints at the window's top-left, so the column that owns that
+/// corner has to leave this zone empty. right is how far the buttons reach -
+/// the measured 14px origin plus the roughly 52px of buttons, rounded up so a
+/// control starts past them; bottom is the reference's own 52px titlebar
+/// strip. A control that cannot start past right must start at or below
+/// bottom, and every column that can own the corner reads both from here
+/// instead of carrying its own copy of the numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TrafficLightInset {
+    /// The zone's right edge, measured from the window's left edge.
+    pub(crate) right: f32,
+    /// The zone's bottom edge, measured from the window's top edge.
+    pub(crate) bottom: f32,
+}
+
+/// The one measurement of the traffic-light zone; see [TrafficLightInset].
+pub(crate) const fn traffic_light_inset() -> TrafficLightInset {
+    TrafficLightInset {
+        right: 76.0,
+        bottom: 52.0,
+    }
+}
 
 /// The reference's SIDEBAR_AUTO_COLLAPSE: below this viewport width the
 /// sidebar folds to its collapsed width unless the reader expanded it over
@@ -685,6 +730,20 @@ pub(crate) const RIGHT_CARD_W: f32 = 380.0;
 
 /// The panel's header and tab-bar height.
 pub(crate) const RIGHT_BAR_H: f32 = 40.0;
+
+/// The right panel's tab row height: the measured 28px chip.
+pub(crate) const RIGHT_TAB_H: f32 = 28.0;
+
+/// The open bar's top pad: (40 - 28) / 2, which centres the tab row and is the
+/// 6px the open-sidebar test pins.
+pub(crate) const RIGHT_BAR_TOP_PAD: f32 = (RIGHT_BAR_H - RIGHT_TAB_H) / 2.0;
+
+/// The band's top pad: the row centres on the WINDOW BUTTONS, not on the 52px
+/// strip. The buttons centre on y=24 (see [`traffic_light_center_y`]), so a
+/// 28px row starts at y=10. The strip's own centre is 26, and a screenshot
+/// showed that centring on it alone left the tabs sitting high against the
+/// lights.
+pub(crate) const RIGHT_BAR_BAND_PAD: f32 = traffic_light_center_y() - RIGHT_TAB_H / 2.0;
 
 /// The padding the panel draws around its own body.
 pub(crate) const RIGHT_PAD: f32 = 12.0;

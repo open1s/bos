@@ -379,13 +379,14 @@ impl Shell {
     /// Measured: the header is 76 tall over a `10px 28px 0 20px` padding with a
     /// `.5px` `border-l3` rule under it; the tab strip adds its own 10px margin.
     ///
-    /// Folded, the row grows its left pad to 76: the window's traffic lights sit
-    /// at x=14 and run to about x=66, so the two controls the folded state adds
-    /// (Show left panel and Add Session) have to start past them rather than
-    /// underneath them. Open, the lights are over the sidebar and 20 is right.
+    /// Folded, the row grows its left pad to the traffic-light zone's right
+    /// edge: the window's lights are over the corner the sidebar gave up, so the
+    /// two controls the folded state adds (Show left panel and Add Session) and
+    /// the tabs start past them rather than underneath them. Open, the lights
+    /// are over the sidebar and 20 is right.
     pub(crate) fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pad_left = if self.sidebar_folded() {
-            theme::SIDEBAR_LIGHT_PAD
+            theme::traffic_light_inset().right
         } else {
             20.0
         };

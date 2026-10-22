@@ -3589,7 +3589,16 @@ impl Render for Shell {
             .when(!self.sidebar_folded(), |root| {
                 root.child(self.render_sidebar(cx))
             })
-            .child(self.render_main_column(cx))
+            // A maximised panel over a folded sidebar consumes the whole row:
+            // the main column gets zero width and draws nothing, and at that
+            // size it still LAYS ITS HEADER OUT across the panel's band (its
+            // folded 76px left pad alone makes the header 104px wide), which is
+            // an overlap the corner test pins. A zero-width column is not a
+            // column, so it is not rendered at all; closing the panel brings it
+            // back through the ordinary path and it owns the corner again.
+            .when(!self.right_panel_owns_the_corner(), |root| {
+                root.child(self.render_main_column(cx))
+            })
             .when_some(self.render_right_panel(cx), |root, panel| root.child(panel))
             // The jobs popover is painted after every column so it can overlap
             // the transcript and the right panel; it is opened from the header
