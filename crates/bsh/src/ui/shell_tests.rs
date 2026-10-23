@@ -1679,9 +1679,24 @@ fn rail_tick_click_scrolls_the_transcript(cx: &mut TestAppContext) {
     let last: &str = Box::leak(String::from("turn-tick-29").into_boxed_str());
     let bounds = cx.debug_bounds(last).expect("the last rail tick");
     cx.simulate_click(bounds.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let (at_last, _) = scroll(cx, &shell);
-    assert_eq!(at_last, -max, "the last tick must jump to the end");
+    // The transcript measures rows as they come into the prefetch band, so the
+    // end it jumps to can grow for a frame or two after the click: assert that
+    // it SETTLES at the end, not that it equals the height read before the jump.
+    draw_until(
+        cx,
+        "the transcript settles at the end",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.update(|_, cx| {
+                let handle = &shell.read(cx).transcript_scroll;
+                handle.offset().y == -handle.max_offset().y
+            })
+        },
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).following_tail),
+        "the newest tick keeps the transcript following the tail"
+    );
 }
 
 /// The plugin inventory carries a switch per plugin, and it writes the setting
@@ -6165,6 +6180,7 @@ fn market_fixture(name: &str) -> crate::market::MarketPlugin {
         description,
         keywords: Vec::new(),
         capabilities: extension.capabilities,
+        loaded_capabilities: Vec::new(),
         refusals,
         source_label: "test fixture".to_string(),
     }
@@ -6271,6 +6287,7 @@ fn remote_market_fixture() -> crate::market::MarketPlugin {
         description: "A plugin from a remote index.".to_string(),
         keywords: vec!["remote".to_string()],
         capabilities: Vec::new(),
+        loaded_capabilities: Vec::new(),
         refusals: 0,
         source_label: "Remote · Test Market".to_string(),
     }
@@ -14843,15 +14860,18 @@ fn fork_copies_the_transcript_into_a_new_session(cx: &mut TestAppContext) {
     );
 }
 
-
-/// TEMPORARY: where a frame's BUILD time goes.
+/// An unchanged frame must reuse the parsed markdown body, not re-parse it.
+///
+/// The kit decides whether to reparse by comparing the ALLOCATION it is handed;
+/// handing it a fresh clone every frame made every visible row re-parse its
+/// whole body per frame. The shell holds one state per body instead.
 #[gpui::test]
-fn probe_frame_cost(cx: &mut TestAppContext) {
+fn a_redraw_does_not_reparse_the_markdown_bodies(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("probe-frame", 30);
+        let mut state = state_with_turns("body-cache", 6);
         let id = state.active_id.clone().expect("a session");
-        let body = "## 五\n\n列车进站，车门打开。车厢里坐着一个女孩。\n".repeat(60);
+        let body = "## 五\n\n列车进站，车门打开。车厢里坐着一个女孩。\n".repeat(40);
         if let Some(session) = state.store.session_mut(&id) {
             for message in session.messages.iter_mut() {
                 if message.role == crate::model::Role::Assistant {
@@ -14862,16 +14882,20 @@ fn probe_frame_cost(cx: &mut TestAppContext) {
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
+    // The first frames parse what they paint and fill the cache.
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    let parsed = crate::ui::shell::bodies_parsed();
+    assert!(parsed > 0, "the first frames parse the visible bodies");
     for _ in 0..3 {
-        eprintln!("--- frame ---");
-        let start = std::time::Instant::now();
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        eprintln!("BSHPROBE frame {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);
     }
+    assert_eq!(
+        crate::ui::shell::bodies_parsed(),
+        parsed,
+        "an unchanged frame re-parsed a body instead of reusing its state"
+    );
 }
-
 /// A branch opens a conversation that renders the rows the reader is already
 /// looking at, so the first frame after the click must be a PAINT: no full
 /// re-measure, and only the rows near the viewport built.
@@ -19758,6 +19782,9 @@ fn a_long_transcript_only_builds_the_rows_near_the_viewport(cx: &mut TestAppCont
     const FRAME_CEILING: Duration = Duration::from_millis(120);
 
     init_test_app(cx);
+    // Counted from BEFORE the shell is built: opening a chat draws it, and that
+    // opening draw is the one that used to lay out the whole history.
+    let opening_before = crate::ui::transcript::transcript_rows_built();
     let state = state_with_turns("transcript-window", TURNS);
     // A second, short chat, so the switch path can be proved as well.
     let other = "transcript-window-other";
@@ -19776,10 +19803,19 @@ fn a_long_transcript_only_builds_the_rows_near_the_viewport(cx: &mut TestAppCont
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
-    // Two frames: the first measures every row (the one frame that pays for the
-    // whole transcript), the second reaches the steady state asserted here.
+    // The FIRST frame of a 400-message chat must already be virtualized: it used
+    // to measure every row, which is one frame that lays out the whole history.
+    // Only the prefetch band and the newest few are built now.
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    let opening = crate::ui::transcript::transcript_rows_built() - opening_before;
+    // The old path built every row here (measured: 456 with 400 messages). The
+    // band may be drawn a few times while the shell settles, so the ceiling is a
+    // few bands wide - row counts do not depend on the machine's speed.
+    assert!(
+        opening <= 120,
+        "opening a 400-message chat built {opening} rows; it must build the prefetch band"
+    );
 
     let before = crate::ui::transcript::transcript_rows_built();
     let started = Instant::now();

@@ -217,7 +217,12 @@ pub struct Extension {
     pub version: String,
     /// The standard the package was read as.
     pub standard: ExtensionStandard,
-    /// Capabilities the package declared or delivered.
+    /// Capabilities the package DECLARED, whether or not they loaded.
+    ///
+    /// A DSH package declares what its JavaScript host entry would register,
+    /// so this list can name a capability that nothing delivered. What the
+    /// host actually loaded is [`Extension::loaded_capabilities`], which is
+    /// derived from the contributions and cannot drift from them.
     pub capabilities: Vec<Capability>,
     /// Package root directory.
     pub source: PathBuf,
@@ -324,6 +329,37 @@ impl Extension {
     /// Whether the package declared `capability`.
     pub fn has_capability(&self, capability: Capability) -> bool {
         self.capabilities.contains(&capability)
+    }
+
+    /// The capabilities the host actually loaded.
+    ///
+    /// This is derived from the contributions and never from what the package's
+    /// source mentions. A capability the package ASKS for and a capability the
+    /// host DELIVERED are two different facts: a package whose script was
+    /// refused declares "models" and delivers none, and a row that prints the
+    /// declaration alone tells the reader it can select a model it cannot.
+    ///
+    /// The refusal list already names the parts that did not load, so a host
+    /// that draws both has the whole story: what arrived, and what was
+    /// declined.
+    pub fn loaded_capabilities(&self) -> Vec<Capability> {
+        let mut capabilities: Vec<Capability> = Vec::new();
+        for contribution in &self.contributions {
+            let capability = match contribution {
+                Contribution::Tool(_) => Capability::Tools,
+                Contribution::Hook(_) => Capability::Hooks,
+                Contribution::Command(_) => Capability::Commands,
+                Contribution::Skill(_) | Contribution::SkillDir(_) => Capability::Skills,
+                Contribution::Panel(_) => Capability::Panels,
+                Contribution::Prompt(_) => Capability::Prompts,
+                Contribution::Provider(_) => Capability::Models,
+            };
+            if !capabilities.contains(&capability) {
+                capabilities.push(capability);
+            }
+        }
+        capabilities.sort();
+        capabilities
     }
 }
 

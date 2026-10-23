@@ -7942,10 +7942,15 @@ impl Shell {
         if !plugin.source_label.is_empty() {
             meta_parts.push(plugin.source_label.clone());
         }
-        if !plugin.capabilities.is_empty() {
+        // The chips say what the host LOADED, not what the package declares:
+        // a DSH package declares its tools and models in a JavaScript host
+        // entry, so the declaration names capabilities that never arrived. The
+        // refusal pill beside the row is what tells the reader the rest was
+        // declined, and this line must not contradict it.
+        if !plugin.loaded_capabilities.is_empty() {
             meta_parts.push(
                 plugin
-                    .capabilities
+                    .loaded_capabilities
                     .iter()
                     .map(|capability| capability.as_str())
                     .collect::<Vec<_>>()

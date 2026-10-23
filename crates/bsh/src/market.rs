@@ -98,8 +98,15 @@ pub(crate) struct MarketPlugin {
     pub(crate) description: String,
     /// Search keywords (remote indexes declare these).
     pub(crate) keywords: Vec<String>,
-    /// Declared capabilities.
+    /// Declared capabilities: what the package says it does.
     pub(crate) capabilities: Vec<Capability>,
+    /// The capabilities that actually loaded, which is what the row's chip line
+    /// draws.
+    ///
+    /// A DSH package's payload lives in its JavaScript host entry, so it
+    /// DECLARES tools or models and delivers none. Printing the declaration
+    /// alone would tell the reader the package can select a model it cannot.
+    pub(crate) loaded_capabilities: Vec<Capability>,
     /// How many non-MCP parts the shim had to refuse (for example a Codex app
     /// connector). Declared MCP servers are started by BSH's MCP pool.
     pub(crate) refusals: usize,
@@ -184,6 +191,10 @@ fn add_candidate(
                 .clone()
                 .filter(|text| !text.trim().is_empty())
                 .unwrap_or_else(|| extension.name.clone());
+            // Read the loaded set before the fields are moved out of the
+            // extension, so the row's chips can say what arrived while the
+            // refusal pill says what did not.
+            let loaded_capabilities = extension.loaded_capabilities();
             scan.plugins.push(MarketPlugin {
                 id: extension.id,
                 name: extension.name,
@@ -193,6 +204,7 @@ fn add_candidate(
                 install: MarketInstall::Local(path.to_path_buf()),
                 description,
                 keywords: Vec::new(),
+                loaded_capabilities,
                 capabilities: extension.capabilities,
                 // BSH starts a package's MCP servers itself (mcp::extension_servers),
                 // so the shim's MCP refusal is not a user-visible gap here.
@@ -324,6 +336,7 @@ pub(crate) fn remote_market_plugins(index: &RemoteIndex) -> Vec<MarketPlugin> {
                 description: plugin.description.clone(),
                 keywords: plugin.keywords.clone(),
                 capabilities: Vec::new(),
+                loaded_capabilities: Vec::new(),
                 refusals: 0,
                 source_label: format!("Remote · {}", index.title),
             })
@@ -481,6 +494,7 @@ fn parse_dsh_catalog(
             description,
             keywords,
             capabilities: Vec::new(),
+            loaded_capabilities: Vec::new(),
             refusals: 0,
             source_label: provider.title.to_string(),
         });
@@ -570,6 +584,7 @@ fn parse_codex_catalog(
             description,
             keywords,
             capabilities: Vec::new(),
+            loaded_capabilities: Vec::new(),
             refusals: 0,
             source_label: provider.title.to_string(),
         });
@@ -1335,6 +1350,7 @@ mod tests {
             description: String::new(),
             keywords: Vec::new(),
             capabilities: Vec::new(),
+            loaded_capabilities: Vec::new(),
             refusals: 0,
             source_label: "Codex cache".to_string(),
         };
@@ -1354,6 +1370,7 @@ mod tests {
             description: String::new(),
             keywords: Vec::new(),
             capabilities: Vec::new(),
+            loaded_capabilities: Vec::new(),
             refusals: 0,
             source_label: "Test Market".to_string(),
         };

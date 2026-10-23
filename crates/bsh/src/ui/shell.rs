@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::text::TextViewState;
 use gpui_kit::*;
 
 use super::paging::{PageFlow, PageKey};
@@ -28,6 +29,29 @@ const COPY_FLASH: std::time::Duration = std::time::Duration::from_millis(1_000);
 /// and copying whatever selection happened to be left on screen would be a
 /// surprise rather than a service.
 pub(crate) const SELECTION_DRAG_PX: f32 = 3.0;
+
+// Bodies parsed since the process started, for the cache test.
+#[cfg(test)]
+thread_local! {
+    static BODIES_PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many markdown bodies this thread has parsed.
+#[cfg(test)]
+pub(crate) fn bodies_parsed() -> usize {
+    BODIES_PARSED.with(|parsed| parsed.get())
+}
+
+/// The parsed markdown bodies still in use: text, the frame that last drew it,
+/// and the state that parsed it.
+type BodyStates = std::collections::BTreeMap<(u8, u64), (String, u64, Entity<TextViewState>)>;
+
+/// How many parsed markdown bodies the shell keeps, in age order.
+///
+/// One screen of rows plus a screen of history: enough that scrolling and
+/// paging never reparse, small enough that a long chat cannot accumulate a
+/// parsed copy of every message it ever showed.
+const BODY_STATES_MAX: usize = 48;
 
 /// Whether a pointer gesture travelled far enough to be a SELECTION drag.
 ///
@@ -232,6 +256,20 @@ pub(crate) struct Shell {
     /// The measured height of every transcript row, so offscreen rows cost a
     /// spacer instead of a full message element on every frame.
     pub(crate) transcript_layout: std::cell::RefCell<super::transcript::TranscriptLayout>,
+    /// Parsed markdown bodies, one state entity per text, reused across frames.
+    ///
+    /// A `TextView` built from TEXT hands the state that text every frame, and
+    /// the state decides whether to reparse by comparing the ALLOCATION it was
+    /// given - a fresh clone is always "new", so every visible row re-parsed
+    /// and re-laid-out its whole body on every frame. Holding the state here
+    /// and handing it to `TextView::new` keeps an unchanged body parsed, and a
+    /// streamed one takes the append path.
+    ///
+    /// Keyed by (kind, content hash) and capped by age: two bodies with the same
+    /// text share one parse, and a body that scrolls away is evicted.
+    pub(crate) body_states: std::cell::RefCell<BodyStates>,
+    /// This frame's number, for the body-state cache's age.
+    pub(crate) frame_no: u64,
     /// The transcript content height as of the last frame. Following the tail
     /// compares against it, so content that grew this frame still counts as
     /// "the reader was at the bottom".
@@ -1210,6 +1248,8 @@ impl Shell {
             transcript_layout: std::cell::RefCell::new(
                 super::transcript::TranscriptLayout::default(),
             ),
+            body_states: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            frame_no: 0,
             tail_max: None,
             tail_session: None,
             following_tail: true,
@@ -3351,6 +3391,52 @@ impl Shell {
         cx.notify();
     }
 
+    /// The parsed body for one text, created once and reused while it matches.
+    ///
+    /// The identity is (kind, hash of the text): two bodies with identical text
+    /// genuinely render identically, so sharing one parse costs nothing and
+    /// saves a second one. The stored text is compared on a hit, so a hash
+    /// collision only costs a reparse, never a wrong body.
+    pub(crate) fn body_state(
+        &self,
+        kind: u8,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        let key = (kind, hasher.finish());
+        let frame = self.frame_no;
+        let mut states = self.body_states.borrow_mut();
+        if let Some((snapshot, used, state)) = states.get_mut(&key) {
+            if snapshot != text {
+                snapshot.clear();
+                snapshot.push_str(text);
+                let next = snapshot.clone();
+                // The streaming path: a body that grew keeps its parsed
+                // document and appends only the new tail.
+                state.update(cx, |state, cx| state.set_text(&next, cx));
+            }
+            *used = frame;
+            return state.clone();
+        }
+        #[cfg(test)]
+        BODIES_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
+        let state = cx.new(|cx| TextViewState::markdown(text, cx));
+        states.insert(key, (text.to_string(), frame, state.clone()));
+        // Bound the cache: drop the body that has gone longest without a paint.
+        if states.len() > BODY_STATES_MAX {
+            let oldest = states
+                .iter()
+                .min_by_key(|(_, (_, used, _))| *used)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                states.remove(&oldest);
+            }
+        }
+        state
+    }
     /// Take the window's current text selection to the clipboard, if a drag
     /// left one.
     ///
@@ -3436,6 +3522,10 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The markdown bodies' cache ages by frame: every body this frame paints
+        // is stamped, and the least recently painted is evicted when the cache
+        // fills.
+        self.frame_no = self.frame_no.wrapping_add(1);
         // The chip counts are cached per roster version, and the expanded job
         // rows read their output here: an unchanged ring costs two integers
         // instead of a 64 KiB copy.
@@ -3700,13 +3790,7 @@ impl Render for Shell {
             .bg(rgb(crate::theme::page()))
             .text_color(rgb(crate::theme::text()))
             .when(!self.sidebar_folded(), |root| {
-                let t = std::time::Instant::now();
-                let sidebar = self.render_sidebar(cx);
-                let took = t.elapsed();
-                if took.as_millis() >= 1 {
-                    eprintln!("BSHPROBE sidebar {took:?}");
-                }
-                root.child(sidebar)
+                root.child(self.render_sidebar(cx))
             })
             // A maximised panel over a folded sidebar consumes the whole row:
             // the main column gets zero width and draws nothing, and at that
@@ -3716,26 +3800,9 @@ impl Render for Shell {
             // column, so it is not rendered at all; closing the panel brings it
             // back through the ordinary path and it owns the corner again.
             .when(!self.right_panel_owns_the_corner(), |root| {
-                let t = std::time::Instant::now();
-                let main = self.render_main_column(cx);
-                let took = t.elapsed();
-                if took.as_millis() >= 1 {
-                    eprintln!("BSHPROBE main {took:?}");
-                }
-                root.child(main)
+                root.child(self.render_main_column(cx))
             })
-            .when_some(
-                {
-                    let t = std::time::Instant::now();
-                    let panel = self.render_right_panel(cx);
-                    let took = t.elapsed();
-                    if took.as_millis() >= 1 {
-                        eprintln!("BSHPROBE right {took:?}");
-                    }
-                    panel
-                },
-                |root, panel| root.child(panel),
-            )
+            .when_some(self.render_right_panel(cx), |root, panel| root.child(panel))
             // The jobs popover is painted after every column so it can overlap
             // the transcript and the right panel; it is opened from the header
             // chip and closes on an outside press (below) or a session switch.

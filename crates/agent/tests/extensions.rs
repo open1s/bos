@@ -461,6 +461,66 @@ fn a_model_provider_package_contributes_providers_and_still_refuses_its_script()
     );
 }
 
+/// A package whose whole payload is an imperative host entry - the shape
+/// every real DSH package ships, because the DSH manifest has no field for
+/// tools or models at all - declares capabilities it cannot deliver.
+///
+/// The declaration and the delivery are two different facts. The host entry
+/// is refused, so nothing loads, and a row that printed the declaration alone
+/// would tell the reader the package can select a model it cannot.
+#[test]
+fn a_script_only_package_declares_more_than_it_delivers() {
+    let package = ExtensionRegistry::load(&fixture("dsh-script-only")).expect("loads");
+    let extension = &package.extension;
+
+    assert!(
+        extension.has_capability(Capability::Models),
+        "the host entry asks for models, so the package declares the capability"
+    );
+    assert!(
+        package
+            .refusals
+            .iter()
+            .any(|refusal| refusal.feature == RefusedFeature::ImperativeHostEntry),
+        "the host entry is refused, because this build has no JavaScript runtime"
+    );
+
+    assert!(
+        extension.loaded_capabilities().is_empty(),
+        "nothing loaded, so the delivered set is empty - a package that delivered \
+         nothing must not claim a capability it refused to deliver"
+    );
+    assert!(
+        extension.contributions.is_empty(),
+        "the refused entry contributes nothing"
+    );
+}
+
+/// The declared set and the loaded set are separate, and the loaded set is
+/// derived from the contributions rather than tracked beside them.
+#[test]
+fn the_loaded_capabilities_follow_the_contributions() {
+    let package = ExtensionRegistry::load(&fixture("dsh-provider")).expect("loads");
+    let extension = &package.extension;
+
+    assert!(
+        extension.has_capability(Capability::Models),
+        "the declarative carrier declares models"
+    );
+    assert_eq!(
+        extension.loaded_capabilities(),
+        vec![Capability::Models],
+        "the declarative provider is the one capability that loaded"
+    );
+
+    // The package also ships a web client entry, which is refused, so it adds
+    // no panel: a client module is browser code and this host is native.
+    assert!(
+        !extension.loaded_capabilities().contains(&Capability::Panels),
+        "a refused client entry delivers no panel"
+    );
+}
+
 /// A package that declares a provider with no models, no base URL, or a
 /// non-HTTP base URL is refused by name rather than loading half an endpoint.
 #[test]

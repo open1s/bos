@@ -93,3 +93,34 @@ opt-level = 3
 # profile, exactly as the KDF above is compiled optimised for the same reason.
 [profile.dev.package.regorus]
 opt-level = 3
+
+# The transcript's per-frame cost is TEXT LAYOUT, and layout lives in the UI
+# stack: a debug build of it is what makes a long message cost tens of
+# milliseconds a frame (measured: ~50 ms per frame for four visible 3 KiB
+# markdown bodies, against ~10 ms for the same shell with nothing to lay out).
+# Optimising the stack keeps the debug binary - the one the round recipes
+# launch - close to what ships, and costs the release profile nothing.
+[profile.dev.package.gpui-pre]
+opt-level = 3
+
+[profile.dev.package.gpui-pre-sum-tree]
+opt-level = 3
+
+[profile.dev.package.gpui-base]
+opt-level = 3
+
+[profile.dev.package.gpui-component]
+opt-level = 3
+
+[profile.dev.package.gpui-kit]
+opt-level = 3
+
+[profile.dev.package.markdown]
+opt-level = 3
+
+# The font stack: shaping and rasterising every glyph a frame draws.
+[profile.dev.package.swash]
+opt-level = 3
+
+[profile.dev.package.fontdb]
+opt-level = 3

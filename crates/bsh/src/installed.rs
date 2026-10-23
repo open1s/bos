@@ -75,8 +75,19 @@ pub(crate) struct InstalledPlugin {
     /// draw: exact command lines, working directories and env KEYS. Empty for a
     /// package that declares none.
     pub(crate) mcp_launches: Vec<crate::mcp::McpLaunch>,
-    /// The capabilities the loaded package declared.
+    /// The capabilities the package DECLARED, whether or not they loaded.
+    ///
+    /// A package whose script was refused still declares what it would have
+    /// done, and the refusal line next to it says why it did not happen. This
+    /// list is the package's own claim.
     pub(crate) capabilities: Vec<String>,
+    /// The capabilities that actually LOADED, which is what the row's chip
+    /// line draws.
+    ///
+    /// The two lists differ whenever a package's payload was refused, and
+    /// drawing the declaration alone would tell the reader a package can
+    /// select a model it cannot.
+    pub(crate) loaded_capabilities: Vec<String>,
     /// The parts the shim refused.
     pub(crate) refusals: Vec<InstalledRefusal>,
     /// Why the package could not be read, when it could not.
@@ -151,7 +162,7 @@ impl InstalledPlugin {
 
     /// The capabilities as one line for the disclosure.
     pub(crate) fn capability_line(&self) -> String {
-        self.capabilities.join(", ")
+        self.loaded_capabilities.join(", ")
     }
 }
 
@@ -164,6 +175,7 @@ struct PackageMeta {
     version: String,
     standard: Option<InstalledStandard>,
     capabilities: Vec<String>,
+    loaded_capabilities: Vec<String>,
     refusals: Vec<InstalledRefusal>,
     /// Declared MCP servers, parsed for the trust disclosure. Values are absent
     /// by construction - [`crate::mcp::McpLaunch`] keeps env KEYS only.
@@ -191,9 +203,16 @@ impl PackageMeta {
                     .collect();
                 // The same declaration the MCP gate reads, but trusted or not:
                 // this is what the row must show before anything may start.
-                let mcp_launches = crate::mcp::declared_servers(root, &extension.id)
-                    .iter()
-                    .map(crate::mcp::ExtensionMcp::launch)
+                let mcp_launches: Vec<crate::mcp::McpLaunch> =
+                    crate::mcp::declared_servers(root, &extension.id)
+                        .iter()
+                        .map(crate::mcp::ExtensionMcp::launch)
+                        .collect();
+                // Read before the struct literal takes the fields by move.
+                let loaded_capabilities: Vec<String> = extension
+                    .loaded_capabilities()
+                    .into_iter()
+                    .map(|capability| capability.as_str().to_string())
                     .collect();
                 (
                     Some(Self {
@@ -204,9 +223,13 @@ impl PackageMeta {
                         standard: Some(InstalledStandard::from(extension.standard)),
                         capabilities: extension
                             .capabilities
-                            .into_iter()
+                            .iter()
                             .map(|capability| capability.as_str().to_string())
                             .collect(),
+                        // What the host actually loaded, which is the claim the
+                        // row's chip line makes. The declared list above stays
+                        // for the refusal disclosure beside it.
+                        loaded_capabilities,
                         refusals,
                         mcp_launches,
                     }),
@@ -302,6 +325,10 @@ impl InstalledCache {
             capabilities: meta
                 .as_ref()
                 .map(|meta| meta.capabilities.clone())
+                .unwrap_or_default(),
+            loaded_capabilities: meta
+                .as_ref()
+                .map(|meta| meta.loaded_capabilities.clone())
                 .unwrap_or_default(),
             refusals: meta
                 .as_ref()

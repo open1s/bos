@@ -1,7 +1,7 @@
 //! The conversation, the trajectory, and the empty states.
 
 use gpui_kit::component::highlighter::HighlightTheme;
-use gpui_kit::component::text::{markdown, TextViewStyle};
+use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
 
 /// What a click on a link in a message does.
@@ -25,6 +25,13 @@ use crate::i18n::{tr, Lang};
 use crate::model::{ChatMessage, PlanStatus, Role, Session, ToolEvent};
 use crate::settings::TranscriptPolicy;
 use crate::theme;
+
+/// Body-cache kinds: the transcript draws several independent markdown
+/// surfaces, and each keeps its own parsed entry.
+const BODY: u8 = 0;
+const THINK: u8 = 1;
+const COMPACTION: u8 = 2;
+const STEP: u8 = 3;
 
 /// A reasoning block's collapsed summary: the first line, with the emphasis
 /// markers stripped.
@@ -779,19 +786,6 @@ impl TranscriptLayout {
         self.heights.get(index).copied().flatten()
     }
 
-    /// Whether a row's last painted box meets the viewport plus overdraw.
-    ///
-    /// `None` means the row has never been painted, so it must be built to be
-    /// measured - the one frame that pays for the whole transcript.
-    fn is_visible(scroll: &ScrollHandle, index: usize, overdraw: Pixels) -> Option<bool> {
-        let bounds = scroll.bounds_for_item(index)?;
-        let view = scroll.bounds();
-        let offset = scroll.offset().y;
-        Some(
-            bounds.bottom() + offset > view.top() - overdraw
-                && bounds.top() + offset < view.bottom() + overdraw,
-        )
-    }
 }
 
 /// Whether a message row carries images.
@@ -916,9 +910,11 @@ impl Shell {
     /// Which message rows this frame must build.
     ///
     /// `Some(height)` culls the row to a same-sized spacer; `None` builds it.
-    /// The last few rows, row 0, and anything near the viewport are built; a row
-    /// whose height was never measured must be built too, which is the one
-    /// frame that pays for the whole transcript.
+    /// Only the rows inside the PREFETCH BAND are built: the visible area plus
+    /// TRANSCRIPT_OVERDRAW above and below, plus row 0 and the newest few. A row
+    /// outside the band is a spacer at its measured height, or at the
+    /// transcript's estimate while it has never been measured - so no frame ever
+    /// has to lay out the whole history.
     fn transcript_plan(
         &self,
         session: &Session,
@@ -928,7 +924,7 @@ impl Shell {
         policy: TranscriptPolicy,
     ) -> Vec<Option<f32>> {
         let mut layout = self.transcript_layout.borrow_mut();
-        let prepared = layout.prepare(
+        layout.prepare(
             TranscriptShape {
                 session: session.id.clone(),
                 width: self.chat_w().to_bits(),
@@ -941,63 +937,36 @@ impl Shell {
             rows,
             self.chat_drag.is_some() || self.sidebar_drag.is_some(),
         );
-        match prepared {
-            // Nothing reusable: every row is built once, which is what measures
-            // the transcript. A new session, width, font or policy costs this
-            // one frame; a paged read or a switch back does not.
-            Prepared::MeasureAll => vec![None; rows],
-            Prepared::Exact => {
-                layout.observe(&self.transcript_scroll);
-                let overdraw = px(TRANSCRIPT_OVERDRAW);
-                (0..rows)
-                    .map(|index| {
-                        if index == 0 || index + TRANSCRIPT_TAIL_BUILT >= rows {
-                            return None;
-                        }
-                        // A zero-height measurement cannot be trusted as a
-                        // spacer: the row would occupy no space and never be
-                        // scrolled to again. An image row keeps building too,
-                        // because its gallery can grow when the data URL
-                        // finishes decoding.
-                        if has_images(session, index) {
-                            return None;
-                        }
-                        let height = layout.height(index).filter(|height| *height >= 8.0)?;
-                        match TranscriptLayout::is_visible(&self.transcript_scroll, index, overdraw)
-                        {
-                            Some(false) => Some(height),
-                            _ => None,
-                        }
-                    })
-                    .collect()
-            }
-            // The rows moved under last frame's bounds (paging shifted them, or
-            // the session changed to a remembered layout), so visibility is
-            // read from the heights instead. Every measured row keeps its exact
-            // spacer; an unmeasured row is built, which for a page is the
-            // page's own rows.
-            Prepared::Stale => {
-                let view = self.transcript_scroll.bounds();
-                let view_h = f32::from(view.size.height);
-                let view_top = -f32::from(self.transcript_scroll.offset().y);
-                let estimate = layout.estimate();
-                let mut plans = Vec::with_capacity(rows);
-                let mut top = TRANSCRIPT_PAD_Y;
-                for index in 0..rows {
-                    let measured = layout.height(index).filter(|height| *height >= 8.0);
-                    let row_h = measured.unwrap_or(estimate);
-                    let forced = index == 0 || index + TRANSCRIPT_TAIL_BUILT >= rows;
-                    let visible = view_h > 0.0
-                        && top + row_h > view_top - TRANSCRIPT_OVERDRAW
-                        && top < view_top + view_h + TRANSCRIPT_OVERDRAW;
-                    let build =
-                        forced || measured.is_none() || has_images(session, index) || visible;
-                    plans.push(if build { None } else { measured });
-                    top += row_h + TRANSCRIPT_GAP;
-                }
-                plans
-            }
+        // One prefetch band for every state. A row inside the band is built; a
+        // row outside it is a spacer at its MEASURED height when it has one and
+        // at the transcript's estimate when it does not. Unmeasured rows are no
+        // longer forced to build: doing that made the first frame of a long chat
+        // - and every frame after a paging shift - lay out the whole history.
+        layout.observe(&self.transcript_scroll);
+        let view = self.transcript_scroll.bounds();
+        let view_h = f32::from(view.size.height);
+        let view_top = -f32::from(self.transcript_scroll.offset().y);
+        let estimate = layout.estimate();
+        let mut plans = Vec::with_capacity(rows);
+        let mut top = TRANSCRIPT_PAD_Y;
+        for index in 0..rows {
+            let measured = layout.height(index).filter(|height| *height >= 8.0);
+            let row_h = measured.unwrap_or(estimate);
+            let forced = index == 0 || index + TRANSCRIPT_TAIL_BUILT >= rows;
+            let in_band = view_h > 0.0
+                && top + row_h > view_top - TRANSCRIPT_OVERDRAW
+                && top < view_top + view_h + TRANSCRIPT_OVERDRAW;
+            // An image row keeps building: its gallery can grow when a data URL
+            // finishes decoding, so a spacer would go stale.
+            let build = forced || has_images(session, index) || in_band;
+            // A row outside the band is a spacer at its MEASURED height, or at
+            // the estimate while it has never been measured: pushing `measured`
+            // here would push None, which the consumer reads as "build it", and
+            // the whole history came back.
+            plans.push(if build { None } else { Some(row_h) });
+            top += row_h + TRANSCRIPT_GAP;
         }
+        plans
     }
 
     /// The scrolling conversation.
@@ -1744,17 +1713,20 @@ impl Shell {
             );
         } else {
             column = column.child(
-                markdown(message.text.clone())
-                    .on_link_click(open_link)
-                    // Selectable, so the reader can quote a reply and so the
-                    // shell's copy-on-selection can take it from the clipboard
-                    // seam. The reference is a web page where every glyph is
-                    // selectable; a native text view has to say so.
-                    .selectable(true)
-                    .style(chrome.style.clone())
-                    .line_height(px(theme::body_line_at(chrome.content_size)))
-                    .text_size(px(theme::body_size_at(chrome.content_size)))
-                    .text_color(rgb(theme::text())),
+                {
+                    let body = self.body_state(BODY, &message.text, cx);
+                    TextView::new(&body)
+                }
+                .on_link_click(open_link)
+                // Selectable, so the reader can quote a reply and so the
+                // shell's copy-on-selection can take it from the clipboard
+                // seam. The reference is a web page where every glyph is
+                // selectable; a native text view has to say so.
+                .selectable(true)
+                .style(chrome.style.clone())
+                .line_height(px(theme::body_line_at(chrome.content_size)))
+                .text_size(px(theme::body_size_at(chrome.content_size)))
+                .text_color(rgb(theme::text())),
             );
         }
 
@@ -1923,11 +1895,14 @@ impl Shell {
                     .pl(px(22.0 + theme::delta_at(content)))
                     .py(px(4.0))
                     .child(
-                        markdown(record.summary.clone())
-                            .style(chrome.style.clone())
-                            .line_height(px(row_h))
-                            .text_size(px(small))
-                            .text_color(rgb(quiet)),
+                        {
+                            let body = self.body_state(COMPACTION, &record.summary, cx);
+                            TextView::new(&body)
+                        }
+                        .style(chrome.style.clone())
+                        .line_height(px(row_h))
+                        .text_size(px(small))
+                        .text_color(rgb(quiet)),
                     ),
             );
         }
@@ -2143,13 +2118,16 @@ impl Shell {
                     .pb(px(4.0))
                     .pl(px(22.0 + theme::delta_at(content)))
                     .child(
-                        markdown(message.reasoning.clone())
-                            .on_link_click(open_link)
-                            .selectable(true)
-                            .style(chrome.style.clone())
-                            .line_height(px(theme::summary_line_at(content)))
-                            .text_size(px(small))
-                            .text_color(rgb(theme::muted())),
+                        {
+                            let body = self.body_state(THINK, &message.reasoning, cx);
+                            TextView::new(&body)
+                        }
+                        .on_link_click(open_link)
+                        .selectable(true)
+                        .style(chrome.style.clone())
+                        .line_height(px(theme::summary_line_at(content)))
+                        .text_size(px(small))
+                        .text_color(rgb(theme::muted())),
                     ),
             );
         }
@@ -2815,12 +2793,15 @@ impl Shell {
                     ),
             );
         let body = match lang {
-            Some(lang) => markdown(format!("```{lang}\n{text}\n```"))
-                .style(chrome.style.clone())
-                .text_size(px(theme::CHIP_SIZE))
-                .max_h(px(theme::TOOL_BODY_MAX))
-                .overflow_hidden()
-                .into_any_element(),
+            Some(lang) => {
+                let body = self.body_state(STEP, &format!("```{lang}\n{text}\n```"), cx);
+                TextView::new(&body)
+            }
+            .style(chrome.style.clone())
+            .text_size(px(theme::CHIP_SIZE))
+            .max_h(px(theme::TOOL_BODY_MAX))
+            .overflow_hidden()
+            .into_any_element(),
             None => txt(
                 text.to_string(),
                 theme::CHIP_SIZE,
