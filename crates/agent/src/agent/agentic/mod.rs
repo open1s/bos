@@ -83,6 +83,15 @@ pub struct AgentConfig {
     pub timeout_secs: u64,
     /// Maximum ReAct steps before the run is stopped.
     pub max_steps: usize,
+    /// Token ceiling for ONE compaction (summarizer) request's input.
+    ///
+    /// The summarizer receives the oldest and newest slices of the shadowed span
+    /// rather than the whole span blindly, so a history larger than the model
+    /// window cannot turn into a provider error. The ceiling covers the
+    /// system prompt, the instruction and the bounded digest together; the
+    /// summary's own output is capped separately. Zero disables the bound and
+    /// keeps the legacy whole-span request.
+    pub compaction_input_tokens: usize,
     /// Offer the model a hosted web-search tool.
     ///
     /// A HOSTED tool, not a local one: the provider runs the search and returns
@@ -124,6 +133,7 @@ impl Default for AgentConfig {
             max_tokens: None,
             timeout_secs: 60,
             max_steps: 10,
+            compaction_input_tokens: 24_000,
             web_search: false,
             parallel_tool_calls: false,
             api_mode: "chat".to_string(),
@@ -181,6 +191,12 @@ impl AgentConfig {
     /// Set the maximum ReAct step count.
     pub fn max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
+        self
+    }
+
+    /// Set the input-token ceiling for one compaction (summarizer) request.
+    pub fn compaction_input_tokens(mut self, tokens: usize) -> Self {
+        self.compaction_input_tokens = tokens;
         self
     }
     /// Run one response's tool calls concurrently instead of one at a time.

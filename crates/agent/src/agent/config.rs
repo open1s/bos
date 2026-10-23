@@ -80,6 +80,9 @@ impl From<TomlAgentConfig> for AgentConfig {
             max_tokens: t.max_tokens,
             timeout_secs: t.timeout_secs,
             max_steps: t.max_steps.unwrap_or(10),
+            // The TOML surface has no compaction budget yet; the direct builder
+            // (`AgentConfig::compaction_input_tokens`) is how a host sets it.
+            compaction_input_tokens: AgentConfig::default().compaction_input_tokens,
             // A TOML agent config carries no switch for these yet; the host sets
             // the fields on the AgentConfig it builds directly.
             web_search: false,

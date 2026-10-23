@@ -478,13 +478,26 @@ impl Agent {
         // The summarizer reads the shadowed span as plain text and answers with
         // the checkpoint. Tools are withheld: the instruction forbids acting,
         // and a tool schema would only invite a call the backend must discard.
-        let mut replayed = String::new();
-        for message in &span {
-            replayed.push_str(&crate::agent::context::render_for_summary(message));
-            replayed.push('\n');
-        }
+        //
+        // The digest is BOUNDED. Sending the whole span was the defect behind
+        // "could not produce a useful summary": a history larger than the
+        // model window produced a provider 400 that the old string error then
+        // reported as a useless summary. The budget covers the system prompt,
+        // the instruction and the digest together, and the old/new slice rule
+        // keeps the original intent plus the work in progress.
+        let instruction_tokens =
+            crate::agent::context::estimate_tokens(crate::agent::context::COMPACTION_INSTRUCTION);
+        let system_tokens = crate::agent::context::estimate_tokens(&self.config.system_prompt);
+        let request_budget = self.config.compaction_input_tokens;
+        let overhead = instruction_tokens + system_tokens + 64;
+        let digest_budget = if request_budget == 0 {
+            0
+        } else {
+            request_budget.saturating_sub(overhead)
+        };
+        let digest = crate::agent::context::render_compaction_digest(&span, digest_budget);
         let prompt = format!(
-            "{replayed}\n\n---\n\n{}",
+            "{digest}\n\n---\n\n{}",
             crate::agent::context::COMPACTION_INSTRUCTION
         );
 
@@ -492,13 +505,22 @@ impl Agent {
             return Err(AgentError::Stopped);
         }
 
+        // A checkpoint is extraction, not writing: the summary should be as
+        // faithful as the reader can make it, and its output is capped well
+        // below the session's normal completion budget so a reasoning model
+        // cannot reserve the whole remaining window for this auxiliary call.
+        let summary_cap = self
+            .config
+            .max_tokens
+            .filter(|cap| *cap > 0)
+            .map_or(crate::agent::context::COMPACTION_MAX_OUTPUT_TOKENS, |cap| {
+                cap.min(crate::agent::context::COMPACTION_MAX_OUTPUT_TOKENS)
+            });
         let request = LlmRequest {
             model: self.config.model.clone(),
             input: Content::Text(prompt),
-            // A checkpoint is extraction, not writing: the summary should be as
-            // faithful as the reader can make it.
             temperature: Some(0.0),
-            max_tokens: self.config.max_tokens,
+            max_tokens: Some(summary_cap),
             reasoning_effort: self
                 .config
                 .reasoning_effort
@@ -517,7 +539,14 @@ impl Agent {
                 &mut self.prepare_context(),
             )
             .await
-            .map_err(|err| AgentError::Session(format!("compaction request failed: {err}")))?;
+            .map_err(|err| {
+                // The row names the cause; the log keeps the full provider text
+                // for the attempt the old generic sentence said was recorded.
+                log::warn!("compaction summarizer request failed: {err}");
+                AgentError::Compaction(crate::agent::context::CompactionFailure::from_llm_error(
+                    &err,
+                ))
+            })?;
 
         if signal.load(Ordering::SeqCst) {
             return Err(AgentError::Stopped);
@@ -528,8 +557,9 @@ impl Agent {
         // a summarizer that produced no usable text (a summary failure). Keep
         // that split: an empty answer is an error, not a silent no-op.
         if summary.trim().is_empty() {
-            return Err(AgentError::Session(
-                "summarization produced no text summary content".to_string(),
+            log::warn!("compaction summarizer returned an empty summary");
+            return Err(AgentError::Compaction(
+                crate::agent::context::CompactionFailure::EmptySummary,
             ));
         }
         // The checkpoint must buy context back. The shipped backend rejects a
@@ -541,9 +571,15 @@ impl Agent {
             content: Content::Text(framed),
         });
         if framed_tokens >= before_tokens {
-            return Err(AgentError::Session(format!(
-                "summary is not smaller than the shadowed content ({framed_tokens} >= {before_tokens})"
-            )));
+            log::warn!(
+                "compaction summary would not shrink the context: {framed_tokens} >= {before_tokens}"
+            );
+            return Err(AgentError::Compaction(
+                crate::agent::context::CompactionFailure::NotSmaller {
+                    framed_tokens,
+                    span_tokens: before_tokens,
+                },
+            ));
         }
 
         // Install only now: a failed or cancelled request must leave the

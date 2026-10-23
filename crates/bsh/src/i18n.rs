@@ -128,7 +128,7 @@ mod tests {
     fn compact_outcomes_use_the_reference_wording() {
         assert_eq!(
             tr(Lang::En, "slash.compactBusy"),
-            "Compaction is unavailable because this process has an active compaction, or the agent is not idle."
+            "Compaction is unavailable because this conversation has an active compaction, or its agent is not idle."
         );
         assert_eq!(
             tr(Lang::En, "slash.nothingToCompact"),
@@ -149,6 +149,25 @@ mod tests {
         assert_eq!(
             tr(Lang::En, "slash.compactCancelled"),
             "Compaction cancelled."
+        );
+        // Each reachable failure class has its own line: one generic sentence
+        // was hiding provider errors, empty answers and grow-gate refusals.
+        assert_eq!(
+            tr(Lang::En, "slash.compactEmpty"),
+            "The summarizer returned an empty summary; the history is unchanged."
+        );
+        assert_eq!(
+            tr(Lang::Zh, "slash.compactEmpty"),
+            "摘要模型返回了空内容；历史保持不变。"
+        );
+        assert!(tr(Lang::En, "slash.compactProvider").contains("{error}"));
+        assert!(tr(Lang::Zh, "slash.compactProvider").contains("{error}"));
+        assert!(tr(Lang::En, "slash.compactNotSmaller").contains("{framed}"));
+        assert!(tr(Lang::Zh, "slash.compactNotSmaller").contains("{span}"));
+        assert_ne!(
+            tr(Lang::En, "slash.compactNoModel"),
+            tr(Lang::En, "slash.compactSummary"),
+            "no-model is not a summary failure"
         );
         assert_eq!(
             tr(Lang::En, "slash.compactChanged"),

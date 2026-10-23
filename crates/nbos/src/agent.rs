@@ -547,6 +547,7 @@ impl From<PyAgentConfig> for AgentConfig {
             max_tokens: value.max_tokens,
             timeout_secs: value.timeout_secs,
             max_steps: value.max_steps,
+            compaction_input_tokens: agent::AgentConfig::default().compaction_input_tokens,
             parallel_tool_calls: false,
             web_search: false,
             api_mode: value.api_mode,

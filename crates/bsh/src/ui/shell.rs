@@ -64,6 +64,58 @@ pub(crate) fn selection_drag(dx: f32, dy: f32) -> bool {
     (dx * dx + dy * dy).sqrt() >= SELECTION_DRAG_PX
 }
 
+/// The row text one classified compaction failure earns.
+///
+/// One generic sentence used to hide every cause: a provider 400, an empty
+/// answer and a summary that would grow the context all landed on the same
+/// key. Each class now names itself, and a provider failure keeps the provider's
+/// own message so the reader can act on it (an oversized request reads as an
+/// oversized request, not as a useless summary).
+pub(crate) fn compact_failure_text(
+    lang: crate::i18n::Lang,
+    failure: &agent::agent::context::CompactionFailure,
+) -> String {
+    use agent::agent::context::CompactionFailure;
+    match failure {
+        CompactionFailure::Provider {
+            detail,
+            over_window,
+        } => {
+            let key = if *over_window {
+                "slash.compactProviderWindow"
+            } else {
+                "slash.compactProvider"
+            };
+            crate::i18n::tr_args(lang, key, &[("error", detail.clone())])
+        }
+        CompactionFailure::MissingCredential { detail } => crate::i18n::tr_args(
+            lang,
+            "slash.compactNoCredential",
+            &[("error", detail.clone())],
+        ),
+        CompactionFailure::EmptySummary => lang.tr("slash.compactEmpty"),
+        CompactionFailure::NotSmaller {
+            framed_tokens,
+            span_tokens,
+        } => crate::i18n::tr_args(
+            lang,
+            "slash.compactNotSmaller",
+            &[
+                ("framed", framed_tokens.to_string()),
+                ("span", span_tokens.to_string()),
+            ],
+        ),
+    }
+}
+
+/// The row text any non-classified compaction error earns.
+pub(crate) fn compact_error_text(lang: crate::i18n::Lang, error: &agent::AgentError) -> String {
+    match error {
+        agent::AgentError::Compaction(failure) => compact_failure_text(lang, failure),
+        other => crate::i18n::tr_args(lang, "slash.compactFailed", &[("error", other.to_string())]),
+    }
+}
+
 /// The window's only view.
 /// The custom preset editor: one TOML buffer keyed by preset id.
 pub(crate) struct PresetEditor {
@@ -285,7 +337,7 @@ pub(crate) struct Shell {
     /// The transcript content height as of the last frame. Following the tail
     /// compares against it, so content that grew this frame still counts as
     /// "the reader was at the bottom".
-    tail_max: Option<Pixels>,
+    pub(crate) tail_max: Option<Pixels>,
     /// The session the tail state belongs to, so switching sessions starts over.
     tail_session: Option<String>,
     /// Whether the newest message should stay in view. A rail jump clears it,
@@ -2117,6 +2169,7 @@ impl Shell {
         cx.notify();
     }
 
+    /// Compact the active conversation, the /compact command's entry point.
     pub(crate) fn compact_history(&mut self, cx: &mut Context<Self>) {
         let lang = self.state.lang;
         let Some(id) = self.state.active_id.clone() else {
@@ -2124,6 +2177,18 @@ impl Shell {
             cx.notify();
             return;
         };
+        self.compact_session(&id, cx);
+    }
+
+    /// Compact ONE named session.
+    ///
+    /// The admission flag is per session, so a caller may start this for a
+    /// session that is not active - and two different sessions run their
+    /// summarizer requests concurrently. The command keeps its own card and
+    /// boundary per session; only the transient notice is shared.
+    pub(crate) fn compact_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let lang = self.state.lang;
+        let id = session_id.to_string();
         // Admission first, the reference's own order: compactNow "requires an
         // idle agent with no waking queued work", so a stream, another
         // compaction, or a prompt already waiting behind this session all
@@ -2132,11 +2197,11 @@ impl Shell {
             || self.state.is_compacting(&id)
             || self.state.has_queued(&id)
         {
-            self.refuse_compact(&id, "slash.compactBusy", true, cx);
+            self.refuse_compact(&id, lang.tr("slash.compactBusy"), true, cx);
             return;
         }
         if !self.state.has_compactable_history(&id) {
-            self.refuse_compact(&id, "slash.nothingToCompact", false, cx);
+            self.refuse_compact(&id, lang.tr("slash.nothingToCompact"), false, cx);
             return;
         }
         // The same gate a turn passes: compaction is a model call, so it needs
@@ -2146,7 +2211,7 @@ impl Shell {
         // reports the same text rather than inventing a fourth outcome.
         let choice = self.state.session_choice(&id);
         if self.state.settings.refusal_for(&choice).is_some() {
-            self.refuse_compact(&id, "slash.compactSummary", true, cx);
+            self.refuse_compact(&id, lang.tr("slash.compactNoModel"), true, cx);
             return;
         }
         let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
@@ -2159,8 +2224,15 @@ impl Shell {
             self.state.subagents.clone(),
             self.state.jobs.clone(),
         );
-        if built.credential_error.is_some() {
-            self.refuse_compact(&id, "slash.compactSummary", true, cx);
+        if let Some(error) = built.credential_error.as_ref() {
+            // The vault's refusal is the real cause and names what is missing;
+            // reporting it as a generic summary failure hid a locked vault.
+            let text = crate::i18n::tr_args(
+                lang,
+                "slash.compactNoCredential",
+                &[("error", error.to_string())],
+            );
+            self.refuse_compact(&id, text, true, cx);
             return;
         }
         let agent = built.agent;
@@ -2184,7 +2256,7 @@ impl Shell {
             let mut probe = agent::agent::AgentSession::new();
             probe.restore_messages(crate::caps::agent_messages(&messages));
             let Some((removed, _)) = probe.split_for_compaction_at(retain) else {
-                self.refuse_compact(&id, "slash.nothingToCompact", false, cx);
+                self.refuse_compact(&id, lang.tr("slash.nothingToCompact"), false, cx);
                 return;
             };
             let start = AppState::compaction_boundary(session, removed.len(), replayed);
@@ -2221,7 +2293,8 @@ impl Shell {
                 // discards its error. Reporting one of those strings would be
                 // inventing a failure the reader could never act on, so only
                 // the reachable classes appear: `busy` (the gates above),
-                // `cancelled` (the unreachable stop arm), and `summary`.
+                // `cancelled` (the unreachable stop arm), and the classified
+                // summarizer failure the agent now carries.
                 let (text, error, landed) = match outcome {
                     // The command reports the SHADOWED span's price, which is
                     // what the shipped command's `shadowedTokenCount` names,
@@ -2254,7 +2327,16 @@ impl Shell {
                     Ok(Err(agent::AgentError::Stopped)) => {
                         (lang.tr("slash.compactCancelled"), true, None)
                     }
-                    Ok(Err(_)) | Err(_) => (lang.tr("slash.compactSummary"), true, None),
+                    Ok(Err(error)) => (compact_error_text(lang, &error), true, None),
+                    Err(error) => (
+                        crate::i18n::tr_args(
+                            lang,
+                            "slash.compactFailed",
+                            &[("error", error.to_string())],
+                        ),
+                        true,
+                        None,
+                    ),
                 };
                 if let Some(report) = landed {
                     // A landed checkpoint replaces the command row, which is
@@ -2282,8 +2364,14 @@ impl Shell {
     ///
     /// The reference returns these from the command handler, so they are
     /// `command/done` rows: the transcript keeps the card and the outcome text.
-    fn refuse_compact(&mut self, id: &str, key: &'static str, error: bool, cx: &mut Context<Self>) {
-        let text = self.state.lang.tr(key);
+    fn refuse_compact(
+        &mut self,
+        id: &str,
+        text: impl Into<String>,
+        error: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.into();
         self.state.begin_compact_command(id);
         self.state.finish_compact_command(id, text.clone(), error);
         self.state.notice(text);
@@ -2301,7 +2389,8 @@ impl Shell {
             let Some(id) = self.state.active_id.clone() else {
                 return;
             };
-            self.refuse_compact(&id, "slash.compactUsage", true, cx);
+            let text = self.state.lang.tr("slash.compactUsage");
+            self.refuse_compact(&id, text, true, cx);
             return;
         }
         self.compact_history(cx);
@@ -3975,6 +4064,60 @@ mod tests {
     // Named import: a glob would pull in gpui's re-export of the test attribute
     // macro, which shadows the builtin one its own expansion emits.
     use super::selection_drag;
+    use super::{compact_error_text, compact_failure_text};
+    use crate::i18n::Lang;
+    use agent::agent::context::CompactionFailure;
+
+    /// One row sentence per failure class, with the provider's own message and
+    /// the shrink gate's two counts carried through. A generic sentence would
+    /// make every class look like a useless summary.
+    #[test]
+    fn compaction_failures_name_the_real_cause() {
+        let provider = compact_failure_text(
+            Lang::En,
+            &CompactionFailure::Provider {
+                detail: "HTTP 400: maximum context length exceeded".to_string(),
+                over_window: false,
+            },
+        );
+        assert!(provider.contains("summarizer request failed"), "{provider}");
+        assert!(
+            provider.contains("maximum context length exceeded"),
+            "the provider's text survives: {provider}"
+        );
+
+        let window = compact_failure_text(
+            Lang::En,
+            &CompactionFailure::Provider {
+                detail: "request too large".to_string(),
+                over_window: true,
+            },
+        );
+        assert!(window.contains("model window"), "{window}");
+        assert_ne!(window, provider, "an over-window error reads differently");
+
+        let empty = compact_failure_text(Lang::En, &CompactionFailure::EmptySummary);
+        assert!(empty.contains("empty summary"), "{empty}");
+
+        let smaller = compact_failure_text(
+            Lang::En,
+            &CompactionFailure::NotSmaller {
+                framed_tokens: 900,
+                span_tokens: 800,
+            },
+        );
+        assert!(smaller.contains("900"), "{smaller}");
+        assert!(smaller.contains("800"), "{smaller}");
+        assert_ne!(smaller, empty);
+
+        // An unclassified error still surfaces its own text rather than
+        // falling back to the old generic sentence.
+        let other = compact_error_text(
+            Lang::En,
+            &agent::AgentError::Session("join failed".to_string()),
+        );
+        assert!(other.contains("join failed"), "{other}");
+    }
 
     /// Copy-on-selection copies on a DRAG and not on a click.
     #[test]

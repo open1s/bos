@@ -4,6 +4,7 @@
 //! crate re-exports them instead of maintaining parallel enums with lossy
 //! conversions. `AgentError` is the composition point.
 
+use crate::agent::context::CompactionFailure;
 use crate::skills::SkillError;
 use thiserror::Error;
 
@@ -28,6 +29,14 @@ pub enum AgentError {
     /// A session or skill operation failed.
     #[error("Session error: {0}")]
     Session(String),
+
+    /// A compaction attempt failed for a classified reason.
+    ///
+    /// Transparent so the failure keeps its own real wording: a caller that
+    /// matches this variant can report the provider's text, an empty answer, or
+    /// a shrink-gate refusal instead of one generic sentence.
+    #[error(transparent)]
+    Compaction(#[from] CompactionFailure),
 
     /// A bus RPC operation failed.
     #[error("Bus error: {0}")]

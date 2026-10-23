@@ -469,6 +469,12 @@ fn build_agent_for_session_inner(
             .clone()
             .filter(|level| !level.eq_ignore_ascii_case("off")),
         max_tokens: eff.max_tokens,
+        // The summarizer's request is bounded against the same window the
+        // session is configured to send into, less the checkpoint's own output
+        // reservation. Without this, a history larger than the window reached
+        // the provider whole and came back as an error the UI called a useless
+        // summary.
+        compaction_input_tokens: compaction_input_tokens(&eff),
         // A zero-step loop would return nothing, so the floor is one.
         max_steps: eff.max_steps.max(1),
         parallel_tool_calls: eff
@@ -877,6 +883,30 @@ fn provider_api_key(eff: &Effective, vault: &Vault) -> (String, Option<VaultErro
 ///
 /// The send path asks this before it opens a turn, so a locked vault is refused
 /// where the reader can see it rather than producing an unauthenticated request.
+/// The input-token budget one summarizer request may use.
+///
+/// The configured context budget is the request ceiling bsh already prices
+/// against, so the summarizer must fit inside it: the checkpoint's own output
+/// is reserved first (it is capped by the agent at
+/// `COMPACTION_MAX_OUTPUT_TOKENS`), then a small margin for the instruction and
+/// framing. A zero context budget means the setting disables pressure-based
+/// compaction, but a manual `/compact` still needs a sane ceiling, so the
+/// agent's default budget is kept rather than unbounded.
+fn compaction_input_tokens(eff: &Effective) -> usize {
+    compaction_input_tokens_for(eff.context_budget)
+}
+
+/// The pure budget rule, split out so a test can pin the arithmetic.
+fn compaction_input_tokens_for(context_budget: usize) -> usize {
+    if context_budget == 0 {
+        return agent::agent::AgentConfig::default().compaction_input_tokens;
+    }
+    let reserved_output = agent::agent::context::COMPACTION_MAX_OUTPUT_TOKENS as usize;
+    context_budget
+        .saturating_sub(reserved_output + 1_024)
+        .max(4_096)
+}
+
 /// The older span a compaction would fold out of one session, if any.
 ///
 /// This is the gate the Compact row reads before it builds an agent, so a
@@ -1927,6 +1957,26 @@ mod tests {
             messages.push(reply);
         }
         messages
+    }
+
+    /// The summarizer's input budget leaves the checkpoint's own output and the
+    /// instruction inside the configured window: the field log's successful
+    /// request already carried a 16710-token prompt while reserving 12800 for
+    /// the summary, leaving only ~3.2k of a 32k window for the next chunk.
+    #[test]
+    fn the_summarizer_budget_leaves_room_for_its_output() {
+        use super::compaction_input_tokens_for;
+        let max_output = agent::agent::context::COMPACTION_MAX_OUTPUT_TOKENS as usize;
+        assert_eq!(compaction_input_tokens_for(32_768), 27_648);
+        assert!(
+            compaction_input_tokens_for(32_768) + max_output <= 32_768,
+            "input + the capped summary output fits the window"
+        );
+        // A zero context budget still gives a manual /compact a sane ceiling,
+        // never the unbounded whole-span request.
+        assert_eq!(compaction_input_tokens_for(0), 24_000);
+        // A tiny window keeps a floor rather than a zero request.
+        assert_eq!(compaction_input_tokens_for(1_000), 4_096);
     }
 
     /// The Compact gate answers with the same selection the summarizer uses: a

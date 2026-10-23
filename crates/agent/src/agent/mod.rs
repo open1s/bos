@@ -8,8 +8,9 @@ pub mod plugin;
 
 pub use self::agentic::{Agent, AgentConfig, FallbackProvider};
 pub use context::{
-    AgentReActApp, AgentReactContext, AgentSession, CompactionOutcome, MessageContext,
-    SteerMailbox, SteerMessage, CHECKPOINT_PREAMBLE, COMPACTION_INSTRUCTION, MAX_STEER_DEPTH,
+    AgentReActApp, AgentReactContext, AgentSession, CompactionFailure, CompactionOutcome,
+    MessageContext, SteerMailbox, SteerMessage, CHECKPOINT_PREAMBLE, COMPACTION_INSTRUCTION,
+    MAX_STEER_DEPTH,
 };
 pub use hooks::external::{EventMatcher, ExternalHook, HookDispatcher, HookOutcome};
 pub use hooks::{AgentHook, HookContext, HookEvent, HookRegistry};

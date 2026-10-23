@@ -14,6 +14,7 @@ use serde_json::Value as JsonValue;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use thiserror::Error;
 
 /// Whether every tool call opened before `cut` is answered before it.
 ///
@@ -78,6 +79,180 @@ impl CompactionOutcome {
     pub fn freed_tokens(&self) -> usize {
         self.before_tokens.saturating_sub(self.after_tokens)
     }
+}
+
+/// Why one compaction attempt did not land.
+///
+/// The variants exist so a caller can report the REAL cause instead of one
+/// generic sentence: a provider failure carries the provider's own text, an
+/// empty answer is not a shrink-gate refusal, and a summary that would grow the
+/// context names both token counts. The display strings keep the wording the
+/// older string errors used, because callers and tests already read them.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CompactionFailure {
+    /// The summarizer request itself failed.
+    ///
+    /// `detail` is the provider's message verbatim. `over_window` is set when
+    /// that message names a context/token limit, so the UI can say the request
+    /// was too large rather than calling it a useless summary.
+    #[error("compaction request failed: {detail}")]
+    Provider {
+        /// The provider's own error text.
+        detail: String,
+        /// Whether the error names a context-window or token-limit overflow.
+        over_window: bool,
+    },
+    /// The provider rejected the request for a missing API key.
+    #[error("compaction request failed: {detail}")]
+    MissingCredential {
+        /// The provider's own error text.
+        detail: String,
+    },
+    /// The summarizer answered with no text at all.
+    #[error("summarization produced no text summary content")]
+    EmptySummary,
+    /// The framed checkpoint is not smaller than the span it would shadow.
+    #[error("summary is not smaller than the shadowed content ({framed_tokens} >= {span_tokens})")]
+    NotSmaller {
+        /// Estimated tokens in the framed checkpoint.
+        framed_tokens: usize,
+        /// Estimated tokens in the span it would replace.
+        span_tokens: usize,
+    },
+}
+
+impl CompactionFailure {
+    /// Classify one failed summarizer request.
+    ///
+    /// The whole provider text is preserved; only the CATEGORY is derived.
+    pub fn from_llm_error(error: &react::llm::LlmError) -> Self {
+        let detail = error.to_string();
+        match error {
+            react::llm::LlmError::ApiKeyMissing => CompactionFailure::MissingCredential { detail },
+            react::llm::LlmError::Http(_)
+            | react::llm::LlmError::Other(_)
+            | react::llm::LlmError::Parse(_)
+            | react::llm::LlmError::Timeout
+            | react::llm::LlmError::RateLimited => CompactionFailure::Provider {
+                over_window: looks_like_context_overflow(&detail),
+                detail,
+            },
+        }
+    }
+}
+
+/// Whether a provider message names a context-window or token-limit overflow.
+///
+/// Providers word this differently (`context length`, `maximum context`,
+/// `too many tokens`, `input is too long`), so the check is deliberately a
+/// fragment match over the lowercased text rather than one exact sentence.
+pub fn looks_like_context_overflow(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    const FRAGMENTS: &[&str] = &[
+        "context length",
+        "context_length",
+        "context window",
+        "context_window",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "token limit",
+        "input is too long",
+        "prompt is too long",
+        "request too large",
+        "exceeds the maximum",
+        "exceeded the maximum",
+    ];
+    FRAGMENTS.iter().any(|fragment| lower.contains(fragment))
+}
+
+/// The completion cap for one summarizer request.
+///
+/// A checkpoint is extraction, not writing: capping the output keeps the
+/// request's input + reserved output inside a modest model window, which is the
+/// other half of a provider's context-length rejection. It is deliberately much
+/// smaller than a normal turn's completion budget.
+pub const COMPACTION_MAX_OUTPUT_TOKENS: u32 = 4_096;
+
+/// The marker a bounded digest puts where it omitted the span's middle.
+pub const COMPACTION_OMISSION: &str =
+    "[... the middle of this span was omitted so the compaction request fits the summarizer budget ...]";
+
+/// Render the shadowed span as the plain text a summarizer reads.
+///
+/// A span that fits `budget` estimated tokens is rendered in full, message by
+/// message, exactly as before. A larger span is reduced to its OLDEST
+/// `budget / 2` tokens plus its NEWEST `budget - budget / 2` tokens with the
+/// omission marker between them: the head carries the original intent and the
+/// tail carries the work in progress, which is what a checkpoint needs. A
+/// zero budget means "unbounded" and keeps the old whole-span behaviour for
+/// callers that do not configure one.
+pub fn render_compaction_digest(span: &[Message], budget: usize) -> String {
+    let rendered: Vec<String> = span.iter().map(render_for_summary).collect();
+    let whole = rendered.join("\n");
+    if budget == 0 || estimate_tokens(&whole) <= budget {
+        return whole;
+    }
+    let marker_tokens = estimate_tokens(COMPACTION_OMISSION) + 2;
+    let content_budget = budget.saturating_sub(marker_tokens);
+    if content_budget == 0 {
+        // The budget cannot even pay for the marker. Reporting the omission is
+        // still bounded and truthful; returning the whole span would not be.
+        return COMPACTION_OMISSION.to_string();
+    }
+    let head_budget = content_budget / 2;
+    let tail_budget = content_budget - head_budget;
+    let head_end = token_prefix_end(&whole, head_budget);
+    let tail_start = token_suffix_start(&whole, tail_budget);
+    if tail_start <= head_end || tail_start >= whole.len() {
+        // The two slices would overlap or the tail could not be paid for at
+        // all: keep the oldest part alone rather than duplicating or spilling
+        // the whole span.
+        return format!("{}\n{COMPACTION_OMISSION}", &whole[..head_end]);
+    }
+    format!(
+        "{}\n{COMPACTION_OMISSION}\n{}",
+        &whole[..head_end],
+        &whole[tail_start..]
+    )
+}
+
+/// The byte end of the longest prefix priced at or below `max_tokens`.
+fn token_prefix_end(text: &str, max_tokens: usize) -> usize {
+    let mut ascii = 0usize;
+    let mut other = 0usize;
+    let mut end = 0usize;
+    for (index, ch) in text.char_indices() {
+        if ch.is_ascii() {
+            ascii += 1;
+        } else {
+            other += 1;
+        }
+        if ascii.div_ceil(4) + other > max_tokens {
+            break;
+        }
+        end = index + ch.len_utf8();
+    }
+    end
+}
+
+/// The byte start of the longest suffix priced at or below `max_tokens`.
+fn token_suffix_start(text: &str, max_tokens: usize) -> usize {
+    let mut ascii = 0usize;
+    let mut other = 0usize;
+    let mut start = text.len();
+    for (index, ch) in text.char_indices().rev() {
+        if ch.is_ascii() {
+            ascii += 1;
+        } else {
+            other += 1;
+        }
+        if ascii.div_ceil(4) + other > max_tokens {
+            break;
+        }
+        start = index;
+    }
+    start
 }
 
 /// Estimated tokens for one message, using the same heuristic as

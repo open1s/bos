@@ -2566,6 +2566,25 @@ impl Shell {
         root
     }
 
+    /// What the command card currently says, and whether it is an error.
+    ///
+    /// The row and this accessor share one source, so a test that asserts the
+    /// wording reads the same string the frame paints - and a provider error,
+    /// an empty summary and a shrink-gate refusal each keep their own line.
+    #[cfg(test)]
+    pub(crate) fn compact_command_summary(&self) -> Option<(String, bool)> {
+        let command = self.state.active_session()?.compact_command.as_ref()?;
+        Some(self.compact_command_text(command))
+    }
+
+    /// The text one command row carries.
+    fn compact_command_text(&self, command: &crate::model::CompactCommand) -> (String, bool) {
+        match &command.outcome {
+            Some(outcome) => (outcome.text.clone(), outcome.error),
+            None => (self.state.lang.tr("msg.compaction.running"), false),
+        }
+    }
+
     /// The `/compact` command card: the reference's `GenericCommandCard`.
     ///
     /// Measured from `GenericCommandCard.module.css` over the shared
@@ -2585,10 +2604,7 @@ impl Shell {
         let row_h = 24.0 + theme::delta_at(content);
         let small = theme::small_size_at(content);
         let quiet = theme::faint();
-        let (summary, error) = match &command.outcome {
-            Some(outcome) => (outcome.text.clone(), outcome.error),
-            None => (self.state.lang.tr("msg.compaction.running"), false),
-        };
+        let (summary, error) = self.compact_command_text(command);
         let title = self.state.lang.tr("msg.compaction.commandTitle");
         div()
             .debug_selector(|| String::from("compact-command-row"))

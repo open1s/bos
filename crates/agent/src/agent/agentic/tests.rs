@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::context::{AgentReactContext, AgentSession, MAX_STEER_DEPTH};
+use crate::agent::context::{AgentReactContext, AgentSession, CompactionFailure, MAX_STEER_DEPTH};
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent};
 use crate::tools::FunctionTool;
 use async_trait::async_trait;
@@ -1389,6 +1389,79 @@ fn agent_with_summary(summary: &str) -> Agent {
     Agent::new(AgentConfig::default(), Arc::new(provider))
 }
 
+/// A summarizer stand-in that records the request it was handed and answers
+/// with either fixed text or a provider error.
+struct ScriptedSummaryMock {
+    answer: Result<String, LlmError>,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for ScriptedSummaryMock {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        let text = match req.input {
+            react::llm::Content::Text(text) => text,
+            react::llm::Content::Parts(parts) => parts
+                .into_iter()
+                .filter_map(|part| match part {
+                    react::llm::ContentPart::Text { text } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        self.seen.lock().unwrap().push(text);
+        match &self.answer {
+            Ok(summary) => Ok(make_text_response(summary.clone())),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        Ok(Box::pin(futures::stream::iter(vec![Ok(StreamToken::Done)])))
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "scripted-summary-mock"
+    }
+}
+
+/// Build an agent whose summarizer is scripted, with an optional input budget.
+fn agent_with_script(
+    answer: Result<String, LlmError>,
+    compaction_input_tokens: usize,
+) -> (Agent, Arc<std::sync::Mutex<Vec<String>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(ScriptedSummaryMock {
+            answer,
+            seen: seen.clone(),
+        }),
+    );
+    let agent = Agent::new(
+        AgentConfig {
+            compaction_input_tokens,
+            ..AgentConfig::default()
+        },
+        Arc::new(provider),
+    );
+    (agent, seen)
+}
+
 fn four_messages(agent: &Agent) {
     let mut session = agent.session();
     session.add_user("old one".to_string());
@@ -1406,6 +1479,10 @@ async fn compact_now_refuses_an_empty_summary() {
         .compact_now(0, &signal)
         .await
         .expect_err("an empty answer is a summary failure");
+    assert!(matches!(
+        error,
+        AgentError::Compaction(CompactionFailure::EmptySummary)
+    ));
     assert!(error.to_string().contains("no text summary content"));
     assert_eq!(
         agent.session().messages().len(),
@@ -1417,6 +1494,110 @@ async fn compact_now_refuses_an_empty_summary() {
 // =========================================================================
 // Steering: a host message taken at the RUNNING turn's next step
 // =========================================================================
+
+/// A provider error keeps its own text and is classified as a provider
+/// failure, never as a "useless summary": the reader has to see whether the
+/// request was too large, malformed or unauthorised.
+#[tokio::test]
+async fn compact_now_classifies_a_provider_failure_and_keeps_its_text() {
+    let (agent, _) = agent_with_script(
+        Err(LlmError::Other(
+            "HTTP 400: maximum context length exceeded (32768 tokens)".to_string(),
+        )),
+        24_000,
+    );
+    four_messages(&agent);
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("the provider rejected the request");
+    match &error {
+        AgentError::Compaction(CompactionFailure::Provider {
+            detail,
+            over_window,
+        }) => {
+            assert!(*over_window, "the text names a context length: {detail}");
+            assert!(detail.contains("maximum context length exceeded"));
+        }
+        other => panic!("a provider failure, not {other:?}"),
+    }
+    assert!(error
+        .to_string()
+        .contains("maximum context length exceeded"));
+    assert_eq!(
+        agent.session().messages().len(),
+        4,
+        "a provider failure leaves the history untouched"
+    );
+}
+
+/// A missing credential is its own class: the row must not tell the reader the
+/// summary was useless when the request was never authorised.
+#[tokio::test]
+async fn compact_now_classifies_a_missing_credential() {
+    let (agent, _) = agent_with_script(Err(LlmError::ApiKeyMissing), 24_000);
+    four_messages(&agent);
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("no credential");
+    assert!(matches!(
+        error,
+        AgentError::Compaction(CompactionFailure::MissingCredential { .. })
+    ));
+}
+
+/// A span larger than the configured budget is sent as its OLDEST slice plus
+/// its NEWEST slice: the request is bounded, both ends survive, and the
+/// compaction still lands.
+#[tokio::test]
+async fn compact_now_bounds_a_span_larger_than_the_request_budget() {
+    const BUDGET: usize = 1_500;
+    let (agent, seen) = agent_with_script(Ok("brief checkpoint".to_string()), BUDGET);
+    {
+        let mut session = agent.session();
+        for index in 0..8 {
+            let body = format!("old {index} {} tail{index}", "x".repeat(2_000));
+            if index % 2 == 0 {
+                session.add_user(body);
+            } else {
+                session.add_assistant(body);
+            }
+        }
+    }
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let outcome = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("the bounded compaction")
+        .expect("a checkpoint");
+    assert_eq!(outcome.replaced, 7, "all but the retained last message");
+    let prompt = seen.lock().unwrap().last().cloned().expect("one request");
+    let priced = crate::agent::context::estimate_tokens(&prompt);
+    assert!(
+        priced <= BUDGET,
+        "the whole request fits the configured budget: {priced} > {BUDGET}"
+    );
+    assert!(
+        prompt.contains("old 0"),
+        "the oldest intent survives the bound"
+    );
+    assert!(
+        prompt.contains("tail6"),
+        "the newest work survives the bound"
+    );
+    assert!(
+        !prompt.contains("tail3"),
+        "the middle is what the budget omits: {}",
+        prompt.len()
+    );
+    assert!(
+        prompt.contains(crate::agent::context::COMPACTION_OMISSION),
+        "the omission is stated, not silent"
+    );
+}
 
 /// The user turns a session carries, in order, as the mock sees it.
 fn user_turns(session: &AgentSession) -> Vec<String> {
@@ -1812,6 +1993,10 @@ async fn compact_now_refuses_a_summary_that_does_not_shrink_the_context() {
         .compact_now(0, &signal)
         .await
         .expect_err("a summary larger than its span is refused");
+    assert!(matches!(
+        error,
+        AgentError::Compaction(CompactionFailure::NotSmaller { .. })
+    ));
     assert!(error
         .to_string()
         .contains("not smaller than the shadowed content"));

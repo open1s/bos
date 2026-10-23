@@ -438,13 +438,15 @@ pub(crate) struct AppState {
     /// delivery event records it in the transcript, the withdrawal event puts
     /// it back in the queue, and nothing is silently lost.
     steering: HashMap<u64, Steering>,
-    /// Sessions whose `/compact` command is in flight right now.
+    /// Sessions whose `/compact` command is in flight right now, BY SESSION ID.
     ///
     /// A compaction is not a stream, so the streaming registry cannot answer
-    /// "is one already running"; the reference's durable lock plays that role
-    /// there and reports `busy`. This is the same admission flag for the
-    /// manual command, and it is runtime state only - a crash leaves no lock
-    /// behind because the next launch starts with nothing in flight.
+    /// "is one already running"; this is the manual command's admission flag.
+    /// It is deliberately keyed by session rather than being one process-wide
+    /// flag: two conversations have independent histories and models, so a
+    /// compaction in one must neither refuse nor cancel a compaction in
+    /// another. Runtime state only - a crash leaves no lock behind because the
+    /// next launch starts with nothing in flight.
     compacting: std::collections::HashSet<String>,
     /// The streaming runtime.
     pub(crate) runner: Runner,

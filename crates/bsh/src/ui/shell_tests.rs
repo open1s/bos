@@ -81,6 +81,45 @@ fn draw_until(
     );
 }
 
+/// Scroll a row into a STABLE position and return its painted y together with
+/// the transcript offset that produced it.
+///
+/// The transcript measures rows as they come into view: a row that was a spacer
+/// with an estimated height can get taller when it is built, which moves every
+/// row below it. A geometry test that compares two frames taken across that
+/// remeasure measures the estimate, not the scroll. Waiting for two identical
+/// frames first makes both ends of the comparison settled.
+fn draw_until_row_is_stable(
+    cx: &mut VisualTestContext,
+    what: &str,
+    shell: &Entity<Shell>,
+    selector: &'static str,
+) -> (f32, f32) {
+    let mut last: Option<(f32, Option<f32>)> = None;
+    let mut history: Vec<(f32, Option<f32>)> = Vec::new();
+    // Two identical frames are the proof; a scroll near the end can spend a few
+    // frames remeasuring rows first, so this bound is wider than draw_until's.
+    const STABLE_FRAMES: usize = 20;
+    for _ in 0..STABLE_FRAMES {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let offset = cx.update(|_, cx| f32::from(shell.read(cx).transcript_scroll.offset().y));
+        let row_y = cx
+            .debug_bounds(selector)
+            .map(|bounds| f32::from(bounds.origin.y));
+        let now = (offset, row_y);
+        history.push(now);
+        if let Some(row_y) = row_y {
+            if last == Some(now) {
+                return (offset, row_y);
+            }
+        }
+        last = Some(now);
+    }
+    panic!(
+        "draw_until_row_is_stable: `{what}` did not settle after {STABLE_FRAMES} frames; history={history:?}"
+    );
+}
+
 /// Wait for work that finishes OFF the UI thread.
 ///
 /// `draw_until` pumps frames, which is right for anything a frame produces. A
@@ -2309,6 +2348,308 @@ fn nothing_sits_between_the_transcript_and_the_composer(cx: &mut TestAppContext)
     assert!(
         transcript.origin.y + transcript.size.height <= composer.origin.y,
         "the transcript itself ends above the composer: transcript={transcript:?} composer={composer:?}"
+    );
+}
+
+/// The compaction rows are CHILDREN of the transcript scroller, not a fixed
+/// slot between the transcript and the composer: scrolling moves their painted
+/// bounds by the scroll delta.
+///
+/// This is the geometric proof the screenshot's "pinned block" asked for. A row
+/// in a footer slot would keep the same window y while the transcript offset
+/// changed; these rows must move with the content.
+#[gpui::test]
+fn the_compaction_rows_scroll_with_the_transcript(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("compact-scrolls", 30);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.compactions.push(crate::model::CompactionRecord {
+                at: 0,
+                items: 33,
+                tokens: 4_219,
+                summary: "checkpoint body".to_string(),
+                manual: true,
+                after: 2,
+            });
+            session.compact_command = Some(crate::model::CompactCommand {
+                started_at: 0,
+                outcome: Some(crate::model::CompactOutcome {
+                    text: "Compaction could not produce a useful summary.".to_string(),
+                    error: true,
+                }),
+            });
+            // Rows AFTER the command: they keep it off the very end of the
+            // scroller, so a small wheel step can move it without clipping.
+            for seq in 1..=8 {
+                state.mark_steering(
+                    &id,
+                    crate::state::Queued {
+                        seq,
+                        text: format!("pending steer {seq}"),
+                        attachments: Vec::new(),
+                    },
+                );
+            }
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let messages = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .map(|session| session.messages.len())
+            .expect("a session")
+    });
+    // Child 0 is the timestamp; one child per message; the marker at after=2
+    // lands before message 2; the command row is the last child.
+    let marker_child = 3usize;
+    let command_child = 1 + messages + 1;
+    // First position: scroll the row two children ABOVE the marker to the top so
+    // the rows above the marker are BUILT and measured, then settle.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.following_tail = false;
+            // One frame of "no previous max" keeps the tail bias from
+            // re-engaging on the frame the scroll request lands: its growth
+            // check would otherwise see the OLD at-the-end offset and snap back.
+            this.tail_max = None;
+            this.transcript_scroll
+                .scroll_to_top_of_item(marker_child - 2);
+        });
+    });
+    let (offset_before, marker_y_before) = draw_until_row_is_stable(
+        cx,
+        "the marker settles below the fold",
+        &shell,
+        "compaction-row-0",
+    );
+    // Second position: put the marker itself at the top. The scrolled distance
+    // is the offset delta; the marker's painted y must move by that same N.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.following_tail = false;
+            this.tail_max = None;
+            this.transcript_scroll.scroll_to_top_of_item(marker_child);
+        });
+    });
+    let (offset_after, marker_y_after) = draw_until_row_is_stable(
+        cx,
+        "the marker settles at the top",
+        &shell,
+        "compaction-row-0",
+    );
+    let scrolled = offset_after - offset_before;
+    assert!(
+        scrolled <= -20.0,
+        "the premise: the transcript really scrolled N pixels: {scrolled}"
+    );
+    let marker_shift = marker_y_after - marker_y_before;
+    assert!(
+        (marker_shift - scrolled).abs() <= 1.5,
+        "the marker moved with the content by the scroll delta: y {marker_y_before} -> {marker_y_after}, shift {marker_shift}, scrolled {scrolled}"
+    );
+    let marker = cx.debug_bounds("compaction-row-0").expect("the marker row");
+    let transcript = cx.debug_bounds("transcript").expect("the transcript pane");
+    assert!(
+        marker.origin.y >= transcript.origin.y
+            && marker.origin.y + marker.size.height <= transcript.origin.y + transcript.size.height,
+        "and it is painted inside the scroller: marker={marker:?} transcript={transcript:?}"
+    );
+
+    // The command row is a scroller child too: a small wheel step moves its
+    // painted y by the same delta. The rows after it are already built, so this
+    // cannot pass through a remeasure instead of a scroll.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.following_tail = true;
+            this.tail_max = None;
+            this.transcript_scroll.scroll_to_bottom();
+        });
+    });
+    draw_until(
+        cx,
+        "the transcript is at the bottom",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            let (offset, max) = cx.update(|_, cx| {
+                let handle = &shell.read(cx).transcript_scroll;
+                (handle.offset().y, handle.max_offset().y)
+            });
+            offset == -max && cx.debug_bounds("compact-command-row").is_some()
+        },
+    );
+    let command_before = cx
+        .debug_bounds("compact-command-row")
+        .expect("the command row is visible above the pending rows");
+    let (command_layout_before, offset_before) = cx.update(|_, cx| {
+        let handle = &shell.read(cx).transcript_scroll;
+        (
+            handle
+                .bounds_for_item(command_child)
+                .expect("the scroller records the command child"),
+            f32::from(handle.offset().y),
+        )
+    });
+    let body = cx.debug_bounds("transcript").expect("the transcript");
+    // One notch UP. The scroller applies it and the shell's own easing takes
+    // over; several frames later both the offset and the painted row show the
+    // movement, without depending on the animation's exact settle frame.
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            gpui_kit::PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
+                position: body.center(),
+                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(60.0))),
+                modifiers: Modifiers::default(),
+                touch_phase: gpui_kit::TouchPhase::Moved,
+            }),
+            cx,
+        );
+    });
+    for _ in 0..6 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let command_after = cx
+        .debug_bounds("compact-command-row")
+        .expect("the command row still paints");
+    let (command_layout_after, offset_after) = cx.update(|_, cx| {
+        let handle = &shell.read(cx).transcript_scroll;
+        (
+            handle
+                .bounds_for_item(command_child)
+                .expect("the scroller still records the command child"),
+            f32::from(handle.offset().y),
+        )
+    });
+    let scrolled = offset_after - offset_before;
+    assert!(
+        scrolled >= 20.0,
+        "the premise: the wheel really scrolled N pixels: {scrolled}"
+    );
+    let command_shift = command_after.origin.y - command_before.origin.y;
+    assert!(
+        command_shift > px(0.0),
+        "the command row moved DOWN with the upward scroll: {command_before:?} -> {command_after:?}"
+    );
+    // The geometry identity of a scroller child: painted = laid out + offset.
+    // The row's laid-out slot may grow when a row above it is first measured,
+    // so the delta is split into that remeasure and the scroll; a fixed footer
+    // has no laid-out child at all and cannot satisfy this.
+    let layout_delta = command_layout_after.origin.y - command_layout_before.origin.y;
+    assert!(
+        (command_shift - (layout_delta + px(scrolled))).abs() <= px(1.5),
+        "the command row's painted y is its laid-out child plus the scroll offset: shift={command_shift:?} layout_delta={layout_delta:?} scrolled={scrolled}"
+    );
+}
+
+/// A compaction performed at the END of the history is a row of the scroller,
+/// AFTER the last message row - identified by the scroller's own recorded child
+/// bounds, not merely by order in the rows vector.
+#[gpui::test]
+fn a_compaction_at_the_end_sits_after_the_last_message_inside_the_scroller(
+    cx: &mut TestAppContext,
+) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("compact-at-end", 6);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            // An idle compaction follows a REAL answer; the trailing empty
+            // assistant placeholder of the seed is not a message the checkpoint
+            // event follows, so give it the answer a finished turn would hold.
+            if let Some(last) = session.messages.last_mut() {
+                last.text = "the final answer".to_string();
+            }
+            let end = session.messages.len();
+            session.compactions.push(crate::model::CompactionRecord {
+                at: 0,
+                items: 33,
+                tokens: 4_219,
+                summary: "checkpoint body".to_string(),
+                manual: true,
+                after: end,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.following_tail = false;
+            this.transcript_scroll.scroll_to_bottom();
+        });
+    });
+    draw_until(cx, "the end marker renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("compaction-row-0").is_some()
+            && cx.debug_bounds("message-footer-11").is_some()
+    });
+    let messages = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .map(|session| session.messages.len())
+            .expect("a session")
+    });
+    let marker = cx
+        .debug_bounds("compaction-row-0")
+        .expect("the checkpoint row");
+    let last_footer = cx
+        .debug_bounds("message-footer-11")
+        .expect("the last message's footer");
+    let transcript = cx.debug_bounds("transcript").expect("the transcript pane");
+    assert!(
+        last_footer.origin.y < marker.origin.y,
+        "the end marker follows the last message: footer={last_footer:?} marker={marker:?}"
+    );
+    assert!(
+        marker.origin.y >= transcript.origin.y
+            && marker.origin.y + marker.size.height
+                <= transcript.origin.y + transcript.size.height,
+        "and it is INSIDE the scroller, not between the scroller and the composer: marker={marker:?} transcript={transcript:?}"
+    );
+    // Parent-scroller identity: the scroller records a painted bound for every
+    // child. The marker must be the child its own index names, with the same
+    // box the frame painted. Order alone would pass for a footer slot too.
+    let child = 1 + messages;
+    let (recorded, offset) = cx.update(|_, cx| {
+        let handle = &shell.read(cx).transcript_scroll;
+        (
+            handle
+                .bounds_for_item(child)
+                .expect("the scroller recorded the marker child"),
+            handle.offset().y,
+        )
+    });
+    // The scroller records a child's LAID OUT box; the painted box is that box
+    // shifted by the current scroll offset. Equality under that shift is the
+    // parent-scroller identity, which a footer slot can never satisfy.
+    assert!(
+        (recorded.origin.y + offset - marker.origin.y).abs() <= px(1.0)
+            && (recorded.origin.x - marker.origin.x).abs() <= px(1.0)
+            && (recorded.size.height - marker.size.height).abs() <= px(1.0),
+        "the scroller's child {child} maps to this exact row at offset {offset:?}: recorded={recorded:?} painted={marker:?}"
+    );
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .transcript_scroll
+            .bounds_for_item(child + 1)
+            .is_none()),
+        "nothing is rendered after the end marker inside the scroller"
+    );
+    let composer = cx.debug_bounds("composer-card").expect("the composer card");
+    assert!(
+        marker.origin.y + marker.size.height <= composer.origin.y
+            && transcript.origin.y + transcript.size.height <= composer.origin.y,
+        "the transcript ends above the composer, so no fixed slot sits between them: transcript={transcript:?} composer={composer:?}"
     );
 }
 
@@ -20511,6 +20852,210 @@ fn the_compact_command_card_draws_running_and_failed_outcomes(cx: &mut TestAppCo
     assert_eq!(compacted, 0, "and the boundary did not move");
 }
 
+/// The compact row NAMES its cause: a provider error keeps the provider's text,
+/// an empty answer says empty, and a grow-gate refusal names both token counts.
+/// One generic sentence used to hide all three (the screenshot's failure).
+#[gpui::test]
+fn the_compact_row_says_which_failure_happened(cx: &mut TestAppContext) {
+    use agent::agent::context::CompactionFailure;
+    let root = skills_scratch("slash-compact-causes");
+    let (harness, cx) = slash_shell(cx, "slash-compact-causes", root, 8);
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let lang = cx.update(|_, cx| shell.read(cx).state.lang);
+    let cases = [
+        (
+            CompactionFailure::Provider {
+                detail: "HTTP 400: maximum context length exceeded".to_string(),
+                over_window: false,
+            },
+            "maximum context length exceeded",
+        ),
+        (CompactionFailure::EmptySummary, "empty summary"),
+        (
+            CompactionFailure::NotSmaller {
+                framed_tokens: 900,
+                span_tokens: 800,
+            },
+            "900",
+        ),
+    ];
+    for (failure, needle) in cases {
+        let text = crate::ui::shell::compact_failure_text(lang, &failure);
+        cx.update(|_, cx| {
+            let id = shell.read(cx).state.active_id.clone().expect("a session");
+            shell.update(cx, |this, _| {
+                this.state.begin_compact_command(&id);
+                this.state.finish_compact_command(&id, text.clone(), true);
+            });
+        });
+        draw_until(
+            cx,
+            "the compact row paints its cause",
+            DRAW_UNTIL_MAX,
+            |cx| cx.debug_bounds("compact-command-summary").is_some(),
+        );
+        let rendered = cx
+            .update(|_, cx| shell.read(cx).compact_command_summary())
+            .expect("the command row's own text");
+        assert_eq!(rendered.0, text, "the row paints the classified line");
+        assert!(rendered.1, "and it keeps the failure colour");
+        assert!(
+            rendered.0.contains(needle),
+            "the row names the cause ({needle}): {}",
+            rendered.0
+        );
+        assert_ne!(
+            rendered.0,
+            cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.compactSummary")),
+            "and it is not the old generic sentence"
+        );
+    }
+}
+
+/// Two different sessions may compact AT THE SAME TIME.
+///
+/// The admission flag is per-session, not process-wide: starting a compaction
+/// in one conversation must not refuse or cancel the one already running in
+/// another. The silent loopback listener keeps both summarizer requests pending
+/// so the assertion observes overlap, not two fast failures in sequence.
+#[gpui::test]
+fn two_sessions_compact_in_parallel(cx: &mut TestAppContext) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener
+        .local_addr()
+        .expect("the bound loopback address")
+        .port();
+    // Both requests must be PENDING at the assertion, then complete normally so
+    // the test leaves no detached task on the runner. The server accepts one
+    // connection at a time: the first sleeps before answering, and the second
+    // waits in the listen backlog - the two are genuinely concurrent.
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let root = skills_scratch("slash-compact-parallel");
+    let (harness, cx) = slash_shell(cx, "slash-compact-parallel", root, 8);
+    // The compaction requests complete on the Tokio runtime and wake the GPUI
+    // executor from that worker, which is the production path. Parking mode is
+    // the kit's seam for a test that really performs that cross-thread I/O.
+    cx.dispatcher.allow_parking();
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let long = "parallel compaction history ".repeat(20);
+    let (first, second) = cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            if let Some(provider) = this.state.settings.global.providers.get_mut("local") {
+                provider.base_url = format!("http://127.0.0.1:{port}/v1");
+            }
+            let first = this.state.active_id.clone().expect("the seeded session");
+            if let Some(session) = this.state.store.session_mut(&first) {
+                session.provider = Some("local".to_string());
+                session.model = Some("local-model".to_string());
+            }
+            let second = this.state.new_session().expect("a second session");
+            if let Some(session) = this.state.store.session_mut(&second) {
+                for turn in 0..8 {
+                    session
+                        .messages
+                        .push(ChatMessage::user(format!("second {turn}: {long}")));
+                    session.messages.push(ChatMessage::assistant());
+                }
+                session.provider = Some("local".to_string());
+                session.model = Some("local-model".to_string());
+            }
+            (first, second)
+        })
+    });
+    // Start the first conversation's compaction through the active-session
+    // command, then start the SECOND by id while the first request is still
+    // waiting for the loopback endpoint. Neither call changes or stops the
+    // other session's in-flight work.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.select(&first);
+            this.compact_history(cx);
+            this.compact_session(&second, cx);
+        });
+    });
+    // Selecting another conversation must not cancel either request.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.state.select(&second));
+    });
+    let (first_running, second_running, first_row, second_row) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        let outcome = |id: &str| {
+            state
+                .store
+                .session(id)
+                .and_then(|session| session.compact_command.as_ref())
+                .is_some_and(|command| command.outcome.is_none())
+        };
+        (
+            state.is_compacting(&first),
+            state.is_compacting(&second),
+            outcome(&first),
+            outcome(&second),
+        )
+    });
+    assert!(
+        first_running && second_running,
+        "both sessions hold their own admission: first={first_running} second={second_running}"
+    );
+    assert!(
+        first_row && second_row,
+        "both sessions show a running command row: first={first_row} second={second_row}"
+    );
+    assert_ne!(first, second, "the two ids are distinct");
+    // Releasing one admission must not release the other: they are separate
+    // entries, not one process-wide flag.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.state.stop_compacting(&first));
+    });
+    let (first_after, second_after) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (state.is_compacting(&first), state.is_compacting(&second))
+    });
+    assert!(!first_after, "the first admission was released");
+    assert!(second_after, "and the second session is still compacting");
+
+    // Let both pending requests finish. The second session clears its own
+    // admission, and each session keeps its own failure outcome; no detached
+    // task is left when the harness goes away.
+    draw_until_settled(cx, "both compaction requests settle", |cx| {
+        cx.update(|_, cx| {
+            let state = &shell.read(cx).state;
+            !state.is_compacting(&first) && !state.is_compacting(&second)
+        })
+    });
+    let (first_outcome, second_outcome) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        let outcome = |id: &str| {
+            state
+                .store
+                .session(id)
+                .and_then(|session| session.compact_command.as_ref())
+                .and_then(|command| command.outcome.clone())
+        };
+        (outcome(&first), outcome(&second))
+    });
+    assert!(
+        first_outcome.as_ref().is_some_and(|outcome| outcome.error),
+        "the first session landed its own failure"
+    );
+    assert!(
+        second_outcome.as_ref().is_some_and(|outcome| outcome.error),
+        "the second session landed its own failure"
+    );
+    server.join().expect("the loopback server finishes");
+}
+
 /// The typed command takes no arguments: a suffix is the shipped usage line,
 /// not prose sent to the model and not a compaction.
 #[gpui::test]
@@ -20554,10 +21099,10 @@ fn the_typed_compact_command_refuses_arguments_with_its_usage_line(cx: &mut Test
     assert_eq!(messages, 16, "and nothing was appended to the transcript");
 }
 
-/// No chosen, credentialed model is refused before the request is built; the
-/// reference classifies that summarizer failure under its summary text.
+/// No chosen, credentialed model is refused before the request is built, and the
+/// row names THAT cause rather than calling it a summary failure.
 #[gpui::test]
-fn the_compact_command_without_a_model_reports_the_summary_failure(cx: &mut TestAppContext) {
+fn the_compact_command_without_a_model_names_the_missing_model(cx: &mut TestAppContext) {
     let root = skills_scratch("slash-compact-nomodel");
     let (harness, cx) = slash_shell(cx, "slash-compact-nomodel", root, 8);
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
@@ -20599,8 +21144,8 @@ fn the_compact_command_without_a_model_reports_the_summary_failure(cx: &mut Test
     assert!(outcome.error);
     assert_eq!(
         outcome.text,
-        cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.compactSummary")),
-        "the reference reports a summarizer failure"
+        cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.compactNoModel")),
+        "the row names the missing model, not a summary failure"
     );
     assert_eq!(compacted, 0, "the boundary did not move");
     assert!(!compacting, "and no admission was leaked");
