@@ -123,7 +123,11 @@ impl Agent {
             Arc::new(self.hooks.clone()),
             Arc::new(self.plugins.clone()),
             self.config.name.clone(),
-        );
+        )
+        // The same mailbox the host steers into: the app drains it at the top
+        // of every ReAct step, which is the only point a message can enter a
+        // request without corrupting the one already in flight.
+        .with_steers(self.steers.clone());
 
         let mut builder = ReActEngineBuilder::<AgentReActApp>::new()
             .llm(react_llm)

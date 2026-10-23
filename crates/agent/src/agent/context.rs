@@ -11,8 +11,9 @@ use react::llm::{
 use react::runtime::app::ReActApp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Whether every tool call opened before `cut` is answered before it.
 ///
@@ -884,6 +885,118 @@ impl ReactContext for AgentReactContext {
     }
 }
 
+/// The largest number of messages one running turn keeps queued for its next
+/// step.
+///
+/// The bound exists so a host that steers faster than the model steps cannot
+/// grow the turn without limit, but it must not be a product limit: a reader
+/// can queue a whole message list and steer it in one gesture, so this is a
+/// guard well above any queue a person builds between two steps. The
+/// reference's inbox is bounded by the session rather than by a constant.
+pub const MAX_STEER_DEPTH: usize = 64;
+
+/// One host message waiting for a running turn's next step.
+///
+/// The content is what the model receives - it is appended as a user turn at
+/// the point the step begins - and the ticket is the host's identity for the
+/// message, reported back when the step takes it.
+#[derive(Debug, Clone)]
+pub struct SteerMessage {
+    /// What the model receives as a user turn.
+    pub content: Content,
+    /// The host's identity for this message.
+    pub ticket: u64,
+}
+
+#[derive(Default)]
+struct SteerState {
+    queue: VecDeque<SteerMessage>,
+    sink: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+/// A bounded mailbox between the host and a RUNNING turn.
+///
+/// The reference's `Agent::steer` puts a message on the session's next-step
+/// inbox and the loop takes it before deriving its next request. The BOS engine
+/// exposes the same point as `ReActApp::before_llm_call`, which runs at the top
+/// of every ReAct step (both the blocking and the streaming loop); this mailbox
+/// is what that hook drains.
+///
+/// It is a mailbox and not a session message because a message pushed while a
+/// request is in flight must not appear in THAT request: the drain happens
+/// before the next step derives its request, so the message lands in the next
+/// request and is recorded in the session at the point it was taken.
+#[derive(Default)]
+pub struct SteerMailbox {
+    state: Mutex<SteerState>,
+}
+
+impl SteerMailbox {
+    /// An empty mailbox.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue one message for the next step.
+    ///
+    /// Returns false - and queues nothing - when the mailbox already holds
+    /// [`MAX_STEER_DEPTH`] messages.
+    pub fn push(&self, message: SteerMessage) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.queue.len() >= MAX_STEER_DEPTH {
+            return false;
+        }
+        state.queue.push_back(message);
+        true
+    }
+
+    /// Take every queued message, oldest first.
+    ///
+    /// The sink, when one is installed, is told every ticket after the queue is
+    /// empty and outside the lock: a sink that calls back into the mailbox (or a
+    /// host that steers again from it) cannot deadlock the drain.
+    pub fn take(&self) -> Vec<SteerMessage> {
+        let (messages, sink) = {
+            let mut state = self.state.lock().unwrap();
+            (
+                state.queue.drain(..).collect::<Vec<_>>(),
+                state.sink.clone(),
+            )
+        };
+        if let Some(sink) = sink {
+            for message in &messages {
+                sink(message.ticket);
+            }
+        }
+        messages
+    }
+
+    /// Drop every queued message and return its ticket, oldest first.
+    ///
+    /// The host calls this when a turn ends before reaching another step: the
+    /// model never saw those messages, so they go back to the host's queue
+    /// instead of being lost with the turn.
+    pub fn withdraw(&self) -> Vec<u64> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .queue
+            .drain(..)
+            .map(|message| message.ticket)
+            .collect()
+    }
+
+    /// How many messages wait for the next step.
+    pub fn depth(&self) -> usize {
+        self.state.lock().unwrap().queue.len()
+    }
+
+    /// Install, or clear with `None`, the callback told each ticket as a step
+    /// takes it.
+    pub fn set_sink(&self, sink: Option<Arc<dyn Fn(u64) + Send + Sync>>) {
+        self.state.lock().unwrap().sink = sink;
+    }
+}
+
 /// AgentReActApp integrates the Agent's hooks, plugins, and configuration with the ReAct engine.
 /// This allows the agent to intercept and react to events during the ReAct loop.
 #[derive(Default)]
@@ -891,6 +1004,7 @@ pub struct AgentReActApp {
     hooks: Arc<HookRegistry>,
     plugins: Arc<PluginRegistry>,
     agent_name: String,
+    steers: Option<Arc<SteerMailbox>>,
 }
 
 impl AgentReActApp {
@@ -900,7 +1014,17 @@ impl AgentReActApp {
             hooks,
             plugins,
             agent_name,
+            steers: None,
         }
+    }
+
+    /// Attach the mailbox this app drains at the top of every step.
+    ///
+    /// An app built by [`AgentReActApp::new`] alone drains nothing and behaves
+    /// exactly as it did before steering existed.
+    pub fn with_steers(mut self, steers: Arc<SteerMailbox>) -> Self {
+        self.steers = Some(steers);
+        self
     }
 }
 
@@ -912,13 +1036,39 @@ impl ReActApp for AgentReActApp {
         &self.agent_name
     }
 
+    /// A steered message extends the turn instead of waiting for the next one.
+    ///
+    /// The engine asks this before it closes a step with no tool call. The
+    /// reference's loop does the same with `inbox.nextStep.length`: the turn
+    /// stays open, the next `before_llm_call` appends the message, and the
+    /// model answers it inside the SAME turn. Nothing is taken here - this is
+    /// only the keep-open decision, so a message pushed at the same instant
+    /// cannot be dropped by an answer that never reaches a step.
+    fn has_pending_step_input(&self) -> bool {
+        self.steers
+            .as_ref()
+            .is_some_and(|steers| steers.depth() > 0)
+    }
+
     #[allow(refining_impl_trait)]
     fn before_llm_call(
         &self,
         req: &mut ReactLlmRequest,
-        _session: &mut Self::Session,
+        session: &mut Self::Session,
         _context: &mut Self::Context,
     ) -> impl Future<Output = react::runtime::HookDecision> + Send {
+        // The host's steered messages become user turns HERE, at the top of the
+        // step and before the request is derived: a message pushed while the
+        // previous request streamed is carried by THIS request, and one pushed
+        // while this request streams waits for the next. This is the engine's
+        // equivalent of the reference's next-step inbox, and it runs through
+        // the same BeforeLlmCall hook a turn's own input passes, so any host
+        // policy on that hook sees the step either way.
+        if let Some(steers) = &self.steers {
+            for message in steers.take() {
+                session.push(Message::user(message.content));
+            }
+        }
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
         let plugins = self.plugins.clone();

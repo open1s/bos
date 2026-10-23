@@ -105,6 +105,18 @@ pub trait ReActApp: Send + Sync {
     ) -> impl Future<Output = ()> + Send {
         async {}
     }
+
+    /// Whether input is waiting for another step of the CURRENT turn.
+    ///
+    /// The streaming loop asks this before it closes a step that produced no
+    /// tool call. A true answer keeps the turn open: the next iteration runs
+    /// `before_llm_call`, which is where an app appends the waiting input.
+    /// This is the reference's next-step inbox rule - a turn ends only when
+    /// nothing is pending - so a steered message EXTENDS the running turn
+    /// instead of having to wait for the next one.
+    fn has_pending_step_input(&self) -> bool {
+        false
+    }
 }
 
 impl<T: ReActApp + ?Sized> ReActApp for Box<T> {
@@ -173,6 +185,9 @@ impl<T: ReActApp + ?Sized> ReActApp for Box<T> {
         context: &mut Self::Context,
     ) -> impl Future<Output = ()> + Send {
         (**self).on_final_answer(answer, session, context)
+    }
+    fn has_pending_step_input(&self) -> bool {
+        (**self).has_pending_step_input()
     }
 }
 

@@ -268,10 +268,15 @@ impl Shell {
 
     /// Select a permission mode, opening the risk gate when the mode needs one.
     ///
-    /// The gate is kept for Full access only. The no-op guard compares BOTH
-    /// trees: a draft that already holds the value while the committed tree does
-    /// not is the old bug's state, where an early return would skip the very
-    /// write that makes the mode real.
+    /// The gate is kept for Full access only, and only when Full access will
+    /// actually take effect: a preset ceiling that ranks below it caps the
+    /// result, so there is no widening to confirm. In that case the request is
+    /// applied directly and the ceiling notice explains why the session stayed
+    /// lower - the same notice, and the same wording, as the composer chip.
+    ///
+    /// The no-op guard compares BOTH trees: a draft that already holds the
+    /// value while the committed tree does not is the old bug's state, where an
+    /// early return would skip the very write that makes the mode real.
     pub(crate) fn request_permission(&mut self, permission: &str, cx: &mut Context<Self>) {
         let committed = self.state.settings.workspace.agent.permission == permission;
         let drafted = self.state.draft().workspace.agent.permission == permission;
@@ -281,6 +286,19 @@ impl Shell {
         if permission == crate::caps::FULL_ACCESS && !committed {
             // The gate is the only route that widens a session to Full access,
             // and it cannot be skipped by picking the mode from another control.
+            // It is also pointless when the preset ceiling already caps the
+            // result: nothing widens, so confirming a widening that cannot
+            // happen would be a lie. Read the ceiling from the same resolution
+            // the chip shows, then let the applied value and its notice speak.
+            let ceiling = self.state.effective().permission.preset_ceiling;
+            let widened = crate::settings::resolve::PermissionResolution::resolve(
+                permission,
+                ceiling.as_deref(),
+            );
+            if widened.reduced_by.is_some() {
+                self.set_permission(permission, cx);
+                return;
+            }
             self.permission_acknowledged = false;
             self.permission_confirm = Some(permission.to_string());
             cx.notify();

@@ -228,7 +228,7 @@ impl Goal {
     /// trimmed - an empty goal is the absence of a goal, not a goal with no
     /// objective.
     ///
-    /// A created goal is armed, which is what /goal <objective> means in the
+    /// A created goal is armed, which is what `/goal <objective>` means in the
     /// reference. max_rounds follows the reference's create request: None
     /// resolves to the deployment default (DEFAULT_MAX_ROUNDS) rather than
     /// meaning "unbounded".

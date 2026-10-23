@@ -325,7 +325,7 @@ impl AuditView {
         let mut turns: Vec<AuditTurn> = Vec::new();
         let mut message_turn: Vec<Option<usize>> = vec![None; session.messages.len()];
         for (index, message) in session.messages.iter().enumerate() {
-            if message.role == Role::User || turns.is_empty() {
+            if (message.role == Role::User && !message.steering) || turns.is_empty() {
                 turns.push(AuditTurn {
                     index: turns.len() + 1,
                     message: index,

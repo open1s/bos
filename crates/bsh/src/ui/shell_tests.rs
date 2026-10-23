@@ -15,7 +15,7 @@ use agent::Tool as _;
 
 use crate::i18n::Lang;
 use crate::model::{
-    ChatMessage, MessageMeta, MessageUsage, PlanItem, PlanStatus, PlanStore, ToolEvent,
+    ChatMessage, MessageMeta, MessageUsage, PlanItem, PlanStatus, PlanStore, Role, ToolEvent,
 };
 use crate::state::{AppState, Overlay, Tab};
 use crate::store::Store;
@@ -792,6 +792,524 @@ fn the_queue_row_edits_its_message(cx: &mut TestAppContext) {
     });
     assert_eq!(text, "second wait", "save rewrites the queued message");
     assert_eq!(editing, None, "and closes the editor");
+}
+
+/// Mark the session as running and give it the mailbox a spawned turn would.
+///
+/// The dock's steer path is gated on a LIVE turn, so a test that wants the
+/// steer path must fake the two facts a spawn leaves behind: the stream
+/// registry entry and the agent's mailbox.
+fn begin_steerable_turn(
+    shell: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+) -> (String, std::sync::Arc<agent::SteerMailbox>) {
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            let id = shell.state.active_id.clone().expect("an active session");
+            shell.state.streams.insert(id.clone(), 1);
+            let mailbox = std::sync::Arc::new(agent::SteerMailbox::new());
+            shell.state.attach_steers(&id, mailbox.clone());
+            shell.queue_open = true;
+            (id, mailbox)
+        })
+    })
+}
+
+/// The transcript's user rows, in order, for the queue tests.
+fn user_rows(shell: &Entity<Shell>, id: &str, cx: &mut VisualTestContext) -> Vec<String> {
+    cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .store
+            .session(id)
+            .expect("the session")
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.text.clone())
+            .collect()
+    })
+}
+
+/// The row's Send now steers exactly that message: the row leaves, its
+/// neighbours stay, the turn's mailbox carries the text, and the transcript
+/// records it where the turn took it.
+#[gpui::test]
+fn the_queue_row_sends_one_message_now(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_queue("queue-steer-one", &["first wait", "second wait"]);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let (id, mailbox) = begin_steerable_turn(&shell, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let arrow = cx
+        .debug_bounds("queue-steer-1")
+        .expect("the send-now control renders on a queued row");
+    assert_eq!(
+        arrow.size.width,
+        px(crate::theme::QUEUE_STEER),
+        "the control is the requested 20px box"
+    );
+    assert_eq!(arrow.size.height, px(crate::theme::QUEUE_STEER));
+    cx.simulate_click(arrow.center(), Modifiers::default());
+
+    let (left, waiting) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell
+                .state
+                .inbox(&id)
+                .iter()
+                .map(|queued| queued.text.clone())
+                .collect::<Vec<_>>(),
+            shell.state.is_steering(1),
+        )
+    });
+    assert_eq!(
+        left,
+        vec!["second wait".to_string()],
+        "only the pressed row leaves the queue; the others stay"
+    );
+    assert!(waiting, "the taken row waits for the turn to answer for it");
+
+    // The steered message shows in the CONVERSATION immediately, before the
+    // running step takes it - the reference's pending steering bubble.
+    draw_until(
+        cx,
+        "the pending steering bubble renders at once",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("steer-pending-1").is_some(),
+    );
+    assert!(
+        cx.debug_bounds("queue-row-1").is_none(),
+        "and it has left the dock rather than appearing in two places"
+    );
+
+    // What the running turn sees at its next step: this message, text intact.
+    let taken = mailbox.take();
+    assert_eq!(taken.len(), 1, "the turn takes exactly the steered message");
+    assert_eq!(taken[0].ticket, 1, "with the row's identity");
+    assert!(
+        matches!(&taken[0].content, react::llm::Content::Text(text) if text == "first wait"),
+        "and its text intact: {:?}",
+        taken[0].content
+    );
+
+    // The delivery report lands where the turn took it: a user row and a fresh
+    // assistant row, in that order, with the turn's own rows before them.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell
+                .state
+                .apply_event(&id, crate::runner::AgentEvent::Steered { ticket: 1 });
+        })
+    });
+    let rows = user_rows(&shell, &id, cx);
+    assert_eq!(
+        rows,
+        vec!["queue the work".to_string(), "first wait".to_string()],
+        "the transcript records the steered message with its text intact"
+    );
+    let shape = cx.update(|_, cx| {
+        let messages = &shell
+            .read(cx)
+            .state
+            .store
+            .session(&id)
+            .expect("the session")
+            .messages;
+        messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        shape,
+        vec![Role::User, Role::Assistant, Role::User, Role::Assistant],
+        "the interjection splits the turn into the rows it really has: the \
+         assistant row before it, the steered user row, and a fresh assistant row"
+    );
+    let flags = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .store
+            .session(&id)
+            .expect("the session")
+            .messages
+            .iter()
+            .map(|message| message.steering)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        flags,
+        vec![false, false, true, false],
+        "only the interjected user row is marked as a steer"
+    );
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).state.is_steering(1)),
+        "the delivery closes the pending steering entry"
+    );
+    draw_until(
+        cx,
+        "the pending bubble becomes the durable row",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("steer-pending-1").is_none()
+                && cx.debug_bounds("steer-bubble-2").is_some()
+        },
+    );
+
+    // The steer is INSIDE the turn: it adds no rail mark, no turn number and no
+    // turn to the count. The transcript rows stay two assistant segments, which
+    // is the request history the model actually saw.
+    let marks = cx.update(|_, cx| shell.read(cx).turn_indices());
+    assert_eq!(
+        marks.len(),
+        1,
+        "the rail counts the prompt that opened the turn, not the steer"
+    );
+    let turns = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_session()
+            .expect("the session")
+            .turn_count()
+    });
+    assert_eq!(turns, 1, "and the session still reports one turn");
+}
+
+/// A steer the turn ends before taking goes back to its old place in the dock,
+/// and its pending bubble goes away - the reader never loses a message.
+#[gpui::test]
+fn a_withdrawn_steer_returns_to_its_place(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_queue("queue-steer-withdraw", &["first wait", "second wait"]);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let (id, _mailbox) = begin_steerable_turn(&shell, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Steer the SECOND row: a restore must put it back in identity order, not
+    // append it blindly.
+    let arrow = cx
+        .debug_bounds("queue-steer-2")
+        .expect("the second row's send-now control renders");
+    cx.simulate_click(arrow.center(), Modifiers::default());
+    assert_eq!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .inbox(&id)
+            .iter()
+            .map(|queued| queued.text.clone())
+            .collect::<Vec<_>>()),
+        vec!["first wait".to_string()],
+        "the steered row left the queue"
+    );
+
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell
+                .state
+                .apply_event(&id, crate::runner::AgentEvent::SteerWithdrawn { ticket: 2 });
+        })
+    });
+    let (texts, pending) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell
+                .state
+                .inbox(&id)
+                .iter()
+                .map(|queued| queued.text.clone())
+                .collect::<Vec<_>>(),
+            shell.state.is_steering(2),
+        )
+    });
+    assert_eq!(
+        texts,
+        vec!["first wait".to_string(), "second wait".to_string()],
+        "the withdrawn row is back in its identity order"
+    );
+    assert!(!pending, "and its pending entry is closed");
+    draw_until(
+        cx,
+        "the withdrawn row's pending bubble is gone",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("steer-pending-2").is_none(),
+    );
+}
+
+/// Cmd/Ctrl+Enter steers every waiting message, oldest first, and empties the
+/// queue; the placeholder and the key agree about what happens.
+#[gpui::test]
+fn the_accelerated_chord_steers_the_whole_queue(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_queue("queue-steer-all", &["first wait", "second wait"]);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let (id, mailbox) = begin_steerable_turn(&shell, cx);
+    focus_composer(&shell, cx);
+
+    cx.simulate_keystrokes("secondary-enter");
+
+    let queued = cx.update(|_, cx| shell.read(cx).state.inbox(&id).len());
+    assert_eq!(queued, 0, "the chord empties the queue");
+    let taken = mailbox.take();
+    assert_eq!(
+        taken
+            .iter()
+            .map(|message| message.ticket)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "every message is steered in queue order"
+    );
+    let texts: Vec<String> = taken
+        .iter()
+        .map(|message| match &message.content {
+            react::llm::Content::Text(text) => text.clone(),
+            other => panic!("a steered text message: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["first wait".to_string(), "second wait".to_string()]
+    );
+
+    // Delivered in order, the transcript shows both messages in that order.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            for message in &taken {
+                shell.state.apply_event(
+                    &id,
+                    crate::runner::AgentEvent::Steered {
+                        ticket: message.ticket,
+                    },
+                );
+            }
+        })
+    });
+    let rows = user_rows(&shell, &id, cx);
+    assert_eq!(
+        rows,
+        vec![
+            "queue the work".to_string(),
+            "first wait".to_string(),
+            "second wait".to_string()
+        ],
+        "every steered message is delivered, in order"
+    );
+}
+
+/// On an idle session the arrow is an ordinary send: it opens the turn and the
+/// message becomes its user row, with the rest of the queue untouched.
+#[gpui::test]
+fn the_send_now_arrow_sends_normally_when_idle(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    // This test drives the real turn-opening path: the runner wakes the GPUI
+    // pump from its Tokio worker, which is the production path and exactly the
+    // cross-thread work the deterministic scheduler refuses. Parking mode is
+    // the kit's seam for a test that performs real I/O.
+    cx.dispatcher.allow_parking();
+    // A loopback port that is bound but never accepted: the TCP handshake
+    // completes from the listen backlog, so the turn's request stays pending
+    // and the turn remains open for the assertions below. Nothing is served.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener
+        .local_addr()
+        .expect("the bound loopback address")
+        .port();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_queue("queue-steer-idle", &["only wait", "other wait"]);
+        // The idle arrow opens a real turn, so the session needs a chosen,
+        // reachable model: the bound-but-silent loopback endpoint keeps the
+        // send gate green without ever answering the turn's request.
+        let mut provider = crate::settings::global::Provider {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            ..Default::default()
+        };
+        provider.models.insert(
+            "local".to_string(),
+            crate::settings::global::ModelEntry {
+                model: "local-id".to_string(),
+                ..Default::default()
+            },
+        );
+        state
+            .settings
+            .global
+            .providers
+            .insert("p".to_string(), provider);
+        state.select_model("local");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell.queue_open = true;
+            shell.state.active_id.clone().expect("an active session")
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let arrow = cx
+        .debug_bounds("queue-steer-1")
+        .expect("the send-now control renders");
+    cx.simulate_click(arrow.center(), Modifiers::default());
+
+    let (streaming, queued, pending, rows, message_count, notice) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let messages = &shell
+            .state
+            .store
+            .session(&id)
+            .expect("the session")
+            .messages;
+        (
+            shell.state.is_streaming(&id),
+            shell
+                .state
+                .inbox(&id)
+                .iter()
+                .map(|queued| queued.text.clone())
+                .collect::<Vec<_>>(),
+            shell.state.is_steering(1),
+            messages
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .map(|message| message.text.clone())
+                .collect::<Vec<_>>(),
+            messages.len(),
+            shell.state.notice.clone(),
+        )
+    });
+    assert!(streaming, "an idle arrow opens the turn normally");
+    assert_eq!(
+        queued,
+        vec!["other wait".to_string()],
+        "the pressed row is sent; the others are untouched"
+    );
+    assert!(
+        !pending,
+        "an idle send does not go through the turn's mailbox"
+    );
+    // The transcript is the second observable: `begin_turn` appended this
+    // message as the turn's user row, which a queued submission never does.
+    assert_eq!(
+        rows,
+        vec!["queue the work".to_string(), "only wait".to_string()],
+        "an idle arrow opens a turn with the message as its user row \
+         (notice {notice:?})"
+    );
+    assert_eq!(
+        message_count, 4,
+        "and the turn's own assistant row follows the user row"
+    );
+    // The turn's request goes to the loopback stub; stop it before the test
+    // ends so nothing outlives the assertion.
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.state.stop(&id)));
+}
+
+/// The copy is the measured reference string in both locales, and the
+/// composer's placeholder states exactly when the chord can keep its promise.
+#[gpui::test]
+fn the_steer_copy_matches_the_behaviour_in_both_locales(cx: &mut TestAppContext) {
+    assert_eq!(
+        crate::i18n::tr(Lang::En, "composer.placeholderSteerQueue"),
+        "Cmd/Ctrl+Enter steers all queued messages"
+    );
+    assert_eq!(
+        crate::i18n::tr(Lang::Zh, "composer.placeholderSteerQueue"),
+        "Cmd/Ctrl+Enter 插话发送全部排队消息"
+    );
+    assert_eq!(crate::i18n::tr(Lang::En, "queue.sendNow"), "Send now");
+    assert_eq!(crate::i18n::tr(Lang::Zh, "queue.sendNow"), "立即发送");
+    assert_eq!(
+        crate::i18n::tr(Lang::En, "queue.edit"),
+        "Edit queued message",
+        "the queue actions carry the reference's accessible names"
+    );
+    assert_eq!(crate::i18n::tr(Lang::Zh, "queue.edit"), "编辑排队消息");
+    assert_eq!(
+        crate::i18n::tr(Lang::En, "queue.save"),
+        "Save queued message"
+    );
+    assert_eq!(crate::i18n::tr(Lang::Zh, "queue.save"), "保存排队消息");
+    assert_eq!(
+        crate::i18n::tr(Lang::En, "queue.remove"),
+        "Remove queued message"
+    );
+    assert_eq!(crate::i18n::tr(Lang::Zh, "queue.remove"), "删除排队消息");
+    assert_eq!(
+        crate::i18n::tr(Lang::En, "queue.cancelEdit"),
+        "Cancel editing"
+    );
+    assert_eq!(crate::i18n::tr(Lang::Zh, "queue.cancelEdit"), "取消编辑");
+
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_queue("queue-steer-copy", &["waiting"]);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let default = crate::i18n::tr(Lang::En, "composer.placeholder");
+    assert_eq!(
+        composer_placeholder(&shell, cx),
+        default,
+        "an idle queue makes no steering promise"
+    );
+
+    begin_steerable_turn(&shell, cx);
+    draw_until(
+        cx,
+        "the queue turns the placeholder into the promise",
+        DRAW_UNTIL_MAX,
+        |cx| composer_placeholder(&shell, cx) == "Cmd/Ctrl+Enter steers all queued messages",
+    );
+
+    let arrow = cx
+        .debug_bounds("queue-steer-1")
+        .expect("the send-now control renders");
+    cx.simulate_click(arrow.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the empty queue takes the promise back",
+        DRAW_UNTIL_MAX,
+        |cx| composer_placeholder(&shell, cx) == default,
+    );
+}
+
+/// The composer's currently fitted placeholder.
+fn composer_placeholder(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> String {
+    cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .presentation()
+            .placeholder()
+            .to_string()
+    })
 }
 
 /// A submission while the session's turn is running waits in the queue instead
@@ -1659,6 +2177,138 @@ fn an_uncompacted_session_draws_no_marker(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("compaction-row-0").is_none(),
         "no compaction means no marker"
+    );
+}
+
+/// The checkpoint marker is a NORMAL transcript row at the event's own slot.
+///
+/// A checkpoint recorded after two messages must sit BETWEEN message 1 and
+/// message 2 - read off the boxes of its neighbours, not merely "it exists".
+/// The old shape pinned the row above the composer, where no transcript row
+/// could ever be.
+#[gpui::test]
+fn the_compaction_marker_sits_between_the_messages_it_follows(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("compact-order"));
+        tests_pin_reference_defaults(&mut state);
+        // Detailed rows, so the marker's neighbours lay out inside the window
+        // and their boxes can be read.
+        state.settings.global.general.transcript_view = "verbose".to_string();
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            // Short turns: every row fits the window without scrolling, so the
+            // order assertion is about the row sequence, not about the scroll.
+            for turn in 0..3 {
+                session
+                    .messages
+                    .push(ChatMessage::user(format!("turn {turn}")));
+                session.messages.push(ChatMessage::assistant());
+            }
+            session.compactions.push(crate::model::CompactionRecord {
+                at: 0,
+                items: 7,
+                tokens: 1_024,
+                summary: "checkpoint body".to_string(),
+                manual: true,
+                // The checkpoint landed after two messages: the slot between
+                // messages 1 and 2.
+                after: 2,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let _ = shell;
+    draw_until(cx, "the marker renders in place", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("compaction-row-0").is_some()
+    });
+    let (marker, first, second, transcript) = (
+        cx.debug_bounds("compaction-row-0")
+            .expect("the checkpoint row"),
+        cx.debug_bounds("message-footer-1")
+            .expect("the footer of the message before the checkpoint"),
+        // The next message is a USER row, which carries a bubble rather than a
+        // footer: the footers belong to assistant turns.
+        cx.debug_bounds("user-bubble-2")
+            .expect("the message after the checkpoint"),
+        cx.debug_bounds("transcript").expect("the transcript pane"),
+    );
+    assert!(
+        first.origin.y < marker.origin.y,
+        "the marker follows message 1: footer={first:?} marker={marker:?}"
+    );
+    assert!(
+        marker.origin.y + marker.size.height <= second.origin.y,
+        "and precedes message 2: marker={marker:?} bubble={second:?}"
+    );
+    assert!(
+        marker.origin.y >= transcript.origin.y
+            && marker.origin.y + marker.size.height
+                <= transcript.origin.y + transcript.size.height,
+        "the marker is a transcript row, not a floating slot: marker={marker:?} transcript={transcript:?}"
+    );
+}
+
+/// Nothing is drawn between the transcript and the composer.
+///
+/// The compact command row used to be a pinned slot above the composer. It is a
+/// transcript row now: its box lies inside the transcript pane and above the
+/// composer card, and it follows the last message's footer.
+#[gpui::test]
+fn nothing_sits_between_the_transcript_and_the_composer(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("compact-pinned-gone"));
+        tests_pin_reference_defaults(&mut state);
+        state.settings.global.general.transcript_view = "verbose".to_string();
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            for turn in 0..2 {
+                session
+                    .messages
+                    .push(ChatMessage::user(format!("turn {turn}")));
+                session.messages.push(ChatMessage::assistant());
+            }
+            session.compact_command = Some(crate::model::CompactCommand {
+                started_at: 0,
+                outcome: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let _shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(cx, "the command row renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("compact-command-row").is_some()
+    });
+    let row = cx
+        .debug_bounds("compact-command-row")
+        .expect("the compact command row");
+    let transcript = cx.debug_bounds("transcript").expect("the transcript pane");
+    let composer = cx.debug_bounds("composer-card").expect("the composer card");
+    let last = cx
+        .debug_bounds("message-footer-3")
+        .expect("the last message's footer");
+    assert!(
+        row.origin.y >= transcript.origin.y
+            && row.origin.y + row.size.height <= transcript.origin.y + transcript.size.height,
+        "the command row is inside the transcript: row={row:?} transcript={transcript:?}"
+    );
+    assert!(
+        last.origin.y < row.origin.y,
+        "and follows the last message, in sequence: last={last:?} row={row:?}"
+    );
+    assert!(
+        row.origin.y + row.size.height <= composer.origin.y,
+        "nothing between the transcript and the composer: row={row:?} composer={composer:?}"
+    );
+    assert!(
+        transcript.origin.y + transcript.size.height <= composer.origin.y,
+        "the transcript itself ends above the composer: transcript={transcript:?} composer={composer:?}"
     );
 }
 
@@ -9600,12 +10250,15 @@ fn a_read_only_preset_caps_the_chip_policy_data_and_audit(cx: &mut TestAppContex
             this.request_permission(crate::caps::FULL_ACCESS, cx)
         })
     });
-    // Full access still goes through the risk gate; confirm it the way the
-    // dialog's own enable action does.
-    cx.update(|_, cx| {
-        shell.update(cx, |this, _| this.permission_acknowledged = true);
-    });
-    cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_confirm_enable(cx)));
+    // NEW SEMANTICS: the read-only ceiling caps Full access, so there is no
+    // widening to confirm and the request is applied without the danger gate.
+    // This used to arm the dialog and confirm it; the chip still reads the same
+    // resolution either way.
+    let confirm = cx.update(|_, cx| shell.read(cx).permission_confirm.clone());
+    assert_eq!(
+        confirm, None,
+        "a Full access the ceiling caps never arms the risk gate"
+    );
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
     let resolution = cx.update(|_, cx| shell.read(cx).state.effective().permission);
@@ -9718,6 +10371,265 @@ fn a_read_only_preset_caps_the_chip_policy_data_and_audit(cx: &mut TestAppContex
     assert!(
         tools.iter().any(|tool| tool == "read_file"),
         "while the read side stays available: {tools:?}"
+    );
+}
+
+/// Two panes, one fact: the General pane's permission row and the composer chip
+/// both read the SAME resolution, so a preset ceiling cannot leave one reporting
+/// the request and the other the effective value. The row still changes the
+/// REQUEST, through the same persist path the chip uses.
+#[gpui::test]
+fn the_general_row_and_the_chip_report_one_effective_permission(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let home = scratch_home("general-permission-effective");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("general-permission-effective", 1);
+        state.lang = Lang::En;
+        // The request is Full access; the session's preset caps it at Read Only.
+        state.settings.workspace.agent.permission = crate::caps::FULL_ACCESS.to_string();
+        state.settings.global.presets.insert(
+            "read-only".to_string(),
+            crate::settings::global::Preset {
+                permission: Some(crate::caps::READ_ONLY.to_string()),
+                plugins: vec!["files".to_string()],
+                ..crate::settings::global::Preset::default()
+            },
+        );
+        state.settings.global.default_preset = "read-only".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("permission-chip-read-only").is_some(),
+        "the composer chip reports the capped effective mode"
+    );
+
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_settings_at(
+                section_index("general").expect("the General pane"),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("settings-pane").is_some(),
+        "the General pane is on screen"
+    );
+
+    // The row's value line and the chip's text come from one resolution.
+    let (row_value, row_selector, chip_text, resolution) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let resolution = shell.state.effective().permission.clone();
+        let (row_value, row_selector) = shell.permission_row_display();
+        (
+            row_value,
+            row_selector,
+            super::composer::permission_chip_text(Lang::En, &resolution),
+            resolution,
+        )
+    });
+    assert_eq!(
+        resolution.effective,
+        crate::caps::READ_ONLY,
+        "the premise: the ceiling lowers the request"
+    );
+    assert_eq!(
+        resolution.requested,
+        crate::caps::FULL_ACCESS,
+        "the row still edits the request, which is Full access"
+    );
+    assert_eq!(
+        row_value, chip_text,
+        "the pane and the chip must render the same string"
+    );
+    assert!(
+        row_value.starts_with("Read Only"),
+        "the pane leads with the EFFECTIVE value, got {row_value:?}"
+    );
+    assert!(
+        row_value.contains("limited by Read Only preset"),
+        "and the pane carries the same ceiling annotation as the chip, got {row_value:?}"
+    );
+    assert_eq!(
+        row_selector, "set-perm-read-only",
+        "the rendered row is drawn in the effective mode"
+    );
+    assert!(
+        cx.debug_bounds("set-perm-read-only").is_some(),
+        "so the pane's row is on screen reporting Read Only"
+    );
+    assert!(
+        cx.debug_bounds("set-perm-full-access").is_none(),
+        "and it never draws the uncapped request it is not obeying"
+    );
+
+    // Choosing a mode from the pane is still the immediate persist path: the
+    // REQUEST changes even though the ceiling keeps the effective mode lower.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            super::settings::permission_action(this, crate::caps::WORKSPACE_WRITE, cx)
+        })
+    });
+    assert_eq!(
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .state
+                .settings
+                .workspace
+                .agent
+                .permission
+                .clone()
+        }),
+        crate::caps::WORKSPACE_WRITE,
+        "the pane's pick writes the request at once"
+    );
+    assert_eq!(
+        reloaded_settings(&home).workspace.agent.permission,
+        crate::caps::WORKSPACE_WRITE,
+        "and it persisted with no Save"
+    );
+}
+
+/// The widening gate follows the EFFECTIVE value. A preset ceiling that caps
+/// Full access below it leaves nothing to widen, so the request is applied and
+/// the ceiling notice explains the result; only a Full access that will actually
+/// take effect arms the dialog, and cancelling it writes nothing.
+#[gpui::test]
+fn a_capped_full_access_skips_the_widening_gate(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let home = scratch_home("composer-permission-capped-gate");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("composer-permission-capped-gate", 1);
+        state.lang = Lang::En;
+        state.settings.workspace.agent.permission = crate::caps::READ_ONLY.to_string();
+        state.settings.global.presets.insert(
+            "capped".to_string(),
+            crate::settings::global::Preset {
+                permission: Some(crate::caps::WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                ..crate::settings::global::Preset::default()
+            },
+        );
+        state.settings.global.default_preset = "capped".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // A workspace-write ceiling under a Full-access request: no dialog.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::FULL_ACCESS, cx)
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (confirm, resolution, notice, requested) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.permission_confirm.clone(),
+            shell.state.effective().permission.clone(),
+            shell.state.notice.clone(),
+            shell.state.settings.workspace.agent.permission.clone(),
+        )
+    });
+    assert_eq!(
+        confirm, None,
+        "a widening that cannot happen must not arm the gate"
+    );
+    assert!(
+        cx.debug_bounds("permission-confirm-dialog").is_none(),
+        "and no dialog is drawn"
+    );
+    assert_eq!(
+        requested,
+        crate::caps::FULL_ACCESS,
+        "the chosen request is applied"
+    );
+    assert_eq!(
+        resolution.effective,
+        crate::caps::WORKSPACE_WRITE,
+        "while the ceiling still caps what the session may do"
+    );
+    let expected_notice = crate::i18n::tr_args(
+        Lang::En,
+        "permission.ceilingNotice",
+        &[
+            (
+                "requested",
+                crate::i18n::tr(Lang::En, "permission.presetFullAccess"),
+            ),
+            (
+                "ceiling",
+                crate::i18n::tr(Lang::En, "permission.presetWorkspaceWrite"),
+            ),
+            (
+                "effective",
+                crate::i18n::tr(Lang::En, "permission.presetWorkspaceWrite"),
+            ),
+        ],
+    );
+    assert_eq!(
+        notice.as_deref(),
+        Some(expected_notice.as_str()),
+        "and the existing ceiling notice says why the result stayed lower"
+    );
+    assert_eq!(
+        reloaded_settings(&home).workspace.agent.permission,
+        crate::caps::FULL_ACCESS,
+        "the request persisted without a Save"
+    );
+
+    // A Full-access ceiling genuinely widens, so the gate is still the route.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            if let Some(preset) = this.state.settings.global.presets.get_mut("capped") {
+                preset.permission = Some(crate::caps::FULL_ACCESS.to_string());
+            }
+            this.request_permission(crate::caps::READ_ONLY, cx);
+        })
+    });
+    let global = home.join("settings.toml");
+    let workspace = crate::settings::workspace::WorkspaceSettings::path(&home);
+    let before_global = std::fs::read(&global).expect("the global document was written");
+    let before_workspace = std::fs::read(&workspace).expect("the workspace document was written");
+
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.request_permission(crate::caps::FULL_ACCESS, cx)
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).permission_confirm.clone())
+            .as_deref(),
+        Some(crate::caps::FULL_ACCESS),
+        "an effective widening still arms the gate"
+    );
+    assert!(
+        cx.debug_bounds("permission-confirm-dialog").is_some(),
+        "and draws it"
+    );
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.permission_cancel_confirm(cx)));
+    assert_eq!(
+        std::fs::read(&global).expect("global document"),
+        before_global,
+        "cancel writes nothing, so the global document is byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(&workspace).expect("workspace document"),
+        before_workspace,
+        "and neither is the workspace document"
+    );
+    assert_eq!(
+        reloaded_settings(&home).workspace.agent.permission,
+        crate::caps::READ_ONLY,
+        "the cancelled offer leaves the stored request alone"
     );
 }
 
@@ -13099,6 +14011,72 @@ fn the_inspect_link_opens_the_call_in_the_trajectory(cx: &mut TestAppContext) {
         "with its panel open"
     );
 }
+/// The turn's changed files render as the reference's closing card, and
+/// hovering a row previews that file's comparison: the effect a reader asks
+/// for when they want to see what an edit actually did.
+#[gpui::test]
+fn hovering_a_changed_file_previews_its_diff(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("changes-card", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        // The file as it is NOW: the change has landed, which is what lets the
+        // preview number its rows.
+        std::fs::write(root.join("lib.rs"), "one\ntwo\nTHREE\nfour\n").expect("the file");
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(crate::model::ToolEvent {
+                name: "edit_file".to_string(),
+                args: r#"{"path":"lib.rs","old_string":"three","new_string":"THREE"}"#.to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(4),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The card is on the assistant message that owns the write.
+    draw_until(cx, "the changed-files card renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("changes-card-1").is_some()
+    });
+    assert!(
+        cx.debug_bounds("changes-row-1-0").is_none(),
+        "a single file is only a header, as the reference draws it"
+    );
+    assert!(
+        cx.debug_bounds("changes-preview").is_none(),
+        "nothing previews before the pointer arrives"
+    );
+
+    // Hover the header: the preview waits 500ms, then opens.
+    let header = cx
+        .debug_bounds("changes-header-1")
+        .expect("the card header");
+    cx.simulate_mouse_move(
+        header.center(),
+        None::<gpui_kit::MouseButton>,
+        Modifiers::default(),
+    );
+    // The preview waits 500ms, and in a test that delay is the DETERMINISTIC
+    // clock rather than wall time: a sleep advances nothing, so the timer would
+    // never fire. Advancing the clock is what a 500ms delay means here.
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_millis(600));
+    cx.run_until_parked();
+    draw_until(cx, "the preview opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("changes-preview").is_some()
+    });
+    // And it is a real comparison: the pane behind it is not needed, the card
+    // names the file it explains.
+    let hovered = cx.update(|_, cx| shell.read(cx).changes_preview.is_some());
+    assert!(hovered, "the shell holds the preview it drew");
+}
+
 /// The Files tab carries the action that FEEDS the comparison pane. The Diff
 /// tab on its own can never load anything, because a comparison needs a file
 /// and that tab has no picker - which is why the surface read as unreachable.
@@ -13253,6 +14231,498 @@ fn a_patch_file_opens_as_a_comparison(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("diff-error").is_none(),
         "and it loaded without an error"
+    );
+}
+
+/// The strip is a real tab list, not a badge for the pane already open: every
+/// pane the Start screen offers is one press away, Diff included. This is the
+/// entry point the pane never had - its body needs no file picker, so the only
+/// door was the Start screen.
+#[gpui::test]
+fn the_right_strip_offers_the_diff_pane(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("strip-diff", 1);
+        tests_pin_reference_defaults(&mut state);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The panel starts collapsed; open it and pick Files, so the strip is
+    // showing one pane and must offer the others.
+    let toggle = cx
+        .debug_bounds("hdr-show-right-panel")
+        .expect("the header carries the right panel's toggle");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    draw_until(cx, "the Start screen renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-card-right.tab.files").is_some()
+    });
+    let card = cx
+        .debug_bounds("right-card-right.tab.files")
+        .expect("the Files card renders");
+    cx.simulate_click(card.center(), Modifiers::default());
+    draw_until(cx, "the Files pane opens", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).right.tab == Some(RightTab::Files))
+    });
+
+    // The strip offers Diff while Files holds the body.
+    draw_until(cx, "the strip offers Diff", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-pane-diff").is_some()
+    });
+    let chip = cx
+        .debug_bounds("right-pane-diff")
+        .expect("the strip's Diff chip");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    draw_until(cx, "the comparison pane opens", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).right.tab == Some(RightTab::Diff))
+    });
+    assert!(
+        cx.update(|_, cx| shell.read(cx).right.open),
+        "the panel stays open on the pane the strip chose"
+    );
+    // Nothing is open yet, and the empty state says how a comparison arrives
+    // rather than drawing a blank box.
+    assert!(
+        cx.debug_bounds("diff-pane").is_some(),
+        "the Diff pane's body renders"
+    );
+    assert!(
+        cx.debug_bounds("diff-empty-hint").is_some(),
+        "with the hint that names its entry points"
+    );
+}
+
+/// The turn-focused pane lists the files that turn wrote, expands a recorded
+/// edit to its unified rows, and says plainly when a write recorded no old
+/// text. The list comes from the tool requests, so no VCS and no invented
+/// hunk is involved.
+#[gpui::test]
+fn a_turn_diff_lists_its_files_and_their_recorded_rows(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("turn-diff", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        // The edit has landed, which is what lets the hunk be placed at its
+        // real line rather than at a synthetic header.
+        std::fs::write(root.join("lib.rs"), "fn main() {\n    let a = 2;\n}\n").expect("the file");
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(ToolEvent {
+                name: "edit_file".to_string(),
+                args: r#"{"path":"lib.rs","old_string":"let a = 1;","new_string":"let a = 2;"}"#
+                    .to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(4),
+                at: None,
+            });
+            session.messages[1].tools.push(ToolEvent {
+                name: "write_file".to_string(),
+                args: r##"{"path":"notes.md","content":"# Notes\nrewritten"}"##.to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(3),
+                at: None,
+            });
+            session.messages[1].tools.push(ToolEvent {
+                name: "create_file".to_string(),
+                args: r#"{"path":"new.rs","content":"fn new() {}"}"#.to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(2),
+                at: None,
+            });
+            // A command can change files the list will never name; the pane
+            // says so rather than implying its list is the whole turn.
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: r#"{"command":"touch side-effect.txt"}"#.to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(1),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.open_diff_turn(1, cx));
+    });
+    draw_until(cx, "the turn list renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-file-0").is_some()
+    });
+    // The pane names the turn and lists all three files.
+    let (tab, ordinal, message) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.right.tab,
+            shell.right.diff.turn.as_ref().map(|turn| turn.ordinal),
+            shell.right.diff.turn.as_ref().map(|turn| turn.message),
+        )
+    });
+    assert_eq!(tab, Some(RightTab::Diff), "the panel shows the comparison");
+    assert_eq!(ordinal, Some(1), "the list names the turn it came from");
+    assert_eq!(
+        message,
+        Some(1),
+        "and it is the message the control named, not any other"
+    );
+    for index in 0..3 {
+        let selector: &str = Box::leak(format!("diff-turn-file-{index}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the list carries file {index}"
+        );
+    }
+    assert!(
+        cx.debug_bounds("diff-body").is_none(),
+        "a turn list is not a kit file comparison"
+    );
+    assert!(
+        cx.debug_bounds("diff-turn-command-note").is_some(),
+        "a turn that also ran a command admits what the list cannot name"
+    );
+
+    // A recorded edit expands to a REAL before/after pair.
+    let row = cx
+        .debug_bounds("diff-turn-file-0")
+        .expect("the first changed file");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the edit's rows open", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-line-0-0").is_some()
+    });
+    let rows = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.rows.get(&0))
+            .cloned()
+            .expect("the first file resolved its rows")
+    });
+    assert!(
+        rows.iter()
+            .any(|line| line.mark == '-' && line.text == "let a = 1;"),
+        "the old side is the text the tool recorded: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|line| line.mark == '+' && line.text == "let a = 2;"),
+        "the new side is what it asked for: {rows:?}"
+    );
+
+    // A write with no recorded old text says so, and draws no fake hunk.
+    let row = cx
+        .debug_bounds("diff-turn-file-1")
+        .expect("the rewritten file");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the rewrite note opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-note-1").is_some()
+    });
+    assert!(
+        cx.debug_bounds("diff-turn-line-1-0").is_none(),
+        "a rewrite has no rows to draw"
+    );
+    let lang = cx.update(|_, cx| shell.read(cx).state.lang);
+    let text = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.files.get(1))
+            .map(|file| file.basis)
+    });
+    assert_eq!(
+        text,
+        Some(crate::ui::diff_pane::TurnBasis::Rewritten),
+        "the basis is the recorded fact"
+    );
+    let note = crate::i18n::tr(lang, "diff.turnRewritten");
+    assert_ne!(note, "diff.turnRewritten", "the note is a real string");
+    assert!(
+        note.contains("previous content") || note.contains("之前的内容"),
+        "the note says the old side is unavailable: {note}"
+    );
+
+    // A creation is new, not a rewrite.
+    let row = cx
+        .debug_bounds("diff-turn-file-2")
+        .expect("the created file");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the creation note opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-note-2").is_some()
+    });
+    let basis = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.files.get(2))
+            .map(|file| file.basis)
+    });
+    assert_eq!(
+        basis,
+        Some(crate::ui::diff_pane::TurnBasis::NewFile),
+        "a create records every line as new"
+    );
+    let note = crate::i18n::tr(lang, "diff.turnNewFile");
+    assert!(
+        note.to_lowercase().contains("new file") || note.contains("新文件"),
+        "the note calls it a new file: {note}"
+    );
+}
+
+/// The turn's own closing card is the control that opens the pane ON THAT
+/// TURN. Two turns exist and only the second wrote anything; the pane must show
+/// the second turn's files, and a row must open that one file inside the list.
+#[gpui::test]
+fn a_turn_card_opens_the_diff_pane_on_that_turn(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("turn-card", 2);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("second.rs"), "let b = 2;").expect("the edited file");
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            // Only the SECOND turn (message 3) wrote; the first turn is clean.
+            session.messages[3].tools.push(ToolEvent {
+                name: "edit_file".to_string(),
+                args: r#"{"path":"second.rs","old_string":"let b = 1;","new_string":"let b = 2;"}"#
+                    .to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(3),
+                at: None,
+            });
+            session.messages[3].tools.push(ToolEvent {
+                name: "write_file".to_string(),
+                args: r#"{"path":"second.md","content":"rewritten"}"#.to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(2),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(cx, "the second turn's card renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("changes-card-3").is_some()
+    });
+    assert!(
+        cx.debug_bounds("changes-card-1").is_none(),
+        "the first turn wrote nothing, so it has no card"
+    );
+
+    // The header is the turn-level control.
+    let header = cx
+        .debug_bounds("changes-header-3")
+        .expect("the closing card's header");
+    cx.simulate_click(header.center(), Modifiers::default());
+    draw_until(cx, "the turn list opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-file-0").is_some()
+    });
+    let (message, ordinal, files) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let turn = shell.right.diff.turn.as_ref();
+        (
+            turn.map(|turn| turn.message),
+            turn.map(|turn| turn.ordinal),
+            turn.map(|turn| {
+                turn.files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>()
+            }),
+        )
+    });
+    assert_eq!(
+        message,
+        Some(3),
+        "the pane targets the turn whose card was pressed"
+    );
+    assert_eq!(ordinal, Some(2), "which is the second turn");
+    assert_eq!(
+        files,
+        Some(vec!["second.rs".to_string(), "second.md".to_string()]),
+        "and lists only that turn's files"
+    );
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .is_some_and(|t| t.open.is_empty())),
+        "a header press lists the files without opening one"
+    );
+
+    // A row opens the list on that file.
+    let row = cx
+        .debug_bounds("changes-row-3-1")
+        .expect("the second file's row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the row's file expands", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-note-1").is_some()
+    });
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.open.contains(&1))),
+        "the row's own file is the one expanded"
+    );
+}
+
+/// An empty turn list names the turn and the reason it has nothing: a command
+/// may change files without recording which ones, which is not the same fact
+/// as a turn that changed nothing.
+#[gpui::test]
+fn an_empty_turn_diff_says_which_turn_and_why(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("turn-diff-empty", 2);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: r#"{"command":"touch generated.txt"}"#.to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(2),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    // The command-only turn: its files are not individually captured.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.open_diff_turn(1, cx));
+    });
+    draw_until(cx, "the empty turn state renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-empty").is_some()
+    });
+    let empty = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.empty)
+    });
+    assert_eq!(
+        empty,
+        Some(crate::ui::diff_pane::TurnEmpty::CommandsOnly),
+        "a shell command is 'not captured', not 'nothing changed'"
+    );
+    let lang = cx.update(|_, cx| shell.read(cx).state.lang);
+    let text = crate::i18n::tr_args(lang, "diff.turnCommands", &[("turn", "1".to_string())]);
+    assert!(
+        text.contains('1') && !text.is_empty(),
+        "the empty state names the turn: {text}"
+    );
+    assert_ne!(text, "diff.turnCommands", "and is a real string");
+
+    // The turn that recorded nothing at all says exactly that.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.open_diff_turn(3, cx));
+    });
+    draw_until(cx, "the no-writes state renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-empty").is_some()
+    });
+    let empty = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.empty)
+    });
+    assert_eq!(
+        empty,
+        Some(crate::ui::diff_pane::TurnEmpty::NoWrites),
+        "a turn with no writing tool changed no file"
+    );
+}
+
+/// Every label the strip and the turn list draw is a real string in BOTH
+/// locales: a missing key renders as itself, which is exactly the raw
+/// `right.tab.diff` the screenshot showed.
+#[test]
+fn the_diff_labels_are_real_in_both_locales() {
+    let keys = [
+        "right.tab.files",
+        "right.tab.terminal",
+        "right.tab.browser",
+        "right.tab.diff",
+        "right.diff.hint",
+        "right.notBuilt",
+        "diff.empty",
+        "diff.emptyHint",
+        "diff.turnTitle",
+        "diff.turnEmpty",
+        "diff.turnCommands",
+        "diff.turnCommandNote",
+        "diff.turnNewFile",
+        "diff.turnRewritten",
+        "diff.turnMore",
+    ];
+    for key in keys {
+        for lang in [Lang::En, Lang::Zh] {
+            let text = crate::i18n::tr(lang, key);
+            assert!(!text.is_empty(), "\"{key}\" has no value in one locale");
+            assert_ne!(text, key, "\"{key}\" rendered as its raw key in one locale");
+        }
+    }
+    // The exact wording of the two honest notes, so a rename cannot slip past
+    // the pane test above.
+    assert_eq!(
+        crate::i18n::tr(Lang::En, "diff.turnNewFile"),
+        "New file — no previous content was recorded"
+    );
+    assert_eq!(
+        crate::i18n::tr(Lang::En, "diff.turnRewritten"),
+        "Rewritten — previous content unavailable"
+    );
+    assert_eq!(
+        crate::i18n::tr(Lang::Zh, "diff.turnNewFile"),
+        "新文件 — 未记录之前的内容"
+    );
+}
+
+/// The changed-files scaffolding was parked under a `dead_code` allow "wired
+/// by the changed-files panel that is landing next". It has landed, so the
+/// allow must be gone: clippy proves the symbols are used, and this pins the
+/// comment so a parking note cannot creep back.
+#[test]
+fn the_changed_files_scaffolding_is_not_parked_under_dead_code() {
+    let transcript = include_str!("transcript.rs");
+    assert!(
+        !transcript.contains("wired by the changed-files panel"),
+        "transcript.rs still parks the changed-files scaffolding"
+    );
+    let theme = include_str!("../theme.rs");
+    assert!(
+        !theme.contains("wired by the changed-files panel"),
+        "theme.rs still parks the changed-files scaffolding"
     );
 }
 

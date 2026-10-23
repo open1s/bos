@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::context::{AgentReactContext, AgentSession};
+use crate::agent::context::{AgentReactContext, AgentSession, MAX_STEER_DEPTH};
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent};
 use crate::tools::FunctionTool;
 use async_trait::async_trait;
@@ -1412,6 +1412,395 @@ async fn compact_now_refuses_an_empty_summary() {
         4,
         "a failed summary leaves the history untouched"
     );
+}
+
+// =========================================================================
+// Steering: a host message taken at the RUNNING turn's next step
+// =========================================================================
+
+/// The user turns a session carries, in order, as the mock sees it.
+fn user_turns(session: &AgentSession) -> Vec<String> {
+    session
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            react::LlmMessage::User {
+                content: Content::Text(text),
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A mock that records the session at every call and asks for one tool on the
+/// first, so the engine reaches a SECOND step - the only place a steer can land.
+struct SteerReceivingLlm {
+    calls: std::sync::atomic::AtomicUsize,
+    seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for SteerReceivingLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        Ok(make_text_response("blocking path unused".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        self.seen.lock().unwrap().push(user_turns(session));
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamToken::ToolCall {
+                    name: "no_such_tool".to_string(),
+                    args: serde_json::json!({}),
+                    id: Some("steer-call-1".to_string()),
+                }),
+                Ok(StreamToken::Done),
+            ])))
+        } else {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamToken::Text("acknowledged".to_string())),
+                Ok(StreamToken::Done),
+            ])))
+        }
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "steer-mock"
+    }
+}
+
+/// A hook that steers once, on the step the engine is about to run.
+struct SteerOnFirstStep {
+    mailbox: Arc<SteerMailbox>,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl AgentHook for SteerOnFirstStep {
+    async fn on_event(&self, _event: HookEvent, _context: &HookContext) -> HookDecision {
+        if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                self.mailbox.push(SteerMessage {
+                    content: Content::Text("steer now".to_string()),
+                    ticket: 7,
+                }),
+                "the mailbox takes the steer"
+            );
+        }
+        HookDecision::Continue
+    }
+}
+
+/// A steer pushed while step one is in flight is appended as a USER TURN
+/// before step two's request, and the sink reports the ticket at that point.
+///
+/// The assertion is on the session the mock is handed - which is what the
+/// vendor turns into the wire request - not on a flag: call one must not carry
+/// the message, call two must.
+#[tokio::test]
+async fn a_steered_message_enters_the_next_request_as_a_user_turn() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+    let tickets = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(SteerReceivingLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: Arc::clone(&seen),
+        }),
+    );
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    // The mailbox the APP drains, not a fresh one: a steer the engine never
+    // reads would prove nothing.
+    let mailbox = agent.steers().clone();
+    agent.hooks().register(
+        HookEvent::BeforeLlmCall,
+        Arc::new(SteerOnFirstStep {
+            mailbox: Arc::clone(&mailbox),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }),
+    );
+    let sink_tickets = Arc::clone(&tickets);
+    agent.on_steered(move |ticket| sink_tickets.lock().unwrap().push(ticket));
+    // The agent's own mailbox must be the one the app drains, or the hook's
+    // push would go somewhere the engine never looks.
+    assert_eq!(mailbox.depth(), 0);
+
+    let stream = agent.stream("start the turn");
+    futures::pin_mut!(stream);
+    while let Some(item) = stream.next().await {
+        assert!(item.is_ok(), "the turn streams cleanly: {item:?}");
+    }
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "the tool call forced a second step");
+    assert!(
+        !seen[0].iter().any(|text| text == "steer now"),
+        "the request already in flight must not carry the steer: {:?}",
+        seen[0]
+    );
+    assert_eq!(
+        seen[1],
+        vec!["start the turn".to_string(), "steer now".to_string()],
+        "the next request carries it as a user turn, in order"
+    );
+    assert_eq!(
+        tickets.lock().unwrap().as_slice(),
+        &[7],
+        "the sink is told the ticket at the point the step takes it"
+    );
+
+    let session = agent.session();
+    let turns = user_turns(&session);
+    assert_eq!(
+        turns,
+        vec!["start the turn".to_string(), "steer now".to_string()],
+        "the session records the message at the point it was taken"
+    );
+    let final_text = session.messages().iter().find_map(|message| match message {
+        react::LlmMessage::Assistant { content } => Some(content.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        final_text.as_deref(),
+        Some("acknowledged"),
+        "the turn keeps streaming after the steer"
+    );
+}
+
+/// A steer no step ever takes is handed back instead of vanishing with the
+/// turn: the host restores it, which is the only honest outcome for a message
+/// the model never saw.
+struct SteerAfterLastStep {
+    mailbox: Arc<SteerMailbox>,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl AgentHook for SteerAfterLastStep {
+    async fn on_event(&self, _event: HookEvent, _context: &HookContext) -> HookDecision {
+        // OnComplete is raised once by the engine's final answer and once by
+        // the Agent wrapper's own completion; only the first is the race under
+        // test.
+        if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.mailbox.push(SteerMessage {
+                content: Content::Text("too late".to_string()),
+                ticket: 9,
+            });
+        }
+        HookDecision::Continue
+    }
+}
+
+#[tokio::test]
+async fn a_steer_the_turn_never_takes_is_withdrawn() {
+    let provider = make_llm_provider();
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    let mailbox = agent.steers().clone();
+    // OnComplete fires as the turn COMMITS its final answer - after the
+    // next-step check has already passed - so this models a steer landing in
+    // the closing instant. A hook earlier in the step would extend the turn
+    // instead (see the extension test below).
+    agent.hooks().register(
+        HookEvent::OnComplete,
+        Arc::new(SteerAfterLastStep {
+            mailbox: Arc::clone(&mailbox),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }),
+    );
+
+    let stream = agent.stream("answer in one step");
+    futures::pin_mut!(stream);
+    while let Some(item) = stream.next().await {
+        assert!(item.is_ok(), "the turn streams cleanly: {item:?}");
+    }
+
+    assert_eq!(
+        agent.take_undelivered_steers(),
+        vec![9],
+        "the unread message is handed back, not silently dropped"
+    );
+    assert_eq!(agent.steers().depth(), 0, "and the mailbox is empty again");
+    assert!(
+        !user_turns(&agent.session())
+            .iter()
+            .any(|text| text == "too late"),
+        "the model never saw it"
+    );
+}
+
+/// A mock that never asks for a tool: every call is a plain answer, so the ONLY
+/// way the turn can reach a second request is the next-step keep-open rule.
+struct PlainAnswerLlm {
+    calls: std::sync::atomic::AtomicUsize,
+    seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for PlainAnswerLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        Ok(make_text_response("blocking path unused".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        self.seen.lock().unwrap().push(user_turns(session));
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let text = if call == 0 {
+            "first answer"
+        } else {
+            "second answer"
+        };
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(StreamToken::Text(text.to_string())),
+            Ok(StreamToken::Done),
+        ])))
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "plain-answer-mock"
+    }
+}
+
+/// A steer that lands while a NO-TOOL answer streams keeps the turn open: the
+/// next step carries it, the model answers inside the SAME turn, and the turn
+/// only ends after that answer.
+///
+/// This is the reference's rule - its loop checks `inbox.nextStep.length`
+/// before closing a turn - and the observable is the mock's session at call
+/// two, not a flag.
+#[tokio::test]
+async fn a_steer_extends_a_turn_whose_step_made_no_tool_call() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+    let tickets = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(PlainAnswerLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: Arc::clone(&seen),
+        }),
+    );
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    let mailbox = agent.steers().clone();
+    // AfterLlmCall fires once the first answer has streamed but BEFORE the
+    // engine decides whether the turn is over.
+    agent.hooks().register(
+        HookEvent::AfterLlmCall,
+        Arc::new(SteerOnFirstStep {
+            mailbox: Arc::clone(&mailbox),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }),
+    );
+    let sink_tickets = Arc::clone(&tickets);
+    agent.on_steered(move |ticket| sink_tickets.lock().unwrap().push(ticket));
+
+    let stream = agent.stream("start the turn");
+    futures::pin_mut!(stream);
+    while let Some(item) = stream.next().await {
+        assert!(item.is_ok(), "the turn streams cleanly: {item:?}");
+    }
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        2,
+        "the steer kept the turn open for a second request: {seen:?}"
+    );
+    assert_eq!(seen[0], vec!["start the turn".to_string()]);
+    assert_eq!(
+        seen[1],
+        vec!["start the turn".to_string(), "steer now".to_string()],
+        "the extended request carries the steer as a user turn"
+    );
+    assert_eq!(
+        tickets.lock().unwrap().as_slice(),
+        &[7],
+        "the sink reports the ticket at the take"
+    );
+
+    let session = agent.session();
+    let transcript: Vec<(bool, String)> = session
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            react::LlmMessage::User {
+                content: Content::Text(text),
+            } => Some((true, text.clone())),
+            react::LlmMessage::Assistant { content } => Some((false, content.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        transcript,
+        vec![
+            (true, "start the turn".to_string()),
+            (false, "first answer".to_string()),
+            (true, "steer now".to_string()),
+            (false, "second answer".to_string()),
+        ],
+        "the transcript keeps the order the turn really produced"
+    );
+}
+
+/// The bound and the order: eight wait, the ninth is refused, and taking them
+/// hands them back oldest first.
+#[test]
+fn the_steer_mailbox_is_bounded_and_first_in_first_out() {
+    let mut provider = LlmProvider::new();
+    provider.register_vendor("mock".to_string(), Box::new(MockLlm::new()));
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    for index in 0..MAX_STEER_DEPTH {
+        assert!(
+            agent.steer(format!("message {index}"), index as u64),
+            "message {index} fits the bound"
+        );
+    }
+    assert!(
+        !agent.steer("one too many", 99),
+        "the mailbox refuses the message past its bound"
+    );
+    assert_eq!(agent.steers().depth(), MAX_STEER_DEPTH);
+    let tickets = agent.steers().withdraw();
+    assert_eq!(
+        tickets,
+        (0..MAX_STEER_DEPTH as u64).collect::<Vec<_>>(),
+        "withdraw returns the tickets oldest first"
+    );
+    assert_eq!(agent.steers().depth(), 0);
+    assert!(agent.take_undelivered_steers().is_empty());
 }
 
 #[tokio::test]

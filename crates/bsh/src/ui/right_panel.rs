@@ -23,6 +23,7 @@ use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::input::{
     Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
 };
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::Focusable;
 use gpui_kit::*;
 
@@ -30,6 +31,7 @@ use super::diff_pane::{self, DiffSource};
 use super::shell::{Shell, SideDrag};
 use super::{hairline_left, handle_bar, icon, txt, DivExt, IconName};
 use crate::files::{self, Kind};
+use crate::model::Role;
 use crate::terminal::KeyOutcome;
 use crate::theme;
 
@@ -431,6 +433,18 @@ impl RightTab {
         }
     }
 
+    /// The pane's stable id stem, for the strip's controls and the tests that
+    /// press them. The label key is dotted ("right.tab.diff"), which makes a
+    /// poor element id, so the two are separate facts.
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            RightTab::Files => "files",
+            RightTab::Terminal => "terminal",
+            RightTab::Diff => "diff",
+            RightTab::Browser => "browser",
+        }
+    }
+
     /// Every pane the Start screen offers, in the order it lists them.
     const ALL: [RightTab; 4] = [
         RightTab::Files,
@@ -829,7 +843,19 @@ impl Shell {
                 ))
                 .child(self.right_panel_close(cx)),
             Some(tab) => {
-                let mut content = row.child(self.right_tab_chip(tab, cx));
+                // The strip is a real tab list: the open pane carries its
+                // label, every other pane keeps its glyph one press away. It
+                // used to carry only the pane that was already open, which left
+                // the Start screen as the only door to a pane - and Diff, whose
+                // body needs no picker, had no door at all from here.
+                let mut content = row;
+                for pane in RightTab::ALL {
+                    content = content.child(if pane == tab {
+                        self.right_tab_chip(pane, cx).into_any_element()
+                    } else {
+                        self.right_pane_chip(pane, cx).into_any_element()
+                    });
+                }
                 // The files open out of the Files pane join the panel's own tab
                 // strip, right after its chip: the reference's dock carries
                 // every open pane and document in one strip, and a second strip
@@ -854,7 +880,8 @@ impl Shell {
                             .hover(|s| s.bg(rgb(theme::hover())))
                             .child(icon(IconName::Plus, 14.0, theme::faint()))
                             // A new tab lands back on the Start screen, which is
-                            // the only place a pane can be picked from.
+                            // where a pane without a chip of its own would be
+                            // picked.
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.right.tab = None;
                                 cx.notify();
@@ -880,6 +907,38 @@ impl Shell {
             }
         };
         bar.child(content)
+    }
+
+    /// One pane's chip in the strip, for every pane that is not the open one.
+    ///
+    /// Its glyph and its tooltip are the same pair the Start card carries, so
+    /// the strip and the Start screen name a pane the same way, and pressing it
+    /// is the same call the Start card makes.
+    fn right_pane_chip(&self, tab: RightTab, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = self.state.lang.tr(tab.key());
+        div()
+            .id(SharedString::from(format!("right-pane-{}", tab.slug())))
+            .debug_selector(move || format!("right-pane-{}", tab.slug()))
+            .h(px(theme::RIGHT_TAB_H))
+            .w(px(26.0))
+            .flex_none()
+            .rounded(px(theme::RADIUS_SM))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .child(icon(tab.glyph(), 14.0, theme::muted()))
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.open_right_tab(tab, cx);
+                // A terminal is a text surface: opening it puts the cursor
+                // where the reader's next keystroke will land.
+                if tab == RightTab::Terminal {
+                    window.focus(&this.terminal_focus, cx);
+                }
+            }))
     }
 
     /// The one open tab, with the close that drops the pane back to Start.
@@ -3613,6 +3672,8 @@ impl Shell {
     /// The same refusal when the message is already built.
     fn diff_refused_text(&mut self, text: String, cx: &mut Context<Self>) {
         self.right.diff.error = Some(text);
+        // A refusal replaces whatever the pane was showing, turn list included.
+        self.right.diff.turn = None;
         self.right.tab = Some(RightTab::Diff);
         self.right.open = true;
         cx.notify();
@@ -3652,6 +3713,7 @@ impl Shell {
             Ok(files) if !files.is_empty() => files,
             _ => {
                 self.right.diff.error = Some(self.state.lang.tr("diff.error"));
+                self.right.diff.turn = None;
                 self.right.tab = Some(RightTab::Diff);
                 self.right.open = true;
                 cx.notify();
@@ -3714,6 +3776,9 @@ impl Shell {
         self.right.diff.path = Some(path);
         self.right.diff.source = Some(source);
         self.right.diff.error = None;
+        // A file comparison and a turn list are two subjects for one surface;
+        // opening a file takes the surface back.
+        self.right.diff.turn = None;
         self.right.diff.conflicts = conflicts;
         // Nothing is resolved the moment a conflicted file opens; the flag is
         // recomputed on every resolution rather than assumed.
@@ -3800,6 +3865,12 @@ impl Shell {
 
     /// The comparison surface.
     pub(crate) fn diff_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        // A turn-focused list is the pane's other subject. It is checked first
+        // because the two are mutually exclusive and a turn has no kit
+        // `DiffState` behind it - the list is built from the tool records.
+        if self.right.diff.turn.is_some() {
+            return self.turn_diff_pane(cx);
+        }
         let lang = self.state.lang;
         let pane = div()
             .debug_selector(|| String::from("diff-pane"))
@@ -3984,6 +4055,423 @@ impl Shell {
             body = body.child(txt(error, theme::CHIP_SIZE, theme::error()));
         }
         pane.child(header).child(body).into_any_element()
+    }
+
+    /// Open the Diff pane on one turn's changed files.
+    ///
+    /// The data is the turn's own tool records: the same grouping the closing
+    /// card draws, plus the one fact the card hides - whether a file's old side
+    /// was recorded. Nothing here reads the disk or a VCS, because a tool
+    /// request is the only before-image bsh keeps.
+    pub(crate) fn open_diff_turn(&mut self, message: usize, cx: &mut Context<Self>) {
+        let Some(session) = self.state.active_session() else {
+            return;
+        };
+        let Some(target) = session.messages.get(message) else {
+            return;
+        };
+        // The tools are cloned out before the shell is written: the session is
+        // borrowed from the shell, and the diff view is a field of it.
+        let tools = target.tools.clone();
+        // The turn's number, one-based: the number of prompts up to and
+        // including the message the reader pressed. It names the turn in the
+        // header and in the empty state, so a reader landing on a list knows
+        // which one they are looking at.
+        let ordinal = session
+            .messages
+            .iter()
+            .take(message + 1)
+            .filter(|line| line.role == Role::User && !line.steering)
+            .count()
+            .max(1);
+        let files = diff_pane::turn_files(&tools);
+        let commands = diff_pane::TurnView::ran_commands(&tools);
+        let empty = files
+            .is_empty()
+            .then(|| diff_pane::TurnView::why_empty(&tools));
+        // The file comparison and the turn list are exclusive subjects: the
+        // turn takes the surface over, and its toolbar carries no mode or wrap
+        // control because neither applies to a recorded hunk.
+        self.right.diff.state = None;
+        self.right.diff.path = None;
+        self.right.diff.source = None;
+        self.right.diff.conflicts = 0;
+        self.right.diff.resolved = false;
+        self.right.diff.turn = Some(diff_pane::TurnView {
+            message,
+            ordinal,
+            files,
+            open: std::collections::HashSet::new(),
+            rows: std::collections::HashMap::new(),
+            empty,
+            commands,
+        });
+        self.right.diff.error = None;
+        self.right.tab = Some(RightTab::Diff);
+        self.right.open = true;
+        cx.notify();
+    }
+
+    /// Open the turn's list with one changed file already expanded.
+    ///
+    /// A changed-file row names one file, so it lands on that file's comparison
+    /// rather than on a list the reader then has to search.
+    pub(crate) fn open_diff_turn_at(&mut self, message: usize, path: &str, cx: &mut Context<Self>) {
+        self.open_diff_turn(message, cx);
+        // The path is the card's own identity for a changed file; an index
+        // would assume the two groupings never differ.
+        let index = self
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.files.iter().position(|file| file.path == path));
+        if let Some(index) = index {
+            self.expand_turn_file(index, cx);
+        }
+        cx.notify();
+    }
+
+    /// Open or close one file's rows in the turn list.
+    pub(crate) fn toggle_turn_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let open = self
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.open.contains(&index));
+        if open {
+            if let Some(turn) = self.right.diff.turn.as_mut() {
+                turn.open.remove(&index);
+            }
+            cx.notify();
+            return;
+        }
+        self.expand_turn_file(index, cx);
+    }
+
+    /// Resolve one file's rows and mark it open.
+    ///
+    /// The rows are resolved HERE rather than per frame because placing the
+    /// hunk reads the file as it is now; the crate's own rule forbids that on
+    /// the render path. A file with no recorded old side resolves to none, and
+    /// the row shows its basis note instead.
+    fn expand_turn_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(file) = self
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.files.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let current = self.current_text_of(&file.path);
+        let rows = diff_pane::turn_rows(&file, current.as_deref());
+        if let Some(turn) = self.right.diff.turn.as_mut() {
+            if let Some(rows) = rows {
+                turn.rows.insert(index, rows);
+            }
+            turn.open.insert(index);
+        }
+        cx.notify();
+    }
+
+    /// The turn-focused body: a header naming the turn, then one row per file
+    /// it wrote, each expandable to the comparison the tool recorded.
+    fn turn_diff_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let turn = self
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .expect("the caller checked the turn view");
+        let added: usize = turn.files.iter().map(|file| file.added).sum();
+        let deleted: usize = turn.files.iter().map(|file| file.deleted).sum();
+        let title = crate::i18n::tr_args(
+            lang,
+            "diff.turnTitle",
+            &[("turn", turn.ordinal.to_string())],
+        );
+        let header = div()
+            .debug_selector(|| String::from("diff-turn-toolbar"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(32.0))
+            .px(px(theme::RIGHT_PAD))
+            .flex_none()
+            .border_b_1()
+            .border_color(rgb(theme::border_soft()))
+            .child(icon(IconName::GitCompareArrows, 13.0, theme::faint()))
+            .child(
+                div()
+                    .debug_selector(|| String::from("diff-turn-title"))
+                    .flex_1()
+                    .min_w_0()
+                    .child(txt(title, 12.0, theme::text()).truncate()),
+            )
+            .when(added > 0, |row| {
+                row.child(txt(format!("+{added}"), 11.0, theme::success()))
+            })
+            .when(deleted > 0, |row| {
+                row.child(txt(format!("\u{2212}{deleted}"), 11.0, theme::error()))
+            })
+            .child(
+                div()
+                    .debug_selector(|| String::from("diff-turn-close"))
+                    .id("diff-turn-close")
+                    .h(px(20.0))
+                    .w(px(20.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .flex_none()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(|cell| cell.bg(rgb(theme::hover())))
+                    .child(icon(IconName::Close, 11.0, theme::faint()))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.right.diff.clear();
+                        this.right.diff.error = None;
+                        cx.notify();
+                    })),
+            );
+        // One scroller per turn: a reader who opens another turn's list lands
+        // at its top rather than at the previous list's offset.
+        let message = turn.message;
+        let mut body = div()
+            .debug_selector(|| String::from("diff-turn-body"))
+            .id(SharedString::from(format!("diff-turn-body-{message}")))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll();
+        if turn.files.is_empty() {
+            // An empty list has a reason, and the two reasons are different
+            // facts: a turn that wrote nothing, versus one whose writes came
+            // from a command nobody recorded file by file.
+            let key = match turn.empty.unwrap_or(diff_pane::TurnEmpty::NoWrites) {
+                diff_pane::TurnEmpty::CommandsOnly => "diff.turnCommands",
+                diff_pane::TurnEmpty::NoWrites => "diff.turnEmpty",
+            };
+            let text = crate::i18n::tr_args(lang, key, &[("turn", turn.ordinal.to_string())]);
+            body = body.child(
+                div()
+                    .debug_selector(|| String::from("diff-turn-empty"))
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(6.0))
+                    .px(px(theme::RIGHT_PAD))
+                    .child(icon(IconName::GitCompareArrows, 22.0, theme::faint()))
+                    .child(
+                        txt(text, theme::CHIP_SIZE, theme::text()).text_align(TextAlign::Center),
+                    ),
+            );
+        } else {
+            for (index, file) in turn.files.iter().enumerate() {
+                body = body.child(self.turn_file_row(index, file, cx));
+            }
+            if turn.commands {
+                // The list knows the recorded writes. A command in the same
+                // turn may have changed more, and saying so is the difference
+                // between a summary and a false claim of completeness.
+                body = body.child(
+                    div()
+                        .debug_selector(|| String::from("diff-turn-command-note"))
+                        .px(px(theme::RIGHT_PAD))
+                        .py(px(8.0))
+                        .child(txt(lang.tr("diff.turnCommandNote"), 11.0, theme::faint())),
+                );
+            }
+        }
+        div()
+            .debug_selector(|| String::from("diff-pane"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    /// One file in the turn list, with its expandable comparison.
+    fn turn_file_row(
+        &self,
+        index: usize,
+        file: &diff_pane::TurnFile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let turn = self
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .expect("a file row belongs to a turn");
+        let open = turn.open.contains(&index);
+        let note = file.basis.note_key().map(|key| lang.tr(key));
+        let name = crate::ui::transcript::base_name(&file.path);
+        let row = div()
+            .debug_selector(move || format!("diff-turn-file-{index}"))
+            .id(SharedString::from(format!("diff-turn-file-{index}")))
+            .w_full()
+            .px(px(theme::RIGHT_PAD))
+            .py(px(6.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .cursor_pointer()
+            .hover(|cell| cell.bg(rgb(theme::hover())))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.toggle_turn_file(index, cx);
+            }))
+            .child(icon(
+                if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                },
+                12.0,
+                theme::faint(),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(txt(name, 12.0, theme::text()).font_family(theme::CODE_FONT)),
+            )
+            .when_some(note, |row, note| row.child(txt(note, 11.0, theme::warn())))
+            .child(txt(format!("+{}", file.added), 11.0, theme::success()))
+            .child(txt(
+                format!("\u{2212}{}", file.deleted),
+                11.0,
+                theme::error(),
+            ));
+        let mut column = div().w_full().flex().flex_col().child(row);
+        if open {
+            if let Some(key) = file.basis.note_key() {
+                // No before-image was recorded: say so instead of drawing the
+                // requested additions as if they were a located hunk.
+                column = column.child(
+                    div()
+                        .debug_selector(move || format!("diff-turn-note-{index}"))
+                        .px(px(theme::RIGHT_PAD + 20.0))
+                        .py(px(6.0))
+                        .child(txt(lang.tr(key), 11.0, theme::warn())),
+                );
+            } else if let Some(rows) = turn.rows.get(&index) {
+                let mut list = div().w_full().flex().flex_col();
+                for (line_no, line) in rows.iter().take(diff_pane::TURN_MAX_ROWS).enumerate() {
+                    list = list.child(Self::turn_diff_line(index, line_no, line));
+                }
+                if rows.len() > diff_pane::TURN_MAX_ROWS {
+                    let left = rows.len() - diff_pane::TURN_MAX_ROWS;
+                    list = list.child(
+                        div()
+                            .debug_selector(move || format!("diff-turn-more-{index}"))
+                            .px(px(theme::RIGHT_PAD + 20.0))
+                            .py(px(4.0))
+                            .child(txt(
+                                crate::i18n::tr_args(
+                                    lang,
+                                    "diff.turnMore",
+                                    &[("count", left.to_string())],
+                                ),
+                                11.0,
+                                theme::faint(),
+                            )),
+                    );
+                }
+                column = column.child(list);
+            }
+        }
+        column.into_any_element()
+    }
+
+    /// One row of an expanded file: the side's line number, the `-` / `+`
+    /// marker, and the line's text.
+    fn turn_diff_line(index: usize, line_no: usize, line: &diff_pane::PreviewLine) -> AnyElement {
+        let ink = match line.mark {
+            '-' | '+' => theme::text(),
+            _ => theme::muted(),
+        };
+        let fill = match line.mark {
+            '-' => theme::diff_del(),
+            '+' => theme::diff_add(),
+            _ => theme::page(),
+        };
+        let marker = match line.mark {
+            '-' => "\u{2212}",
+            '+' => "+",
+            _ => "",
+        };
+        let marker_ink = match line.mark {
+            '-' => theme::error(),
+            '+' => theme::success(),
+            _ => theme::faint(),
+        };
+        let number = line
+            .new
+            .or(line.old)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        div()
+            .debug_selector(move || format!("diff-turn-line-{index}-{line_no}"))
+            .id(SharedString::from(format!(
+                "diff-turn-line-{index}-{line_no}"
+            )))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(18.0))
+            .bg(rgb(fill))
+            .child(
+                txt(number, 11.0, theme::faint())
+                    .w(px(34.0))
+                    .pr(px(6.0))
+                    .flex_none()
+                    .line_height(px(18.0))
+                    .text_align(TextAlign::Right),
+            )
+            .child(
+                txt(marker, 11.0, marker_ink)
+                    .w(px(14.0))
+                    .flex_none()
+                    .line_height(px(18.0))
+                    .text_align(TextAlign::Center),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .px(px(6.0))
+                    .child(
+                        txt(line.text.clone(), 11.0, ink)
+                            .font_family(theme::CODE_FONT)
+                            .line_height(px(18.0)),
+                    ),
+            )
+            .into_any_element()
     }
 }
 

@@ -1,6 +1,8 @@
 //! The Agent type, its config, and the ReAct execution paths.
 
-use crate::agent::context::{AgentReActApp, AgentReactContext, AgentSession};
+use crate::agent::context::{
+    AgentReActApp, AgentReactContext, AgentSession, SteerMailbox, SteerMessage,
+};
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
 use crate::agent::plugin::{AgentPlugin, PluginRegistry, StreamTokenWrapper};
 use crate::memory::{MemoryItem, MemoryStore, MetadataFilter};
@@ -263,6 +265,10 @@ pub struct Agent {
     last_stream_tool_calls: std::sync::Mutex<u64>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     last_stream_tool_time: std::sync::Mutex<std::time::Duration>,
+    /// Messages the host steered into the RUNNING turn, waiting for its next
+    /// step; shared with the engine's app so the step can drain it.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    steers: Arc<SteerMailbox>,
 }
 
 impl Agent {
@@ -300,6 +306,7 @@ impl Agent {
             last_stream_cache_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0),
             last_stream_tool_time: std::sync::Mutex::new(std::time::Duration::ZERO),
+            steers: Arc::new(SteerMailbox::new()),
         }
     }
 
@@ -408,6 +415,58 @@ impl Agent {
     /// (an empty list clears it).
     pub fn set_plan(&self, items: Vec<PlanItem>) {
         self.plan.replace(items);
+    }
+
+    /// Queue one message for the RUNNING turn's next step, tagged with a host
+    /// ticket.
+    ///
+    /// The engine appends it to the session as a user turn at the top of the
+    /// next step - before that step derives its request - so a message pushed
+    /// while a request is in flight is carried by the FOLLOWING request, never
+    /// by the one already streaming. The session records it at the point it is
+    /// taken, which is what makes the transcript show where the reader
+    /// interjected.
+    ///
+    /// Returns false when the mailbox already holds
+    /// [`MAX_STEER_DEPTH`](crate::agent::context::MAX_STEER_DEPTH)
+    /// messages; nothing is queued in that case. The host decides whether a
+    /// turn is running before calling this: the mailbox exists for the agent's
+    /// lifetime, but a turn that never reaches another step cannot take from it
+    /// (use [`Agent::take_undelivered_steers`] then).
+    pub fn steer(&self, content: impl Into<Content>, ticket: u64) -> bool {
+        self.steers.push(SteerMessage {
+            content: content.into(),
+            ticket,
+        })
+    }
+
+    /// The mailbox this agent's running turn drains.
+    ///
+    /// A host shares it with its own state so a control can steer the turn it
+    /// belongs to without holding the agent.
+    #[must_use]
+    pub fn steers(&self) -> &Arc<SteerMailbox> {
+        &self.steers
+    }
+
+    /// Take back every message no step ever took, oldest first.
+    ///
+    /// A turn that ends before reaching another step leaves its mailbox
+    /// unread; the host restores those messages rather than losing them.
+    pub fn take_undelivered_steers(&self) -> Vec<u64> {
+        self.steers.withdraw()
+    }
+
+    /// Install the callback told each ticket as the running turn takes it.
+    ///
+    /// The callback runs on the turn's own task, outside the mailbox lock; a
+    /// host that needs to record the message at the point it was taken hooks
+    /// here. Installing a second sink replaces the first.
+    pub fn on_steered<F>(&self, sink: F)
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        self.steers.set_sink(Some(Arc::new(sink)));
     }
 
     /// Store one completed exchange when auto-remember is on.
@@ -1068,6 +1127,10 @@ impl Clone for Agent {
             last_stream_cache_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0),
             last_stream_tool_time: std::sync::Mutex::new(std::time::Duration::ZERO),
+            // A clone is a separate stateless agent, so it gets its own
+            // mailbox: sharing one would let a clone take (or withdraw) the
+            // other's mid-turn messages.
+            steers: Arc::new(SteerMailbox::new()),
         }
     }
 }

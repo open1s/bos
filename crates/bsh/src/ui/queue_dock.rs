@@ -7,12 +7,16 @@
 //! rows that preview the message beside the actions that rewrite it.
 //!
 //! The reference's rows are its session's durable inbox, echoed by a
-//! "Sending…" row until the Host admits the submission. bsh has no admission
-//! round-trip - a queued message is state, not a request in flight - so it
-//! draws the durable half only: a row appears already queued, and the status
-//! the reference shows while one is in flight has nothing to stand for here.
+//! "Sending…" row only for a local submission the Host has not admitted yet.
+//! bsh has no admission round-trip, so that phase does not exist here. A
+//! STEERED message does have a pending span - it leaves this queue when the
+//! reader presses Send now and the running turn takes it at its next step - and
+//! the reference shows that span in the CONVERSATION (its pending steering
+//! bubble), not here. The transcript draws it, so one message never appears in
+//! two places; when the turn ends before taking it, the row comes back here.
 
 use gpui_kit::component::input::Textarea;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::shell::Shell;
@@ -46,10 +50,19 @@ pub(crate) fn preview(text: &str) -> String {
 /// The kit hands out `on_click` on a stateful element only, so every action
 /// carries its own identity: the row's seq keeps two rows apart and the name
 /// keeps the two or three actions inside one row apart.
-fn action_box(name: &'static str, seq: u64) -> Stateful<Div> {
+///
+/// The label is both the accessible name and the hover tip, which is the
+/// reference's own pairing (`aria-label` = the tooltip label on every queue
+/// path button). GPUI needs a role as well as a label for a div to reach
+/// AccessKit, so these are buttons, not anonymous click targets.
+fn action_box(name: &'static str, seq: u64, label: SharedString) -> Stateful<Div> {
     div()
         .debug_selector(move || format!("{name}-{seq}"))
         .id((name, seq as usize))
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .tooltip_show_delay(std::time::Duration::from_millis(500))
+        .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
         .w(px(theme::QUEUE_ACTION))
         .h(px(theme::QUEUE_ACTION))
         .flex_none()
@@ -62,8 +75,13 @@ fn action_box(name: &'static str, seq: u64) -> Stateful<Div> {
 }
 
 /// An action that cannot run: the reference's own disabled face.
-fn action_disabled(glyph: IconName, name: &'static str, seq: u64) -> Stateful<Div> {
-    action_box(name, seq).opacity(0.45).child(icon(
+fn action_disabled(
+    glyph: IconName,
+    name: &'static str,
+    seq: u64,
+    label: SharedString,
+) -> Stateful<Div> {
+    action_box(name, seq, label).opacity(0.45).child(icon(
         glyph,
         theme::QUEUE_ACTION_GLYPH,
         theme::faint(),
@@ -78,6 +96,10 @@ impl Shell {
     /// `hidden` list.
     pub(crate) fn queue_dock(&self, cx: &mut Context<Self>) -> Option<Div> {
         let id = self.state.active_id.clone()?;
+        // Only the DURABLE queue is listed. A steered message has left it: the
+        // reference moves the row to the next-step inbox and shows the pending
+        // steering bubble in the conversation instead, so echoing it here too
+        // would show one message in two places.
         let items = self.state.inbox(&id);
         if items.is_empty() {
             return None;
@@ -85,6 +107,7 @@ impl Shell {
         let count = items.len();
         let expanded = self.queue_open || self.queue_edit_for.is_some();
         let list_visible = count == 1 || expanded;
+        let header_label = tr_args(self.state.lang, "queue.count", &[("n", count.to_string())]);
         let mut rows: Vec<Div> = Vec::with_capacity(count);
         for (index, item) in items.iter().enumerate() {
             rows.push(self.queue_row(&id, index, item, count, cx));
@@ -103,6 +126,9 @@ impl Shell {
                     div()
                         .id("queue-dock-header")
                         .debug_selector(|| "queue-dock-header".to_string())
+                        .role(Role::Button)
+                        .aria_label(header_label.clone())
+                        .aria_expanded(expanded)
                         .h(px(theme::QUEUE_HEAD_H))
                         .px(px(theme::QUEUE_HEAD_PAD_X))
                         .py(px(theme::QUEUE_HEAD_PAD_Y))
@@ -114,20 +140,12 @@ impl Shell {
                         .child(icon(IconName::Inbox, theme::QUEUE_GLYPH, theme::faint()))
                         .child(
                             div().flex_1().min_w_0().child(
-                                txt(
-                                    tr_args(
-                                        self.state.lang,
-                                        "queue.count",
-                                        &[("n", count.to_string())],
-                                    ),
-                                    theme::QUEUE_COUNT,
-                                    theme::text(),
-                                )
-                                .font_weight(FontWeight::MEDIUM)
-                                .line_height(px(theme::QUEUE_COUNT_LINE))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap(),
+                                txt(header_label, theme::QUEUE_COUNT, theme::text())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .line_height(px(theme::QUEUE_COUNT_LINE))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap(),
                             ),
                         )
                         .child(icon(
@@ -232,6 +250,7 @@ impl Shell {
         // The reference disables Save on an empty draft, so the draft's own
         // emptiness is read before the button is built.
         let draft = self.queue_edit.read(cx).value().trim().to_string();
+        let lang = self.state.lang;
         let mut actions = div()
             .flex_none()
             .flex()
@@ -240,10 +259,11 @@ impl Shell {
             .gap(px(theme::QUEUE_ACTION_GAP));
         if editing {
             let save_session = session.clone();
+            let save_label: SharedString = lang.tr("queue.save").into();
             let save = if draft.is_empty() {
-                action_disabled(IconName::Check, "queue-save", seq)
+                action_disabled(IconName::Check, "queue-save", seq, save_label)
             } else {
-                action_box("queue-save", seq)
+                action_box("queue-save", seq, save_label)
                     .child(icon(
                         IconName::Check,
                         theme::QUEUE_ACTION_GLYPH,
@@ -259,7 +279,7 @@ impl Shell {
                     }))
             };
             actions = actions.child(save).child(
-                action_box("queue-cancel", seq)
+                action_box("queue-cancel", seq, lang.tr("queue.cancelEdit").into())
                     .child(icon(IconName::X, theme::QUEUE_ACTION_GLYPH, theme::faint()))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.queue_edit_for = None;
@@ -269,8 +289,9 @@ impl Shell {
         } else {
             let remove_session = session.clone();
             let text = item.text.clone();
+            let edit_label: SharedString = lang.tr("queue.edit").into();
             let edit = if editable {
-                action_box("queue-edit", seq)
+                action_box("queue-edit", seq, edit_label.clone())
                     .child(icon(
                         IconName::Pencil,
                         theme::QUEUE_ACTION_GLYPH,
@@ -285,20 +306,39 @@ impl Shell {
                         cx.notify();
                     }))
             } else {
-                action_disabled(IconName::Pencil, "queue-edit", seq)
+                action_disabled(IconName::Pencil, "queue-edit", seq, edit_label)
             };
-            actions = actions.child(edit).child(
-                action_box("queue-remove", seq)
-                    .child(icon(
-                        IconName::Trash,
-                        theme::QUEUE_ACTION_GLYPH,
-                        theme::faint(),
-                    ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.remove_queued(&remove_session, seq);
-                        cx.notify();
-                    })),
-            );
+            // Steer: send this one message into the running turn now. The
+            // reference calls it Steer and draws it last; the affordance is the
+            // send button's own arrow, so the row reads as "send", not as a
+            // second edit-like action.
+            let steer_session = session.clone();
+            let steer = action_box("queue-steer", seq, lang.tr("queue.sendNow").into())
+                .w(px(theme::QUEUE_STEER))
+                .h(px(theme::QUEUE_STEER))
+                .child(icon(
+                    IconName::ArrowUp,
+                    theme::QUEUE_STEER_GLYPH,
+                    theme::faint(),
+                ))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.steer_now(&steer_session, seq, cx);
+                }));
+            actions = actions
+                .child(edit)
+                .child(
+                    action_box("queue-remove", seq, lang.tr("queue.remove").into())
+                        .child(icon(
+                            IconName::Trash,
+                            theme::QUEUE_ACTION_GLYPH,
+                            theme::faint(),
+                        ))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.state.remove_queued(&remove_session, seq);
+                            cx.notify();
+                        })),
+                )
+                .child(steer);
         }
         row.child(actions)
     }

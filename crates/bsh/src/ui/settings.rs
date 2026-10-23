@@ -377,7 +377,7 @@ fn preset_label(lang: Lang, permission: &str) -> String {
 /// `dsh-client-ui-permission-presets`: `read-only`, `workspace-write` and
 /// `danger-full-access`. Full access goes through `request_permission` rather
 /// than landing here, so the risk gate cannot be skipped from the pane either.
-fn permission_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
+pub(crate) fn permission_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell>) {
     shell.request_permission(key, cx);
 }
 
@@ -1544,6 +1544,22 @@ impl Shell {
     /// 14/22 label-primary over the module-platform fill, the value then a
     /// chevron, and the option list anchored to the row's end.
     fn select_row(&self, row: SelectRow, cx: &mut Context<Self>) -> AnyElement {
+        self.select_row_with_value(row, None, cx)
+    }
+
+    /// A select row whose value line may show a resolved string instead of the
+    /// current option's label.
+    ///
+    /// `shown` exists for the permission row: its value is the SAME resolved
+    /// string the composer chip draws (the effective mode plus the ceiling
+    /// annotation), while `current` stays the request - the option the menu
+    /// checks and the write a pick performs. Every other row passes `None`.
+    fn select_row_with_value(
+        &self,
+        row: SelectRow,
+        shown: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let SelectRow {
             id,
             title,
@@ -1555,11 +1571,13 @@ impl Shell {
         let current = current.as_str();
         let options = options.as_slice();
         let shell = cx.entity();
-        let value = options
-            .iter()
-            .find(|(key, _)| *key == current)
-            .map(|(_, text)| text.clone())
-            .unwrap_or_else(|| current.to_string());
+        let value = shown.unwrap_or_else(|| {
+            options
+                .iter()
+                .find(|(key, _)| *key == current)
+                .map(|(_, text)| text.clone())
+                .unwrap_or_else(|| current.to_string())
+        });
         // The kit's menu builder is `'static`, so the option list and the
         // selected key are owned before they are captured.
         let entries: Vec<(&'static str, String)> = options.to_vec();
@@ -1647,6 +1665,24 @@ impl Shell {
         .into_any_element()
     }
 
+    /// The General permission row's value line and the selector naming the
+    /// effective mode it reports.
+    ///
+    /// One resolution feeds both: the text is the composer chip's own formatter
+    /// (effective mode plus the ceiling annotation), so the two panes cannot
+    /// answer "what may this session do" differently, and the selector mirrors
+    /// the chip's `permission-chip-{effective}` so a test can prove the pane drew
+    /// the effective mode rather than the request. The row still edits the
+    /// REQUEST (`permission_action`), which is what the setting stores.
+    pub(crate) fn permission_row_display(&self) -> (String, String) {
+        let resolution = self.state.effective().permission;
+        let selector = format!("set-perm-{}", resolution.effective);
+        (
+            super::composer::permission_chip_text(self.state.lang, &resolution),
+            selector,
+        )
+    }
+
     /// General: the reference's own rows in its own order.
     ///
     /// Measured from `dsh-client-ui-settings-general`'s `settings.general.item`
@@ -1664,7 +1700,12 @@ impl Shell {
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let lang = self.state.lang;
         let draft = self.state.draft().clone();
+        // The REQUEST is what the setting stores and what the menu's checkmark
+        // follows; the row's value line reads the effective mode below, so the
+        // pane and the composer chip answer "what may this session do" from one
+        // resolution instead of two.
         let permission = draft.workspace.agent.permission.clone();
+        let (permission_value, permission_selector) = self.permission_row_display();
         let language = if self.state.lang == Lang::Zh {
             "zh"
         } else {
@@ -1676,8 +1717,12 @@ impl Shell {
         let performance = draft.global.general.performance_usage.clone();
         let developer_tools = draft.global.general.developer_tools;
         let failed = self.developer_tools_failed;
-        let mut rows = vec![
-            self.select_row(
+        // The value-encoded selector mirrors the chip's own, so a test can prove
+        // the row laid out reporting the effective mode; a kit Button carries no
+        // debug selector of its own.
+        let permission_row = div()
+            .debug_selector(move || permission_selector)
+            .child(self.select_row_with_value(
                 SelectRow {
                     id: "set-perm",
                     title: "settings.permission",
@@ -1699,8 +1744,12 @@ impl Shell {
                     ],
                     action: permission_action,
                 },
+                Some(permission_value),
                 cx,
-            ),
+            ))
+            .into_any_element();
+        let mut rows = vec![
+            permission_row,
             self.select_row(
                 SelectRow {
                     id: "set-lang",

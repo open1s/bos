@@ -810,6 +810,17 @@ skill_dir: {}
                 }
 
                 if !saw_tool_call {
+                    // A turn ends only when nothing waits for its next step.
+                    // This is the reference's next-step inbox rule (the agent
+                    // loop checks `inbox.nextStep.length` before closing a
+                    // turn): a steer that arrived while this response streamed
+                    // keeps the turn open, and the next iteration's
+                    // `before_llm_call` appends it as a user turn. Without
+                    // this, a steer could only be taken when a tool call
+                    // happened to force another step.
+                    if self.react_app.has_pending_step_input() {
+                        continue;
+                    }
                     self.react_app.on_final_answer(&full_response, session, context).await;
                     self.telemetry.emit(&TelemetryEvent::FinalAnswer {
                         answer: full_response.clone(),

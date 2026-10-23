@@ -28,6 +28,9 @@ use gpui_kit::component::diff::{DiffFile, DiffMode, DiffState};
 // explicitly. This module keeps plain unit tests, so the glob is out.
 use gpui_kit::Entity;
 
+use crate::model::ToolEvent;
+use crate::ui::transcript;
+
 /// How a file was read, which decides whether the pane can save its result.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DiffSource {
@@ -58,6 +61,199 @@ pub(crate) struct DiffView {
     pub(crate) conflicts: usize,
     /// Whether every conflict has a resolution.
     pub(crate) resolved: bool,
+    /// The turn whose changed files the pane lists, when it is showing a turn
+    /// rather than one workspace file. The two are mutually exclusive: opening
+    /// a file comparison drops the turn and opening a turn drops the file.
+    pub(crate) turn: Option<TurnView>,
+}
+
+/// What a turn's changed file can honestly show as its before-image.
+///
+/// bsh records a tool's ARGUMENTS, not the disk. An edit carries the string it
+/// replaced, so its old side is real; a write carries only the new text, so its
+/// old side is unknown. Naming that difference is the difference between a
+/// comparison and an invented one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum TurnBasis {
+    /// The tool recorded the text it replaced.
+    #[default]
+    Recorded,
+    /// The tool created the file, so every line is new.
+    NewFile,
+    /// The tool wrote only new content over a file it did not record.
+    Rewritten,
+}
+
+impl TurnBasis {
+    /// The note this basis shows in place of a diff, or `None` when the old
+    /// side is real. The key is the pane's own, so the wording lives in the
+    /// locale files with every other label.
+    pub(crate) fn note_key(self) -> Option<&'static str> {
+        match self {
+            TurnBasis::Recorded => None,
+            TurnBasis::NewFile => Some("diff.turnNewFile"),
+            TurnBasis::Rewritten => Some("diff.turnRewritten"),
+        }
+    }
+}
+
+/// One file a turn wrote, as the pane lists it.
+#[derive(Clone)]
+pub(crate) struct TurnFile {
+    /// The path exactly as the step named it.
+    pub(crate) path: String,
+    /// Lines the request added.
+    pub(crate) added: usize,
+    /// Lines the request removed.
+    pub(crate) deleted: usize,
+    /// What its before-image can honestly be.
+    pub(crate) basis: TurnBasis,
+    /// The recorded change, as `+` / `-` lines.
+    pub(crate) diff: Vec<(char, String)>,
+}
+
+/// One turn's changed files, as the Diff pane lists them.
+///
+/// The files are the tool requests the turn recorded, grouped by path - never
+/// a disk diff and never a VCS query, because bsh keeps no before-image of a
+/// file. Rows are resolved only for a file the reader expands, so a turn that
+/// touched forty files costs nothing until one is opened.
+#[derive(Clone, Default)]
+pub(crate) struct TurnView {
+    /// The transcript message whose steps the list was built from.
+    pub(crate) message: usize,
+    /// The turn's own number, one-based, for the header and the empty state.
+    pub(crate) ordinal: usize,
+    /// The files the turn wrote, in the order it touched them.
+    pub(crate) files: Vec<TurnFile>,
+    /// The files whose unified rows are open.
+    pub(crate) open: std::collections::HashSet<usize>,
+    /// The resolved rows of each open file, keyed by its index in `files`.
+    pub(crate) rows: std::collections::HashMap<usize, Vec<PreviewLine>>,
+    /// Why the list is empty, when it is. An empty list has two honest
+    /// explanations and they are not the same fact.
+    pub(crate) empty: Option<TurnEmpty>,
+    /// Whether the turn also ran commands, which can change files nobody
+    /// recorded. The list then says so beside the files it does know, so the
+    /// comparison never implies it is the whole story.
+    pub(crate) commands: bool,
+}
+
+/// Why a turn-focused pane has no files to list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TurnEmpty {
+    /// The turn ran commands, which can change files without recording which
+    /// ones, so no per-file comparison exists to draw.
+    CommandsOnly,
+    /// The turn recorded nothing that writes a file.
+    NoWrites,
+}
+
+/// The most rows one expanded file draws.
+///
+/// A request can carry a whole file's text, and building thousands of row
+/// elements per frame is exactly the per-frame work this crate's rule forbids.
+/// The pane says how many it left out rather than silently truncating.
+pub(crate) const TURN_MAX_ROWS: usize = 400;
+
+/// Classify a turn's written files, grouped exactly the way the transcript's
+/// closing card groups them.
+///
+/// The GROUPING is `transcript::turn_changes`' job and stays the one source of
+/// it. The BASIS is the pane's own question, answered from the same tool
+/// records: did any step that touched this path carry the text it replaced?
+pub(crate) fn turn_files(tools: &[ToolEvent]) -> Vec<TurnFile> {
+    let writing: Vec<(&str, String)> = tools
+        .iter()
+        .filter(|tool| transcript::is_write_tool(&tool.name))
+        .filter_map(|tool| transcript::tool_path(&tool.args).map(|path| (tool.name.as_str(), path)))
+        .collect();
+    // `create_file` is in this crate's write-tool vocabulary but shares
+    // `write_file`'s path+content shape, so it is normalised onto that parser
+    // before the grouping runs. Without this the create case would be
+    // classified and then dropped, because `tool_diff` knows only the names it
+    // parses.
+    let normalized: Vec<ToolEvent> = tools
+        .iter()
+        .map(|tool| {
+            if tool.name == "create_file" {
+                let mut copy = tool.clone();
+                copy.name = "write_file".to_string();
+                copy
+            } else {
+                tool.clone()
+            }
+        })
+        .collect();
+    transcript::turn_changes(&normalized)
+        .into_iter()
+        .map(|file| {
+            let recorded = file.diff.iter().any(|(mark, _)| *mark == '-');
+            let mut touched = false;
+            let mut all_create = true;
+            for (name, path) in &writing {
+                if *path != file.path {
+                    continue;
+                }
+                touched = true;
+                if *name != "create_file" {
+                    all_create = false;
+                }
+            }
+            let basis = if recorded {
+                TurnBasis::Recorded
+            } else if touched && all_create {
+                TurnBasis::NewFile
+            } else {
+                TurnBasis::Rewritten
+            };
+            TurnFile {
+                path: file.path,
+                added: file.added,
+                deleted: file.deleted,
+                basis,
+                diff: file.diff,
+            }
+        })
+        .collect()
+}
+
+/// The unified rows one changed file expands to, or `None` when there is no
+/// recorded before-image to diff against.
+///
+/// Only a recorded old side is diffable. A creation or a rewrite has an unknown
+/// before-image, so drawing `+` lines as if they were a hunk would be exactly
+/// the invented comparison this pane exists to avoid; the caller draws the
+/// basis note instead.
+pub(crate) fn turn_rows(file: &TurnFile, current: Option<&str>) -> Option<Vec<PreviewLine>> {
+    if file.basis != TurnBasis::Recorded {
+        return None;
+    }
+    Some(preview_lines(&file.path, &file.diff, current))
+}
+
+impl TurnView {
+    /// Whether the turn ran a tool that can change files without recording
+    /// WHICH files - a shell or a script. The list cannot name those changes,
+    /// but it must not pretend they do not exist.
+    pub(crate) fn ran_commands(tools: &[ToolEvent]) -> bool {
+        tools.iter().any(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "bash" | "run_code" | "run_command" | "shell" | "execute"
+            )
+        })
+    }
+
+    /// Why the list is empty: commands may have written files without
+    /// recording them, while a turn with no writing tool recorded no change.
+    pub(crate) fn why_empty(tools: &[ToolEvent]) -> TurnEmpty {
+        if Self::ran_commands(tools) {
+            TurnEmpty::CommandsOnly
+        } else {
+            TurnEmpty::NoWrites
+        }
+    }
 }
 
 impl DiffView {
@@ -78,6 +274,7 @@ impl DiffView {
         self.source = None;
         self.conflicts = 0;
         self.resolved = false;
+        self.turn = None;
     }
 }
 
@@ -391,6 +588,175 @@ pub(crate) fn patch_for_located(
     }
     Some(patch)
 }
+/// One row of a hover preview: the numbers each side shows and the marked text.
+///
+/// The reference's preview draws a line-number column per side, so a reader can
+/// see WHERE the change sits. bsh can only do that honestly by locating the hunk
+/// in the file as it is now; when that fails the numbers are absent rather than
+/// invented, and the row still shows its text.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreviewLine {
+    /// The line number on the old side, when this row exists there.
+    pub(crate) old: Option<usize>,
+    /// The line number on the new side, when this row exists there.
+    pub(crate) new: Option<usize>,
+    /// The unified-diff marker: a space, a minus or a plus.
+    pub(crate) mark: char,
+    /// The line's own text, without the marker.
+    pub(crate) text: String,
+}
+
+/// The rows a hover preview draws for one changed file.
+///
+/// The numbers come from the hunk `patch_for_located` builds, walked the way a
+/// unified diff is read: a context row advances both sides, a removed row only
+/// the old, an added row only the new. An unlocatable change keeps its text and
+/// drops its numbers, because a guessed line number is worse than none.
+pub(crate) fn preview_lines(
+    path: &str,
+    changes: &[(char, String)],
+    current: Option<&str>,
+) -> Vec<PreviewLine> {
+    let located = current.and_then(|text| patch_for_located(path, changes, text));
+    match located.as_deref().and_then(rows_of) {
+        Some(rows) => rows,
+        // No location: the text is still the change the step asked for, so it is
+        // shown with no numbers rather than with made-up ones.
+        None => changes
+            .iter()
+            .filter(|(mark, _)| *mark == '-' || *mark == '+')
+            .map(|(mark, line)| PreviewLine {
+                old: None,
+                new: None,
+                mark: *mark,
+                text: line.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// The numbered rows of the first hunk in a unified diff.
+///
+/// A context row advances both sides, a removed row only the old, an added row
+/// only the new - which is what puts the two number columns where a reader
+/// expects them. `None` when the patch carries no hunk at all.
+fn rows_of(patch: &str) -> Option<Vec<PreviewLine>> {
+    let mut lines = patch.lines();
+    let header = lines.find(|line| line.starts_with("@@"))?;
+    // `split_whitespace`, not `split(' ')`: the header opens with `@@ -1,3`,
+    // so a plain space split yields an EMPTY first part and every start line
+    // parses as a failure.
+    let mut parts = header.trim_start_matches("@@").split_whitespace();
+    let old = parts.next()?.trim_start_matches('-');
+    let new = parts.next()?.trim_start_matches('+');
+    let mut old_line: usize = old.split(',').next()?.parse().ok()?;
+    let mut new_line: usize = new.split(',').next()?.parse().ok()?;
+    let mut rows = Vec::new();
+    for line in lines {
+        let mark = line.chars().next().unwrap_or(' ');
+        let text = line.get(1..).unwrap_or("").to_string();
+        match mark {
+            '-' => {
+                rows.push(PreviewLine {
+                    old: Some(old_line),
+                    new: None,
+                    mark,
+                    text,
+                });
+                old_line += 1;
+            }
+            '+' => {
+                rows.push(PreviewLine {
+                    old: None,
+                    new: Some(new_line),
+                    mark,
+                    text,
+                });
+                new_line += 1;
+            }
+            _ => {
+                rows.push(PreviewLine {
+                    old: Some(old_line),
+                    new: Some(new_line),
+                    mark: ' ',
+                    text,
+                });
+                old_line += 1;
+                new_line += 1;
+            }
+        }
+    }
+    Some(rows)
+}
+
+/// Where a preview panel hangs, from the pointer down the pane.
+///
+/// BELOW by default, ABOVE when the pane has no room underneath: the composer
+/// sits under the transcript, so a card growing downward from a low row was
+/// drawn behind it and read as clipped. When neither side has room the card
+/// sits at the top and its own body scrolls, which is what that scroller is for.
+///
+/// Pure, so the placement can be pinned without a window: the panel's height is
+/// estimated from the rows it will draw rather than measured.
+pub(crate) fn preview_top(pointer_y: f32, panel_h: f32, view_h: f32) -> f32 {
+    const GAP: f32 = 16.0;
+    const EDGE: f32 = 8.0;
+    let below = pointer_y + GAP;
+    let above = pointer_y - GAP - panel_h;
+    if below + panel_h <= view_h - EDGE {
+        below
+    } else if above >= EDGE {
+        above
+    } else {
+        EDGE
+    }
+}
+
+/// The preview rows for one changed file, from the REAL before-image when git
+/// has one.
+///
+/// The card's own summary is built from the tool request, because that is all a
+/// turn records. A PREVIEW can do better: git holds the committed text, so the
+/// rows can be a genuine diff of the file against its last commit - which is
+/// what the reference's preview shows. Three sources, best first:
+///
+/// 1. `git diff HEAD` for the file, parsed into rows with both line numbers;
+/// 2. the file as it is now, with the requested change located inside it;
+/// 3. the request alone, with text and no numbers.
+///
+/// Runs off the UI thread, because the first source is a subprocess.
+pub(crate) fn preview_for_workspace(
+    root: &Path,
+    path: &str,
+    changes: &[(char, String)],
+) -> Vec<PreviewLine> {
+    let rel = workspace_relative(root, path);
+    if let Some(patch) = git_diff(root, &rel) {
+        if let Some(rows) = rows_of(&patch) {
+            return rows;
+        }
+    }
+    if let Ok(bytes) = crate::files::read(root, &rel) {
+        if let Ok(text) = String::from_utf8(bytes) {
+            return preview_lines(path, changes, Some(&text));
+        }
+    }
+    preview_lines(path, changes, None)
+}
+
+/// A path a step recorded, expressed against the workspace root.
+///
+/// A step records the path the model wrote, which may be absolute; the file
+/// helpers resolve workspace-relative paths only, so an absolute one inside the
+/// workspace is trimmed back to its relative form.
+pub(crate) fn workspace_relative(root: &Path, path: &str) -> std::path::PathBuf {
+    let candidate = Path::new(path);
+    match candidate.strip_prefix(root) {
+        Ok(trimmed) => trimmed.to_path_buf(),
+        Err(_) => candidate.to_path_buf(),
+    }
+}
+
 /// The file a comparison is titled with, for the header and the tooltip.
 pub(crate) fn display_name(path: &Path) -> String {
     path.file_name()
@@ -412,9 +778,11 @@ mod tests {
     // parent module brought in, and GPUI's `test` macro shadows the builtin
     // `#[test]` these unit tests rely on.
     use super::{
-        classify, load, mode_key, mode_of, patch_for, patch_for_located, read_for, DiffMode,
-        DiffSource,
+        classify, load, mode_key, mode_of, patch_for, patch_for_located, preview_for_workspace,
+        preview_lines, preview_top, read_for, turn_files, turn_rows, DiffMode, DiffSource,
+        TurnBasis, TurnEmpty, TurnView,
     };
+    use crate::model::ToolEvent;
     use gpui_kit::component::diff::DiffFile;
     use std::path::Path;
 
@@ -569,6 +937,136 @@ mod tests {
         let changes = vec![('-', "old".to_string()), ('+', "never applied".to_string())];
         assert!(patch_for_located("a.txt", &changes, "something else\n").is_none());
     }
+    /// A located change numbers BOTH sides: context advances both, a removal only
+    /// the old, an addition only the new. That is what the hover preview draws.
+    #[test]
+    fn preview_rows_carry_the_real_line_numbers() {
+        let content = "one
+two
+THREE
+four
+five
+";
+        let changes = vec![('-', "three".to_string()), ('+', "THREE".to_string())];
+        let rows = preview_lines("a.txt", &changes, Some(content));
+        assert!(!rows.is_empty(), "the change produced rows");
+        // The removed row sits on the old side at line 3 and on no new line.
+        let removed = rows.iter().find(|row| row.mark == '-').expect("a removal");
+        assert_eq!(removed.old, Some(3));
+        assert_eq!(removed.new, None);
+        assert_eq!(removed.text, "three");
+        // The added row is the same line on the NEW side.
+        let added = rows
+            .iter()
+            .find(|row| row.mark == '+')
+            .expect("an addition");
+        assert_eq!(added.new, Some(3));
+        assert_eq!(added.old, None);
+        assert_eq!(added.text, "THREE");
+        // Context rows carry both numbers and the plain marker.
+        let context = rows.iter().find(|row| row.mark == ' ').expect("context");
+        assert!(context.old.is_some() && context.new.is_some());
+    }
+
+    /// A change that cannot be located keeps its text and DROPS its numbers: a
+    /// guessed line number is worse than none.
+    #[test]
+    fn an_unlocated_change_has_no_line_numbers() {
+        let changes = vec![('-', "old".to_string()), ('+', "new".to_string())];
+        let rows = preview_lines(
+            "a.txt",
+            &changes,
+            Some(
+                "different content
+",
+            ),
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| row.old.is_none() && row.new.is_none()));
+        assert_eq!(rows[0].mark, '-');
+        assert_eq!(rows[1].mark, '+');
+    }
+
+    /// A file that is not on disk at all still previews its requested text.
+    #[test]
+    fn a_preview_without_a_file_still_shows_the_change() {
+        let changes = vec![('+', "brand new".to_string())];
+        let rows = preview_lines("a.txt", &changes, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "brand new");
+        assert!(rows[0].new.is_none());
+    }
+
+    /// THE fix for the preview's before-image: the rows come from git's
+    /// committed text, not from the tool request. A request only knows what it
+    /// asked for, so it cannot say what the file held.
+    #[test]
+    fn a_preview_reads_the_committed_text_not_the_request() {
+        let root = scratch("preview-git");
+        git(&root, &["init", "-q"]);
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "one\ntwo\nthree\n").expect("the file");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "one"]);
+        // The working copy now differs from the commit.
+        std::fs::write(&file, "one\nTWO\nthree\n").expect("the edit");
+
+        // The request DESCRIBES the change, but git knows the file it replaced.
+        let changes = vec![('-', "two".to_string()), ('+', "TWO".to_string())];
+        let rows = preview_for_workspace(&root, "lib.rs", &changes);
+        let removed = rows.iter().find(|row| row.mark == '-').expect("a removal");
+        assert_eq!(removed.text, "two", "git's own old line: {rows:?}");
+        assert_eq!(removed.old, Some(2), "at its real line: {rows:?}");
+        let added = rows
+            .iter()
+            .find(|row| row.mark == '+')
+            .expect("an addition");
+        assert_eq!(added.text, "TWO");
+        assert_eq!(added.new, Some(2));
+    }
+
+    /// A request that misdescribes the change cannot mislead the preview: git
+    /// is the source, so the rows still describe the file.
+    #[test]
+    fn a_preview_ignores_a_wrong_request() {
+        let root = scratch("preview-wrong");
+        git(&root, &["init", "-q"]);
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "one\ntwo\n").expect("the file");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "one"]);
+        std::fs::write(&file, "one\nTWO\n").expect("the edit");
+
+        // This request mentions text the file never held.
+        let lying = vec![('+', "not in this file".to_string())];
+        let rows = preview_for_workspace(&root, "lib.rs", &lying);
+        assert!(
+            rows.iter().all(|row| row.text != "not in this file"),
+            "the request did not supply the rows: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.text == "two"),
+            "git's old line is what a reader sees: {rows:?}"
+        );
+    }
+
+    /// The preview hangs below the pointer while the pane has room, and flips
+    /// ABOVE when it does not: the composer sits under the transcript, so a card
+    /// growing downward from a low row was drawn behind it.
+    #[test]
+    fn a_preview_flips_above_when_the_pane_has_no_room_below() {
+        // Room below: 100 + 16 + 200 <= 800 - 8, so it hangs down.
+        assert_eq!(preview_top(100.0, 200.0, 800.0), 116.0);
+        // Near the bottom: below would run past the pane, so it flips up.
+        let top = preview_top(700.0, 200.0, 800.0);
+        assert_eq!(top, 700.0 - 16.0 - 200.0, "it sits above the pointer");
+        assert!(top + 200.0 <= 700.0, "and clears the pointer it points at");
+        // A pane too short for either side pins the card to the top edge.
+        assert_eq!(preview_top(50.0, 400.0, 120.0), 8.0);
+    }
+
     /// The stored names round-trip, and an unknown one lands on the default.
     #[test]
     fn the_mode_preference_round_trips() {
@@ -655,5 +1153,114 @@ mod tests {
             Ok(_) => panic!("a binary file must be refused, never opened"),
             Err(error) => assert_eq!(error, "diff.binary"),
         }
+    }
+
+    /// The tool records a step's arguments, so the basis is a fact about the
+    /// REQUEST: a create has every line new, a write over an unknown file has
+    /// no old side, and an edit carries the text it replaced.
+    fn step(name: &str, args: &str) -> ToolEvent {
+        ToolEvent {
+            name: name.to_string(),
+            args: args.to_string(),
+            output: Some("ok".to_string()),
+            ms: Some(1),
+            at: None,
+        }
+    }
+
+    #[test]
+    fn a_created_file_is_new_rather_than_a_fake_hunk() {
+        let tools = [step(
+            "create_file",
+            r#"{"path":"src/new.rs","content":"one
+two"}"#,
+        )];
+        let files = turn_files(&tools);
+        assert_eq!(files.len(), 1, "one file was written");
+        assert_eq!(files[0].path, "src/new.rs");
+        assert_eq!(files[0].basis, TurnBasis::NewFile);
+        assert_eq!(files[0].basis.note_key(), Some("diff.turnNewFile"));
+        // And the expansion refuses to draw a diff it cannot support.
+        assert!(
+            turn_rows(&files[0], None).is_none(),
+            "a creation has no before-image to diff"
+        );
+    }
+
+    #[test]
+    fn a_write_without_old_text_says_the_previous_content_is_gone() {
+        let tools = [step(
+            "write_file",
+            r#"{"path":"src/lib.rs","content":"one
+two"}"#,
+        )];
+        let files = turn_files(&tools);
+        assert_eq!(files[0].basis, TurnBasis::Rewritten);
+        assert_eq!(files[0].basis.note_key(), Some("diff.turnRewritten"));
+        assert!(turn_rows(&files[0], Some("whatever\n")).is_none());
+        assert_eq!(files[0].added, 2, "the recorded additions still count");
+        assert_eq!(files[0].deleted, 0);
+    }
+
+    #[test]
+    fn an_edit_records_both_sides_and_expands_to_them() {
+        let tools = [step(
+            "edit_file",
+            r#"{"path":"lib.rs","old_string":"let a = 1;","new_string":"let a = 2;"}"#,
+        )];
+        let files = turn_files(&tools);
+        assert_eq!(files[0].basis, TurnBasis::Recorded);
+        assert_eq!(
+            files[0].basis.note_key(),
+            None,
+            "a real old side has no note"
+        );
+        // The current file lets the hunk be placed; without one the rows still
+        // carry the requested text, with no invented numbers.
+        let rows = turn_rows(&files[0], Some("let a = 2;")).expect("a recorded edit is diffable");
+        let removed = rows.iter().find(|row| row.mark == '-').expect("a removal");
+        assert_eq!(removed.text, "let a = 1;");
+        let added = rows
+            .iter()
+            .find(|row| row.mark == '+')
+            .expect("an addition");
+        assert_eq!(added.text, "let a = 2;");
+        assert_eq!(added.new, Some(1), "the hunk is located at its real line");
+        let unlocated = turn_rows(&files[0], None).expect("still diffable");
+        assert!(unlocated
+            .iter()
+            .all(|row| row.old.is_none() && row.new.is_none()));
+    }
+
+    #[test]
+    fn two_steps_on_one_file_are_one_row() {
+        let tools = [
+            step(
+                "edit_file",
+                r#"{"path":"a.rs","old_string":"one","new_string":"two"}"#,
+            ),
+            step(
+                "edit_file",
+                r#"{"path":"a.rs","old_string":"two","new_string":"three"}"#,
+            ),
+        ];
+        let files = turn_files(&tools);
+        assert_eq!(files.len(), 1, "one file, two edits");
+        assert_eq!(files[0].deleted, 2);
+        assert_eq!(files[0].added, 2);
+    }
+
+    #[test]
+    fn an_empty_turn_names_its_reason() {
+        // A command can write files without recording which ones, so an empty
+        // list after one is "not captured", not "nothing changed".
+        assert_eq!(
+            TurnView::why_empty(&[step("bash", r#"{"command":"touch a"}"#)]),
+            TurnEmpty::CommandsOnly
+        );
+        assert_eq!(
+            TurnView::why_empty(&[step("read_file", r#"{"path":"a"}"#)]),
+            TurnEmpty::NoWrites
+        );
     }
 }

@@ -481,6 +481,11 @@ pub(crate) const QUEUE_PREVIEW_CHARS: usize = 200;
 pub(crate) const QUEUE_ACTION: f32 = 28.0;
 pub(crate) const QUEUE_ACTION_GAP: f32 = 10.0;
 pub(crate) const QUEUE_ACTION_GLYPH: f32 = 14.0;
+/// The Send now control: the requested 20x20 box, smaller than the edit/remove
+/// pair so it cannot grow a row or push the preview.
+pub(crate) const QUEUE_STEER: f32 = 20.0;
+/// Its glyph: the send button's own arrow, at the row actions' 14px size.
+pub(crate) const QUEUE_STEER_GLYPH: f32 = 14.0;
 /// The row editor's own box: min-height 28, radius 6, padded 3/8.
 pub(crate) const QUEUE_EDITOR_MIN_H: f32 = 28.0;
 /// The queue editor's ceiling, measured: `.editor{max-height:127px}`, with the
@@ -946,16 +951,31 @@ pub(crate) fn scrollbar_bar() -> u32 {
 /// The wash behind an added line of a step's patch.
 ///
 /// A diff tint has to stay legible over the page in both palettes, so it is the
-/// success tone at low alpha rather than a hard fill.
-pub(crate) fn diff_add() -> u32 {
-    let rgb = success() & 0x00FF_FFFF;
-    (rgb << 8) | 0x24
+/// One colour moved toward another, as an OPAQUE RGB.
+///
+/// The pair below used to pack an alpha byte into a `rgb()` value, and `rgb()`
+/// reads only the low 24 bits: a green wash came out amber, which is what a
+/// reader saw as a solid brown diff. Blending against the page keeps the wash
+/// correct in both themes and needs no alpha at all.
+fn tint(base: u32, accent: u32, t: f32) -> u32 {
+    let channel = |shift: u32| {
+        let b = ((base >> shift) & 0xFF) as f32;
+        let a = ((accent >> shift) & 0xFF) as f32;
+        // A CHANNEL is 0..255, so it clamps there: clamping to 0..1 saturated
+        // every channel to white, which is how the wash came out blank.
+        (b + (a - b) * t).clamp(0.0, 255.0).round() as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
-/// The wash behind a removed line of a step's patch.
+/// The wash behind an added line of a patch.
+pub(crate) fn diff_add() -> u32 {
+    tint(page(), success(), 0.14)
+}
+
+/// The wash behind a removed line of a patch.
 pub(crate) fn diff_del() -> u32 {
-    let rgb = error() & 0x00FF_FFFF;
-    (rgb << 8) | 0x24
+    tint(page(), error(), 0.14)
 }
 /// The changed-files card's header fill.
 ///
@@ -963,34 +983,37 @@ pub(crate) fn diff_del() -> u32 {
 /// repaints it `-850` under the dark theme, so the header is a deliberately
 /// STATIC grey rather than a layered surface - it does not follow the
 /// translucent-layer ladder the way the card's own background does.
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
+///
+/// OPAQUE, because `rgb()` reads only the low 24 bits: an `AARRGGBB` literal
+/// here rendered as its blue channel, which made the dark header BLUE.
 pub(crate) fn changes_fill() -> u32 {
     if is_dark() {
-        0x2A2A2BFF
+        0x2A2A2B
     } else {
-        0xFAFAFAFF
+        0xFAFAFA
     }
 }
 
 /// The header's fill under the pointer: `--changes-hover`, measured as
 /// `--dsw-static-neutral-100` (light) / `-800` (dark).
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) fn changes_hover() -> u32 {
     if is_dark() {
-        0x333334FF
+        0x333334
     } else {
-        0xF5F5F5FF
+        0xF5F5F5
     }
 }
 
 /// The 40x40 file tile's fill: the reference mixes the static neutral-00 -
 /// pure white in BOTH themes - half into the header, and 5% of it in dark.
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) fn changes_tile() -> u32 {
+    // White mixed INTO the header at the measured strength, computed rather
+    // than packed as alpha: the old literal put the strength in the low byte,
+    // so `rgb()` drew a yellow tile instead of a white one.
     if is_dark() {
-        0xFFFFFF0D
+        tint(changes_fill(), 0xFFFFFF, 0.05)
     } else {
-        0xFFFFFF80
+        tint(changes_fill(), 0xFFFFFF, 0.5)
     }
 }
 
@@ -1001,35 +1024,21 @@ pub(crate) fn changes_tile() -> u32 {
 /// the title is 13px/20px at weight 500, the stat line is 10px/16px, a row is
 /// `min-height:24px` over `7px 18px 7px 14px` at 11px/18px, and the fold
 /// control is `10px 18px 10px 14px` at 12px/18px with a 14px chevron.
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_HEADER_H: f32 = 60.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_TILE: f32 = 40.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_TILE_RADIUS: f32 = 10.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_TITLE_SIZE: f32 = 13.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_TITLE_LINE: f32 = 20.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_STAT_SIZE: f32 = 10.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_STAT_LINE: f32 = 16.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_ROW_PAD_L: f32 = 14.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_ROW_PAD_R: f32 = 18.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_ROW_PAD_Y: f32 = 7.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_ROW_LINE: f32 = 18.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_ROW_SIZE: f32 = 11.0;
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_PATH_SIZE: f32 = 12.0;
 /// The rows the card shows before it folds, measured as the reference's
 /// `COLLAPSED_ROWS` - "the design's summary height for a closing message".
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) const CHANGES_COLLAPSED_ROWS: usize = 4;
 
 /// The measured bar: a 2px column, 72 tall, whose solid 16px band sits
@@ -1187,6 +1196,29 @@ fn mix(a: Hsla, b: Hsla, t: f32) -> u32 {
 mod tests {
     use super::THEME_SET;
     use gpui_kit::component::theme::ThemeSet;
+
+    /// The diff washes must stay the hue they name. They used to pack an alpha
+    /// byte into a `rgb()` value, and `rgb()` reads only the low 24 bits, so a
+    /// green wash rendered AMBER: a reader saw a solid brown diff.
+    #[test]
+    fn the_diff_washes_stay_the_hue_they_name() {
+        let channels = |hex: u32| {
+            (
+                ((hex >> 16) & 0xFF) as i32,
+                ((hex >> 8) & 0xFF) as i32,
+                (hex & 0xFF) as i32,
+            )
+        };
+        // The blend is what had the bug, so the blend is what this pins: a
+        // green accent over white, and a red one, at the wash's own strength.
+        let (r, g, _b) = channels(super::tint(0xFFFFFF, 0x22C55E, 0.14));
+        assert!(g > r, "an addition wash is green, got r={r} g={g}");
+        let (r, g, _b) = channels(super::tint(0xFFFFFF, 0xEF4444, 0.14));
+        assert!(r > g, "a removal wash is red, got r={r} g={g}");
+        // And it is a WASH, not the accent itself.
+        let (r, _g, _b) = channels(super::tint(0xFFFFFF, 0xEF4444, 0.14));
+        assert!(r > 200, "the wash stays near the page, got r={r}");
+    }
 
     #[test]
     fn the_content_size_moves_the_conversation_text() {

@@ -10,11 +10,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::goal::GoalState;
+use agent::SteerMailbox;
 
 use crate::i18n::Lang;
 use crate::model::{
     ChatMessage, CompactCommand, CompactOutcome, CompactionReport, MessageMeta, MessageUsage,
-    PlanItem, PlanStore, Session, ToolEvent,
+    PlanItem, PlanStore, Role, Session, ToolEvent,
 };
 use crate::runner::{AgentEvent, Runner};
 use crate::settings::Settings;
@@ -257,6 +258,19 @@ pub(crate) struct Queued {
     pub(crate) attachments: Vec<Attachment>,
 }
 
+/// One queued row taken off the dock to steer the running turn.
+///
+/// It travels to the agent as a ticket and waits here until the turn either
+/// takes it (the transcript records it) or ends first (the row goes back).
+#[derive(Clone)]
+pub(crate) struct Steering {
+    /// The session whose running turn it was steered into.
+    pub(crate) session: String,
+    /// The row exactly as it was queued, so a withdrawal can restore it in
+    /// its old place.
+    pub(crate) queued: Queued,
+}
+
 /// The last policy audit the shell drew, kept outside the policy's own locks.
 #[derive(Clone, Default)]
 pub(crate) struct PolicyAuditView {
@@ -410,6 +424,20 @@ pub(crate) struct AppState {
     inbox: HashMap<String, Vec<Queued>>,
     /// Identity for the next queued row; see [`Queued::seq`].
     inbox_seq: u64,
+    /// The steer mailbox of each session whose turn is running.
+    ///
+    /// Attached when the turn is spawned and dropped when it ends, so a
+    /// control can only steer a LIVE turn: an idle session's queued row is an
+    /// ordinary send, not a message into a mailbox nobody drains.
+    steer_mailboxes: HashMap<String, Arc<SteerMailbox>>,
+    /// Messages taken off a queue to steer, by ticket.
+    ///
+    /// A message is removed from the queue the moment the reader asks for it
+    /// (the row must leave the dock now), but the turn may end before its next
+    /// step takes it. The row is kept here until one of those two happens: the
+    /// delivery event records it in the transcript, the withdrawal event puts
+    /// it back in the queue, and nothing is silently lost.
+    steering: HashMap<u64, Steering>,
     /// Sessions whose `/compact` command is in flight right now.
     ///
     /// A compaction is not a stream, so the streaming registry cannot answer
@@ -667,6 +695,8 @@ impl AppState {
             persisted_subagents,
             inbox: HashMap::new(),
             inbox_seq: 0,
+            steer_mailboxes: HashMap::new(),
+            steering: HashMap::new(),
             search_open: false,
             search_query: String::new(),
             plugin_query: String::new(),
@@ -1601,6 +1631,11 @@ impl AppState {
     pub(crate) fn stop(&mut self, id: &str) {
         self.runner.stop(id);
         self.streams.remove(id);
+        // The task is aborted before it can report a withdrawal, so the rows
+        // it never answered for are put back here: an aborted turn never
+        // delivered them, and the next turn is seeded from the store.
+        self.steer_mailboxes.remove(id);
+        self.restore_orphan_steers(id);
         let stopped = now_ms();
         if let Some(session) = self.store.session_mut(id) {
             if let Some(message) = session.messages.last_mut() {
@@ -2678,6 +2713,145 @@ impl AppState {
         }
     }
 
+    /// Take one queued message off the dock by its identity.
+    ///
+    /// The row leaves the dock the moment the reader asks for it, so a steer
+    /// that the turn cannot honour has to be able to put it back - which is
+    /// what [`Self::restore_queued`] is for.
+    pub(crate) fn take_queued(&mut self, id: &str, seq: u64) -> Option<Queued> {
+        let queue = self.inbox.get_mut(id)?;
+        let index = queue.iter().position(|queued| queued.seq == seq)?;
+        let queued = queue.remove(index);
+        let empty = queue.is_empty();
+        if empty {
+            self.inbox.remove(id);
+        }
+        Some(queued)
+    }
+
+    /// Put a queued row back in its identity order.
+    ///
+    /// Inserting by ticket rather than appending restores the row where it
+    /// was, so a withdrawal cannot reorder the messages around it.
+    pub(crate) fn restore_queued(&mut self, id: &str, queued: Queued) {
+        let queue = self.inbox.entry(id.to_string()).or_default();
+        let index = queue
+            .iter()
+            .position(|waiting| waiting.seq > queued.seq)
+            .unwrap_or(queue.len());
+        queue.insert(index, queued);
+    }
+
+    /// Attach the mailbox a newly spawned turn drains.
+    pub(crate) fn attach_steers(&mut self, id: &str, mailbox: Arc<SteerMailbox>) {
+        self.steer_mailboxes.insert(id.to_string(), mailbox);
+    }
+
+    /// The steer mailbox of a session whose turn is running.
+    ///
+    /// None for an idle session: a queued row there is an ordinary send, not a
+    /// message into a mailbox nobody will drain.
+    pub(crate) fn steers(&self, id: &str) -> Option<Arc<SteerMailbox>> {
+        self.steer_mailboxes.get(id).cloned()
+    }
+
+    /// The rows this session has steered and is still waiting to have taken.
+    ///
+    /// The dock draws one disabled "Sending…" echo per row: it left the queue
+    /// when the reader pressed Send now, but the turn has not admitted it yet,
+    /// and the reference shows that pending span rather than dropping the row
+    /// out of sight.
+    pub(crate) fn pending_steers(&self, id: &str) -> Vec<&Queued> {
+        let mut rows: Vec<&Queued> = self
+            .steering
+            .values()
+            .filter(|steering| steering.session == id)
+            .map(|steering| &steering.queued)
+            .collect();
+        rows.sort_by_key(|queued| queued.seq);
+        rows
+    }
+
+    /// Keep the row a steer took until the turn answers for it.
+    pub(crate) fn mark_steering(&mut self, id: &str, queued: Queued) {
+        self.steering.insert(
+            queued.seq,
+            Steering {
+                session: id.to_string(),
+                queued,
+            },
+        );
+    }
+
+    /// Whether a ticket the shell reported is still waiting for the turn.
+    #[cfg(test)]
+    pub(crate) fn is_steering(&self, ticket: u64) -> bool {
+        self.steering.contains_key(&ticket)
+    }
+
+    /// Put back every steering row this session never got an answer for.
+    ///
+    /// The runner reports a withdrawal BEFORE the terminal event, so an entry
+    /// still here when the turn ends means its delivery report was lost - the
+    /// row goes back rather than vanishing with the turn.
+    fn restore_orphan_steers(&mut self, id: &str) {
+        let orphans: Vec<u64> = self
+            .steering
+            .iter()
+            .filter(|(_, steering)| steering.session == id)
+            .map(|(ticket, _)| *ticket)
+            .collect();
+        for ticket in orphans {
+            if let Some(steering) = self.steering.remove(&ticket) {
+                self.restore_queued(&steering.session, steering.queued);
+            }
+        }
+    }
+
+    /// Record a steered message in the transcript at the point the turn took
+    /// it.
+    ///
+    /// The running assistant row is closed at this instant, the message becomes
+    /// a STEERING user row, and a fresh assistant row takes over: tokens after
+    /// the interjection belong after it. The two assistant rows are the two
+    /// assistant turns the running loop really produced - the request history
+    /// alternates assistant, user, assistant - and the steering flag is what
+    /// keeps the rail, the trajectory and the turn count treating the whole
+    /// span as ONE turn.
+    fn land_steered(&mut self, id: &str, ticket: u64) {
+        let Some(steering) = self.steering.remove(&ticket) else {
+            return;
+        };
+        let at = now_ms();
+        let display = display_text(&steering.queued.text, &steering.queued.attachments);
+        {
+            let Some(session) = self.store.session_mut(id) else {
+                return;
+            };
+            if let Some(last) = session.messages.last_mut() {
+                if last.role == Role::Assistant {
+                    settle_ms(last, at);
+                }
+            }
+            let mut user = ChatMessage::steer(display);
+            user.timing_mut().start = Some(at);
+            session.messages.push(user);
+            let mut placeholder = ChatMessage::assistant();
+            placeholder.timing_mut().start = Some(at);
+            session.messages.push(placeholder);
+            session.updated_at = now();
+        }
+        self.save_session(id);
+    }
+
+    /// Put a withdrawn steering row back where it was queued.
+    fn restore_steer(&mut self, ticket: u64) {
+        let Some(steering) = self.steering.remove(&ticket) else {
+            return;
+        };
+        self.restore_queued(&steering.session, steering.queued);
+    }
+
     /// Fold one runner event into the transcript.
     pub(crate) fn apply_event(&mut self, id: &str, event: AgentEvent) {
         // An automatic compaction lands BEFORE the turn's first token: the
@@ -2694,6 +2868,17 @@ impl AppState {
         } = &event
         {
             self.land_automatic_compaction(id, *before, *dropped, summary.clone());
+        }
+        // A steered message and a withdrawn one are transcript/queue events,
+        // not stream deltas: they touch no message the turn is filling in, so
+        // they are handled before the store borrow below.
+        if let AgentEvent::Steered { ticket } = &event {
+            self.land_steered(id, *ticket);
+            return;
+        }
+        if let AgentEvent::SteerWithdrawn { ticket } = &event {
+            self.restore_steer(*ticket);
+            return;
         }
         let terminal = matches!(event, AgentEvent::Done | AgentEvent::Error(_));
         // One clock for the event: it stamps a call's start, the turn's first
@@ -2766,7 +2951,12 @@ impl AppState {
                         message.error = Some(error);
                     }
                 }
-                AgentEvent::AutoCompacted { .. } | AgentEvent::Done => {}
+                // Both steering events returned before this borrow; the
+                // arms exist so the match stays exhaustive by the type.
+                AgentEvent::AutoCompacted { .. }
+                | AgentEvent::Steered { .. }
+                | AgentEvent::SteerWithdrawn { .. }
+                | AgentEvent::Done => {}
             }
             if terminal {
                 session.updated_at = now();
@@ -2777,6 +2967,10 @@ impl AppState {
         }
         if terminal {
             self.streams.remove(id);
+            // The turn is over: nothing may steer it any more, and a steering
+            // row it never answered for goes back to the queue.
+            self.steer_mailboxes.remove(id);
+            self.restore_orphan_steers(id);
             self.turn_started = None;
             self.refresh_policy_audit();
             if let Some(session) = self.store.session(id) {
@@ -2808,6 +3002,8 @@ impl AppState {
     pub(crate) fn archive_session(&mut self, id: &str) {
         self.runner.stop(id);
         self.streams.remove(id);
+        self.steer_mailboxes.remove(id);
+        self.restore_orphan_steers(id);
         if let Some(session) = self.store.session_mut(id) {
             session.archived_at = Some(now());
             session.updated_at = now();

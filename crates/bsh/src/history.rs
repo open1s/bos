@@ -33,7 +33,10 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, ArrayRef, Int64Builder, StringArray, StringBuilder, UInt64Builder};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Int64Builder, StringArray, StringBuilder,
+    UInt64Builder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -1342,6 +1345,9 @@ fn message_schema() -> Arc<Schema> {
         // Appended after the original schema; old files simply have fewer
         // columns and decode with no images.
         Field::new("images", DataType::Utf8, false),
+        // Appended with steering; a file written before it decodes every row
+        // as a turn prompt, which is what those rows were.
+        Field::new("steering", DataType::Boolean, false),
     ]))
 }
 
@@ -1458,6 +1464,7 @@ fn message_batch(messages: &[ChatMessage], base: usize) -> Result<RecordBatch> {
     let mut meta = StringBuilder::new();
     let mut tools = StringBuilder::new();
     let mut images = StringBuilder::new();
+    let mut steering = BooleanBuilder::new();
     for (offset, message) in messages.iter().enumerate() {
         index.append_value((base + offset) as i64);
         role.append_value(match message.role {
@@ -1476,6 +1483,7 @@ fn message_batch(messages: &[ChatMessage], base: usize) -> Result<RecordBatch> {
         }
         tools.append_value(serde_json::to_string(&message.tools)?);
         images.append_value(serde_json::to_string(&message.images)?);
+        steering.append_value(message.steering);
     }
     Ok(RecordBatch::try_new(
         message_schema(),
@@ -1488,6 +1496,7 @@ fn message_batch(messages: &[ChatMessage], base: usize) -> Result<RecordBatch> {
             Arc::new(meta.finish()),
             Arc::new(tools.finish()),
             Arc::new(images.finish()),
+            Arc::new(steering.finish()),
         ],
     )?)
 }
@@ -1553,6 +1562,9 @@ fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
     let images = (batch.num_columns() > 7)
         .then(|| column::<StringArray>(batch, 7))
         .transpose()?;
+    let steering = (batch.num_columns() > 8)
+        .then(|| column::<BooleanArray>(batch, 8))
+        .transpose()?;
     let mut rows = Vec::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
         rows.push(ChatMessage {
@@ -1574,6 +1586,7 @@ fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
                 .is_valid(index)
                 .then(|| serde_json::from_str::<MessageMeta>(meta.value(index)).ok())
                 .flatten(),
+            steering: steering.as_ref().is_some_and(|column| column.value(index)),
         });
     }
     Ok(rows)
@@ -1645,6 +1658,9 @@ mod tests {
             },
             error: (index.is_multiple_of(7)).then(|| format!("boom {index}")),
             meta: (index.is_multiple_of(5)).then(MessageMeta::default),
+            // An even index is a user row; make one of them a steering row so
+            // the round trip proves the flag survives the log.
+            steering: index == 2,
         }
     }
 
@@ -1816,6 +1832,10 @@ mod tests {
                 assert_eq!(row.error, expected.error);
                 assert_eq!(row.tools.len(), expected.tools.len());
                 assert_eq!(row.images, expected.images, "images survive the log");
+                assert_eq!(
+                    row.steering, expected.steering,
+                    "the steering flag survives the log"
+                );
             }
         }
         let _ = fs::remove_dir_all(&dir);

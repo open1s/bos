@@ -18,7 +18,7 @@ fn open_link(url: &SharedString, _event: &ClickEvent, _window: &mut Window, cx: 
 use gpui_kit::*;
 use std::sync::Arc;
 
-use super::shell::Shell;
+use super::shell::{ChangesHover, Shell};
 use super::todo_panel::spinner;
 use super::{glyph, icon, txt, DivExt, IconName};
 use crate::i18n::{tr, Lang};
@@ -396,7 +396,6 @@ pub(crate) fn tool_diff(name: &str, args: &str) -> Option<Vec<(char, String)>> {
 /// host record, so the honest source is the step's own request, exactly like
 /// `tool_diff`. The three names are what this crate's own tool switch already
 /// treats as a write.
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
@@ -411,13 +410,9 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
 /// a summary of what the turn ASKED for - never a claim about what the disk
 /// held, which bsh cannot know without a before-image.
 #[derive(Clone)]
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) struct ChangedFile {
     /// The path exactly as the step named it.
     pub(crate) path: String,
-    /// The FIRST step in the message that touched this file, so pressing a row
-    /// opens the file through the same seam a step's own path link uses.
-    pub(crate) tool: usize,
     /// Lines the request added.
     pub(crate) added: usize,
     /// Lines the request removed.
@@ -432,10 +427,9 @@ pub(crate) struct ChangedFile {
 /// groups them: the counts add up and the preview shows both changes in order.
 /// A step with no readable path or no readable change is skipped rather than
 /// shown as a nameless row.
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) fn turn_changes(tools: &[ToolEvent]) -> Vec<ChangedFile> {
     let mut files: Vec<ChangedFile> = Vec::new();
-    for (index, tool) in tools.iter().enumerate() {
+    for tool in tools {
         if !is_write_tool(&tool.name) {
             continue;
         }
@@ -455,7 +449,6 @@ pub(crate) fn turn_changes(tools: &[ToolEvent]) -> Vec<ChangedFile> {
             }
             None => files.push(ChangedFile {
                 path,
-                tool: index,
                 added,
                 deleted,
                 diff,
@@ -470,7 +463,6 @@ pub(crate) fn turn_changes(tools: &[ToolEvent]) -> Vec<ChangedFile> {
 /// Measured: the reference's `changes.singleTitle` names the BASENAME, because
 /// the header's tile already carries the file's own kind icon and the full path
 /// would ellipsise the one word that identifies it.
-#[allow(dead_code)] // wired by the changed-files panel that is landing next
 pub(crate) fn base_name(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
@@ -879,6 +871,20 @@ struct RowChrome<'a> {
     style: &'a TextViewStyle,
 }
 
+/// The state of the TURN one transcript row belongs to.
+///
+/// A turn can hold two assistant rows when a steer landed mid-turn, so "is this
+/// turn settled?" and "is this the row still being written?" are separate
+/// facts: the settled policy decides how much detail a finished turn keeps, and
+/// only the newest row of the live turn may claim the "Running…" line.
+#[derive(Clone, Copy, Default)]
+struct RowTurn {
+    /// The fold policy treats this row's turn as settled.
+    settled: bool,
+    /// The live turn is still writing into this row.
+    writing: bool,
+}
+
 impl Shell {
     /// The reference's own markdown scale, measured from its theme tokens.
     ///
@@ -1102,12 +1108,14 @@ impl Shell {
             .collect();
         markers.sort_by_key(|(position, _, _)| *position);
         let mut pending = markers.into_iter().peekable();
-        // One scan for the newest prompt, so no row has to look ahead over the
-        // messages below it to decide whether its action row is revealed.
+        // One scan for the newest PROMPT, so no row has to look ahead over the
+        // messages below it to decide whether its action row is revealed. A
+        // steering row is not a prompt: it does not push the prompt above it
+        // out of the newest slot.
         let last_user = session
             .messages
             .iter()
-            .rposition(|message| message.role == Role::User);
+            .rposition(|message| message.role == Role::User && !message.steering);
         for (index, message) in session.messages.iter().enumerate() {
             while pending
                 .peek()
@@ -1124,8 +1132,15 @@ impl Shell {
                 continue;
             }
             let settled = folded && !(live && index == last);
+            // ONE running indicator per turn: after a steer the turn holds two
+            // assistant rows, and both would otherwise report "Running…" while
+            // only the newest is still writing.
+            let row = RowTurn {
+                settled,
+                writing: live && index == last,
+            };
             rows.push(
-                self.message_row(index, message, settled, last_user, &chrome, cx)
+                self.message_row(index, message, row, last_user, &chrome, cx)
                     .into_any_element(),
             );
         }
@@ -1146,6 +1161,14 @@ impl Shell {
                 self.compact_command_row(command, &chrome)
                     .into_any_element(),
             );
+        }
+        // A steered message shows in the conversation IMMEDIATELY, before the
+        // running step takes it: the reference keeps it in the next-step inbox
+        // and renders it as a pending steering bubble, which is how the reader
+        // sees their interjection land. The durable row replaces it when the
+        // `Steered` delivery arrives.
+        for queued in self.state.pending_steers(&session.id) {
+            rows.push(self.pending_steer_row(queued).into_any_element());
         }
         // The reference puts a turn-jump rail down the transcript's right edge.
         // The scroll handle records each child's painted bounds, so a tick can jump
@@ -1360,6 +1383,10 @@ impl Shell {
                     .children(rows),
             )
             .children(rail)
+            // The hover preview lives in this relative frame, not inside the
+            // scroller: a scroller clips absolute children, so a card hanging off
+            // a row would be cut at the viewport edge.
+            .children(self.changes_preview_overlay(cx))
             // While a window of older rows is loading, the pane shows the
             // shared busy mark rather than a frame that looks idle. It is an
             // overlay, so it adds no child and the turn rail's child indices
@@ -1639,11 +1666,45 @@ impl Shell {
         self.tool_row(usize::MAX - index, 0, &tool, true, chrome, cx)
     }
 
+    /// One steered message the running turn has not taken yet.
+    ///
+    /// The reference renders an inbox steering item with the same bubble it
+    /// uses for an admitted user row (its `data-pending-steering` bubble), so
+    /// the reader sees the interjection immediately; the bubble becomes the
+    /// durable row when the step claims it. No action row: there is nothing to
+    /// copy or retry until it is part of the conversation.
+    fn pending_steer_row(&self, queued: &crate::state::Queued) -> Div {
+        let seq = queued.seq;
+        let content = self.state.draft().global.general.content_font_size;
+        div()
+            .debug_selector(move || format!("steer-pending-{seq}"))
+            .w_full()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .child(
+                div()
+                    .max_w(px((self.chat_w() - 2.0 * theme::INSET) * 0.82))
+                    .px(px(16.0))
+                    .py(px(10.0))
+                    .rounded(px(20.0))
+                    .bg(rgb(theme::user_bubble()))
+                    .child(
+                        txt(
+                            crate::state::display_text(&queued.text, &queued.attachments),
+                            theme::body_size_at(content),
+                            theme::text(),
+                        )
+                        .line_height(px(theme::bubble_line_at(content))),
+                    ),
+            )
+    }
+
     fn message_row(
         &self,
         index: usize,
         message: &ChatMessage,
-        folded: bool,
+        turn: RowTurn,
         // The newest prompt in the transcript. A prompt that has a later one
         // below it hides its action row until the pointer is on the turn, which
         // is the reference's own reveal rule for user rows.
@@ -1686,7 +1747,19 @@ impl Shell {
                             // 82% of the row - and at `content * .702`, which only
                             // binds wider.
                             div()
-                                .debug_selector(move || format!("user-bubble-{index}"))
+                                // The reference draws an admitted steer with the
+                                // SAME user bubble it draws a prompt with (its
+                                // `data-chat-flow-kind=steering` shares the user
+                                // styles), so the only difference is the identity
+                                // a test can look up and the turn grouping the
+                                // flag drives.
+                                .debug_selector(move || {
+                                    if message.steering {
+                                        format!("steer-bubble-{index}")
+                                    } else {
+                                        format!("user-bubble-{index}")
+                                    }
+                                })
                                 // 82% of the transcript's content box. The reference
                                 // also caps at `content * .702`, which only binds wider.
                                 .max_w(px((self.chat_w() - 2.0 * theme::INSET) * 0.82))
@@ -1707,28 +1780,35 @@ impl Shell {
         let mut column = div().w_full().flex().flex_col().gap(px(8.0));
 
         if !message.reasoning.is_empty() {
-            column = column.child(self.think_row(index, message, folded, chrome, cx));
+            column = column.child(self.think_row(index, message, turn.settled, chrome, cx));
         }
 
-        if message.text.is_empty() && message.error.is_none() && !folded {
-            column = column.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(glyph("●", 9.0, theme::accent()))
-                    .child(txt(
-                        match self.state.turn_elapsed() {
-                            Some(elapsed) => {
-                                format!("{} · {elapsed}", self.state.lang.tr("msg.running"))
-                            }
-                            None => self.state.lang.tr("msg.running").to_string(),
-                        },
-                        theme::body_size_at(self.state.draft().global.general.content_font_size),
-                        theme::muted(),
-                    )),
-            );
+        if message.text.is_empty() && message.error.is_none() {
+            // An empty segment of a steered turn contributes no body: the turn
+            // holds one row before the steer and one after it, and only the
+            // newest is writing.
+            if !turn.settled && turn.writing {
+                column = column.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(glyph("●", 9.0, theme::accent()))
+                        .child(txt(
+                            match self.state.turn_elapsed() {
+                                Some(elapsed) => {
+                                    format!("{} · {elapsed}", self.state.lang.tr("msg.running"))
+                                }
+                                None => self.state.lang.tr("msg.running").to_string(),
+                            },
+                            theme::body_size_at(
+                                self.state.draft().global.general.content_font_size,
+                            ),
+                            theme::muted(),
+                        )),
+                );
+            }
         } else {
             column = column.child(
                 {
@@ -1749,7 +1829,16 @@ impl Shell {
         }
 
         for (tool_index, tool) in message.tools.iter().enumerate() {
-            column = column.child(self.tool_row(index, tool_index, tool, folded, chrome, cx));
+            column = column.child(self.tool_row(index, tool_index, tool, turn.settled, chrome, cx));
+        }
+
+        // The turn's changed files, as the reference's closing card. It sits after
+        // the steps because it SUMMARISES them, and it is the only place a reader
+        // can hover a file and see what changed in it.
+        if let Some(files) = self.changed_files(index) {
+            if let Some(card) = self.changes_card(index, &files, cx) {
+                column = column.child(card);
+            }
         }
 
         if let Some(error) = &message.error {
@@ -1779,6 +1868,556 @@ impl Shell {
     /// `20px + secondary delta`. Open, the complete reasoning renders in a body
     /// indented `22px + delta`. The row colour is label-tertiary, label-secondary
     /// under the pointer.
+    /// The changed files of one message, from the per-frame cache.
+    ///
+    /// Parsing every write's arguments on every frame is the per-frame work the
+    /// crate's own rule forbids, so the summary is cached on the steps it was
+    /// built from.
+    fn changed_files(&self, message: usize) -> Option<std::rc::Rc<Vec<ChangedFile>>> {
+        let session = self.state.active_session()?;
+        let tools = &session.messages.get(message)?.tools;
+        let files = self.changes_cache.borrow_mut().get(message, tools);
+        if files.is_empty() {
+            return None;
+        }
+        Some(files)
+    }
+
+    /// Record the row the pointer is over and arm the 500ms preview clock.
+    ///
+    /// Moving WITHIN one row must not restart the clock on every pixel, so only a
+    /// different row arms a new timer; the same row just follows the pointer.
+    fn arm_changes_hover(
+        &mut self,
+        message: usize,
+        file: usize,
+        at: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(current) = self.changes_hover {
+            if current.message == message && current.file == file {
+                self.changes_hover = Some(ChangesHover { message, file, at });
+                return;
+            }
+        }
+        self.changes_hover = Some(ChangesHover { message, file, at });
+        self.changes_preview = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            // Decide WHAT to resolve on the UI thread, where the state is; the
+            // resolving itself costs a git subprocess and belongs off it.
+            let prepared = this.update(cx, |this, _cx| {
+                let hover = this.changes_hover?;
+                if hover.message != message || hover.file != file {
+                    return None;
+                }
+                let files = this.changed_files(message)?;
+                let changed = files.get(file)?;
+                let root = this.state.workspace_root()?;
+                // The reference titles the preview with the file's resolved path;
+                // a step often records a short one ("x.md"), which names nothing
+                // outside the directory the reader has in mind.
+                let rel = crate::ui::diff_pane::workspace_relative(&root, &changed.path);
+                let absolute = root.join(&rel);
+                let display = if absolute.is_file() {
+                    absolute.to_string_lossy().to_string()
+                } else {
+                    changed.path.clone()
+                };
+                Some((root, display, changed.diff.clone()))
+            });
+            let Ok(Some((root, path, changes))) = prepared else {
+                return;
+            };
+            let resolving = path.clone();
+            let rows = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::ui::diff_pane::preview_for_workspace(&root, &resolving, &changes)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // Still the same row? The pointer may have moved while the
+                // subprocess ran, which is exactly what the delay exists to
+                // avoid showing.
+                let Some(hover) = this.changes_hover else {
+                    return;
+                };
+                if hover.message != message || hover.file != file {
+                    return;
+                }
+                this.changes_preview = Some((message, file, path, rows));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Drop the hover state and its preview.
+    fn clear_changes_hover(&mut self, cx: &mut Context<Self>) {
+        if self.changes_hover.is_none() && self.changes_preview.is_none() {
+            return;
+        }
+        self.changes_hover = None;
+        self.changes_preview = None;
+        cx.notify();
+    }
+
+    /// The hover preview, positioned at the pointer.
+    ///
+    /// It is drawn in the transcript's own relative frame rather than inside the
+    /// scroller: a GPUI scroller clips absolute children, so a card hanging off a
+    /// row would be cut at the viewport edge. The pointer's window position is
+    /// therefore taken back to that frame through the scroller's bounds, which is
+    /// the box the frame wraps.
+    fn changes_preview_overlay(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (message, index, path, rows) = self.changes_preview.clone()?;
+        let hover = self.changes_hover?;
+        if hover.message != message || hover.file != index {
+            return None;
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        const W: f32 = 460.0;
+        const MAX_H: f32 = 320.0;
+        let bounds = self.transcript_scroll.bounds();
+        let origin_y = f32::from(bounds.origin.y);
+        let view_w = f32::from(bounds.size.width);
+        let view_h = f32::from(bounds.size.height);
+        // The LEFT edge is the content's own edge, so the card lines up with the
+        // row it explains rather than floating wherever the pointer happened to
+        // sit.
+        let x = theme::INSET.min((view_w - W - 8.0).max(8.0));
+        // The panel's height is not measured before it is placed, so it is
+        // estimated from the rows it will draw - enough to decide which side of
+        // the pointer has room for it.
+        const HEAD_H: f32 = 28.0;
+        const ROW_H: f32 = 18.0;
+        let panel_h = (HEAD_H + rows.len() as f32 * ROW_H).min(MAX_H);
+        let y = crate::ui::diff_pane::preview_top(hover.at.1 - origin_y, panel_h, view_h);
+        let lines: Vec<AnyElement> = rows
+            .iter()
+            .map(|row| {
+                // The wash carries the row, but the MARKER states it: a reader
+                // scanning a diff looks for the glyph, and a tint alone leaves
+                // them hunting for whether a line was added or removed.
+                let ink = match row.mark {
+                    '-' | '+' => theme::text(),
+                    _ => theme::muted(),
+                };
+                let fill = match row.mark {
+                    '-' => theme::diff_del(),
+                    '+' => theme::diff_add(),
+                    _ => theme::page(),
+                };
+                let marker = match row.mark {
+                    '-' => "\u{2212}",
+                    '+' => "+",
+                    _ => "",
+                };
+                let marker_ink = match row.mark {
+                    '-' => theme::error(),
+                    '+' => theme::success(),
+                    _ => theme::faint(),
+                };
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(ROW_H))
+                    .bg(rgb(fill))
+                    .child(
+                        txt(
+                            row.old.map(|n| n.to_string()).unwrap_or_default(),
+                            theme::CHIP_SIZE,
+                            theme::faint(),
+                        )
+                        .w(px(30.0))
+                        .pr(px(6.0))
+                        .flex_none()
+                        .line_height(px(ROW_H))
+                        .text_align(gpui_kit::TextAlign::Right),
+                    )
+                    .child(
+                        txt(
+                            row.new.map(|n| n.to_string()).unwrap_or_default(),
+                            theme::CHIP_SIZE,
+                            theme::faint(),
+                        )
+                        .w(px(30.0))
+                        .pr(px(6.0))
+                        .flex_none()
+                        .line_height(px(ROW_H))
+                        .text_align(gpui_kit::TextAlign::Right),
+                    )
+                    .child(
+                        // The glyph the eye searches for, in its own colour.
+                        txt(marker, theme::CHIP_SIZE, marker_ink)
+                            .w(px(14.0))
+                            .flex_none()
+                            .line_height(px(ROW_H))
+                            .text_align(gpui_kit::TextAlign::Center),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .child(
+                                txt(row.text.clone(), theme::CHIP_SIZE, ink)
+                                    .font_family(theme::CODE_FONT)
+                                    .line_height(px(ROW_H)),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            super::hairline_all(div())
+                .debug_selector(|| "changes-preview".to_string())
+                .id("changes-preview")
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .border_color(rgb(theme::border_soft()))
+                .w(px(W))
+                .max_h(px(MAX_H))
+                .occlude()
+                .rounded(px(12.0))
+                .bg(rgb(theme::page()))
+                .shadow_lg()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(rgb(theme::border_soft()))
+                        .whitespace_nowrap()
+                        .child(
+                            txt(path.clone(), theme::CHIP_SIZE, theme::muted())
+                                .font_family(theme::CODE_FONT),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("changes-preview-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        // Full-bleed rows, the way the reference draws a patch: a
+                        // wash inset from the card edge reads as a highlighted
+                        // block rather than as the line itself.
+                        .py(px(4.0))
+                        .children(lines),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The turn's changed files, as the reference's closing card.
+    ///
+    /// Measured (ChangedFiles.module.css): the card is a `.5px` border-l2 at
+    /// radius-lg over the page fill; the header is a fixed 60 over `8px 10px` at
+    /// gap 10 holding a 40x40 tile; the title is 13/20 at weight 500 and the stat
+    /// line 10/16; a row is `min-height:24px` over `7px 18px 7px 14px` at a
+    /// code-face 11/18; and the fold control is `10px 18px 10px 14px` at 12/18.
+    ///
+    /// A single changed file is only a header - the reference calls it a
+    /// single-file card - and a list appears once a turn touched more than one.
+    fn changes_card(
+        &self,
+        message: usize,
+        files: &[ChangedFile],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let lang = self.state.lang;
+        let first = files.first()?;
+        let single = files.len() == 1;
+        let foldable = files.len() > theme::CHANGES_COLLAPSED_ROWS;
+        let expanded = self.changes_open.contains(&message);
+        let shown: Vec<&ChangedFile> = if foldable && !expanded {
+            files.iter().take(theme::CHANGES_COLLAPSED_ROWS).collect()
+        } else {
+            files.iter().collect()
+        };
+        let added: usize = files.iter().map(|file| file.added).sum();
+        let deleted: usize = files.iter().map(|file| file.deleted).sum();
+        let title = if single {
+            crate::i18n::tr_args(
+                lang,
+                "changes.singleTitle",
+                &[("name", base_name(&first.path))],
+            )
+        } else {
+            crate::i18n::tr_args(lang, "changes.title", &[("count", files.len().to_string())])
+        };
+        // The counts a reader scans, in the two colours the card pairs them in.
+        let counts = {
+            let added =
+                crate::i18n::tr_args(lang, "changes.added", &[("count", added.to_string())]);
+            let deleted =
+                crate::i18n::tr_args(lang, "changes.deleted", &[("count", deleted.to_string())]);
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(6.0))
+                .font_family(theme::CODE_FONT)
+                .child(txt(added, theme::CHANGES_STAT_SIZE, theme::success()))
+                .child(txt(deleted, theme::CHANGES_STAT_SIZE, theme::error()))
+        };
+        let header = {
+            let hovered = self
+                .changes_hover
+                .is_some_and(|state| state.message == message);
+            let hint = txt(
+                lang.tr("presented.preview"),
+                theme::CHANGES_STAT_SIZE,
+                theme::faint(),
+            );
+            div()
+                .debug_selector(move || format!("changes-header-{message}"))
+                .id(SharedString::from(format!("changes-header-{message}")))
+                .h(px(theme::CHANGES_HEADER_H))
+                .px(px(10.0))
+                .py(px(8.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .w_full()
+                .bg(rgb(theme::changes_fill()))
+                .cursor_pointer()
+                .hover(|row| row.bg(rgb(theme::changes_hover())))
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                        this.arm_changes_hover(
+                            message,
+                            0,
+                            (f32::from(event.position.x), f32::from(event.position.y)),
+                            cx,
+                        );
+                    }),
+                )
+                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                    if !*hovered {
+                        this.clear_changes_hover(cx);
+                    }
+                }))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    // The card summarises the WHOLE turn, so pressing it opens
+                    // the turn's file list in the Diff pane rather than one
+                    // file's comparison - the list is what the card is.
+                    this.open_diff_turn(message, cx);
+                }))
+                .child(
+                    // The tile: a 40x40 radius-10 plate holding the kind's glyph,
+                    // which is the reference's FileTypeIcon slot.
+                    div()
+                        .w(px(theme::CHANGES_TILE))
+                        .h(px(theme::CHANGES_TILE))
+                        .flex_none()
+                        .rounded(px(theme::CHANGES_TILE_RADIUS))
+                        .bg(rgb(theme::changes_tile()))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(IconName::Code, 20.0, theme::muted())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(
+                                    txt(title, theme::CHANGES_TITLE_SIZE, theme::text())
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .line_height(px(theme::CHANGES_TITLE_LINE)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .h(px(theme::CHANGES_STAT_LINE))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                // The counts swap for the preview hint under the
+                                // pointer, which is the reference's own rule for
+                                // telling the reader the row does something.
+                                .child(if hovered {
+                                    hint.into_any_element()
+                                } else {
+                                    counts.into_any_element()
+                                }),
+                        ),
+                )
+        };
+        let mut card = super::hairline_all(div())
+            .debug_selector(move || format!("changes-card-{message}"))
+            .mt(px(4.0))
+            .rounded(px(theme::RADIUS_LG))
+            .bg(rgb(theme::page()))
+            .border_color(rgb(theme::border_soft()))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .w_full()
+            .child(header);
+        if !single {
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(rgb(theme::border_soft()));
+            for (index, file) in shown.iter().enumerate() {
+                list = list.child(self.changes_row(message, index, file, cx));
+            }
+            card = card.child(list);
+        }
+        if foldable {
+            let open = expanded;
+            card = card.child(
+                div()
+                    .debug_selector(move || format!("changes-toggle-{message}"))
+                    .id(SharedString::from(format!("changes-toggle-{message}")))
+                    .w_full()
+                    .px(px(theme::CHANGES_ROW_PAD_R))
+                    .pl(px(theme::CHANGES_ROW_PAD_L))
+                    .py(px(10.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .cursor_pointer()
+                    .hover(|row| row.bg(rgb(theme::hover())))
+                    .child(icon(
+                        if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        },
+                        14.0,
+                        theme::faint(),
+                    ))
+                    .child(txt(
+                        if open {
+                            lang.tr("changes.collapse")
+                        } else {
+                            crate::i18n::tr_args(
+                                lang,
+                                "changes.all",
+                                &[("count", files.len().to_string())],
+                            )
+                        },
+                        12.0,
+                        theme::faint(),
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        if !this.changes_open.remove(&message) {
+                            this.changes_open.insert(message);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        Some(card.into_any_element())
+    }
+
+    /// One file row inside the card.
+    fn changes_row(
+        &self,
+        message: usize,
+        index: usize,
+        file: &ChangedFile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let path = file.path.clone();
+        let added =
+            crate::i18n::tr_args(lang, "changes.added", &[("count", file.added.to_string())]);
+        let deleted = crate::i18n::tr_args(
+            lang,
+            "changes.deleted",
+            &[("count", file.deleted.to_string())],
+        );
+        div()
+            .debug_selector(move || format!("changes-row-{message}-{index}"))
+            .id(SharedString::from(format!("changes-row-{message}-{index}")))
+            .w_full()
+            .min_h(px(24.0))
+            .px(px(theme::CHANGES_ROW_PAD_R))
+            .pl(px(theme::CHANGES_ROW_PAD_L))
+            .py(px(theme::CHANGES_ROW_PAD_Y))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(10.0))
+            .cursor_pointer()
+            .font_family(theme::CODE_FONT)
+            .hover(|row| row.bg(rgb(theme::hover())))
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    this.arm_changes_hover(
+                        message,
+                        index,
+                        (f32::from(event.position.x), f32::from(event.position.y)),
+                        cx,
+                    );
+                }),
+            )
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                if !*hovered {
+                    this.clear_changes_hover(cx);
+                }
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(txt(path.clone(), theme::CHANGES_PATH_SIZE, theme::muted())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .gap(px(6.0))
+                    .child(
+                        txt(added, theme::CHANGES_ROW_SIZE, theme::success())
+                            .line_height(px(theme::CHANGES_ROW_LINE)),
+                    )
+                    .child(
+                        txt(deleted, theme::CHANGES_ROW_SIZE, theme::error())
+                            .line_height(px(theme::CHANGES_ROW_LINE)),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                // The row names ONE file, so the turn list opens with that
+                // file already expanded - the comparison the reader asked for,
+                // in the context of everything else the turn changed.
+                this.open_diff_turn_at(message, &path, cx);
+            }))
+            .into_any_element()
+    }
+
     /// The compaction marker: one line that says a span was condensed, and the
     /// summary the model was given in its place when expanded.
     ///

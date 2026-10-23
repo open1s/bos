@@ -71,6 +71,18 @@ pub(crate) struct PresetEditor {
     pub(crate) text: Entity<TextareaState>,
 }
 
+/// What became of one submission.
+///
+/// The attachments ride back on a refusal because only the caller knows where
+/// they belong: the composer's chip row, or the queue row that must not lose
+/// them.
+enum Submit {
+    /// Queued behind a running turn, or the turn opened.
+    Accepted,
+    /// Refused before a turn opened, with the attachments to put back.
+    Refused(Vec<crate::state::Attachment>),
+}
+
 pub(crate) struct Shell {
     /// The model list the last successful fetch returned, if any.
     pub(crate) models_fetched: Option<Vec<String>>,
@@ -345,14 +357,14 @@ pub(crate) struct Shell {
     /// delay, so the row that armed the timer and the moment it did are the
     /// two facts the timer needs.
     pub(crate) changes_hover: Option<ChangesHover>,
-    /// The changed file whose preview has cleared that delay, and the lines the
-    /// card draws for it. Held, not recomputed: the diff is read out of the
-    /// step's own arguments once, when the pointer arrives.
-    pub(crate) changes_preview: Option<(
-        usize,
-        usize,
-        std::rc::Rc<Vec<crate::ui::transcript::ChangedFile>>,
-    )>,
+    /// The changed file whose preview has cleared that delay, the path it
+    /// explains, and the rows the card draws for it.
+    ///
+    /// Held already RESOLVED, because resolving it costs a git subprocess: the
+    /// rows are computed once when the delay passes and re-read every frame
+    /// after that.
+    pub(crate) changes_preview:
+        Option<(usize, usize, String, Vec<crate::ui::diff_pane::PreviewLine>)>,
     /// One changed-file summary per message, keyed on the steps it was built
     /// from. Parsing every write's arguments on every frame is exactly the
     /// per-frame work the crate's own rule forbids.
@@ -637,7 +649,6 @@ pub(crate) struct SideDrag {
 /// row itself is not enough state: the card has to know WHEN the pointer
 /// arrived to know whether the delay has passed, and where the pointer is so the
 /// card can hang off it.
-#[allow(dead_code)] // scaffolding of the changed-files hover card being wired
 #[derive(Clone, Copy)]
 pub(crate) struct ChangesHover {
     /// The message whose card the row belongs to.
@@ -661,7 +672,6 @@ pub(crate) struct ChangesCache {
 
 impl ChangesCache {
     /// The summary for one message, rebuilt only when its steps changed.
-    #[allow(dead_code)] // read by the changed-files card once it is wired
     pub(crate) fn get(
         &mut self,
         message: usize,
@@ -851,7 +861,20 @@ impl Shell {
                         this.command_menu.sync(this.composer_value.as_str());
                         cx.notify();
                     }
-                    InputEvent::PressEnter { shift: false, .. } => {
+                    InputEvent::PressEnter {
+                        secondary,
+                        shift: false,
+                        ..
+                    } => {
+                        // Cmd/Ctrl+Enter steers every waiting message into the
+                        // running turn - the reference's accelerated submit -
+                        // under its own gate: a running turn, a non-empty
+                        // queue, an empty composer and no command card. When
+                        // the gate does not hold, the same chord is the
+                        // ordinary submit it was before steering existed.
+                        if *secondary && this.steer_all_queued(cx) {
+                            return;
+                        }
                         // The reference gives Enter to the open overlay first: the
                         // highlighted row runs, and the composer keeps its draft.
                         if this.slash.open {
@@ -1791,15 +1814,30 @@ impl Shell {
             return;
         }
         let attachments = std::mem::take(&mut self.state.attachments);
+        match self.submit(text, attachments, cx) {
+            Submit::Accepted => self.clear_composer(window, cx),
+            // A refusal leaves the chips where the reader can retry them.
+            Submit::Refused(attachments) => self.state.attachments = attachments,
+        }
+    }
+
+    /// Put one message into the session: queue it behind a running turn, or
+    /// open a turn when the session is idle.
+    ///
+    /// The composer and a queue row's Send now both come through here, so
+    /// pressing the arrow on an idle session behaves exactly as if the reader
+    /// had submitted the text. On refusal the attachments come back, because
+    /// the caller knows where they belong: the composer's chip row, or the
+    /// queue row that must not lose them.
+    fn submit(
+        &mut self,
+        text: String,
+        attachments: Vec<crate::state::Attachment>,
+        cx: &mut Context<Self>,
+    ) -> Submit {
         // Measured: the reference queues a submission while its session is
         // already running instead of opening a second turn over the same
         // transcript, which is what its queue dock lists.
-        // The reference's own EnterBehaviorRow picks the channel: Queue holds
-        // the text for the next turn, which is what the dock lists. Steer has
-        // no backing seam - `Runner` exposes only spawn/stop and
-        // `Agent::stream` takes no mid-turn input - so that mode records the
-        // same submission as an ordinary queue row and the preferences pane
-        // reports the gap rather than claiming a delivery it cannot make.
         if let Some(id) = self.state.active_id.clone() {
             // A running turn is the reference's ordinary queue case. A manual
             // compaction is the second: its own prompts are "accepted and start
@@ -1807,8 +1845,7 @@ impl Shell {
             // works must wait rather than open a turn under it.
             if self.state.is_streaming(&id) || self.state.is_compacting(&id) {
                 self.state.enqueue(&id, text, attachments);
-                self.clear_composer(window, cx);
-                return;
+                return Submit::Accepted;
             }
         }
         // Plan mode and any @reference guidance travel on the REQUEST, not on
@@ -1831,9 +1868,8 @@ impl Shell {
         // it, before a turn opens against a model nobody chose.
         if let Some(key) = self.state.settings.refusal_for(&choice) {
             let why = crate::i18n::tr(self.state.lang, key);
-            self.state.attachments = attachments;
             self.state.notice(why);
-            return;
+            return Submit::Refused(attachments);
         }
         // A credential the vault was meant to supply but cannot, because the
         // vault is locked, is refused here - before a turn opens - rather than
@@ -1842,16 +1878,113 @@ impl Shell {
             crate::caps::credential_error(&self.state.settings, &self.state.vault, &choice)
         {
             let why = error.message(self.state.lang);
-            self.state.attachments = attachments;
             self.state.notice(why);
-            return;
+            return Submit::Refused(attachments);
         }
         let Some((id, transcript, budget)) = self.state.begin_turn(&display) else {
-            self.state.attachments = attachments;
-            return;
+            return Submit::Refused(attachments);
         };
         self.spawn_turn(id, input, transcript, budget, cx);
-        self.clear_composer(window, cx);
+        Submit::Accepted
+    }
+
+    /// Send one waiting message to the running turn now - the reference's
+    /// Steer.
+    ///
+    /// The message leaves the dock and goes into the turn's next-step mailbox;
+    /// the turn appends it as a user row at the step that takes it and reports
+    /// the ticket back, so the transcript shows where the reader interjected.
+    /// A session with no running turn has nothing to steer into, so the row is
+    /// submitted normally instead: "send now" is then just a send.
+    pub(crate) fn steer_now(&mut self, id: &str, seq: u64, cx: &mut Context<Self>) {
+        if !self.state.is_streaming(id) {
+            let Some(queued) = self.state.take_queued(id, seq) else {
+                return;
+            };
+            match self.submit(queued.text.clone(), queued.attachments.clone(), cx) {
+                Submit::Accepted => {}
+                Submit::Refused(_) => self.state.restore_queued(id, queued),
+            }
+            cx.notify();
+            return;
+        }
+        // No mailbox means the turn is between the store and the runner: keep
+        // the row queued rather than dropping it into nothing.
+        let Some(mailbox) = self.state.steers(id) else {
+            return;
+        };
+        let Some(queued) = self.state.take_queued(id, seq) else {
+            return;
+        };
+        let plan = self.state.plan_mode(id);
+        let request = crate::state::turn_text(&queued.text, plan);
+        let input = crate::state::turn_input(&request, &queued.attachments);
+        let accepted = mailbox.push(agent::SteerMessage {
+            content: input,
+            ticket: seq,
+        });
+        if !accepted {
+            // The turn is holding as many messages as it will take, so the row
+            // goes back rather than disappearing into a mailbox no step reads.
+            self.state.restore_queued(id, queued);
+            let why = crate::i18n::tr(self.state.lang, "queue.steerFailed");
+            self.state.notice(why);
+            cx.notify();
+            return;
+        }
+        self.state.mark_steering(id, queued);
+        cx.notify();
+    }
+
+    /// Steer every waiting message, oldest first. True when there was anything
+    /// to steer.
+    ///
+    /// The reference's gate: the chord steers only while a turn runs, a queue
+    /// waits, the composer holds no draft and no command card is open;
+    /// otherwise the same chord is the ordinary accelerated submit it was
+    /// before steering existed.
+    pub(crate) fn steer_all_queued(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.state.active_id.clone() else {
+            return false;
+        };
+        // A child run owns the composer while it is selected, so the chord must
+        // not reach past it into the parent session's queue - the reference's
+        // own `steeringAvailable` term.
+        if self.state.subagent.is_some()
+            || !self.state.is_streaming(&id)
+            || !self.state.has_queued(&id)
+        {
+            return false;
+        }
+        if !self.composer.read(cx).value().trim().is_empty() || !self.state.attachments.is_empty() {
+            return false;
+        }
+        if self.slash.open || self.command_menu.trigger.is_some() {
+            return false;
+        }
+        let seqs: Vec<u64> = self
+            .state
+            .inbox(&id)
+            .iter()
+            .map(|queued| queued.seq)
+            .collect();
+        for seq in seqs {
+            self.steer_now(&id, seq, cx);
+        }
+        true
+    }
+
+    /// Whether the accelerated chord would steer right now.
+    ///
+    /// Exactly the condition the composer's placeholder states, so the promise
+    /// and the key agree: a running turn with a message waiting behind it.
+    pub(crate) fn queued_steerable(&self) -> bool {
+        self.state.subagent.is_none()
+            && self
+                .state
+                .active_id
+                .as_deref()
+                .is_some_and(|id| self.state.is_streaming(id) && self.state.has_queued(id))
     }
 
     /// Empty the composer after a submission left it.
@@ -2230,6 +2363,10 @@ impl Shell {
         // The agent shares this store with its `update_plan` tool, so the
         // to-do panel reads the running plan through it.
         self.state.attach_plan(&id, agent.plan());
+        // The queue dock steers into this turn through the agent's own
+        // mailbox. It is attached here, at the one turn-opening path, and
+        // dropped when the turn ends - so only a live turn can be steered.
+        self.state.attach_steers(&id, agent.steers().clone());
         let cap = self.state.effective_in(&id).tool_output_cap;
         // The automatic trigger prices the request the turn is about to send:
         // the history window plus the rows `begin_turn_in` just appended (the
@@ -3491,7 +3628,11 @@ impl Shell {
                     .messages
                     .iter()
                     .enumerate()
-                    .filter(|(_, message)| message.role == crate::model::Role::User)
+                    // A steering row belongs to the turn it interjected into,
+                    // so it is not a mark of its own.
+                    .filter(|(_, message)| {
+                        message.role == crate::model::Role::User && !message.steering
+                    })
                     .map(|(index, _)| index)
                     .collect()
             })
@@ -3546,6 +3687,9 @@ impl Render for Shell {
         // always notifies and must not run per frame.
         let placeholder = match self.claim_hint() {
             Some(claim) => claim,
+            // The reference's own order: a steerable queue outranks plan mode,
+            // because the key is one press away from acting on it.
+            None if self.queued_steerable() => "composer.placeholderSteerQueue",
             None if self.state.active_plan_mode() => "composer.planPlaceholder",
             None if self.state.hero_phase() => "composer.heroPlaceholder",
             None => "composer.placeholder",
@@ -3617,6 +3761,10 @@ impl Render for Shell {
             self.changes_hover = None;
             self.changes_preview = None;
             self.changes_cache.borrow_mut().clear();
+            // A turn list names a message index in the session that just went
+            // away, so it goes with it; a file comparison names a workspace
+            // file and is still meaningful, which is why only the turn clears.
+            self.right.diff.turn = None;
             self.state.stat_open = false;
             self.state.meter_open = false;
             // The jobs popover is scoped to the session it was opened in, so a

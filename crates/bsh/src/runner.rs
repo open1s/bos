@@ -63,6 +63,24 @@ pub(crate) enum AgentEvent {
         /// The model-written checkpoint text, unframed.
         summary: String,
     },
+    /// A steered message was taken by the running turn's next step.
+    ///
+    /// The ticket is the host identity the message was queued with. It lands
+    /// at the step boundary, before that step's first token, so the shell
+    /// records the message exactly where the running turn took it.
+    Steered {
+        /// The host ticket the message was queued with.
+        ticket: u64,
+    },
+    /// The turn ended before taking a steered message, so it was handed back.
+    ///
+    /// The shell restores the row rather than losing a message the model never
+    /// saw. It lands before the terminal event, so a queue drained by the
+    /// finished turn already sees it.
+    SteerWithdrawn {
+        /// The host ticket the message was queued with.
+        ticket: u64,
+    },
     /// The turn finished.
     Done,
     /// The turn failed.
@@ -155,6 +173,14 @@ impl Runner {
         Self::seed_session(&agent, &transcript);
 
         let (tx, rx) = async_channel::unbounded();
+        // The turn's delivery sink, installed before the stream starts: the
+        // agent reports a steered ticket at the step that takes it, which is
+        // the moment the shell records the message. It belongs to this turn -
+        // the next turn builds a fresh agent and installs its own sink.
+        let steered = tx.clone();
+        agent.on_steered(move |ticket| {
+            let _ = steered.try_send(AgentEvent::Steered { ticket });
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let stop_task = stop.clone();
         let handle = self.rt.spawn(async move {
@@ -180,51 +206,69 @@ impl Runner {
             if stop_task.load(Ordering::SeqCst) {
                 return;
             }
-            let mut stream = agent.stream(input);
-            while let Some(item) = stream.next().await {
-                if stop_task.load(Ordering::SeqCst) {
-                    break;
-                }
-                let terminal =
-                    matches!(&item, Ok(StreamToken::Done | StreamToken::Stopped) | Err(_));
-                let event = match item {
-                    Ok(StreamToken::Text(text)) => AgentEvent::Text(text),
-                    Ok(StreamToken::ReasoningContent(text)) => AgentEvent::Reasoning(text),
-                    Ok(StreamToken::ToolCall { name, args, .. }) => AgentEvent::ToolCall {
-                        name,
-                        args: args.to_string(),
-                    },
-                    Ok(StreamToken::ToolResult { name, output, ms }) => {
-                        let output = if output.chars().count() > tool_output_cap {
-                            let cut: String = output.chars().take(tool_output_cap).collect();
-                            format!("{cut}\n... [output truncated for display]")
-                        } else {
-                            output
-                        };
-                        AgentEvent::ToolResult { name, output, ms }
+            // The terminal event is held back until the mailbox has been handed
+            // back: a steer the turn never reached another step for must be
+            // restored BEFORE the shell starts the next turn from the queue.
+            let mut terminal_event = None;
+            {
+                let mut stream = agent.stream(input);
+                while let Some(item) = stream.next().await {
+                    if stop_task.load(Ordering::SeqCst) {
+                        break;
                     }
-                    Ok(StreamToken::Usage(usage)) => AgentEvent::Usage {
-                        prompt: u64::from(usage.prompt_tokens),
-                        completion: u64::from(usage.completion_tokens),
-                        // The provider's cache breakdown rides on the raw
-                        // provider usage, the same way the engine reads it.
-                        cached: u64::from(
-                            usage
-                                .prompt_tokens_details
-                                .as_ref()
-                                .and_then(|details| details.cached_tokens)
-                                .unwrap_or(0),
-                        ),
-                    },
-                    Ok(StreamToken::Done | StreamToken::Stopped) => AgentEvent::Done,
-                    Err(err) => AgentEvent::Error(err.to_string()),
-                };
-                if tx.send_blocking(event).is_err() {
+                    let terminal =
+                        matches!(&item, Ok(StreamToken::Done | StreamToken::Stopped) | Err(_));
+                    let event = match item {
+                        Ok(StreamToken::Text(text)) => AgentEvent::Text(text),
+                        Ok(StreamToken::ReasoningContent(text)) => AgentEvent::Reasoning(text),
+                        Ok(StreamToken::ToolCall { name, args, .. }) => AgentEvent::ToolCall {
+                            name,
+                            args: args.to_string(),
+                        },
+                        Ok(StreamToken::ToolResult { name, output, ms }) => {
+                            let output = if output.chars().count() > tool_output_cap {
+                                let cut: String = output.chars().take(tool_output_cap).collect();
+                                format!("{cut}\n... [output truncated for display]")
+                            } else {
+                                output
+                            };
+                            AgentEvent::ToolResult { name, output, ms }
+                        }
+                        Ok(StreamToken::Usage(usage)) => AgentEvent::Usage {
+                            prompt: u64::from(usage.prompt_tokens),
+                            completion: u64::from(usage.completion_tokens),
+                            // The provider's cache breakdown rides on the raw
+                            // provider usage, the same way the engine reads it.
+                            cached: u64::from(
+                                usage
+                                    .prompt_tokens_details
+                                    .as_ref()
+                                    .and_then(|details| details.cached_tokens)
+                                    .unwrap_or(0),
+                            ),
+                        },
+                        Ok(StreamToken::Done | StreamToken::Stopped) => AgentEvent::Done,
+                        Err(err) => AgentEvent::Error(err.to_string()),
+                    };
+                    if terminal {
+                        terminal_event = Some(event);
+                        break;
+                    }
+                    if tx.send_blocking(event).is_err() {
+                        break;
+                    }
+                }
+            }
+            for ticket in agent.take_undelivered_steers() {
+                if tx
+                    .send_blocking(AgentEvent::SteerWithdrawn { ticket })
+                    .is_err()
+                {
                     break;
                 }
-                if terminal {
-                    break;
-                }
+            }
+            if let Some(event) = terminal_event {
+                let _ = tx.send_blocking(event);
             }
         });
         self.tasks.retain(|_, task| !task.is_finished());

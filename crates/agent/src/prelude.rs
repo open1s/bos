@@ -4,7 +4,9 @@ pub use crate::agent::agentic::LlmProvider;
 pub use crate::agent::config::TomlAgentBuilder as AgentBuilder;
 pub use crate::agent::config::TomlAgentConfig;
 pub use crate::agent::config::TomlToolRef;
-pub use crate::agent::context::{estimate_tokens, CompactionReport, ContextBudget};
+pub use crate::agent::context::{
+    estimate_tokens, CompactionReport, ContextBudget, SteerMailbox, SteerMessage, MAX_STEER_DEPTH,
+};
 pub use crate::agent::hooks::{AgentHook, HookContext, HookEvent, HookRegistry};
 pub use crate::agent::{Agent, AgentConfig, FallbackProvider};
 pub use crate::bus::{AgentCallableServer, AgentCallerTool, AgentRpcClient};

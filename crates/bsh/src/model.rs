@@ -340,6 +340,23 @@ pub(crate) struct ChatMessage {
     /// Reader notes: marker, feedback, usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) meta: Option<MessageMeta>,
+    /// Whether this is a mid-turn STEER rather than the turn's own prompt.
+    ///
+    /// A steered message is a real user turn in the model history - it sits
+    /// between the assistant text before it and the continuation after it,
+    /// because that is the order the running turn took them. But it does not
+    /// OPEN a turn: the rail, the trajectory's turn numbers, the audit's turn
+    /// grouping, the usage count and the diff's turn ordinal all belong to the
+    /// prompt that started the turn. The flag is what tells those readers
+    /// "inside this turn", and it is persisted so a relaunch groups the
+    /// transcript the same way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) steering: bool,
+}
+
+/// Skip a false flag in the stored session; see [`ChatMessage::steering`].
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ChatMessage {
@@ -353,6 +370,15 @@ impl ChatMessage {
             images: Vec::new(),
             error: None,
             meta: None,
+            steering: false,
+        }
+    }
+
+    /// A user message injected into a turn already running.
+    pub(crate) fn steer(text: impl Into<String>) -> Self {
+        Self {
+            steering: true,
+            ..Self::user(text)
         }
     }
 
@@ -366,6 +392,7 @@ impl ChatMessage {
             images: Vec::new(),
             error: None,
             meta: None,
+            steering: false,
         }
     }
 
@@ -648,10 +675,12 @@ impl Session {
     }
 
     /// Number of user-and-assistant turns.
+    ///
+    /// A steering row is part of the turn around it, not a turn of its own.
     pub(crate) fn turn_count(&self) -> usize {
         self.messages
             .iter()
-            .filter(|m| m.role == Role::User)
+            .filter(|m| m.role == Role::User && !m.steering)
             .count()
     }
 

@@ -536,7 +536,9 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
     // folded history. The marker names how much moved and what replaced it.
     let mut markers = session.compactions.iter().peekable();
     for (index, message) in session.messages.iter().enumerate() {
-        if message.role == crate::model::Role::User {
+        // A steer is an occurrence INSIDE the running turn, not a new turn:
+        // its row is numbered with the prompt it interjected into.
+        if message.role == crate::model::Role::User && !message.steering {
             turn += 1;
         }
         let turn_now = turn.max(1);
